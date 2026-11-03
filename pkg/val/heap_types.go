@@ -197,6 +197,67 @@ type PyGenerator struct {
 	Iters      [8]PyIter
 }
 
+// CoroutineState classifies the lifecycle state of a PyCoroutine.
+type CoroutineState uint8
+
+const (
+	CoroCreated CoroutineState = iota
+	CoroRunning
+	CoroSuspended
+	CoroClosed
+)
+
+// PyCoroutine represents a frame-detaching Python coroutine object on the heap.
+// Header MUST be at offset 0.
+type PyCoroutine struct {
+	Header     ObjectHeader
+	Name       string
+	Code       Value
+	State      CoroutineState
+	Stack      []Value
+	SP         int
+	Base       int
+	IP         int
+	Cells      []Value
+	Globals    *PyDict
+	YieldVal   Value
+	RetVal     Value
+	LastSent   Value
+	ResumeHook func(ctx *ExecContext, coro *PyCoroutine, val Value) (Value, IterStatus)
+	Iters      [8]PyIter
+}
+
+// FutureState classifies the lifecycle state of a PyFuture.
+type FutureState uint8
+
+const (
+	FutPending FutureState = iota
+	FutFinished
+	FutCancelled
+)
+
+// PyFuture represents an asynchronous Future computation.
+// Header MUST be at offset 0.
+type PyFuture struct {
+	Header    ObjectHeader
+	State     FutureState
+	ResultVal Value
+	ExcVal    Value
+	Callbacks []func(Value)
+	mu        sync.Mutex
+	doneChan  chan struct{}
+}
+
+// PyTask represents an asyncio Task scheduling a Coroutine on an EventLoop.
+// Header MUST be at offset 0.
+type PyTask struct {
+	Header   ObjectHeader
+	Future   PyFuture
+	Coro     *PyCoroutine
+	Loop     any
+	NextSent Value
+}
+
 // Compile-time assertions that every heap object places Header at offset 0.
 var (
 	_ [0 - unsafe.Offsetof(PyBigInt{}.Header)]byte
@@ -206,6 +267,9 @@ var (
 	_ [0 - unsafe.Offsetof(PyCell{}.Header)]byte
 	_ [0 - unsafe.Offsetof(PyIter{}.Header)]byte
 	_ [0 - unsafe.Offsetof(PyGenerator{}.Header)]byte
+	_ [0 - unsafe.Offsetof(PyCoroutine{}.Header)]byte
+	_ [0 - unsafe.Offsetof(PyFuture{}.Header)]byte
+	_ [0 - unsafe.Offsetof(PyTask{}.Header)]byte
 	_ [0 - unsafe.Offsetof(PyChan{}.Header)]byte
 	_ [0 - unsafe.Offsetof(PyBytes{}.Header)]byte
 	_ [0 - unsafe.Offsetof(PyByteArray{}.Header)]byte
@@ -224,6 +288,9 @@ func init() {
 		unsafe.Offsetof(PyCell{}.Header) != 0 ||
 		unsafe.Offsetof(PyIter{}.Header) != 0 ||
 		unsafe.Offsetof(PyGenerator{}.Header) != 0 ||
+		unsafe.Offsetof(PyCoroutine{}.Header) != 0 ||
+		unsafe.Offsetof(PyFuture{}.Header) != 0 ||
+		unsafe.Offsetof(PyTask{}.Header) != 0 ||
 		unsafe.Offsetof(PyChan{}.Header) != 0 ||
 		unsafe.Offsetof(PyBytes{}.Header) != 0 ||
 		unsafe.Offsetof(PyByteArray{}.Header) != 0 ||
@@ -706,6 +773,183 @@ func (g *PyGenerator) Throw(ctx *ExecContext, exc Value) (Value, IterStatus) {
 		ctx.Raise(exc)
 	}
 	return g.Send(ctx, NoneVal())
+}
+
+// AsCoroutine performs a zero-cost offset-0 downcast from Value to *PyCoroutine.
+func (v Value) AsCoroutine() *PyCoroutine {
+	return (*PyCoroutine)(unsafe.Pointer(v.ptr))
+}
+
+// NewCoroutineVal constructs a heap-allocated KindCoroutine Value with pre-allocated stack.
+func NewCoroutineVal(name string, code Value, maxStack int, cells []Value, globals *PyDict) Value {
+	if maxStack < 8 {
+		maxStack = 8
+	}
+	stack := make([]Value, maxStack)
+	for i := range stack {
+		stack[i] = NoneVal()
+	}
+	coro := &PyCoroutine{
+		Header:  ObjectHeader{Kind: KindCoroutine, Type: CoroutineType},
+		Name:    name,
+		Code:    code,
+		State:   CoroCreated,
+		Stack:   stack,
+		SP:      0,
+		Base:    0,
+		IP:      0,
+		Cells:   cells,
+		Globals: globals,
+		RetVal:  NoneVal(),
+	}
+	return Value{num: 0, ptr: &coro.Header}
+}
+
+// Send advances the coroutine with a value, returning (yieldedValue, status).
+func (c *PyCoroutine) Send(ctx *ExecContext, val Value) (Value, IterStatus) {
+	if c.State == CoroClosed {
+		return NoneVal(), IterExhausted
+	}
+	if c.ResumeHook != nil {
+		return c.ResumeHook(ctx, c, val)
+	}
+	return NoneVal(), IterExhausted
+}
+
+// Close closes the coroutine and marks it CoroClosed.
+func (c *PyCoroutine) Close(ctx *ExecContext) {
+	c.State = CoroClosed
+}
+
+// Throw resumes the coroutine by raising an exception at the point of suspension.
+func (c *PyCoroutine) Throw(ctx *ExecContext, exc Value) (Value, IterStatus) {
+	if c.State == CoroClosed {
+		return NoneVal(), IterExhausted
+	}
+	if ctx != nil {
+		ctx.Raise(exc)
+	}
+	return c.Send(ctx, NoneVal())
+}
+
+// AsFuture performs a zero-cost offset-0 downcast from Value to *PyFuture.
+func (v Value) AsFuture() *PyFuture {
+	return (*PyFuture)(unsafe.Pointer(v.ptr))
+}
+
+// NewFutureVal constructs a heap-allocated KindFuture Value.
+func NewFutureVal() Value {
+	fut := &PyFuture{
+		Header:   ObjectHeader{Kind: KindFuture, Type: FutureType},
+		State:    FutPending,
+		doneChan: make(chan struct{}),
+	}
+	return Value{num: 0, ptr: &fut.Header}
+}
+
+func (f *PyFuture) IsDone() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.State != FutPending
+}
+
+func (f *PyFuture) Result() (Value, Value) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.ResultVal, f.ExcVal
+}
+
+func (f *PyFuture) SetResult(v Value) {
+	f.mu.Lock()
+	if f.State != FutPending {
+		f.mu.Unlock()
+		return
+	}
+	f.State = FutFinished
+	f.ResultVal = v
+	cbs := f.Callbacks
+	f.Callbacks = nil
+	close(f.doneChan)
+	f.mu.Unlock()
+
+	futVal := Value{num: 0, ptr: &f.Header}
+	for _, cb := range cbs {
+		cb(futVal)
+	}
+}
+
+func (f *PyFuture) SetException(exc Value) {
+	f.mu.Lock()
+	if f.State != FutPending {
+		f.mu.Unlock()
+		return
+	}
+	f.State = FutFinished
+	f.ExcVal = exc
+	cbs := f.Callbacks
+	f.Callbacks = nil
+	close(f.doneChan)
+	f.mu.Unlock()
+
+	futVal := Value{num: 0, ptr: &f.Header}
+	for _, cb := range cbs {
+		cb(futVal)
+	}
+}
+
+func (f *PyFuture) AddDoneCallback(cb func(Value)) {
+	f.mu.Lock()
+	if f.State != FutPending {
+		f.mu.Unlock()
+		futVal := Value{num: 0, ptr: &f.Header}
+		cb(futVal)
+		return
+	}
+	f.Callbacks = append(f.Callbacks, cb)
+	f.mu.Unlock()
+}
+
+func (f *PyFuture) DoneChan() <-chan struct{} {
+	return f.doneChan
+}
+
+// AsTask performs a zero-cost offset-0 downcast from Value to *PyTask.
+func (v Value) AsTask() *PyTask {
+	return (*PyTask)(unsafe.Pointer(v.ptr))
+}
+
+// NewTaskVal constructs a heap-allocated KindTask Value.
+func NewTaskVal(coro *PyCoroutine) Value {
+	task := &PyTask{
+		Header: ObjectHeader{Kind: KindTask, Type: TaskType},
+		Future: PyFuture{
+			Header:   ObjectHeader{Kind: KindFuture, Type: FutureType},
+			State:    FutPending,
+			doneChan: make(chan struct{}),
+		},
+		Coro: coro,
+	}
+	return Value{num: 0, ptr: &task.Header}
+}
+
+func (t *PyTask) IsDone() bool {
+	return t.Future.IsDone()
+}
+
+func (t *PyTask) Result() (Value, Value) {
+	return t.Future.Result()
+}
+
+func (t *PyTask) SetResult(v Value) {
+	t.Future.SetResult(v)
+}
+
+func (t *PyTask) SetException(exc Value) {
+	t.Future.SetException(exc)
+}
+
+func (t *PyTask) AddDoneCallback(cb func(Value)) {
+	t.Future.AddDoneCallback(cb)
 }
 
 // Standard Exception Constructors

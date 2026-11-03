@@ -67,6 +67,12 @@ type CallFrame struct {
 	iters      [16]val.PyIter
 }
 
+// CodeObject Flags bitmask constants.
+const (
+	FlagGenerator uint32 = 1 << 0
+	FlagCoroutine uint32 = 1 << 1
+)
+
 // CodeObject represents a compiled function or module bytecode unit.
 // Header is placed at offset 0 so a *CodeObject can be stored inside a val.Value (KindCode)
 // in a constant pool with zero-cost downcasting.
@@ -82,6 +88,8 @@ type CodeObject struct {
 	NumParams      int
 	MaxStackSize   int
 	IsGenerator    bool
+	IsCoroutine    bool
+	Flags          uint32
 	ExceptionTable []ExceptionEntry
 }
 
@@ -116,6 +124,7 @@ type VM struct {
 	builtins       *val.PyDict
 	modules        *val.PyDict
 	lastException  val.Value
+	coroFreeList   []*val.PyCoroutine
 	rootCO         CodeObject
 }
 

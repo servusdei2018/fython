@@ -609,6 +609,10 @@ func lookupKeyword(s string) TokenType {
 		return TOKEN_IMPORT
 	case "from":
 		return TOKEN_FROM
+	case "async":
+		return TOKEN_ASYNC
+	case "await":
+		return TOKEN_AWAIT
 	default:
 		return TOKEN_IDENT
 	}

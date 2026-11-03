@@ -37,6 +37,7 @@ const (
 	ExprKindYield
 	ExprKindYieldFrom
 	ExprKindSlice
+	ExprKindAwait
 )
 
 // ASTExpr represents a flat, unboxed expression node stored in contiguous arena slices.
@@ -76,6 +77,9 @@ const (
 	StmtKindWith
 	StmtKindImport
 	StmtKindImportFrom
+	StmtKindAsyncFuncDef
+	StmtKindAsyncFor
+	StmtKindAsyncWith
 )
 
 // ASTStmt represents a flat, unboxed statement node stored in contiguous arena slices.
@@ -138,6 +142,7 @@ type ASTFuncDef struct {
 	ParamNames IdentSlice
 	Defaults   ExprSlice
 	Body       StmtSlice
+	IsAsync    bool
 }
 
 // ASTClassDef stores class definition metadata.

@@ -265,6 +265,9 @@ var (
 	IterType        *PyType
 	RangeType       *PyType
 	GeneratorType   *PyType
+	CoroutineType   *PyType
+	FutureType      *PyType
+	TaskType        *PyType
 	ChanType        *PyType
 	ModuleType      *PyType
 	BytesType       *PyType
@@ -284,6 +287,7 @@ var (
 	AttributeErrorType      *PyType
 	RuntimeErrorType        *PyType
 	StopIterationType       *PyType
+	StopAsyncIterationType  *PyType
 	GeneratorExitType       *PyType
 	ImportErrorType         *PyType
 	ModuleNotFoundErrorType *PyType

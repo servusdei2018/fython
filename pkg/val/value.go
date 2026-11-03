@@ -41,6 +41,9 @@ const (
 	KindByteArray   // Heap-allocated mutable bytearray (*PyByteArray)
 	KindMemoryView  // Heap-allocated buffer memoryview (*PyMemoryView)
 	KindSlice       // Heap-allocated slice object (*PySlice)
+	KindCoroutine   // Heap-allocated detached coroutine frame (*PyCoroutine)
+	KindFuture      // Heap-allocated async Future (*PyFuture)
+	KindTask        // Heap-allocated async Task (*PyTask)
 )
 
 // ObjectHeader Flags bitmask constants.
@@ -110,6 +113,12 @@ func (k Kind) String() string {
 		return "memoryview"
 	case KindSlice:
 		return "slice"
+	case KindCoroutine:
+		return "coroutine"
+	case KindFuture:
+		return "Future"
+	case KindTask:
+		return "Task"
 	default:
 		return "unknown"
 	}
@@ -239,82 +248,97 @@ func (v Value) IsInlineStr() bool {
 
 // IsBigInt reports whether v is a heap-allocated arbitrary-precision integer.
 func (v Value) IsBigInt() bool {
-	return v.ptr.Kind == KindBigInt
+	return v.ptr != nil && v.ptr.Kind == KindBigInt
 }
 
 // IsString reports whether v is a heap-allocated string (> 7 bytes).
 func (v Value) IsString() bool {
-	return v.ptr.Kind == KindString
+	return v.ptr != nil && v.ptr.Kind == KindString
 }
 
 // IsAnyString reports whether v is either an inline small string or a heap-allocated string.
 func (v Value) IsAnyString() bool {
-	return v.ptr == &tagInlineStr || v.ptr.Kind == KindString
+	return v.ptr == &tagInlineStr || (v.ptr != nil && v.ptr.Kind == KindString)
 }
 
 // IsList reports whether v is a heap-allocated PyList.
 func (v Value) IsList() bool {
-	return v.ptr.Kind == KindList
+	return v.ptr != nil && v.ptr.Kind == KindList
 }
 
 // IsDict reports whether v is a heap-allocated PyDict.
 func (v Value) IsDict() bool {
-	return v.ptr.Kind == KindDict
+	return v.ptr != nil && v.ptr.Kind == KindDict
 }
 
 // IsInstance reports whether v is a heap-allocated PyInstance.
 func (v Value) IsInstance() bool {
-	return v.ptr.Kind == KindInstance
+	return v.ptr != nil && v.ptr.Kind == KindInstance
 }
 
 // IsType reports whether v is a heap-allocated PyType.
 func (v Value) IsType() bool {
-	return v.ptr.Kind == KindType
+	return v.ptr != nil && v.ptr.Kind == KindType
 }
 
 // IsFunction reports whether v is a heap-allocated PyFunction.
 func (v Value) IsFunction() bool {
-	return v.ptr.Kind == KindFunction
+	return v.ptr != nil && v.ptr.Kind == KindFunction
 }
 
 // IsBuiltinFunc reports whether v is a heap-allocated PyBuiltinFunc.
 func (v Value) IsBuiltinFunc() bool {
-	return v.ptr.Kind == KindBuiltinFunc
+	return v.ptr != nil && v.ptr.Kind == KindBuiltinFunc
 }
 
 // IsBoundMethod reports whether v is a heap-allocated PyBoundMethod.
 func (v Value) IsBoundMethod() bool {
-	return v.ptr.Kind == KindBoundMethod
+	return v.ptr != nil && v.ptr.Kind == KindBoundMethod
 }
 
 // IsProperty reports whether v is a heap-allocated PyProperty.
 func (v Value) IsProperty() bool {
-	return v.ptr.Kind == KindProperty
+	return v.ptr != nil && v.ptr.Kind == KindProperty
 }
 
 // IsSuper reports whether v is a heap-allocated PySuper.
 func (v Value) IsSuper() bool {
-	return v.ptr.Kind == KindSuper
+	return v.ptr != nil && v.ptr.Kind == KindSuper
 }
 
 // IsTuple reports whether v is a heap-allocated PyTuple.
 func (v Value) IsTuple() bool {
-	return v.ptr.Kind == KindTuple
+	return v.ptr != nil && v.ptr.Kind == KindTuple
 }
 
 // IsCell reports whether v is a heap-allocated PyCell.
 func (v Value) IsCell() bool {
-	return v.ptr.Kind == KindCell
+	return v.ptr != nil && v.ptr.Kind == KindCell
 }
 
 // IsIter reports whether v is a heap-allocated PyIter.
 func (v Value) IsIter() bool {
-	return v.ptr.Kind == KindIter
+	return v.ptr != nil && v.ptr.Kind == KindIter
 }
 
 // IsGenerator reports whether v is a heap-allocated PyGenerator.
 func (v Value) IsGenerator() bool {
-	return v.ptr.Kind == KindGenerator
+	return v.ptr != nil && v.ptr.Kind == KindGenerator
+}
+
+// IsCoroutine reports whether v is a heap-allocated PyCoroutine.
+func (v Value) IsCoroutine() bool {
+	return v.ptr != nil && v.ptr.Kind == KindCoroutine
+}
+
+// IsFuture reports whether v is a heap-allocated PyFuture.
+func (v Value) IsFuture() bool {
+	return v.ptr != nil && v.ptr.Kind == KindFuture
+}
+
+// IsTask reports whether v is a heap-allocated PyTask.
+func (v Value) IsTask() bool {
+	return v.ptr != nil && v.ptr.Kind == KindTask
 }
 
 // IsChan reports whether v is a heap-allocated PyChan.
@@ -693,6 +717,12 @@ func (v Value) String() string {
 		return fmt.Sprintf("range(%d, %d)", start, stop)
 	case KindGenerator:
 		return fmt.Sprintf("<generator object %s at %p>", v.AsGenerator().Name, v.ptr)
+	case KindCoroutine:
+		return fmt.Sprintf("<coroutine object %s at %p>", v.AsCoroutine().Name, v.ptr)
+	case KindFuture:
+		return fmt.Sprintf("<Future at %p>", v.ptr)
+	case KindTask:
+		return fmt.Sprintf("<Task at %p>", v.ptr)
 	case KindModule:
 		mod := v.AsModule()
 		if mod.File != "" {

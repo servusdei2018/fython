@@ -1196,6 +1196,99 @@ func initTypes() {
 		return v
 	}))
 
+	CoroutineType = MustNewType("coroutine", []*PyType{ObjectType}, nil)
+	CoroutineType.Slots.TpIter = func(ctx *ExecContext, o Value) Value { return o }
+	CoroutineType.Slots.TpIterNext = func(ctx *ExecContext, o Value) (Value, IterStatus) {
+		coro := o.AsCoroutine()
+		return coro.Send(ctx, NoneVal())
+	}
+	CoroutineType.Dict.Set(InternString("send"), NewBuiltinFuncVal("send", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: send() takes exactly one argument")
+		}
+		coro := args[0].AsCoroutine()
+		v, status := coro.Send(ctx, args[1])
+		if status == IterExhausted {
+			ctx.Raise(NewStopIteration(v))
+		}
+		return v
+	}))
+	CoroutineType.Dict.Set(InternString("close"), NewBuiltinFuncVal("close", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: close() takes at least 1 argument")
+		}
+		coro := args[0].AsCoroutine()
+		coro.Close(ctx)
+		return NoneVal()
+	}))
+	CoroutineType.Dict.Set(InternString("throw"), NewBuiltinFuncVal("throw", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: throw() takes at least 1 argument")
+		}
+		coro := args[0].AsCoroutine()
+		v, _ := coro.Throw(ctx, args[1])
+		return v
+	}))
+	CoroutineType.Dict.Set(InternString("__await__"), NewBuiltinFuncVal("__await__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: __await__() takes at least 1 argument")
+		}
+		return args[0]
+	}))
+
+	FutureType = MustNewType("Future", []*PyType{ObjectType}, nil)
+	FutureType.Dict.Set(InternString("done"), NewBuiltinFuncVal("done", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: done() takes at least 1 argument")
+		}
+		return BoolVal(args[0].AsFuture().IsDone())
+	}))
+	FutureType.Dict.Set(InternString("result"), NewBuiltinFuncVal("result", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: result() takes at least 1 argument")
+		}
+		fut := args[0].AsFuture()
+		res, exc := fut.Result()
+		if !exc.IsNone() && exc.HeaderPtr() != nil {
+			if ctx != nil {
+				ctx.Raise(exc)
+			}
+			return NoneVal()
+		}
+		return res
+	}))
+	FutureType.Dict.Set(InternString("set_result"), NewBuiltinFuncVal("set_result", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: set_result() takes exactly one argument")
+		}
+		args[0].AsFuture().SetResult(args[1])
+		return NoneVal()
+	}))
+	FutureType.Dict.Set(InternString("set_exception"), NewBuiltinFuncVal("set_exception", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: set_exception() takes exactly one argument")
+		}
+		args[0].AsFuture().SetException(args[1])
+		return NoneVal()
+	}))
+	FutureType.Dict.Set(InternString("__await__"), NewBuiltinFuncVal("__await__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: __await__() takes at least 1 argument")
+		}
+		return args[0]
+	}))
+
+	TaskType = MustNewType("Task", []*PyType{FutureType}, nil)
+	if fn, ok := FutureType.Dict.Get(InternString("done")); ok {
+		TaskType.Dict.Set(InternString("done"), fn)
+	}
+	if fn, ok := FutureType.Dict.Get(InternString("result")); ok {
+		TaskType.Dict.Set(InternString("result"), fn)
+	}
+	if fn, ok := FutureType.Dict.Get(InternString("__await__")); ok {
+		TaskType.Dict.Set(InternString("__await__"), fn)
+	}
+
 	ChanType = MustNewType("chan", []*PyType{ObjectType}, nil)
 	ChanType.Slots.TpIter = func(ctx *ExecContext, o Value) Value {
 		return o
@@ -1271,6 +1364,7 @@ func initTypes() {
 	AttributeErrorType = MustNewType("AttributeError", []*PyType{ExceptionType}, nil)
 	RuntimeErrorType = MustNewType("RuntimeError", []*PyType{ExceptionType}, nil)
 	StopIterationType = MustNewType("StopIteration", []*PyType{ExceptionType}, nil)
+	StopAsyncIterationType = MustNewType("StopAsyncIteration", []*PyType{ExceptionType}, nil)
 	GeneratorExitType = MustNewType("GeneratorExit", []*PyType{BaseExceptionType}, nil)
 	ImportErrorType = MustNewType("ImportError", []*PyType{ExceptionType}, nil)
 	ModuleNotFoundErrorType = MustNewType("ModuleNotFoundError", []*PyType{ImportErrorType}, nil)
@@ -1503,6 +1597,9 @@ func initTypes() {
 	builtinTypes[KindIter] = IterType
 	builtinTypes[KindRange] = RangeType
 	builtinTypes[KindGenerator] = GeneratorType
+	builtinTypes[KindCoroutine] = CoroutineType
+	builtinTypes[KindFuture] = FutureType
+	builtinTypes[KindTask] = TaskType
 	builtinTypes[KindChan] = ChanType
 	builtinTypes[KindModule] = ModuleType
 	builtinTypes[KindBytes] = BytesType

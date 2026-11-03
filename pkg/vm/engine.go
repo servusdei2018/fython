@@ -58,6 +58,8 @@ type Engine struct {
 	searchPaths     []string
 	compileHook     func(src []byte) (*CodeObject, error)
 	virtualModules  sync.Map
+	asyncMode       AsyncMode
+	coroPool        sync.Pool
 }
 
 // NewEngine creates and initializes a shared Engine instance.
@@ -67,6 +69,7 @@ func NewEngine() *Engine {
 		rootShape:   val.NewRootShape(),
 		builtins:    val.NewDictVal(64).AsDict(),
 		searchPaths: []string{"."},
+		asyncMode:   AsyncModeSingleThread,
 	}
 	// Temporary bootstrap VM to populate e.builtins
 	bootVM := &VM{
@@ -114,8 +117,19 @@ func (e *Engine) newSysModules() *val.PyDict {
 	modules.Set(val.InternString("time"), e.createTimeModule())
 	modules.Set(val.InternString("os"), e.createOSModule())
 	modules.Set(val.InternString("io"), e.createIOModule())
+	modules.Set(val.InternString("asyncio"), e.createAsyncioModule())
 
 	return modules
+}
+
+// SetAsyncMode sets the coroutine scheduling strategy for this Engine.
+func (e *Engine) SetAsyncMode(mode AsyncMode) {
+	e.asyncMode = mode
+}
+
+// AsyncMode returns the current coroutine scheduling strategy.
+func (e *Engine) AsyncMode() AsyncMode {
+	return e.asyncMode
 }
 
 // newVMInternal allocates a new isolated VM attached to this Engine.

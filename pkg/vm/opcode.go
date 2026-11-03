@@ -65,6 +65,8 @@ const (
 	OP_YIELD_FROM
 	OP_CHECK_EXC_MATCH
 	OP_CLEANUP_EXC
+	OP_GET_AWAITABLE
+	OP_AWAIT
 
 	// Quickened (PEP 659 Adaptive) Operations
 	OP_BINARY_ADD_INT
@@ -201,6 +203,10 @@ func (op Opcode) String() string {
 		return "OP_CHECK_EXC_MATCH"
 	case OP_CLEANUP_EXC:
 		return "OP_CLEANUP_EXC"
+	case OP_GET_AWAITABLE:
+		return "OP_GET_AWAITABLE"
+	case OP_AWAIT:
+		return "OP_AWAIT"
 	case OP_BINARY_ADD_INT:
 		return "OP_BINARY_ADD_INT"
 	case OP_BINARY_ADD_FLOAT:

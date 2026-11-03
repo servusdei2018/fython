@@ -61,6 +61,7 @@ type Scope struct {
 	ExplicitNL  map[string]bool // nonlocal x
 	Used        map[string]bool
 	IsGenerator bool
+	IsCoroutine bool
 
 	ParamNames []string
 	CellVars   []string
@@ -127,7 +128,7 @@ func (st *SymbolTable) visitStmt(stmtID StmtID) error {
 	}
 
 	switch stmt.Kind {
-	case StmtKindFuncDef:
+	case StmtKindFuncDef, StmtKindAsyncFuncDef:
 		fnDef := &st.arena.FuncDefs[stmt.Extra]
 		st.cur.Bound[fnDef.Name] = true
 
@@ -140,6 +141,9 @@ func (st *SymbolTable) visitStmt(stmtID StmtID) error {
 
 		// Function scope
 		fnScope := NewScope(ScopeFunction, fnDef.Name, st.cur)
+		if stmt.Kind == StmtKindAsyncFuncDef || fnDef.IsAsync {
+			fnScope.IsCoroutine = true
+		}
 		st.Scopes = append(st.Scopes, fnScope)
 		params := st.arena.GetIdentSlice(fnDef.ParamNames)
 		fnScope.ParamNames = append(fnScope.ParamNames, params...)
@@ -211,7 +215,7 @@ func (st *SymbolTable) visitStmt(stmtID StmtID) error {
 		}
 		st.bindTarget(stmt.Expr1)
 
-	case StmtKindFor:
+	case StmtKindFor, StmtKindAsyncFor:
 		if err := st.visitExpr(stmt.Expr2); err != nil {
 			return err
 		}
@@ -330,7 +334,7 @@ func (st *SymbolTable) visitStmt(stmtID StmtID) error {
 			}
 		}
 
-	case StmtKindWith:
+	case StmtKindWith, StmtKindAsyncWith:
 		sliceStart := stmt.Extra & 0xFFFF
 		sliceCount := stmt.Extra >> 16
 		items := st.arena.WithItems[sliceStart : sliceStart+sliceCount]
@@ -513,6 +517,11 @@ func (st *SymbolTable) visitExpr(exprID ExprID) error {
 
 	case ExprKindYieldFrom:
 		st.cur.IsGenerator = true
+		if expr.Left != ExprNone {
+			return st.visitExpr(expr.Left)
+		}
+
+	case ExprKindAwait:
 		if expr.Left != ExprNone {
 			return st.visitExpr(expr.Left)
 		}

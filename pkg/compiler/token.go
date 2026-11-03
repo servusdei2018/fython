@@ -48,6 +48,8 @@ const (
 	TOKEN_YIELD
 	TOKEN_IMPORT
 	TOKEN_FROM
+	TOKEN_ASYNC
+	TOKEN_AWAIT
 
 	// Delimiters
 	TOKEN_LPAREN   // (
@@ -168,6 +170,10 @@ func (t TokenType) String() string {
 		return "import"
 	case TOKEN_FROM:
 		return "from"
+	case TOKEN_ASYNC:
+		return "async"
+	case TOKEN_AWAIT:
+		return "await"
 	case TOKEN_LPAREN:
 		return "("
 	case TOKEN_RPAREN:

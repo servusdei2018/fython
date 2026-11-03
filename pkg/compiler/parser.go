@@ -155,6 +155,8 @@ func (p *Parser) parseStmt() (StmtID, error) {
 		return p.parseImportStmt()
 	case TOKEN_FROM:
 		return p.parseFromImportStmt()
+	case TOKEN_ASYNC:
+		return p.parseAsyncStmt()
 	default:
 		return p.parseSimpleStmt()
 	}
@@ -195,8 +197,31 @@ func (p *Parser) parseSuite() (uint32, error) {
 	return p.arena.AddStmtSlice(stmts), nil
 }
 
+func (p *Parser) parseAsyncStmt() (StmtID, error) {
+	asyncTok, _ := p.expect(TOKEN_ASYNC)
+	switch p.cur.Type {
+	case TOKEN_DEF:
+		return p.parseFuncDefInternal(true, asyncTok.Start)
+	case TOKEN_FOR:
+		return p.parseAsyncForStmt(asyncTok.Start)
+	case TOKEN_WITH:
+		return p.parseAsyncWithStmt(asyncTok.Start)
+	default:
+		return StmtNone, fmt.Errorf("SyntaxError: expected def, for, or with after async at line %d, col %d", p.cur.Line, p.cur.Col)
+	}
+}
+
 func (p *Parser) parseFuncDef() (StmtID, error) {
 	startTok, _ := p.expect(TOKEN_DEF)
+	return p.parseFuncDefInternal(false, startTok.Start)
+}
+
+func (p *Parser) parseFuncDefInternal(isAsync bool, startPos uint32) (StmtID, error) {
+	if isAsync {
+		if _, err := p.expect(TOKEN_DEF); err != nil {
+			return StmtNone, err
+		}
+	}
 	nameTok, err := p.expect(TOKEN_IDENT)
 	if err != nil {
 		return StmtNone, err
@@ -246,11 +271,17 @@ func (p *Parser) parseFuncDef() (StmtID, error) {
 		ParamNames: p.arena.AddIdentSlice(paramNames),
 		Defaults:   p.arena.AddExprSlice(defaults),
 		Body:       p.arena.StmtSlices[bodySlice],
+		IsAsync:    isAsync,
 	})
 
+	kind := StmtKindFuncDef
+	if isAsync {
+		kind = StmtKindAsyncFuncDef
+	}
+
 	return p.arena.AllocStmt(ASTStmt{
-		Kind:  StmtKindFuncDef,
-		Start: startTok.Start,
+		Kind:  kind,
+		Start: startPos,
 		End:   p.arena.GetStmtSlice(bodySlice)[len(p.arena.GetStmtSlice(bodySlice))-1].endInArena(p.arena),
 		Extra: fnIdx,
 	}), nil
@@ -465,6 +496,53 @@ func (p *Parser) parseForStmt() (StmtID, error) {
 	}), nil
 }
 
+func (p *Parser) parseAsyncForStmt(startPos uint32) (StmtID, error) {
+	if _, err := p.expect(TOKEN_FOR); err != nil {
+		return StmtNone, err
+	}
+	p.parsingForTarget = true
+	target, err := p.parseExpr()
+	p.parsingForTarget = false
+	if err != nil {
+		return StmtNone, err
+	}
+	if _, err := p.expect(TOKEN_IN); err != nil {
+		return StmtNone, err
+	}
+	iter, err := p.parseExpr()
+	if err != nil {
+		return StmtNone, err
+	}
+	if _, err := p.expect(TOKEN_COLON); err != nil {
+		return StmtNone, err
+	}
+
+	body, err := p.parseSuite()
+	if err != nil {
+		return StmtNone, err
+	}
+
+	var elseBody uint32
+	if p.match(TOKEN_ELSE) {
+		if _, err := p.expect(TOKEN_COLON); err != nil {
+			return StmtNone, err
+		}
+		elseBody, err = p.parseSuite()
+		if err != nil {
+			return StmtNone, err
+		}
+	}
+
+	return p.arena.AllocStmt(ASTStmt{
+		Kind:  StmtKindAsyncFor,
+		Start: startPos,
+		Expr1: target,
+		Expr2: iter,
+		Body:  body,
+		Else:  elseBody,
+	}), nil
+}
+
 func (p *Parser) parseTryStmt() (StmtID, error) {
 	startTok, _ := p.expect(TOKEN_TRY)
 	if _, err := p.expect(TOKEN_COLON); err != nil {
@@ -621,6 +699,47 @@ func (p *Parser) parseWithStmt() (StmtID, error) {
 	return p.arena.AllocStmt(ASTStmt{
 		Kind:  StmtKindWith,
 		Start: startTok.Start,
+		Body:  body,
+		Extra: withSlice.Start | (withSlice.Count << 16),
+	}), nil
+}
+
+func (p *Parser) parseAsyncWithStmt(startPos uint32) (StmtID, error) {
+	if _, err := p.expect(TOKEN_WITH); err != nil {
+		return StmtNone, err
+	}
+	var items []ASTWithItem
+	for {
+		expr, err := p.parseExpr()
+		if err != nil {
+			return StmtNone, err
+		}
+		var target ExprID
+		if p.match(TOKEN_AS) {
+			target, err = p.parseExpr()
+			if err != nil {
+				return StmtNone, err
+			}
+		}
+		items = append(items, ASTWithItem{
+			Expr:   expr,
+			Target: target,
+		})
+		if !p.match(TOKEN_COMMA) {
+			break
+		}
+	}
+	if _, err := p.expect(TOKEN_COLON); err != nil {
+		return StmtNone, err
+	}
+	body, err := p.parseSuite()
+	if err != nil {
+		return StmtNone, err
+	}
+	withSlice := p.arena.AddWithSlice(items)
+	return p.arena.AllocStmt(ASTStmt{
+		Kind:  StmtKindAsyncWith,
+		Start: startPos,
 		Body:  body,
 		Extra: withSlice.Start | (withSlice.Count << 16),
 	}), nil
@@ -1113,6 +1232,18 @@ func (p *Parser) parseMulDiv() (ExprID, error) {
 }
 
 func (p *Parser) parseUnary() (ExprID, error) {
+	if p.cur.Type == TOKEN_AWAIT {
+		opTok := p.advance()
+		operand, err := p.parseUnary()
+		if err != nil {
+			return ExprNone, err
+		}
+		return p.arena.AllocExpr(ASTExpr{
+			Kind:  ExprKindAwait,
+			Start: opTok.Start,
+			Left:  operand,
+		}), nil
+	}
 	if p.cur.Type == TOKEN_PLUS || p.cur.Type == TOKEN_MINUS {
 		opTok := p.advance()
 		operand, err := p.parseUnary()
@@ -1614,6 +1745,18 @@ func (p *Parser) parseAtom() (ExprID, error) {
 
 	case TOKEN_YIELD:
 		return p.parseYield()
+
+	case TOKEN_AWAIT:
+		tok := p.advance()
+		operand, err := p.parseUnary()
+		if err != nil {
+			return ExprNone, err
+		}
+		return p.arena.AllocExpr(ASTExpr{
+			Kind:  ExprKindAwait,
+			Start: tok.Start,
+			Left:  operand,
+		}), nil
 
 	default:
 		return ExprNone, fmt.Errorf("SyntaxError: unexpected token %s at line %d, col %d", tok.Type, tok.Line, tok.Col)
