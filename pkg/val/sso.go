@@ -1,6 +1,9 @@
 package val
 
-import "unsafe"
+import (
+	"sync"
+	"unsafe"
+)
 
 const (
 	fnvOffset32 uint32 = 2166136261
@@ -84,6 +87,9 @@ func StringEquals(a, b Value) bool {
 		if a.ptr == b.ptr {
 			return true
 		}
+		if (a.ptr.Flags & b.ptr.Flags & FlagInterned) != 0 {
+			return false
+		}
 		sa := (*PyString)(unsafe.Pointer(a.ptr))
 		sb := (*PyString)(unsafe.Pointer(b.ptr))
 		if sa.Header.Hash != 0 && sb.Header.Hash != 0 && sa.Header.Hash != sb.Header.Hash {
@@ -142,4 +148,140 @@ func (v Value) AsString() string {
 		return (*PyString)(unsafe.Pointer(v.ptr)).Data
 	}
 	return ""
+}
+
+// InternPool manages an open-addressed table of canonicalized heap *PyString objects
+// with FlagInterned set on ObjectHeader.Flags (without using Go's built-in map).
+type InternPool struct {
+	mu      sync.RWMutex
+	buckets []*PyString
+	mask    uint32
+	count   int
+}
+
+// NewInternPool constructs a new InternPool with the given initial capacity.
+func NewInternPool(capacity int) *InternPool {
+	capPow2 := uint32(64)
+	for int(capPow2)*2 < capacity*3 {
+		capPow2 <<= 1
+	}
+	return &InternPool{
+		buckets: make([]*PyString, capPow2),
+		mask:    capPow2 - 1,
+	}
+}
+
+// Intern returns a canonicalized string Value for s.
+// Strings <= 7 bytes return a 0-allocation KindInlineStr.
+// Strings >= 8 bytes return a heap-allocated KindString with FlagInterned set.
+func (p *InternPool) Intern(s string) Value {
+	if len(s) <= 7 {
+		return SmallStringVal(s)
+	}
+	h := HashString(s)
+
+	p.mu.RLock()
+	if len(p.buckets) > 0 {
+		idx := h & p.mask
+		for {
+			b := p.buckets[idx]
+			if b == nil {
+				break
+			}
+			if b.Header.Hash == h && b.Data == s {
+				p.mu.RUnlock()
+				return Value{num: 0, ptr: &b.Header}
+			}
+			idx = (idx + 1) & p.mask
+		}
+	}
+	p.mu.RUnlock()
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if len(p.buckets) == 0 {
+		p.buckets = make([]*PyString, 64)
+		p.mask = 63
+	}
+
+	idx := h & p.mask
+	for {
+		b := p.buckets[idx]
+		if b == nil {
+			break
+		}
+		if b.Header.Hash == h && b.Data == s {
+			return Value{num: 0, ptr: &b.Header}
+		}
+		idx = (idx + 1) & p.mask
+	}
+
+	if (p.count+1)*3 > len(p.buckets)*2 {
+		p.grow()
+		idx = h & p.mask
+		for p.buckets[idx] != nil {
+			idx = (idx + 1) & p.mask
+		}
+	}
+
+	obj := &PyString{
+		Header: ObjectHeader{
+			Kind:  KindString,
+			Flags: FlagInterned,
+			Hash:  h,
+		},
+		Data: s,
+	}
+	p.buckets[idx] = obj
+	p.count++
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+// InternValue returns a canonicalized string Value for v.
+// If v is already KindInlineStr or a KindString with FlagInterned set, it returns v with 0 allocations.
+func (p *InternPool) InternValue(v Value) Value {
+	if v.ptr == &tagInlineStr {
+		return v
+	}
+	if v.ptr.Kind == KindString {
+		if (v.ptr.Flags & FlagInterned) != 0 {
+			return v
+		}
+		return p.Intern((*PyString)(unsafe.Pointer(v.ptr)).Data)
+	}
+	panic("val.InternValue: value is not a string")
+}
+
+func (p *InternPool) grow() {
+	newCap := uint32(len(p.buckets) * 2)
+	if newCap < 64 {
+		newCap = 64
+	}
+	newBuckets := make([]*PyString, newCap)
+	newMask := newCap - 1
+	for _, b := range p.buckets {
+		if b == nil {
+			continue
+		}
+		idx := b.Header.Hash & newMask
+		for newBuckets[idx] != nil {
+			idx = (idx + 1) & newMask
+		}
+		newBuckets[idx] = b
+	}
+	p.buckets = newBuckets
+	p.mask = newMask
+}
+
+var defaultInternPool = NewInternPool(256)
+
+// InternString interns s in the process-wide default InternPool.
+func InternString(s string) Value {
+	return defaultInternPool.Intern(s)
+}
+
+// InternValue canonicalizes a string Value in the process-wide default InternPool.
+func InternValue(v Value) Value {
+	return defaultInternPool.InternValue(v)
 }

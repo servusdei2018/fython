@@ -22,6 +22,9 @@ func TestValueSizeAndHeaderOffsets(t *testing.T) {
 	if off := unsafe.Offsetof(PyDict{}.Header); off != 0 {
 		t.Fatalf("unsafe.Offsetof(PyDict{}.Header) = %d, want 0", off)
 	}
+	if off := unsafe.Offsetof(PyInstance{}.Header); off != 0 {
+		t.Fatalf("unsafe.Offsetof(PyInstance{}.Header) = %d, want 0", off)
+	}
 }
 
 func TestPrimitivesAndSentinels(t *testing.T) {
@@ -245,4 +248,181 @@ func BenchmarkSmallStringCompare(b *testing.B) {
 		res = StringEquals(s1, s2)
 	}
 	benchSinkBool = res
+}
+
+func TestDictNumericEquivalence(t *testing.T) {
+	// Acceptance test: d[1] = "a", d[1.0] = "b", d[True] = "c"
+	// must result in a dictionary of length 1 with key 1 and value "c".
+	dVal := NewDictVal(8)
+	d := dVal.AsDict()
+
+	kInt := Int64Val(1)
+	kFloat := Float64Val(1.0)
+	kBool := BoolVal(true)
+
+	if HashValue(kInt) != HashValue(kFloat) || HashValue(kInt) != HashValue(kBool) {
+		t.Fatalf("numeric hash mismatch: hash(1)=%d, hash(1.0)=%d, hash(True)=%d",
+			HashValue(kInt), HashValue(kFloat), HashValue(kBool))
+	}
+
+	d.Set(kInt, NewStringVal("a"))
+	d.Set(kFloat, NewStringVal("b"))
+	d.Set(kBool, NewStringVal("c"))
+
+	if d.Len() != 1 {
+		t.Fatalf("d.Len() = %d, want 1", d.Len())
+	}
+	if len(d.Entries) != 1 || !d.Entries[0].Active {
+		t.Fatalf("expected 1 active DictEntry, got %+v", d.Entries)
+	}
+	// First-inserted key (1, KindInt64) must be preserved
+	if !d.Entries[0].Key.IsInt64() || d.Entries[0].Key.AsInt64() != 1 {
+		t.Fatalf("preserved key = %v (kind %v), want Int64Val(1)", d.Entries[0].Key, d.Entries[0].Key.Kind())
+	}
+
+	for _, probe := range []Value{kInt, kFloat, kBool} {
+		got, ok := d.Get(probe)
+		if !ok || got.AsString() != "c" {
+			t.Fatalf("d.Get(%v) = (%q, %v), want (\"c\", true)", probe.Kind(), got.AsString(), ok)
+		}
+	}
+
+	// Verify 0 == 0.0 == -0.0 == False equivalence as well
+	negZero := Float64Val(math.Copysign(0, -1))
+	if HashValue(Int64Val(0)) != HashValue(Float64Val(0.0)) ||
+		HashValue(Int64Val(0)) != HashValue(negZero) ||
+		HashValue(Int64Val(0)) != HashValue(BoolVal(false)) {
+		t.Fatalf("zero hash equivalence failed")
+	}
+}
+
+func TestDictInsertionOrderAndResize(t *testing.T) {
+	dVal := NewDictVal(4)
+	d := dVal.AsDict()
+
+	// Insert 300 keys to trigger uint8 -> uint16 sparse index table growth
+	const N = 300
+	for i := 0; i < N; i++ {
+		d.Set(Int64Val(int64(i)), Int64Val(int64(i*10)))
+	}
+	if d.Len() != N {
+		t.Fatalf("d.Len() = %d, want %d", d.Len(), N)
+	}
+	for i := 0; i < N; i++ {
+		v, ok := d.Get(Int64Val(int64(i)))
+		if !ok || v.AsInt64() != int64(i*10) {
+			t.Fatalf("d.Get(%d) = (%v, %v), want (%d, true)", i, v, ok, i*10)
+		}
+		if d.Entries[i].Key.AsInt64() != int64(i) {
+			t.Fatalf("insertion order broken at index %d: got %d", i, d.Entries[i].Key.AsInt64())
+		}
+	}
+}
+
+func TestStringInterningFastPath(t *testing.T) {
+	// >= 8 byte strings must be heap-allocated with FlagInterned set and share identical pointers
+	id1 := InternString("__attribute_name__")
+	id2 := InternString(string([]byte("__attribute_name__")))
+	id3 := InternString("__different_name__")
+
+	if !id1.IsString() || !id1.IsInterned() || (id1.HeaderPtr().Flags&FlagInterned) == 0 {
+		t.Fatalf("expected id1 to be interned KindString")
+	}
+	if id1.HeaderPtr() != id2.HeaderPtr() {
+		t.Fatalf("interned strings with identical content must share identical *ObjectHeader pointers")
+	}
+	if !StringEquals(id1, id2) || !Equals(id1, id2) {
+		t.Fatalf("expected id1 == id2")
+	}
+	if StringEquals(id1, id3) || Equals(id1, id3) {
+		t.Fatalf("expected id1 != id3")
+	}
+
+	// Comparing two interned strings must allocate 0 bytes
+	allocs := testing.AllocsPerRun(100, func() {
+		if !StringEquals(id1, id2) || StringEquals(id1, id3) {
+			t.Fatal("unexpected interned comparison result")
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("interned StringEquals allocated %v times, want 0", allocs)
+	}
+}
+
+func TestHiddenClassShapesAndInstances(t *testing.T) {
+	root := NewRootShape()
+	inst1Val := NewInstanceVal(root)
+	inst2Val := NewInstanceVal(root)
+
+	inst1 := inst1Val.AsInstance()
+	inst2 := inst2Val.AsInstance()
+
+	attrX := InternString("x_coordinate")
+	attrY := InternString("y_coordinate")
+
+	inst1.SetAttr(attrX, Int64Val(10))
+	inst1.SetAttr(attrY, Int64Val(20))
+
+	inst2.SetAttr(attrX, Int64Val(30))
+	inst2.SetAttr(attrY, Int64Val(40))
+
+	// Both instances added attributes in the same order from the same root shape,
+	// so they MUST converge to the exact same immutable Shape pointer and ID.
+	if inst1.Shape != inst2.Shape || inst1.Shape.ID != inst2.Shape.ID {
+		t.Fatalf("instances with identical attribute transition order did not share Shape: %p vs %p", inst1.Shape, inst2.Shape)
+	}
+
+	v1x, ok1 := inst1.GetAttr(attrX)
+	v2y, ok2 := inst2.GetAttr(attrY)
+	if !ok1 || v1x.AsInt64() != 10 || !ok2 || v2y.AsInt64() != 40 {
+		t.Fatalf("unexpected slot values: v1x=%v, v2y=%v", v1x, v2y)
+	}
+}
+
+func BenchmarkDictLookupInt(b *testing.B) {
+	dVal := NewDictVal(64)
+	d := dVal.AsDict()
+	for i := int64(0); i < 32; i++ {
+		d.Set(Int64Val(i), Int64Val(i*100))
+	}
+	probeKey := Int64Val(17)
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	var v Value
+	var ok bool
+	for b.Loop() {
+		v, ok = d.Get(probeKey)
+	}
+	if !ok {
+		b.Fatal("expected key to be found")
+	}
+	benchSinkVal = v
+	benchSinkBool = ok
+}
+
+func BenchmarkDictLookupInternedStr(b *testing.B) {
+	dVal := NewDictVal(64)
+	d := dVal.AsDict()
+	keys := []string{
+		"__init__", "__repr__", "__dict__", "__class__",
+		"attribute_alpha", "attribute_beta", "attribute_gamma", "attribute_delta",
+	}
+	for i, k := range keys {
+		d.Set(InternString(k), Int64Val(int64(i)))
+	}
+	probeKey := InternString("attribute_gamma")
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	var v Value
+	var ok bool
+	for b.Loop() {
+		v, ok = d.Get(probeKey)
+	}
+	if !ok {
+		b.Fatal("expected interned key to be found")
+	}
+	benchSinkVal = v
+	benchSinkBool = ok
 }

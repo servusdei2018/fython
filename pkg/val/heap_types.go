@@ -26,17 +26,32 @@ type PyList struct {
 	Items  []Value
 }
 
-// DictEntry represents a key-value pair stored in a PyDict.
+// DictEntry represents a key-value pair stored in the dense, insertion-ordered PyDict array.
 type DictEntry struct {
-	Key   Value
-	Value Value
+	Hash   uint32
+	Active bool
+	Key    Value
+	Value  Value
 }
 
-// PyDict represents a heap-allocated dictionary with offset-0 ObjectHeader.
+const (
+	dictIndexEmpty  = 0
+	dictIndexDummy  = 1
+	dictIndexOffset = 2
+)
+
+// PyDict represents a Hettinger-style compact open-addressed dictionary with offset-0 ObjectHeader.
+// It separates the sparse hash index table (indices, dynamically sized as uint8, uint16, or uint32 per slot)
+// from the dense insertion-ordered Entries slice.
 // Header MUST be at offset 0.
 type PyDict struct {
-	Header  ObjectHeader
-	Entries []DictEntry
+	Header     ObjectHeader
+	Entries    []DictEntry
+	indices    []byte
+	mask       uint32
+	used       int
+	filled     int
+	indexShift uint8 // 0: uint8 slots, 1: uint16 slots, 2: uint32 slots
 }
 
 // Compile-time assertions that every heap object places Header at offset 0.
@@ -90,13 +105,11 @@ func NewListVal(items ...Value) Value {
 
 // NewDictVal constructs an empty heap-allocated KindDict Value with initial capacity.
 func NewDictVal(capacity int) Value {
-	var entries []DictEntry
-	if capacity > 0 {
-		entries = make([]DictEntry, 0, capacity)
-	}
 	obj := &PyDict{
-		Header:  ObjectHeader{Kind: KindDict},
-		Entries: entries,
+		Header: ObjectHeader{Kind: KindDict},
+	}
+	if capacity > 0 {
+		obj.initTable(capacity)
 	}
 	return Value{num: 0, ptr: &obj.Header}
 }
@@ -121,28 +134,265 @@ func (v Value) AsDict() *PyDict {
 	return (*PyDict)(unsafe.Pointer(v.ptr))
 }
 
-// Set inserts or updates a key-value pair in PyDict.
+func (d *PyDict) initTable(minEntries int) {
+	tableCap := uint32(8)
+	for int(tableCap)*2 < minEntries*3 {
+		tableCap <<= 1
+	}
+	shift := uint8(0)
+	if tableCap > 65536 {
+		shift = 2
+	} else if tableCap > 256 {
+		shift = 1
+	}
+	d.indices = make([]byte, int(tableCap)<<shift)
+	d.mask = tableCap - 1
+	d.indexShift = shift
+	maxDense := int(tableCap) * 2 / 3
+	if cap(d.Entries) < maxDense {
+		d.Entries = make([]DictEntry, 0, maxDense)
+	}
+}
+
+func (d *PyDict) readIndex(slot uint32) uint32 {
+	switch d.indexShift {
+	case 0:
+		return uint32(d.indices[slot])
+	case 1:
+		off := slot << 1
+		return uint32(d.indices[off]) | (uint32(d.indices[off+1]) << 8)
+	default:
+		off := slot << 2
+		return uint32(d.indices[off]) |
+			(uint32(d.indices[off+1]) << 8) |
+			(uint32(d.indices[off+2]) << 16) |
+			(uint32(d.indices[off+3]) << 24)
+	}
+}
+
+func (d *PyDict) writeIndex(slot uint32, val uint32) {
+	switch d.indexShift {
+	case 0:
+		d.indices[slot] = uint8(val)
+	case 1:
+		off := slot << 1
+		d.indices[off] = uint8(val)
+		d.indices[off+1] = uint8(val >> 8)
+	default:
+		off := slot << 2
+		d.indices[off] = uint8(val)
+		d.indices[off+1] = uint8(val >> 8)
+		d.indices[off+2] = uint8(val >> 16)
+		d.indices[off+3] = uint8(val >> 24)
+	}
+}
+
+func (d *PyDict) maxIndexValue() int {
+	switch d.indexShift {
+	case 0:
+		return 0xFF
+	case 1:
+		return 0xFFFF
+	default:
+		return 0x7FFFFFFF
+	}
+}
+
+func (d *PyDict) resize(minEntries int) {
+	tableCap := uint32(8)
+	for int(tableCap)*2 <= minEntries*3 {
+		tableCap <<= 1
+	}
+	shift := uint8(0)
+	if tableCap > 65536 {
+		shift = 2
+	} else if tableCap > 256 {
+		shift = 1
+	}
+
+	oldEntries := d.Entries
+	maxDense := int(tableCap) * 2 / 3
+	newEntries := make([]DictEntry, 0, maxDense)
+	d.indices = make([]byte, int(tableCap)<<shift)
+	d.mask = tableCap - 1
+	d.indexShift = shift
+	d.used = 0
+	d.filled = 0
+
+	mask := d.mask
+	for i := range oldEntries {
+		e := &oldEntries[i]
+		if !e.Active {
+			continue
+		}
+		newIdx := len(newEntries)
+		newEntries = append(newEntries, *e)
+		slot := e.Hash & mask
+		for d.readIndex(slot) != dictIndexEmpty {
+			slot = (slot + 1) & mask
+		}
+		d.writeIndex(slot, uint32(newIdx+dictIndexOffset))
+		d.used++
+		d.filled++
+	}
+	d.Entries = newEntries
+}
+
+// Set inserts or updates a key-value pair in PyDict while preserving insertion order
+// and keeping the first-inserted key on value updates (Python dict invariant).
 func (d *PyDict) Set(key, value Value) {
-	for i := range d.Entries {
-		if Equals(d.Entries[i].Key, key) {
-			d.Entries[i].Value = value
-			return
+	if len(d.indices) == 0 {
+		d.initTable(8)
+	}
+
+	h := HashValue(key)
+	mask := d.mask
+	slot := h & mask
+	insertSlot := -1
+
+	if d.indexShift == 0 {
+		for {
+			raw := d.indices[slot]
+			if raw == dictIndexEmpty {
+				if insertSlot < 0 {
+					insertSlot = int(slot)
+				}
+				break
+			}
+			if raw == dictIndexDummy {
+				if insertSlot < 0 {
+					insertSlot = int(slot)
+				}
+			} else {
+				e := &d.Entries[int(raw)-dictIndexOffset]
+				if e.Hash == h && e.Active && Equals(e.Key, key) {
+					e.Value = value
+					return
+				}
+			}
+			slot = (slot + 1) & mask
+		}
+	} else {
+		for {
+			raw := d.readIndex(slot)
+			if raw == dictIndexEmpty {
+				if insertSlot < 0 {
+					insertSlot = int(slot)
+				}
+				break
+			}
+			if raw == dictIndexDummy {
+				if insertSlot < 0 {
+					insertSlot = int(slot)
+				}
+			} else {
+				e := &d.Entries[int(raw)-dictIndexOffset]
+				if e.Hash == h && e.Active && Equals(e.Key, key) {
+					e.Value = value
+					return
+				}
+			}
+			slot = (slot + 1) & mask
 		}
 	}
-	d.Entries = append(d.Entries, DictEntry{Key: key, Value: value})
+
+	// Inserting a new key: check if table needs resizing.
+	if (d.filled+1)*3 > int(d.mask+1)*2 || len(d.Entries)+dictIndexOffset >= d.maxIndexValue() {
+		d.resize(d.used + 1)
+		mask = d.mask
+		slot = h & mask
+		for d.readIndex(slot) != dictIndexEmpty {
+			slot = (slot + 1) & mask
+		}
+		insertSlot = int(slot)
+	}
+
+	entryIdx := len(d.Entries)
+	d.Entries = append(d.Entries, DictEntry{
+		Hash:   h,
+		Active: true,
+		Key:    key,
+		Value:  value,
+	})
+	if d.readIndex(uint32(insertSlot)) == dictIndexEmpty {
+		d.filled++
+	}
+	d.writeIndex(uint32(insertSlot), uint32(entryIdx+dictIndexOffset))
+	d.used++
 }
 
-// Get retrieves a value by key from PyDict.
+// Get retrieves a value by key from PyDict with 0 heap allocations.
 func (d *PyDict) Get(key Value) (Value, bool) {
-	for i := range d.Entries {
-		if Equals(d.Entries[i].Key, key) {
-			return d.Entries[i].Value, true
+	if d.used == 0 {
+		return NoneVal(), false
+	}
+
+	h := HashValue(key)
+	mask := d.mask
+	slot := h & mask
+
+	if d.indexShift == 0 {
+		for {
+			raw := d.indices[slot]
+			if raw == dictIndexEmpty {
+				return NoneVal(), false
+			}
+			if raw >= dictIndexOffset {
+				e := &d.Entries[int(raw)-dictIndexOffset]
+				if e.Hash == h && e.Active && Equals(e.Key, key) {
+					return e.Value, true
+				}
+			}
+			slot = (slot + 1) & mask
 		}
 	}
-	return NoneVal(), false
+
+	for {
+		raw := d.readIndex(slot)
+		if raw == dictIndexEmpty {
+			return NoneVal(), false
+		}
+		if raw >= dictIndexOffset {
+			e := &d.Entries[int(raw)-dictIndexOffset]
+			if e.Hash == h && e.Active && Equals(e.Key, key) {
+				return e.Value, true
+			}
+		}
+		slot = (slot + 1) & mask
+	}
 }
 
-// Len returns the number of entries in PyDict.
+// Delete removes key from PyDict if present, returning true if an entry was removed.
+func (d *PyDict) Delete(key Value) bool {
+	if d.used == 0 {
+		return false
+	}
+
+	h := HashValue(key)
+	mask := d.mask
+	slot := h & mask
+
+	for {
+		raw := d.readIndex(slot)
+		if raw == dictIndexEmpty {
+			return false
+		}
+		if raw >= dictIndexOffset {
+			e := &d.Entries[int(raw)-dictIndexOffset]
+			if e.Hash == h && e.Active && Equals(e.Key, key) {
+				e.Active = false
+				e.Key = NoneVal()
+				e.Value = NoneVal()
+				d.writeIndex(slot, dictIndexDummy)
+				d.used--
+				return true
+			}
+		}
+		slot = (slot + 1) & mask
+	}
+}
+
+// Len returns the number of active entries in PyDict.
 func (d *PyDict) Len() int {
-	return len(d.Entries)
+	return d.used
 }

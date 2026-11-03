@@ -19,6 +19,14 @@ const (
 	KindList      // Heap-allocated dynamic array of Value
 	KindDict      // Heap-allocated hash table
 	KindCode      // Heap-allocated VM bytecode object
+	KindInstance  // Heap-allocated Python object instance (Shape + flat Slots)
+)
+
+// ObjectHeader Flags bitmask constants.
+const (
+	// FlagInterned marks a heap-allocated KindString as canonicalized in an intern pool,
+	// enabling O(1) pointer-equality comparison when both strings have FlagInterned set.
+	FlagInterned uint8 = 1 << 0
 )
 
 // String returns the human-readable name of the Kind.
@@ -42,6 +50,8 @@ func (k Kind) String() string {
 		return "dict"
 	case KindCode:
 		return "code"
+	case KindInstance:
+		return "instance"
 	default:
 		return "unknown"
 	}
@@ -172,6 +182,16 @@ func (v Value) IsDict() bool {
 	return v.ptr.Kind == KindDict
 }
 
+// IsInstance reports whether v is a heap-allocated PyInstance.
+func (v Value) IsInstance() bool {
+	return v.ptr.Kind == KindInstance
+}
+
+// IsInterned reports whether v has FlagInterned set in its ObjectHeader, or is an inline string.
+func (v Value) IsInterned() bool {
+	return v.ptr == &tagInlineStr || (v.ptr.Flags&FlagInterned) != 0
+}
+
 // AsBool extracts the boolean payload from a KindBool Value.
 func (v Value) AsBool() bool {
 	return v.num != 0
@@ -231,6 +251,11 @@ func Equals(a, b Value) bool {
 		return true
 	}
 
+	// Fast path: two distinct interned heap strings can never be equal.
+	if (a.ptr.Flags & b.ptr.Flags & FlagInterned) != 0 {
+		return false
+	}
+
 	// String comparison across inline and heap strings.
 	if (a.ptr == &tagInlineStr || a.ptr.Kind == KindString) &&
 		(b.ptr == &tagInlineStr || b.ptr.Kind == KindString) {
@@ -250,17 +275,92 @@ func Equals(a, b Value) bool {
 	if a.ptr == &tagBool && b.ptr == &tagInt64 {
 		return a.num == b.num
 	}
+	if a.ptr == &tagFloat64 && b.ptr == &tagBool {
+		return math.Float64frombits(a.num) == float64(b.num)
+	}
+	if a.ptr == &tagBool && b.ptr == &tagFloat64 {
+		return float64(a.num) == math.Float64frombits(b.num)
+	}
 	if a.ptr.Kind == KindBigInt && b.ptr.Kind == KindBigInt {
 		return a.AsBigInt().Val.Cmp(&b.AsBigInt().Val) == 0
 	}
-	if a.ptr.Kind == KindBigInt && b.ptr == &tagInt64 {
-		bi := b.AsInt64()
+	if a.ptr.Kind == KindBigInt && (b.ptr == &tagInt64 || b.ptr == &tagBool) {
+		bi := int64(b.num)
 		return a.AsBigInt().Val.IsInt64() && a.AsBigInt().Val.Int64() == bi
 	}
-	if a.ptr == &tagInt64 && b.ptr.Kind == KindBigInt {
-		ai := a.AsInt64()
+	if (a.ptr == &tagInt64 || a.ptr == &tagBool) && b.ptr.Kind == KindBigInt {
+		ai := int64(a.num)
 		return b.AsBigInt().Val.IsInt64() && b.AsBigInt().Val.Int64() == ai
+	}
+	if a.ptr.Kind == KindBigInt && b.ptr == &tagFloat64 {
+		f, _ := a.AsBigInt().Val.Float64()
+		return f == math.Float64frombits(b.num)
+	}
+	if a.ptr == &tagFloat64 && b.ptr.Kind == KindBigInt {
+		f, _ := b.AsBigInt().Val.Float64()
+		return math.Float64frombits(a.num) == f
 	}
 
 	return false
+}
+
+// mix64To32 folds a 64-bit value into a non-zero 32-bit hash in registers (0 allocations).
+func mix64To32(x uint64) uint32 {
+	x ^= x >> 33
+	x *= 0xff51afd7ed558ccd
+	x ^= x >> 33
+	x *= 0xc4ceb9fe1a85ec53
+	x ^= x >> 33
+	h := uint32(x)
+	if h == 0 {
+		return 1
+	}
+	return h
+}
+
+// HashValue computes the 32-bit hash of v with 0 heap allocations.
+// Enforces Python numeric hash equivalence: for any int64 i, float64 f, and bool b
+// where float64(i) == f, HashValue(i) == HashValue(f) == HashValue(b).
+func HashValue(v Value) uint32 {
+	if v.ptr == &tagInt64 || v.ptr == &tagBool {
+		f := float64(int64(v.num))
+		if f == 0.0 {
+			return mix64To32(0)
+		}
+		return mix64To32(math.Float64bits(f))
+	}
+	if v.ptr.Kind == KindString {
+		if v.ptr.Hash != 0 {
+			return v.ptr.Hash
+		}
+		h := HashString((*PyString)(unsafe.Pointer(v.ptr)).Data)
+		v.ptr.Hash = h
+		return h
+	}
+	if v.ptr == &tagInlineStr {
+		return InlineStrHash(v)
+	}
+	if v.ptr == &tagFloat64 {
+		f := math.Float64frombits(v.num)
+		if f == 0.0 {
+			return mix64To32(0)
+		}
+		return mix64To32(v.num)
+	}
+	if v.ptr == &tagNone {
+		return 0x4e6f6e65
+	}
+	if v.ptr.Kind == KindBigInt {
+		bi := &v.AsBigInt().Val
+		if bi.IsInt64() {
+			f := float64(bi.Int64())
+			if f == 0.0 {
+				return mix64To32(0)
+			}
+			return mix64To32(math.Float64bits(f))
+		}
+		f, _ := bi.Float64()
+		return mix64To32(math.Float64bits(f))
+	}
+	return mix64To32(uint64(uintptr(unsafe.Pointer(v.ptr))))
 }
