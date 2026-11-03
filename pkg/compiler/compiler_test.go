@@ -304,3 +304,326 @@ func BenchmarkFullCompile500Lines(b *testing.B) {
 		_, _ = Compile(src, arena)
 	}
 }
+
+func TestTryExceptBasic(t *testing.T) {
+	src := `
+caught = False
+val = 0
+try:
+    val = 1
+    raise ValueError
+    val = 2
+except ValueError:
+    caught = True
+    val = 3
+`
+	_, v := runPython(t, src)
+	c, ok := v.GetGlobal("caught")
+	if !ok || !c.IsTruthy() {
+		t.Fatalf("expected caught = True, got %v", c)
+	}
+	resVal, ok := v.GetGlobal("val")
+	if !ok || !resVal.IsInt64() || resVal.AsInt64() != 3 {
+		t.Fatalf("expected val = 3, got %v", resVal)
+	}
+}
+
+func TestTryExceptAsName(t *testing.T) {
+	src := `
+err_name = ""
+try:
+    raise ValueError
+except ValueError as e:
+    err_name = "ValueError caught"
+`
+	_, v := runPython(t, src)
+	res, ok := v.GetGlobal("err_name")
+	if !ok || res.AsString() != "ValueError caught" {
+		t.Fatalf("expected 'ValueError caught', got %v", res)
+	}
+}
+
+func TestTryExceptSubclassMatching(t *testing.T) {
+	src := `
+res = ""
+try:
+    raise TypeError
+except Exception:
+    res = "caught by Exception"
+`
+	_, v := runPython(t, src)
+	res, ok := v.GetGlobal("res")
+	if !ok || res.AsString() != "caught by Exception" {
+		t.Fatalf("expected 'caught by Exception', got %v", res)
+	}
+}
+
+func TestTryExceptElseFinally(t *testing.T) {
+	// 1. Happy path: try -> else -> finally
+	srcHappy := `
+log = []
+try:
+    log.append(1)
+except Exception:
+    log.append(2)
+else:
+    log.append(3)
+finally:
+    log.append(4)
+`
+	_, vHappy := runPython(t, srcHappy)
+	logVal, ok := vHappy.GetGlobal("log")
+	if !ok || !logVal.IsList() {
+		t.Fatalf("log is not a list: %v", logVal)
+	}
+	items := logVal.AsList().Items
+	if len(items) != 3 || items[0].AsInt64() != 1 || items[1].AsInt64() != 3 || items[2].AsInt64() != 4 {
+		t.Fatalf("happy path log = %v, want [1, 3, 4]", items)
+	}
+
+	// 2. Exception path: try -> except -> finally (no else)
+	srcExc := `
+log = []
+try:
+    log.append(1)
+    raise KeyError
+    log.append(2)
+except KeyError:
+    log.append(3)
+else:
+    log.append(4)
+finally:
+    log.append(5)
+`
+	_, vExc := runPython(t, srcExc)
+	logVal2, ok := vExc.GetGlobal("log")
+	if !ok || !logVal2.IsList() {
+		t.Fatalf("log is not a list: %v", logVal2)
+	}
+	items2 := logVal2.AsList().Items
+	if len(items2) != 3 || items2[0].AsInt64() != 1 || items2[1].AsInt64() != 3 || items2[2].AsInt64() != 5 {
+		t.Fatalf("exception path log = %v, want [1, 3, 5]", items2)
+	}
+}
+
+func TestNestedExceptionUnwindingMultiFrame(t *testing.T) {
+	src := `
+log = []
+
+def h():
+    log.append("h_enter")
+    raise ZeroDivisionError
+    log.append("h_exit")
+
+def g():
+    log.append("g_enter")
+    h()
+    log.append("g_exit")
+
+def f():
+    log.append("f_enter")
+    try:
+        g()
+    except ZeroDivisionError:
+        log.append("f_caught")
+    finally:
+        log.append("f_finally")
+
+f()
+`
+	_, v := runPython(t, src)
+	logVal, ok := v.GetGlobal("log")
+	if !ok || !logVal.IsList() {
+		t.Fatalf("log is not a list: %v", logVal)
+	}
+	items := logVal.AsList().Items
+	expected := []string{"f_enter", "g_enter", "h_enter", "f_caught", "f_finally"}
+	if len(items) != len(expected) {
+		t.Fatalf("log length = %d, want %d: %v", len(items), len(expected), items)
+	}
+	for i, exp := range expected {
+		if items[i].AsString() != exp {
+			t.Fatalf("log[%d] = %s, want %s", i, items[i].AsString(), exp)
+		}
+	}
+}
+
+func TestExceptionChaining(t *testing.T) {
+	src := `
+caught = False
+cause_is_type_error = False
+try:
+    try:
+        raise TypeError
+    except TypeError as e1:
+        raise ValueError from e1
+except ValueError as e2:
+    caught = True
+    cause = e2.__cause__
+    cause_is_type_error = isinstance(cause, TypeError)
+`
+	_, v := runPython(t, src)
+	c, ok := v.GetGlobal("caught")
+	if !ok || !c.IsTruthy() {
+		t.Fatalf("expected caught = True, got %v", c)
+	}
+	isTE, ok := v.GetGlobal("cause_is_type_error")
+	if !ok || !isTE.IsTruthy() {
+		t.Fatalf("expected cause_is_type_error = True, got %v", isTE)
+	}
+}
+
+func TestWithStatementSuppressionAndPropagation(t *testing.T) {
+	src := `
+class SuppressManager:
+    def __init__(self):
+        self.entered = False
+        self.exited = False
+    def __enter__(self):
+        self.entered = True
+        return self
+    def __exit__(self, exc_type, exc_val, tb):
+        self.exited = True
+        return True # Suppress!
+
+class PropagateManager:
+    def __init__(self):
+        self.entered = False
+        self.exited = False
+    def __enter__(self):
+        self.entered = True
+        return self
+    def __exit__(self, exc_type, exc_val, tb):
+        self.exited = True
+        return False # Do not suppress!
+
+# Test suppression
+supp_res = "before"
+with SuppressManager() as m1:
+    supp_res = "inside"
+    raise RuntimeError
+    supp_res = "after_raise"
+supp_res = "suppressed_successfully"
+
+# Test propagation
+prop_caught = False
+try:
+    with PropagateManager() as m2:
+        raise KeyError
+except KeyError:
+    prop_caught = True
+`
+	_, v := runPython(t, src)
+	sRes, ok := v.GetGlobal("supp_res")
+	if !ok || sRes.AsString() != "suppressed_successfully" {
+		t.Fatalf("expected 'suppressed_successfully', got %v", sRes)
+	}
+	pCaught, ok := v.GetGlobal("prop_caught")
+	if !ok || !pCaught.IsTruthy() {
+		t.Fatalf("expected prop_caught = True, got %v", pCaught)
+	}
+}
+
+func TestGeneratorBasicYieldAndSend(t *testing.T) {
+	src := `
+def gen_count():
+    yield 10
+    val = yield 20
+    yield val * 2
+
+g = gen_count()
+v1 = next(g)
+v2 = next(g)
+v3 = g.send(5)
+`
+	_, v := runPython(t, src)
+	v1, _ := v.GetGlobal("v1")
+	v2, _ := v.GetGlobal("v2")
+	v3, _ := v.GetGlobal("v3")
+	if !v1.IsInt64() || v1.AsInt64() != 10 {
+		t.Fatalf("v1 = %v, want 10", v1)
+	}
+	if !v2.IsInt64() || v2.AsInt64() != 20 {
+		t.Fatalf("v2 = %v, want 20", v2)
+	}
+	if !v3.IsInt64() || v3.AsInt64() != 10 {
+		t.Fatalf("v3 = %v, want 10 (5 * 2)", v3)
+	}
+}
+
+func TestGeneratorForLoopIteration(t *testing.T) {
+	src := `
+def my_range(n):
+    i = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+res = []
+for x in my_range(5):
+    res.append(x)
+`
+	_, v := runPython(t, src)
+	res, ok := v.GetGlobal("res")
+	if !ok || !res.IsList() {
+		t.Fatalf("res is not a list: %v", res)
+	}
+	items := res.AsList().Items
+	if len(items) != 5 {
+		t.Fatalf("len(items) = %d, want 5", len(items))
+	}
+	for i := 0; i < 5; i++ {
+		if items[i].AsInt64() != int64(i) {
+			t.Fatalf("items[%d] = %v, want %d", i, items[i], i)
+		}
+	}
+}
+
+func TestGeneratorYieldFrom(t *testing.T) {
+	src := `
+def subgen():
+    yield 1
+    yield 2
+    return 42
+
+def delegator():
+    yield 0
+    ret = yield from subgen()
+    yield ret
+    yield 100
+
+res = []
+for x in delegator():
+    res.append(x)
+`
+	_, v := runPython(t, src)
+	res, ok := v.GetGlobal("res")
+	if !ok || !res.IsList() {
+		t.Fatalf("res is not a list: %v", res)
+	}
+	items := res.AsList().Items
+	expected := []int64{0, 1, 2, 42, 100}
+	if len(items) != len(expected) {
+		t.Fatalf("len(items) = %d, want %d: %v", len(items), len(expected), items)
+	}
+	for i, exp := range expected {
+		if items[i].AsInt64() != exp {
+			t.Fatalf("items[%d] = %d, want %d", i, items[i].AsInt64(), exp)
+		}
+	}
+}
+
+func TestZeroDivisionErrorAutomaticUnwind(t *testing.T) {
+	src := `
+caught = False
+try:
+    x = 10 / 0
+except ZeroDivisionError:
+    caught = True
+`
+	_, v := runPython(t, src)
+	c, ok := v.GetGlobal("caught")
+	if !ok || !c.IsTruthy() {
+		t.Fatalf("expected ZeroDivisionError caught, got %v", c)
+	}
+}

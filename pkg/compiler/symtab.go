@@ -50,15 +50,16 @@ type Symbol struct {
 
 // Scope represents a lexical environment in the symbol table tree.
 type Scope struct {
-	Kind       ScopeKind
-	Name       string
-	Parent     *Scope
-	Children   []*Scope
-	Symbols    map[string]*Symbol
-	Bound      map[string]bool
-	ExplicitG  map[string]bool // global x
-	ExplicitNL map[string]bool // nonlocal x
-	Used       map[string]bool
+	Kind        ScopeKind
+	Name        string
+	Parent      *Scope
+	Children    []*Scope
+	Symbols     map[string]*Symbol
+	Bound       map[string]bool
+	ExplicitG   map[string]bool // global x
+	ExplicitNL  map[string]bool // nonlocal x
+	Used        map[string]bool
+	IsGenerator bool
 
 	ParamNames []string
 	CellVars   []string
@@ -278,6 +279,73 @@ func (st *SymbolTable) visitStmt(stmtID StmtID) error {
 		if stmt.Expr1 != ExprNone {
 			return st.visitExpr(stmt.Expr1)
 		}
+
+	case StmtKindTry:
+		tryStmt := &st.arena.TryStmts[stmt.Extra]
+		for _, sID := range st.arena.StmtIDs[tryStmt.Body.Start : tryStmt.Body.Start+tryStmt.Body.Count] {
+			if err := st.visitStmt(sID); err != nil {
+				return err
+			}
+		}
+		for _, h := range st.arena.GetExceptSlice(tryStmt.Handlers) {
+			if h.Type != ExprNone {
+				if err := st.visitExpr(h.Type); err != nil {
+					return err
+				}
+			}
+			if h.Name != "" {
+				st.cur.Bound[h.Name] = true
+			}
+			for _, sID := range st.arena.StmtIDs[h.Body.Start : h.Body.Start+h.Body.Count] {
+				if err := st.visitStmt(sID); err != nil {
+					return err
+				}
+			}
+		}
+		if tryStmt.Else.Count > 0 {
+			for _, sID := range st.arena.StmtIDs[tryStmt.Else.Start : tryStmt.Else.Start+tryStmt.Else.Count] {
+				if err := st.visitStmt(sID); err != nil {
+					return err
+				}
+			}
+		}
+		if tryStmt.Finally.Count > 0 {
+			for _, sID := range st.arena.StmtIDs[tryStmt.Finally.Start : tryStmt.Finally.Start+tryStmt.Finally.Count] {
+				if err := st.visitStmt(sID); err != nil {
+					return err
+				}
+			}
+		}
+
+	case StmtKindRaise:
+		if stmt.Expr1 != ExprNone {
+			if err := st.visitExpr(stmt.Expr1); err != nil {
+				return err
+			}
+		}
+		if stmt.Expr2 != ExprNone {
+			if err := st.visitExpr(stmt.Expr2); err != nil {
+				return err
+			}
+		}
+
+	case StmtKindWith:
+		sliceStart := stmt.Extra & 0xFFFF
+		sliceCount := stmt.Extra >> 16
+		items := st.arena.WithItems[sliceStart : sliceStart+sliceCount]
+		for _, item := range items {
+			if err := st.visitExpr(item.Expr); err != nil {
+				return err
+			}
+			if item.Target != ExprNone {
+				st.bindTarget(item.Target)
+			}
+		}
+		for _, sID := range st.arena.GetStmtSlice(stmt.Body) {
+			if err := st.visitStmt(sID); err != nil {
+				return err
+			}
+		}
 	}
 
 	return nil
@@ -410,6 +478,18 @@ func (st *SymbolTable) visitExpr(exprID ExprID) error {
 			}
 		}
 		st.cur = saved
+
+	case ExprKindYield:
+		st.cur.IsGenerator = true
+		if expr.Left != ExprNone {
+			return st.visitExpr(expr.Left)
+		}
+
+	case ExprKindYieldFrom:
+		st.cur.IsGenerator = true
+		if expr.Left != ExprNone {
+			return st.visitExpr(expr.Left)
+		}
 	}
 
 	return nil

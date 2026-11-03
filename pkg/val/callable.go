@@ -484,6 +484,10 @@ func initTypes() {
 	DunderInit = InternString("__init__")
 	DunderGetAttr = InternString("__getattr__")
 	DunderSetAttr = InternString("__setattr__")
+	DunderIter = InternString("__iter__")
+	DunderNext = InternString("__next__")
+	DunderEnter = InternString("__enter__")
+	DunderExit = InternString("__exit__")
 
 	// 2. Bootstrap ObjectType and TypeType.
 	ObjectType = &PyType{
@@ -559,6 +563,14 @@ func initTypes() {
 	ListType.Slots.MpSubscript = listSqItem
 	ListType.Slots.SqAssItem = listSqAssItem
 	ListType.Slots.MpAssSubscript = listSqAssItem
+	ListType.Dict.Set(InternString("append"), NewBuiltinFuncVal("append", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: append() takes exactly one argument")
+		}
+		list := args[0].AsList()
+		list.Items = append(list.Items, args[1])
+		return NoneVal()
+	}))
 
 	DictType = MustNewType("dict", []*PyType{ObjectType}, nil)
 	DictType.Slots.SqLen = dictSqLen
@@ -593,6 +605,95 @@ func initTypes() {
 
 	CellType = MustNewType("cell", []*PyType{ObjectType}, nil)
 	IterType = MustNewType("iterator", []*PyType{ObjectType}, nil)
+	IterType.Slots.TpIter = func(ctx *ExecContext, o Value) Value { return o }
+	IterType.Slots.TpIterNext = func(ctx *ExecContext, o Value) (Value, IterStatus) {
+		it := o.AsIter()
+		v, ok := it.Next()
+		if ok {
+			return v, IterYielded
+		}
+		return NoneVal(), IterExhausted
+	}
+
+	RangeType = MustNewType("range", []*PyType{ObjectType}, nil)
+	RangeType.Slots.TpIter = func(ctx *ExecContext, o Value) Value { return o }
+	RangeType.Slots.TpIterNext = func(ctx *ExecContext, o Value) (Value, IterStatus) {
+		if o.IsIter() {
+			it := o.AsIter()
+			v, ok := it.Next()
+			if ok {
+				return v, IterYielded
+			}
+			return NoneVal(), IterExhausted
+		}
+		return NoneVal(), IterExhausted
+	}
+
+	GeneratorType = MustNewType("generator", []*PyType{ObjectType}, nil)
+	GeneratorType.Slots.TpIter = func(ctx *ExecContext, o Value) Value { return o }
+	GeneratorType.Slots.TpIterNext = func(ctx *ExecContext, o Value) (Value, IterStatus) {
+		gen := o.AsGenerator()
+		return gen.Send(ctx, NoneVal())
+	}
+	GeneratorType.Dict.Set(InternString("send"), NewBuiltinFuncVal("send", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: send() takes exactly one argument")
+		}
+		gen := args[0].AsGenerator()
+		v, status := gen.Send(ctx, args[1])
+		if status == IterExhausted {
+			ctx.Raise(NewStopIteration(v))
+		}
+		return v
+	}))
+	GeneratorType.Dict.Set(InternString("close"), NewBuiltinFuncVal("close", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: close() takes at least 1 argument")
+		}
+		gen := args[0].AsGenerator()
+		gen.Close(ctx)
+		return NoneVal()
+	}))
+	GeneratorType.Dict.Set(InternString("throw"), NewBuiltinFuncVal("throw", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: throw() takes at least 1 argument")
+		}
+		gen := args[0].AsGenerator()
+		v, _ := gen.Throw(ctx, args[1])
+		return v
+	}))
+
+	ListType.Slots.TpIter = func(ctx *ExecContext, o Value) Value { return NewIterVal(o) }
+	TupleType.Slots.TpIter = func(ctx *ExecContext, o Value) Value { return NewIterVal(o) }
+	DictType.Slots.TpIter = func(ctx *ExecContext, o Value) Value { return NewIterVal(o) }
+
+	// Initialize built-in exception types
+	BaseExceptionType = MustNewType("BaseException", []*PyType{ObjectType}, nil)
+	BaseExceptionType.Dict.Set(DunderInit, NewBuiltinFuncVal("__init__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) > 0 {
+			self := args[0]
+			if self.IsInstance() {
+				var tupleItems []Value
+				if len(args) > 1 {
+					tupleItems = make([]Value, len(args)-1)
+					copy(tupleItems, args[1:])
+				}
+				self.AsInstance().SetAttr(InternString("args"), NewTupleVal(tupleItems...))
+			}
+		}
+		return NoneVal()
+	}))
+	ExceptionType = MustNewType("Exception", []*PyType{BaseExceptionType}, nil)
+	TypeErrorType = MustNewType("TypeError", []*PyType{ExceptionType}, nil)
+	ValueErrorType = MustNewType("ValueError", []*PyType{ExceptionType}, nil)
+	KeyErrorType = MustNewType("KeyError", []*PyType{ExceptionType}, nil)
+	IndexErrorType = MustNewType("IndexError", []*PyType{ExceptionType}, nil)
+	ZeroDivisionErrorType = MustNewType("ZeroDivisionError", []*PyType{ExceptionType}, nil)
+	NameErrorType = MustNewType("NameError", []*PyType{ExceptionType}, nil)
+	AttributeErrorType = MustNewType("AttributeError", []*PyType{ExceptionType}, nil)
+	RuntimeErrorType = MustNewType("RuntimeError", []*PyType{ExceptionType}, nil)
+	StopIterationType = MustNewType("StopIteration", []*PyType{ExceptionType}, nil)
+	GeneratorExitType = MustNewType("GeneratorExit", []*PyType{BaseExceptionType}, nil)
 
 	// 4. Populate static lookup table and sentinel headers.
 	builtinTypes[KindNone] = NoneType
@@ -615,6 +716,8 @@ func initTypes() {
 	builtinTypes[KindTuple] = TupleType
 	builtinTypes[KindCell] = CellType
 	builtinTypes[KindIter] = IterType
+	builtinTypes[KindRange] = RangeType
+	builtinTypes[KindGenerator] = GeneratorType
 
 	tagNone.Type = NoneType
 	tagBool.Type = BoolType
@@ -622,6 +725,7 @@ func initTypes() {
 	tagFloat64.Type = FloatType
 	tagInlineStr.Type = StrType
 	tagUnbound.Type = NoneType
+	tagRange.Type = RangeType
 
 	// 5. Initialize standard native built-in callables.
 	BuiltinLenVal = NewBuiltinFuncVal("len", BuiltinLen)

@@ -18,13 +18,26 @@ type LoopContext struct {
 
 // Compiler compiles an ASTArena + SymbolTable into 32-bit VM bytecode.
 type Compiler struct {
-	src        []byte
-	arena      *ASTArena
-	scope      *Scope
-	constPool  *ConstPool
-	code       []uint32
-	activeLoop *LoopContext
-	err        error
+	src            []byte
+	arena          *ASTArena
+	scope          *Scope
+	constPool      *ConstPool
+	code           []uint32
+	exceptionTable []vm.ExceptionEntry
+	stackDepth     int
+	maxStackDepth  int
+	activeLoop     *LoopContext
+	err            error
+}
+
+func (c *Compiler) addExceptionRange(startIP, endIP, targetIP, targetDepth int, pushLasti bool) {
+	c.exceptionTable = append(c.exceptionTable, vm.ExceptionEntry{
+		StartIP:          startIP,
+		EndIP:            endIP,
+		TargetIP:         targetIP,
+		TargetStackDepth: targetDepth,
+		PushLasti:        pushLasti,
+	})
 }
 
 // Compile compiles Python source bytes into an executable *vm.CodeObject using the provided arena.
@@ -60,11 +73,13 @@ func Compile(src []byte, arena *ASTArena) (*vm.CodeObject, error) {
 	c.peephole()
 
 	co := &vm.CodeObject{
-		Name:      "<module>",
-		Code:      c.code,
-		Consts:    c.constPool.Slice(),
-		NumLocals: 0,
-		NumParams: 0,
+		Name:           "<module>",
+		Code:           c.code,
+		Consts:         c.constPool.Slice(),
+		NumLocals:      len(c.scope.FastLocals),
+		NumParams:      0,
+		MaxStackSize:   c.maxStackDepth + 16,
+		ExceptionTable: c.exceptionTable,
 	}
 	return co, nil
 }
@@ -155,6 +170,15 @@ func (c *Compiler) compileStmt(stmtID StmtID) error {
 
 	case StmtKindFor:
 		return c.compileForStmt(stmt)
+
+	case StmtKindTry:
+		return c.compileTryStmt(stmt)
+
+	case StmtKindRaise:
+		return c.compileRaiseStmt(stmt)
+
+	case StmtKindWith:
+		return c.compileWithStmt(stmt)
 
 	case StmtKindBreak:
 		if c.activeLoop == nil {
@@ -468,6 +492,243 @@ func (c *Compiler) compileForStmt(stmt *ASTStmt) error {
 	return nil
 }
 
+func (c *Compiler) allocTempLocal() int {
+	offset := len(c.scope.FastLocals)
+	name := fmt.Sprintf(".temp_%d", offset)
+	c.scope.FastLocals = append(c.scope.FastLocals, name)
+	c.scope.Symbols[name] = &Symbol{
+		Name:    name,
+		Storage: StorageFastLocal,
+		Offset:  offset,
+	}
+	return offset
+}
+
+func (c *Compiler) compileTryStmt(stmt *ASTStmt) error {
+	tryStmt := &c.arena.TryStmts[stmt.Extra]
+
+	tryStart := len(c.code)
+	depth := c.stackDepth
+
+	for _, sID := range c.arena.StmtIDs[tryStmt.Body.Start : tryStmt.Body.Start+tryStmt.Body.Count] {
+		if err := c.compileStmt(sID); err != nil {
+			return err
+		}
+	}
+	tryEnd := len(c.code)
+
+	var normalEndJumps []int
+	if tryStmt.Else.Count > 0 {
+		for _, sID := range c.arena.StmtIDs[tryStmt.Else.Start : tryStmt.Else.Start+tryStmt.Else.Count] {
+			if err := c.compileStmt(sID); err != nil {
+				return err
+			}
+		}
+	}
+	jumpEnd := c.emitOp(vm.OP_JUMP, 0, 0)
+	normalEndJumps = append(normalEndJumps, jumpEnd)
+
+	handlers := c.arena.GetExceptSlice(tryStmt.Handlers)
+	var handlerEndJumps []int
+
+	if len(handlers) > 0 {
+		c.addExceptionRange(tryStart, tryEnd, len(c.code), depth, false)
+	}
+
+	for _, h := range handlers {
+		var nextHandlerJump int
+		if h.Type != ExprNone {
+			c.emitOp(vm.OP_DUP_TOP, 0, 0)
+			if err := c.compileExpr(h.Type); err != nil {
+				return err
+			}
+			c.emitOp(vm.OP_CHECK_EXC_MATCH, 0, 0)
+			nextHandlerJump = c.emitOp(vm.OP_JUMP_IF_FALSE, 0, 0)
+		}
+
+		if h.Name != "" {
+			c.emitOp(vm.OP_DUP_TOP, 0, 0)
+			if err := c.compileNameStore(h.Name); err != nil {
+				return err
+			}
+		}
+		c.emitOp(vm.OP_POP_TOP, 0, 0)
+
+		for _, sID := range c.arena.StmtIDs[h.Body.Start : h.Body.Start+h.Body.Count] {
+			if err := c.compileStmt(sID); err != nil {
+				return err
+			}
+		}
+		hEndJump := c.emitOp(vm.OP_JUMP, 0, 0)
+		handlerEndJumps = append(handlerEndJumps, hEndJump)
+
+		if h.Type != ExprNone {
+			c.patchJump(nextHandlerJump, len(c.code))
+		}
+	}
+
+	if len(handlers) > 0 {
+		c.emitOp(vm.OP_RAISE, 1, 0)
+	}
+
+	handlersEnd := len(c.code)
+	for _, j := range normalEndJumps {
+		c.patchJump(j, handlersEnd)
+	}
+	for _, j := range handlerEndJumps {
+		c.patchJump(j, handlersEnd)
+	}
+
+	if tryStmt.Finally.Count > 0 {
+		// Normal path:
+		for _, sID := range c.arena.StmtIDs[tryStmt.Finally.Start : tryStmt.Finally.Start+tryStmt.Finally.Count] {
+			if err := c.compileStmt(sID); err != nil {
+				return err
+			}
+		}
+		afterFin := c.emitOp(vm.OP_JUMP, 0, 0)
+
+		// Exception path for finally: covers try body and all handlers
+		finExcTarget := len(c.code)
+		c.addExceptionRange(tryStart, handlersEnd, finExcTarget, depth, false)
+
+		// Run finally body on exception, then re-raise
+		for _, sID := range c.arena.StmtIDs[tryStmt.Finally.Start : tryStmt.Finally.Start+tryStmt.Finally.Count] {
+			if err := c.compileStmt(sID); err != nil {
+				return err
+			}
+		}
+		c.emitOp(vm.OP_RAISE, 1, 0)
+		c.patchJump(afterFin, len(c.code))
+	}
+
+	return nil
+}
+
+func (c *Compiler) compileRaiseStmt(stmt *ASTStmt) error {
+	if stmt.Expr1 == ExprNone {
+		c.emitOp(vm.OP_RAISE, 0, 0)
+		return nil
+	}
+	if err := c.compileExpr(stmt.Expr1); err != nil {
+		return err
+	}
+	if stmt.Expr2 != ExprNone {
+		if err := c.compileExpr(stmt.Expr2); err != nil {
+			return err
+		}
+		c.emitOp(vm.OP_RAISE, 2, 0)
+	} else {
+		c.emitOp(vm.OP_RAISE, 1, 0)
+	}
+	return nil
+}
+
+func (c *Compiler) compileWithStmt(stmt *ASTStmt) error {
+	sliceStart := stmt.Extra & 0xFFFF
+	sliceCount := stmt.Extra >> 16
+	items := c.arena.WithItems[sliceStart : sliceStart+sliceCount]
+	return c.compileWithItemRecursive(items, stmt.Body)
+}
+
+func (c *Compiler) compileWithItemRecursive(items []ASTWithItem, body uint32) error {
+	if len(items) == 0 {
+		for _, sID := range c.arena.GetStmtSlice(body) {
+			if err := c.compileStmt(sID); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	item := items[0]
+	if err := c.compileExpr(item.Expr); err != nil {
+		return err
+	}
+	tempSlot := c.allocTempLocal()
+	c.emitOp(vm.OP_STORE_FAST, 0, uint16(tempSlot))
+
+	// Call __enter__
+	c.emitOp(vm.OP_LOAD_FAST, 0, uint16(tempSlot))
+	_, enterIdx := c.constPool.InternName("__enter__")
+	c.emitOp(vm.OP_LOAD_METHOD, 0, enterIdx)
+	c.emitOp(vm.OP_CALL_METHOD, 0, 0)
+
+	if item.Target != ExprNone {
+		if err := c.compileStoreTarget(item.Target); err != nil {
+			return err
+		}
+	} else {
+		c.emitOp(vm.OP_POP_TOP, 0, 0)
+	}
+
+	depth := c.stackDepth
+	withStart := len(c.code)
+	if err := c.compileWithItemRecursive(items[1:], body); err != nil {
+		return err
+	}
+	withEnd := len(c.code)
+
+	// Normal exit: call __exit__(None, None, None)
+	_, exitIdx := c.constPool.InternName("__exit__")
+	c.emitOp(vm.OP_LOAD_FAST, 0, uint16(tempSlot))
+	c.emitOp(vm.OP_LOAD_METHOD, 0, exitIdx)
+	noneIdx := c.constPool.Add(val.NoneVal())
+	c.emitOp(vm.OP_LOAD_CONST, 0, noneIdx)
+	c.emitOp(vm.OP_LOAD_CONST, 0, noneIdx)
+	c.emitOp(vm.OP_LOAD_CONST, 0, noneIdx)
+	c.emitOp(vm.OP_CALL_METHOD, 3, 0)
+	c.emitOp(vm.OP_POP_TOP, 0, 0)
+	jumpAfterWith := c.emitOp(vm.OP_JUMP, 0, 0)
+
+	// Exception handler: call __exit__(exc, exc, None) and check suppression
+	excTarget := len(c.code)
+	c.addExceptionRange(withStart, withEnd, excTarget, depth, false)
+
+	// At excTarget, exc is at top of stack.
+	tempSlot2 := c.allocTempLocal()
+	c.emitOp(vm.OP_STORE_FAST, 0, uint16(tempSlot2))
+
+	c.emitOp(vm.OP_LOAD_FAST, 0, uint16(tempSlot))
+	c.emitOp(vm.OP_LOAD_METHOD, 0, exitIdx)
+	c.emitOp(vm.OP_LOAD_FAST, 0, uint16(tempSlot2))
+	c.emitOp(vm.OP_LOAD_FAST, 0, uint16(tempSlot2))
+	c.emitOp(vm.OP_LOAD_CONST, 0, noneIdx)
+	c.emitOp(vm.OP_CALL_METHOD, 3, 0)
+	jumpSuppress := c.emitOp(vm.OP_JUMP_IF_TRUE, 0, 0)
+
+	// Not suppressed: reload exc and re-raise
+	c.emitOp(vm.OP_LOAD_FAST, 0, uint16(tempSlot2))
+	c.emitOp(vm.OP_RAISE, 1, 0)
+
+	// Suppressed: continue
+	c.patchJump(jumpSuppress, len(c.code))
+	c.patchJump(jumpAfterWith, len(c.code))
+	return nil
+}
+
+func (c *Compiler) compileYieldExpr(expr *ASTExpr) error {
+	if expr.Left != ExprNone {
+		if err := c.compileExpr(expr.Left); err != nil {
+			return err
+		}
+	} else {
+		noneIdx := c.constPool.Add(val.NoneVal())
+		c.emitOp(vm.OP_LOAD_CONST, 0, noneIdx)
+	}
+	c.emitOp(vm.OP_YIELD_VALUE, 0, 0)
+	return nil
+}
+
+func (c *Compiler) compileYieldFromExpr(expr *ASTExpr) error {
+	if err := c.compileExpr(expr.Left); err != nil {
+		return err
+	}
+	c.emitOp(vm.OP_GET_ITER, 0, 0)
+	c.emitOp(vm.OP_YIELD_FROM, 0, 0)
+	return nil
+}
+
 func (c *Compiler) compileFuncDef(stmt *ASTStmt) error {
 	fnDef := &c.arena.FuncDefs[stmt.Extra]
 
@@ -520,15 +781,19 @@ func (c *Compiler) compileFuncDef(stmt *ASTStmt) error {
 		numLocals = len(paramNames)
 	}
 
+	maxStack := numLocals + subCompiler.maxStackDepth + 16
 	fnCodeObj := &vm.CodeObject{
-		Name:       fnDef.Name,
-		Code:       subCompiler.code,
-		Consts:     subCompiler.constPool.Slice(),
-		ParamNames: paramValSlice,
-		CellVars:   cellValSlice,
-		FreeVars:   freeValSlice,
-		NumLocals:  numLocals,
-		NumParams:  len(paramNames),
+		Name:           fnDef.Name,
+		Code:           subCompiler.code,
+		Consts:         subCompiler.constPool.Slice(),
+		ParamNames:     paramValSlice,
+		CellVars:       cellValSlice,
+		FreeVars:       freeValSlice,
+		NumLocals:      numLocals,
+		NumParams:      len(paramNames),
+		MaxStackSize:   maxStack,
+		IsGenerator:    fnScope.IsGenerator,
+		ExceptionTable: subCompiler.exceptionTable,
 	}
 
 	// Closure cells (if FreeVars > 0)
@@ -806,6 +1071,12 @@ func (c *Compiler) compileExpr(exprID ExprID) error {
 
 	case ExprKindDictComp:
 		return c.compileDictComp(expr)
+
+	case ExprKindYield:
+		return c.compileYieldExpr(expr)
+
+	case ExprKindYieldFrom:
+		return c.compileYieldFromExpr(expr)
 	}
 
 	return nil

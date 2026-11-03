@@ -84,6 +84,36 @@ type PyIter struct {
 	Step   int64
 }
 
+// GenState classifies the lifecycle state of a PyGenerator.
+type GenState uint8
+
+const (
+	GenCreated GenState = iota
+	GenRunning
+	GenSuspended
+	GenClosed
+)
+
+// PyGenerator represents a frame-detaching Python generator object on the heap.
+// Header MUST be at offset 0.
+type PyGenerator struct {
+	Header     ObjectHeader
+	Name       string
+	Code       Value
+	State      GenState
+	Stack      []Value
+	SP         int
+	Base       int
+	IP         int
+	Cells      []Value
+	Globals    *PyDict
+	YieldVal   Value
+	RetVal     Value
+	LastSent   Value
+	ResumeHook func(ctx *ExecContext, gen *PyGenerator, val Value) (Value, IterStatus)
+	Iters      [8]PyIter
+}
+
 // Compile-time assertions that every heap object places Header at offset 0.
 var (
 	_ [0 - unsafe.Offsetof(PyBigInt{}.Header)]byte
@@ -92,6 +122,7 @@ var (
 	_ [0 - unsafe.Offsetof(PyDict{}.Header)]byte
 	_ [0 - unsafe.Offsetof(PyCell{}.Header)]byte
 	_ [0 - unsafe.Offsetof(PyIter{}.Header)]byte
+	_ [0 - unsafe.Offsetof(PyGenerator{}.Header)]byte
 )
 
 func init() {
@@ -103,7 +134,8 @@ func init() {
 		unsafe.Offsetof(PyList{}.Header) != 0 ||
 		unsafe.Offsetof(PyDict{}.Header) != 0 ||
 		unsafe.Offsetof(PyCell{}.Header) != 0 ||
-		unsafe.Offsetof(PyIter{}.Header) != 0 {
+		unsafe.Offsetof(PyIter{}.Header) != 0 ||
+		unsafe.Offsetof(PyGenerator{}.Header) != 0 {
 		panic("val: heap object Header must be at offset 0")
 	}
 }
@@ -254,6 +286,131 @@ func (it *PyIter) Next() (Value, bool) {
 	default:
 		return NoneVal(), false
 	}
+}
+
+// AsGenerator performs a zero-cost offset-0 downcast from Value to *PyGenerator.
+func (v Value) AsGenerator() *PyGenerator {
+	return (*PyGenerator)(unsafe.Pointer(v.ptr))
+}
+
+// NewGeneratorVal constructs a heap-allocated KindGenerator Value with pre-allocated stack.
+func NewGeneratorVal(name string, code Value, maxStack int, cells []Value, globals *PyDict) Value {
+	if maxStack < 8 {
+		maxStack = 8
+	}
+	gen := &PyGenerator{
+		Header:  ObjectHeader{Kind: KindGenerator, Type: GeneratorType},
+		Name:    name,
+		Code:    code,
+		State:   GenCreated,
+		Stack:   make([]Value, maxStack),
+		SP:      0,
+		Base:    0,
+		IP:      0,
+		Cells:   cells,
+		Globals: globals,
+		RetVal:  NoneVal(),
+	}
+	return Value{num: 0, ptr: &gen.Header}
+}
+
+// Send advances the generator with a value, returning (yieldedValue, status).
+func (g *PyGenerator) Send(ctx *ExecContext, val Value) (Value, IterStatus) {
+	if g.State == GenClosed {
+		return NoneVal(), IterExhausted
+	}
+	if g.ResumeHook != nil {
+		return g.ResumeHook(ctx, g, val)
+	}
+	return NoneVal(), IterExhausted
+}
+
+// Close closes the generator and marks it GenClosed.
+func (g *PyGenerator) Close(ctx *ExecContext) {
+	g.State = GenClosed
+}
+
+// Throw resumes the generator by raising an exception at the point of suspension.
+func (g *PyGenerator) Throw(ctx *ExecContext, exc Value) (Value, IterStatus) {
+	if g.State == GenClosed {
+		return NoneVal(), IterExhausted
+	}
+	if ctx != nil {
+		ctx.Raise(exc)
+	}
+	return g.Send(ctx, NoneVal())
+}
+
+// Standard Exception Constructors
+
+// NewException constructs a new Python exception instance of the specified class.
+func NewException(cls *PyType, msg string) Value {
+	if cls == nil {
+		cls = ExceptionType
+	}
+	inst := NewInstanceOfType(cls)
+	argsTuple := NewTupleVal()
+	if msg != "" {
+		strVal := InternString(msg)
+		argsTuple = NewTupleVal(strVal)
+	}
+	inst.AsInstance().SetAttr(InternString("args"), argsTuple)
+	return inst
+}
+
+// NewTypeError constructs a TypeError instance.
+func NewTypeError(msg string) Value {
+	return NewException(TypeErrorType, msg)
+}
+
+// NewValueError constructs a ValueError instance.
+func NewValueError(msg string) Value {
+	return NewException(ValueErrorType, msg)
+}
+
+// NewKeyError constructs a KeyError instance.
+func NewKeyError(key Value) Value {
+	inst := NewInstanceOfType(KeyErrorType)
+	inst.AsInstance().SetAttr(InternString("args"), NewTupleVal(key))
+	return inst
+}
+
+// NewIndexError constructs an IndexError instance.
+func NewIndexError(msg string) Value {
+	return NewException(IndexErrorType, msg)
+}
+
+// NewZeroDivisionError constructs a ZeroDivisionError instance.
+func NewZeroDivisionError(msg string) Value {
+	return NewException(ZeroDivisionErrorType, msg)
+}
+
+// NewNameError constructs a NameError instance.
+func NewNameError(msg string) Value {
+	return NewException(NameErrorType, msg)
+}
+
+// NewAttributeError constructs an AttributeError instance.
+func NewAttributeError(msg string) Value {
+	return NewException(AttributeErrorType, msg)
+}
+
+// NewRuntimeError constructs a RuntimeError instance.
+func NewRuntimeError(msg string) Value {
+	return NewException(RuntimeErrorType, msg)
+}
+
+// NewStopIteration constructs a StopIteration instance.
+func NewStopIteration(retVal Value) Value {
+	inst := NewInstanceOfType(StopIterationType)
+	if !retVal.IsNone() && retVal.ptr != nil && retVal.ptr != &tagNone {
+		inst.AsInstance().SetAttr(InternString("args"), NewTupleVal(retVal))
+		inst.AsInstance().SetAttr(InternString("value"), retVal)
+	} else {
+		inst.AsInstance().SetAttr(InternString("args"), NewTupleVal())
+		inst.AsInstance().SetAttr(InternString("value"), NoneVal())
+	}
+	return inst
 }
 
 func (d *PyDict) initTable(minEntries int) {

@@ -32,6 +32,8 @@ const (
 	KindTuple       // Heap-allocated immutable tuple (*PyTuple)
 	KindCell        // Heap-allocated closure Cell (*PyCell)
 	KindIter        // Heap-allocated sequence/generator iterator (*PyIter)
+	KindGenerator   // Heap-allocated detached generator frame (*PyGenerator)
+	KindRange       // Unboxed range(start, stop) packed in Value.num
 )
 
 // ObjectHeader Flags bitmask constants.
@@ -85,6 +87,10 @@ func (k Kind) String() string {
 		return "cell"
 	case KindIter:
 		return "iterator"
+	case KindGenerator:
+		return "generator"
+	case KindRange:
+		return "range"
 	default:
 		return "unknown"
 	}
@@ -122,6 +128,7 @@ var (
 	tagFloat64   = ObjectHeader{Kind: KindFloat64}
 	tagInlineStr = ObjectHeader{Kind: KindInlineStr}
 	tagUnbound   = ObjectHeader{Kind: KindNone}
+	tagRange     = ObjectHeader{Kind: KindRange}
 )
 
 // NoneVal constructs the singleton None Value (0 allocations).
@@ -279,6 +286,34 @@ func (v Value) IsCell() bool {
 // IsIter reports whether v is a heap-allocated PyIter.
 func (v Value) IsIter() bool {
 	return v.ptr.Kind == KindIter
+}
+
+// IsGenerator reports whether v is a heap-allocated PyGenerator.
+func (v Value) IsGenerator() bool {
+	return v.ptr.Kind == KindGenerator
+}
+
+// IsRange reports whether v is an unboxed range Value.
+func (v Value) IsRange() bool {
+	return v.ptr == &tagRange
+}
+
+// RangeVal constructs a zero-allocation unboxed range(start, stop) Value.
+func RangeVal(start, stop int32) Value {
+	return Value{
+		num: (uint64(uint32(start)) << 32) | uint64(uint32(stop)),
+		ptr: &tagRange,
+	}
+}
+
+// RangeStart returns the start index of an unboxed range Value.
+func (v Value) RangeStart() int32 {
+	return int32(v.num >> 32)
+}
+
+// RangeStop returns the stop index of an unboxed range Value.
+func (v Value) RangeStop() int32 {
+	return int32(v.num)
 }
 
 // IsDataDescriptor reports whether v has FlagDataDescriptor set in its ObjectHeader.
@@ -533,6 +568,15 @@ func (v Value) String() string {
 		return "<function " + v.AsFunction().Name + ">"
 	case KindBuiltinFunc:
 		return "<built-in function " + v.AsBuiltinFunc().Name + ">"
+	case KindRange:
+		start := v.RangeStart()
+		stop := v.RangeStop()
+		if start == 0 {
+			return fmt.Sprintf("range(0, %d)", stop)
+		}
+		return fmt.Sprintf("range(%d, %d)", start, stop)
+	case KindGenerator:
+		return fmt.Sprintf("<generator object %s at %p>", v.AsGenerator().Name, v.ptr)
 	default:
 		return fmt.Sprintf("<%s object at %p>", v.Type().Name, v.ptr)
 	}

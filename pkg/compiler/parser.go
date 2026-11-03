@@ -114,6 +114,12 @@ func (p *Parser) parseStmt() (StmtID, error) {
 		return p.parseWhileStmt()
 	case TOKEN_FOR:
 		return p.parseForStmt()
+	case TOKEN_TRY:
+		return p.parseTryStmt()
+	case TOKEN_RAISE:
+		return p.parseRaiseStmt()
+	case TOKEN_WITH:
+		return p.parseWithStmt()
 	case TOKEN_BREAK:
 		tok := p.advance()
 		p.match(TOKEN_SEMI)
@@ -455,6 +461,167 @@ func (p *Parser) parseForStmt() (StmtID, error) {
 	}), nil
 }
 
+func (p *Parser) parseTryStmt() (StmtID, error) {
+	startTok, _ := p.expect(TOKEN_TRY)
+	if _, err := p.expect(TOKEN_COLON); err != nil {
+		return StmtNone, err
+	}
+	body, err := p.parseSuite()
+	if err != nil {
+		return StmtNone, err
+	}
+
+	var handlers []ASTExceptHandler
+	for p.cur.Type == TOKEN_EXCEPT {
+		p.advance() // 'except'
+		var excType ExprID
+		var excName string
+		if p.cur.Type != TOKEN_COLON {
+			var parseErr error
+			excType, parseErr = p.parseExpr()
+			if parseErr != nil {
+				return StmtNone, parseErr
+			}
+			if p.cur.Type == TOKEN_AS {
+				p.advance() // 'as'
+				nameTok, err := p.expect(TOKEN_IDENT)
+				if err != nil {
+					return StmtNone, err
+				}
+				excName = string(p.src[nameTok.Start:nameTok.End])
+			}
+		}
+		if _, err := p.expect(TOKEN_COLON); err != nil {
+			return StmtNone, err
+		}
+		hBody, err := p.parseSuite()
+		if err != nil {
+			return StmtNone, err
+		}
+		handlers = append(handlers, ASTExceptHandler{
+			Type: excType,
+			Name: excName,
+			Body: p.arena.StmtSlices[hBody],
+		})
+	}
+
+	var elseBody uint32
+	if p.match(TOKEN_ELSE) {
+		if _, err := p.expect(TOKEN_COLON); err != nil {
+			return StmtNone, err
+		}
+		elseBody, err = p.parseSuite()
+		if err != nil {
+			return StmtNone, err
+		}
+	}
+
+	var finBody uint32
+	if p.match(TOKEN_FINALLY) {
+		if _, err := p.expect(TOKEN_COLON); err != nil {
+			return StmtNone, err
+		}
+		finBody, err = p.parseSuite()
+		if err != nil {
+			return StmtNone, err
+		}
+	}
+
+	if len(handlers) == 0 && finBody == 0 {
+		return StmtNone, fmt.Errorf("SyntaxError: expected 'except' or 'finally' block")
+	}
+
+	exceptSlice := p.arena.AddExceptSlice(handlers)
+	var elseSlice StmtSlice
+	if elseBody != 0 {
+		elseSlice = p.arena.StmtSlices[elseBody]
+	}
+	var finSlice StmtSlice
+	if finBody != 0 {
+		finSlice = p.arena.StmtSlices[finBody]
+	}
+
+	tryIdx := p.arena.AllocTry(ASTTry{
+		Body:     p.arena.StmtSlices[body],
+		Handlers: exceptSlice,
+		Else:     elseSlice,
+		Finally:  finSlice,
+	})
+
+	return p.arena.AllocStmt(ASTStmt{
+		Kind:  StmtKindTry,
+		Start: startTok.Start,
+		Extra: tryIdx,
+	}), nil
+}
+
+func (p *Parser) parseRaiseStmt() (StmtID, error) {
+	startTok, _ := p.expect(TOKEN_RAISE)
+	var exc ExprID
+	var from ExprID
+	if p.cur.Type != TOKEN_NEWLINE && p.cur.Type != TOKEN_SEMI && p.cur.Type != TOKEN_EOF {
+		var err error
+		exc, err = p.parseExpr()
+		if err != nil {
+			return StmtNone, err
+		}
+		if p.cur.Type == TOKEN_IDENT && string(p.src[p.cur.Start:p.cur.End]) == "from" {
+			p.advance() // 'from'
+			from, err = p.parseExpr()
+			if err != nil {
+				return StmtNone, err
+			}
+		}
+	}
+	p.match(TOKEN_SEMI)
+	p.match(TOKEN_NEWLINE)
+	return p.arena.AllocStmt(ASTStmt{
+		Kind:  StmtKindRaise,
+		Start: startTok.Start,
+		Expr1: exc,
+		Expr2: from,
+	}), nil
+}
+
+func (p *Parser) parseWithStmt() (StmtID, error) {
+	startTok, _ := p.expect(TOKEN_WITH)
+	var items []ASTWithItem
+	for {
+		expr, err := p.parseExpr()
+		if err != nil {
+			return StmtNone, err
+		}
+		var target ExprID
+		if p.match(TOKEN_AS) {
+			target, err = p.parseExpr()
+			if err != nil {
+				return StmtNone, err
+			}
+		}
+		items = append(items, ASTWithItem{
+			Expr:   expr,
+			Target: target,
+		})
+		if !p.match(TOKEN_COMMA) {
+			break
+		}
+	}
+	if _, err := p.expect(TOKEN_COLON); err != nil {
+		return StmtNone, err
+	}
+	body, err := p.parseSuite()
+	if err != nil {
+		return StmtNone, err
+	}
+	withSlice := p.arena.AddWithSlice(items)
+	return p.arena.AllocStmt(ASTStmt{
+		Kind:  StmtKindWith,
+		Start: startTok.Start,
+		Body:  body,
+		Extra: withSlice.Start | (withSlice.Count << 16),
+	}), nil
+}
+
 func (p *Parser) parseGlobalStmt() (StmtID, error) {
 	startTok, _ := p.expect(TOKEN_GLOBAL)
 	var names []string
@@ -565,6 +732,9 @@ func (s StmtID) endInArena(arena *ASTArena) uint32 {
 // Expression Parsing (Pratt Precedence)
 
 func (p *Parser) parseExpr() (ExprID, error) {
+	if p.cur.Type == TOKEN_YIELD {
+		return p.parseYield()
+	}
 	first, err := p.parseTernary()
 	if err != nil {
 		return ExprNone, err
@@ -1206,7 +1376,41 @@ func (p *Parser) parseAtom() (ExprID, error) {
 			Op:    uint8(count),
 		}), nil
 
+	case TOKEN_YIELD:
+		return p.parseYield()
+
 	default:
 		return ExprNone, fmt.Errorf("SyntaxError: unexpected token %s at line %d, col %d", tok.Type, tok.Line, tok.Col)
 	}
+}
+
+func (p *Parser) parseYield() (ExprID, error) {
+	startTok, _ := p.expect(TOKEN_YIELD)
+	if p.cur.Type == TOKEN_IDENT && string(p.src[p.cur.Start:p.cur.End]) == "from" {
+		p.advance() // 'from'
+		sub, err := p.parseExpr()
+		if err != nil {
+			return ExprNone, err
+		}
+		return p.arena.AllocExpr(ASTExpr{
+			Kind:  ExprKindYieldFrom,
+			Start: startTok.Start,
+			Left:  sub,
+		}), nil
+	}
+	var val ExprID
+	if p.cur.Type != TOKEN_NEWLINE && p.cur.Type != TOKEN_SEMI && p.cur.Type != TOKEN_EOF &&
+		p.cur.Type != TOKEN_RPAREN && p.cur.Type != TOKEN_RBRACKET && p.cur.Type != TOKEN_RBRACE &&
+		p.cur.Type != TOKEN_COLON && p.cur.Type != TOKEN_COMMA {
+		var err error
+		val, err = p.parseExpr()
+		if err != nil {
+			return ExprNone, err
+		}
+	}
+	return p.arena.AllocExpr(ASTExpr{
+		Kind:  ExprKindYield,
+		Start: startTok.Start,
+		Left:  val,
+	}), nil
 }

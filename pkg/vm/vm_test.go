@@ -865,3 +865,176 @@ func BenchmarkNativeBuiltinCall(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkTryBlockHappyPath(b *testing.B) {
+	v := NewVM()
+
+	// 1. Loop outside try:
+	constsNoTry := []val.Value{val.Int64Val(0), val.Int64Val(1000), val.Int64Val(1)}
+	codeNoTry := []uint32{
+		Encode(OP_LOAD_CONST, 0, 0),
+		Encode(OP_STORE_FAST, 0, 0),
+		Encode(OP_LOAD_FAST, 0, 0),
+		Encode(OP_LOAD_CONST, 0, 1),
+		Encode(OP_COMPARE_LT, 0, 0),
+		Encode(OP_JUMP_IF_FALSE, 0, 11),
+		Encode(OP_LOAD_FAST, 0, 0),
+		Encode(OP_LOAD_CONST, 0, 2),
+		Encode(OP_BINARY_ADD, 0, 0),
+		Encode(OP_STORE_FAST, 0, 0),
+		Encode(OP_JUMP, 0, 2),
+		Encode(OP_LOAD_FAST, 0, 0),
+		Encode(OP_RETURN, 0, 0),
+	}
+	coNoTry := &CodeObject{
+		Name:      "no_try",
+		Code:      codeNoTry,
+		Consts:    constsNoTry,
+		NumLocals: 1,
+	}
+
+	// 2. Exact same loop inside try...except Exception (which never raises):
+	constsWithTry := []val.Value{val.Int64Val(0), val.Int64Val(1000), val.Int64Val(1), val.TypeVal(val.ExceptionType), val.Int64Val(-1)}
+	codeWithTry := []uint32{
+		/* 00 */ Encode(OP_LOAD_CONST, 0, 0),
+		/* 01 */ Encode(OP_STORE_FAST, 0, 0),
+		/* 02 */ Encode(OP_LOAD_FAST, 0, 0),
+		/* 03 */ Encode(OP_LOAD_CONST, 0, 1),
+		/* 04 */ Encode(OP_COMPARE_LT, 0, 0),
+		/* 05 */ Encode(OP_JUMP_IF_FALSE, 0, 11),
+		/* 06 */ Encode(OP_LOAD_FAST, 0, 0),
+		/* 07 */ Encode(OP_LOAD_CONST, 0, 2),
+		/* 08 */ Encode(OP_BINARY_ADD, 0, 0),
+		/* 09 */ Encode(OP_STORE_FAST, 0, 0),
+		/* 10 */ Encode(OP_JUMP, 0, 2),
+		/* 11 */ Encode(OP_JUMP, 0, 19), // jump to normal return
+		/* 12 */ Encode(OP_DUP_TOP, 0, 0),
+		/* 13 */ Encode(OP_LOAD_CONST, 0, 3), // Exception
+		/* 14 */ Encode(OP_CHECK_EXC_MATCH, 0, 0),
+		/* 15 */ Encode(OP_JUMP_IF_FALSE, 0, 18),
+		/* 16 */ Encode(OP_POP_TOP, 0, 0),
+		/* 17 */ Encode(OP_LOAD_CONST, 0, 4), // -1
+		/* 18 */ Encode(OP_STORE_FAST, 0, 0),
+		/* 19 */ Encode(OP_LOAD_FAST, 0, 0),
+		/* 20 */ Encode(OP_RETURN, 0, 0),
+	}
+	coWithTry := &CodeObject{
+		Name:      "with_try",
+		Code:      codeWithTry,
+		Consts:    constsWithTry,
+		NumLocals: 1,
+		ExceptionTable: []ExceptionEntry{
+			{StartIP: 0, EndIP: 11, TargetIP: 12, TargetStackDepth: 0},
+		},
+	}
+
+	b.Run("WithoutTry", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			res := v.RunCode(coNoTry)
+			if !res.IsInt64() || res.AsInt64() != 1000 {
+				b.Fatalf("res = %v, want 1000", res)
+			}
+		}
+	})
+
+	b.Run("WithTryHappyPath", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			res := v.RunCode(coWithTry)
+			if !res.IsInt64() || res.AsInt64() != 1000 {
+				b.Fatalf("res = %v, want 1000", res)
+			}
+		}
+	})
+}
+
+func BenchmarkForLoopRangeAndList(b *testing.B) {
+	v := NewVM()
+
+	// 1. for x in range(100_000):
+	//        s = s + x
+	//    return s
+	constsRange := []val.Value{
+		val.RangeVal(0, 100_000),
+		val.Int64Val(0),
+	}
+	codeRange := []uint32{
+		Encode(OP_LOAD_CONST, 0, 1),
+		Encode(OP_STORE_FAST, 0, 1),
+		Encode(OP_LOAD_CONST, 0, 0),
+		Encode(OP_GET_ITER, 0, 0),
+		/* 04 */ Encode(OP_FOR_ITER, 0, 11),
+		/* 05 */ Encode(OP_STORE_FAST, 0, 0),
+		/* 06 */ Encode(OP_LOAD_FAST, 0, 1),
+		/* 07 */ Encode(OP_LOAD_FAST, 0, 0),
+		/* 08 */ Encode(OP_BINARY_ADD, 0, 0),
+		/* 09 */ Encode(OP_STORE_FAST, 0, 1),
+		/* 10 */ Encode(OP_JUMP, 0, 4),
+		/* 11 */ Encode(OP_LOAD_FAST, 0, 1),
+		/* 12 */ Encode(OP_RETURN, 0, 0),
+	}
+	coRange := &CodeObject{
+		Name:      "for_range",
+		Code:      codeRange,
+		Consts:    constsRange,
+		NumLocals: 2,
+	}
+
+	// 2. Preallocated list of 100_000 integers:
+	listItems := make([]val.Value, 100_000)
+	for i := 0; i < 100_000; i++ {
+		listItems[i] = val.Int64Val(int64(i))
+	}
+	preallocList := val.NewListVal(listItems...)
+
+	constsList := []val.Value{
+		preallocList,
+		val.Int64Val(0),
+	}
+	codeList := []uint32{
+		Encode(OP_LOAD_CONST, 0, 1),
+		Encode(OP_STORE_FAST, 0, 1),
+		Encode(OP_LOAD_CONST, 0, 0),
+		Encode(OP_GET_ITER, 0, 0),
+		/* 04 */ Encode(OP_FOR_ITER, 0, 11),
+		/* 05 */ Encode(OP_STORE_FAST, 0, 0),
+		/* 06 */ Encode(OP_LOAD_FAST, 0, 1),
+		/* 07 */ Encode(OP_LOAD_FAST, 0, 0),
+		/* 08 */ Encode(OP_BINARY_ADD, 0, 0),
+		/* 09 */ Encode(OP_STORE_FAST, 0, 1),
+		/* 10 */ Encode(OP_JUMP, 0, 4),
+		/* 11 */ Encode(OP_LOAD_FAST, 0, 1),
+		/* 12 */ Encode(OP_RETURN, 0, 0),
+	}
+	coList := &CodeObject{
+		Name:      "for_list",
+		Code:      codeList,
+		Consts:    constsList,
+		NumLocals: 2,
+	}
+
+	b.Run("Range_100k", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			res := v.RunCode(coRange)
+			if !res.IsInt64() || res.AsInt64() != 4999950000 {
+				b.Fatalf("res = %v, want 4999950000", res)
+			}
+		}
+	})
+
+	b.Run("PreallocatedList_100k", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			res := v.RunCode(coList)
+			if !res.IsInt64() || res.AsInt64() != 4999950000 {
+				b.Fatalf("res = %v, want 4999950000", res)
+			}
+		}
+	})
+}

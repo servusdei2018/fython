@@ -34,6 +34,8 @@ const (
 	ExprKindListComp
 	ExprKindDictComp
 	ExprKindIfExp
+	ExprKindYield
+	ExprKindYieldFrom
 )
 
 // ASTExpr represents a flat, unboxed expression node stored in contiguous arena slices.
@@ -68,6 +70,9 @@ const (
 	StmtKindClassDef
 	StmtKindGlobal
 	StmtKindNonlocal
+	StmtKindTry
+	StmtKindRaise
+	StmtKindWith
 )
 
 // ASTStmt represents a flat, unboxed statement node stored in contiguous arena slices.
@@ -145,25 +150,61 @@ type ASTElif struct {
 	Body StmtSlice
 }
 
+// ASTExceptHandler stores an except clause.
+type ASTExceptHandler struct {
+	Type ExprID // Exception type expression, or ExprNone for bare except:
+	Name string // as name, or empty string
+	Body StmtSlice
+}
+
+// ExceptSlice references a contiguous sequence of ASTExceptHandler handles in ASTArena.ExceptHandlers.
+type ExceptSlice struct {
+	Start uint32
+	Count uint32
+}
+
+// ASTWithItem stores a single item in a with statement.
+type ASTWithItem struct {
+	Expr   ExprID // Context manager expression
+	Target ExprID // Optional target (or ExprNone)
+}
+
+// WithSlice references a contiguous sequence of ASTWithItems in ASTArena.WithItems.
+type WithSlice struct {
+	Start uint32
+	Count uint32
+}
+
+// ASTTry stores try/except/else/finally statement metadata.
+type ASTTry struct {
+	Body     StmtSlice
+	Handlers ExceptSlice
+	Else     StmtSlice
+	Finally  StmtSlice
+}
+
 // ASTArena provides flat, contiguous, typed storage for all AST nodes and auxiliary metadata.
 // Enables zero per-node heap allocations and rapid GC-free reuse via Reset().
 type ASTArena struct {
-	Exprs       []ASTExpr
-	Stmts       []ASTStmt
-	ExprIDs     []ExprID
-	StmtIDs     []StmtID
-	StmtSlices  []StmtSlice
-	ExprSlices  []ExprSlice
-	IdentSlices []IdentSlice
-	Idents      []string
-	IntConsts   []int64
-	FloatConsts []float64
-	Calls       []ASTCall
-	Comps       []ASTComp
-	DictPairs   []ASTDictPair
-	FuncDefs    []ASTFuncDef
-	ClassDefs   []ASTClassDef
-	Elifs       []ASTElif
+	Exprs          []ASTExpr
+	Stmts          []ASTStmt
+	ExprIDs        []ExprID
+	StmtIDs        []StmtID
+	StmtSlices     []StmtSlice
+	ExprSlices     []ExprSlice
+	IdentSlices    []IdentSlice
+	Idents         []string
+	IntConsts      []int64
+	FloatConsts    []float64
+	Calls          []ASTCall
+	Comps          []ASTComp
+	DictPairs      []ASTDictPair
+	FuncDefs       []ASTFuncDef
+	ClassDefs      []ASTClassDef
+	Elifs          []ASTElif
+	ExceptHandlers []ASTExceptHandler
+	WithItems      []ASTWithItem
+	TryStmts       []ASTTry
 }
 
 // NewASTArena constructs an ASTArena with pre-allocated capacity for zero-allocation parsing.
@@ -172,22 +213,25 @@ func NewASTArena(initialCap int) *ASTArena {
 		initialCap = 256
 	}
 	return &ASTArena{
-		Exprs:       make([]ASTExpr, 0, initialCap*2),
-		Stmts:       make([]ASTStmt, 0, initialCap),
-		ExprIDs:     make([]ExprID, 0, initialCap*2),
-		StmtIDs:     make([]StmtID, 0, initialCap*2),
-		StmtSlices:  make([]StmtSlice, 0, initialCap/2),
-		ExprSlices:  make([]ExprSlice, 0, initialCap/2),
-		IdentSlices: make([]IdentSlice, 0, initialCap/4),
-		Idents:      make([]string, 0, initialCap),
-		IntConsts:   make([]int64, 0, initialCap/2),
-		FloatConsts: make([]float64, 0, initialCap/4),
-		Calls:       make([]ASTCall, 0, initialCap/4),
-		Comps:       make([]ASTComp, 0, initialCap/8),
-		DictPairs:   make([]ASTDictPair, 0, initialCap/2),
-		FuncDefs:    make([]ASTFuncDef, 0, initialCap/8),
-		ClassDefs:   make([]ASTClassDef, 0, initialCap/16),
-		Elifs:       make([]ASTElif, 0, initialCap/8),
+		Exprs:          make([]ASTExpr, 0, initialCap*2),
+		Stmts:          make([]ASTStmt, 0, initialCap),
+		ExprIDs:        make([]ExprID, 0, initialCap*2),
+		StmtIDs:        make([]StmtID, 0, initialCap*2),
+		StmtSlices:     make([]StmtSlice, 0, initialCap/2),
+		ExprSlices:     make([]ExprSlice, 0, initialCap/2),
+		IdentSlices:    make([]IdentSlice, 0, initialCap/4),
+		Idents:         make([]string, 0, initialCap),
+		IntConsts:      make([]int64, 0, initialCap/2),
+		FloatConsts:    make([]float64, 0, initialCap/4),
+		Calls:          make([]ASTCall, 0, initialCap/4),
+		Comps:          make([]ASTComp, 0, initialCap/8),
+		DictPairs:      make([]ASTDictPair, 0, initialCap/2),
+		FuncDefs:       make([]ASTFuncDef, 0, initialCap/8),
+		ClassDefs:      make([]ASTClassDef, 0, initialCap/16),
+		Elifs:          make([]ASTElif, 0, initialCap/8),
+		ExceptHandlers: make([]ASTExceptHandler, 0, initialCap/8),
+		WithItems:      make([]ASTWithItem, 0, initialCap/8),
+		TryStmts:       make([]ASTTry, 0, initialCap/8),
 	}
 }
 
@@ -209,6 +253,9 @@ func (a *ASTArena) Reset() {
 	a.FuncDefs = a.FuncDefs[:0]
 	a.ClassDefs = a.ClassDefs[:0]
 	a.Elifs = a.Elifs[:0]
+	a.ExceptHandlers = a.ExceptHandlers[:0]
+	a.WithItems = a.WithItems[:0]
+	a.TryStmts = a.TryStmts[:0]
 }
 
 // AllocExpr appends an ASTExpr and returns its 1-based ExprID handle.
@@ -308,4 +355,55 @@ func (a *ASTArena) AddIdentSlice(names []string) IdentSlice {
 // GetIdentSlice retrieves the contiguous identifier strings for an IdentSlice descriptor.
 func (a *ASTArena) GetIdentSlice(s IdentSlice) []string {
 	return a.Idents[s.Start : s.Start+s.Count]
+}
+
+// AllocTry records an ASTTry and returns its index.
+func (a *ASTArena) AllocTry(t ASTTry) uint32 {
+	idx := uint32(len(a.TryStmts))
+	a.TryStmts = append(a.TryStmts, t)
+	return idx
+}
+
+// AllocExceptHandler records an ASTExceptHandler and returns its index.
+func (a *ASTArena) AllocExceptHandler(h ASTExceptHandler) uint32 {
+	idx := uint32(len(a.ExceptHandlers))
+	a.ExceptHandlers = append(a.ExceptHandlers, h)
+	return idx
+}
+
+// AddExceptSlice records a contiguous sequence of ASTExceptHandlers and returns an ExceptSlice descriptor.
+func (a *ASTArena) AddExceptSlice(handlers []ASTExceptHandler) ExceptSlice {
+	start := uint32(len(a.ExceptHandlers))
+	a.ExceptHandlers = append(a.ExceptHandlers, handlers...)
+	return ExceptSlice{
+		Start: start,
+		Count: uint32(len(handlers)),
+	}
+}
+
+// GetExceptSlice retrieves the contiguous ASTExceptHandlers for an ExceptSlice descriptor.
+func (a *ASTArena) GetExceptSlice(s ExceptSlice) []ASTExceptHandler {
+	return a.ExceptHandlers[s.Start : s.Start+s.Count]
+}
+
+// AllocWithItem records an ASTWithItem and returns its index.
+func (a *ASTArena) AllocWithItem(item ASTWithItem) uint32 {
+	idx := uint32(len(a.WithItems))
+	a.WithItems = append(a.WithItems, item)
+	return idx
+}
+
+// AddWithSlice records a contiguous sequence of ASTWithItems and returns a WithSlice descriptor.
+func (a *ASTArena) AddWithSlice(items []ASTWithItem) WithSlice {
+	start := uint32(len(a.WithItems))
+	a.WithItems = append(a.WithItems, items...)
+	return WithSlice{
+		Start: start,
+		Count: uint32(len(items)),
+	}
+}
+
+// GetWithSlice retrieves the contiguous ASTWithItems for a WithSlice descriptor.
+func (a *ASTArena) GetWithSlice(s WithSlice) []ASTWithItem {
+	return a.WithItems[s.Start : s.Start+s.Count]
 }

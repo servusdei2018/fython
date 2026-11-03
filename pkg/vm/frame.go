@@ -42,9 +42,19 @@ type ICSlot struct {
 	ExpectedBuiltinsVer uint64
 }
 
+// ExceptionEntry records a protected instruction range and handler target in a static exception table.
+type ExceptionEntry struct {
+	StartIP          int
+	EndIP            int
+	TargetIP         int
+	TargetStackDepth int
+	PushLasti        bool
+}
+
 // CallFrame is an unboxed value struct stored in the contiguous VM.frames slab.
 // It is never heap-allocated per function call.
 type CallFrame struct {
+	co         *CodeObject
 	code       []uint32
 	consts     []val.Value
 	ip         int
@@ -52,21 +62,25 @@ type CallFrame struct {
 	retSP      int // Caller's stack pointer where the return value will be written
 	cells      []val.Value
 	globals    *val.PyDict
+	iters      [16]val.PyIter
 }
 
 // CodeObject represents a compiled function or module bytecode unit.
 // Header is placed at offset 0 so a *CodeObject can be stored inside a val.Value (KindCode)
 // in a constant pool with zero-cost downcasting.
 type CodeObject struct {
-	Header     val.ObjectHeader
-	Name       string
-	Code       []uint32
-	Consts     []val.Value
-	ParamNames []val.Value
-	CellVars   []val.Value
-	FreeVars   []val.Value
-	NumLocals  int
-	NumParams  int
+	Header         val.ObjectHeader
+	Name           string
+	Code           []uint32
+	Consts         []val.Value
+	ParamNames     []val.Value
+	CellVars       []val.Value
+	FreeVars       []val.Value
+	NumLocals      int
+	NumParams      int
+	MaxStackSize   int
+	IsGenerator    bool
+	ExceptionTable []ExceptionEntry
 }
 
 // Compile-time check that CodeObject.Header is at byte offset 0.
@@ -97,6 +111,21 @@ type VM struct {
 	kwSet          [64]bool
 	globals        *val.PyDict
 	builtins       *val.PyDict
+	lastException  val.Value
+	rootCO         CodeObject
+}
+
+// LastException returns the most recent unhandled exception Value, or NoneVal.
+func (vm *VM) LastException() val.Value {
+	if vm.lastException.HeaderPtr() == nil {
+		return val.NoneVal()
+	}
+	return vm.lastException
+}
+
+// SetLastException sets the most recent exception.
+func (vm *VM) SetLastException(exc val.Value) {
+	vm.lastException = exc
 }
 
 // NewVM allocates a new VM with default contiguous stack (4096 Values), frame (256 CallFrames),

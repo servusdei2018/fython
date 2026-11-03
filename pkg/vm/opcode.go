@@ -24,7 +24,7 @@ const (
 	OP_BINARY_SUBSCR
 	OP_STORE_SUBSCR
 
-	// Extended Bytecode Operations for Phase 4
+	// Extended Bytecode Operations
 	OP_POP_TOP
 	OP_DUP_TOP
 	OP_LOAD_GLOBAL
@@ -52,6 +52,13 @@ const (
 	OP_JUMP_IF_FALSE_OR_POP
 	OP_JUMP_IF_TRUE_OR_POP
 	OP_LOAD_CLOSURE
+
+	// Exceptions, Context Managers & Generators
+	OP_RAISE
+	OP_YIELD_VALUE
+	OP_YIELD_FROM
+	OP_CHECK_EXC_MATCH
+	OP_CLEANUP_EXC
 
 	// Quickened (PEP 659 Adaptive) Operations
 	OP_BINARY_ADD_INT
@@ -170,6 +177,16 @@ func (op Opcode) String() string {
 		return "OP_JUMP_IF_TRUE_OR_POP"
 	case OP_LOAD_CLOSURE:
 		return "OP_LOAD_CLOSURE"
+	case OP_RAISE:
+		return "OP_RAISE"
+	case OP_YIELD_VALUE:
+		return "OP_YIELD_VALUE"
+	case OP_YIELD_FROM:
+		return "OP_YIELD_FROM"
+	case OP_CHECK_EXC_MATCH:
+		return "OP_CHECK_EXC_MATCH"
+	case OP_CLEANUP_EXC:
+		return "OP_CLEANUP_EXC"
 	case OP_BINARY_ADD_INT:
 		return "OP_BINARY_ADD_INT"
 	case OP_BINARY_ADD_FLOAT:

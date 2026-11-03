@@ -39,6 +39,13 @@ const (
 	TOKEN_NONE
 	TOKEN_TRUE
 	TOKEN_FALSE
+	TOKEN_TRY
+	TOKEN_EXCEPT
+	TOKEN_FINALLY
+	TOKEN_RAISE
+	TOKEN_WITH
+	TOKEN_AS
+	TOKEN_YIELD
 
 	// Delimiters
 	TOKEN_LPAREN   // (
@@ -141,6 +148,20 @@ func (t TokenType) String() string {
 		return "True"
 	case TOKEN_FALSE:
 		return "False"
+	case TOKEN_TRY:
+		return "try"
+	case TOKEN_EXCEPT:
+		return "except"
+	case TOKEN_FINALLY:
+		return "finally"
+	case TOKEN_RAISE:
+		return "raise"
+	case TOKEN_WITH:
+		return "with"
+	case TOKEN_AS:
+		return "as"
+	case TOKEN_YIELD:
+		return "yield"
 	case TOKEN_LPAREN:
 		return "("
 	case TOKEN_RPAREN:

@@ -591,6 +591,20 @@ func lookupKeyword(s string) TokenType {
 		return TOKEN_TRUE
 	case "False":
 		return TOKEN_FALSE
+	case "try":
+		return TOKEN_TRY
+	case "except":
+		return TOKEN_EXCEPT
+	case "finally":
+		return TOKEN_FINALLY
+	case "raise":
+		return TOKEN_RAISE
+	case "with":
+		return TOKEN_WITH
+	case "as":
+		return TOKEN_AS
+	case "yield":
+		return TOKEN_YIELD
 	default:
 		return TOKEN_IDENT
 	}

@@ -12,9 +12,26 @@ var ErrInconsistentMRO = errors.New("val: Cannot create a consistent method reso
 // ExecContext bridges TypeSlots and descriptor execution back to the active VM
 // without circular package imports or interface/slice heap escapes.
 type ExecContext struct {
-	Stack    []Value
-	SP       int
-	CallHook func(ctx *ExecContext, callable Value, argBase int, nargs int, kwnames []Value) Value
+	Stack           []Value
+	SP              int
+	CallHook        func(ctx *ExecContext, callable Value, argBase int, nargs int, kwnames []Value) Value
+	ActiveException Value
+}
+
+func (ctx *ExecContext) Raise(exc Value) {
+	if ctx != nil {
+		ctx.ActiveException = exc
+	}
+}
+
+func (ctx *ExecContext) HasException() bool {
+	return ctx != nil && ctx.ActiveException.ptr != nil && ctx.ActiveException.ptr != &tagNone
+}
+
+func (ctx *ExecContext) ClearException() {
+	if ctx != nil {
+		ctx.ActiveException = NoneVal()
+	}
 }
 
 // Invoke0 invokes callable with 0 arguments.
@@ -110,6 +127,15 @@ func (ctx *ExecContext) Invoke3(callable, a, b, c Value) Value {
 	panic("val: object is not callable")
 }
 
+// IterStatus indicates the result of an iterator step in TpIterNext.
+type IterStatus uint8
+
+const (
+	IterYielded IterStatus = iota
+	IterExhausted
+	IterError
+)
+
 // Type Slot function pointer signatures.
 type (
 	UnaryOpFunc    func(ctx *ExecContext, a Value) Value
@@ -119,6 +145,8 @@ type (
 	DescrGetFunc   func(ctx *ExecContext, descr, obj Value, owner *PyType) Value
 	DescrSetFunc   func(ctx *ExecContext, descr, obj, value Value)
 	VectorcallFunc func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value
+	IterFunc       func(ctx *ExecContext, o Value) Value
+	IterNextFunc   func(ctx *ExecContext, o Value) (Value, IterStatus)
 )
 
 // TypeSlots holds CPython-style native Go function pointers for fast polymorphic operations.
@@ -137,6 +165,8 @@ type TypeSlots struct {
 	TpSetAttr      TernaryOpFunc
 	TpDescrGet     DescrGetFunc
 	TpDescrSet     DescrSetFunc
+	TpIter         IterFunc
+	TpIterNext     IterNextFunc
 }
 
 // PyType represents a Python type/class object with CPython-style TypeSlots,
@@ -169,6 +199,10 @@ type PyType struct {
 	dunderInit    Value
 	dunderGetAttr Value
 	dunderSetAttr Value
+	dunderIter    Value
+	dunderNext    Value
+	dunderEnter   Value
+	dunderExit    Value
 }
 
 // Compile-time assertion that PyType.Header is at byte offset 0.
@@ -203,6 +237,22 @@ var (
 	SuperType       *PyType
 	CellType        *PyType
 	IterType        *PyType
+	RangeType       *PyType
+	GeneratorType   *PyType
+
+	// Built-in exception types
+	BaseExceptionType     *PyType
+	ExceptionType         *PyType
+	TypeErrorType         *PyType
+	ValueErrorType        *PyType
+	KeyErrorType          *PyType
+	IndexErrorType        *PyType
+	ZeroDivisionErrorType *PyType
+	NameErrorType         *PyType
+	AttributeErrorType    *PyType
+	RuntimeErrorType      *PyType
+	StopIterationType     *PyType
+	GeneratorExitType     *PyType
 )
 
 // Pre-interned canonical dunder names used for slot synchronization.
@@ -220,6 +270,10 @@ var (
 	DunderInit    Value
 	DunderGetAttr Value
 	DunderSetAttr Value
+	DunderIter    Value
+	DunderNext    Value
+	DunderEnter   Value
+	DunderExit    Value
 )
 
 // TypeVal wraps a *PyType as a Value of KindType.
@@ -557,6 +611,70 @@ func (t *PyType) syncDunderSlots() {
 	} else {
 		t.dunderSetAttr = Value{}
 	}
+	if fn, _, ok := t.LookupMRO(DunderIter); ok {
+		t.dunderIter = fn
+		t.Slots.TpIter = func(ctx *ExecContext, o Value) Value {
+			return ctx.Invoke1(t.dunderIter, o)
+		}
+	} else {
+		t.dunderIter = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderNext); ok {
+		t.dunderNext = fn
+		t.Slots.TpIterNext = func(ctx *ExecContext, o Value) (Value, IterStatus) {
+			res := ctx.Invoke1(t.dunderNext, o)
+			if ctx.HasException() {
+				exc := ctx.ActiveException
+				ctx.ClearException()
+				if IsInstance(exc, StopIterationType) {
+					return NoneVal(), IterExhausted
+				}
+				ctx.Raise(exc)
+				return NoneVal(), IterError
+			}
+			return res, IterYielded
+		}
+	} else {
+		t.dunderNext = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderEnter); ok {
+		t.dunderEnter = fn
+	} else {
+		t.dunderEnter = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderExit); ok {
+		t.dunderExit = fn
+	} else {
+		t.dunderExit = Value{}
+	}
+}
+
+// DunderEnterVal returns the cached __enter__ callable for t.
+func (t *PyType) DunderEnterVal() Value {
+	return t.dunderEnter
+}
+
+// DunderExitVal returns the cached __exit__ callable for t.
+func (t *PyType) DunderExitVal() Value {
+	return t.dunderExit
+}
+
+// IsSubclass reports whether cls is a subclass of base by checking base in cls.MRO.
+func IsSubclass(cls, base *PyType) bool {
+	if cls == nil || base == nil {
+		return false
+	}
+	for _, m := range cls.MRO {
+		if m == base {
+			return true
+		}
+	}
+	return false
+}
+
+// IsInstance reports whether v is an instance of cls or any of its subclasses.
+func IsInstance(v Value, cls *PyType) bool {
+	return IsSubclass(v.Type(), cls)
 }
 
 // HasInit reports whether t defines or inherits an __init__ method.
