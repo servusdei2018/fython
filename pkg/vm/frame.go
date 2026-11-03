@@ -15,11 +15,26 @@ const (
 	DefaultICSlabSize = 4096
 )
 
-// ICSlot caches [ExpectedShapeID, SlotIndex] for O(1) zero-allocation attribute access
-// in OP_LOAD_ATTR and OP_STORE_ATTR.
+// ICKind identifies the cached resolution category in an ICSlot.
+type ICKind uint8
+
+const (
+	ICKindNone           ICKind = iota
+	ICKindInstanceSlot          // Hit in PyInstance.Slots[SlotIndex]
+	ICKindClassMethod           // Hit on PyType MRO method (CachedVal holds raw callable)
+	ICKindDataDescriptor        // Hit on PyType MRO data descriptor (CachedVal holds descriptor)
+	ICKindClassAttr             // Hit on PyType MRO non-descriptor class attribute
+)
+
+// ICSlot caches [ExpectedShapeID, ExpectedTypeVer, SlotIndex, CachedVal] for O(1)
+// zero-allocation attribute and method lookup in OP_LOAD_ATTR, OP_STORE_ATTR, and OP_LOAD_METHOD.
 type ICSlot struct {
 	ExpectedShapeID uint32
+	Kind            ICKind
 	SlotIndex       int
+	ExpectedTypeVer uint64
+	CodePtr         *uint32
+	CachedVal       val.Value
 }
 
 // CallFrame is an unboxed value struct stored in the contiguous VM.frames slab.
@@ -36,11 +51,13 @@ type CallFrame struct {
 // Header is placed at offset 0 so a *CodeObject can be stored inside a val.Value (KindCode)
 // in a constant pool with zero-cost downcasting.
 type CodeObject struct {
-	Header    val.ObjectHeader
-	Code      []uint32
-	Consts    []val.Value
-	NumLocals int
-	NumParams int
+	Header     val.ObjectHeader
+	Name       string
+	Code       []uint32
+	Consts     []val.Value
+	ParamNames []val.Value
+	NumLocals  int
+	NumParams  int
 }
 
 // Compile-time check that CodeObject.Header is at byte offset 0.
@@ -49,6 +66,7 @@ var _ [0 - unsafe.Offsetof(CodeObject{}.Header)]byte
 // NewCodeVal wraps a *CodeObject as a val.Value with KindCode.
 func NewCodeVal(co *CodeObject) val.Value {
 	co.Header.Kind = val.KindCode
+	co.Header.Type = val.CodeType
 	return val.ObjectVal(&co.Header)
 }
 
@@ -58,23 +76,22 @@ func AsCodeObject(v val.Value) *CodeObject {
 }
 
 // VM represents a single execution thread with contiguous Value, CallFrame, and ICSlot slabs,
-// plus a VM-managed string interning pool.
+// plus a VM-managed string interning pool and zero-allocation Vectorcall execution context.
 type VM struct {
-	stack      []val.Value
-	frames     []CallFrame
-	ic         []ICSlot
-	internPool *val.InternPool
+	stack          []val.Value
+	frames         []CallFrame
+	ic             []ICSlot
+	internPool     *val.InternPool
+	execCtx        val.ExecContext
+	activeFrameIdx int
+	kwScratch      [64]val.Value
+	kwSet          [64]bool
 }
 
 // NewVM allocates a new VM with default contiguous stack (4096 Values), frame (256 CallFrames),
 // and inline cache (4096 ICSlots) slabs.
 func NewVM() *VM {
-	return &VM{
-		stack:      make([]val.Value, DefaultStackSize),
-		frames:     make([]CallFrame, DefaultFrameSlabSize),
-		ic:         make([]ICSlot, DefaultICSlabSize),
-		internPool: val.NewInternPool(256),
-	}
+	return NewVMWithCapacity(DefaultStackSize, DefaultFrameSlabSize)
 }
 
 // NewVMWithCapacity allocates a new VM with custom stack and frame slab sizes.
@@ -85,20 +102,25 @@ func NewVMWithCapacity(stackCap, frameCap int) *VM {
 	if frameCap <= 0 {
 		frameCap = DefaultFrameSlabSize
 	}
-	return &VM{
+	v := &VM{
 		stack:      make([]val.Value, stackCap),
 		frames:     make([]CallFrame, frameCap),
 		ic:         make([]ICSlot, DefaultICSlabSize),
 		internPool: val.NewInternPool(256),
 	}
+	v.execCtx.Stack = v.stack
+	v.execCtx.CallHook = v.callFromHook
+	return v
 }
 
 // Intern canonicalizes an identifier, attribute name, or string constant in the VM's intern pool.
+// Delegates to the process-wide val.InternString pool so VM-interned and type-interned identifiers
+// share identical canonical pointers.
 func (vm *VM) Intern(s string) val.Value {
-	return vm.internPool.Intern(s)
+	return val.InternString(s)
 }
 
-// InternValue canonicalizes a string Value in the VM's intern pool.
+// InternValue canonicalizes a string Value in the canonical intern pool.
 func (vm *VM) InternValue(v val.Value) val.Value {
-	return vm.internPool.InternValue(v)
+	return val.InternValue(v)
 }

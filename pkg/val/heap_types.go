@@ -77,7 +77,7 @@ func init() {
 // NewBigIntVal constructs a heap-allocated KindBigInt Value from a *big.Int.
 func NewBigIntVal(bi *big.Int) Value {
 	obj := &PyBigInt{
-		Header: ObjectHeader{Kind: KindBigInt},
+		Header: ObjectHeader{Kind: KindBigInt, Type: BigIntType},
 	}
 	if bi != nil {
 		obj.Val.Set(bi)
@@ -88,7 +88,7 @@ func NewBigIntVal(bi *big.Int) Value {
 // NewBigIntFromInt64 constructs a heap-allocated KindBigInt Value initialized to x.
 func NewBigIntFromInt64(x int64) Value {
 	obj := &PyBigInt{
-		Header: ObjectHeader{Kind: KindBigInt},
+		Header: ObjectHeader{Kind: KindBigInt, Type: BigIntType},
 	}
 	obj.Val.SetInt64(x)
 	return Value{num: 0, ptr: &obj.Header}
@@ -97,7 +97,7 @@ func NewBigIntFromInt64(x int64) Value {
 // NewListVal constructs a heap-allocated KindList Value wrapping the provided slice.
 func NewListVal(items ...Value) Value {
 	obj := &PyList{
-		Header: ObjectHeader{Kind: KindList},
+		Header: ObjectHeader{Kind: KindList, Type: ListType},
 		Items:  items,
 	}
 	return Value{num: 0, ptr: &obj.Header}
@@ -106,7 +106,7 @@ func NewListVal(items ...Value) Value {
 // NewDictVal constructs an empty heap-allocated KindDict Value with initial capacity.
 func NewDictVal(capacity int) Value {
 	obj := &PyDict{
-		Header: ObjectHeader{Kind: KindDict},
+		Header: ObjectHeader{Kind: KindDict, Type: DictType},
 	}
 	if capacity > 0 {
 		obj.initTable(capacity)

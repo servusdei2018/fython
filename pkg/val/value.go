@@ -13,13 +13,20 @@ const (
 	KindBool
 	KindInt64
 	KindFloat64
-	KindInlineStr // Strings <= 7 bytes packed into Value.num
-	KindBigInt    // Heap-allocated math/big.Int wrapper
-	KindString    // Heap-allocated string > 7 bytes
-	KindList      // Heap-allocated dynamic array of Value
-	KindDict      // Heap-allocated hash table
-	KindCode      // Heap-allocated VM bytecode object
-	KindInstance  // Heap-allocated Python object instance (Shape + flat Slots)
+	KindInlineStr   // Strings <= 7 bytes packed into Value.num
+	KindBigInt      // Heap-allocated math/big.Int wrapper
+	KindString      // Heap-allocated string > 7 bytes
+	KindList        // Heap-allocated dynamic array of Value
+	KindDict        // Heap-allocated hash table
+	KindCode        // Heap-allocated VM bytecode object
+	KindInstance    // Heap-allocated Python object instance (Shape + flat Slots)
+	KindType        // Heap-allocated Python type / class object (*PyType)
+	KindFunction    // Heap-allocated Python bytecode function (*PyFunction)
+	KindBuiltinFunc // Heap-allocated native Go function (*PyBuiltinFunc)
+	KindBoundMethod // Heap-allocated bound method (*PyBoundMethod)
+	KindProperty    // Heap-allocated @property data descriptor (*PyProperty)
+	KindSuper       // Heap-allocated super() proxy object (*PySuper)
+	KindTuple       // Heap-allocated immutable tuple (*PyTuple)
 )
 
 // ObjectHeader Flags bitmask constants.
@@ -27,6 +34,9 @@ const (
 	// FlagInterned marks a heap-allocated KindString as canonicalized in an intern pool,
 	// enabling O(1) pointer-equality comparison when both strings have FlagInterned set.
 	FlagInterned uint8 = 1 << 0
+	// FlagDataDescriptor marks a descriptor object (such as @property or custom __set__)
+	// as a data descriptor that takes precedence over instance attributes.
+	FlagDataDescriptor uint8 = 1 << 1
 )
 
 // String returns the human-readable name of the Kind.
@@ -52,13 +62,24 @@ func (k Kind) String() string {
 		return "code"
 	case KindInstance:
 		return "instance"
+	case KindType:
+		return "type"
+	case KindFunction:
+		return "function"
+	case KindBuiltinFunc:
+		return "builtin_function_or_method"
+	case KindBoundMethod:
+		return "method"
+	case KindProperty:
+		return "property"
+	case KindSuper:
+		return "super"
+	case KindTuple:
+		return "tuple"
 	default:
 		return "unknown"
 	}
 }
-
-// PyType represents a Python type descriptor (stubbed in Phase 1).
-type PyType struct{}
 
 // ObjectHeader is placed at byte offset 0 of every heap-allocated Python object,
 // and is also instantiated as package-level static sentinels for unboxed primitives.
@@ -91,11 +112,22 @@ var (
 	tagInt64     = ObjectHeader{Kind: KindInt64}
 	tagFloat64   = ObjectHeader{Kind: KindFloat64}
 	tagInlineStr = ObjectHeader{Kind: KindInlineStr}
+	tagUnbound   = ObjectHeader{Kind: KindNone}
 )
 
 // NoneVal constructs the singleton None Value (0 allocations).
 func NoneVal() Value {
 	return Value{num: 0, ptr: &tagNone}
+}
+
+// UnboundVal constructs a zero-allocation internal sentinel for unbound method receivers in OP_LOAD_METHOD.
+func UnboundVal() Value {
+	return Value{num: 0, ptr: &tagUnbound}
+}
+
+// IsUnbound reports whether v is the unbound receiver sentinel via a single pointer equality check.
+func (v Value) IsUnbound() bool {
+	return v.ptr == &tagUnbound
 }
 
 // BoolVal constructs an unboxed boolean Value (0 allocations).
@@ -125,6 +157,14 @@ func ObjectVal(hdr *ObjectHeader) Value {
 // Kind returns the Value's Kind directly from its ObjectHeader with zero branching.
 func (v Value) Kind() Kind {
 	return v.ptr.Kind
+}
+
+// Type resolves the Value to its *PyType (either via v.ptr.Type or the static builtinTypes lookup table).
+func (v Value) Type() *PyType {
+	if t := v.ptr.Type; t != nil {
+		return t
+	}
+	return builtinTypes[v.ptr.Kind]
 }
 
 // HeaderPtr returns the underlying *ObjectHeader pointer (sentinel or offset-0 heap header).
@@ -187,6 +227,46 @@ func (v Value) IsInstance() bool {
 	return v.ptr.Kind == KindInstance
 }
 
+// IsType reports whether v is a heap-allocated PyType.
+func (v Value) IsType() bool {
+	return v.ptr.Kind == KindType
+}
+
+// IsFunction reports whether v is a heap-allocated PyFunction.
+func (v Value) IsFunction() bool {
+	return v.ptr.Kind == KindFunction
+}
+
+// IsBuiltinFunc reports whether v is a heap-allocated PyBuiltinFunc.
+func (v Value) IsBuiltinFunc() bool {
+	return v.ptr.Kind == KindBuiltinFunc
+}
+
+// IsBoundMethod reports whether v is a heap-allocated PyBoundMethod.
+func (v Value) IsBoundMethod() bool {
+	return v.ptr.Kind == KindBoundMethod
+}
+
+// IsProperty reports whether v is a heap-allocated PyProperty.
+func (v Value) IsProperty() bool {
+	return v.ptr.Kind == KindProperty
+}
+
+// IsSuper reports whether v is a heap-allocated PySuper.
+func (v Value) IsSuper() bool {
+	return v.ptr.Kind == KindSuper
+}
+
+// IsTuple reports whether v is a heap-allocated PyTuple.
+func (v Value) IsTuple() bool {
+	return v.ptr.Kind == KindTuple
+}
+
+// IsDataDescriptor reports whether v has FlagDataDescriptor set in its ObjectHeader.
+func (v Value) IsDataDescriptor() bool {
+	return (v.ptr.Flags & FlagDataDescriptor) != 0
+}
+
 // IsInterned reports whether v has FlagInterned set in its ObjectHeader, or is an inline string.
 func (v Value) IsInterned() bool {
 	return v.ptr == &tagInlineStr || (v.ptr.Flags&FlagInterned) != 0
@@ -233,6 +313,8 @@ func (v Value) IsTruthy() bool {
 		return len(v.AsList().Items) > 0
 	case KindDict:
 		return v.AsDict().Len() > 0
+	case KindTuple:
+		return len(v.AsTuple().Items) > 0
 	default:
 		return true
 	}

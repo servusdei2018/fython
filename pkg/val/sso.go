@@ -68,6 +68,7 @@ func NewStringVal(s string) Value {
 		Header: ObjectHeader{
 			Kind: KindString,
 			Hash: HashString(s),
+			Type: StrType,
 		},
 		Data: s,
 	}
@@ -230,6 +231,7 @@ func (p *InternPool) Intern(s string) Value {
 			Kind:  KindString,
 			Flags: FlagInterned,
 			Hash:  h,
+			Type:  StrType,
 		},
 		Data: s,
 	}

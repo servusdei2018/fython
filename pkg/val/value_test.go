@@ -25,6 +25,27 @@ func TestValueSizeAndHeaderOffsets(t *testing.T) {
 	if off := unsafe.Offsetof(PyInstance{}.Header); off != 0 {
 		t.Fatalf("unsafe.Offsetof(PyInstance{}.Header) = %d, want 0", off)
 	}
+	if off := unsafe.Offsetof(PyType{}.Header); off != 0 {
+		t.Fatalf("unsafe.Offsetof(PyType{}.Header) = %d, want 0", off)
+	}
+	if off := unsafe.Offsetof(PyTuple{}.Header); off != 0 {
+		t.Fatalf("unsafe.Offsetof(PyTuple{}.Header) = %d, want 0", off)
+	}
+	if off := unsafe.Offsetof(PyBuiltinFunc{}.Header); off != 0 {
+		t.Fatalf("unsafe.Offsetof(PyBuiltinFunc{}.Header) = %d, want 0", off)
+	}
+	if off := unsafe.Offsetof(PyFunction{}.Header); off != 0 {
+		t.Fatalf("unsafe.Offsetof(PyFunction{}.Header) = %d, want 0", off)
+	}
+	if off := unsafe.Offsetof(PyBoundMethod{}.Header); off != 0 {
+		t.Fatalf("unsafe.Offsetof(PyBoundMethod{}.Header) = %d, want 0", off)
+	}
+	if off := unsafe.Offsetof(PyProperty{}.Header); off != 0 {
+		t.Fatalf("unsafe.Offsetof(PyProperty{}.Header) = %d, want 0", off)
+	}
+	if off := unsafe.Offsetof(PySuper{}.Header); off != 0 {
+		t.Fatalf("unsafe.Offsetof(PySuper{}.Header) = %d, want 0", off)
+	}
 }
 
 func TestPrimitivesAndSentinels(t *testing.T) {
@@ -425,4 +446,76 @@ func BenchmarkDictLookupInternedStr(b *testing.B) {
 	}
 	benchSinkVal = v
 	benchSinkBool = ok
+}
+
+func TestC3MRODiamondAndConflict(t *testing.T) {
+	// Diamond hierarchy:
+	//   A(object)
+	//  / \
+	// B   C
+	//  \ /
+	//   D(B, C)
+	clsA := MustNewType("A", nil, nil)
+	clsB := MustNewType("B", []*PyType{clsA}, nil)
+	clsC := MustNewType("C", []*PyType{clsA}, nil)
+	clsD := MustNewType("D", []*PyType{clsB, clsC}, nil)
+
+	wantMRO := []*PyType{clsD, clsB, clsC, clsA, ObjectType}
+	if len(clsD.MRO) != len(wantMRO) {
+		t.Fatalf("len(clsD.MRO) = %d, want %d", len(clsD.MRO), len(wantMRO))
+	}
+	for i, want := range wantMRO {
+		if clsD.MRO[i] != want {
+			t.Fatalf("clsD.MRO[%d] = %s, want %s", i, clsD.MRO[i].Name, want.Name)
+		}
+	}
+
+	// Conflicting MRO: X(M, N), Y(N, M), Z(X, Y) must fail C3 linearization.
+	clsM := MustNewType("M", nil, nil)
+	clsN := MustNewType("N", nil, nil)
+	clsX := MustNewType("X", []*PyType{clsM, clsN}, nil)
+	clsY := MustNewType("Y", []*PyType{clsN, clsM}, nil)
+	if _, err := NewType("Z", []*PyType{clsX, clsY}, nil); err == nil {
+		t.Fatalf("expected C3 MRO conflict error for Z(X, Y), got nil")
+	}
+}
+
+func TestTypeVersionTagPropagation(t *testing.T) {
+	clsBase := MustNewType("Base", nil, nil)
+	clsMid := MustNewType("Mid", []*PyType{clsBase}, nil)
+	clsLeaf := MustNewType("Leaf", []*PyType{clsMid}, nil)
+
+	vBase0 := clsBase.VersionTag
+	vMid0 := clsMid.VersionTag
+	vLeaf0 := clsLeaf.VersionTag
+
+	// Mutating Base must monotonically bump VersionTag on Base, Mid, and Leaf.
+	clsBase.SetAttrStr("x", Int64Val(42))
+
+	if clsBase.VersionTag <= vBase0 {
+		t.Fatalf("Base.VersionTag did not advance: %d -> %d", vBase0, clsBase.VersionTag)
+	}
+	if clsMid.VersionTag <= vMid0 {
+		t.Fatalf("Mid.VersionTag did not advance: %d -> %d", vMid0, clsMid.VersionTag)
+	}
+	if clsLeaf.VersionTag <= vLeaf0 {
+		t.Fatalf("Leaf.VersionTag did not advance: %d -> %d", vLeaf0, clsLeaf.VersionTag)
+	}
+
+	// Also verify dunder slot propagation to subclasses on mutation.
+	if clsLeaf.Slots.NbAdd != nil {
+		t.Fatalf("expected Leaf.Slots.NbAdd to be nil before __add__ definition")
+	}
+	customAdd := NewBuiltinFuncVal("__add__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		return Int64Val(999)
+	})
+	clsBase.SetAttr(DunderAdd, customAdd)
+	if clsBase.Slots.NbAdd == nil || clsMid.Slots.NbAdd == nil || clsLeaf.Slots.NbAdd == nil {
+		t.Fatalf("expected NbAdd slot to be populated on Base, Mid, and Leaf after Base.SetAttr(__add__)")
+	}
+	inst := NewInstanceOfType(clsLeaf)
+	res := Add(inst, Int64Val(1))
+	if !res.IsInt64() || res.AsInt64() != 999 {
+		t.Fatalf("Add(Leaf(), 1) = %v, want 999", res)
+	}
 }

@@ -145,7 +145,29 @@ func NewInstanceVal(shape *Shape) Value {
 		slotCap = n
 	}
 	obj := &PyInstance{
-		Header: ObjectHeader{Kind: KindInstance},
+		Header: ObjectHeader{Kind: KindInstance, Type: ObjectType},
+		Shape:  shape,
+		Slots:  make([]Value, n, slotCap),
+	}
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+// NewInstanceOfType constructs a new heap-allocated KindInstance Value belonging to cls.
+func NewInstanceOfType(cls *PyType) Value {
+	if cls == nil {
+		cls = ObjectType
+	}
+	shape := cls.RootShape
+	if shape == nil {
+		shape = defaultRootShape
+	}
+	n := len(shape.Attrs)
+	slotCap := 8
+	if n > slotCap {
+		slotCap = n
+	}
+	obj := &PyInstance{
+		Header: ObjectHeader{Kind: KindInstance, Type: cls},
 		Shape:  shape,
 		Slots:  make([]Value, n, slotCap),
 	}

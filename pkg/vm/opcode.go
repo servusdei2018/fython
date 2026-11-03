@@ -18,6 +18,11 @@ const (
 	OP_RETURN
 	OP_LOAD_ATTR
 	OP_STORE_ATTR
+	OP_LOAD_METHOD
+	OP_CALL_METHOD
+	OP_CALL_KW
+	OP_BINARY_SUBSCR
+	OP_STORE_SUBSCR
 
 	// Quickened (PEP 659 Adaptive) Operations
 	OP_BINARY_ADD_INT
@@ -55,6 +60,16 @@ func (op Opcode) String() string {
 		return "OP_LOAD_ATTR"
 	case OP_STORE_ATTR:
 		return "OP_STORE_ATTR"
+	case OP_LOAD_METHOD:
+		return "OP_LOAD_METHOD"
+	case OP_CALL_METHOD:
+		return "OP_CALL_METHOD"
+	case OP_CALL_KW:
+		return "OP_CALL_KW"
+	case OP_BINARY_SUBSCR:
+		return "OP_BINARY_SUBSCR"
+	case OP_STORE_SUBSCR:
+		return "OP_STORE_SUBSCR"
 	case OP_BINARY_ADD_INT:
 		return "OP_BINARY_ADD_INT"
 	case OP_BINARY_ADD_FLOAT:
