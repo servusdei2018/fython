@@ -16,6 +16,7 @@ type ExecContext struct {
 	SP              int
 	CallHook        func(ctx *ExecContext, callable Value, argBase int, nargs int, kwnames []Value) Value
 	ActiveException Value
+	VM              any
 }
 
 func (ctx *ExecContext) Raise(exc Value) {
@@ -239,6 +240,7 @@ var (
 	IterType        *PyType
 	RangeType       *PyType
 	GeneratorType   *PyType
+	ChanType        *PyType
 
 	// Built-in exception types
 	BaseExceptionType     *PyType

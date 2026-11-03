@@ -1,7 +1,10 @@
 package val
 
 import (
+	"errors"
 	"math/big"
+	"sync"
+	"sync/atomic"
 	"unsafe"
 )
 
@@ -24,6 +27,7 @@ type PyString struct {
 type PyList struct {
 	Header ObjectHeader
 	Items  []Value
+	mu     sync.RWMutex
 }
 
 // DictEntry represents a key-value pair stored in the dense, insertion-ordered PyDict array.
@@ -53,6 +57,7 @@ type PyDict struct {
 	filled     int
 	indexShift uint8 // 0: uint8 slots, 1: uint16 slots, 2: uint32 slots
 	VersionTag uint64
+	mu         sync.RWMutex
 }
 
 // PyCell wraps a shared mutable Value on the heap for closures and nonlocal variables.
@@ -60,6 +65,15 @@ type PyDict struct {
 type PyCell struct {
 	Header ObjectHeader
 	Value  Value
+	mu     sync.RWMutex
+}
+
+// PyChan represents a Go channel wrapped as a first-class Python Value.
+// Header MUST be at offset 0.
+type PyChan struct {
+	Header ObjectHeader
+	Ch     chan Value
+	closed uint32
 }
 
 // IterKind classifies the source collection of a PyIter.
@@ -123,6 +137,7 @@ var (
 	_ [0 - unsafe.Offsetof(PyCell{}.Header)]byte
 	_ [0 - unsafe.Offsetof(PyIter{}.Header)]byte
 	_ [0 - unsafe.Offsetof(PyGenerator{}.Header)]byte
+	_ [0 - unsafe.Offsetof(PyChan{}.Header)]byte
 )
 
 func init() {
@@ -135,7 +150,8 @@ func init() {
 		unsafe.Offsetof(PyDict{}.Header) != 0 ||
 		unsafe.Offsetof(PyCell{}.Header) != 0 ||
 		unsafe.Offsetof(PyIter{}.Header) != 0 ||
-		unsafe.Offsetof(PyGenerator{}.Header) != 0 {
+		unsafe.Offsetof(PyGenerator{}.Header) != 0 ||
+		unsafe.Offsetof(PyChan{}.Header) != 0 {
 		panic("val: heap object Header must be at offset 0")
 	}
 }
@@ -200,6 +216,23 @@ func (v Value) AsDict() *PyDict {
 	return (*PyDict)(unsafe.Pointer(v.ptr))
 }
 
+// NewChanVal constructs a heap-allocated KindChan Value wrapping a native Go chan Value.
+func NewChanVal(capacity int) Value {
+	if capacity < 0 {
+		capacity = 0
+	}
+	obj := &PyChan{
+		Header: ObjectHeader{Kind: KindChan, Type: ChanType},
+		Ch:     make(chan Value, capacity),
+	}
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+// AsChan performs a zero-cost offset-0 downcast from Value to *PyChan.
+func (v Value) AsChan() *PyChan {
+	return (*PyChan)(unsafe.Pointer(v.ptr))
+}
+
 // NewCellVal constructs a heap-allocated KindCell Value initialized to v.
 func NewCellVal(v Value) Value {
 	obj := &PyCell{
@@ -212,6 +245,129 @@ func NewCellVal(v Value) Value {
 // AsCell performs a zero-cost offset-0 downcast from Value to *PyCell.
 func (v Value) AsCell() *PyCell {
 	return (*PyCell)(unsafe.Pointer(v.ptr))
+}
+
+// Append adds a Value to the end of the PyList in a thread-safe manner.
+func (l *PyList) Append(v Value) {
+	l.mu.Lock()
+	l.Items = append(l.Items, v)
+	l.mu.Unlock()
+}
+
+// Get returns the Value at idx in a thread-safe manner.
+func (l *PyList) Get(idx int) (Value, bool) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if idx < 0 {
+		idx += len(l.Items)
+	}
+	if idx < 0 || idx >= len(l.Items) {
+		return NoneVal(), false
+	}
+	return l.Items[idx], true
+}
+
+// Set updates the Value at idx in a thread-safe manner.
+func (l *PyList) Set(idx int, v Value) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if idx < 0 {
+		idx += len(l.Items)
+	}
+	if idx < 0 || idx >= len(l.Items) {
+		return false
+	}
+	l.Items[idx] = v
+	return true
+}
+
+// Len returns the number of items in the PyList in a thread-safe manner.
+func (l *PyList) Len() int {
+	l.mu.RLock()
+	n := len(l.Items)
+	l.mu.RUnlock()
+	return n
+}
+
+// Pop removes and returns the last item in a thread-safe manner.
+func (l *PyList) Pop() (Value, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := len(l.Items)
+	if n == 0 {
+		return NoneVal(), false
+	}
+	val := l.Items[n-1]
+	l.Items = l.Items[:n-1]
+	return val, true
+}
+
+// Contains reports whether v is in l in a thread-safe manner.
+func (l *PyList) Contains(v Value) bool {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	for _, item := range l.Items {
+		if Equals(item, v) {
+			return true
+		}
+	}
+	return false
+}
+
+// CopyItems returns a shallow copy of l.Items in a thread-safe manner.
+func (l *PyList) CopyItems() []Value {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	res := make([]Value, len(l.Items))
+	copy(res, l.Items)
+	return res
+}
+
+// Get returns the cell's Value in a thread-safe manner.
+func (c *PyCell) Get() Value {
+	c.mu.RLock()
+	v := c.Value
+	c.mu.RUnlock()
+	return v
+}
+
+// Set updates the cell's Value in a thread-safe manner.
+func (c *PyCell) Set(v Value) {
+	c.mu.Lock()
+	c.Value = v
+	c.mu.Unlock()
+}
+
+// Send sends v over the channel. Returns an error if the channel is closed.
+func (c *PyChan) Send(v Value) error {
+	if atomic.LoadUint32(&c.closed) == 1 {
+		return errors.New("cannot send on closed channel")
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			// Channel was closed concurrently
+		}
+	}()
+	c.Ch <- v
+	return nil
+}
+
+// Recv receives a Value from the channel. Returns (NoneVal(), false) if closed and drained.
+func (c *PyChan) Recv() (Value, bool) {
+	v, ok := <-c.Ch
+	if !ok {
+		return NoneVal(), false
+	}
+	return v, true
+}
+
+// Close closes the underlying Go channel. Safe to call concurrently.
+func (c *PyChan) Close() bool {
+	if atomic.CompareAndSwapUint32(&c.closed, 0, 1) {
+		close(c.Ch)
+		return true
+	}
+	return false
 }
 
 // NewIterVal constructs a heap-allocated KindIter Value wrapping an iterable.
@@ -252,10 +408,10 @@ func (it *PyIter) Next() (Value, bool) {
 	switch it.Kind {
 	case IterKindList:
 		list := it.Obj.AsList()
-		if it.Idx >= len(list.Items) {
+		res, ok := list.Get(it.Idx)
+		if !ok {
 			return NoneVal(), false
 		}
-		res := list.Items[it.Idx]
 		it.Idx++
 		return res, true
 	case IterKindTuple:
@@ -268,13 +424,17 @@ func (it *PyIter) Next() (Value, bool) {
 		return res, true
 	case IterKindDict:
 		dict := it.Obj.AsDict()
+		dict.mu.RLock()
 		for it.Idx < len(dict.Entries) {
 			entry := &dict.Entries[it.Idx]
 			it.Idx++
 			if entry.Active {
-				return entry.Key, true
+				key := entry.Key
+				dict.mu.RUnlock()
+				return key, true
 			}
 		}
+		dict.mu.RUnlock()
 		return NoneVal(), false
 	case IterKindRange:
 		if (it.Step > 0 && it.Cur >= it.Stop) || (it.Step < 0 && it.Cur <= it.Stop) {
@@ -521,8 +681,14 @@ func (d *PyDict) resize(minEntries int) {
 }
 
 // Set inserts or updates a key-value pair in PyDict while preserving insertion order
-// and keeping the first-inserted key on value updates (Python dict invariant).
+// and keeping the first-inserted key on value updates (Python dict invariant) in a thread-safe manner.
 func (d *PyDict) Set(key, value Value) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.setLocked(key, value)
+}
+
+func (d *PyDict) setLocked(key, value Value) {
 	if len(d.indices) == 0 {
 		d.initTable(8)
 	}
@@ -549,7 +715,7 @@ func (d *PyDict) Set(key, value Value) {
 				e := &d.Entries[int(raw)-dictIndexOffset]
 				if e.Hash == h && e.Active && Equals(e.Key, key) {
 					e.Value = value
-					d.VersionTag++
+					atomic.AddUint64(&d.VersionTag, 1)
 					return
 				}
 			}
@@ -572,7 +738,7 @@ func (d *PyDict) Set(key, value Value) {
 				e := &d.Entries[int(raw)-dictIndexOffset]
 				if e.Hash == h && e.Active && Equals(e.Key, key) {
 					e.Value = value
-					d.VersionTag++
+					atomic.AddUint64(&d.VersionTag, 1)
 					return
 				}
 			}
@@ -603,11 +769,17 @@ func (d *PyDict) Set(key, value Value) {
 	}
 	d.writeIndex(uint32(insertSlot), uint32(entryIdx+dictIndexOffset))
 	d.used++
-	d.VersionTag++
+	atomic.AddUint64(&d.VersionTag, 1)
 }
 
-// Get retrieves a value by key from PyDict with 0 heap allocations.
+// Get retrieves a value by key from PyDict in a thread-safe manner with 0 heap allocations.
 func (d *PyDict) Get(key Value) (Value, bool) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.getLocked(key)
+}
+
+func (d *PyDict) getLocked(key Value) (Value, bool) {
 	if d.used == 0 {
 		return NoneVal(), false
 	}
@@ -647,8 +819,14 @@ func (d *PyDict) Get(key Value) (Value, bool) {
 	}
 }
 
-// Delete removes key from PyDict if present, returning true if an entry was removed.
+// Delete removes key from PyDict if present, returning true if an entry was removed in a thread-safe manner.
 func (d *PyDict) Delete(key Value) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.deleteLocked(key)
+}
+
+func (d *PyDict) deleteLocked(key Value) bool {
 	if d.used == 0 {
 		return false
 	}
@@ -670,7 +848,7 @@ func (d *PyDict) Delete(key Value) bool {
 				e.Value = NoneVal()
 				d.writeIndex(slot, dictIndexDummy)
 				d.used--
-				d.VersionTag++
+				atomic.AddUint64(&d.VersionTag, 1)
 				return true
 			}
 		}
@@ -678,7 +856,36 @@ func (d *PyDict) Delete(key Value) bool {
 	}
 }
 
-// Len returns the number of active entries in PyDict.
+// Len returns the number of active entries in PyDict in a thread-safe manner.
 func (d *PyDict) Len() int {
-	return d.used
+	d.mu.RLock()
+	n := d.used
+	d.mu.RUnlock()
+	return n
+}
+
+// Keys returns a slice of all active keys in PyDict in a thread-safe manner.
+func (d *PyDict) Keys() []Value {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	keys := make([]Value, 0, d.used)
+	for i := range d.Entries {
+		if d.Entries[i].Active {
+			keys = append(keys, d.Entries[i].Key)
+		}
+	}
+	return keys
+}
+
+// Values returns a slice of all active values in PyDict in a thread-safe manner.
+func (d *PyDict) Values() []Value {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	vals := make([]Value, 0, d.used)
+	for i := range d.Entries {
+		if d.Entries[i].Active {
+			vals = append(vals, d.Entries[i].Value)
+		}
+	}
+	return vals
 }

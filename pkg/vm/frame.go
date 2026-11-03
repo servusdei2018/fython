@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"sync"
 	"unsafe"
 
 	"github.com/servusdei2018/fython/pkg/val"
@@ -101,6 +102,7 @@ func AsCodeObject(v val.Value) *CodeObject {
 // VM represents a single execution thread with contiguous Value, CallFrame, and ICSlot slabs,
 // plus a VM-managed string interning pool and zero-allocation Vectorcall execution context.
 type VM struct {
+	engine         *Engine
 	stack          []val.Value
 	frames         []CallFrame
 	ic             []ICSlot
@@ -113,6 +115,25 @@ type VM struct {
 	builtins       *val.PyDict
 	lastException  val.Value
 	rootCO         CodeObject
+}
+
+// Engine returns the parent Engine managing this VM.
+func (vm *VM) Engine() *Engine {
+	return vm.engine
+}
+
+// Reset clears the active stack and execution frame state for reuse in Engine's sync.Pool.
+func (vm *VM) Reset() {
+	sp := vm.execCtx.SP
+	if sp > len(vm.stack) {
+		sp = len(vm.stack)
+	}
+	for i := 0; i < sp; i++ {
+		vm.stack[i] = val.NoneVal()
+	}
+	vm.execCtx.SP = 0
+	vm.activeFrameIdx = 0
+	vm.lastException = val.NoneVal()
 }
 
 // LastException returns the most recent unhandled exception Value, or NoneVal.
@@ -128,32 +149,28 @@ func (vm *VM) SetLastException(exc val.Value) {
 	vm.lastException = exc
 }
 
-// NewVM allocates a new VM with default contiguous stack (4096 Values), frame (256 CallFrames),
-// and inline cache (4096 ICSlots) slabs.
-func NewVM() *VM {
-	return NewVMWithCapacity(DefaultStackSize, DefaultFrameSlabSize)
+var (
+	defaultEngine     *Engine
+	defaultEngineOnce sync.Once
+)
+
+// DefaultEngine returns the shared default Engine singleton.
+func DefaultEngine() *Engine {
+	defaultEngineOnce.Do(func() {
+		defaultEngine = NewEngine()
+	})
+	return defaultEngine
 }
 
-// NewVMWithCapacity allocates a new VM with custom stack and frame slab sizes.
+// NewVM allocates a new VM with default contiguous stack (4096 Values), frame (256 CallFrames),
+// and inline cache (4096 ICSlots) slabs attached to the default Engine.
+func NewVM() *VM {
+	return DefaultEngine().NewVM()
+}
+
+// NewVMWithCapacity allocates a new VM with custom stack and frame slab sizes attached to the default Engine.
 func NewVMWithCapacity(stackCap, frameCap int) *VM {
-	if stackCap <= 0 {
-		stackCap = DefaultStackSize
-	}
-	if frameCap <= 0 {
-		frameCap = DefaultFrameSlabSize
-	}
-	v := &VM{
-		stack:      make([]val.Value, stackCap),
-		frames:     make([]CallFrame, frameCap),
-		ic:         make([]ICSlot, DefaultICSlabSize),
-		internPool: val.NewInternPool(256),
-		globals:    val.NewDictVal(64).AsDict(),
-		builtins:   val.NewDictVal(64).AsDict(),
-	}
-	v.execCtx.Stack = v.stack
-	v.execCtx.CallHook = v.callFromHook
-	v.initBuiltins()
-	return v
+	return DefaultEngine().NewVMWithCapacity(stackCap, frameCap)
 }
 
 // Globals returns the VM's active module globals dictionary.

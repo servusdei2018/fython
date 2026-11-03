@@ -344,31 +344,21 @@ func strSqItem(ctx *ExecContext, a, idxVal Value) Value {
 }
 
 func listSqLen(ctx *ExecContext, a Value) int64 {
-	return int64(len(a.AsList().Items))
+	return int64(a.AsList().Len())
 }
 
 func listSqItem(ctx *ExecContext, a, idxVal Value) Value {
-	items := a.AsList().Items
-	idx := int(idxVal.AsInt64())
-	if idx < 0 {
-		idx += len(items)
-	}
-	if idx < 0 || idx >= len(items) {
+	val, ok := a.AsList().Get(int(idxVal.AsInt64()))
+	if !ok {
 		panic("val: IndexError: list index out of range")
 	}
-	return items[idx]
+	return val
 }
 
 func listSqAssItem(ctx *ExecContext, a, idxVal, val Value) Value {
-	items := a.AsList().Items
-	idx := int(idxVal.AsInt64())
-	if idx < 0 {
-		idx += len(items)
-	}
-	if idx < 0 || idx >= len(items) {
+	if !a.AsList().Set(int(idxVal.AsInt64()), val) {
 		panic("val: IndexError: list assignment index out of range")
 	}
-	items[idx] = val
 	return NoneVal()
 }
 
@@ -568,7 +558,7 @@ func initTypes() {
 			panic("TypeError: append() takes exactly one argument")
 		}
 		list := args[0].AsList()
-		list.Items = append(list.Items, args[1])
+		list.Append(args[1])
 		return NoneVal()
 	}))
 
@@ -663,6 +653,51 @@ func initTypes() {
 		return v
 	}))
 
+	ChanType = MustNewType("chan", []*PyType{ObjectType}, nil)
+	ChanType.Slots.TpIter = func(ctx *ExecContext, o Value) Value {
+		return o
+	}
+	ChanType.Slots.TpIterNext = func(ctx *ExecContext, o Value) (Value, IterStatus) {
+		ch := o.AsChan()
+		v, ok := ch.Recv()
+		if !ok {
+			return NoneVal(), IterExhausted
+		}
+		return v, IterYielded
+	}
+	ChanType.Dict.Set(InternString("send"), NewBuiltinFuncVal("send", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: chan.send() takes exactly 1 argument")
+		}
+		ch := args[0].AsChan()
+		if err := ch.Send(args[1]); err != nil {
+			panic("RuntimeError: " + err.Error())
+		}
+		return NoneVal()
+	}))
+	ChanType.Dict.Set(InternString("recv"), NewBuiltinFuncVal("recv", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: chan.recv() takes at least 0 arguments")
+		}
+		ch := args[0].AsChan()
+		v, ok := ch.Recv()
+		if !ok {
+			if len(args) >= 2 {
+				return args[1]
+			}
+			panic("StopIteration")
+		}
+		return v
+	}))
+	ChanType.Dict.Set(InternString("close"), NewBuiltinFuncVal("close", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: chan.close() takes no arguments")
+		}
+		ch := args[0].AsChan()
+		ch.Close()
+		return NoneVal()
+	}))
+
 	ListType.Slots.TpIter = func(ctx *ExecContext, o Value) Value { return NewIterVal(o) }
 	TupleType.Slots.TpIter = func(ctx *ExecContext, o Value) Value { return NewIterVal(o) }
 	DictType.Slots.TpIter = func(ctx *ExecContext, o Value) Value { return NewIterVal(o) }
@@ -718,6 +753,7 @@ func initTypes() {
 	builtinTypes[KindIter] = IterType
 	builtinTypes[KindRange] = RangeType
 	builtinTypes[KindGenerator] = GeneratorType
+	builtinTypes[KindChan] = ChanType
 
 	tagNone.Type = NoneType
 	tagBool.Type = BoolType

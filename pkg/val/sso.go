@@ -151,25 +151,57 @@ func (v Value) AsString() string {
 	return ""
 }
 
-// InternPool manages an open-addressed table of canonicalized heap *PyString objects
-// with FlagInterned set on ObjectHeader.Flags (without using Go's built-in map).
-type InternPool struct {
+const internShardCount = 64
+
+type internShard struct {
 	mu      sync.RWMutex
 	buckets []*PyString
 	mask    uint32
 	count   int
 }
 
-// NewInternPool constructs a new InternPool with the given initial capacity.
+func (s *internShard) grow() {
+	newCap := uint32(len(s.buckets) * 2)
+	if newCap < 32 {
+		newCap = 32
+	}
+	newBuckets := make([]*PyString, newCap)
+	newMask := newCap - 1
+	for _, b := range s.buckets {
+		if b == nil {
+			continue
+		}
+		idx := b.Header.Hash & newMask
+		for newBuckets[idx] != nil {
+			idx = (idx + 1) & newMask
+		}
+		newBuckets[idx] = b
+	}
+	s.buckets = newBuckets
+	s.mask = newMask
+}
+
+// InternPool manages a sharded open-addressed table of canonicalized heap *PyString objects
+// with FlagInterned set on ObjectHeader.Flags, providing scalable concurrent interning.
+type InternPool struct {
+	shards [internShardCount]internShard
+}
+
+// NewInternPool constructs a new InternPool with 64 independent shards.
 func NewInternPool(capacity int) *InternPool {
-	capPow2 := uint32(64)
-	for int(capPow2)*2 < capacity*3 {
-		capPow2 <<= 1
+	shardCap := uint32(32)
+	perShard := capacity / internShardCount
+	for int(shardCap)*2 < perShard*3 {
+		shardCap <<= 1
 	}
-	return &InternPool{
-		buckets: make([]*PyString, capPow2),
-		mask:    capPow2 - 1,
+	p := &InternPool{}
+	for i := 0; i < internShardCount; i++ {
+		p.shards[i] = internShard{
+			buckets: make([]*PyString, shardCap),
+			mask:    shardCap - 1,
+		}
 	}
+	return p
 }
 
 // Intern returns a canonicalized string Value for s.
@@ -180,49 +212,51 @@ func (p *InternPool) Intern(s string) Value {
 		return SmallStringVal(s)
 	}
 	h := HashString(s)
+	shardIdx := h & (internShardCount - 1)
+	shard := &p.shards[shardIdx]
 
-	p.mu.RLock()
-	if len(p.buckets) > 0 {
-		idx := h & p.mask
+	shard.mu.RLock()
+	if len(shard.buckets) > 0 {
+		idx := h & shard.mask
 		for {
-			b := p.buckets[idx]
+			b := shard.buckets[idx]
 			if b == nil {
 				break
 			}
 			if b.Header.Hash == h && b.Data == s {
-				p.mu.RUnlock()
+				shard.mu.RUnlock()
 				return Value{num: 0, ptr: &b.Header}
 			}
-			idx = (idx + 1) & p.mask
+			idx = (idx + 1) & shard.mask
 		}
 	}
-	p.mu.RUnlock()
+	shard.mu.RUnlock()
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
-	if len(p.buckets) == 0 {
-		p.buckets = make([]*PyString, 64)
-		p.mask = 63
+	if len(shard.buckets) == 0 {
+		shard.buckets = make([]*PyString, 32)
+		shard.mask = 31
 	}
 
-	idx := h & p.mask
+	idx := h & shard.mask
 	for {
-		b := p.buckets[idx]
+		b := shard.buckets[idx]
 		if b == nil {
 			break
 		}
 		if b.Header.Hash == h && b.Data == s {
 			return Value{num: 0, ptr: &b.Header}
 		}
-		idx = (idx + 1) & p.mask
+		idx = (idx + 1) & shard.mask
 	}
 
-	if (p.count+1)*3 > len(p.buckets)*2 {
-		p.grow()
-		idx = h & p.mask
-		for p.buckets[idx] != nil {
-			idx = (idx + 1) & p.mask
+	if (shard.count+1)*3 > len(shard.buckets)*2 {
+		shard.grow()
+		idx = h & shard.mask
+		for shard.buckets[idx] != nil {
+			idx = (idx + 1) & shard.mask
 		}
 	}
 
@@ -235,8 +269,8 @@ func (p *InternPool) Intern(s string) Value {
 		},
 		Data: s,
 	}
-	p.buckets[idx] = obj
-	p.count++
+	shard.buckets[idx] = obj
+	shard.count++
 	return Value{num: 0, ptr: &obj.Header}
 }
 
@@ -253,27 +287,6 @@ func (p *InternPool) InternValue(v Value) Value {
 		return p.Intern((*PyString)(unsafe.Pointer(v.ptr)).Data)
 	}
 	panic("val.InternValue: value is not a string")
-}
-
-func (p *InternPool) grow() {
-	newCap := uint32(len(p.buckets) * 2)
-	if newCap < 64 {
-		newCap = 64
-	}
-	newBuckets := make([]*PyString, newCap)
-	newMask := newCap - 1
-	for _, b := range p.buckets {
-		if b == nil {
-			continue
-		}
-		idx := b.Header.Hash & newMask
-		for newBuckets[idx] != nil {
-			idx = (idx + 1) & newMask
-		}
-		newBuckets[idx] = b
-	}
-	p.buckets = newBuckets
-	p.mask = newMask
 }
 
 var defaultInternPool = NewInternPool(256)

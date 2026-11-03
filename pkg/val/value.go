@@ -34,6 +34,7 @@ const (
 	KindIter        // Heap-allocated sequence/generator iterator (*PyIter)
 	KindGenerator   // Heap-allocated detached generator frame (*PyGenerator)
 	KindRange       // Unboxed range(start, stop) packed in Value.num
+	KindChan        // Heap-allocated Go channel wrapper (*PyChan)
 )
 
 // ObjectHeader Flags bitmask constants.
@@ -91,6 +92,8 @@ func (k Kind) String() string {
 		return "generator"
 	case KindRange:
 		return "range"
+	case KindChan:
+		return "channel"
 	default:
 		return "unknown"
 	}
@@ -291,6 +294,11 @@ func (v Value) IsIter() bool {
 // IsGenerator reports whether v is a heap-allocated PyGenerator.
 func (v Value) IsGenerator() bool {
 	return v.ptr.Kind == KindGenerator
+}
+
+// IsChan reports whether v is a heap-allocated PyChan.
+func (v Value) IsChan() bool {
+	return v.ptr != nil && v.ptr.Kind == KindChan
 }
 
 // IsRange reports whether v is an unboxed range Value.

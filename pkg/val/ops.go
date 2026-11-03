@@ -98,8 +98,8 @@ func strNbAdd(ctx *ExecContext, a, b Value) Value {
 
 func listNbAdd(ctx *ExecContext, a, b Value) Value {
 	if a.ptr.Kind == KindList && b.ptr.Kind == KindList {
-		la := a.AsList().Items
-		lb := b.AsList().Items
+		la := a.AsList().CopyItems()
+		lb := b.AsList().CopyItems()
 		merged := make([]Value, len(la)+len(lb))
 		copy(merged, la)
 		copy(merged[len(la):], lb)
@@ -526,13 +526,7 @@ func IsNot(a, b Value) Value {
 // In performs Python containment test (item in container).
 func In(item, container Value) Value {
 	if container.IsList() {
-		items := container.AsList().Items
-		for i := 0; i < len(items); i++ {
-			if Equals(items[i], item) {
-				return BoolVal(true)
-			}
-		}
-		return BoolVal(false)
+		return BoolVal(container.AsList().Contains(item))
 	}
 	if container.IsTuple() {
 		items := container.AsTuple().Items

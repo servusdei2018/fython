@@ -33,16 +33,19 @@ type Shape struct {
 	AttrName    Value
 	SlotIndex   int
 	Attrs       []ShapeAttr
-	mu          sync.RWMutex
-	Transitions []ShapeTransition
+	mu          sync.Mutex
+	transitions atomic.Pointer[[]ShapeTransition]
 }
 
 // NewRootShape allocates a new empty root Shape with a unique non-zero ID.
 func NewRootShape() *Shape {
-	return &Shape{
+	s := &Shape{
 		ID:        allocShapeID(),
 		SlotIndex: -1,
 	}
+	empty := make([]ShapeTransition, 0, 4)
+	s.transitions.Store(&empty)
+	return s
 }
 
 var defaultRootShape = NewRootShape()
@@ -74,28 +77,35 @@ func (s *Shape) Lookup(name Value) (int, bool) {
 }
 
 // Transition returns the child Shape resulting from adding attribute name to s.
-// If a transition for name already exists, the existing child Shape is returned.
+// It uses a lock-free atomic load on the fast path and copy-on-write transitions on new attributes.
 func (s *Shape) Transition(name Value) *Shape {
 	interned := InternValue(name)
 
-	s.mu.RLock()
-	for i := range s.Transitions {
-		t := &s.Transitions[i]
-		if t.Name.ptr == interned.ptr && t.Name.num == interned.num {
-			target := t.Target
-			s.mu.RUnlock()
-			return target
+	// Lock-free fast path
+	tPtr := s.transitions.Load()
+	if tPtr != nil {
+		transitions := *tPtr
+		for i := range transitions {
+			t := &transitions[i]
+			if t.Name.ptr == interned.ptr && t.Name.num == interned.num {
+				return t.Target
+			}
 		}
 	}
-	s.mu.RUnlock()
 
+	// Slow path: acquire mutex and double-check
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for i := range s.Transitions {
-		t := &s.Transitions[i]
-		if t.Name.ptr == interned.ptr && t.Name.num == interned.num {
-			return t.Target
+	tPtr = s.transitions.Load()
+	var transitions []ShapeTransition
+	if tPtr != nil {
+		transitions = *tPtr
+		for i := range transitions {
+			t := &transitions[i]
+			if t.Name.ptr == interned.ptr && t.Name.num == interned.num {
+				return t.Target
+			}
 		}
 	}
 
@@ -114,10 +124,17 @@ func (s *Shape) Transition(name Value) *Shape {
 		SlotIndex: newSlotIdx,
 		Attrs:     newAttrs,
 	}
-	s.Transitions = append(s.Transitions, ShapeTransition{
+	empty := make([]ShapeTransition, 0, 4)
+	child.transitions.Store(&empty)
+
+	newTransitions := make([]ShapeTransition, len(transitions)+1)
+	copy(newTransitions, transitions)
+	newTransitions[len(transitions)] = ShapeTransition{
 		Name:   interned,
 		Target: child,
-	})
+	}
+	s.transitions.Store(&newTransitions)
+
 	return child
 }
 
@@ -128,6 +145,7 @@ type PyInstance struct {
 	Header ObjectHeader
 	Shape  *Shape
 	Slots  []Value
+	mu     sync.RWMutex
 }
 
 // Compile-time assertion that PyInstance.Header is at byte offset 0.
@@ -179,20 +197,54 @@ func (v Value) AsInstance() *PyInstance {
 	return (*PyInstance)(unsafe.Pointer(v.ptr))
 }
 
-// GetAttr looks up an attribute by name on the instance using its Shape.
-func (inst *PyInstance) GetAttr(name Value) (Value, bool) {
-	idx, ok := inst.Shape.Lookup(name)
-	if !ok {
+// GetSlot returns the Value at slot index idx in a thread-safe manner.
+func (inst *PyInstance) GetSlot(idx int) (Value, bool) {
+	inst.mu.RLock()
+	if idx < 0 || idx >= len(inst.Slots) {
+		inst.mu.RUnlock()
 		return NoneVal(), false
 	}
-	return inst.Slots[idx], true
+	val := inst.Slots[idx]
+	inst.mu.RUnlock()
+	return val, true
 }
 
-// SetAttr sets or adds an attribute on the instance, transitioning its Shape if the attribute is new.
+// SetSlot sets the Value at slot index idx in a thread-safe manner.
+func (inst *PyInstance) SetSlot(idx int, val Value) bool {
+	inst.mu.Lock()
+	if idx < 0 || idx >= len(inst.Slots) {
+		inst.mu.Unlock()
+		return false
+	}
+	inst.Slots[idx] = val
+	inst.mu.Unlock()
+	return true
+}
+
+// GetAttr looks up an attribute by name on the instance using its Shape in a thread-safe manner.
+func (inst *PyInstance) GetAttr(name Value) (Value, bool) {
+	inst.mu.RLock()
+	idx, ok := inst.Shape.Lookup(name)
+	if !ok || idx >= len(inst.Slots) {
+		inst.mu.RUnlock()
+		return NoneVal(), false
+	}
+	val := inst.Slots[idx]
+	inst.mu.RUnlock()
+	return val, true
+}
+
+// SetAttr sets or adds an attribute on the instance, transitioning its Shape if the attribute is new in a thread-safe manner.
 // Returns the resolved slot index.
 func (inst *PyInstance) SetAttr(name, value Value) int {
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
 	if idx, ok := inst.Shape.Lookup(name); ok {
-		inst.Slots[idx] = value
+		if idx < len(inst.Slots) {
+			inst.Slots[idx] = value
+		} else {
+			inst.Slots = append(inst.Slots, value)
+		}
 		return idx
 	}
 	newShape := inst.Shape.Transition(name)
