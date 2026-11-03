@@ -31,6 +31,7 @@ const (
 	TagString
 	TagTuple
 	TagCode
+	TagBytes
 )
 
 // FycHeader represents the 64-byte deterministic header of a .fyc file.
@@ -279,6 +280,13 @@ func encodeValue(buf []byte, v val.Value, sc *stringCollector) []byte {
 	case val.KindCode:
 		buf = append(buf, TagCode)
 		buf = encodeCodeObject(buf, AsCodeObject(v), sc)
+
+	case val.KindBytes:
+		buf = append(buf, TagBytes)
+		data := v.AsBytes().Data
+		binary.LittleEndian.PutUint32(tmp4[:], uint32(len(data)))
+		buf = append(buf, tmp4[:]...)
+		buf = append(buf, data...)
 
 	default:
 		// Fallback for sentinels
@@ -628,6 +636,19 @@ func decodeValue(r *binaryReader, stringTable []val.Value) (val.Value, error) {
 			return val.NoneVal(), err
 		}
 		return NewCodeVal(subCO), nil
+
+	case TagBytes:
+		count, err := r.readUint32()
+		if err != nil {
+			return val.NoneVal(), err
+		}
+		data, err := r.readBytes(int(count))
+		if err != nil {
+			return val.NoneVal(), err
+		}
+		res := make([]byte, count)
+		copy(res, data)
+		return val.NewBytesVal(res), nil
 
 	default:
 		return val.NoneVal(), fmt.Errorf("fyc: unknown constant tag %d", tag)

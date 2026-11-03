@@ -240,6 +240,15 @@ func (vm *VM) initBuiltins() {
 		if a.IsAnyString() {
 			return val.Int64Val(int64(a.StringLen()))
 		}
+		if a.IsBytes() {
+			return val.Int64Val(int64(len(a.AsBytes().Data)))
+		}
+		if a.IsByteArray() {
+			return val.Int64Val(int64(len(a.AsByteArray().Data)))
+		}
+		if a.IsMemoryView() {
+			return val.Int64Val(int64(len(a.AsMemoryView().Buf)))
+		}
 		if sqLen := a.Type().Slots.SqLen; sqLen != nil {
 			return val.Int64Val(sqLen(ctx, a))
 		}
@@ -265,6 +274,21 @@ func (vm *VM) initBuiltins() {
 	vm.builtins.Set(val.InternString("bool"), val.TypeVal(val.BoolType))
 	vm.builtins.Set(val.InternString("tuple"), val.TypeVal(val.TupleType))
 	vm.builtins.Set(val.InternString("object"), val.TypeVal(val.ObjectType))
+	vm.builtins.Set(val.InternString("bytes"), val.TypeVal(val.BytesType))
+	vm.builtins.Set(val.InternString("bytearray"), val.TypeVal(val.ByteArrayType))
+	vm.builtins.Set(val.InternString("memoryview"), val.TypeVal(val.MemoryViewType))
+	vm.builtins.Set(val.InternString("slice"), val.TypeVal(val.SliceType))
+	vm.builtins.Set(val.InternString("open"), val.NewBuiltinFuncVal("open", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: open() takes at least 1 argument")
+		}
+		file := args[0].AsString()
+		mode := "r"
+		if len(args) >= 2 && args[1].IsAnyString() {
+			mode = args[1].AsString()
+		}
+		return openFileBuiltin(file, mode)
+	}))
 
 	// Built-in exception types
 	vm.builtins.Set(val.InternString("BaseException"), val.TypeVal(val.BaseExceptionType))
@@ -279,6 +303,7 @@ func (vm *VM) initBuiltins() {
 	vm.builtins.Set(val.InternString("RuntimeError"), val.TypeVal(val.RuntimeErrorType))
 	vm.builtins.Set(val.InternString("StopIteration"), val.TypeVal(val.StopIterationType))
 	vm.builtins.Set(val.InternString("GeneratorExit"), val.TypeVal(val.GeneratorExitType))
+	vm.builtins.Set(val.InternString("BufferError"), val.TypeVal(val.BufferErrorType))
 
 	vm.builtins.Set(val.InternString("isinstance"), val.NewBuiltinFuncVal("isinstance", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
@@ -828,9 +853,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			ip++
 
 		case OP_STORE_SUBSCR:
-			valToStore := stack[sp-1]
-			key := stack[sp-2]
-			obj := stack[sp-3]
+			key := stack[sp-1]
+			obj := stack[sp-2]
+			valToStore := stack[sp-3]
 			if obj.IsList() && key.IsInt64() {
 				if !obj.AsList().Set(int(key.AsInt64()), valToStore) {
 					panic("vm: IndexError: list assignment index out of range")
@@ -1616,6 +1641,22 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			sp -= count
 			stack[sp] = val.NewTupleVal(items...)
 			sp++
+			ip++
+
+		case OP_BUILD_SLICE:
+			count := int(uint16(inst))
+			if count == 2 {
+				stop := stack[sp-1]
+				start := stack[sp-2]
+				stack[sp-2] = val.NewSliceVal(start, stop, val.NoneVal())
+				sp--
+			} else if count == 3 {
+				step := stack[sp-1]
+				stop := stack[sp-2]
+				start := stack[sp-3]
+				stack[sp-3] = val.NewSliceVal(start, stop, step)
+				sp -= 2
+			}
 			ip++
 
 		case OP_BUILD_CLASS:

@@ -1217,7 +1217,7 @@ func (p *Parser) parsePrimary() (ExprID, error) {
 		}
 
 		if p.match(TOKEN_LBRACKET) {
-			subExpr, err := p.parseExpr()
+			subExpr, err := p.parseSubscriptItem()
 			if err != nil {
 				return ExprNone, err
 			}
@@ -1236,6 +1236,82 @@ func (p *Parser) parsePrimary() (ExprID, error) {
 	}
 
 	return expr, nil
+}
+
+func (p *Parser) parseSubscriptItem() (ExprID, error) {
+	if p.cur.Type == TOKEN_COLON {
+		p.advance()
+		var stop, step ExprID
+		if p.cur.Type == TOKEN_COLON {
+			p.advance()
+			if p.cur.Type != TOKEN_RBRACKET {
+				var err error
+				step, err = p.parseExpr()
+				if err != nil {
+					return ExprNone, err
+				}
+			}
+		} else if p.cur.Type != TOKEN_RBRACKET {
+			var err error
+			stop, err = p.parseExpr()
+			if err != nil {
+				return ExprNone, err
+			}
+			if p.match(TOKEN_COLON) {
+				if p.cur.Type != TOKEN_RBRACKET {
+					step, err = p.parseExpr()
+					if err != nil {
+						return ExprNone, err
+					}
+				}
+			}
+		}
+		return p.arena.AllocExpr(ASTExpr{
+			Kind:  ExprKindSlice,
+			Left:  ExprNone,
+			Right: stop,
+			Extra: uint32(step),
+		}), nil
+	}
+
+	first, err := p.parseExpr()
+	if err != nil {
+		return ExprNone, err
+	}
+
+	if p.match(TOKEN_COLON) {
+		var stop, step ExprID
+		if p.cur.Type == TOKEN_COLON {
+			p.advance()
+			if p.cur.Type != TOKEN_RBRACKET {
+				step, err = p.parseExpr()
+				if err != nil {
+					return ExprNone, err
+				}
+			}
+		} else if p.cur.Type != TOKEN_RBRACKET {
+			stop, err = p.parseExpr()
+			if err != nil {
+				return ExprNone, err
+			}
+			if p.match(TOKEN_COLON) {
+				if p.cur.Type != TOKEN_RBRACKET {
+					step, err = p.parseExpr()
+					if err != nil {
+						return ExprNone, err
+					}
+				}
+			}
+		}
+		return p.arena.AllocExpr(ASTExpr{
+			Kind:  ExprKindSlice,
+			Left:  first,
+			Right: stop,
+			Extra: uint32(step),
+		}), nil
+	}
+
+	return first, nil
 }
 
 func (p *Parser) parseAtom() (ExprID, error) {

@@ -1,6 +1,8 @@
 package val
 
 import (
+	"bytes"
+	"errors"
 	"math"
 	"math/big"
 	"math/bits"
@@ -544,10 +546,129 @@ func In(item, container Value) Value {
 	if container.IsAnyString() && item.IsAnyString() {
 		return BoolVal(strings.Contains(container.AsString(), item.AsString()))
 	}
+	if container.IsBytes() || container.IsByteArray() || container.IsMemoryView() {
+		var buf []byte
+		if container.IsBytes() {
+			buf = container.AsBytes().Data
+		} else if container.IsByteArray() {
+			buf = container.AsByteArray().Data
+		} else {
+			buf = container.AsMemoryView().Buf
+		}
+		if item.IsInt64() {
+			targetByte := byte(item.AsInt64())
+			return BoolVal(bytes.IndexByte(buf, targetByte) >= 0)
+		}
+		if item.IsBytes() {
+			return BoolVal(bytes.Contains(buf, item.AsBytes().Data))
+		}
+		if item.IsByteArray() {
+			return BoolVal(bytes.Contains(buf, item.AsByteArray().Data))
+		}
+	}
 	panic("val.In: type is not iterable or container")
 }
 
 // NotIn performs Python inverted containment test (item not in container).
 func NotIn(item, container Value) Value {
 	return BoolVal(!In(item, container).AsBool())
+}
+
+// NormalizeSliceIndices normalizes slice start, stop, step for a sequence of the given length according to PEP / Python slice semantics.
+func NormalizeSliceIndices(startVal, stopVal, stepVal Value, length int) (start, stop, step, sliceLen int, err error) {
+	step = 1
+	if !stepVal.IsNone() && stepVal.ptr != nil {
+		if !stepVal.IsInt64() {
+			return 0, 0, 0, 0, errors.New("TypeError: slice step must be an integer")
+		}
+		step = int(stepVal.AsInt64())
+		if step == 0 {
+			return 0, 0, 0, 0, errors.New("ValueError: slice step cannot be zero")
+		}
+	}
+
+	if step > 0 {
+		if startVal.IsNone() || startVal.ptr == nil {
+			start = 0
+		} else {
+			if !startVal.IsInt64() {
+				return 0, 0, 0, 0, errors.New("TypeError: slice indices must be integers")
+			}
+			start = int(startVal.AsInt64())
+			if start < 0 {
+				start += length
+				if start < 0 {
+					start = 0
+				}
+			} else if start > length {
+				start = length
+			}
+		}
+
+		if stopVal.IsNone() || stopVal.ptr == nil {
+			stop = length
+		} else {
+			if !stopVal.IsInt64() {
+				return 0, 0, 0, 0, errors.New("TypeError: slice indices must be integers")
+			}
+			stop = int(stopVal.AsInt64())
+			if stop < 0 {
+				stop += length
+				if stop < 0 {
+					stop = 0
+				}
+			} else if stop > length {
+				stop = length
+			}
+		}
+
+		if start >= stop {
+			sliceLen = 0
+		} else {
+			sliceLen = (stop - start + step - 1) / step
+		}
+	} else {
+		// Negative step
+		if startVal.IsNone() || startVal.ptr == nil {
+			start = length - 1
+		} else {
+			if !startVal.IsInt64() {
+				return 0, 0, 0, 0, errors.New("TypeError: slice indices must be integers")
+			}
+			start = int(startVal.AsInt64())
+			if start < 0 {
+				start += length
+				if start < -1 {
+					start = -1
+				}
+			} else if start >= length {
+				start = length - 1
+			}
+		}
+
+		if stopVal.IsNone() || stopVal.ptr == nil {
+			stop = -1
+		} else {
+			if !stopVal.IsInt64() {
+				return 0, 0, 0, 0, errors.New("TypeError: slice indices must be integers")
+			}
+			stop = int(stopVal.AsInt64())
+			if stop < 0 {
+				stop += length
+				if stop < -1 {
+					stop = -1
+				}
+			} else if stop >= length {
+				stop = length - 1
+			}
+		}
+
+		if start <= stop {
+			sliceLen = 0
+		} else {
+			sliceLen = (stop - start + step + 1) / step
+		}
+	}
+
+	return start, stop, step, sliceLen, nil
 }

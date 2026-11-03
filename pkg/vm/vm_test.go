@@ -823,9 +823,8 @@ func BenchmarkMethodCallLoop(b *testing.B) {
 
 	runtime.GC()
 	b.ReportAllocs()
-	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		v.stack[0] = objVal
 		res := v.Run(code, consts, 3)
 		if !res.IsInt64() || res.AsInt64() != limit {

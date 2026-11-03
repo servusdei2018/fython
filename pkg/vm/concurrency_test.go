@@ -366,10 +366,9 @@ func BenchmarkBoundGoFuncCall(b *testing.B) {
 	}
 
 	v := vm.NewVM()
-	b.ResetTimer()
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		res := v.Run(code, consts, 0)
 		if res.AsInt64() != 30 {
 			b.Fatal("wrong result")

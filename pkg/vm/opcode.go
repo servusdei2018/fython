@@ -39,6 +39,7 @@ const (
 	OP_BUILD_MAP
 	OP_MAP_ADD
 	OP_BUILD_TUPLE
+	OP_BUILD_SLICE
 	OP_BUILD_CLASS
 	OP_UNPACK_SEQUENCE
 	OP_COMPARE_OP
@@ -156,6 +157,8 @@ func (op Opcode) String() string {
 		return "OP_MAP_ADD"
 	case OP_BUILD_TUPLE:
 		return "OP_BUILD_TUPLE"
+	case OP_BUILD_SLICE:
+		return "OP_BUILD_SLICE"
 	case OP_BUILD_CLASS:
 		return "OP_BUILD_CLASS"
 	case OP_UNPACK_SEQUENCE:

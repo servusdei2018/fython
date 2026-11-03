@@ -86,6 +86,41 @@ type PyModule struct {
 	Package string
 }
 
+// PyBytes represents an immutable sequence of bytes on the heap.
+// Header MUST be at offset 0.
+type PyBytes struct {
+	Header ObjectHeader
+	Data   []byte
+}
+
+// PyByteArray represents a mutable sequence of bytes on the heap.
+// Header MUST be at offset 0.
+type PyByteArray struct {
+	Header ObjectHeader
+	Data   []byte
+	mu     sync.RWMutex
+}
+
+// PyMemoryView represents a zero-copy buffer view on the heap.
+// Header MUST be at offset 0.
+type PyMemoryView struct {
+	Header   ObjectHeader
+	Obj      Value
+	Buf      []byte
+	ReadOnly bool
+	ItemSize int
+	released bool
+}
+
+// PySlice represents a Python slice(start, stop, step) object.
+// Header MUST be at offset 0.
+type PySlice struct {
+	Header ObjectHeader
+	Start  Value
+	Stop   Value
+	Step   Value
+}
+
 // Compile-time assertion that PyModule.Header is at byte offset 0.
 var _ [0 - unsafe.Offsetof(PyModule{}.Header)]byte
 
@@ -172,6 +207,10 @@ var (
 	_ [0 - unsafe.Offsetof(PyIter{}.Header)]byte
 	_ [0 - unsafe.Offsetof(PyGenerator{}.Header)]byte
 	_ [0 - unsafe.Offsetof(PyChan{}.Header)]byte
+	_ [0 - unsafe.Offsetof(PyBytes{}.Header)]byte
+	_ [0 - unsafe.Offsetof(PyByteArray{}.Header)]byte
+	_ [0 - unsafe.Offsetof(PyMemoryView{}.Header)]byte
+	_ [0 - unsafe.Offsetof(PySlice{}.Header)]byte
 )
 
 func init() {
@@ -185,7 +224,11 @@ func init() {
 		unsafe.Offsetof(PyCell{}.Header) != 0 ||
 		unsafe.Offsetof(PyIter{}.Header) != 0 ||
 		unsafe.Offsetof(PyGenerator{}.Header) != 0 ||
-		unsafe.Offsetof(PyChan{}.Header) != 0 {
+		unsafe.Offsetof(PyChan{}.Header) != 0 ||
+		unsafe.Offsetof(PyBytes{}.Header) != 0 ||
+		unsafe.Offsetof(PyByteArray{}.Header) != 0 ||
+		unsafe.Offsetof(PyMemoryView{}.Header) != 0 ||
+		unsafe.Offsetof(PySlice{}.Header) != 0 {
 		panic("val: heap object Header must be at offset 0")
 	}
 }
@@ -266,6 +309,136 @@ func NewChanVal(capacity int) Value {
 func (v Value) AsChan() *PyChan {
 	return (*PyChan)(unsafe.Pointer(v.ptr))
 }
+
+// NewBytesVal constructs a heap-allocated KindBytes Value wrapping data.
+func NewBytesVal(data []byte) Value {
+	obj := &PyBytes{
+		Header: ObjectHeader{
+			Kind: KindBytes,
+			Type: BytesType,
+		},
+		Data: data,
+	}
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+// NewByteArrayVal constructs a heap-allocated KindByteArray Value wrapping data.
+func NewByteArrayVal(data []byte) Value {
+	obj := &PyByteArray{
+		Header: ObjectHeader{
+			Kind: KindByteArray,
+			Type: ByteArrayType,
+		},
+		Data: data,
+	}
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+// NewMemoryViewVal constructs a zero-copy PyMemoryView Value referencing the buffer of target.
+func NewMemoryViewVal(target Value) Value {
+	var view PyBuffer
+	tp := target.Type()
+	if tp.Slots.TpAsBuffer == nil {
+		panic("TypeError: a bytes-like object is required, not '" + tp.Name + "'")
+	}
+	if err := tp.Slots.TpAsBuffer(nil, target, &view, PyBUF_SIMPLE); err != nil {
+		panic("BufferError: " + err.Error())
+	}
+	obj := &PyMemoryView{
+		Header: ObjectHeader{
+			Kind: KindMemoryView,
+			Type: MemoryViewType,
+		},
+		Obj:      target,
+		Buf:      view.Buf,
+		ReadOnly: view.ReadOnly,
+		ItemSize: view.ItemSize,
+	}
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+// NewSliceVal constructs a heap-allocated KindSlice Value.
+func NewSliceVal(start, stop, step Value) Value {
+	obj := &PySlice{
+		Header: ObjectHeader{
+			Kind: KindSlice,
+			Type: SliceType,
+		},
+		Start: start,
+		Stop:  stop,
+		Step:  step,
+	}
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+var emptyTuple = PyTuple{
+	Header: ObjectHeader{
+		Kind: KindTuple,
+		Type: TupleType,
+	},
+	Items: nil,
+}
+
+// EmptyTupleVal returns the singleton empty tuple Value.
+func EmptyTupleVal() Value {
+	return Value{num: 0, ptr: &emptyTuple.Header}
+}
+
+// NewTupleView returns a zero-copy sub-slice view of tuple items without element copies.
+func NewTupleView(items []Value) Value {
+	if len(items) == 0 {
+		return EmptyTupleVal()
+	}
+	obj := &PyTuple{
+		Header: ObjectHeader{
+			Kind: KindTuple,
+			Type: TupleType,
+		},
+		Items: items,
+	}
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+func (b *PyBytes) GetBuffer(ctx *ExecContext, view *PyBuffer, flags int) error {
+	if (flags & PyBUF_WRITABLE) != 0 {
+		return errors.New("cannot create writable buffer view into immutable bytes")
+	}
+	view.Buf = b.Data[:len(b.Data):len(b.Data)]
+	view.ReadOnly = true
+	view.ItemSize = 1
+	view.Obj = ObjectVal(&b.Header)
+	return nil
+}
+
+func (b *PyBytes) ReleaseBuffer(view *PyBuffer) {}
+
+func (ba *PyByteArray) GetBuffer(ctx *ExecContext, view *PyBuffer, flags int) error {
+	ba.mu.RLock()
+	defer ba.mu.RUnlock()
+	view.Buf = ba.Data
+	view.ReadOnly = false
+	view.ItemSize = 1
+	view.Obj = ObjectVal(&ba.Header)
+	return nil
+}
+
+func (ba *PyByteArray) ReleaseBuffer(view *PyBuffer) {}
+
+func (mv *PyMemoryView) GetBuffer(ctx *ExecContext, view *PyBuffer, flags int) error {
+	if mv.released {
+		return errors.New("operation on released memoryview")
+	}
+	if mv.ReadOnly && (flags&PyBUF_WRITABLE) != 0 {
+		return errors.New("cannot create writable buffer view into read-only memoryview")
+	}
+	view.Buf = mv.Buf
+	view.ReadOnly = mv.ReadOnly
+	view.ItemSize = mv.ItemSize
+	view.Obj = mv.Obj
+	return nil
+}
+
+func (mv *PyMemoryView) ReleaseBuffer(view *PyBuffer) {}
 
 // NewCellVal constructs a heap-allocated KindCell Value initialized to v.
 func NewCellVal(v Value) Value {

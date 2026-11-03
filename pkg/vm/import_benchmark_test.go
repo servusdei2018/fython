@@ -53,9 +53,7 @@ def run_loop(n):
 	argSlice := []val.Value{val.Int64Val(100)}
 
 	b.ReportAllocs()
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		res := v.Vectorcall(runLoopFn, argSlice, nil)
 		if !res.IsInt64() || res.AsInt64() != 4300 {
 			b.Fatalf("unexpected result: %v", res)

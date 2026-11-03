@@ -108,6 +108,13 @@ func (e *Engine) newSysModules() *val.PyDict {
 	builtinsMod.Dict = e.builtins
 	modules.Set(val.InternString("builtins"), builtinsModVal)
 
+	// 3. Native standard library modules
+	modules.Set(val.InternString("json"), e.createJSONModule())
+	modules.Set(val.InternString("math"), e.createMathModule())
+	modules.Set(val.InternString("time"), e.createTimeModule())
+	modules.Set(val.InternString("os"), e.createOSModule())
+	modules.Set(val.InternString("io"), e.createIOModule())
+
 	return modules
 }
 

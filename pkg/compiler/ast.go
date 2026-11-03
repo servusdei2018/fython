@@ -36,6 +36,7 @@ const (
 	ExprKindIfExp
 	ExprKindYield
 	ExprKindYieldFrom
+	ExprKindSlice
 )
 
 // ASTExpr represents a flat, unboxed expression node stored in contiguous arena slices.

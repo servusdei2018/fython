@@ -246,8 +246,7 @@ def fib(n):
 	}
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		res := v.Vectorcall(fibFn, args, nil)
 		if !res.IsInt64() || res.AsInt64() != 75025 {
 			b.Fatalf("unexpected fib result: %v", res)
@@ -281,8 +280,7 @@ func BenchmarkArenaReuse500Lines(b *testing.B) {
 	}
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		arena.Reset()
 		parser.Reset(src)
 		_, _ = parser.ParseModule()
@@ -298,8 +296,7 @@ func BenchmarkFullCompile500Lines(b *testing.B) {
 	arena := NewASTArena(4096)
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		arena.Reset()
 		_, _ = Compile(src, arena)
 	}

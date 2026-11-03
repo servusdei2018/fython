@@ -958,6 +958,12 @@ func (c *Compiler) compileExpr(exprID ExprID) error {
 
 	case ExprKindString:
 		rawStr := string(c.src[expr.Start:expr.End])
+		if strings.HasPrefix(rawStr, "b") || strings.HasPrefix(rawStr, "B") {
+			parsedBytes := parseBytesLiteral(rawStr)
+			idx := c.constPool.Add(val.NewBytesVal(parsedBytes))
+			c.emitOp(vm.OP_LOAD_CONST, 0, idx)
+			return nil
+		}
 		parsedStr := parseStringLiteral(rawStr)
 		idx := c.constPool.Add(val.NewStringVal(parsedStr))
 		c.emitOp(vm.OP_LOAD_CONST, 0, idx)
@@ -1124,6 +1130,32 @@ func (c *Compiler) compileExpr(exprID ExprID) error {
 
 	case ExprKindYieldFrom:
 		return c.compileYieldFromExpr(expr)
+
+	case ExprKindSlice:
+		if expr.Left != ExprNone {
+			if err := c.compileExpr(expr.Left); err != nil {
+				return err
+			}
+		} else {
+			idx := c.constPool.Add(val.NoneVal())
+			c.emitOp(vm.OP_LOAD_CONST, 0, idx)
+		}
+		if expr.Right != ExprNone {
+			if err := c.compileExpr(expr.Right); err != nil {
+				return err
+			}
+		} else {
+			idx := c.constPool.Add(val.NoneVal())
+			c.emitOp(vm.OP_LOAD_CONST, 0, idx)
+		}
+		if expr.Extra != 0 {
+			if err := c.compileExpr(ExprID(expr.Extra)); err != nil {
+				return err
+			}
+			c.emitOp(vm.OP_BUILD_SLICE, 0, 3)
+		} else {
+			c.emitOp(vm.OP_BUILD_SLICE, 0, 2)
+		}
 	}
 
 	return nil
@@ -1345,4 +1377,58 @@ func parseStringLiteral(s string) string {
 		}
 	}
 	return b.String()
+}
+
+func parseBytesLiteral(s string) []byte {
+	if strings.HasPrefix(s, "b") || strings.HasPrefix(s, "B") {
+		s = s[1:]
+	}
+	// Strip quotes
+	if strings.HasPrefix(s, "'''") || strings.HasPrefix(s, `"""`) {
+		if len(s) >= 6 {
+			s = s[3 : len(s)-3]
+		}
+	} else if (strings.HasPrefix(s, "'") && strings.HasSuffix(s, "'")) ||
+		(strings.HasPrefix(s, `"`) && strings.HasSuffix(s, `"`)) {
+		if len(s) >= 2 {
+			s = s[1 : len(s)-1]
+		}
+	}
+
+	var res []byte
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			i++
+			switch s[i] {
+			case 'n':
+				res = append(res, '\n')
+			case 't':
+				res = append(res, '\t')
+			case 'r':
+				res = append(res, '\r')
+			case '\\':
+				res = append(res, '\\')
+			case '\'':
+				res = append(res, '\'')
+			case '"':
+				res = append(res, '"')
+			case 'x':
+				if i+2 < len(s) {
+					hexStr := s[i+1 : i+3]
+					var b byte
+					if _, err := fmt.Sscanf(hexStr, "%x", &b); err == nil {
+						res = append(res, b)
+						i += 2
+						continue
+					}
+				}
+				res = append(res, '\\', s[i])
+			default:
+				res = append(res, '\\', s[i])
+			}
+		} else {
+			res = append(res, s[i])
+		}
+	}
+	return res
 }

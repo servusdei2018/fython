@@ -1,6 +1,7 @@
 package val
 
 import (
+	"bytes"
 	"fmt"
 	"math"
 	"strconv"
@@ -36,6 +37,10 @@ const (
 	KindRange       // Unboxed range(start, stop) packed in Value.num
 	KindChan        // Heap-allocated Go channel wrapper (*PyChan)
 	KindModule      // Heap-allocated Python module (*PyModule)
+	KindBytes       // Heap-allocated immutable bytes (*PyBytes)
+	KindByteArray   // Heap-allocated mutable bytearray (*PyByteArray)
+	KindMemoryView  // Heap-allocated buffer memoryview (*PyMemoryView)
+	KindSlice       // Heap-allocated slice object (*PySlice)
 )
 
 // ObjectHeader Flags bitmask constants.
@@ -97,6 +102,14 @@ func (k Kind) String() string {
 		return "channel"
 	case KindModule:
 		return "module"
+	case KindBytes:
+		return "bytes"
+	case KindByteArray:
+		return "bytearray"
+	case KindMemoryView:
+		return "memoryview"
+	case KindSlice:
+		return "slice"
 	default:
 		return "unknown"
 	}
@@ -192,6 +205,11 @@ func (v Value) Type() *PyType {
 // HeaderPtr returns the underlying *ObjectHeader pointer (sentinel or offset-0 heap header).
 func (v Value) HeaderPtr() *ObjectHeader {
 	return v.ptr
+}
+
+// AsPointer returns the unsafe.Pointer to the underlying heap object header.
+func AsPointer(v Value) unsafe.Pointer {
+	return unsafe.Pointer(v.ptr)
 }
 
 // IsNone reports whether v is None via a single pointer equality check.
@@ -314,6 +332,46 @@ func (v Value) AsModule() *PyModule {
 	return (*PyModule)(unsafe.Pointer(v.ptr))
 }
 
+// IsBytes reports whether v is a heap-allocated PyBytes.
+func (v Value) IsBytes() bool {
+	return v.ptr != nil && v.ptr.Kind == KindBytes
+}
+
+// AsBytes performs an offset-0 downcast from Value to *PyBytes.
+func (v Value) AsBytes() *PyBytes {
+	return (*PyBytes)(unsafe.Pointer(v.ptr))
+}
+
+// IsByteArray reports whether v is a heap-allocated PyByteArray.
+func (v Value) IsByteArray() bool {
+	return v.ptr != nil && v.ptr.Kind == KindByteArray
+}
+
+// AsByteArray performs an offset-0 downcast from Value to *PyByteArray.
+func (v Value) AsByteArray() *PyByteArray {
+	return (*PyByteArray)(unsafe.Pointer(v.ptr))
+}
+
+// IsMemoryView reports whether v is a heap-allocated PyMemoryView.
+func (v Value) IsMemoryView() bool {
+	return v.ptr != nil && v.ptr.Kind == KindMemoryView
+}
+
+// AsMemoryView performs an offset-0 downcast from Value to *PyMemoryView.
+func (v Value) AsMemoryView() *PyMemoryView {
+	return (*PyMemoryView)(unsafe.Pointer(v.ptr))
+}
+
+// IsSlice reports whether v is a heap-allocated PySlice.
+func (v Value) IsSlice() bool {
+	return v.ptr != nil && v.ptr.Kind == KindSlice
+}
+
+// AsSlice performs an offset-0 downcast from Value to *PySlice.
+func (v Value) AsSlice() *PySlice {
+	return (*PySlice)(unsafe.Pointer(v.ptr))
+}
+
 // IsRange reports whether v is an unboxed range Value.
 func (v Value) IsRange() bool {
 	return v.ptr == &tagRange
@@ -390,6 +448,14 @@ func (v Value) IsTruthy() bool {
 		return v.AsDict().Len() > 0
 	case KindTuple:
 		return len(v.AsTuple().Items) > 0
+	case KindBytes:
+		return len(v.AsBytes().Data) > 0
+	case KindByteArray:
+		return len(v.AsByteArray().Data) > 0
+	case KindMemoryView:
+		return len(v.AsMemoryView().Buf) > 0
+	case KindSlice:
+		return true
 	default:
 		return true
 	}
@@ -417,6 +483,35 @@ func Equals(a, b Value) bool {
 	if (a.ptr == &tagInlineStr || a.ptr.Kind == KindString) &&
 		(b.ptr == &tagInlineStr || b.ptr.Kind == KindString) {
 		return StringEquals(a, b)
+	}
+
+	// Binary data types comparison (bytes, bytearray, memoryview).
+	isBufA := a.ptr.Kind == KindBytes || a.ptr.Kind == KindByteArray || a.ptr.Kind == KindMemoryView
+	isBufB := b.ptr.Kind == KindBytes || b.ptr.Kind == KindByteArray || b.ptr.Kind == KindMemoryView
+	if isBufA && isBufB {
+		var bufA, bufB []byte
+		switch a.ptr.Kind {
+		case KindBytes:
+			bufA = a.AsBytes().Data
+		case KindByteArray:
+			bufA = a.AsByteArray().Data
+		case KindMemoryView:
+			bufA = a.AsMemoryView().Buf
+		}
+		switch b.ptr.Kind {
+		case KindBytes:
+			bufB = b.AsBytes().Data
+		case KindByteArray:
+			bufB = b.AsByteArray().Data
+		case KindMemoryView:
+			bufB = b.AsMemoryView().Buf
+		}
+		return bytes.Equal(bufA, bufB)
+	}
+	if a.ptr.Kind == KindSlice && b.ptr.Kind == KindSlice {
+		sa := a.AsSlice()
+		sb := b.AsSlice()
+		return Equals(sa.Start, sb.Start) && Equals(sa.Stop, sb.Stop) && Equals(sa.Step, sb.Step)
 	}
 
 	// Numeric cross-type equality (int64, float64, bool, bigint).
@@ -604,6 +699,15 @@ func (v Value) String() string {
 			return fmt.Sprintf("<module '%s' from '%s'>", mod.Name, mod.File)
 		}
 		return fmt.Sprintf("<module '%s'>", mod.Name)
+	case KindBytes:
+		return fmt.Sprintf("b%q", string(v.AsBytes().Data))
+	case KindByteArray:
+		return fmt.Sprintf("bytearray(b%q)", string(v.AsByteArray().Data))
+	case KindMemoryView:
+		return fmt.Sprintf("<memory at %p>", v.ptr)
+	case KindSlice:
+		sl := v.AsSlice()
+		return fmt.Sprintf("slice(%s, %s, %s)", sl.Start.String(), sl.Stop.String(), sl.Step.String())
 	default:
 		return fmt.Sprintf("<%s object at %p>", v.Type().Name, v.ptr)
 	}

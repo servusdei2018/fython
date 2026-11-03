@@ -58,6 +58,37 @@ func SmallStringVal(s string) Value {
 	}
 }
 
+// SmallStringFromBytes packs a byte slice of length 0 <= len(b) <= 7 into Value.num (0 allocations).
+// Byte 0 holds uint64(len(b)), and bytes 1..7 hold the characters.
+// Panics if len(b) > 7.
+func SmallStringFromBytes(b []byte) Value {
+	n := len(b)
+	if n > 7 {
+		panic("val.SmallStringFromBytes: byte slice length exceeds 7 bytes")
+	}
+	num := uint64(n)
+	for i := 0; i < n; i++ {
+		num |= uint64(b[i]) << ((i + 1) * 8)
+	}
+	return Value{
+		num: num,
+		ptr: &tagInlineStr,
+	}
+}
+
+// HashBytes computes the 32-bit FNV-1a hash of a byte slice.
+func HashBytes(b []byte) uint32 {
+	h := fnvOffset32
+	for i := 0; i < len(b); i++ {
+		h ^= uint32(b[i])
+		h *= fnvPrime32
+	}
+	if h == 0 {
+		return 1
+	}
+	return h
+}
+
 // NewStringVal routes strings of length <= 7 bytes to SmallStringVal (0 allocations)
 // and strings > 7 bytes to a heap-allocated *PyString.
 func NewStringVal(s string) Value {
@@ -271,6 +302,78 @@ func (p *InternPool) Intern(s string) Value {
 	}
 	shard.buckets[idx] = obj
 	shard.count++
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+// InternBytes returns a canonicalized string Value for byte slice b.
+// Strings <= 7 bytes return a 0-allocation KindInlineStr.
+// Strings >= 8 bytes return a heap-allocated KindString with FlagInterned set.
+func (p *InternPool) InternBytes(b []byte) Value {
+	if len(b) <= 7 {
+		return SmallStringFromBytes(b)
+	}
+	h := HashBytes(b)
+	shardIdx := h & (internShardCount - 1)
+	shard := &p.shards[shardIdx]
+
+	shard.mu.RLock()
+	if len(shard.buckets) > 0 {
+		idx := h & shard.mask
+		for {
+			bucket := shard.buckets[idx]
+			if bucket == nil {
+				break
+			}
+			if bucket.Header.Hash == h && bucket.Data == string(b) {
+				shard.mu.RUnlock()
+				return Value{num: 0, ptr: &bucket.Header}
+			}
+			idx = (idx + 1) & shard.mask
+		}
+	}
+	shard.mu.RUnlock()
+
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	if len(shard.buckets) == 0 {
+		shard.buckets = make([]*PyString, 32)
+		shard.mask = 31
+	}
+
+	idx := h & shard.mask
+	for {
+		bucket := shard.buckets[idx]
+		if bucket == nil {
+			break
+		}
+		if bucket.Header.Hash == h && bucket.Data == string(b) {
+			return Value{num: 0, ptr: &bucket.Header}
+		}
+		idx = (idx + 1) & shard.mask
+	}
+
+	if (shard.count+1)*3 > len(shard.buckets)*2 {
+		shard.grow()
+		idx = h & shard.mask
+		for shard.buckets[idx] != nil {
+			idx = (idx + 1) & shard.mask
+		}
+	}
+
+	str := string(b)
+	obj := &PyString{
+		Header: ObjectHeader{
+			Kind:  KindString,
+			Flags: FlagInterned,
+			Hash:  h,
+			Type:  StrType,
+		},
+		Data: str,
+	}
+	shard.buckets[idx] = obj
+	shard.count++
+
 	return Value{num: 0, ptr: &obj.Header}
 }
 

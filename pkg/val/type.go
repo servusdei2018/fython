@@ -148,7 +148,31 @@ type (
 	VectorcallFunc func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value
 	IterFunc       func(ctx *ExecContext, o Value) Value
 	IterNextFunc   func(ctx *ExecContext, o Value) (Value, IterStatus)
+	BufferFunc     func(ctx *ExecContext, obj Value, view *PyBuffer, flags int) error
 )
+
+// BufferFlags for TpAsBuffer / GetBuffer.
+const (
+	PyBUF_SIMPLE   = 0
+	PyBUF_WRITABLE = 0x0001
+	PyBUF_FORMAT   = 0x0004
+	PyBUF_ND       = 0x0008
+	PyBUF_STRIDES  = 0x0010 | PyBUF_ND
+)
+
+// PyBuffer represents a zero-allocation direct memory view into an underlying binary object.
+type PyBuffer struct {
+	Buf      []byte
+	ReadOnly bool
+	ItemSize int
+	Obj      Value
+}
+
+// BufferProvider interface for Go types that can export a zero-copy byte buffer.
+type BufferProvider interface {
+	GetBuffer(ctx *ExecContext, view *PyBuffer, flags int) error
+	ReleaseBuffer(view *PyBuffer)
+}
 
 // TypeSlots holds CPython-style native Go function pointers for fast polymorphic operations.
 type TypeSlots struct {
@@ -168,6 +192,7 @@ type TypeSlots struct {
 	TpDescrSet     DescrSetFunc
 	TpIter         IterFunc
 	TpIterNext     IterNextFunc
+	TpAsBuffer     BufferFunc
 }
 
 // PyType represents a Python type/class object with CPython-style TypeSlots,
@@ -242,6 +267,10 @@ var (
 	GeneratorType   *PyType
 	ChanType        *PyType
 	ModuleType      *PyType
+	BytesType       *PyType
+	ByteArrayType   *PyType
+	MemoryViewType  *PyType
+	SliceType       *PyType
 
 	// Built-in exception types
 	BaseExceptionType       *PyType
@@ -258,6 +287,7 @@ var (
 	GeneratorExitType       *PyType
 	ImportErrorType         *PyType
 	ModuleNotFoundErrorType *PyType
+	BufferErrorType         *PyType
 )
 
 // Pre-interned canonical dunder names used for slot synchronization.

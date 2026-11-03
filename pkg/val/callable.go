@@ -1,6 +1,8 @@
 package val
 
 import (
+	"bytes"
+	"encoding/hex"
 	"math"
 	"unsafe"
 )
@@ -308,6 +310,9 @@ func superGetAttr(ctx *ExecContext, superObj, name Value) Value {
 
 func typeTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 	cls := callable.AsType()
+	if cls.Slots.TpCall != nil {
+		return cls.Slots.TpCall(ctx, callable, args, kwnames)
+	}
 	inst := NewInstanceOfType(cls)
 	if cls.HasInit() {
 		initFn := cls.DunderInitVal()
@@ -387,11 +392,75 @@ func listSqItem(ctx *ExecContext, a, idxVal Value) Value {
 	return val
 }
 
+func listMpSubscript(ctx *ExecContext, a, idxVal Value) Value {
+	if idxVal.IsSlice() {
+		sl := idxVal.AsSlice()
+		items := a.AsList().Items
+		start, stop, step, sliceLen, err := NormalizeSliceIndices(sl.Start, sl.Stop, sl.Step, len(items))
+		if err != nil {
+			panic(err.Error())
+		}
+		if sliceLen == 0 {
+			return NewListVal()
+		}
+		if step == 1 {
+			res := make([]Value, sliceLen)
+			copy(res, items[start:stop])
+			return NewListVal(res...)
+		}
+		res := make([]Value, sliceLen)
+		cur := start
+		for i := 0; i < sliceLen; i++ {
+			res[i] = items[cur]
+			cur += step
+		}
+		return NewListVal(res...)
+	}
+	return listSqItem(ctx, a, idxVal)
+}
+
 func listSqAssItem(ctx *ExecContext, a, idxVal, val Value) Value {
 	if !a.AsList().Set(int(idxVal.AsInt64()), val) {
 		panic("val: IndexError: list assignment index out of range")
 	}
 	return NoneVal()
+}
+
+func listMpAssSubscript(ctx *ExecContext, a, idxVal, val Value) Value {
+	if idxVal.IsSlice() {
+		sl := idxVal.AsSlice()
+		l := a.AsList()
+		start, stop, step, sliceLen, err := NormalizeSliceIndices(sl.Start, sl.Stop, sl.Step, len(l.Items))
+		if err != nil {
+			panic(err.Error())
+		}
+		var rhsItems []Value
+		if val.IsList() {
+			rhsItems = val.AsList().Items
+		} else if val.IsTuple() {
+			rhsItems = val.AsTuple().Items
+		} else {
+			panic("TypeError: can only assign an iterable to a slice")
+		}
+		if step == 1 {
+			newItems := make([]Value, 0, len(l.Items)-sliceLen+len(rhsItems))
+			newItems = append(newItems, l.Items[:start]...)
+			newItems = append(newItems, rhsItems...)
+			newItems = append(newItems, l.Items[stop:]...)
+			l.Items = newItems
+			return NoneVal()
+		}
+		if len(rhsItems) != sliceLen {
+			panic("ValueError: attempt to assign sequence of size X to extended slice of size Y")
+		}
+		cur := start
+		for i := 0; i < sliceLen; i++ {
+			l.Items[cur] = rhsItems[i]
+			cur += step
+		}
+		return NoneVal()
+	}
+	return listSqAssItem(ctx, a, idxVal, val)
 }
 
 func tupleSqLen(ctx *ExecContext, a Value) int64 {
@@ -408,6 +477,292 @@ func tupleSqItem(ctx *ExecContext, a, idxVal Value) Value {
 		panic("val: IndexError: tuple index out of range")
 	}
 	return items[idx]
+}
+
+func tupleMpSubscript(ctx *ExecContext, a, idxVal Value) Value {
+	if idxVal.IsSlice() {
+		sl := idxVal.AsSlice()
+		items := a.AsTuple().Items
+		start, stop, step, sliceLen, err := NormalizeSliceIndices(sl.Start, sl.Stop, sl.Step, len(items))
+		if err != nil {
+			panic(err.Error())
+		}
+		if sliceLen == 0 {
+			return EmptyTupleVal()
+		}
+		if step == 1 {
+			// Zero-copy sub-slice view! 0 element copies!
+			return NewTupleView(items[start:stop:stop])
+		}
+		res := make([]Value, sliceLen)
+		cur := start
+		for i := 0; i < sliceLen; i++ {
+			res[i] = items[cur]
+			cur += step
+		}
+		return NewTupleVal(res...)
+	}
+	return tupleSqItem(ctx, a, idxVal)
+}
+
+func bytesSqLen(ctx *ExecContext, a Value) int64 {
+	return int64(len(a.AsBytes().Data))
+}
+
+func bytesTpAsBuffer(ctx *ExecContext, obj Value, view *PyBuffer, flags int) error {
+	return obj.AsBytes().GetBuffer(ctx, view, flags)
+}
+
+func bytesMpSubscript(ctx *ExecContext, a, idxVal Value) Value {
+	data := a.AsBytes().Data
+	if idxVal.IsSlice() {
+		sl := idxVal.AsSlice()
+		start, stop, step, sliceLen, err := NormalizeSliceIndices(sl.Start, sl.Stop, sl.Step, len(data))
+		if err != nil {
+			panic(err.Error())
+		}
+		if sliceLen == 0 {
+			return NewBytesVal(nil)
+		}
+		if step == 1 {
+			// Zero-copy sub-slice view! 0 bytes copied!
+			return NewBytesVal(data[start:stop:stop])
+		}
+		res := make([]byte, sliceLen)
+		cur := start
+		for i := 0; i < sliceLen; i++ {
+			res[i] = data[cur]
+			cur += step
+		}
+		return NewBytesVal(res)
+	}
+	idx := int(idxVal.AsInt64())
+	if idx < 0 {
+		idx += len(data)
+	}
+	if idx < 0 || idx >= len(data) {
+		panic("val: IndexError: index out of range")
+	}
+	return Int64Val(int64(data[idx]))
+}
+
+func byteArraySqLen(ctx *ExecContext, a Value) int64 {
+	return int64(len(a.AsByteArray().Data))
+}
+
+func byteArrayTpAsBuffer(ctx *ExecContext, obj Value, view *PyBuffer, flags int) error {
+	return obj.AsByteArray().GetBuffer(ctx, view, flags)
+}
+
+func byteArrayMpSubscript(ctx *ExecContext, a, idxVal Value) Value {
+	ba := a.AsByteArray()
+	ba.mu.RLock()
+	defer ba.mu.RUnlock()
+	data := ba.Data
+	if idxVal.IsSlice() {
+		sl := idxVal.AsSlice()
+		start, stop, step, sliceLen, err := NormalizeSliceIndices(sl.Start, sl.Stop, sl.Step, len(data))
+		if err != nil {
+			panic(err.Error())
+		}
+		if sliceLen == 0 {
+			return NewByteArrayVal(nil)
+		}
+		if step == 1 {
+			res := make([]byte, sliceLen)
+			copy(res, data[start:stop])
+			return NewByteArrayVal(res)
+		}
+		res := make([]byte, sliceLen)
+		cur := start
+		for i := 0; i < sliceLen; i++ {
+			res[i] = data[cur]
+			cur += step
+		}
+		return NewByteArrayVal(res)
+	}
+	idx := int(idxVal.AsInt64())
+	if idx < 0 {
+		idx += len(data)
+	}
+	if idx < 0 || idx >= len(data) {
+		panic("val: IndexError: bytearray index out of range")
+	}
+	return Int64Val(int64(data[idx]))
+}
+
+func byteArrayMpAssSubscript(ctx *ExecContext, a, idxVal, val Value) Value {
+	ba := a.AsByteArray()
+	ba.mu.Lock()
+	defer ba.mu.Unlock()
+	if idxVal.IsSlice() {
+		sl := idxVal.AsSlice()
+		start, stop, step, sliceLen, err := NormalizeSliceIndices(sl.Start, sl.Stop, sl.Step, len(ba.Data))
+		if err != nil {
+			panic(err.Error())
+		}
+		var rhsBytes []byte
+		if val.IsBytes() {
+			rhsBytes = val.AsBytes().Data
+		} else if val.IsByteArray() {
+			rhsBytes = val.AsByteArray().Data
+		} else if val.IsMemoryView() {
+			rhsBytes = val.AsMemoryView().Buf
+		} else {
+			panic("TypeError: can't set slice with non-bytes-like object")
+		}
+		if step == 1 {
+			newData := make([]byte, 0, len(ba.Data)-sliceLen+len(rhsBytes))
+			newData = append(newData, ba.Data[:start]...)
+			newData = append(newData, rhsBytes...)
+			newData = append(newData, ba.Data[stop:]...)
+			ba.Data = newData
+			return NoneVal()
+		}
+		if len(rhsBytes) != sliceLen {
+			panic("ValueError: attempt to assign sequence of size X to extended slice of size Y")
+		}
+		cur := start
+		for i := 0; i < sliceLen; i++ {
+			ba.Data[cur] = rhsBytes[i]
+			cur += step
+		}
+		return NoneVal()
+	}
+	idx := int(idxVal.AsInt64())
+	if idx < 0 {
+		idx += len(ba.Data)
+	}
+	if idx < 0 || idx >= len(ba.Data) {
+		panic("val: IndexError: bytearray assignment index out of range")
+	}
+	b := val.AsInt64()
+	if b < 0 || b > 255 {
+		panic("ValueError: byte must be in range(0, 256)")
+	}
+	ba.Data[idx] = byte(b)
+	return NoneVal()
+}
+
+func memoryViewSqLen(ctx *ExecContext, a Value) int64 {
+	return int64(len(a.AsMemoryView().Buf))
+}
+
+func memoryViewTpAsBuffer(ctx *ExecContext, obj Value, view *PyBuffer, flags int) error {
+	return obj.AsMemoryView().GetBuffer(ctx, view, flags)
+}
+
+func memoryViewMpSubscript(ctx *ExecContext, a, idxVal Value) Value {
+	mv := a.AsMemoryView()
+	if mv.released {
+		panic("ValueError: operation on released memoryview")
+	}
+	if idxVal.IsSlice() {
+		sl := idxVal.AsSlice()
+		start, stop, step, sliceLen, err := NormalizeSliceIndices(sl.Start, sl.Stop, sl.Step, len(mv.Buf))
+		if err != nil {
+			panic(err.Error())
+		}
+		if step != 1 {
+			panic("NotImplementedError: non-contiguous memoryview slice not supported")
+		}
+		if sliceLen == 0 {
+			obj := &PyMemoryView{
+				Header: ObjectHeader{
+					Kind: KindMemoryView,
+					Type: MemoryViewType,
+				},
+				Obj:      mv.Obj,
+				Buf:      mv.Buf[start:start:start],
+				ReadOnly: mv.ReadOnly,
+				ItemSize: mv.ItemSize,
+			}
+			return Value{num: 0, ptr: &obj.Header}
+		}
+		// Zero-copy sub-slice view! 0 bytes copied, shares underlying buffer!
+		obj := &PyMemoryView{
+			Header: ObjectHeader{
+				Kind: KindMemoryView,
+				Type: MemoryViewType,
+			},
+			Obj:      mv.Obj,
+			Buf:      mv.Buf[start:stop:stop],
+			ReadOnly: mv.ReadOnly,
+			ItemSize: mv.ItemSize,
+		}
+		return Value{num: 0, ptr: &obj.Header}
+	}
+	idx := int(idxVal.AsInt64())
+	if idx < 0 {
+		idx += len(mv.Buf)
+	}
+	if idx < 0 || idx >= len(mv.Buf) {
+		panic("IndexError: index out of bounds")
+	}
+	return Int64Val(int64(mv.Buf[idx]))
+}
+
+func memoryViewMpAssSubscript(ctx *ExecContext, a, idxVal, val Value) Value {
+	mv := a.AsMemoryView()
+	if mv.released {
+		panic("ValueError: operation on released memoryview")
+	}
+	if mv.ReadOnly {
+		panic("TypeError: cannot modify read-only memoryview")
+	}
+	if idxVal.IsSlice() {
+		sl := idxVal.AsSlice()
+		start, stop, step, sliceLen, err := NormalizeSliceIndices(sl.Start, sl.Stop, sl.Step, len(mv.Buf))
+		if err != nil {
+			panic(err.Error())
+		}
+		if step != 1 {
+			panic("NotImplementedError: non-contiguous memoryview slice assignment")
+		}
+		var rhsBytes []byte
+		if val.IsBytes() {
+			rhsBytes = val.AsBytes().Data
+		} else if val.IsByteArray() {
+			rhsBytes = val.AsByteArray().Data
+		} else if val.IsMemoryView() {
+			rhsBytes = val.AsMemoryView().Buf
+		} else {
+			panic("TypeError: must assign bytes-like object")
+		}
+		if len(rhsBytes) != sliceLen {
+			panic("ValueError: cannot resize memoryview")
+		}
+		copy(mv.Buf[start:stop], rhsBytes)
+		return NoneVal()
+	}
+	idx := int(idxVal.AsInt64())
+	if idx < 0 {
+		idx += len(mv.Buf)
+	}
+	if idx < 0 || idx >= len(mv.Buf) {
+		panic("IndexError: index out of bounds")
+	}
+	b := val.AsInt64()
+	if b < 0 || b > 255 {
+		panic("ValueError: byte must be in range(0, 256)")
+	}
+	mv.Buf[idx] = byte(b)
+	return NoneVal()
+}
+
+func sliceGetAttr(ctx *ExecContext, obj, name Value) Value {
+	sl := obj.AsSlice()
+	attr := name.AsString()
+	switch attr {
+	case "start":
+		return sl.Start
+	case "stop":
+		return sl.Stop
+	case "step":
+		return sl.Step
+	default:
+		panic("AttributeError: 'slice' object has no attribute '" + attr + "'")
+	}
 }
 
 func dictSqLen(ctx *ExecContext, a Value) int64 {
@@ -486,6 +841,162 @@ var (
 	BuiltinLenVal Value
 	BuiltinAbsVal Value
 )
+
+func bytesNbAdd(ctx *ExecContext, a, b Value) Value {
+	var aBytes, bBytes []byte
+	if a.IsBytes() {
+		aBytes = a.AsBytes().Data
+	} else {
+		panic("TypeError: can't concat " + a.Type().Name + " to bytes")
+	}
+	if b.IsBytes() {
+		bBytes = b.AsBytes().Data
+	} else if b.IsByteArray() {
+		bBytes = b.AsByteArray().Data
+	} else {
+		panic("TypeError: can't concat " + b.Type().Name + " to bytes")
+	}
+	res := make([]byte, len(aBytes)+len(bBytes))
+	copy(res, aBytes)
+	copy(res[len(aBytes):], bBytes)
+	return NewBytesVal(res)
+}
+
+func bytesTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+	if len(args) == 0 {
+		return NewBytesVal(nil)
+	}
+	arg := args[0]
+	if arg.IsInt64() {
+		n := int(arg.AsInt64())
+		if n < 0 {
+			panic("ValueError: negative count")
+		}
+		return NewBytesVal(make([]byte, n))
+	}
+	if arg.IsBytes() {
+		return arg
+	}
+	if arg.IsByteArray() {
+		ba := arg.AsByteArray()
+		res := make([]byte, len(ba.Data))
+		copy(res, ba.Data)
+		return NewBytesVal(res)
+	}
+	if arg.IsMemoryView() {
+		mv := arg.AsMemoryView()
+		res := make([]byte, len(mv.Buf))
+		copy(res, mv.Buf)
+		return NewBytesVal(res)
+	}
+	if arg.IsAnyString() {
+		return NewBytesVal([]byte(arg.AsString()))
+	}
+	if arg.IsList() {
+		items := arg.AsList().Items
+		res := make([]byte, len(items))
+		for i, it := range items {
+			b := it.AsInt64()
+			if b < 0 || b > 255 {
+				panic("ValueError: bytes must be in range(0, 256)")
+			}
+			res[i] = byte(b)
+		}
+		return NewBytesVal(res)
+	}
+	if arg.IsTuple() {
+		items := arg.AsTuple().Items
+		res := make([]byte, len(items))
+		for i, it := range items {
+			b := it.AsInt64()
+			if b < 0 || b > 255 {
+				panic("ValueError: bytes must be in range(0, 256)")
+			}
+			res[i] = byte(b)
+		}
+		return NewBytesVal(res)
+	}
+	panic("TypeError: cannot convert '" + arg.Type().Name + "' object to bytes")
+}
+
+func byteArrayTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+	if len(args) == 0 {
+		return NewByteArrayVal(nil)
+	}
+	arg := args[0]
+	if arg.IsInt64() {
+		n := int(arg.AsInt64())
+		if n < 0 {
+			panic("ValueError: negative count")
+		}
+		return NewByteArrayVal(make([]byte, n))
+	}
+	if arg.IsBytes() {
+		res := make([]byte, len(arg.AsBytes().Data))
+		copy(res, arg.AsBytes().Data)
+		return NewByteArrayVal(res)
+	}
+	if arg.IsByteArray() {
+		ba := arg.AsByteArray()
+		res := make([]byte, len(ba.Data))
+		copy(res, ba.Data)
+		return NewByteArrayVal(res)
+	}
+	if arg.IsMemoryView() {
+		mv := arg.AsMemoryView()
+		res := make([]byte, len(mv.Buf))
+		copy(res, mv.Buf)
+		return NewByteArrayVal(res)
+	}
+	if arg.IsAnyString() {
+		return NewByteArrayVal([]byte(arg.AsString()))
+	}
+	if arg.IsList() {
+		items := arg.AsList().Items
+		res := make([]byte, len(items))
+		for i, it := range items {
+			b := it.AsInt64()
+			if b < 0 || b > 255 {
+				panic("ValueError: byte must be in range(0, 256)")
+			}
+			res[i] = byte(b)
+		}
+		return NewByteArrayVal(res)
+	}
+	if arg.IsTuple() {
+		items := arg.AsTuple().Items
+		res := make([]byte, len(items))
+		for i, it := range items {
+			b := it.AsInt64()
+			if b < 0 || b > 255 {
+				panic("ValueError: byte must be in range(0, 256)")
+			}
+			res[i] = byte(b)
+		}
+		return NewByteArrayVal(res)
+	}
+	panic("TypeError: cannot convert '" + arg.Type().Name + "' object to bytearray")
+}
+
+func memoryViewTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+	if len(args) < 1 {
+		panic("TypeError: memoryview() takes at least 1 argument")
+	}
+	return NewMemoryViewVal(args[0])
+}
+
+func sliceTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+	if len(args) == 1 {
+		return NewSliceVal(NoneVal(), args[0], NoneVal())
+	}
+	if len(args) == 2 {
+		return NewSliceVal(args[0], args[1], NoneVal())
+	}
+	if len(args) >= 3 {
+		return NewSliceVal(args[0], args[1], args[2])
+	}
+	panic("TypeError: slice() takes at least 1 argument")
+}
 
 func init() {
 	initTypes()
@@ -582,9 +1093,9 @@ func initTypes() {
 	ListType.Slots.NbAdd = listNbAdd
 	ListType.Slots.SqLen = listSqLen
 	ListType.Slots.SqItem = listSqItem
-	ListType.Slots.MpSubscript = listSqItem
+	ListType.Slots.MpSubscript = listMpSubscript
 	ListType.Slots.SqAssItem = listSqAssItem
-	ListType.Slots.MpAssSubscript = listSqAssItem
+	ListType.Slots.MpAssSubscript = listMpAssSubscript
 	ListType.Dict.Set(InternString("append"), NewBuiltinFuncVal("append", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
 			panic("TypeError: append() takes exactly one argument")
@@ -602,7 +1113,7 @@ func initTypes() {
 	TupleType = MustNewType("tuple", []*PyType{ObjectType}, nil)
 	TupleType.Slots.SqLen = tupleSqLen
 	TupleType.Slots.SqItem = tupleSqItem
-	TupleType.Slots.MpSubscript = tupleSqItem
+	TupleType.Slots.MpSubscript = tupleMpSubscript
 
 	CodeType = MustNewType("code", []*PyType{ObjectType}, nil)
 	CodeType.Slots.TpCall = functionTpCall
@@ -763,6 +1274,207 @@ func initTypes() {
 	GeneratorExitType = MustNewType("GeneratorExit", []*PyType{BaseExceptionType}, nil)
 	ImportErrorType = MustNewType("ImportError", []*PyType{ExceptionType}, nil)
 	ModuleNotFoundErrorType = MustNewType("ModuleNotFoundError", []*PyType{ImportErrorType}, nil)
+	BufferErrorType = MustNewType("BufferError", []*PyType{ExceptionType}, nil)
+
+	// Binary Types and Slice Type
+	BytesType = MustNewType("bytes", []*PyType{ObjectType}, nil)
+	BytesType.Slots.SqLen = bytesSqLen
+	BytesType.Slots.SqItem = bytesMpSubscript
+	BytesType.Slots.MpSubscript = bytesMpSubscript
+	BytesType.Slots.TpAsBuffer = bytesTpAsBuffer
+	BytesType.Slots.NbAdd = bytesNbAdd
+	BytesType.Slots.TpCall = bytesTpCall
+	BytesType.Dict.Set(InternString("decode"), NewBuiltinFuncVal("decode", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: decode() takes at least 1 argument")
+		}
+		b := args[0].AsBytes()
+		return NewStringVal(string(b.Data))
+	}))
+	BytesType.Dict.Set(InternString("hex"), NewBuiltinFuncVal("hex", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: hex() takes at least 1 argument")
+		}
+		b := args[0].AsBytes()
+		return NewStringVal(hex.EncodeToString(b.Data))
+	}))
+	BytesType.Dict.Set(InternString("startswith"), NewBuiltinFuncVal("startswith", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: startswith() takes 1 argument")
+		}
+		b := args[0].AsBytes().Data
+		var prefix []byte
+		if args[1].IsBytes() {
+			prefix = args[1].AsBytes().Data
+		} else if args[1].IsByteArray() {
+			prefix = args[1].AsByteArray().Data
+		} else {
+			panic("TypeError: startswith first arg must be bytes or a tuple of bytes")
+		}
+		return BoolVal(bytes.HasPrefix(b, prefix))
+	}))
+	BytesType.Dict.Set(InternString("endswith"), NewBuiltinFuncVal("endswith", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: endswith() takes 1 argument")
+		}
+		b := args[0].AsBytes().Data
+		var suffix []byte
+		if args[1].IsBytes() {
+			suffix = args[1].AsBytes().Data
+		} else if args[1].IsByteArray() {
+			suffix = args[1].AsByteArray().Data
+		} else {
+			panic("TypeError: endswith first arg must be bytes or a tuple of bytes")
+		}
+		return BoolVal(bytes.HasSuffix(b, suffix))
+	}))
+	BytesType.Dict.Set(InternString("find"), NewBuiltinFuncVal("find", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: find() takes 1 argument")
+		}
+		b := args[0].AsBytes().Data
+		var sub []byte
+		if args[1].IsBytes() {
+			sub = args[1].AsBytes().Data
+		} else if args[1].IsByteArray() {
+			sub = args[1].AsByteArray().Data
+		} else {
+			panic("TypeError: find argument must be bytes")
+		}
+		return Int64Val(int64(bytes.Index(b, sub)))
+	}))
+
+	ByteArrayType = MustNewType("bytearray", []*PyType{ObjectType}, nil)
+	ByteArrayType.Slots.SqLen = byteArraySqLen
+	ByteArrayType.Slots.SqItem = byteArrayMpSubscript
+	ByteArrayType.Slots.MpSubscript = byteArrayMpSubscript
+	ByteArrayType.Slots.SqAssItem = byteArrayMpAssSubscript
+	ByteArrayType.Slots.MpAssSubscript = byteArrayMpAssSubscript
+	ByteArrayType.Slots.TpAsBuffer = byteArrayTpAsBuffer
+	ByteArrayType.Slots.TpCall = byteArrayTpCall
+	ByteArrayType.Dict.Set(InternString("append"), NewBuiltinFuncVal("append", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: append() takes exactly one argument")
+		}
+		ba := args[0].AsByteArray()
+		b := args[1].AsInt64()
+		if b < 0 || b > 255 {
+			panic("ValueError: byte must be in range(0, 256)")
+		}
+		ba.mu.Lock()
+		ba.Data = append(ba.Data, byte(b))
+		ba.mu.Unlock()
+		return NoneVal()
+	}))
+	ByteArrayType.Dict.Set(InternString("extend"), NewBuiltinFuncVal("extend", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: extend() takes exactly one argument")
+		}
+		ba := args[0].AsByteArray()
+		val := args[1]
+		var toAppend []byte
+		if val.IsBytes() {
+			toAppend = val.AsBytes().Data
+		} else if val.IsByteArray() {
+			toAppend = val.AsByteArray().Data
+		} else if val.IsMemoryView() {
+			toAppend = val.AsMemoryView().Buf
+		} else if val.IsList() {
+			for _, item := range val.AsList().Items {
+				b := item.AsInt64()
+				if b < 0 || b > 255 {
+					panic("ValueError: byte must be in range(0, 256)")
+				}
+				toAppend = append(toAppend, byte(b))
+			}
+		} else {
+			panic("TypeError: 'extend' requires an iterable of ints or bytes-like object")
+		}
+		ba.mu.Lock()
+		ba.Data = append(ba.Data, toAppend...)
+		ba.mu.Unlock()
+		return NoneVal()
+	}))
+	ByteArrayType.Dict.Set(InternString("decode"), NewBuiltinFuncVal("decode", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: decode() takes at least 1 argument")
+		}
+		ba := args[0].AsByteArray()
+		ba.mu.RLock()
+		s := string(ba.Data)
+		ba.mu.RUnlock()
+		return NewStringVal(s)
+	}))
+	ByteArrayType.Dict.Set(InternString("hex"), NewBuiltinFuncVal("hex", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: hex() takes at least 1 argument")
+		}
+		ba := args[0].AsByteArray()
+		ba.mu.RLock()
+		s := hex.EncodeToString(ba.Data)
+		ba.mu.RUnlock()
+		return NewStringVal(s)
+	}))
+
+	MemoryViewType = MustNewType("memoryview", []*PyType{ObjectType}, nil)
+	MemoryViewType.Slots.SqLen = memoryViewSqLen
+	MemoryViewType.Slots.SqItem = memoryViewMpSubscript
+	MemoryViewType.Slots.MpSubscript = memoryViewMpSubscript
+	MemoryViewType.Slots.SqAssItem = memoryViewMpAssSubscript
+	MemoryViewType.Slots.MpAssSubscript = memoryViewMpAssSubscript
+	MemoryViewType.Slots.TpAsBuffer = memoryViewTpAsBuffer
+	MemoryViewType.Slots.TpCall = memoryViewTpCall
+	MemoryViewType.Dict.Set(InternString("tobytes"), NewBuiltinFuncVal("tobytes", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: tobytes() takes no arguments")
+		}
+		mv := args[0].AsMemoryView()
+		if mv.released {
+			panic("ValueError: operation on released memoryview")
+		}
+		res := make([]byte, len(mv.Buf))
+		copy(res, mv.Buf)
+		return NewBytesVal(res)
+	}))
+	MemoryViewType.Dict.Set(InternString("tolist"), NewBuiltinFuncVal("tolist", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: tolist() takes no arguments")
+		}
+		mv := args[0].AsMemoryView()
+		if mv.released {
+			panic("ValueError: operation on released memoryview")
+		}
+		items := make([]Value, len(mv.Buf))
+		for i, b := range mv.Buf {
+			items[i] = Int64Val(int64(b))
+		}
+		return NewListVal(items...)
+	}))
+	MemoryViewType.Dict.Set(InternString("release"), NewBuiltinFuncVal("release", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: release() takes no arguments")
+		}
+		mv := args[0].AsMemoryView()
+		mv.released = true
+		mv.Buf = nil
+		return NoneVal()
+	}))
+
+	SliceType = MustNewType("slice", []*PyType{ObjectType}, nil)
+	SliceType.Slots.TpGetAttr = sliceGetAttr
+	SliceType.Slots.TpCall = sliceTpCall
+	SliceType.Dict.Set(InternString("indices"), NewBuiltinFuncVal("indices", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: slice.indices() takes 1 argument")
+		}
+		sl := args[0].AsSlice()
+		length := int(args[1].AsInt64())
+		start, stop, step, _, err := NormalizeSliceIndices(sl.Start, sl.Stop, sl.Step, length)
+		if err != nil {
+			panic(err.Error())
+		}
+		return NewTupleVal(Int64Val(int64(start)), Int64Val(int64(stop)), Int64Val(int64(step)))
+	}))
 
 	ModuleType = MustNewType("module", []*PyType{ObjectType}, nil)
 	ModuleType.Slots.TpGetAttr = moduleGetAttr
@@ -793,6 +1505,10 @@ func initTypes() {
 	builtinTypes[KindGenerator] = GeneratorType
 	builtinTypes[KindChan] = ChanType
 	builtinTypes[KindModule] = ModuleType
+	builtinTypes[KindBytes] = BytesType
+	builtinTypes[KindByteArray] = ByteArrayType
+	builtinTypes[KindMemoryView] = MemoryViewType
+	builtinTypes[KindSlice] = SliceType
 
 	tagNone.Type = NoneType
 	tagBool.Type = BoolType
