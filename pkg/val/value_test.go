@@ -519,3 +519,32 @@ func TestTypeVersionTagPropagation(t *testing.T) {
 		t.Fatalf("Add(Leaf(), 1) = %v, want 999", res)
 	}
 }
+
+func TestPyModuleAndDictGetWithSlot(t *testing.T) {
+	modVal := NewModuleVal("my_module", "/path/to/my_module.py")
+	if !modVal.IsModule() {
+		t.Fatalf("expected modVal.IsModule() to be true")
+	}
+	mod := modVal.AsModule()
+	if mod.Name != "my_module" || mod.File != "/path/to/my_module.py" {
+		t.Fatalf("unexpected module metadata: name=%s file=%s", mod.Name, mod.File)
+	}
+
+	// Test GetWithSlot
+	d := mod.Dict
+	v, slot, ok := d.GetWithSlot(InternString("__name__"))
+	if !ok || v.AsString() != "my_module" || slot < 0 {
+		t.Fatalf("GetWithSlot(__name__) = %v, slot=%d, ok=%v", v, slot, ok)
+	}
+
+	// Test module attribute access via GetAttrCtx / SetAttrCtx
+	ctx := &ExecContext{}
+	attrVal := Int64Val(12345)
+	attrName := InternString("custom_attr")
+	SetAttrCtx(ctx, modVal, attrName, attrVal)
+
+	got := GetAttrCtx(ctx, modVal, attrName)
+	if !got.IsInt64() || got.AsInt64() != 12345 {
+		t.Fatalf("GetAttrCtx returned %v, want 12345", got)
+	}
+}

@@ -605,6 +605,10 @@ func lookupKeyword(s string) TokenType {
 		return TOKEN_AS
 	case "yield":
 		return TOKEN_YIELD
+	case "import":
+		return TOKEN_IMPORT
+	case "from":
+		return TOKEN_FROM
 	default:
 		return TOKEN_IDENT
 	}

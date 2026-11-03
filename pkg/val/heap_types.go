@@ -76,6 +76,40 @@ type PyChan struct {
 	closed uint32
 }
 
+// PyModule represents a Python module or package object.
+// Header MUST be at offset 0.
+type PyModule struct {
+	Header  ObjectHeader
+	Name    string
+	File    string
+	Dict    *PyDict
+	Package string
+}
+
+// Compile-time assertion that PyModule.Header is at byte offset 0.
+var _ [0 - unsafe.Offsetof(PyModule{}.Header)]byte
+
+// NewModuleVal wraps a newly created PyModule as a Value of KindModule.
+func NewModuleVal(name, file string) Value {
+	mod := &PyModule{
+		Header: ObjectHeader{
+			Kind: KindModule,
+			Type: ModuleType,
+		},
+		Name: name,
+		File: file,
+		Dict: NewDictVal(16).AsDict(),
+	}
+	mod.Dict.Set(InternString("__name__"), NewStringVal(name))
+	if file != "" {
+		mod.Dict.Set(InternString("__file__"), NewStringVal(file))
+	} else {
+		mod.Dict.Set(InternString("__file__"), NoneVal())
+	}
+	mod.Dict.Set(InternString("__doc__"), NoneVal())
+	return ObjectVal(&mod.Header)
+}
+
 // IterKind classifies the source collection of a PyIter.
 type IterKind uint8
 
@@ -777,6 +811,69 @@ func (d *PyDict) Get(key Value) (Value, bool) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return d.getLocked(key)
+}
+
+// GetWithSlot returns the value, slot index inside Entries, and whether the key was found.
+// This allows inline cache revalidation in O(1) without re-hashing when dict version changes.
+func (d *PyDict) GetWithSlot(key Value) (Value, int, bool) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.getWithSlotLocked(key)
+}
+
+// GetWithSlotHint checks the cached slot index first under RLock before falling back to full lookup.
+func (d *PyDict) GetWithSlotHint(key Value, slotHint int) (Value, int, bool) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if slotHint >= 0 && slotHint < len(d.Entries) {
+		e := &d.Entries[slotHint]
+		if e.Active && Equals(e.Key, key) {
+			return e.Value, slotHint, true
+		}
+	}
+	return d.getWithSlotLocked(key)
+}
+
+func (d *PyDict) getWithSlotLocked(key Value) (Value, int, bool) {
+	if d.used == 0 {
+		return NoneVal(), -1, false
+	}
+
+	h := HashValue(key)
+	mask := d.mask
+	slot := h & mask
+
+	if d.indexShift == 0 {
+		for {
+			raw := d.indices[slot]
+			if raw == dictIndexEmpty {
+				return NoneVal(), -1, false
+			}
+			if raw >= dictIndexOffset {
+				idx := int(raw) - dictIndexOffset
+				e := &d.Entries[idx]
+				if e.Hash == h && e.Active && Equals(e.Key, key) {
+					return e.Value, idx, true
+				}
+			}
+			slot = (slot + 1) & mask
+		}
+	}
+
+	for {
+		raw := d.readIndex(slot)
+		if raw == dictIndexEmpty {
+			return NoneVal(), -1, false
+		}
+		if raw >= dictIndexOffset {
+			idx := int(raw) - dictIndexOffset
+			e := &d.Entries[idx]
+			if e.Hash == h && e.Active && Equals(e.Key, key) {
+				return e.Value, idx, true
+			}
+		}
+		slot = (slot + 1) & mask
+	}
 }
 
 func (d *PyDict) getLocked(key Value) (Value, bool) {

@@ -46,6 +46,8 @@ const (
 	TOKEN_WITH
 	TOKEN_AS
 	TOKEN_YIELD
+	TOKEN_IMPORT
+	TOKEN_FROM
 
 	// Delimiters
 	TOKEN_LPAREN   // (
@@ -162,6 +164,10 @@ func (t TokenType) String() string {
 		return "as"
 	case TOKEN_YIELD:
 		return "yield"
+	case TOKEN_IMPORT:
+		return "import"
+	case TOKEN_FROM:
+		return "from"
 	case TOKEN_LPAREN:
 		return "("
 	case TOKEN_RPAREN:

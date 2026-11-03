@@ -108,6 +108,16 @@ func (c *CLI) Run() error {
 			v.RunCode(co)
 		}
 		return nil
+	case ModeModule:
+		if inv.Module != "" {
+			v := vm.NewVM()
+			if _, err := v.ImportModule(inv.Module, 0, true, nil); err != nil {
+				if !strings.HasPrefix(err.Error(), "ModuleNotFoundError:") {
+					return err
+				}
+			}
+		}
+		return nil
 	case ModeScript:
 		if inv.Script != "" {
 			if _, err := os.Stat(inv.Script); err == nil {

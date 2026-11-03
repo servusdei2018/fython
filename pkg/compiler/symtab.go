@@ -2,6 +2,7 @@ package compiler
 
 import (
 	"fmt"
+	"strings"
 )
 
 // StorageClass represents the lexical variable storage category.
@@ -344,6 +345,31 @@ func (st *SymbolTable) visitStmt(stmtID StmtID) error {
 		for _, sID := range st.arena.GetStmtSlice(stmt.Body) {
 			if err := st.visitStmt(sID); err != nil {
 				return err
+			}
+		}
+
+	case StmtKindImport:
+		imp := st.arena.GetImport(stmt.Extra)
+		if imp != nil {
+			for _, alias := range st.arena.GetAliasSlice(imp.Aliases) {
+				if alias.AsName != "" {
+					st.cur.Bound[alias.AsName] = true
+				} else {
+					parts := strings.Split(alias.Name, ".")
+					st.cur.Bound[parts[0]] = true
+				}
+			}
+		}
+
+	case StmtKindImportFrom:
+		impFrom := st.arena.GetImportFrom(stmt.Extra)
+		if impFrom != nil && !impFrom.IsStar {
+			for _, alias := range st.arena.GetAliasSlice(impFrom.Aliases) {
+				target := alias.Name
+				if alias.AsName != "" {
+					target = alias.AsName
+				}
+				st.cur.Bound[target] = true
 			}
 		}
 	}

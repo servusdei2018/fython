@@ -54,13 +54,17 @@ func (vm *VM) callFromHook(ctx *val.ExecContext, callable val.Value, argBase int
 	case val.KindFunction:
 		fn := callable.AsFunction()
 		co := AsCodeObject(fn.Code)
+		fnGlobals := fn.Globals
+		if fnGlobals == nil {
+			fnGlobals = vm.globals
+		}
 		if co.IsGenerator {
-			return vm.instantiateGenerator(co, callable, fn.Defaults, fn.KwDefaults, argBase, nargs, kwnames, vm.globals)
+			return vm.instantiateGenerator(co, callable, fn.Defaults, fn.KwDefaults, argBase, nargs, kwnames, fnGlobals)
 		}
 		spAfterBind := vm.bindFunctionArgs(co, fn.Defaults, fn.KwDefaults, argBase, nargs, kwnames)
 		savedSP := ctx.SP
 		cells := vm.setupCalleeCells(co, callable, argBase, nargs)
-		res := vm.runLoopWithGlobals(co, argBase, spAfterBind, vm.activeFrameIdx, cells, vm.globals, vm.stack, nil)
+		res := vm.runLoopWithGlobals(co, argBase, spAfterBind, vm.activeFrameIdx, cells, fnGlobals, vm.stack, nil)
 		ctx.SP = savedSP
 		return res
 
@@ -689,7 +693,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			a := stack[sp-2]
 			if a.IsInt64() && b.IsInt64() {
 				// Quickening: specialize in-place to OP_BINARY_ADD_INT
-				atomic.StoreUint32(&code[ip], (inst & 0x00FFFFFF) | (uint32(OP_BINARY_ADD_INT) << 24))
+				atomic.StoreUint32(&code[ip], (inst&0x00FFFFFF)|(uint32(OP_BINARY_ADD_INT)<<24))
 				ai := a.AsInt64()
 				bi := b.AsInt64()
 				sum := ai + bi
@@ -700,7 +704,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				}
 			} else if a.IsFloat64() && b.IsFloat64() {
 				// Quickening: specialize in-place to OP_BINARY_ADD_FLOAT
-				atomic.StoreUint32(&code[ip], (inst & 0x00FFFFFF) | (uint32(OP_BINARY_ADD_FLOAT) << 24))
+				atomic.StoreUint32(&code[ip], (inst&0x00FFFFFF)|(uint32(OP_BINARY_ADD_FLOAT)<<24))
 				stack[sp-2] = val.Float64Val(a.AsFloat64() + b.AsFloat64())
 			} else {
 				vm.execCtx.SP = sp
@@ -724,7 +728,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				}
 			} else {
 				// Type stability broken: deoptimize in-place back to OP_BINARY_ADD
-				atomic.StoreUint32(&code[ip], (inst & 0x00FFFFFF) | (uint32(OP_BINARY_ADD) << 24))
+				atomic.StoreUint32(&code[ip], (inst&0x00FFFFFF)|(uint32(OP_BINARY_ADD)<<24))
 				vm.execCtx.SP = sp
 				vm.activeFrameIdx = frameIdx
 				stack[sp-2] = val.AddCtx(&vm.execCtx, a, b)
@@ -739,7 +743,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				stack[sp-2] = val.Float64Val(a.AsFloat64() + b.AsFloat64())
 			} else {
 				// Type stability broken: deoptimize in-place back to OP_BINARY_ADD
-				atomic.StoreUint32(&code[ip], (inst & 0x00FFFFFF) | (uint32(OP_BINARY_ADD) << 24))
+				atomic.StoreUint32(&code[ip], (inst&0x00FFFFFF)|(uint32(OP_BINARY_ADD)<<24))
 				vm.execCtx.SP = sp
 				vm.activeFrameIdx = frameIdx
 				stack[sp-2] = val.AddCtx(&vm.execCtx, a, b)
@@ -752,7 +756,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			a := stack[sp-2]
 			if a.IsInt64() && b.IsInt64() {
 				// Quickening: specialize in-place to OP_BINARY_SUB_INT
-				atomic.StoreUint32(&code[ip], (inst & 0x00FFFFFF) | (uint32(OP_BINARY_SUB_INT) << 24))
+				atomic.StoreUint32(&code[ip], (inst&0x00FFFFFF)|(uint32(OP_BINARY_SUB_INT)<<24))
 				ai := a.AsInt64()
 				bi := b.AsInt64()
 				diff := ai - bi
@@ -783,7 +787,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				}
 			} else {
 				// Type stability broken: deoptimize in-place back to OP_BINARY_SUB
-				atomic.StoreUint32(&code[ip], (inst & 0x00FFFFFF) | (uint32(OP_BINARY_SUB) << 24))
+				atomic.StoreUint32(&code[ip], (inst&0x00FFFFFF)|(uint32(OP_BINARY_SUB)<<24))
 				vm.execCtx.SP = sp
 				vm.activeFrameIdx = frameIdx
 				stack[sp-2] = val.SubCtx(&vm.execCtx, a, b)
@@ -846,7 +850,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			a := stack[sp-2]
 			if a.IsInt64() && b.IsInt64() {
 				// Quickening: specialize in-place to OP_COMPARE_LT_INT
-				atomic.StoreUint32(&code[ip], (inst & 0x00FFFFFF) | (uint32(OP_COMPARE_LT_INT) << 24))
+				atomic.StoreUint32(&code[ip], (inst&0x00FFFFFF)|(uint32(OP_COMPARE_LT_INT)<<24))
 				stack[sp-2] = val.BoolVal(a.AsInt64() < b.AsInt64())
 			} else {
 				stack[sp-2] = val.LessThan(a, b)
@@ -861,7 +865,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				stack[sp-2] = val.BoolVal(a.AsInt64() < b.AsInt64())
 			} else {
 				// Type stability broken: deoptimize in-place back to OP_COMPARE_LT
-				atomic.StoreUint32(&code[ip], (inst & 0x00FFFFFF) | (uint32(OP_COMPARE_LT) << 24))
+				atomic.StoreUint32(&code[ip], (inst&0x00FFFFFF)|(uint32(OP_COMPARE_LT)<<24))
 				stack[sp-2] = val.LessThan(a, b)
 			}
 			sp--
@@ -957,6 +961,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				consts = callee.Consts
 				baseOffset = newBase
 				cells = vm.setupCalleeCells(callee, target, newBase, argc)
+				if fn.Globals != nil {
+					globals = fn.Globals
+				}
 				ip = 0
 
 			case val.KindBuiltinFunc:
@@ -1014,6 +1021,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				consts = callee.Consts
 				baseOffset = newBase
 				cells = vm.setupCalleeCells(callee, target, newBase, totalArgs)
+				if fn.Globals != nil {
+					globals = fn.Globals
+				}
 				ip = 0
 
 			case val.KindCode:
@@ -1084,6 +1094,30 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 						continue
 					}
 				}
+			} else if obj.IsModule() {
+				mod := obj.AsModule()
+				entry := &vm.ic[ip]
+				modVer := atomic.LoadUint64(&mod.Dict.VersionTag)
+				if entry.CodePtr == &code[0] && entry.Kind == ICKindModuleAttr && entry.ExpectedGlobalsVer == modVer {
+					stack[sp-1] = val.UnboundVal()
+					stack[sp] = entry.CachedVal
+					sp++
+					ip++
+					continue
+				}
+				attrName := consts[uint16(inst)]
+				if v, slot, ok := mod.Dict.GetWithSlotHint(attrName, entry.SlotIndex); ok {
+					entry.Kind = ICKindModuleAttr
+					entry.ExpectedGlobalsVer = modVer
+					entry.CodePtr = &code[0]
+					entry.CachedVal = v
+					entry.SlotIndex = slot
+					stack[sp-1] = val.UnboundVal()
+					stack[sp] = v
+					sp++
+					ip++
+					continue
+				}
 			}
 			vm.loadMethodSlow(obj, consts[uint16(inst)], ip, sp, frameIdx, &code[0])
 			sp++
@@ -1142,6 +1176,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				consts = callee.Consts
 				baseOffset = newBase
 				cells = vm.setupCalleeCells(callee, callable, newBase, totalArgs)
+				if fn.Globals != nil {
+					globals = fn.Globals
+				}
 				ip = 0
 
 			case val.KindCode:
@@ -1235,6 +1272,29 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					}
 				}
 				stack[sp-1] = vm.loadAttrInstanceSlow(instObj, obj, consts[uint16(inst)], ip, sp, frameIdx, &code[0])
+			} else if obj.IsModule() {
+				mod := obj.AsModule()
+				entry := &vm.ic[ip]
+				modVer := atomic.LoadUint64(&mod.Dict.VersionTag)
+				if entry.CodePtr == &code[0] && entry.Kind == ICKindModuleAttr && entry.ExpectedGlobalsVer == modVer {
+					stack[sp-1] = entry.CachedVal
+					ip++
+					continue
+				}
+				attrName := consts[uint16(inst)]
+				if v, slot, ok := mod.Dict.GetWithSlotHint(attrName, entry.SlotIndex); ok {
+					entry.Kind = ICKindModuleAttr
+					entry.ExpectedGlobalsVer = modVer
+					entry.CodePtr = &code[0]
+					entry.CachedVal = v
+					entry.SlotIndex = slot
+					stack[sp-1] = v
+					ip++
+					continue
+				}
+				vm.execCtx.SP = sp
+				vm.activeFrameIdx = frameIdx
+				stack[sp-1] = val.GetAttrCtx(&vm.execCtx, obj, attrName)
 			} else {
 				vm.execCtx.SP = sp
 				vm.activeFrameIdx = frameIdx
@@ -1312,11 +1372,12 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					continue
 				}
 			}
-			if v, ok := globals.Get(nameVal); ok {
+			if v, slot, ok := globals.GetWithSlotHint(nameVal, entry.SlotIndex); ok {
 				entry.Kind = ICKindGlobal
 				entry.ExpectedGlobalsVer = globVer
 				entry.CodePtr = &code[0]
 				entry.CachedVal = v
+				entry.SlotIndex = slot
 				stack[sp] = v
 				sp++
 				ip++
@@ -1360,6 +1421,42 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			sp++
 			ip++
 
+		case OP_IMPORT_NAME:
+			bx := uint16(inst)
+			nameVal := consts[bx]
+			argA := uint8(inst >> 16)
+			level := int(argA & 0x7F)
+			returnLeaf := (argA & 0x80) != 0
+
+			modVal, err := vm.ImportModule(nameVal.AsString(), level, returnLeaf, globals)
+			if err != nil {
+				panic("vm: " + err.Error())
+			}
+			stack[sp] = modVal
+			sp++
+			ip++
+
+		case OP_IMPORT_FROM:
+			bx := uint16(inst)
+			symVal := consts[bx]
+			modVal := stack[sp-1]
+
+			v, err := vm.ImportFrom(modVal, symVal.AsString(), globals)
+			if err != nil {
+				panic("vm: " + err.Error())
+			}
+			stack[sp] = v
+			sp++
+			ip++
+
+		case OP_IMPORT_STAR:
+			sp--
+			modVal := stack[sp]
+			if err := vm.ImportStar(modVal, globals); err != nil {
+				panic("vm: " + err.Error())
+			}
+			ip++
+
 		case OP_MAKE_FUNCTION:
 			flags := uint8(inst >> 16)
 			sp--
@@ -1377,7 +1474,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				defaultsSlice = defVal.AsTuple().Items
 			}
 			callee := AsCodeObject(codeVal)
-			fnVal := val.NewFunctionValWithClosure(callee.Name, codeVal, defaultsSlice, closureSlice)
+			fnVal := val.NewFunctionValWithGlobalsAndClosure(callee.Name, codeVal, defaultsSlice, closureSlice, globals)
 			stack[sp] = fnVal
 			sp++
 			ip++
@@ -1836,6 +1933,15 @@ func isCallableConst(v val.Value) bool {
 //go:noinline
 func (vm *VM) loadMethodSlow(obj, attrName val.Value, ip, sp, frameIdx int, codePtr *uint32) {
 	attrName = val.InternValue(attrName)
+
+	if obj.IsModule() {
+		mod := obj.AsModule()
+		if fnVal, ok := mod.Dict.Get(attrName); ok {
+			vm.stack[sp-1] = val.UnboundVal()
+			vm.stack[sp] = fnVal
+			return
+		}
+	}
 
 	if obj.IsSuper() {
 		sup := obj.AsSuper()

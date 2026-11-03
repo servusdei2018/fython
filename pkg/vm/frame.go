@@ -27,6 +27,7 @@ const (
 	ICKindClassAttr             // Hit on PyType MRO non-descriptor class attribute
 	ICKindGlobal                // Hit on module globals dict
 	ICKindBuiltin               // Hit on builtins dict fallback
+	ICKindModuleAttr            // Hit on module dict
 )
 
 // ICSlot caches [ExpectedShapeID, ExpectedTypeVer, SlotIndex, CachedVal] for O(1)
@@ -113,6 +114,7 @@ type VM struct {
 	kwSet          [64]bool
 	globals        *val.PyDict
 	builtins       *val.PyDict
+	modules        *val.PyDict
 	lastException  val.Value
 	rootCO         CodeObject
 }
@@ -181,6 +183,11 @@ func (vm *VM) Globals() *val.PyDict {
 // Builtins returns the VM's builtins dictionary.
 func (vm *VM) Builtins() *val.PyDict {
 	return vm.builtins
+}
+
+// Modules returns the VM's active sys.modules dictionary.
+func (vm *VM) Modules() *val.PyDict {
+	return vm.modules
 }
 
 // SetGlobal assigns a variable in the VM's module globals dictionary.

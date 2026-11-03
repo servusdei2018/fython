@@ -53,6 +53,11 @@ const (
 	OP_JUMP_IF_TRUE_OR_POP
 	OP_LOAD_CLOSURE
 
+	// Module Imports
+	OP_IMPORT_NAME
+	OP_IMPORT_FROM
+	OP_IMPORT_STAR
+
 	// Exceptions, Context Managers & Generators
 	OP_RAISE
 	OP_YIELD_VALUE
@@ -177,6 +182,12 @@ func (op Opcode) String() string {
 		return "OP_JUMP_IF_TRUE_OR_POP"
 	case OP_LOAD_CLOSURE:
 		return "OP_LOAD_CLOSURE"
+	case OP_IMPORT_NAME:
+		return "OP_IMPORT_NAME"
+	case OP_IMPORT_FROM:
+		return "OP_IMPORT_FROM"
+	case OP_IMPORT_STAR:
+		return "OP_IMPORT_STAR"
 	case OP_RAISE:
 		return "OP_RAISE"
 	case OP_YIELD_VALUE:

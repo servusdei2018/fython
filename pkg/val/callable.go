@@ -30,6 +30,7 @@ type PyFunction struct {
 	Defaults   []Value
 	KwDefaults *PyDict
 	Closure    []Value
+	Globals    *PyDict
 }
 
 // PyBoundMethod represents a first-class bound method object allocated on the heap ONLY when
@@ -128,6 +129,37 @@ func NewFunctionValWithClosure(name string, codeVal Value, defaults []Value, clo
 		Code:     codeVal,
 		Defaults: defaults,
 		Closure:  closure,
+	}
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+// NewFunctionValWithGlobals constructs a heap-allocated KindFunction Value bound to module globals.
+func NewFunctionValWithGlobals(name string, codeVal Value, defaults []Value, globals *PyDict) Value {
+	obj := &PyFunction{
+		Header: ObjectHeader{
+			Kind: KindFunction,
+			Type: FunctionType,
+		},
+		Name:     name,
+		Code:     codeVal,
+		Defaults: defaults,
+		Globals:  globals,
+	}
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+// NewFunctionValWithGlobalsAndClosure constructs a heap-allocated KindFunction Value bound to module globals and closure cells.
+func NewFunctionValWithGlobalsAndClosure(name string, codeVal Value, defaults []Value, closure []Value, globals *PyDict) Value {
+	obj := &PyFunction{
+		Header: ObjectHeader{
+			Kind: KindFunction,
+			Type: FunctionType,
+		},
+		Name:     name,
+		Code:     codeVal,
+		Defaults: defaults,
+		Closure:  closure,
+		Globals:  globals,
 	}
 	return Value{num: 0, ptr: &obj.Header}
 }
@@ -729,6 +761,12 @@ func initTypes() {
 	RuntimeErrorType = MustNewType("RuntimeError", []*PyType{ExceptionType}, nil)
 	StopIterationType = MustNewType("StopIteration", []*PyType{ExceptionType}, nil)
 	GeneratorExitType = MustNewType("GeneratorExit", []*PyType{BaseExceptionType}, nil)
+	ImportErrorType = MustNewType("ImportError", []*PyType{ExceptionType}, nil)
+	ModuleNotFoundErrorType = MustNewType("ModuleNotFoundError", []*PyType{ImportErrorType}, nil)
+
+	ModuleType = MustNewType("module", []*PyType{ObjectType}, nil)
+	ModuleType.Slots.TpGetAttr = moduleGetAttr
+	ModuleType.Slots.TpSetAttr = moduleSetAttr
 
 	// 4. Populate static lookup table and sentinel headers.
 	builtinTypes[KindNone] = NoneType
@@ -754,6 +792,7 @@ func initTypes() {
 	builtinTypes[KindRange] = RangeType
 	builtinTypes[KindGenerator] = GeneratorType
 	builtinTypes[KindChan] = ChanType
+	builtinTypes[KindModule] = ModuleType
 
 	tagNone.Type = NoneType
 	tagBool.Type = BoolType

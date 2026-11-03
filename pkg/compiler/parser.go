@@ -151,6 +151,10 @@ func (p *Parser) parseStmt() (StmtID, error) {
 		return p.parseGlobalStmt()
 	case TOKEN_NONLOCAL:
 		return p.parseNonlocalStmt()
+	case TOKEN_IMPORT:
+		return p.parseImportStmt()
+	case TOKEN_FROM:
+		return p.parseFromImportStmt()
 	default:
 		return p.parseSimpleStmt()
 	}
@@ -565,7 +569,7 @@ func (p *Parser) parseRaiseStmt() (StmtID, error) {
 		if err != nil {
 			return StmtNone, err
 		}
-		if p.cur.Type == TOKEN_IDENT && string(p.src[p.cur.Start:p.cur.End]) == "from" {
+		if p.cur.Type == TOKEN_FROM || (p.cur.Type == TOKEN_IDENT && string(p.src[p.cur.Start:p.cur.End]) == "from") {
 			p.advance() // 'from'
 			from, err = p.parseExpr()
 			if err != nil {
@@ -667,6 +671,162 @@ func (p *Parser) parseNonlocalStmt() (StmtID, error) {
 		Kind:  StmtKindNonlocal,
 		Start: startTok.Start,
 		Extra: sliceIdx,
+	}), nil
+}
+
+func (p *Parser) parseDottedName() (string, uint32, uint32, error) {
+	tok, err := p.expect(TOKEN_IDENT)
+	if err != nil {
+		return "", 0, 0, err
+	}
+	start := tok.Start
+	end := tok.End
+	name := p.tokenText(tok)
+	for p.match(TOKEN_DOT) {
+		nextTok, err := p.expect(TOKEN_IDENT)
+		if err != nil {
+			return "", 0, 0, err
+		}
+		end = nextTok.End
+		name += "." + p.tokenText(nextTok)
+	}
+	return name, start, end, nil
+}
+
+func (p *Parser) parseImportStmt() (StmtID, error) {
+	startTok, _ := p.expect(TOKEN_IMPORT)
+	var aliases []ASTAlias
+	for {
+		name, _, _, err := p.parseDottedName()
+		if err != nil {
+			return StmtNone, err
+		}
+		asName := ""
+		if p.match(TOKEN_AS) {
+			asTok, err := p.expect(TOKEN_IDENT)
+			if err != nil {
+				return StmtNone, err
+			}
+			asName = p.tokenText(asTok)
+		}
+		aliases = append(aliases, ASTAlias{Name: name, AsName: asName})
+		if !p.match(TOKEN_COMMA) {
+			break
+		}
+	}
+	p.match(TOKEN_SEMI)
+	p.match(TOKEN_NEWLINE)
+
+	aliasSlice := p.arena.AddAliasSlice(aliases)
+	impIdx := p.arena.AllocImport(ASTImport{Aliases: aliasSlice})
+	return p.arena.AllocStmt(ASTStmt{
+		Kind:  StmtKindImport,
+		Start: startTok.Start,
+		Extra: impIdx,
+	}), nil
+}
+
+func (p *Parser) parseFromImportStmt() (StmtID, error) {
+	startTok, _ := p.expect(TOKEN_FROM)
+	level := 0
+	for p.match(TOKEN_DOT) {
+		level++
+	}
+
+	module := ""
+	if p.cur.Type == TOKEN_IDENT {
+		modName, _, _, err := p.parseDottedName()
+		if err != nil {
+			return StmtNone, err
+		}
+		module = modName
+	}
+
+	if _, err := p.expect(TOKEN_IMPORT); err != nil {
+		return StmtNone, err
+	}
+
+	if p.match(TOKEN_STAR) {
+		p.match(TOKEN_SEMI)
+		p.match(TOKEN_NEWLINE)
+		impFromIdx := p.arena.AllocImportFrom(ASTImportFrom{
+			Module: module,
+			Level:  level,
+			IsStar: true,
+		})
+		return p.arena.AllocStmt(ASTStmt{
+			Kind:  StmtKindImportFrom,
+			Start: startTok.Start,
+			Extra: impFromIdx,
+		}), nil
+	}
+
+	hasParen := p.match(TOKEN_LPAREN)
+	var aliases []ASTAlias
+
+	for {
+		if hasParen {
+			for p.match(TOKEN_NEWLINE) {
+			}
+			if p.match(TOKEN_RPAREN) {
+				break
+			}
+		}
+
+		nameTok, err := p.expect(TOKEN_IDENT)
+		if err != nil {
+			return StmtNone, err
+		}
+		name := p.tokenText(nameTok)
+		asName := ""
+		if p.match(TOKEN_AS) {
+			asTok, err := p.expect(TOKEN_IDENT)
+			if err != nil {
+				return StmtNone, err
+			}
+			asName = p.tokenText(asTok)
+		}
+		aliases = append(aliases, ASTAlias{Name: name, AsName: asName})
+
+		if hasParen {
+			for p.match(TOKEN_NEWLINE) {
+			}
+		}
+
+		if !p.match(TOKEN_COMMA) {
+			if hasParen {
+				for p.match(TOKEN_NEWLINE) {
+				}
+				if _, err := p.expect(TOKEN_RPAREN); err != nil {
+					return StmtNone, err
+				}
+			}
+			break
+		}
+
+		if hasParen {
+			for p.match(TOKEN_NEWLINE) {
+			}
+			if p.match(TOKEN_RPAREN) {
+				break
+			}
+		}
+	}
+
+	p.match(TOKEN_SEMI)
+	p.match(TOKEN_NEWLINE)
+
+	aliasSlice := p.arena.AddAliasSlice(aliases)
+	impFromIdx := p.arena.AllocImportFrom(ASTImportFrom{
+		Module:  module,
+		Level:   level,
+		Aliases: aliasSlice,
+		IsStar:  false,
+	})
+	return p.arena.AllocStmt(ASTStmt{
+		Kind:  StmtKindImportFrom,
+		Start: startTok.Start,
+		Extra: impFromIdx,
 	}), nil
 }
 
@@ -1386,7 +1546,7 @@ func (p *Parser) parseAtom() (ExprID, error) {
 
 func (p *Parser) parseYield() (ExprID, error) {
 	startTok, _ := p.expect(TOKEN_YIELD)
-	if p.cur.Type == TOKEN_IDENT && string(p.src[p.cur.Start:p.cur.End]) == "from" {
+	if p.cur.Type == TOKEN_FROM || (p.cur.Type == TOKEN_IDENT && string(p.src[p.cur.Start:p.cur.End]) == "from") {
 		p.advance() // 'from'
 		sub, err := p.parseExpr()
 		if err != nil {

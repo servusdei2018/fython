@@ -8,6 +8,10 @@ import (
 	"github.com/servusdei2018/fython/pkg/vm"
 )
 
+func init() {
+	vm.DefaultEngine().SetCompileHook(CompileSource)
+}
+
 // LoopContext tracks jump patch locations for break and continue statements.
 type LoopContext struct {
 	LoopStart int
@@ -205,6 +209,49 @@ func (c *Compiler) compileStmt(stmtID StmtID) error {
 
 	case StmtKindGlobal, StmtKindNonlocal:
 		// Handled in symbol table pass
+
+	case StmtKindImport:
+		imp := c.arena.GetImport(stmt.Extra)
+		if imp != nil {
+			for _, alias := range c.arena.GetAliasSlice(imp.Aliases) {
+				_, constIdx := c.constPool.InternName(alias.Name)
+				flagLeaf := uint8(0)
+				if alias.AsName != "" {
+					flagLeaf = 0x80
+				}
+				c.emitOp(vm.OP_IMPORT_NAME, flagLeaf, constIdx)
+				targetName := alias.AsName
+				if targetName == "" {
+					targetName = strings.Split(alias.Name, ".")[0]
+				}
+				if err := c.compileNameStore(targetName); err != nil {
+					return err
+				}
+			}
+		}
+
+	case StmtKindImportFrom:
+		impFrom := c.arena.GetImportFrom(stmt.Extra)
+		if impFrom != nil {
+			_, constIdx := c.constPool.InternName(impFrom.Module)
+			c.emitOp(vm.OP_IMPORT_NAME, 0x80|uint8(impFrom.Level&0x7F), constIdx)
+			if impFrom.IsStar {
+				c.emitOp(vm.OP_IMPORT_STAR, 0, 0)
+			} else {
+				for _, alias := range c.arena.GetAliasSlice(impFrom.Aliases) {
+					_, symIdx := c.constPool.InternName(alias.Name)
+					c.emitOp(vm.OP_IMPORT_FROM, 0, symIdx)
+					targetName := alias.Name
+					if alias.AsName != "" {
+						targetName = alias.AsName
+					}
+					if err := c.compileNameStore(targetName); err != nil {
+						return err
+					}
+				}
+				c.emitOp(vm.OP_POP_TOP, 0, 0)
+			}
+		}
 	}
 
 	return nil

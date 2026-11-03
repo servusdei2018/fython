@@ -241,20 +241,23 @@ var (
 	RangeType       *PyType
 	GeneratorType   *PyType
 	ChanType        *PyType
+	ModuleType      *PyType
 
 	// Built-in exception types
-	BaseExceptionType     *PyType
-	ExceptionType         *PyType
-	TypeErrorType         *PyType
-	ValueErrorType        *PyType
-	KeyErrorType          *PyType
-	IndexErrorType        *PyType
-	ZeroDivisionErrorType *PyType
-	NameErrorType         *PyType
-	AttributeErrorType    *PyType
-	RuntimeErrorType      *PyType
-	StopIterationType     *PyType
-	GeneratorExitType     *PyType
+	BaseExceptionType       *PyType
+	ExceptionType           *PyType
+	TypeErrorType           *PyType
+	ValueErrorType          *PyType
+	KeyErrorType            *PyType
+	IndexErrorType          *PyType
+	ZeroDivisionErrorType   *PyType
+	NameErrorType           *PyType
+	AttributeErrorType      *PyType
+	RuntimeErrorType        *PyType
+	StopIterationType       *PyType
+	GeneratorExitType       *PyType
+	ImportErrorType         *PyType
+	ModuleNotFoundErrorType *PyType
 )
 
 // Pre-interned canonical dunder names used for slot synchronization.
@@ -770,5 +773,31 @@ func typeGetAttr(ctx *ExecContext, typeObj, name Value) Value {
 func typeSetAttr(ctx *ExecContext, typeObj, name, value Value) Value {
 	cls := typeObj.AsType()
 	cls.SetAttr(name, value)
+	return NoneVal()
+}
+
+// moduleGetAttr implements attribute lookup on a *PyModule object.
+func moduleGetAttr(ctx *ExecContext, obj, name Value) Value {
+	mod := obj.AsModule()
+	interned := InternValue(name)
+	if v, ok := mod.Dict.Get(interned); ok {
+		return v
+	}
+	if ModuleType != nil {
+		if descr, _, ok := ModuleType.LookupMRO(interned); ok {
+			if descrGet := descr.Type().Slots.TpDescrGet; descrGet != nil {
+				return descrGet(ctx, descr, obj, ModuleType)
+			}
+			return descr
+		}
+	}
+	panic("val: AttributeError: module '" + mod.Name + "' has no attribute '" + interned.AsString() + "'")
+}
+
+// moduleSetAttr implements attribute assignment on a *PyModule object.
+func moduleSetAttr(ctx *ExecContext, obj, name, value Value) Value {
+	mod := obj.AsModule()
+	interned := InternValue(name)
+	mod.Dict.Set(interned, value)
 	return NoneVal()
 }

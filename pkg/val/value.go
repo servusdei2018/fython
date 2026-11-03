@@ -35,6 +35,7 @@ const (
 	KindGenerator   // Heap-allocated detached generator frame (*PyGenerator)
 	KindRange       // Unboxed range(start, stop) packed in Value.num
 	KindChan        // Heap-allocated Go channel wrapper (*PyChan)
+	KindModule      // Heap-allocated Python module (*PyModule)
 )
 
 // ObjectHeader Flags bitmask constants.
@@ -94,6 +95,8 @@ func (k Kind) String() string {
 		return "range"
 	case KindChan:
 		return "channel"
+	case KindModule:
+		return "module"
 	default:
 		return "unknown"
 	}
@@ -299,6 +302,16 @@ func (v Value) IsGenerator() bool {
 // IsChan reports whether v is a heap-allocated PyChan.
 func (v Value) IsChan() bool {
 	return v.ptr != nil && v.ptr.Kind == KindChan
+}
+
+// IsModule reports whether v is a heap-allocated PyModule.
+func (v Value) IsModule() bool {
+	return v.ptr != nil && v.ptr.Kind == KindModule
+}
+
+// AsModule performs an offset-0 downcast from Value to *PyModule.
+func (v Value) AsModule() *PyModule {
+	return (*PyModule)(unsafe.Pointer(v.ptr))
 }
 
 // IsRange reports whether v is an unboxed range Value.
@@ -585,6 +598,12 @@ func (v Value) String() string {
 		return fmt.Sprintf("range(%d, %d)", start, stop)
 	case KindGenerator:
 		return fmt.Sprintf("<generator object %s at %p>", v.AsGenerator().Name, v.ptr)
+	case KindModule:
+		mod := v.AsModule()
+		if mod.File != "" {
+			return fmt.Sprintf("<module '%s' from '%s'>", mod.Name, mod.File)
+		}
+		return fmt.Sprintf("<module '%s'>", mod.Name)
 	default:
 		return fmt.Sprintf("<%s object at %p>", v.Type().Name, v.ptr)
 	}

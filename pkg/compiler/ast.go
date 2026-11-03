@@ -73,6 +73,8 @@ const (
 	StmtKindTry
 	StmtKindRaise
 	StmtKindWith
+	StmtKindImport
+	StmtKindImportFrom
 )
 
 // ASTStmt represents a flat, unboxed statement node stored in contiguous arena slices.
@@ -183,6 +185,31 @@ type ASTTry struct {
 	Finally  StmtSlice
 }
 
+// ASTAlias stores an imported name and its optional alias.
+type ASTAlias struct {
+	Name   string
+	AsName string
+}
+
+// AliasSlice references a contiguous sequence of ASTAlias inside ASTArena.Aliases.
+type AliasSlice struct {
+	Start uint32
+	Count uint32
+}
+
+// ASTImport stores metadata for an `import ...` statement.
+type ASTImport struct {
+	Aliases AliasSlice
+}
+
+// ASTImportFrom stores metadata for a `from ... import ...` statement.
+type ASTImportFrom struct {
+	Module  string
+	Level   int
+	Aliases AliasSlice
+	IsStar  bool
+}
+
 // ASTArena provides flat, contiguous, typed storage for all AST nodes and auxiliary metadata.
 // Enables zero per-node heap allocations and rapid GC-free reuse via Reset().
 type ASTArena struct {
@@ -205,6 +232,10 @@ type ASTArena struct {
 	ExceptHandlers []ASTExceptHandler
 	WithItems      []ASTWithItem
 	TryStmts       []ASTTry
+	Aliases        []ASTAlias
+	AliasSlices    []AliasSlice
+	Imports        []ASTImport
+	ImportFroms    []ASTImportFrom
 }
 
 // NewASTArena constructs an ASTArena with pre-allocated capacity for zero-allocation parsing.
@@ -232,6 +263,10 @@ func NewASTArena(initialCap int) *ASTArena {
 		ExceptHandlers: make([]ASTExceptHandler, 0, initialCap/8),
 		WithItems:      make([]ASTWithItem, 0, initialCap/8),
 		TryStmts:       make([]ASTTry, 0, initialCap/8),
+		Aliases:        make([]ASTAlias, 0, initialCap/4),
+		AliasSlices:    make([]AliasSlice, 0, initialCap/8),
+		Imports:        make([]ASTImport, 0, initialCap/8),
+		ImportFroms:    make([]ASTImportFrom, 0, initialCap/8),
 	}
 }
 
@@ -256,6 +291,10 @@ func (a *ASTArena) Reset() {
 	a.ExceptHandlers = a.ExceptHandlers[:0]
 	a.WithItems = a.WithItems[:0]
 	a.TryStmts = a.TryStmts[:0]
+	a.Aliases = a.Aliases[:0]
+	a.AliasSlices = a.AliasSlices[:0]
+	a.Imports = a.Imports[:0]
+	a.ImportFroms = a.ImportFroms[:0]
 }
 
 // AllocExpr appends an ASTExpr and returns its 1-based ExprID handle.
@@ -406,4 +445,49 @@ func (a *ASTArena) AddWithSlice(items []ASTWithItem) WithSlice {
 // GetWithSlice retrieves the contiguous ASTWithItems for a WithSlice descriptor.
 func (a *ASTArena) GetWithSlice(s WithSlice) []ASTWithItem {
 	return a.WithItems[s.Start : s.Start+s.Count]
+}
+
+// AddAliasSlice records a contiguous sequence of ASTAlias and returns an AliasSlice descriptor.
+func (a *ASTArena) AddAliasSlice(aliases []ASTAlias) AliasSlice {
+	start := uint32(len(a.Aliases))
+	a.Aliases = append(a.Aliases, aliases...)
+	return AliasSlice{
+		Start: start,
+		Count: uint32(len(aliases)),
+	}
+}
+
+// GetAliasSlice retrieves the contiguous ASTAliases for an AliasSlice descriptor.
+func (a *ASTArena) GetAliasSlice(s AliasSlice) []ASTAlias {
+	return a.Aliases[s.Start : s.Start+s.Count]
+}
+
+// AllocImport records an ASTImport and returns its index.
+func (a *ASTArena) AllocImport(imp ASTImport) uint32 {
+	idx := uint32(len(a.Imports))
+	a.Imports = append(a.Imports, imp)
+	return idx
+}
+
+// GetImport retrieves an ASTImport by index.
+func (a *ASTArena) GetImport(idx uint32) *ASTImport {
+	if int(idx) >= len(a.Imports) {
+		return nil
+	}
+	return &a.Imports[idx]
+}
+
+// AllocImportFrom records an ASTImportFrom and returns its index.
+func (a *ASTArena) AllocImportFrom(imp ASTImportFrom) uint32 {
+	idx := uint32(len(a.ImportFroms))
+	a.ImportFroms = append(a.ImportFroms, imp)
+	return idx
+}
+
+// GetImportFrom retrieves an ASTImportFrom by index.
+func (a *ASTArena) GetImportFrom(idx uint32) *ASTImportFrom {
+	if int(idx) >= len(a.ImportFroms) {
+		return nil
+	}
+	return &a.ImportFroms[idx]
 }
