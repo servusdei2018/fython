@@ -24,12 +24,58 @@ const (
 	OP_BINARY_SUBSCR
 	OP_STORE_SUBSCR
 
+	// Extended Bytecode Operations for Phase 4
+	OP_POP_TOP
+	OP_DUP_TOP
+	OP_LOAD_GLOBAL
+	OP_STORE_GLOBAL
+	OP_LOAD_DEREF
+	OP_STORE_DEREF
+	OP_MAKE_FUNCTION
+	OP_GET_ITER
+	OP_FOR_ITER
+	OP_BUILD_LIST
+	OP_LIST_APPEND
+	OP_BUILD_MAP
+	OP_MAP_ADD
+	OP_BUILD_TUPLE
+	OP_BUILD_CLASS
+	OP_UNPACK_SEQUENCE
+	OP_COMPARE_OP
+	OP_BINARY_TRUE_DIV
+	OP_BINARY_FLOOR_DIV
+	OP_BINARY_MOD
+	OP_BINARY_POW
+	OP_UNARY_NEGATIVE
+	OP_UNARY_NOT
+	OP_JUMP_IF_TRUE
+	OP_JUMP_IF_FALSE_OR_POP
+	OP_JUMP_IF_TRUE_OR_POP
+	OP_LOAD_CLOSURE
+
 	// Quickened (PEP 659 Adaptive) Operations
 	OP_BINARY_ADD_INT
 	OP_BINARY_ADD_FLOAT
 	OP_BINARY_SUB_INT
 	OP_COMPARE_LT_INT
 )
+
+// Comparison operation codes for OP_COMPARE_OP (passed in ArgA field).
+const (
+	CMP_LT uint8 = iota
+	CMP_LTE
+	CMP_EQ
+	CMP_NEQ
+	CMP_GT
+	CMP_GTE
+	CMP_IN
+	CMP_NOT_IN
+	CMP_IS
+	CMP_IS_NOT
+)
+
+// CallFromStack is the sentinel value for ArgBx indicating OP_CALL callee is at stack[sp-argc-1].
+const CallFromStack uint16 = 0xFFFF
 
 // String returns the mnemonic name of the Opcode.
 func (op Opcode) String() string {
@@ -70,6 +116,60 @@ func (op Opcode) String() string {
 		return "OP_BINARY_SUBSCR"
 	case OP_STORE_SUBSCR:
 		return "OP_STORE_SUBSCR"
+	case OP_POP_TOP:
+		return "OP_POP_TOP"
+	case OP_DUP_TOP:
+		return "OP_DUP_TOP"
+	case OP_LOAD_GLOBAL:
+		return "OP_LOAD_GLOBAL"
+	case OP_STORE_GLOBAL:
+		return "OP_STORE_GLOBAL"
+	case OP_LOAD_DEREF:
+		return "OP_LOAD_DEREF"
+	case OP_STORE_DEREF:
+		return "OP_STORE_DEREF"
+	case OP_MAKE_FUNCTION:
+		return "OP_MAKE_FUNCTION"
+	case OP_GET_ITER:
+		return "OP_GET_ITER"
+	case OP_FOR_ITER:
+		return "OP_FOR_ITER"
+	case OP_BUILD_LIST:
+		return "OP_BUILD_LIST"
+	case OP_LIST_APPEND:
+		return "OP_LIST_APPEND"
+	case OP_BUILD_MAP:
+		return "OP_BUILD_MAP"
+	case OP_MAP_ADD:
+		return "OP_MAP_ADD"
+	case OP_BUILD_TUPLE:
+		return "OP_BUILD_TUPLE"
+	case OP_BUILD_CLASS:
+		return "OP_BUILD_CLASS"
+	case OP_UNPACK_SEQUENCE:
+		return "OP_UNPACK_SEQUENCE"
+	case OP_COMPARE_OP:
+		return "OP_COMPARE_OP"
+	case OP_BINARY_TRUE_DIV:
+		return "OP_BINARY_TRUE_DIV"
+	case OP_BINARY_FLOOR_DIV:
+		return "OP_BINARY_FLOOR_DIV"
+	case OP_BINARY_MOD:
+		return "OP_BINARY_MOD"
+	case OP_BINARY_POW:
+		return "OP_BINARY_POW"
+	case OP_UNARY_NEGATIVE:
+		return "OP_UNARY_NEGATIVE"
+	case OP_UNARY_NOT:
+		return "OP_UNARY_NOT"
+	case OP_JUMP_IF_TRUE:
+		return "OP_JUMP_IF_TRUE"
+	case OP_JUMP_IF_FALSE_OR_POP:
+		return "OP_JUMP_IF_FALSE_OR_POP"
+	case OP_JUMP_IF_TRUE_OR_POP:
+		return "OP_JUMP_IF_TRUE_OR_POP"
+	case OP_LOAD_CLOSURE:
+		return "OP_LOAD_CLOSURE"
 	case OP_BINARY_ADD_INT:
 		return "OP_BINARY_ADD_INT"
 	case OP_BINARY_ADD_FLOAT:

@@ -29,6 +29,7 @@ type PyFunction struct {
 	Code       Value
 	Defaults   []Value
 	KwDefaults *PyDict
+	Closure    []Value
 }
 
 // PyBoundMethod represents a first-class bound method object allocated on the heap ONLY when
@@ -112,6 +113,21 @@ func NewFunctionVal(name string, codeVal Value, defaults ...Value) Value {
 		Name:     name,
 		Code:     codeVal,
 		Defaults: defaults,
+	}
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+// NewFunctionValWithClosure constructs a heap-allocated KindFunction Value with closure cells.
+func NewFunctionValWithClosure(name string, codeVal Value, defaults []Value, closure []Value) Value {
+	obj := &PyFunction{
+		Header: ObjectHeader{
+			Kind: KindFunction,
+			Type: FunctionType,
+		},
+		Name:     name,
+		Code:     codeVal,
+		Defaults: defaults,
+		Closure:  closure,
 	}
 	return Value{num: 0, ptr: &obj.Header}
 }
@@ -575,6 +591,9 @@ func initTypes() {
 	SuperType = MustNewType("super", []*PyType{ObjectType}, nil)
 	SuperType.Slots.TpGetAttr = superGetAttr
 
+	CellType = MustNewType("cell", []*PyType{ObjectType}, nil)
+	IterType = MustNewType("iterator", []*PyType{ObjectType}, nil)
+
 	// 4. Populate static lookup table and sentinel headers.
 	builtinTypes[KindNone] = NoneType
 	builtinTypes[KindBool] = BoolType
@@ -594,6 +613,8 @@ func initTypes() {
 	builtinTypes[KindProperty] = PropertyType
 	builtinTypes[KindSuper] = SuperType
 	builtinTypes[KindTuple] = TupleType
+	builtinTypes[KindCell] = CellType
+	builtinTypes[KindIter] = IterType
 
 	tagNone.Type = NoneType
 	tagBool.Type = BoolType

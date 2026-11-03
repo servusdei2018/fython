@@ -1,7 +1,10 @@
 package val
 
 import (
+	"fmt"
 	"math"
+	"strconv"
+	"strings"
 	"unsafe"
 )
 
@@ -27,6 +30,8 @@ const (
 	KindProperty    // Heap-allocated @property data descriptor (*PyProperty)
 	KindSuper       // Heap-allocated super() proxy object (*PySuper)
 	KindTuple       // Heap-allocated immutable tuple (*PyTuple)
+	KindCell        // Heap-allocated closure Cell (*PyCell)
+	KindIter        // Heap-allocated sequence/generator iterator (*PyIter)
 )
 
 // ObjectHeader Flags bitmask constants.
@@ -76,6 +81,10 @@ func (k Kind) String() string {
 		return "super"
 	case KindTuple:
 		return "tuple"
+	case KindCell:
+		return "cell"
+	case KindIter:
+		return "iterator"
 	default:
 		return "unknown"
 	}
@@ -262,6 +271,16 @@ func (v Value) IsTuple() bool {
 	return v.ptr.Kind == KindTuple
 }
 
+// IsCell reports whether v is a heap-allocated PyCell.
+func (v Value) IsCell() bool {
+	return v.ptr.Kind == KindCell
+}
+
+// IsIter reports whether v is a heap-allocated PyIter.
+func (v Value) IsIter() bool {
+	return v.ptr.Kind == KindIter
+}
+
 // IsDataDescriptor reports whether v has FlagDataDescriptor set in its ObjectHeader.
 func (v Value) IsDataDescriptor() bool {
 	return (v.ptr.Flags & FlagDataDescriptor) != 0
@@ -445,4 +464,76 @@ func HashValue(v Value) uint32 {
 		return mix64To32(math.Float64bits(f))
 	}
 	return mix64To32(uint64(uintptr(unsafe.Pointer(v.ptr))))
+}
+
+// String returns the Python string representation of Value.
+func (v Value) String() string {
+	switch v.Kind() {
+	case KindNone:
+		return "None"
+	case KindBool:
+		if v.AsBool() {
+			return "True"
+		}
+		return "False"
+	case KindInt64:
+		return strconv.FormatInt(v.AsInt64(), 10)
+	case KindFloat64:
+		return strconv.FormatFloat(v.AsFloat64(), 'g', -1, 64)
+	case KindInlineStr, KindString:
+		return v.AsString()
+	case KindList:
+		var sb strings.Builder
+		sb.WriteString("[")
+		items := v.AsList().Items
+		for i, it := range items {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteString(it.String())
+		}
+		sb.WriteString("]")
+		return sb.String()
+	case KindTuple:
+		var sb strings.Builder
+		sb.WriteString("(")
+		items := v.AsTuple().Items
+		for i, it := range items {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteString(it.String())
+		}
+		if len(items) == 1 {
+			sb.WriteString(",")
+		}
+		sb.WriteString(")")
+		return sb.String()
+	case KindDict:
+		var sb strings.Builder
+		sb.WriteString("{")
+		d := v.AsDict()
+		first := true
+		for _, e := range d.Entries {
+			if !e.Key.IsUnbound() {
+				if !first {
+					sb.WriteString(", ")
+				}
+				first = false
+				sb.WriteString(e.Key.String())
+				sb.WriteString(": ")
+				sb.WriteString(e.Value.String())
+			}
+		}
+		sb.WriteString("}")
+		return sb.String()
+	case KindType:
+		return "<class '" + v.AsType().Name + "'>"
+	case KindFunction:
+		return "<function " + v.AsFunction().Name + ">"
+	case KindBuiltinFunc:
+		return "<built-in function " + v.AsBuiltinFunc().Name + ">"
+	default:
+		return fmt.Sprintf("<%s object at %p>", v.Type().Name, v.ptr)
+	}
 }

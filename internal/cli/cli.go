@@ -1,9 +1,12 @@
 package cli
 
 import (
+	"os"
 	"strings"
 
 	"github.com/alecthomas/kong"
+	"github.com/servusdei2018/fython/pkg/compiler"
+	"github.com/servusdei2018/fython/pkg/vm"
 )
 
 // Version is the reported Fython compatibility version string.
@@ -92,10 +95,38 @@ func (c *CLI) Resolve() Invocation {
 }
 
 // Run executes the resolved CLI invocation.
-// Currently it resolves the invocation configuration and exits 0 silently.
 func (c *CLI) Run() error {
-	_ = c.Resolve()
-	return nil
+	inv := c.Resolve()
+	switch inv.Mode {
+	case ModeCommand:
+		if inv.Command != "" {
+			co, err := compiler.CompileString(inv.Command)
+			if err != nil {
+				return err
+			}
+			v := vm.NewVM()
+			v.RunCode(co)
+		}
+		return nil
+	case ModeScript:
+		if inv.Script != "" {
+			if _, err := os.Stat(inv.Script); err == nil {
+				src, err := os.ReadFile(inv.Script)
+				if err != nil {
+					return err
+				}
+				co, err := compiler.CompileSource(src)
+				if err != nil {
+					return err
+				}
+				v := vm.NewVM()
+				v.RunCode(co)
+			}
+		}
+		return nil
+	default:
+		return nil
+	}
 }
 
 // NewParser constructs a configured Kong parser for CLI.

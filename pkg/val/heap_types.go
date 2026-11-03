@@ -52,6 +52,36 @@ type PyDict struct {
 	used       int
 	filled     int
 	indexShift uint8 // 0: uint8 slots, 1: uint16 slots, 2: uint32 slots
+	VersionTag uint64
+}
+
+// PyCell wraps a shared mutable Value on the heap for closures and nonlocal variables.
+// Header MUST be at offset 0.
+type PyCell struct {
+	Header ObjectHeader
+	Value  Value
+}
+
+// IterKind classifies the source collection of a PyIter.
+type IterKind uint8
+
+const (
+	IterKindList IterKind = iota
+	IterKindTuple
+	IterKindDict
+	IterKindRange
+)
+
+// PyIter represents a zero-allocation iterator over lists, tuples, dicts, or ranges.
+// Header MUST be at offset 0.
+type PyIter struct {
+	Header ObjectHeader
+	Kind   IterKind
+	Obj    Value
+	Idx    int
+	Cur    int64
+	Stop   int64
+	Step   int64
 }
 
 // Compile-time assertions that every heap object places Header at offset 0.
@@ -60,6 +90,8 @@ var (
 	_ [0 - unsafe.Offsetof(PyString{}.Header)]byte
 	_ [0 - unsafe.Offsetof(PyList{}.Header)]byte
 	_ [0 - unsafe.Offsetof(PyDict{}.Header)]byte
+	_ [0 - unsafe.Offsetof(PyCell{}.Header)]byte
+	_ [0 - unsafe.Offsetof(PyIter{}.Header)]byte
 )
 
 func init() {
@@ -69,7 +101,9 @@ func init() {
 	if unsafe.Offsetof(PyBigInt{}.Header) != 0 ||
 		unsafe.Offsetof(PyString{}.Header) != 0 ||
 		unsafe.Offsetof(PyList{}.Header) != 0 ||
-		unsafe.Offsetof(PyDict{}.Header) != 0 {
+		unsafe.Offsetof(PyDict{}.Header) != 0 ||
+		unsafe.Offsetof(PyCell{}.Header) != 0 ||
+		unsafe.Offsetof(PyIter{}.Header) != 0 {
 		panic("val: heap object Header must be at offset 0")
 	}
 }
@@ -134,6 +168,94 @@ func (v Value) AsDict() *PyDict {
 	return (*PyDict)(unsafe.Pointer(v.ptr))
 }
 
+// NewCellVal constructs a heap-allocated KindCell Value initialized to v.
+func NewCellVal(v Value) Value {
+	obj := &PyCell{
+		Header: ObjectHeader{Kind: KindCell, Type: CellType},
+		Value:  v,
+	}
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+// AsCell performs a zero-cost offset-0 downcast from Value to *PyCell.
+func (v Value) AsCell() *PyCell {
+	return (*PyCell)(unsafe.Pointer(v.ptr))
+}
+
+// NewIterVal constructs a heap-allocated KindIter Value wrapping an iterable.
+func NewIterVal(obj Value) Value {
+	it := &PyIter{
+		Header: ObjectHeader{Kind: KindIter, Type: IterType},
+		Obj:    obj,
+	}
+	if obj.IsList() {
+		it.Kind = IterKindList
+	} else if obj.IsTuple() {
+		it.Kind = IterKindTuple
+	} else if obj.IsDict() {
+		it.Kind = IterKindDict
+	}
+	return Value{num: 0, ptr: &it.Header}
+}
+
+// NewRangeIterVal constructs a heap-allocated KindIter Value for range(start, stop, step).
+func NewRangeIterVal(start, stop, step int64) Value {
+	it := &PyIter{
+		Header: ObjectHeader{Kind: KindIter, Type: IterType},
+		Kind:   IterKindRange,
+		Cur:    start,
+		Stop:   stop,
+		Step:   step,
+	}
+	return Value{num: 0, ptr: &it.Header}
+}
+
+// AsIter performs a zero-cost offset-0 downcast from Value to *PyIter.
+func (v Value) AsIter() *PyIter {
+	return (*PyIter)(unsafe.Pointer(v.ptr))
+}
+
+// Next advances the iterator and returns the next Value and true, or NoneVal() and false when exhausted.
+func (it *PyIter) Next() (Value, bool) {
+	switch it.Kind {
+	case IterKindList:
+		list := it.Obj.AsList()
+		if it.Idx >= len(list.Items) {
+			return NoneVal(), false
+		}
+		res := list.Items[it.Idx]
+		it.Idx++
+		return res, true
+	case IterKindTuple:
+		tuple := it.Obj.AsTuple()
+		if it.Idx >= len(tuple.Items) {
+			return NoneVal(), false
+		}
+		res := tuple.Items[it.Idx]
+		it.Idx++
+		return res, true
+	case IterKindDict:
+		dict := it.Obj.AsDict()
+		for it.Idx < len(dict.Entries) {
+			entry := &dict.Entries[it.Idx]
+			it.Idx++
+			if entry.Active {
+				return entry.Key, true
+			}
+		}
+		return NoneVal(), false
+	case IterKindRange:
+		if (it.Step > 0 && it.Cur >= it.Stop) || (it.Step < 0 && it.Cur <= it.Stop) {
+			return NoneVal(), false
+		}
+		res := Int64Val(it.Cur)
+		it.Cur += it.Step
+		return res, true
+	default:
+		return NoneVal(), false
+	}
+}
+
 func (d *PyDict) initTable(minEntries int) {
 	tableCap := uint32(8)
 	for int(tableCap)*2 < minEntries*3 {
@@ -151,6 +273,9 @@ func (d *PyDict) initTable(minEntries int) {
 	maxDense := int(tableCap) * 2 / 3
 	if cap(d.Entries) < maxDense {
 		d.Entries = make([]DictEntry, 0, maxDense)
+	}
+	if d.VersionTag == 0 {
+		d.VersionTag = 1
 	}
 }
 
@@ -267,6 +392,7 @@ func (d *PyDict) Set(key, value Value) {
 				e := &d.Entries[int(raw)-dictIndexOffset]
 				if e.Hash == h && e.Active && Equals(e.Key, key) {
 					e.Value = value
+					d.VersionTag++
 					return
 				}
 			}
@@ -289,6 +415,7 @@ func (d *PyDict) Set(key, value Value) {
 				e := &d.Entries[int(raw)-dictIndexOffset]
 				if e.Hash == h && e.Active && Equals(e.Key, key) {
 					e.Value = value
+					d.VersionTag++
 					return
 				}
 			}
@@ -319,6 +446,7 @@ func (d *PyDict) Set(key, value Value) {
 	}
 	d.writeIndex(uint32(insertSlot), uint32(entryIdx+dictIndexOffset))
 	d.used++
+	d.VersionTag++
 }
 
 // Get retrieves a value by key from PyDict with 0 heap allocations.
@@ -385,6 +513,7 @@ func (d *PyDict) Delete(key Value) bool {
 				e.Value = NoneVal()
 				d.writeIndex(slot, dictIndexDummy)
 				d.used--
+				d.VersionTag++
 				return true
 			}
 		}

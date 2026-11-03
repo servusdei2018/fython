@@ -1,6 +1,8 @@
 package vm
 
 import (
+	"fmt"
+
 	"github.com/servusdei2018/fython/pkg/val"
 )
 
@@ -8,12 +10,21 @@ import (
 // Hot loop state (code, consts, ip, baseOffset, sp, stack) is kept in local variables so the Go
 // compiler allocates them to CPU registers across loop iterations.
 func (vm *VM) Run(code []uint32, consts []val.Value, numLocals int) val.Value {
-	return vm.runLoop(code, consts, 0, numLocals, 0)
+	return vm.runLoopWithGlobals(code, consts, 0, numLocals, 0, nil, vm.globals)
 }
 
 // RunCode executes a *CodeObject on the VM.
 func (vm *VM) RunCode(co *CodeObject) val.Value {
-	return vm.runLoop(co.Code, co.Consts, 0, co.NumLocals, 0)
+	return vm.runLoopWithGlobals(co.Code, co.Consts, 0, co.NumLocals, 0, nil, vm.globals)
+}
+
+// RunCodeWithGlobals executes a *CodeObject using a custom module globals dictionary.
+func (vm *VM) RunCodeWithGlobals(co *CodeObject, globals *val.PyDict) val.Value {
+	return vm.runLoopWithGlobals(co.Code, co.Consts, 0, co.NumLocals, 0, nil, globals)
+}
+
+func (vm *VM) runClassBody(co *CodeObject, classDict *val.PyDict) {
+	vm.runLoopWithGlobals(co.Code, co.Consts, 0, co.NumLocals, 0, nil, classDict)
 }
 
 // Vectorcall invokes a Python or native callable using a contiguous argument slice and optional keyword names.
@@ -38,7 +49,8 @@ func (vm *VM) callFromHook(ctx *val.ExecContext, callable val.Value, argBase int
 		co := AsCodeObject(fn.Code)
 		spAfterBind := vm.bindFunctionArgs(co, fn.Defaults, fn.KwDefaults, argBase, nargs, kwnames)
 		savedSP := ctx.SP
-		res := vm.runLoop(co.Code, co.Consts, argBase, spAfterBind, vm.activeFrameIdx)
+		cells := vm.setupCalleeCells(co, callable, argBase, nargs)
+		res := vm.runLoopWithGlobals(co.Code, co.Consts, argBase, spAfterBind, vm.activeFrameIdx, cells, vm.globals)
 		ctx.SP = savedSP
 		return res
 
@@ -46,7 +58,8 @@ func (vm *VM) callFromHook(ctx *val.ExecContext, callable val.Value, argBase int
 		co := AsCodeObject(callable)
 		spAfterBind := vm.bindFunctionArgs(co, nil, nil, argBase, nargs, kwnames)
 		savedSP := ctx.SP
-		res := vm.runLoop(co.Code, co.Consts, argBase, spAfterBind, vm.activeFrameIdx)
+		cells := vm.setupCalleeCells(co, callable, argBase, nargs)
+		res := vm.runLoopWithGlobals(co.Code, co.Consts, argBase, spAfterBind, vm.activeFrameIdx, cells, vm.globals)
 		ctx.SP = savedSP
 		return res
 
@@ -146,13 +159,110 @@ func (vm *VM) bindFunctionArgs(co *CodeObject, defaults []val.Value, kwDefaults 
 	return argBase + numLocals
 }
 
+func (vm *VM) setupCalleeCells(callee *CodeObject, target val.Value, newBase int, argc int) []val.Value {
+	nCells := len(callee.CellVars)
+	nFree := len(callee.FreeVars)
+	if nCells == 0 && nFree == 0 {
+		return nil
+	}
+	res := make([]val.Value, nCells+nFree)
+	for i := 0; i < nCells; i++ {
+		name := callee.CellVars[i]
+		initVal := val.NoneVal()
+		for p := 0; p < len(callee.ParamNames); p++ {
+			if val.StringEquals(callee.ParamNames[p], name) && p < argc {
+				initVal = vm.stack[newBase+p]
+				break
+			}
+		}
+		res[i] = val.NewCellVal(initVal)
+	}
+	if target.IsFunction() {
+		closure := target.AsFunction().Closure
+		for j := 0; j < nFree && j < len(closure); j++ {
+			res[nCells+j] = closure[j]
+		}
+	}
+	return res
+}
+
+func (vm *VM) initBuiltins() {
+	vm.builtins.Set(val.InternString("range"), val.NewBuiltinFuncVal("range", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		var start, stop, step int64
+		step = 1
+		if len(args) == 1 {
+			stop = args[0].AsInt64()
+		} else if len(args) == 2 {
+			start = args[0].AsInt64()
+			stop = args[1].AsInt64()
+		} else if len(args) >= 3 {
+			start = args[0].AsInt64()
+			stop = args[1].AsInt64()
+			step = args[2].AsInt64()
+		}
+		return val.NewRangeIterVal(start, stop, step)
+	}))
+
+	vm.builtins.Set(val.InternString("len"), val.NewBuiltinFuncVal("len", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) == 0 {
+			panic("vm: TypeError: len() takes 1 argument")
+		}
+		a := args[0]
+		if a.IsList() {
+			return val.Int64Val(int64(len(a.AsList().Items)))
+		}
+		if a.IsTuple() {
+			return val.Int64Val(int64(len(a.AsTuple().Items)))
+		}
+		if a.IsDict() {
+			return val.Int64Val(int64(a.AsDict().Len()))
+		}
+		if a.IsAnyString() {
+			return val.Int64Val(int64(a.StringLen()))
+		}
+		if sqLen := a.Type().Slots.SqLen; sqLen != nil {
+			return val.Int64Val(sqLen(ctx, a))
+		}
+		panic("vm: TypeError: object of type '" + a.Type().Name + "' has no len()")
+	}))
+
+	vm.builtins.Set(val.InternString("print"), val.NewBuiltinFuncVal("print", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		for i, arg := range args {
+			if i > 0 {
+				fmt.Print(" ")
+			}
+			fmt.Print(arg.String())
+		}
+		fmt.Println()
+		return val.NoneVal()
+	}))
+
+	vm.builtins.Set(val.InternString("int"), val.TypeVal(val.IntType))
+	vm.builtins.Set(val.InternString("float"), val.TypeVal(val.FloatType))
+	vm.builtins.Set(val.InternString("str"), val.TypeVal(val.StrType))
+	vm.builtins.Set(val.InternString("list"), val.TypeVal(val.ListType))
+	vm.builtins.Set(val.InternString("dict"), val.TypeVal(val.DictType))
+	vm.builtins.Set(val.InternString("bool"), val.TypeVal(val.BoolType))
+	vm.builtins.Set(val.InternString("tuple"), val.TypeVal(val.TupleType))
+	vm.builtins.Set(val.InternString("object"), val.TypeVal(val.ObjectType))
+}
+
 func (vm *VM) runLoop(code []uint32, consts []val.Value, startBase int, startSP int, startFrameIdx int) val.Value {
+	return vm.runLoopWithGlobals(code, consts, startBase, startSP, startFrameIdx, nil, vm.globals)
+}
+
+func (vm *VM) runLoopWithGlobals(code []uint32, consts []val.Value, startBase int, startSP int, startFrameIdx int, startCells []val.Value, startGlobals *val.PyDict) val.Value {
 	stack := vm.stack
 
 	frameIdx := startFrameIdx
 	baseOffset := startBase
 	sp := startSP
 	ip := 0
+	cells := startCells
+	globals := startGlobals
+	if globals == nil {
+		globals = vm.globals
+	}
 
 	for {
 		inst := code[ip]
@@ -403,11 +513,14 @@ func (vm *VM) runLoop(code []uint32, consts []val.Value, startBase int, startSP 
 					ip:         ip + 1,
 					baseOffset: baseOffset,
 					retSP:      retSP,
+					cells:      cells,
+					globals:    globals,
 				}
 				frameIdx++
 				code = callee.Code
 				consts = callee.Consts
 				baseOffset = newBase
+				cells = vm.setupCalleeCells(callee, target, newBase, argc)
 				numLocalsCallee := callee.NumLocals
 				if numLocalsCallee < argc {
 					numLocalsCallee = argc
@@ -424,12 +537,15 @@ func (vm *VM) runLoop(code []uint32, consts []val.Value, startBase int, startSP 
 					ip:         ip + 1,
 					baseOffset: baseOffset,
 					retSP:      retSP,
+					cells:      cells,
+					globals:    globals,
 				}
 				frameIdx++
 				sp = vm.bindFunctionArgs(callee, fn.Defaults, fn.KwDefaults, newBase, argc, nil)
 				code = callee.Code
 				consts = callee.Consts
 				baseOffset = newBase
+				cells = vm.setupCalleeCells(callee, target, newBase, argc)
 				ip = 0
 
 			case val.KindBuiltinFunc:
@@ -469,12 +585,15 @@ func (vm *VM) runLoop(code []uint32, consts []val.Value, startBase int, startSP 
 					ip:         ip + 1,
 					baseOffset: baseOffset,
 					retSP:      retSP,
+					cells:      cells,
+					globals:    globals,
 				}
 				frameIdx++
 				sp = vm.bindFunctionArgs(callee, fn.Defaults, fn.KwDefaults, newBase, totalArgs, kwnames)
 				code = callee.Code
 				consts = callee.Consts
 				baseOffset = newBase
+				cells = vm.setupCalleeCells(callee, target, newBase, totalArgs)
 				ip = 0
 
 			case val.KindCode:
@@ -485,12 +604,15 @@ func (vm *VM) runLoop(code []uint32, consts []val.Value, startBase int, startSP 
 					ip:         ip + 1,
 					baseOffset: baseOffset,
 					retSP:      retSP,
+					cells:      cells,
+					globals:    globals,
 				}
 				frameIdx++
 				sp = vm.bindFunctionArgs(callee, nil, nil, newBase, totalArgs, kwnames)
 				code = callee.Code
 				consts = callee.Consts
 				baseOffset = newBase
+				cells = vm.setupCalleeCells(callee, target, newBase, totalArgs)
 				ip = 0
 
 			case val.KindBuiltinFunc:
@@ -572,6 +694,8 @@ func (vm *VM) runLoop(code []uint32, consts []val.Value, startBase int, startSP 
 					ip:         ip + 1,
 					baseOffset: baseOffset,
 					retSP:      retSP,
+					cells:      cells,
+					globals:    globals,
 				}
 				frameIdx++
 				if totalArgs < callee.NumParams && len(fn.Defaults) > 0 {
@@ -586,6 +710,7 @@ func (vm *VM) runLoop(code []uint32, consts []val.Value, startBase int, startSP 
 				code = callee.Code
 				consts = callee.Consts
 				baseOffset = newBase
+				cells = vm.setupCalleeCells(callee, callable, newBase, totalArgs)
 				ip = 0
 
 			case val.KindCode:
@@ -596,11 +721,14 @@ func (vm *VM) runLoop(code []uint32, consts []val.Value, startBase int, startSP 
 					ip:         ip + 1,
 					baseOffset: baseOffset,
 					retSP:      retSP,
+					cells:      cells,
+					globals:    globals,
 				}
 				frameIdx++
 				code = callee.Code
 				consts = callee.Consts
 				baseOffset = newBase
+				cells = vm.setupCalleeCells(callee, callable, newBase, totalArgs)
 				numLocalsCallee := callee.NumLocals
 				if numLocalsCallee < totalArgs {
 					numLocalsCallee = totalArgs
@@ -638,6 +766,8 @@ func (vm *VM) runLoop(code []uint32, consts []val.Value, startBase int, startSP 
 			consts = caller.consts
 			ip = caller.ip
 			baseOffset = caller.baseOffset
+			cells = caller.cells
+			globals = caller.globals
 			stack[caller.retSP] = retVal
 			sp = caller.retSP + 1
 
@@ -709,6 +839,313 @@ func (vm *VM) runLoop(code []uint32, consts []val.Value, startBase int, startSP 
 			}
 			sp -= 2
 			ip++
+
+		case OP_POP_TOP:
+			sp--
+			ip++
+
+		case OP_DUP_TOP:
+			stack[sp] = stack[sp-1]
+			sp++
+			ip++
+
+		case OP_LOAD_GLOBAL:
+			bx := uint16(inst)
+			nameVal := consts[bx]
+			globVer := globals.VersionTag
+			entry := &vm.ic[ip]
+			if entry.CodePtr == &code[0] && entry.ExpectedGlobalsVer == globVer {
+				if entry.Kind == ICKindGlobal {
+					stack[sp] = entry.CachedVal
+					sp++
+					ip++
+					continue
+				}
+				if entry.Kind == ICKindBuiltin && entry.ExpectedBuiltinsVer == vm.builtins.VersionTag {
+					stack[sp] = entry.CachedVal
+					sp++
+					ip++
+					continue
+				}
+			}
+			if v, ok := globals.Get(nameVal); ok {
+				entry.Kind = ICKindGlobal
+				entry.ExpectedGlobalsVer = globVer
+				entry.CodePtr = &code[0]
+				entry.CachedVal = v
+				stack[sp] = v
+				sp++
+				ip++
+				continue
+			}
+			if v, ok := vm.builtins.Get(nameVal); ok {
+				entry.Kind = ICKindBuiltin
+				entry.ExpectedGlobalsVer = globVer
+				entry.ExpectedBuiltinsVer = vm.builtins.VersionTag
+				entry.CodePtr = &code[0]
+				entry.CachedVal = v
+				stack[sp] = v
+				sp++
+				ip++
+				continue
+			}
+			panic("vm: NameError: name '" + nameVal.AsString() + "' is not defined")
+
+		case OP_STORE_GLOBAL:
+			bx := uint16(inst)
+			nameVal := consts[bx]
+			sp--
+			globals.Set(nameVal, stack[sp])
+			ip++
+
+		case OP_LOAD_DEREF:
+			bx := int(uint16(inst))
+			stack[sp] = cells[bx].AsCell().Value
+			sp++
+			ip++
+
+		case OP_STORE_DEREF:
+			bx := int(uint16(inst))
+			sp--
+			cells[bx].AsCell().Value = stack[sp]
+			ip++
+
+		case OP_LOAD_CLOSURE:
+			bx := int(uint16(inst))
+			stack[sp] = cells[bx]
+			sp++
+			ip++
+
+		case OP_MAKE_FUNCTION:
+			flags := uint8(inst >> 16)
+			sp--
+			codeVal := stack[sp]
+			var closureSlice []val.Value
+			if (flags & 0x01) != 0 {
+				sp--
+				closureVal := stack[sp]
+				closureSlice = closureVal.AsTuple().Items
+			}
+			var defaultsSlice []val.Value
+			if (flags & 0x02) != 0 {
+				sp--
+				defVal := stack[sp]
+				defaultsSlice = defVal.AsTuple().Items
+			}
+			callee := AsCodeObject(codeVal)
+			fnVal := val.NewFunctionValWithClosure(callee.Name, codeVal, defaultsSlice, closureSlice)
+			stack[sp] = fnVal
+			sp++
+			ip++
+
+		case OP_GET_ITER:
+			top := stack[sp-1]
+			if !top.IsIter() {
+				stack[sp-1] = val.NewIterVal(top)
+			}
+			ip++
+
+		case OP_FOR_ITER:
+			it := stack[sp-1].AsIter()
+			if nextVal, ok := it.Next(); ok {
+				stack[sp] = nextVal
+				sp++
+				ip++
+			} else {
+				sp--
+				ip = int(uint16(inst))
+			}
+
+		case OP_BUILD_LIST:
+			count := int(uint16(inst))
+			items := make([]val.Value, count)
+			copy(items, stack[sp-count:sp])
+			sp -= count
+			stack[sp] = val.NewListVal(items...)
+			sp++
+			ip++
+
+		case OP_LIST_APPEND:
+			depth := int(uint16(inst))
+			listVal := stack[sp-depth-1]
+			item := stack[sp-1]
+			sp--
+			l := listVal.AsList()
+			l.Items = append(l.Items, item)
+			ip++
+
+		case OP_BUILD_MAP:
+			count := int(uint16(inst))
+			dictVal := val.NewDictVal(count)
+			d := dictVal.AsDict()
+			for i := sp - count*2; i < sp; i += 2 {
+				d.Set(stack[i], stack[i+1])
+			}
+			sp -= count * 2
+			stack[sp] = dictVal
+			sp++
+			ip++
+
+		case OP_MAP_ADD:
+			depth := int(uint16(inst))
+			dictVal := stack[sp-depth-1]
+			v := stack[sp-1]
+			k := stack[sp-2]
+			sp -= 2
+			dictVal.AsDict().Set(k, v)
+			ip++
+
+		case OP_BUILD_TUPLE:
+			count := int(uint16(inst))
+			items := make([]val.Value, count)
+			copy(items, stack[sp-count:sp])
+			sp -= count
+			stack[sp] = val.NewTupleVal(items...)
+			sp++
+			ip++
+
+		case OP_BUILD_CLASS:
+			basesVal := stack[sp-1]
+			nameVal := stack[sp-2]
+			classBody := stack[sp-3]
+			sp -= 3
+
+			classDict := val.NewDictVal(8).AsDict()
+			var bases []*val.PyType
+			if basesVal.IsTuple() {
+				for _, b := range basesVal.AsTuple().Items {
+					if b.IsType() {
+						bases = append(bases, b.AsType())
+					}
+				}
+			} else if basesVal.IsType() {
+				bases = []*val.PyType{basesVal.AsType()}
+			}
+
+			if classBody.Kind() == val.KindCode {
+				vm.runClassBody(AsCodeObject(classBody), classDict)
+			} else if classBody.IsFunction() {
+				vm.runClassBody(AsCodeObject(classBody.AsFunction().Code), classDict)
+			}
+
+			newCls := val.MustNewType(nameVal.AsString(), bases, classDict)
+			stack[sp] = val.TypeVal(newCls)
+			sp++
+			ip++
+
+		case OP_UNPACK_SEQUENCE:
+			count := int(uint16(inst))
+			sp--
+			seq := stack[sp]
+			var items []val.Value
+			if seq.IsTuple() {
+				items = seq.AsTuple().Items
+			} else if seq.IsList() {
+				items = seq.AsList().Items
+			} else {
+				panic("vm: TypeError: cannot unpack non-iterable object")
+			}
+			if len(items) != count {
+				panic("vm: ValueError: not enough or too many values to unpack")
+			}
+			for i := count - 1; i >= 0; i-- {
+				stack[sp] = items[i]
+				sp++
+			}
+			ip++
+
+		case OP_COMPARE_OP:
+			cmpOp := uint8(inst >> 16)
+			b := stack[sp-1]
+			a := stack[sp-2]
+			var res val.Value
+			switch cmpOp {
+			case CMP_LT:
+				res = val.LessThan(a, b)
+			case CMP_LTE:
+				res = val.LessOrEqual(a, b)
+			case CMP_EQ:
+				res = val.BoolVal(val.Equals(a, b))
+			case CMP_NEQ:
+				res = val.NotEquals(a, b)
+			case CMP_GT:
+				res = val.GreaterThan(a, b)
+			case CMP_GTE:
+				res = val.GreaterOrEqual(a, b)
+			case CMP_IN:
+				res = val.In(a, b)
+			case CMP_NOT_IN:
+				res = val.NotIn(a, b)
+			case CMP_IS:
+				res = val.Is(a, b)
+			case CMP_IS_NOT:
+				res = val.IsNot(a, b)
+			default:
+				panic("vm: unknown comparison op")
+			}
+			stack[sp-2] = res
+			sp--
+			ip++
+
+		case OP_BINARY_TRUE_DIV:
+			stack[sp-2] = val.TrueDiv(stack[sp-2], stack[sp-1])
+			sp--
+			ip++
+
+		case OP_BINARY_FLOOR_DIV:
+			stack[sp-2] = val.FloorDiv(stack[sp-2], stack[sp-1])
+			sp--
+			ip++
+
+		case OP_BINARY_MOD:
+			stack[sp-2] = val.Mod(stack[sp-2], stack[sp-1])
+			sp--
+			ip++
+
+		case OP_BINARY_POW:
+			stack[sp-2] = val.Pow(stack[sp-2], stack[sp-1])
+			sp--
+			ip++
+
+		case OP_UNARY_NEGATIVE:
+			v := stack[sp-1]
+			if v.IsInt64() {
+				stack[sp-1] = val.Int64Val(-v.AsInt64())
+			} else if v.IsFloat64() {
+				stack[sp-1] = val.Float64Val(-v.AsFloat64())
+			} else {
+				stack[sp-1] = val.Sub(val.Int64Val(0), v)
+			}
+			ip++
+
+		case OP_UNARY_NOT:
+			stack[sp-1] = val.BoolVal(!stack[sp-1].IsTruthy())
+			ip++
+
+		case OP_JUMP_IF_TRUE:
+			sp--
+			cond := stack[sp]
+			if cond.AsBool() {
+				ip = int(uint16(inst))
+			} else {
+				ip++
+			}
+
+		case OP_JUMP_IF_FALSE_OR_POP:
+			if !stack[sp-1].IsTruthy() {
+				ip = int(uint16(inst))
+			} else {
+				sp--
+				ip++
+			}
+
+		case OP_JUMP_IF_TRUE_OR_POP:
+			if stack[sp-1].IsTruthy() {
+				ip = int(uint16(inst))
+			} else {
+				sp--
+				ip++
+			}
 
 		default:
 			panic("vm: unknown opcode")

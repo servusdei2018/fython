@@ -201,6 +201,8 @@ var (
 	BoundMethodType *PyType
 	PropertyType    *PyType
 	SuperType       *PyType
+	CellType        *PyType
+	IterType        *PyType
 )
 
 // Pre-interned canonical dunder names used for slot synchronization.

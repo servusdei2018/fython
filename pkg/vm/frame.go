@@ -24,17 +24,22 @@ const (
 	ICKindClassMethod           // Hit on PyType MRO method (CachedVal holds raw callable)
 	ICKindDataDescriptor        // Hit on PyType MRO data descriptor (CachedVal holds descriptor)
 	ICKindClassAttr             // Hit on PyType MRO non-descriptor class attribute
+	ICKindGlobal                // Hit on module globals dict
+	ICKindBuiltin               // Hit on builtins dict fallback
 )
 
 // ICSlot caches [ExpectedShapeID, ExpectedTypeVer, SlotIndex, CachedVal] for O(1)
 // zero-allocation attribute and method lookup in OP_LOAD_ATTR, OP_STORE_ATTR, and OP_LOAD_METHOD.
+// Also caches [ExpectedGlobalsVer, ExpectedBuiltinsVer, CachedVal] for OP_LOAD_GLOBAL.
 type ICSlot struct {
-	ExpectedShapeID uint32
-	Kind            ICKind
-	SlotIndex       int
-	ExpectedTypeVer uint64
-	CodePtr         *uint32
-	CachedVal       val.Value
+	ExpectedShapeID     uint32
+	Kind                ICKind
+	SlotIndex           int
+	ExpectedTypeVer     uint64
+	CodePtr             *uint32
+	CachedVal           val.Value
+	ExpectedGlobalsVer  uint64
+	ExpectedBuiltinsVer uint64
 }
 
 // CallFrame is an unboxed value struct stored in the contiguous VM.frames slab.
@@ -45,6 +50,8 @@ type CallFrame struct {
 	ip         int
 	baseOffset int
 	retSP      int // Caller's stack pointer where the return value will be written
+	cells      []val.Value
+	globals    *val.PyDict
 }
 
 // CodeObject represents a compiled function or module bytecode unit.
@@ -56,6 +63,8 @@ type CodeObject struct {
 	Code       []uint32
 	Consts     []val.Value
 	ParamNames []val.Value
+	CellVars   []val.Value
+	FreeVars   []val.Value
 	NumLocals  int
 	NumParams  int
 }
@@ -86,6 +95,8 @@ type VM struct {
 	activeFrameIdx int
 	kwScratch      [64]val.Value
 	kwSet          [64]bool
+	globals        *val.PyDict
+	builtins       *val.PyDict
 }
 
 // NewVM allocates a new VM with default contiguous stack (4096 Values), frame (256 CallFrames),
@@ -107,10 +118,33 @@ func NewVMWithCapacity(stackCap, frameCap int) *VM {
 		frames:     make([]CallFrame, frameCap),
 		ic:         make([]ICSlot, DefaultICSlabSize),
 		internPool: val.NewInternPool(256),
+		globals:    val.NewDictVal(64).AsDict(),
+		builtins:   val.NewDictVal(64).AsDict(),
 	}
 	v.execCtx.Stack = v.stack
 	v.execCtx.CallHook = v.callFromHook
+	v.initBuiltins()
 	return v
+}
+
+// Globals returns the VM's active module globals dictionary.
+func (vm *VM) Globals() *val.PyDict {
+	return vm.globals
+}
+
+// Builtins returns the VM's builtins dictionary.
+func (vm *VM) Builtins() *val.PyDict {
+	return vm.builtins
+}
+
+// SetGlobal assigns a variable in the VM's module globals dictionary.
+func (vm *VM) SetGlobal(name string, v val.Value) {
+	vm.globals.Set(val.InternString(name), v)
+}
+
+// GetGlobal resolves a variable from the VM's module globals dictionary.
+func (vm *VM) GetGlobal(name string) (val.Value, bool) {
+	return vm.globals.Get(val.InternString(name))
 }
 
 // Intern canonicalizes an identifier, attribute name, or string constant in the VM's intern pool.

@@ -4,6 +4,7 @@ import (
 	"math"
 	"math/big"
 	"math/bits"
+	"strings"
 )
 
 // Add performs overflow-safe Python addition (a + b) without an explicit VM context.
@@ -386,4 +387,173 @@ func toFloat64(v Value) float64 {
 		return f
 	}
 	panic("val: cannot convert value to float64")
+}
+
+// FloorDiv performs Python floor division (a // b).
+func FloorDiv(a, b Value) Value {
+	if (a.ptr == &tagInt64 || a.ptr == &tagBool) && (b.ptr == &tagInt64 || b.ptr == &tagBool) {
+		ai := int64(a.num)
+		bi := int64(b.num)
+		if bi == 0 {
+			panic("vm: ZeroDivisionError: integer division or modulo by zero")
+		}
+		res := ai / bi
+		rem := ai % bi
+		if (rem != 0) && ((ai < 0) != (bi < 0)) {
+			res--
+		}
+		return Int64Val(res)
+	}
+	if a.ptr == &tagFloat64 || b.ptr == &tagFloat64 {
+		af := toFloat64(a)
+		bf := toFloat64(b)
+		if bf == 0 {
+			panic("vm: ZeroDivisionError: float floor division by zero")
+		}
+		return Float64Val(math.Floor(af / bf))
+	}
+	panic("val.FloorDiv: unsupported operand types")
+}
+
+// TrueDiv performs Python true division (a / b).
+func TrueDiv(a, b Value) Value {
+	bf := toFloat64(b)
+	if bf == 0 {
+		panic("vm: ZeroDivisionError: division by zero")
+	}
+	af := toFloat64(a)
+	return Float64Val(af / bf)
+}
+
+// Mod performs Python modulo operation (a % b).
+func Mod(a, b Value) Value {
+	if (a.ptr == &tagInt64 || a.ptr == &tagBool) && (b.ptr == &tagInt64 || b.ptr == &tagBool) {
+		ai := int64(a.num)
+		bi := int64(b.num)
+		if bi == 0 {
+			panic("vm: ZeroDivisionError: integer modulo by zero")
+		}
+		rem := ai % bi
+		if (rem != 0) && ((rem < 0) != (bi < 0)) {
+			rem += bi
+		}
+		return Int64Val(rem)
+	}
+	if a.ptr == &tagFloat64 || b.ptr == &tagFloat64 {
+		af := toFloat64(a)
+		bf := toFloat64(b)
+		if bf == 0 {
+			panic("vm: ZeroDivisionError: float modulo by zero")
+		}
+		rem := math.Mod(af, bf)
+		if (rem != 0) && ((rem < 0) != (bf < 0)) {
+			rem += bf
+		}
+		return Float64Val(rem)
+	}
+	panic("val.Mod: unsupported operand types")
+}
+
+// Pow performs Python exponentiation (a ** b).
+func Pow(a, b Value) Value {
+	if (a.ptr == &tagInt64 || a.ptr == &tagBool) && (b.ptr == &tagInt64 || b.ptr == &tagBool) {
+		ai := int64(a.num)
+		bi := int64(b.num)
+		if bi >= 0 && bi <= 62 {
+			res := int64(1)
+			base := ai
+			exp := bi
+			overflow := false
+			for exp > 0 {
+				if exp&1 != 0 {
+					hi, lo := mul64Signed(res, base)
+					if hi != (int64(lo) >> 63) {
+						overflow = true
+						break
+					}
+					res = int64(lo)
+				}
+				exp >>= 1
+				if exp > 0 {
+					hi, lo := mul64Signed(base, base)
+					if hi != (int64(lo) >> 63) {
+						overflow = true
+						break
+					}
+					base = int64(lo)
+				}
+			}
+			if !overflow {
+				return Int64Val(res)
+			}
+		}
+	}
+	af := toFloat64(a)
+	bf := toFloat64(b)
+	return Float64Val(math.Pow(af, bf))
+}
+
+// GreaterThan performs Python greater-than comparison (a > b).
+func GreaterThan(a, b Value) Value {
+	return LessThan(b, a)
+}
+
+// LessOrEqual performs Python less-or-equal comparison (a <= b).
+func LessOrEqual(a, b Value) Value {
+	return BoolVal(!GreaterThan(a, b).AsBool())
+}
+
+// GreaterOrEqual performs Python greater-or-equal comparison (a >= b).
+func GreaterOrEqual(a, b Value) Value {
+	return BoolVal(!LessThan(a, b).AsBool())
+}
+
+// NotEquals performs Python inequality comparison (a != b).
+func NotEquals(a, b Value) Value {
+	return BoolVal(!Equals(a, b))
+}
+
+// Is performs Python identity comparison (a is b).
+func Is(a, b Value) Value {
+	return BoolVal(a.ptr == b.ptr && a.num == b.num)
+}
+
+// IsNot performs Python inverted identity comparison (a is not b).
+func IsNot(a, b Value) Value {
+	return BoolVal(a.ptr != b.ptr || a.num != b.num)
+}
+
+// In performs Python containment test (item in container).
+func In(item, container Value) Value {
+	if container.IsList() {
+		items := container.AsList().Items
+		for i := 0; i < len(items); i++ {
+			if Equals(items[i], item) {
+				return BoolVal(true)
+			}
+		}
+		return BoolVal(false)
+	}
+	if container.IsTuple() {
+		items := container.AsTuple().Items
+		for i := 0; i < len(items); i++ {
+			if Equals(items[i], item) {
+				return BoolVal(true)
+			}
+		}
+		return BoolVal(false)
+	}
+	if container.IsDict() {
+		_, ok := container.AsDict().Get(item)
+		return BoolVal(ok)
+	}
+	if container.IsAnyString() && item.IsAnyString() {
+		return BoolVal(strings.Contains(container.AsString(), item.AsString()))
+	}
+	panic("val.In: type is not iterable or container")
+}
+
+// NotIn performs Python inverted containment test (item not in container).
+func NotIn(item, container Value) Value {
+	return BoolVal(!In(item, container).AsBool())
 }
