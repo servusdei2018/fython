@@ -1,7 +1,9 @@
 package vm
 
 import (
+	"math"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -1036,4 +1038,241 @@ func BenchmarkForLoopRangeAndList(b *testing.B) {
 			}
 		}
 	})
+}
+
+func TestTier2SuperinstructionFusion(t *testing.T) {
+	// Pattern 1: LOAD_FAST + LOAD_FAST + BINARY_ADD + STORE_FAST
+	// Pattern 2: LOAD_FAST + LOAD_CONST + BINARY_ADD + STORE_FAST (same reg)
+	// Pattern 3: LOAD_FAST + LOAD_CONST + COMPARE_LT + JUMP_IF_FALSE
+	code := []uint32{
+		// Pattern 1: local[2] = local[0] + local[1]
+		Encode(OP_LOAD_FAST, 0, 0),
+		Encode(OP_LOAD_FAST, 0, 1),
+		Encode(OP_BINARY_ADD, 0, 0),
+		Encode(OP_STORE_FAST, 0, 2),
+
+		// Pattern 2: local[0] += const[1]
+		Encode(OP_LOAD_FAST, 0, 0),
+		Encode(OP_LOAD_CONST, 0, 1),
+		Encode(OP_BINARY_ADD, 0, 0),
+		Encode(OP_STORE_FAST, 0, 0),
+
+		// Pattern 3: while local[0] < const[2]: jump to 12
+		Encode(OP_LOAD_FAST, 0, 0),
+		Encode(OP_LOAD_CONST, 0, 2),
+		Encode(OP_COMPARE_LT, 0, 0),
+		Encode(OP_JUMP_IF_FALSE, 0, 12),
+
+		Encode(OP_RETURN, 0, 0),
+	}
+
+	co := &CodeObject{
+		Code:      code,
+		NumLocals: 3,
+	}
+
+	OptimizeCodeObject(co)
+
+	if DecodeOpcode(co.Code[0]) != OP_FAST_ADD_INT_LOCAL_TO_LOCAL {
+		t.Fatalf("expected OP_FAST_ADD_INT_LOCAL_TO_LOCAL at index 0, got %v", DecodeOpcode(co.Code[0]))
+	}
+	if DecodeArgA(co.Code[0]) != 2 || DecodeArgB(co.Code[0]) != 0 || DecodeArgC(co.Code[0]) != 1 {
+		t.Fatalf("unexpected args for FAST_ADD: dst=%d, srcA=%d, srcB=%d",
+			DecodeArgA(co.Code[0]), DecodeArgB(co.Code[0]), DecodeArgC(co.Code[0]))
+	}
+
+	if DecodeOpcode(co.Code[4]) != OP_FAST_INC_INT_LOCAL_CONST {
+		t.Fatalf("expected OP_FAST_INC_INT_LOCAL_CONST at index 4, got %v", DecodeOpcode(co.Code[4]))
+	}
+	if DecodeArgA(co.Code[4]) != 0 || DecodeArgBx(co.Code[4]) != 1 {
+		t.Fatalf("unexpected args for FAST_INC: reg=%d, constIdx=%d",
+			DecodeArgA(co.Code[4]), DecodeArgBx(co.Code[4]))
+	}
+
+	if DecodeOpcode(co.Code[8]) != OP_FAST_LOOP_CMP_LT_CONST_JUMP {
+		t.Fatalf("expected OP_FAST_LOOP_CMP_LT_CONST_JUMP at index 8, got %v", DecodeOpcode(co.Code[8]))
+	}
+	if DecodeArgA(co.Code[8]) != 0 || DecodeArgBx(co.Code[8]) != 12 {
+		t.Fatalf("unexpected args for FAST_LOOP: reg=%d, exitTarget=%d",
+			DecodeArgA(co.Code[8]), DecodeArgBx(co.Code[8]))
+	}
+}
+
+func TestSuperinstructionFastAdd(t *testing.T) {
+	// local[0] = 10, local[1] = 20, local[2] = local[0] + local[1], return local[2]
+	consts := []val.Value{val.Int64Val(10), val.Int64Val(20)}
+	code := []uint32{
+		Encode(OP_LOAD_CONST, 0, 0),
+		Encode(OP_STORE_FAST, 0, 0),
+		Encode(OP_LOAD_CONST, 0, 1),
+		Encode(OP_STORE_FAST, 0, 1),
+
+		Encode(OP_LOAD_FAST, 0, 0),
+		Encode(OP_LOAD_FAST, 0, 1),
+		Encode(OP_BINARY_ADD, 0, 0),
+		Encode(OP_STORE_FAST, 0, 2),
+
+		Encode(OP_LOAD_FAST, 0, 2),
+		Encode(OP_RETURN, 0, 0),
+	}
+	co := &CodeObject{Code: code, Consts: consts, NumLocals: 3}
+	OptimizeCodeObject(co)
+
+	v := NewVM()
+	res := v.RunCode(co)
+	if !res.IsInt64() || res.AsInt64() != 30 {
+		t.Fatalf("expected 30, got %v", res)
+	}
+
+	// Test Deoptimization with floats
+	constsFloat := []val.Value{val.Float64Val(1.5), val.Float64Val(2.5)}
+	codeFloat := make([]uint32, len(code))
+	copy(codeFloat, code)
+	coFloat := &CodeObject{Code: codeFloat, Consts: constsFloat, NumLocals: 3}
+	OptimizeCodeObject(coFloat)
+	resFloat := v.RunCode(coFloat)
+	if !resFloat.IsFloat64() || resFloat.AsFloat64() != 4.0 {
+		t.Fatalf("expected 4.0, got %v", resFloat)
+	}
+
+	// Test Overflow to BigInt
+	constsOverflow := []val.Value{val.Int64Val(math.MaxInt64), val.Int64Val(1)}
+	codeOverflow := make([]uint32, len(code))
+	copy(codeOverflow, code)
+	coOverflow := &CodeObject{Code: codeOverflow, Consts: constsOverflow, NumLocals: 3}
+	OptimizeCodeObject(coOverflow)
+	resOverflow := v.RunCode(coOverflow)
+	if !resOverflow.IsBigInt() {
+		t.Fatalf("expected BigInt result on overflow, got %v", resOverflow)
+	}
+}
+
+func TestSuperinstructionFastInc(t *testing.T) {
+	// x = 10; x += 5; return x
+	consts := []val.Value{val.Int64Val(10), val.Int64Val(5)}
+	code := []uint32{
+		Encode(OP_LOAD_CONST, 0, 0),
+		Encode(OP_STORE_FAST, 0, 0),
+
+		Encode(OP_LOAD_FAST, 0, 0),
+		Encode(OP_LOAD_CONST, 0, 1),
+		Encode(OP_BINARY_ADD, 0, 0),
+		Encode(OP_STORE_FAST, 0, 0),
+
+		Encode(OP_LOAD_FAST, 0, 0),
+		Encode(OP_RETURN, 0, 0),
+	}
+	co := &CodeObject{Code: code, Consts: consts, NumLocals: 1}
+	OptimizeCodeObject(co)
+
+	v := NewVM()
+	res := v.RunCode(co)
+	if !res.IsInt64() || res.AsInt64() != 15 {
+		t.Fatalf("expected 15, got %v", res)
+	}
+
+	// Test Overflow
+	constsOverflow := []val.Value{val.Int64Val(math.MaxInt64), val.Int64Val(10)}
+	codeOverflow := make([]uint32, len(code))
+	copy(codeOverflow, code)
+	coOverflow := &CodeObject{Code: codeOverflow, Consts: constsOverflow, NumLocals: 1}
+	OptimizeCodeObject(coOverflow)
+	resOverflow := v.RunCode(coOverflow)
+	if !resOverflow.IsBigInt() {
+		t.Fatalf("expected BigInt result on overflow, got %v", resOverflow)
+	}
+
+	// Test Deopt with string
+	constsStr := []val.Value{val.NewStringVal("hello "), val.NewStringVal("world")}
+	codeStr := make([]uint32, len(code))
+	copy(codeStr, code)
+	coStr := &CodeObject{Code: codeStr, Consts: constsStr, NumLocals: 1}
+	OptimizeCodeObject(coStr)
+	resStr := v.RunCode(coStr)
+	if !resStr.IsString() || resStr.AsString() != "hello world" {
+		t.Fatalf("expected 'hello world', got %v", resStr)
+	}
+}
+
+func TestSuperinstructionFastLoop(t *testing.T) {
+	// x = 0; while x < 10: x += 1; return x
+	consts := []val.Value{val.Int64Val(0), val.Int64Val(10), val.Int64Val(1)}
+	code := []uint32{
+		/* 00 */ Encode(OP_LOAD_CONST, 0, 0),
+		/* 01 */ Encode(OP_STORE_FAST, 0, 0),
+		/* 02 */ Encode(OP_LOAD_FAST, 0, 0),
+		/* 03 */ Encode(OP_LOAD_CONST, 0, 1),
+		/* 04 */ Encode(OP_COMPARE_LT, 0, 0),
+		/* 05 */ Encode(OP_JUMP_IF_FALSE, 0, 11),
+		/* 06 */ Encode(OP_LOAD_FAST, 0, 0),
+		/* 07 */ Encode(OP_LOAD_CONST, 0, 2),
+		/* 08 */ Encode(OP_BINARY_ADD, 0, 0),
+		/* 09 */ Encode(OP_STORE_FAST, 0, 0),
+		/* 10 */ Encode(OP_JUMP, 0, 2),
+		/* 11 */ Encode(OP_LOAD_FAST, 0, 0),
+		/* 12 */ Encode(OP_RETURN, 0, 0),
+	}
+	co := &CodeObject{Code: code, Consts: consts, NumLocals: 1}
+	OptimizeCodeObject(co)
+
+	v := NewVM()
+	res := v.RunCode(co)
+	if !res.IsInt64() || res.AsInt64() != 10 {
+		t.Fatalf("expected 10, got %v", res)
+	}
+}
+
+func TestJumpTargetCollisionNoFuse(t *testing.T) {
+	// Ensure that if an intermediate instruction is a jump target, fusion does NOT happen
+	code := []uint32{
+		/* 00 */ Encode(OP_JUMP, 0, 2), // Jumps to index 2!
+		/* 01 */ Encode(OP_LOAD_FAST, 0, 0),
+		/* 02 */ Encode(OP_LOAD_CONST, 0, 1), // Jump target!
+		/* 03 */ Encode(OP_BINARY_ADD, 0, 0),
+		/* 04 */ Encode(OP_STORE_FAST, 0, 0),
+		/* 05 */ Encode(OP_RETURN, 0, 0),
+	}
+	co := &CodeObject{Code: code, NumLocals: 1}
+	OptimizeCodeObject(co)
+
+	// Since index 2 is a jump target, instructions 1..4 must NOT be fused!
+	if DecodeOpcode(co.Code[1]) != OP_LOAD_FAST {
+		t.Fatalf("expected OP_LOAD_FAST preserved at index 1, got %v", DecodeOpcode(co.Code[1]))
+	}
+}
+
+func TestConcurrentTier2Execution(t *testing.T) {
+	// Multiple goroutines executing the same CodeObject concurrently
+	const limit = 50_000
+	consts := []val.Value{val.Int64Val(0), val.Int64Val(limit), val.Int64Val(1)}
+	code := []uint32{
+		/* 00 */ Encode(OP_LOAD_CONST, 0, 0),
+		/* 01 */ Encode(OP_STORE_FAST, 0, 0),
+		/* 02 */ Encode(OP_LOAD_FAST, 0, 0),
+		/* 03 */ Encode(OP_LOAD_CONST, 0, 1),
+		/* 04 */ Encode(OP_COMPARE_LT, 0, 0),
+		/* 05 */ Encode(OP_JUMP_IF_FALSE, 0, 11),
+		/* 06 */ Encode(OP_LOAD_FAST, 0, 0),
+		/* 07 */ Encode(OP_LOAD_CONST, 0, 2),
+		/* 08 */ Encode(OP_BINARY_ADD, 0, 0),
+		/* 09 */ Encode(OP_STORE_FAST, 0, 0),
+		/* 10 */ Encode(OP_JUMP, 0, 2),
+		/* 11 */ Encode(OP_LOAD_FAST, 0, 0),
+		/* 12 */ Encode(OP_RETURN, 0, 0),
+	}
+	co := &CodeObject{Code: code, Consts: consts, NumLocals: 1}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			vm := NewVM()
+			res := vm.RunCode(co)
+			if !res.IsInt64() || res.AsInt64() != limit {
+				panic("concurrent run mismatch")
+			}
+		}()
+	}
+	wg.Wait()
 }

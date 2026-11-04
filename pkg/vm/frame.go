@@ -77,20 +77,22 @@ const (
 // Header is placed at offset 0 so a *CodeObject can be stored inside a val.Value (KindCode)
 // in a constant pool with zero-cost downcasting.
 type CodeObject struct {
-	Header         val.ObjectHeader
-	Name           string
-	Code           []uint32
-	Consts         []val.Value
-	ParamNames     []val.Value
-	CellVars       []val.Value
-	FreeVars       []val.Value
-	NumLocals      int
-	NumParams      int
-	MaxStackSize   int
-	IsGenerator    bool
-	IsCoroutine    bool
-	Flags          uint32
-	ExceptionTable []ExceptionEntry
+	Header           val.ObjectHeader
+	Name             string
+	Code             []uint32
+	Consts           []val.Value
+	ParamNames       []val.Value
+	CellVars         []val.Value
+	FreeVars         []val.Value
+	NumLocals        int
+	NumParams        int
+	MaxStackSize     int
+	IsGenerator      bool
+	IsCoroutine      bool
+	Flags            uint32
+	ExceptionTable   []ExceptionEntry
+	Hotness          int32
+	IsTier2Optimized int32
 }
 
 // Compile-time check that CodeObject.Header is at byte offset 0.

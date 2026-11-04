@@ -73,6 +73,12 @@ const (
 	OP_BINARY_ADD_FLOAT
 	OP_BINARY_SUB_INT
 	OP_COMPARE_LT_INT
+
+	// Tier-2 Superinstructions
+	OP_NOP
+	OP_FAST_ADD_INT_LOCAL_TO_LOCAL
+	OP_FAST_INC_INT_LOCAL_CONST
+	OP_FAST_LOOP_CMP_LT_CONST_JUMP
 )
 
 // Comparison operation codes for OP_COMPARE_OP (passed in ArgA field).
@@ -215,6 +221,14 @@ func (op Opcode) String() string {
 		return "OP_BINARY_SUB_INT"
 	case OP_COMPARE_LT_INT:
 		return "OP_COMPARE_LT_INT"
+	case OP_NOP:
+		return "OP_NOP"
+	case OP_FAST_ADD_INT_LOCAL_TO_LOCAL:
+		return "OP_FAST_ADD_INT_LOCAL_TO_LOCAL"
+	case OP_FAST_INC_INT_LOCAL_CONST:
+		return "OP_FAST_INC_INT_LOCAL_CONST"
+	case OP_FAST_LOOP_CMP_LT_CONST_JUMP:
+		return "OP_FAST_LOOP_CMP_LT_CONST_JUMP"
 	default:
 		return "OP_UNKNOWN"
 	}
@@ -226,6 +240,12 @@ func Encode(op Opcode, argA uint8, argBx uint16) uint32 {
 	return (uint32(op) << 24) | (uint32(argA) << 16) | uint32(argBx)
 }
 
+// EncodeABC packs an 8-bit Opcode, 8-bit ArgA, 8-bit ArgB, and 8-bit ArgC into a 32-bit instruction word:
+// [8-bit Opcode (bits 24..31)][8-bit ArgA (bits 16..23)][8-bit ArgB (bits 8..15)][8-bit ArgC (bits 0..7)]
+func EncodeABC(op Opcode, argA uint8, argB uint8, argC uint8) uint32 {
+	return (uint32(op) << 24) | (uint32(argA) << 16) | (uint32(argB) << 8) | uint32(argC)
+}
+
 // DecodeOpcode extracts the 8-bit Opcode from a 32-bit instruction word.
 func DecodeOpcode(inst uint32) Opcode {
 	return Opcode(inst >> 24)
@@ -234,6 +254,16 @@ func DecodeOpcode(inst uint32) Opcode {
 // DecodeArgA extracts the 8-bit ArgA field from a 32-bit instruction word.
 func DecodeArgA(inst uint32) uint8 {
 	return uint8(inst >> 16)
+}
+
+// DecodeArgB extracts the 8-bit ArgB field from bits 8..15 of a 32-bit instruction word.
+func DecodeArgB(inst uint32) uint8 {
+	return uint8(inst >> 8)
+}
+
+// DecodeArgC extracts the 8-bit ArgC field from bits 0..7 of a 32-bit instruction word.
+func DecodeArgC(inst uint32) uint8 {
+	return uint8(inst)
 }
 
 // DecodeArgBx extracts the 16-bit ArgBx field from a 32-bit instruction word.

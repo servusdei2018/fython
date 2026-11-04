@@ -792,6 +792,19 @@ func (vm *VM) runLoop(code []uint32, consts []val.Value, startBase int, startSP 
 	return vm.runLoopWithGlobals(&vm.rootCO, startBase, startSP, startFrameIdx, nil, vm.globals, vm.stack, nil, nil)
 }
 
+func ensureStack(stack []val.Value, minCap int) []val.Value {
+	if minCap <= len(stack) {
+		return stack
+	}
+	newCap := len(stack) * 2
+	if newCap < minCap {
+		newCap = minCap + 256
+	}
+	newStack := make([]val.Value, newCap)
+	copy(newStack, stack)
+	return newStack
+}
+
 func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, startFrameIdx int, startCells []val.Value, startGlobals *val.PyDict, stack []val.Value, activeGen *val.PyGenerator, activeCoro *val.PyCoroutine) val.Value {
 	savedCtxStack := vm.execCtx.Stack
 	vm.execCtx.Stack = stack
@@ -817,6 +830,22 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		globals = vm.globals
 	}
 
+	if baseOffset+256 > len(stack) {
+		stack = ensureStack(stack, baseOffset+256)
+		vm.execCtx.Stack = stack
+		if activeCoro != nil {
+			activeCoro.Stack = stack
+		} else if activeGen != nil {
+			activeGen.Stack = stack
+		} else {
+			vm.stack = stack
+		}
+	}
+	locals := stack[baseOffset : baseOffset+256 : baseOffset+256]
+	_ = locals[255]
+
+	maybeOptimizeCodeObject(curCO)
+
 	for {
 		inst := atomic.LoadUint32(&code[ip])
 		op := Opcode(inst >> 24)
@@ -829,15 +858,23 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			ip++
 
 		case OP_LOAD_FAST:
-			bx := int(uint16(inst))
-			stack[sp] = stack[baseOffset+bx]
+			bx := uint16(inst)
+			if bx < 256 {
+				stack[sp] = locals[uint8(bx)]
+			} else {
+				stack[sp] = stack[baseOffset+int(bx)]
+			}
 			sp++
 			ip++
 
 		case OP_STORE_FAST:
-			bx := int(uint16(inst))
+			bx := uint16(inst)
 			sp--
-			stack[baseOffset+bx] = stack[sp]
+			if bx < 256 {
+				locals[uint8(bx)] = stack[sp]
+			} else {
+				stack[baseOffset+int(bx)] = stack[sp]
+			}
 			ip++
 
 		case OP_BINARY_ADD:
@@ -1033,7 +1070,11 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			}
 
 		case OP_JUMP:
-			ip = int(uint16(inst))
+			target := int(uint16(inst))
+			if target <= ip {
+				maybeOptimizeCodeObject(curCO)
+			}
+			ip = target
 
 		case OP_CALL:
 			argc := int(uint8(inst >> 16))
@@ -1085,6 +1126,20 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				code = callee.Code
 				consts = callee.Consts
 				baseOffset = newBase
+				if baseOffset+256 > len(stack) {
+					stack = ensureStack(stack, baseOffset+256)
+					vm.execCtx.Stack = stack
+					if activeCoro != nil {
+						activeCoro.Stack = stack
+					} else if activeGen != nil {
+						activeGen.Stack = stack
+					} else {
+						vm.stack = stack
+					}
+				}
+				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+				_ = locals[255]
+				maybeOptimizeCodeObject(callee)
 				cells = vm.setupCalleeCells(callee, target, stack, newBase, argc)
 				numLocalsCallee := callee.NumLocals
 				if numLocalsCallee < argc {
@@ -1126,6 +1181,20 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				code = callee.Code
 				consts = callee.Consts
 				baseOffset = newBase
+				if baseOffset+256 > len(stack) {
+					stack = ensureStack(stack, baseOffset+256)
+					vm.execCtx.Stack = stack
+					if activeCoro != nil {
+						activeCoro.Stack = stack
+					} else if activeGen != nil {
+						activeGen.Stack = stack
+					} else {
+						vm.stack = stack
+					}
+				}
+				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+				_ = locals[255]
+				maybeOptimizeCodeObject(callee)
 				cells = vm.setupCalleeCells(callee, target, stack, newBase, argc)
 				if fn.Globals != nil {
 					globals = fn.Globals
@@ -1193,6 +1262,20 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				code = callee.Code
 				consts = callee.Consts
 				baseOffset = newBase
+				if baseOffset+256 > len(stack) {
+					stack = ensureStack(stack, baseOffset+256)
+					vm.execCtx.Stack = stack
+					if activeCoro != nil {
+						activeCoro.Stack = stack
+					} else if activeGen != nil {
+						activeGen.Stack = stack
+					} else {
+						vm.stack = stack
+					}
+				}
+				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+				_ = locals[255]
+				maybeOptimizeCodeObject(callee)
 				cells = vm.setupCalleeCells(callee, target, stack, newBase, totalArgs)
 				if fn.Globals != nil {
 					globals = fn.Globals
@@ -1231,6 +1314,20 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				code = callee.Code
 				consts = callee.Consts
 				baseOffset = newBase
+				if baseOffset+256 > len(stack) {
+					stack = ensureStack(stack, baseOffset+256)
+					vm.execCtx.Stack = stack
+					if activeCoro != nil {
+						activeCoro.Stack = stack
+					} else if activeGen != nil {
+						activeGen.Stack = stack
+					} else {
+						vm.stack = stack
+					}
+				}
+				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+				_ = locals[255]
+				maybeOptimizeCodeObject(callee)
 				cells = vm.setupCalleeCells(callee, target, stack, newBase, totalArgs)
 				ip = 0
 
@@ -1369,6 +1466,20 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				code = callee.Code
 				consts = callee.Consts
 				baseOffset = newBase
+				if baseOffset+256 > len(stack) {
+					stack = ensureStack(stack, baseOffset+256)
+					vm.execCtx.Stack = stack
+					if activeCoro != nil {
+						activeCoro.Stack = stack
+					} else if activeGen != nil {
+						activeGen.Stack = stack
+					} else {
+						vm.stack = stack
+					}
+				}
+				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+				_ = locals[255]
+				maybeOptimizeCodeObject(callee)
 				cells = vm.setupCalleeCells(callee, callable, stack, newBase, totalArgs)
 				if fn.Globals != nil {
 					globals = fn.Globals
@@ -1406,6 +1517,20 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				code = callee.Code
 				consts = callee.Consts
 				baseOffset = newBase
+				if baseOffset+256 > len(stack) {
+					stack = ensureStack(stack, baseOffset+256)
+					vm.execCtx.Stack = stack
+					if activeCoro != nil {
+						activeCoro.Stack = stack
+					} else if activeGen != nil {
+						activeGen.Stack = stack
+					} else {
+						vm.stack = stack
+					}
+				}
+				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+				_ = locals[255]
+				maybeOptimizeCodeObject(callee)
 				cells = vm.setupCalleeCells(callee, callable, stack, newBase, totalArgs)
 				numLocalsCallee := callee.NumLocals
 				if numLocalsCallee < totalArgs {
@@ -1457,6 +1582,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			consts = caller.consts
 			ip = caller.ip
 			baseOffset = caller.baseOffset
+			locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+			_ = locals[255]
 			cells = caller.cells
 			globals = caller.globals
 			stack[caller.retSP] = retVal
@@ -2310,6 +2437,106 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		case OP_CLEANUP_EXC:
 			sp--
 			ip++
+
+		case OP_NOP:
+			ip++
+
+		case OP_FAST_ADD_INT_LOCAL_TO_LOCAL:
+			_ = locals[255]
+			dstReg := uint8(inst >> 16)
+			srcRegA := uint8(inst >> 8)
+			srcRegB := uint8(inst)
+			va := locals[srcRegA]
+			vb := locals[srcRegB]
+			if va.IsInt64() && vb.IsInt64() {
+				ai := va.AsInt64()
+				bi := vb.AsInt64()
+				sum := ai + bi
+				if ((ai ^ sum) & (bi ^ sum)) >= 0 {
+					locals[dstReg] = val.Int64Val(sum)
+					ip += 4
+					continue
+				}
+				locals[dstReg] = val.Add(va, vb)
+				ip += 4
+				continue
+			}
+			DeoptimizeFastAdd(code, ip, dstReg, srcRegA, srcRegB)
+			continue
+
+		case OP_FAST_INC_INT_LOCAL_CONST:
+			_ = locals[255]
+			reg := uint8(inst >> 16)
+			constIdx := uint16(inst)
+			v := locals[reg]
+			c := consts[constIdx]
+			if v.IsInt64() && c.IsInt64() {
+				vi := v.AsInt64()
+				ci := c.AsInt64()
+				sum := vi + ci
+				if ((vi ^ sum) & (ci ^ sum)) >= 0 {
+					locals[reg] = val.Int64Val(sum)
+					ip += 4
+					continue
+				}
+				locals[reg] = val.Add(v, c)
+				ip += 4
+				continue
+			}
+			DeoptimizeFastInc(code, ip, reg, constIdx)
+			continue
+
+		case OP_FAST_LOOP_CMP_LT_CONST_JUMP:
+			_ = locals[255]
+			reg := uint8(inst >> 16)
+			exitTarget := uint16(inst)
+			constIdx := uint16(atomic.LoadUint32(&code[ip+1]))
+			v := locals[reg]
+			c := consts[constIdx]
+			if !v.IsInt64() || !c.IsInt64() {
+				DeoptimizeFastLoop(code, ip, reg, constIdx, exitTarget)
+				continue
+			}
+			limit := c.AsInt64()
+			cur := v.AsInt64()
+
+			// Hot-Loop Register Optimizer:
+			// If followed by OP_FAST_INC_INT_LOCAL_CONST (same reg) and back-edge OP_JUMP back to this instruction
+			if ip+8 < len(code) {
+				inst4 := atomic.LoadUint32(&code[ip+4])
+				inst8 := atomic.LoadUint32(&code[ip+8])
+				if DecodeOpcode(inst4) == OP_FAST_INC_INT_LOCAL_CONST &&
+					DecodeArgA(inst4) == reg &&
+					DecodeOpcode(inst8) == OP_JUMP &&
+					int(DecodeArgBx(inst8)) == ip {
+
+					stepConstIdx := DecodeArgBx(inst4)
+					stepVal := consts[stepConstIdx]
+					if stepVal.IsInt64() {
+						step := stepVal.AsInt64()
+						if step > 0 && cur < limit {
+							for cur < limit {
+								next := cur + step
+								if next < cur {
+									break
+								}
+								cur = next
+							}
+							locals[reg] = val.Int64Val(cur)
+							if cur >= limit {
+								ip = int(exitTarget)
+								continue
+							}
+						}
+					}
+				}
+			}
+
+			if cur < limit {
+				ip += 4
+			} else {
+				ip = int(exitTarget)
+			}
 
 		default:
 			panic("vm: unknown opcode")
