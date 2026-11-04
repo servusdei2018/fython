@@ -6,6 +6,7 @@ import (
 
 	"github.com/alecthomas/kong"
 	"github.com/servusdei2018/fython/pkg/compiler"
+	"github.com/servusdei2018/fython/pkg/val"
 	"github.com/servusdei2018/fython/pkg/vm"
 )
 
@@ -105,6 +106,7 @@ func (c *CLI) Run() error {
 				return err
 			}
 			v := vm.NewVM()
+			v.SetGlobal("__name__", val.NewStringVal("__main__"))
 			v.RunCode(co)
 		}
 		return nil
@@ -130,6 +132,8 @@ func (c *CLI) Run() error {
 					return err
 				}
 				v := vm.NewVM()
+				v.SetGlobal("__name__", val.NewStringVal("__main__"))
+				v.SetGlobal("__file__", val.NewStringVal(inv.Script))
 				v.RunCode(co)
 			}
 		}

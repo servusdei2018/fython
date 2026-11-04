@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/hex"
 	"math"
+	"strconv"
+	"strings"
 	"unsafe"
 )
 
@@ -1057,18 +1059,74 @@ func initTypes() {
 	IntType.Slots.NbSub = numericNbSub
 	IntType.Slots.NbMul = numericNbMul
 	IntType.Slots.NbAbs = intNbAbs
+	IntType.Slots.TpCall = func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) == 0 {
+			return Int64Val(0)
+		}
+		a := args[0]
+		if a.IsInt64() {
+			return a
+		}
+		if a.IsFloat64() {
+			return Int64Val(int64(a.AsFloat64()))
+		}
+		if a.IsBool() {
+			if a.AsBool() {
+				return Int64Val(1)
+			}
+			return Int64Val(0)
+		}
+		if a.IsAnyString() {
+			n, err := strconv.ParseInt(strings.TrimSpace(a.AsString()), 10, 64)
+			if err == nil {
+				return Int64Val(n)
+			}
+		}
+		panic("TypeError: int() argument must be a string or number")
+	}
 
 	BoolType = MustNewType("bool", []*PyType{IntType}, nil)
 	BoolType.Slots.NbAdd = numericNbAdd
 	BoolType.Slots.NbSub = numericNbSub
 	BoolType.Slots.NbMul = numericNbMul
 	BoolType.Slots.NbAbs = intNbAbs
+	BoolType.Slots.TpCall = func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) == 0 {
+			return BoolVal(false)
+		}
+		return BoolVal(args[0].IsTruthy())
+	}
 
 	FloatType = MustNewType("float", []*PyType{ObjectType}, nil)
 	FloatType.Slots.NbAdd = numericNbAdd
 	FloatType.Slots.NbSub = numericNbSub
 	FloatType.Slots.NbMul = numericNbMul
 	FloatType.Slots.NbAbs = floatNbAbs
+	FloatType.Slots.TpCall = func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) == 0 {
+			return Float64Val(0.0)
+		}
+		a := args[0]
+		if a.IsFloat64() {
+			return a
+		}
+		if a.IsInt64() {
+			return Float64Val(float64(a.AsInt64()))
+		}
+		if a.IsBool() {
+			if a.AsBool() {
+				return Float64Val(1.0)
+			}
+			return Float64Val(0.0)
+		}
+		if a.IsAnyString() {
+			f, err := strconv.ParseFloat(strings.TrimSpace(a.AsString()), 64)
+			if err == nil {
+				return Float64Val(f)
+			}
+		}
+		panic("TypeError: float() argument must be a string or number")
+	}
 
 	BigIntType = MustNewType("bigint", []*PyType{IntType}, nil)
 	BigIntType.Slots.NbAdd = numericNbAdd
@@ -1081,6 +1139,12 @@ func initTypes() {
 	StrType.Slots.SqLen = strSqLen
 	StrType.Slots.SqItem = strSqItem
 	StrType.Slots.MpSubscript = strSqItem
+	StrType.Slots.TpCall = func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) == 0 {
+			return NewStringVal("")
+		}
+		return NewStringVal(args[0].String())
+	}
 
 	// Backfill Type = StrType on heap dunder strings interned prior to StrType creation.
 	for _, d := range []Value{DunderGetItem, DunderSetItem, DunderCall, DunderInit, DunderGetAttr, DunderSetAttr} {

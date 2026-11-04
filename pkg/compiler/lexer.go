@@ -6,15 +6,16 @@ import (
 
 // Lexer implements a zero-copy Python tokenizer with indentation state machine.
 type Lexer struct {
-	src         []byte
-	pos         int
-	line        uint32
-	col         uint32
-	indentStack []int
-	parenDepth  int
-	pendingToks []Token
-	atBOL       bool // at Beginning of Line
-	err         error
+	src             []byte
+	pos             int
+	line            uint32
+	col             uint32
+	indentStack     []int
+	parenDepth      int
+	pendingToks     []Token
+	atBOL           bool // at Beginning of Line
+	hasTokensOnLine bool
+	err             error
 }
 
 // NewLexer creates a new Lexer for the source buffer.
@@ -46,6 +47,7 @@ func (l *Lexer) Reset(src []byte) {
 	l.parenDepth = 0
 	l.pendingToks = l.pendingToks[:0]
 	l.atBOL = true
+	l.hasTokensOnLine = false
 	l.err = nil
 }
 
@@ -114,10 +116,11 @@ func (l *Lexer) NextToken() Token {
 			l.col = 1
 			l.atBOL = true
 
-			// If inside parentheses/brackets/braces, suppress NEWLINE token
-			if l.parenDepth > 0 {
+			// If blank line or inside parentheses/brackets/braces, suppress NEWLINE token
+			if !l.hasTokensOnLine || l.parenDepth > 0 {
 				continue
 			}
+			l.hasTokensOnLine = false
 
 			return Token{
 				Type:  TOKEN_NEWLINE,
@@ -129,6 +132,7 @@ func (l *Lexer) NextToken() Token {
 		}
 
 		// Start of a regular token
+		l.hasTokensOnLine = true
 		startPos := uint32(l.pos)
 		tokLine := l.line
 		tokCol := l.col

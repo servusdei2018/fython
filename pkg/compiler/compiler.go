@@ -1537,7 +1537,7 @@ func (c *Compiler) peephole() {
 			target := int(vm.DecodeArgBx(code[i]))
 			if target == i+1 {
 				// JUMP to next instruction is a no-op
-				code[i] = vm.Encode(vm.OP_POP_TOP, 0, 0) // or NOP equivalent
+				code[i] = vm.Encode(vm.OP_NOP, 0, 0)
 			} else if target < len(code) && vm.DecodeOpcode(code[target]) == vm.OP_JUMP {
 				// Jump to jump chaining
 				nextTarget := vm.DecodeArgBx(code[target])

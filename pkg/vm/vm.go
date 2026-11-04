@@ -1827,23 +1827,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				continue
 			}
 			if top.IsList() || top.IsTuple() || top.IsDict() {
-				var it *val.PyIter
-				if activeGen != nil {
-					it = &activeGen.Iters[(sp-1)&7]
-				} else {
-					it = &vm.frames[frameIdx].iters[(sp-1)&15]
-				}
-				it.Header = val.ObjectHeader{Kind: val.KindIter, Type: val.IterType}
-				if top.IsList() {
-					it.Kind = val.IterKindList
-				} else if top.IsTuple() {
-					it.Kind = val.IterKindTuple
-				} else {
-					it.Kind = val.IterKindDict
-				}
-				it.Obj = top
-				it.Idx = 0
-				stack[sp-1] = val.ObjectVal(&it.Header)
+				stack[sp-1] = val.NewIterVal(top)
 				ip++
 				continue
 			}
