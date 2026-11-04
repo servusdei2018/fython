@@ -30,6 +30,7 @@ type ShapeTransition struct {
 type Shape struct {
 	ID          uint32
 	Parent      *Shape
+	Type        *PyType
 	AttrName    Value
 	SlotIndex   int
 	Attrs       []ShapeAttr
@@ -37,15 +38,21 @@ type Shape struct {
 	transitions atomic.Pointer[[]ShapeTransition]
 }
 
-// NewRootShape allocates a new empty root Shape with a unique non-zero ID.
-func NewRootShape() *Shape {
+// NewRootShapeForType allocates a new empty root Shape tied to a specific concrete PyType.
+func NewRootShapeForType(cls *PyType) *Shape {
 	s := &Shape{
 		ID:        allocShapeID(),
+		Type:      cls,
 		SlotIndex: -1,
 	}
 	empty := make([]ShapeTransition, 0, 4)
 	s.transitions.Store(&empty)
 	return s
+}
+
+// NewRootShape allocates a new empty root Shape with a unique non-zero ID.
+func NewRootShape() *Shape {
+	return NewRootShapeForType(nil)
 }
 
 var defaultRootShape = NewRootShape()
@@ -120,6 +127,7 @@ func (s *Shape) Transition(name Value) *Shape {
 	child := &Shape{
 		ID:        allocShapeID(),
 		Parent:    s,
+		Type:      s.Type,
 		AttrName:  interned,
 		SlotIndex: newSlotIdx,
 		Attrs:     newAttrs,

@@ -793,8 +793,7 @@ func (c *Compiler) compileWithItemRecursive(items []ASTWithItem, body uint32) er
 	// Call __enter__
 	c.emitOp(vm.OP_LOAD_FAST, 0, uint16(tempSlot))
 	_, enterIdx := c.constPool.InternName("__enter__")
-	c.emitOp(vm.OP_LOAD_METHOD, 0, enterIdx)
-	c.emitOp(vm.OP_CALL_METHOD, 0, 0)
+	c.emitOp(vm.OP_CALL_METHOD_PIC, 0, enterIdx)
 
 	if item.Target != ExprNone {
 		if err := c.compileStoreTarget(item.Target); err != nil {
@@ -814,12 +813,11 @@ func (c *Compiler) compileWithItemRecursive(items []ASTWithItem, body uint32) er
 	// Normal exit: call __exit__(None, None, None)
 	_, exitIdx := c.constPool.InternName("__exit__")
 	c.emitOp(vm.OP_LOAD_FAST, 0, uint16(tempSlot))
-	c.emitOp(vm.OP_LOAD_METHOD, 0, exitIdx)
 	noneIdx := c.constPool.Add(val.NoneVal())
 	c.emitOp(vm.OP_LOAD_CONST, 0, noneIdx)
 	c.emitOp(vm.OP_LOAD_CONST, 0, noneIdx)
 	c.emitOp(vm.OP_LOAD_CONST, 0, noneIdx)
-	c.emitOp(vm.OP_CALL_METHOD, 3, 0)
+	c.emitOp(vm.OP_CALL_METHOD_PIC, 3, exitIdx)
 	c.emitOp(vm.OP_POP_TOP, 0, 0)
 	jumpAfterWith := c.emitOp(vm.OP_JUMP, 0, 0)
 
@@ -832,11 +830,10 @@ func (c *Compiler) compileWithItemRecursive(items []ASTWithItem, body uint32) er
 	c.emitOp(vm.OP_STORE_FAST, 0, uint16(tempSlot2))
 
 	c.emitOp(vm.OP_LOAD_FAST, 0, uint16(tempSlot))
-	c.emitOp(vm.OP_LOAD_METHOD, 0, exitIdx)
 	c.emitOp(vm.OP_LOAD_FAST, 0, uint16(tempSlot2))
 	c.emitOp(vm.OP_LOAD_FAST, 0, uint16(tempSlot2))
 	c.emitOp(vm.OP_LOAD_CONST, 0, noneIdx)
-	c.emitOp(vm.OP_CALL_METHOD, 3, 0)
+	c.emitOp(vm.OP_CALL_METHOD_PIC, 3, exitIdx)
 	jumpSuppress := c.emitOp(vm.OP_JUMP_IF_TRUE, 0, 0)
 
 	// Not suppressed: reload exc and re-raise
@@ -1384,15 +1381,14 @@ func (c *Compiler) compileCall(expr *ASTExpr) error {
 		if err := c.compileExpr(calleeExpr.Left); err != nil {
 			return err
 		}
-		attrName := string(c.src[calleeExpr.Start:calleeExpr.End])
-		_, idx := c.constPool.InternName(attrName)
-		c.emitOp(vm.OP_LOAD_METHOD, 0, idx)
 		for _, arg := range posArgs {
 			if err := c.compileExpr(arg); err != nil {
 				return err
 			}
 		}
-		c.emitOp(vm.OP_CALL_METHOD, uint8(len(posArgs)), 0)
+		attrName := string(c.src[calleeExpr.Start:calleeExpr.End])
+		_, idx := c.constPool.InternName(attrName)
+		c.emitOp(vm.OP_CALL_METHOD_PIC, uint8(len(posArgs)), idx)
 		return nil
 	}
 

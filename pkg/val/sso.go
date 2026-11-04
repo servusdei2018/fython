@@ -1,6 +1,7 @@
 package val
 
 import (
+	"strconv"
 	"sync"
 	"unsafe"
 )
@@ -87,6 +88,28 @@ func HashBytes(b []byte) uint32 {
 		return 1
 	}
 	return h
+}
+
+// AppendValueBytes appends the UTF-8 bytes of string-like Value v into dst without heap allocations.
+// If v is KindInlineStr, it unpacks the 1–7 bytes directly from v.num using bit shifts.
+// If v is KindString (*PyString), it views the underlying bytes via unsafe.Slice without copying.
+func AppendValueBytes(dst []byte, v Value) ([]byte, bool) {
+	if v.ptr == &tagInlineStr {
+		n := int(v.num & 0xFF)
+		for i := 0; i < n; i++ {
+			dst = append(dst, byte(v.num>>((i+1)*8)))
+		}
+		return dst, true
+	}
+	if v.ptr != nil && v.ptr.Kind == KindString {
+		ps := (*PyString)(unsafe.Pointer(v.ptr))
+		if len(ps.Data) > 0 {
+			view := unsafe.Slice(unsafe.StringData(ps.Data), len(ps.Data))
+			dst = append(dst, view...)
+		}
+		return dst, true
+	}
+	return dst, false
 }
 
 // NewStringVal routes strings of length <= 7 bytes to SmallStringVal (0 allocations)
@@ -402,4 +425,106 @@ func InternString(s string) Value {
 // InternValue canonicalizes a string Value in the process-wide default InternPool.
 func InternValue(v Value) Value {
 	return defaultInternPool.InternValue(v)
+}
+
+// IntToStringVal formats an integer to a string Value.
+// For numbers 0 <= n <= 9,999,999 (and small negative numbers), it packs the ASCII digits directly
+// into a KindInlineStr (0 allocations).
+func IntToStringVal(n int64) Value {
+	if n >= 0 && n <= 9999999 {
+		var buf [8]byte
+		i := len(buf)
+		temp := n
+		if temp == 0 {
+			i--
+			buf[i] = '0'
+		} else {
+			for temp > 0 {
+				i--
+				buf[i] = byte('0' + (temp % 10))
+				temp /= 10
+			}
+		}
+		return SmallStringFromBytes(buf[i:])
+	}
+	if n < 0 && n >= -999999 {
+		var buf [8]byte
+		i := len(buf)
+		temp := -n
+		for temp > 0 {
+			i--
+			buf[i] = byte('0' + (temp % 10))
+			temp /= 10
+		}
+		i--
+		buf[i] = '-'
+		return SmallStringFromBytes(buf[i:])
+	}
+	var stackBuf [32]byte
+	b := strconv.AppendInt(stackBuf[:0], n, 10)
+	dataBuf := make([]byte, len(b))
+	copy(dataBuf, b)
+	s := unsafe.String(unsafe.SliceData(dataBuf), len(b))
+	ps := &PyString{
+		Header: ObjectHeader{
+			Kind: KindString,
+			Hash: HashString(s),
+			Type: StrType,
+		},
+		Data: s,
+	}
+	return Value{num: 0, ptr: &ps.Header}
+}
+
+// ConcatStrings concatenates two string-like Values.
+// If the combined length <= 7, it returns a KindInlineStr with 0 allocations.
+// For larger strings, it copies directly into an allocated buffer with extra headroom
+// for chained in-place additions, avoiding redundant Go string copies.
+func ConcatStrings(a, b Value) Value {
+	lenA := a.StringLen()
+	lenB := b.StringLen()
+	totalLen := lenA + lenB
+	if totalLen <= 7 {
+		var buf [8]byte
+		dst, _ := AppendValueBytes(buf[:0], a)
+		dst, _ = AppendValueBytes(dst, b)
+		return SmallStringFromBytes(dst)
+	}
+	capSize := totalLen
+	if capSize < 128 {
+		capSize = 128
+	}
+	buf := make([]byte, totalLen, capSize)
+	var pos int
+	if a.ptr == &tagInlineStr {
+		n := int(a.num & 0xFF)
+		for i := 0; i < n; i++ {
+			buf[i] = byte(a.num >> ((i + 1) * 8))
+		}
+		pos = n
+	} else if a.ptr.Kind == KindString {
+		data := (*PyString)(unsafe.Pointer(a.ptr)).Data
+		copy(buf, data)
+		pos = len(data)
+	}
+	if b.ptr == &tagInlineStr {
+		n := int(b.num & 0xFF)
+		for i := 0; i < n; i++ {
+			buf[pos+i] = byte(b.num >> ((i + 1) * 8))
+		}
+	} else if b.ptr.Kind == KindString {
+		data := (*PyString)(unsafe.Pointer(b.ptr)).Data
+		copy(buf[pos:], data)
+	}
+	s := unsafe.String(unsafe.SliceData(buf), totalLen)
+	ps := &PyString{
+		Header: ObjectHeader{
+			Kind: KindString,
+			Hash: HashString(s),
+			Type: StrType,
+		},
+		Data: s,
+		Buf:  buf,
+	}
+	return Value{num: 0, ptr: &ps.Header}
 }

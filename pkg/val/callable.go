@@ -37,6 +37,15 @@ type PyFunction struct {
 	Globals    *PyDict
 }
 
+// MethodPICEntry represents a single slot in a 4-way Polymorphic Inline Cache for method calls.
+type MethodPICEntry struct {
+	Shape       *Shape         // Verifies both concrete PyType and that no instance attr shadows the method
+	TypeVersion uint64         // Verifies the class MRO / method dict hasn't been mutated
+	TargetFn    *PyFunction    // Direct concrete pointer to target bytecode function (NO interface{})
+	NativeFn    VectorcallFunc // Direct function pointer if builtin/native method
+	TargetVal   Value          // Cached Value wrapper
+}
+
 // PyBoundMethod represents a first-class bound method object allocated on the heap ONLY when
 // `obj.method` is accessed as a value (via OP_LOAD_ATTR / TpDescrGet) rather than called via OP_LOAD_METHOD.
 // Header MUST be at byte offset 0.
@@ -1031,6 +1040,7 @@ func initTypes() {
 		RootShape:  defaultRootShape,
 		VersionTag: allocTypeVersion(),
 	}
+	defaultRootShape.Type = ObjectType
 	ObjectType.MRO = []*PyType{ObjectType}
 	ObjectType.Slots.TpGetAttr = objectGetAttr
 	ObjectType.Slots.TpSetAttr = objectSetAttr
@@ -1040,9 +1050,10 @@ func initTypes() {
 		Name:       "type",
 		Bases:      []*PyType{ObjectType},
 		MRO:        []*PyType{nil, ObjectType},
-		RootShape:  NewRootShape(),
+		RootShape:  NewRootShapeForType(nil),
 		VersionTag: allocTypeVersion(),
 	}
+	TypeType.RootShape.Type = TypeType
 	TypeType.MRO[0] = TypeType
 	TypeType.Header.Type = TypeType
 	ObjectType.Header.Type = TypeType
@@ -1143,7 +1154,14 @@ func initTypes() {
 		if len(args) == 0 {
 			return NewStringVal("")
 		}
-		return NewStringVal(args[0].String())
+		a := args[0]
+		if a.IsInt64() {
+			return IntToStringVal(a.AsInt64())
+		}
+		if a.IsAnyString() {
+			return a
+		}
+		return NewStringVal(a.String())
 	}
 
 	// Backfill Type = StrType on heap dunder strings interned prior to StrType creation.

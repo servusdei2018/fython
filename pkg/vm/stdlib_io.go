@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"unsafe"
 
 	"github.com/servusdei2018/fython/pkg/val"
 )
@@ -28,7 +29,7 @@ type pyBytesIO struct {
 type pyStringIO struct {
 	Header val.ObjectHeader
 	Shape  *val.Shape
-	buf    string
+	buf    []byte
 	pos    int
 	mu     sync.RWMutex
 }
@@ -38,9 +39,20 @@ type pyFile struct {
 	Shape    *val.Shape
 	f        *os.File
 	reader   *bufio.Reader
+	writeBuf []byte
 	binary   bool
 	isClosed bool
 	mu       sync.Mutex
+}
+
+func (pf *pyFile) flushLocked() {
+	if len(pf.writeBuf) > 0 && pf.f != nil {
+		_, err := pf.f.Write(pf.writeBuf)
+		pf.writeBuf = pf.writeBuf[:0]
+		if err != nil {
+			panic("OSError: " + err.Error())
+		}
+	}
 }
 
 func initIOTypes() {
@@ -166,7 +178,7 @@ func initIOTypes() {
 			}
 			res := sio.buf[sio.pos : sio.pos+n]
 			sio.pos += n
-			return val.NewStringVal(res)
+			return val.NewStringVal(string(res))
 		}))
 
 		StringIOType.Dict.Set(val.InternString("write"), val.NewBuiltinFuncVal("write", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -175,27 +187,60 @@ func initIOTypes() {
 			}
 			sio := (*pyStringIO)(val.AsPointer(args[0]))
 			sio.mu.Lock()
-			defer sio.mu.Unlock()
-			s := args[1].AsString()
-			if sio.pos == len(sio.buf) {
-				sio.buf += s
-			} else {
-				prefix := sio.buf[:sio.pos]
-				var suffix string
-				if sio.pos+len(s) < len(sio.buf) {
-					suffix = sio.buf[sio.pos+len(s):]
+			v := args[1]
+			oldLen := len(sio.buf)
+			if sio.pos == oldLen {
+				var ok bool
+				sio.buf, ok = val.AppendValueBytes(sio.buf, v)
+				if !ok {
+					sio.buf = append(sio.buf, v.AsString()...)
 				}
-				sio.buf = prefix + s + suffix
+				written := len(sio.buf) - oldLen
+				sio.pos = len(sio.buf)
+				sio.mu.Unlock()
+				return val.Int64Val(int64(written))
+			} else {
+				var tmp []byte
+				var ok bool
+				tmp, ok = val.AppendValueBytes(tmp, v)
+				if !ok {
+					tmp = append(tmp, v.AsString()...)
+				}
+				if sio.pos+len(tmp) <= len(sio.buf) {
+					copy(sio.buf[sio.pos:], tmp)
+				} else {
+					sio.buf = append(sio.buf[:sio.pos], tmp...)
+				}
+				sio.pos += len(tmp)
+				sio.mu.Unlock()
+				return val.Int64Val(int64(len(tmp)))
 			}
-			sio.pos += len(s)
-			return val.Int64Val(int64(len(s)))
 		}))
 
 		StringIOType.Dict.Set(val.InternString("getvalue"), val.NewBuiltinFuncVal("getvalue", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			sio := (*pyStringIO)(val.AsPointer(args[0]))
 			sio.mu.RLock()
-			defer sio.mu.RUnlock()
-			return val.NewStringVal(sio.buf)
+			n := len(sio.buf)
+			if n == 0 {
+				sio.mu.RUnlock()
+				return val.NewStringVal("")
+			}
+			if n <= 7 {
+				res := val.SmallStringFromBytes(sio.buf)
+				sio.mu.RUnlock()
+				return res
+			}
+			s := unsafe.String(unsafe.SliceData(sio.buf), n)
+			ps := &val.PyString{
+				Header: val.ObjectHeader{
+					Kind: val.KindString,
+					Hash: val.HashString(s),
+					Type: val.StrType,
+				},
+				Data: s,
+			}
+			sio.mu.RUnlock()
+			return val.ObjectVal(&ps.Header)
 		}))
 
 		StringIOType.Dict.Set(val.InternString("seek"), val.NewBuiltinFuncVal("seek", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -234,7 +279,7 @@ func initIOTypes() {
 		StringIOType.Dict.Set(val.InternString("close"), val.NewBuiltinFuncVal("close", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			sio := (*pyStringIO)(val.AsPointer(args[0]))
 			sio.mu.Lock()
-			sio.buf = ""
+			sio.buf = nil
 			sio.pos = 0
 			sio.mu.Unlock()
 			return val.NoneVal()
@@ -258,6 +303,7 @@ func initIOTypes() {
 			pf := (*pyFile)(val.AsPointer(args[0]))
 			pf.mu.Lock()
 			if !pf.isClosed && pf.f != nil {
+				pf.flushLocked()
 				_ = pf.f.Close()
 				pf.isClosed = true
 			}
@@ -268,8 +314,8 @@ func initIOTypes() {
 		FileType.Dict.Set(val.InternString("read"), val.NewBuiltinFuncVal("read", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			pf := (*pyFile)(val.AsPointer(args[0]))
 			pf.mu.Lock()
-			defer pf.mu.Unlock()
 			if pf.isClosed {
+				pf.mu.Unlock()
 				panic("ValueError: I/O operation on closed file.")
 			}
 			n := -1
@@ -277,20 +323,57 @@ func initIOTypes() {
 				n = int(args[1].AsInt64())
 			}
 			if n < 0 {
+				pf.flushLocked()
+				stat, err := pf.f.Stat()
+				if err == nil && stat.Size() > 0 {
+					size := stat.Size()
+					buf := make([]byte, size)
+					readN, _ := io.ReadFull(pf.f, buf)
+					if readN > 0 {
+						buf = buf[:readN]
+						if pf.binary {
+							pf.mu.Unlock()
+							return val.NewBytesVal(buf)
+						}
+						s := unsafe.String(unsafe.SliceData(buf), readN)
+						ps := &val.PyString{
+							Header: val.ObjectHeader{
+								Kind: val.KindString,
+								Hash: val.HashString(s),
+								Type: val.StrType,
+							},
+							Data: s,
+						}
+						pf.mu.Unlock()
+						return val.ObjectVal(&ps.Header)
+					}
+				}
 				content, err := io.ReadAll(pf.reader)
 				if err != nil && len(content) == 0 {
+					pf.mu.Unlock()
 					if pf.binary {
 						return val.NewBytesVal(nil)
 					}
 					return val.NewStringVal("")
 				}
+				pf.mu.Unlock()
 				if pf.binary {
 					return val.NewBytesVal(content)
 				}
-				return val.NewStringVal(string(content))
+				s := unsafe.String(unsafe.SliceData(content), len(content))
+				ps := &val.PyString{
+					Header: val.ObjectHeader{
+						Kind: val.KindString,
+						Hash: val.HashString(s),
+						Type: val.StrType,
+					},
+					Data: s,
+				}
+				return val.ObjectVal(&ps.Header)
 			}
 			buf := make([]byte, n)
 			readN, _ := io.ReadFull(pf.reader, buf)
+			pf.mu.Unlock()
 			if readN <= 0 {
 				if pf.binary {
 					return val.NewBytesVal(nil)
@@ -300,7 +383,16 @@ func initIOTypes() {
 			if pf.binary {
 				return val.NewBytesVal(buf[:readN])
 			}
-			return val.NewStringVal(string(buf[:readN]))
+			s := unsafe.String(unsafe.SliceData(buf), readN)
+			ps := &val.PyString{
+				Header: val.ObjectHeader{
+					Kind: val.KindString,
+					Hash: val.HashString(s),
+					Type: val.StrType,
+				},
+				Data: s,
+			}
+			return val.ObjectVal(&ps.Header)
 		}))
 
 		FileType.Dict.Set(val.InternString("readline"), val.NewBuiltinFuncVal("readline", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -329,30 +421,39 @@ func initIOTypes() {
 			}
 			pf := (*pyFile)(val.AsPointer(args[0]))
 			pf.mu.Lock()
-			defer pf.mu.Unlock()
 			if pf.isClosed {
+				pf.mu.Unlock()
 				panic("ValueError: I/O operation on closed file.")
 			}
-			var data []byte
+			oldLen := len(pf.writeBuf)
 			if pf.binary {
 				if args[1].IsBytes() {
-					data = args[1].AsBytes().Data
+					pf.writeBuf = append(pf.writeBuf, args[1].AsBytes().Data...)
 				} else if args[1].IsByteArray() {
-					data = args[1].AsByteArray().Data
+					pf.writeBuf = append(pf.writeBuf, args[1].AsByteArray().Data...)
+				} else if args[1].IsMemoryView() {
+					pf.writeBuf = append(pf.writeBuf, args[1].AsMemoryView().Buf...)
 				} else {
+					pf.mu.Unlock()
 					panic("TypeError: a bytes-like object is required, not 'str'")
 				}
 			} else {
-				if !args[1].IsAnyString() {
-					panic("TypeError: write() argument must be str, not " + args[1].Type().Name)
+				var ok bool
+				pf.writeBuf, ok = val.AppendValueBytes(pf.writeBuf, args[1])
+				if !ok {
+					if !args[1].IsAnyString() {
+						pf.mu.Unlock()
+						panic("TypeError: write() argument must be str, not " + args[1].Type().Name)
+					}
+					pf.writeBuf = append(pf.writeBuf, args[1].AsString()...)
 				}
-				data = []byte(args[1].AsString())
 			}
-			n, err := pf.f.Write(data)
-			if err != nil {
-				panic("OSError: " + err.Error())
+			written := len(pf.writeBuf) - oldLen
+			if len(pf.writeBuf) >= 65536 {
+				pf.flushLocked()
 			}
-			return val.Int64Val(int64(n))
+			pf.mu.Unlock()
+			return val.Int64Val(int64(written))
 		}))
 
 		FileType.Dict.Set(val.InternString("flush"), val.NewBuiltinFuncVal("flush", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -360,6 +461,7 @@ func initIOTypes() {
 			pf.mu.Lock()
 			defer pf.mu.Unlock()
 			if !pf.isClosed && pf.f != nil {
+				pf.flushLocked()
 				_ = pf.f.Sync()
 			}
 			return val.NoneVal()
@@ -370,6 +472,7 @@ func initIOTypes() {
 			pf.mu.Lock()
 			defer pf.mu.Unlock()
 			if !pf.isClosed && pf.f != nil {
+				pf.flushLocked()
 				_ = pf.f.Close()
 				pf.isClosed = true
 			}
@@ -400,15 +503,21 @@ func openFileBuiltin(file string, mode string) val.Value {
 		panic("FileNotFoundError: " + err.Error())
 	}
 
+	var writeBuf []byte
+	if strings.Contains(mode, "w") || strings.Contains(mode, "a") || strings.Contains(mode, "+") {
+		writeBuf = make([]byte, 0, 65536)
+	}
+
 	pf := &pyFile{
 		Header: val.ObjectHeader{
 			Kind: val.KindInstance,
 			Type: FileType,
 		},
-		Shape:  FileType.RootShape,
-		f:      f,
-		reader: bufio.NewReader(f),
-		binary: binary,
+		Shape:    FileType.RootShape,
+		f:        f,
+		reader:   bufio.NewReader(f),
+		writeBuf: writeBuf,
+		binary:   binary,
 	}
 
 	return val.ObjectVal(&pf.Header)
@@ -444,9 +553,11 @@ func (e *Engine) createIOModule() val.Value {
 
 	// StringIO constructor
 	ioMod.Dict.Set(val.InternString("StringIO"), val.NewBuiltinFuncVal("StringIO", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		var initStr string
+		var initBytes []byte
 		if len(args) > 0 && args[0].IsAnyString() {
-			initStr = args[0].AsString()
+			initBytes, _ = val.AppendValueBytes(nil, args[0])
+		} else {
+			initBytes = make([]byte, 0, 8192)
 		}
 		sio := &pyStringIO{
 			Header: val.ObjectHeader{
@@ -454,7 +565,7 @@ func (e *Engine) createIOModule() val.Value {
 				Type: StringIOType,
 			},
 			Shape: StringIOType.RootShape,
-			buf:   initStr,
+			buf:   initBytes,
 		}
 		return val.ObjectVal(&sio.Header)
 	}))

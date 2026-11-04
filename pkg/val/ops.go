@@ -93,7 +93,7 @@ func numericNbAdd(ctx *ExecContext, a, b Value) Value {
 func strNbAdd(ctx *ExecContext, a, b Value) Value {
 	if (a.ptr == &tagInlineStr || a.ptr.Kind == KindString) &&
 		(b.ptr == &tagInlineStr || b.ptr.Kind == KindString) {
-		return NewStringVal(a.AsString() + b.AsString())
+		return ConcatStrings(a, b)
 	}
 	panic("val.Add: can only concatenate str to str")
 }

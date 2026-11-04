@@ -6,6 +6,9 @@ import (
 	"unsafe"
 )
 
+// NativeFunc is an alias for VectorcallFunc for direct native method pointers.
+type NativeFunc = VectorcallFunc
+
 // ErrInconsistentMRO is returned when C3 superclass linearization cannot find a valid ordering.
 var ErrInconsistentMRO = errors.New("val: Cannot create a consistent method resolution order (MRO)")
 
@@ -433,9 +436,10 @@ func NewType(name string, bases []*PyType, dict *PyDict) (*PyType, error) {
 		Name:       name,
 		Bases:      bases,
 		Dict:       dict,
-		RootShape:  NewRootShape(),
+		RootShape:  NewRootShapeForType(nil),
 		VersionTag: allocTypeVersion(),
 	}
+	t.RootShape.Type = t
 
 	mro, err := ComputeMRO(t)
 	if err != nil {

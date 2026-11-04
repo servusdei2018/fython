@@ -2,6 +2,7 @@ package vm
 
 import (
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/servusdei2018/fython/pkg/val"
@@ -29,6 +30,12 @@ const (
 	ICKindBuiltin               // Hit on builtins dict fallback
 	ICKindModuleAttr            // Hit on module dict
 )
+
+// AttrPICEntry represents a single slot in a 4-way polymorphic inline cache for attribute access.
+type AttrPICEntry struct {
+	Shape     *val.Shape
+	SlotIndex int
+}
 
 // ICSlot caches [ExpectedShapeID, ExpectedTypeVer, SlotIndex, CachedVal] for O(1)
 // zero-allocation attribute and method lookup in OP_LOAD_ATTR, OP_STORE_ATTR, and OP_LOAD_METHOD.
@@ -64,7 +71,7 @@ type CallFrame struct {
 	retSP      int // Caller's stack pointer where the return value will be written
 	cells      []val.Value
 	globals    *val.PyDict
-	iters      [16]val.PyIter
+	cache      *VMCodeCache
 }
 
 // CodeObject Flags bitmask constants.
@@ -78,6 +85,7 @@ const (
 // in a constant pool with zero-cost downcasting.
 type CodeObject struct {
 	Header           val.ObjectHeader
+	ID               uint32
 	Name             string
 	Code             []uint32
 	Consts           []val.Value
@@ -95,11 +103,33 @@ type CodeObject struct {
 	IsTier2Optimized int32
 }
 
+var nextCodeObjectID uint32
+
+func (co *CodeObject) initID() uint32 {
+	id := atomic.LoadUint32(&co.ID)
+	if id != 0 {
+		return id
+	}
+	newID := atomic.AddUint32(&nextCodeObjectID, 1)
+	if atomic.CompareAndSwapUint32(&co.ID, 0, newID) {
+		return newID
+	}
+	return atomic.LoadUint32(&co.ID)
+}
+
+// VMCodeCache holds per-CodeObject inline caches isolated per VM instance (0 races, 0 cross-call thrashing).
+type VMCodeCache struct {
+	ic        []ICSlot
+	methodPIC [][4]val.MethodPICEntry
+	attrPIC   [][4]AttrPICEntry
+}
+
 // Compile-time check that CodeObject.Header is at byte offset 0.
 var _ [0 - unsafe.Offsetof(CodeObject{}.Header)]byte
 
 // NewCodeVal wraps a *CodeObject as a val.Value with KindCode.
 func NewCodeVal(co *CodeObject) val.Value {
+	co.initID()
 	co.Header.Kind = val.KindCode
 	co.Header.Type = val.CodeType
 	return val.ObjectVal(&co.Header)
@@ -117,6 +147,10 @@ type VM struct {
 	stack          []val.Value
 	frames         []CallFrame
 	ic             []ICSlot
+	methodPIC      [][4]val.MethodPICEntry
+	attrPIC        [][4]AttrPICEntry
+	codeCaches     []VMCodeCache
+	builtinRange   val.Value
 	internPool     *val.InternPool
 	execCtx        val.ExecContext
 	activeFrameIdx int
@@ -128,6 +162,26 @@ type VM struct {
 	lastException  val.Value
 	coroFreeList   []*val.PyCoroutine
 	rootCO         CodeObject
+	rootCache      VMCodeCache
+}
+
+func (vm *VM) getCodeCache(co *CodeObject) *VMCodeCache {
+	if co == nil || co == &vm.rootCO {
+		return &vm.rootCache
+	}
+	id := int(co.initID())
+	if id >= len(vm.codeCaches) {
+		newCaches := make([]VMCodeCache, id+16)
+		copy(newCaches, vm.codeCaches)
+		vm.codeCaches = newCaches
+	}
+	cache := &vm.codeCaches[id]
+	if len(cache.ic) < len(co.Code) {
+		cache.ic = make([]ICSlot, len(co.Code))
+		cache.methodPIC = make([][4]val.MethodPICEntry, len(co.Code))
+		cache.attrPIC = make([][4]AttrPICEntry, len(co.Code))
+	}
+	return cache
 }
 
 // Engine returns the parent Engine managing this VM.

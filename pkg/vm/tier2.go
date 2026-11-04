@@ -5,7 +5,10 @@ import "sync/atomic"
 // maybeOptimizeCodeObject atomically increments co.Hotness and triggers Tier-2 optimization
 // once the hotness threshold (1,000) is exceeded.
 func maybeOptimizeCodeObject(co *CodeObject) {
-	if atomic.AddInt32(&co.Hotness, 1) >= 1000 && atomic.LoadInt32(&co.IsTier2Optimized) == 0 {
+	if atomic.LoadInt32(&co.IsTier2Optimized) != 0 {
+		return
+	}
+	if atomic.AddInt32(&co.Hotness, 1) >= 1000 {
 		OptimizeCodeObject(co)
 	}
 }
@@ -22,7 +25,7 @@ func OptimizeCodeObject(co *CodeObject) {
 		return
 	}
 
-	// Phase 1: Build jump target and exception boundary map
+	// Step 1: Build jump target and exception boundary map
 	isJumpTarget := make([]bool, len(code)+1)
 	for i := 0; i < len(code); i++ {
 		inst := atomic.LoadUint32(&code[i])
@@ -47,7 +50,7 @@ func OptimizeCodeObject(co *CodeObject) {
 		}
 	}
 
-	// Phase 2: Linear scan and pattern fusion
+	// Step 2: Linear scan and pattern fusion
 	for i := 0; i+3 < len(code); {
 		// Never fuse across internal jump targets
 		if isJumpTarget[i+1] || isJumpTarget[i+2] || isJumpTarget[i+3] {
@@ -105,6 +108,25 @@ func OptimizeCodeObject(co *CodeObject) {
 			}
 		}
 
+		// Pattern 4: OP_LOAD_DEREF + OP_LOAD_CONST + (OP_BINARY_ADD | OP_BINARY_ADD_INT) + OP_STORE_DEREF
+		// -> OP_INC_DEREF_INT (when const is 1 and same cell)
+		if op0 == OP_LOAD_DEREF && op1 == OP_LOAD_CONST &&
+			(op2 == OP_BINARY_ADD || op2 == OP_BINARY_ADD_INT) &&
+			op3 == OP_STORE_DEREF &&
+			DecodeArgBx(w0) == DecodeArgBx(w3) {
+
+			cellIdx := DecodeArgBx(w0)
+			constIdx := DecodeArgBx(w1)
+			if int(constIdx) < len(co.Consts) && co.Consts[constIdx].IsInt64() && co.Consts[constIdx].AsInt64() == 1 {
+				atomic.StoreUint32(&code[i], Encode(OP_INC_DEREF_INT, 0, cellIdx))
+				atomic.StoreUint32(&code[i+1], Encode(OP_NOP, 0, 0))
+				atomic.StoreUint32(&code[i+2], Encode(OP_NOP, 0, 0))
+				atomic.StoreUint32(&code[i+3], Encode(OP_NOP, 0, 0))
+				i += 4
+				continue
+			}
+		}
+
 		// Pattern 1: OP_LOAD_FAST + OP_LOAD_FAST + (OP_BINARY_ADD | OP_BINARY_ADD_INT) + OP_STORE_FAST
 		// -> OP_FAST_ADD_INT_LOCAL_TO_LOCAL
 		if op0 == OP_LOAD_FAST && op1 == OP_LOAD_FAST &&
@@ -121,6 +143,86 @@ func OptimizeCodeObject(co *CodeObject) {
 				atomic.StoreUint32(&code[i+2], Encode(OP_NOP, 0, 0))
 				atomic.StoreUint32(&code[i+3], Encode(OP_NOP, 0, 0))
 				i += 4
+				continue
+			}
+		}
+
+		// Pattern 5: OP_LOAD_FAST + OP_LOAD_FAST + (OP_BINARY_SUB | OP_BINARY_SUB_INT) + OP_STORE_FAST
+		// -> OP_FAST_SUB_INT_LOCAL_TO_LOCAL
+		if op0 == OP_LOAD_FAST && op1 == OP_LOAD_FAST &&
+			(op2 == OP_BINARY_SUB || op2 == OP_BINARY_SUB_INT) &&
+			op3 == OP_STORE_FAST {
+
+			srcA := DecodeArgBx(w0)
+			srcB := DecodeArgBx(w1)
+			dst := DecodeArgBx(w3)
+
+			if srcA < 256 && srcB < 256 && dst < 256 {
+				atomic.StoreUint32(&code[i], EncodeABC(OP_FAST_SUB_INT_LOCAL_TO_LOCAL, uint8(dst), uint8(srcA), uint8(srcB)))
+				atomic.StoreUint32(&code[i+1], Encode(OP_NOP, 0, 0))
+				atomic.StoreUint32(&code[i+2], Encode(OP_NOP, 0, 0))
+				atomic.StoreUint32(&code[i+3], Encode(OP_NOP, 0, 0))
+				i += 4
+				continue
+			}
+		}
+
+		// Pattern 6: OP_LOAD_FAST + OP_LOAD_FAST + OP_COMPARE_OP (CMP_EQ) + OP_JUMP_IF_FALSE
+		// -> OP_FAST_CMP_EQ_JUMP_IF_FALSE
+		if op0 == OP_LOAD_FAST && op1 == OP_LOAD_FAST &&
+			op2 == OP_COMPARE_OP && DecodeArgA(w2) == CMP_EQ &&
+			op3 == OP_JUMP_IF_FALSE {
+
+			srcA := DecodeArgBx(w0)
+			srcB := DecodeArgBx(w1)
+			exitTarget := DecodeArgBx(w3)
+
+			if srcA < 256 && srcB < 256 {
+				atomic.StoreUint32(&code[i], Encode(OP_FAST_CMP_EQ_JUMP_IF_FALSE, uint8(srcA), exitTarget))
+				atomic.StoreUint32(&code[i+1], Encode(OP_NOP, uint8(srcB), 0))
+				atomic.StoreUint32(&code[i+2], Encode(OP_NOP, 0, 0))
+				atomic.StoreUint32(&code[i+3], Encode(OP_NOP, 0, 0))
+				i += 4
+				continue
+			}
+		}
+
+		// Pattern 7: OP_LOAD_DEREF + OP_LOAD_FAST + OP_BINARY_SUBSCR + OP_STORE_FAST
+		// -> OP_FAST_SUBSCR_DEREF_LIST_LOCAL
+		if op0 == OP_LOAD_DEREF && op1 == OP_LOAD_FAST &&
+			op2 == OP_BINARY_SUBSCR &&
+			op3 == OP_STORE_FAST {
+
+			cellIdx := DecodeArgBx(w0)
+			idxReg := DecodeArgBx(w1)
+			dstReg := DecodeArgBx(w3)
+
+			if cellIdx < 256 && idxReg < 256 && dstReg < 256 {
+				atomic.StoreUint32(&code[i], EncodeABC(OP_FAST_SUBSCR_DEREF_LIST_LOCAL, uint8(dstReg), uint8(cellIdx), uint8(idxReg)))
+				atomic.StoreUint32(&code[i+1], Encode(OP_NOP, 0, 0))
+				atomic.StoreUint32(&code[i+2], Encode(OP_NOP, 0, 0))
+				atomic.StoreUint32(&code[i+3], Encode(OP_NOP, 0, 0))
+				i += 4
+				continue
+			}
+		}
+
+		// Pattern 8: OP_LOAD_FAST + OP_UNARY_NEGATIVE + OP_STORE_FAST (same register)
+		// -> OP_FAST_NEG_INT_LOCAL
+		if op0 == OP_LOAD_FAST && op1 == OP_UNARY_NEGATIVE &&
+			op2 == OP_STORE_FAST &&
+			DecodeArgBx(w0) == DecodeArgBx(w2) {
+
+			reg := DecodeArgBx(w0)
+			if reg < 256 {
+				atomic.StoreUint32(&code[i], Encode(OP_FAST_NEG_INT_LOCAL, uint8(reg), 0))
+				atomic.StoreUint32(&code[i+1], Encode(OP_NOP, 0, 0))
+				atomic.StoreUint32(&code[i+2], Encode(OP_NOP, 0, 0))
+				if op3 == OP_NOP {
+					i += 4
+				} else {
+					i += 3
+				}
 				continue
 			}
 		}
@@ -151,4 +253,35 @@ func DeoptimizeFastLoop(code []uint32, ip int, reg uint8, constIdx uint16, exitT
 	atomic.StoreUint32(&code[ip+1], Encode(OP_LOAD_CONST, 0, constIdx))
 	atomic.StoreUint32(&code[ip+2], Encode(OP_COMPARE_LT, 0, 0))
 	atomic.StoreUint32(&code[ip+3], Encode(OP_JUMP_IF_FALSE, 0, exitTarget))
+}
+
+// DeoptimizeFastSub restores original instructions for OP_FAST_SUB_INT_LOCAL_TO_LOCAL.
+func DeoptimizeFastSub(code []uint32, ip int, dst, srcA, srcB uint8) {
+	atomic.StoreUint32(&code[ip], Encode(OP_LOAD_FAST, 0, uint16(srcA)))
+	atomic.StoreUint32(&code[ip+1], Encode(OP_LOAD_FAST, 0, uint16(srcB)))
+	atomic.StoreUint32(&code[ip+2], Encode(OP_BINARY_SUB, 0, 0))
+	atomic.StoreUint32(&code[ip+3], Encode(OP_STORE_FAST, 0, uint16(dst)))
+}
+
+// DeoptimizeFastCmpEq restores original instructions for OP_FAST_CMP_EQ_JUMP_IF_FALSE.
+func DeoptimizeFastCmpEq(code []uint32, ip int, srcA, srcB uint8, exitTarget uint16) {
+	atomic.StoreUint32(&code[ip], Encode(OP_LOAD_FAST, 0, uint16(srcA)))
+	atomic.StoreUint32(&code[ip+1], Encode(OP_LOAD_FAST, 0, uint16(srcB)))
+	atomic.StoreUint32(&code[ip+2], Encode(OP_COMPARE_OP, CMP_EQ, 0))
+	atomic.StoreUint32(&code[ip+3], Encode(OP_JUMP_IF_FALSE, 0, exitTarget))
+}
+
+// DeoptimizeFastSubscr restores original instructions for OP_FAST_SUBSCR_DEREF_LIST_LOCAL.
+func DeoptimizeFastSubscr(code []uint32, ip int, dst, cellIdx, idxReg uint8) {
+	atomic.StoreUint32(&code[ip], Encode(OP_LOAD_DEREF, 0, uint16(cellIdx)))
+	atomic.StoreUint32(&code[ip+1], Encode(OP_LOAD_FAST, 0, uint16(idxReg)))
+	atomic.StoreUint32(&code[ip+2], Encode(OP_BINARY_SUBSCR, 0, 0))
+	atomic.StoreUint32(&code[ip+3], Encode(OP_STORE_FAST, 0, uint16(dst)))
+}
+
+// DeoptimizeFastNeg restores original instructions for OP_FAST_NEG_INT_LOCAL.
+func DeoptimizeFastNeg(code []uint32, ip int, reg uint8) {
+	atomic.StoreUint32(&code[ip], Encode(OP_LOAD_FAST, 0, uint16(reg)))
+	atomic.StoreUint32(&code[ip+1], Encode(OP_UNARY_NEGATIVE, 0, 0))
+	atomic.StoreUint32(&code[ip+2], Encode(OP_STORE_FAST, 0, uint16(reg)))
 }

@@ -20,6 +20,7 @@ type PyBigInt struct {
 type PyString struct {
 	Header ObjectHeader
 	Data   string
+	Buf    []byte
 }
 
 // PyList represents a dynamic array of Value on the heap.
@@ -531,27 +532,30 @@ func (l *PyList) Append(v Value) {
 // Get returns the Value at idx in a thread-safe manner.
 func (l *PyList) Get(idx int) (Value, bool) {
 	l.mu.RLock()
-	defer l.mu.RUnlock()
 	if idx < 0 {
 		idx += len(l.Items)
 	}
 	if idx < 0 || idx >= len(l.Items) {
+		l.mu.RUnlock()
 		return NoneVal(), false
 	}
-	return l.Items[idx], true
+	v := l.Items[idx]
+	l.mu.RUnlock()
+	return v, true
 }
 
 // Set updates the Value at idx in a thread-safe manner.
 func (l *PyList) Set(idx int, v Value) bool {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	if idx < 0 {
 		idx += len(l.Items)
 	}
 	if idx < 0 || idx >= len(l.Items) {
+		l.mu.Unlock()
 		return false
 	}
 	l.Items[idx] = v
+	l.mu.Unlock()
 	return true
 }
 

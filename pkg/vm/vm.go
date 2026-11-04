@@ -3,6 +3,7 @@ package vm
 import (
 	"fmt"
 	"sync/atomic"
+	"unsafe"
 
 	"github.com/servusdei2018/fython/pkg/val"
 )
@@ -188,6 +189,9 @@ func (vm *VM) setupCalleeCells(callee *CodeObject, target val.Value, stack []val
 	if nCells == 0 && nFree == 0 {
 		return nil
 	}
+	if nCells == 0 && target.IsFunction() {
+		return target.AsFunction().Closure
+	}
 	res := make([]val.Value, nCells+nFree)
 	for i := 0; i < nCells; i++ {
 		name := callee.CellVars[i]
@@ -210,7 +214,7 @@ func (vm *VM) setupCalleeCells(callee *CodeObject, target val.Value, stack []val
 }
 
 func (vm *VM) initBuiltins() {
-	vm.builtins.Set(val.InternString("range"), val.NewBuiltinFuncVal("range", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+	rangeVal := val.NewBuiltinFuncVal("range", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		var start, stop, step int64
 		step = 1
 		if len(args) == 1 {
@@ -227,7 +231,9 @@ func (vm *VM) initBuiltins() {
 			return val.RangeVal(int32(start), int32(stop))
 		}
 		return val.NewRangeIterVal(start, stop, step)
-	}))
+	})
+	vm.builtinRange = rangeVal
+	vm.builtins.Set(val.InternString("range"), rangeVal)
 
 	vm.builtins.Set(val.InternString("len"), val.NewBuiltinFuncVal("len", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) == 0 {
@@ -626,6 +632,9 @@ func (vm *VM) setupCalleeCellsSlice(callee *CodeObject, target val.Value, stack 
 	if nCells == 0 && nFree == 0 {
 		return nil
 	}
+	if nCells == 0 && target.IsFunction() {
+		return target.AsFunction().Closure
+	}
 	res := make([]val.Value, nCells+nFree)
 	for i := 0; i < nCells; i++ {
 		name := callee.CellVars[i]
@@ -735,7 +744,7 @@ func (vm *VM) resumeCoroutine(ctx *val.ExecContext, coro *val.PyCoroutine, sentV
 	return res, val.IterExhausted
 }
 
-func (vm *VM) unwindException(exc val.Value, curCO **CodeObject, ip *int, frameIdx *int, startFrameIdx int, baseOffset *int, sp *int, code *[]uint32, consts *[]val.Value, cells *[]val.Value, globals **val.PyDict, stack []val.Value) bool {
+func (vm *VM) unwindException(exc val.Value, curCO **CodeObject, ip *int, frameIdx *int, startFrameIdx int, baseOffset *int, sp *int, code *[]uint32, consts *[]val.Value, cells *[]val.Value, globals **val.PyDict, stack []val.Value, curIC *[]ICSlot, curMethodPIC *[][4]val.MethodPICEntry, curAttrPIC *[][4]AttrPICEntry) bool {
 	vm.lastException = exc
 	for {
 		co := *curCO
@@ -762,13 +771,17 @@ func (vm *VM) unwindException(exc val.Value, curCO **CodeObject, ip *int, frameI
 				stack[*sp] = exc
 				(*sp)++
 				*ip = matched.TargetIP
+				cache := vm.getCodeCache(co)
+				*curIC = cache.ic
+				*curMethodPIC = cache.methodPIC
+				*curAttrPIC = cache.attrPIC
 				return true
 			}
 		}
 
 		if *frameIdx > startFrameIdx {
 			(*frameIdx)--
-			caller := vm.frames[*frameIdx]
+			caller := &vm.frames[*frameIdx]
 			*curCO = caller.co
 			*code = caller.code
 			*consts = caller.consts
@@ -844,6 +857,11 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 	locals := stack[baseOffset : baseOffset+256 : baseOffset+256]
 	_ = locals[255]
 
+	curCodeCache := vm.getCodeCache(curCO)
+	curIC := curCodeCache.ic
+	curMethodPIC := curCodeCache.methodPIC
+	curAttrPIC := curCodeCache.attrPIC
+
 	maybeOptimizeCodeObject(curCO)
 
 	for {
@@ -870,10 +888,14 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		case OP_STORE_FAST:
 			bx := uint16(inst)
 			sp--
+			valToStore := stack[sp]
+			if valToStore.IsString() {
+				valToStore.AsStringObj().Buf = nil
+			}
 			if bx < 256 {
-				locals[uint8(bx)] = stack[sp]
+				locals[uint8(bx)] = valToStore
 			} else {
-				stack[baseOffset+int(bx)] = stack[sp]
+				stack[baseOffset+int(bx)] = valToStore
 			}
 			ip++
 
@@ -895,6 +917,20 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				// Quickening: specialize in-place to OP_BINARY_ADD_FLOAT
 				atomic.StoreUint32(&code[ip], (inst&0x00FFFFFF)|(uint32(OP_BINARY_ADD_FLOAT)<<24))
 				stack[sp-2] = val.Float64Val(a.AsFloat64() + b.AsFloat64())
+			} else if a.IsAnyString() && b.IsAnyString() {
+				if a.IsString() {
+					psA := a.AsStringObj()
+					bLen := b.StringLen()
+					if psA.Buf != nil && cap(psA.Buf) >= len(psA.Buf)+bLen {
+						psA.Buf, _ = val.AppendValueBytes(psA.Buf, b)
+						psA.Data = unsafe.String(unsafe.SliceData(psA.Buf), len(psA.Buf))
+						psA.Header.Hash = 0
+						sp--
+						ip++
+						continue
+					}
+				}
+				stack[sp-2] = val.ConcatStrings(a, b)
 			} else {
 				vm.execCtx.SP = sp
 				vm.activeFrameIdx = frameIdx
@@ -997,7 +1033,15 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			key := stack[sp-1]
 			obj := stack[sp-2]
 			if obj.IsList() && key.IsInt64() {
-				val, ok := obj.AsList().Get(int(key.AsInt64()))
+				lst := obj.AsList()
+				k := key.AsInt64()
+				if k >= 0 && k < int64(len(lst.Items)) {
+					stack[sp-2] = lst.Items[k]
+					sp--
+					ip++
+					continue
+				}
+				val, ok := lst.Get(int(k))
 				if !ok {
 					panic("vm: IndexError: list index out of range")
 				}
@@ -1021,7 +1065,15 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			obj := stack[sp-2]
 			valToStore := stack[sp-3]
 			if obj.IsList() && key.IsInt64() {
-				if !obj.AsList().Set(int(key.AsInt64()), valToStore) {
+				lst := obj.AsList()
+				k := key.AsInt64()
+				if k >= 0 && k < int64(len(lst.Items)) {
+					lst.Items[k] = valToStore
+					sp -= 3
+					ip++
+					continue
+				}
+				if !lst.Set(int(k), valToStore) {
 					panic("vm: IndexError: list assignment index out of range")
 				}
 			} else if obj.IsDict() {
@@ -1094,6 +1146,34 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				retSP = sp - argc - 1
 			}
 
+			// Builtin range fast-path: 0 allocations
+			if target == vm.builtinRange && argc == 1 && stack[newBase].IsInt64() {
+				stop := stack[newBase].AsInt64()
+				if stop >= 0 && stop <= 0x7FFFFFFF {
+					stack[retSP] = val.RangeVal(0, int32(stop))
+					sp = retSP + 1
+					ip++
+					continue
+				}
+			}
+
+			// Builtin str fast-path: 0 allocations for int64 and strings
+			if target.IsType() && target.AsType() == val.StrType && argc == 1 {
+				arg := stack[newBase]
+				if arg.IsInt64() {
+					stack[retSP] = val.IntToStringVal(arg.AsInt64())
+					sp = retSP + 1
+					ip++
+					continue
+				}
+				if arg.IsAnyString() {
+					stack[retSP] = arg
+					sp = retSP + 1
+					ip++
+					continue
+				}
+			}
+
 			switch target.Kind() {
 			case val.KindCode:
 				callee := AsCodeObject(target)
@@ -1111,16 +1191,16 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					ip++
 					continue
 				}
-				vm.frames[frameIdx] = CallFrame{
-					co:         curCO,
-					code:       code,
-					consts:     consts,
-					ip:         ip + 1,
-					baseOffset: baseOffset,
-					retSP:      retSP,
-					cells:      cells,
-					globals:    globals,
-				}
+				saved := &vm.frames[frameIdx]
+				saved.co = curCO
+				saved.code = code
+				saved.consts = consts
+				saved.ip = ip + 1
+				saved.baseOffset = baseOffset
+				saved.retSP = retSP
+				saved.cells = cells
+				saved.globals = globals
+				saved.cache = curCodeCache
 				frameIdx++
 				curCO = callee
 				code = callee.Code
@@ -1146,7 +1226,12 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					numLocalsCallee = argc
 				}
 				sp = newBase + numLocalsCallee
+				curCodeCache = vm.getCodeCache(curCO)
+				curIC = curCodeCache.ic
+				curMethodPIC = curCodeCache.methodPIC
+				curAttrPIC = curCodeCache.attrPIC
 				ip = 0
+				continue
 
 			case val.KindFunction:
 				fn := target.AsFunction()
@@ -1165,19 +1250,27 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					ip++
 					continue
 				}
-				vm.frames[frameIdx] = CallFrame{
-					co:         curCO,
-					code:       code,
-					consts:     consts,
-					ip:         ip + 1,
-					baseOffset: baseOffset,
-					retSP:      retSP,
-					cells:      cells,
-					globals:    globals,
-				}
+				saved := &vm.frames[frameIdx]
+				saved.co = curCO
+				saved.code = code
+				saved.consts = consts
+				saved.ip = ip + 1
+				saved.baseOffset = baseOffset
+				saved.retSP = retSP
+				saved.cells = cells
+				saved.globals = globals
+				saved.cache = curCodeCache
 				frameIdx++
 				curCO = callee
-				sp = vm.bindFunctionArgs(callee, fn.Defaults, fn.KwDefaults, stack, newBase, argc, nil)
+				if argc == callee.NumParams && len(fn.Defaults) == 0 {
+					numLocalsCallee := callee.NumLocals
+					if numLocalsCallee < argc {
+						numLocalsCallee = argc
+					}
+					sp = newBase + numLocalsCallee
+				} else {
+					sp = vm.bindFunctionArgs(callee, fn.Defaults, fn.KwDefaults, stack, newBase, argc, nil)
+				}
 				code = callee.Code
 				consts = callee.Consts
 				baseOffset = newBase
@@ -1194,12 +1287,22 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				}
 				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
 				_ = locals[255]
-				maybeOptimizeCodeObject(callee)
-				cells = vm.setupCalleeCells(callee, target, stack, newBase, argc)
+				if len(callee.CellVars) == 0 && fn.Closure != nil {
+					cells = fn.Closure
+				} else if len(callee.CellVars) == 0 && len(callee.FreeVars) == 0 {
+					cells = nil
+				} else {
+					cells = vm.setupCalleeCells(callee, target, stack, newBase, argc)
+				}
 				if fn.Globals != nil {
 					globals = fn.Globals
 				}
+				curCodeCache = vm.getCodeCache(curCO)
+				curIC = curCodeCache.ic
+				curMethodPIC = curCodeCache.methodPIC
+				curAttrPIC = curCodeCache.attrPIC
 				ip = 0
+				continue
 
 			case val.KindBuiltinFunc:
 				builtin := target.AsBuiltinFunc()
@@ -1246,16 +1349,16 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					ip++
 					continue
 				}
-				vm.frames[frameIdx] = CallFrame{
-					co:         curCO,
-					code:       code,
-					consts:     consts,
-					ip:         ip + 1,
-					baseOffset: baseOffset,
-					retSP:      retSP,
-					cells:      cells,
-					globals:    globals,
-				}
+				saved := &vm.frames[frameIdx]
+				saved.co = curCO
+				saved.code = code
+				saved.consts = consts
+				saved.ip = ip + 1
+				saved.baseOffset = baseOffset
+				saved.retSP = retSP
+				saved.cells = cells
+				saved.globals = globals
+				saved.cache = curCodeCache
 				frameIdx++
 				curCO = callee
 				sp = vm.bindFunctionArgs(callee, fn.Defaults, fn.KwDefaults, stack, newBase, totalArgs, kwnames)
@@ -1298,16 +1401,16 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					ip++
 					continue
 				}
-				vm.frames[frameIdx] = CallFrame{
-					co:         curCO,
-					code:       code,
-					consts:     consts,
-					ip:         ip + 1,
-					baseOffset: baseOffset,
-					retSP:      retSP,
-					cells:      cells,
-					globals:    globals,
-				}
+				saved := &vm.frames[frameIdx]
+				saved.co = curCO
+				saved.code = code
+				saved.consts = consts
+				saved.ip = ip + 1
+				saved.baseOffset = baseOffset
+				saved.retSP = retSP
+				saved.cells = cells
+				saved.globals = globals
+				saved.cache = curCodeCache
 				frameIdx++
 				curCO = callee
 				sp = vm.bindFunctionArgs(callee, nil, nil, stack, newBase, totalArgs, kwnames)
@@ -1353,9 +1456,35 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			obj := stack[sp-1]
 			if obj.IsInstance() {
 				instObj := obj.AsInstance()
+				instShape := instObj.Shape
 				instType := instObj.Header.Type
-				entry := vm.ic[ip]
-				if instObj.Shape.ID == entry.ExpectedShapeID && instType.VersionTag == entry.ExpectedTypeVer && entry.CodePtr == &code[0] {
+				pic := &curMethodPIC[ip]
+				if pic[0].Shape == instShape && instType.VersionTag == pic[0].TypeVersion {
+					stack[sp] = pic[0].TargetVal
+					sp++
+					ip++
+					continue
+				}
+				if pic[1].Shape == instShape && instType.VersionTag == pic[1].TypeVersion {
+					stack[sp] = pic[1].TargetVal
+					sp++
+					ip++
+					continue
+				}
+				if pic[2].Shape == instShape && instType.VersionTag == pic[2].TypeVersion {
+					stack[sp] = pic[2].TargetVal
+					sp++
+					ip++
+					continue
+				}
+				if pic[3].Shape == instShape && instType.VersionTag == pic[3].TypeVersion {
+					stack[sp] = pic[3].TargetVal
+					sp++
+					ip++
+					continue
+				}
+				entry := curIC[ip]
+				if instShape.ID == entry.ExpectedShapeID && instType.VersionTag == entry.ExpectedTypeVer {
 					if entry.Kind == ICKindClassMethod {
 						// stack[sp-1] is already obj (Receiver); place raw Callable at stack[sp] with 0 allocs!
 						stack[sp] = entry.CachedVal
@@ -1373,9 +1502,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				}
 			} else if obj.IsModule() {
 				mod := obj.AsModule()
-				entry := &vm.ic[ip]
+				entry := &curIC[ip]
 				modVer := atomic.LoadUint64(&mod.Dict.VersionTag)
-				if entry.CodePtr == &code[0] && entry.Kind == ICKindModuleAttr && entry.ExpectedGlobalsVer == modVer {
+				if entry.Kind == ICKindModuleAttr && entry.ExpectedGlobalsVer == modVer {
 					stack[sp-1] = val.UnboundVal()
 					stack[sp] = entry.CachedVal
 					sp++
@@ -1386,7 +1515,6 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if v, slot, ok := mod.Dict.GetWithSlotHint(attrName, entry.SlotIndex); ok {
 					entry.Kind = ICKindModuleAttr
 					entry.ExpectedGlobalsVer = modVer
-					entry.CodePtr = &code[0]
 					entry.CachedVal = v
 					entry.SlotIndex = slot
 					stack[sp-1] = val.UnboundVal()
@@ -1396,7 +1524,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					continue
 				}
 			}
-			vm.loadMethodSlow(obj, consts[uint16(inst)], ip, sp, frameIdx, &code[0], stack)
+			vm.loadMethodSlow(obj, consts[uint16(inst)], ip, sp, frameIdx, stack, curIC, curMethodPIC)
 			sp++
 			ip++
 
@@ -1442,26 +1570,26 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					ip++
 					continue
 				}
-				vm.frames[frameIdx] = CallFrame{
-					co:         curCO,
-					code:       code,
-					consts:     consts,
-					ip:         ip + 1,
-					baseOffset: baseOffset,
-					retSP:      retSP,
-					cells:      cells,
-					globals:    globals,
-				}
+				saved := &vm.frames[frameIdx]
+				saved.co = curCO
+				saved.code = code
+				saved.consts = consts
+				saved.ip = ip + 1
+				saved.baseOffset = baseOffset
+				saved.retSP = retSP
+				saved.cells = cells
+				saved.globals = globals
+				saved.cache = curCodeCache
 				frameIdx++
 				curCO = callee
-				if totalArgs < callee.NumParams && len(fn.Defaults) > 0 {
-					sp = vm.bindFunctionArgs(callee, fn.Defaults, fn.KwDefaults, stack, newBase, totalArgs, nil)
-				} else {
+				if totalArgs == callee.NumParams && len(fn.Defaults) == 0 {
 					numLocalsCallee := callee.NumLocals
 					if numLocalsCallee < totalArgs {
 						numLocalsCallee = totalArgs
 					}
 					sp = newBase + numLocalsCallee
+				} else {
+					sp = vm.bindFunctionArgs(callee, fn.Defaults, fn.KwDefaults, stack, newBase, totalArgs, nil)
 				}
 				code = callee.Code
 				consts = callee.Consts
@@ -1479,12 +1607,22 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				}
 				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
 				_ = locals[255]
-				maybeOptimizeCodeObject(callee)
-				cells = vm.setupCalleeCells(callee, callable, stack, newBase, totalArgs)
+				if len(callee.CellVars) == 0 && fn.Closure != nil {
+					cells = fn.Closure
+				} else if len(callee.CellVars) == 0 && len(callee.FreeVars) == 0 {
+					cells = nil
+				} else {
+					cells = vm.setupCalleeCells(callee, callable, stack, newBase, totalArgs)
+				}
 				if fn.Globals != nil {
 					globals = fn.Globals
 				}
+				curCodeCache = vm.getCodeCache(curCO)
+				curIC = curCodeCache.ic
+				curMethodPIC = curCodeCache.methodPIC
+				curAttrPIC = curCodeCache.attrPIC
 				ip = 0
+				continue
 
 			case val.KindCode:
 				callee := AsCodeObject(callable)
@@ -1502,16 +1640,16 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					ip++
 					continue
 				}
-				vm.frames[frameIdx] = CallFrame{
-					co:         curCO,
-					code:       code,
-					consts:     consts,
-					ip:         ip + 1,
-					baseOffset: baseOffset,
-					retSP:      retSP,
-					cells:      cells,
-					globals:    globals,
-				}
+				saved := &vm.frames[frameIdx]
+				saved.co = curCO
+				saved.code = code
+				saved.consts = consts
+				saved.ip = ip + 1
+				saved.baseOffset = baseOffset
+				saved.retSP = retSP
+				saved.cells = cells
+				saved.globals = globals
+				saved.cache = curCodeCache
 				frameIdx++
 				curCO = callee
 				code = callee.Code
@@ -1537,7 +1675,12 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					numLocalsCallee = totalArgs
 				}
 				sp = newBase + numLocalsCallee
+				curCodeCache = vm.getCodeCache(curCO)
+				curIC = curCodeCache.ic
+				curMethodPIC = curCodeCache.methodPIC
+				curAttrPIC = curCodeCache.attrPIC
 				ip = 0
+				continue
 
 			case val.KindBuiltinFunc:
 				builtin := callable.AsBuiltinFunc()
@@ -1556,6 +1699,112 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				sp = retSP + 1
 				ip++
 			}
+
+		case OP_CALL_METHOD_PIC:
+			argc := int(uint8(inst >> 16))
+			methIdx := uint16(inst)
+			newBase := sp - argc - 1
+			receiver := stack[newBase]
+			retSP := newBase
+			totalArgs := argc + 1
+
+			if receiver.IsInstance() {
+				instObj := receiver.AsInstance()
+				instShape := instObj.Shape
+				instType := instObj.Header.Type
+				pic := &curMethodPIC[ip]
+				var targetFn *val.PyFunction
+				var nativeFn val.VectorcallFunc
+				var targetVal val.Value
+				if pic[0].Shape == instShape && instType.VersionTag == pic[0].TypeVersion {
+					targetFn = pic[0].TargetFn
+					nativeFn = pic[0].NativeFn
+					targetVal = pic[0].TargetVal
+				} else if pic[1].Shape == instShape && instType.VersionTag == pic[1].TypeVersion {
+					targetFn = pic[1].TargetFn
+					nativeFn = pic[1].NativeFn
+					targetVal = pic[1].TargetVal
+				} else if pic[2].Shape == instShape && instType.VersionTag == pic[2].TypeVersion {
+					targetFn = pic[2].TargetFn
+					nativeFn = pic[2].NativeFn
+					targetVal = pic[2].TargetVal
+				} else if pic[3].Shape == instShape && instType.VersionTag == pic[3].TypeVersion {
+					targetFn = pic[3].TargetFn
+					nativeFn = pic[3].NativeFn
+					targetVal = pic[3].TargetVal
+				}
+
+				if targetFn != nil {
+					callee := AsCodeObject(targetFn.Code)
+					if !callee.IsGenerator && !callee.IsCoroutine {
+						saved := &vm.frames[frameIdx]
+						saved.co = curCO
+						saved.code = code
+						saved.consts = consts
+						saved.ip = ip + 1
+						saved.baseOffset = baseOffset
+						saved.retSP = retSP
+						saved.cells = cells
+						saved.globals = globals
+						saved.cache = curCodeCache
+						frameIdx++
+						curCO = callee
+						if totalArgs == callee.NumParams && len(targetFn.Defaults) == 0 {
+							numLocals := callee.NumLocals
+							if numLocals < totalArgs {
+								numLocals = totalArgs
+							}
+							sp = newBase + numLocals
+						} else {
+							sp = vm.bindFunctionArgs(callee, targetFn.Defaults, targetFn.KwDefaults, stack, newBase, totalArgs, nil)
+						}
+						code = callee.Code
+						consts = callee.Consts
+						baseOffset = newBase
+						if baseOffset+256 > len(stack) {
+							stack = ensureStack(stack, baseOffset+256)
+							vm.execCtx.Stack = stack
+							if activeCoro != nil {
+								activeCoro.Stack = stack
+							} else if activeGen != nil {
+								activeGen.Stack = stack
+							} else {
+								vm.stack = stack
+							}
+						}
+						locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+						_ = locals[255]
+						if len(callee.CellVars) == 0 && targetFn.Closure != nil {
+							cells = targetFn.Closure
+						} else if len(callee.CellVars) == 0 && len(callee.FreeVars) == 0 {
+							cells = nil
+						} else {
+							cells = vm.setupCalleeCells(callee, targetVal, stack, newBase, totalArgs)
+						}
+						if targetFn.Globals != nil {
+							globals = targetFn.Globals
+						}
+						curCodeCache = vm.getCodeCache(curCO)
+						curIC = curCodeCache.ic
+						curMethodPIC = curCodeCache.methodPIC
+						curAttrPIC = curCodeCache.attrPIC
+						ip = 0
+						continue
+					}
+				} else if nativeFn != nil {
+					vm.execCtx.SP = newBase + totalArgs
+					vm.activeFrameIdx = frameIdx
+					res := nativeFn(&vm.execCtx, targetVal, stack[newBase:newBase+totalArgs], nil)
+					stack[retSP] = res
+					sp = retSP + 1
+					ip++
+					continue
+				}
+			}
+
+			vm.callMethodPICSlow(receiver, consts[methIdx], ip, newBase, argc, frameIdx, stack, curMethodPIC)
+			sp = retSP + 1
+			ip++
 
 		case OP_RETURN:
 			sp--
@@ -1576,7 +1825,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				return retVal
 			}
 			frameIdx--
-			caller := vm.frames[frameIdx]
+			caller := &vm.frames[frameIdx]
 			curCO = caller.co
 			code = caller.code
 			consts = caller.consts
@@ -1588,18 +1837,48 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			globals = caller.globals
 			stack[caller.retSP] = retVal
 			sp = caller.retSP + 1
+			if caller.cache != nil {
+				curCodeCache = caller.cache
+			} else {
+				curCodeCache = vm.getCodeCache(curCO)
+			}
+			curIC = curCodeCache.ic
+			curMethodPIC = curCodeCache.methodPIC
+			curAttrPIC = curCodeCache.attrPIC
+			continue
 
 		case OP_LOAD_ATTR:
 			obj := stack[sp-1]
 			if obj.IsInstance() {
 				instObj := obj.AsInstance()
+				instShape := instObj.Shape
+				pic := &curAttrPIC[ip]
+				if pic[0].Shape == instShape {
+					stack[sp-1] = instObj.Slots[pic[0].SlotIndex]
+					ip++
+					continue
+				}
+				if pic[1].Shape == instShape {
+					stack[sp-1] = instObj.Slots[pic[1].SlotIndex]
+					ip++
+					continue
+				}
+				if pic[2].Shape == instShape {
+					stack[sp-1] = instObj.Slots[pic[2].SlotIndex]
+					ip++
+					continue
+				}
+				if pic[3].Shape == instShape {
+					stack[sp-1] = instObj.Slots[pic[3].SlotIndex]
+					ip++
+					continue
+				}
 				instType := instObj.Header.Type
-				entry := vm.ic[ip]
-				if instObj.Shape.ID == entry.ExpectedShapeID && instType.VersionTag == entry.ExpectedTypeVer && entry.CodePtr == &code[0] {
+				entry := curIC[ip]
+				if instObj.Shape.ID == entry.ExpectedShapeID && instType.VersionTag == entry.ExpectedTypeVer {
 					if entry.Kind == ICKindInstanceSlot {
-						val, ok := instObj.GetSlot(entry.SlotIndex)
-						if ok {
-							stack[sp-1] = val
+						if entry.SlotIndex >= 0 && entry.SlotIndex < len(instObj.Slots) {
+							stack[sp-1] = instObj.Slots[entry.SlotIndex]
 							ip++
 							continue
 						}
@@ -1612,12 +1891,12 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 						continue
 					}
 				}
-				stack[sp-1] = vm.loadAttrInstanceSlow(instObj, obj, consts[uint16(inst)], ip, sp, frameIdx, &code[0])
+				stack[sp-1] = vm.loadAttrInstanceSlow(instObj, obj, consts[uint16(inst)], ip, sp, frameIdx, curIC, curAttrPIC)
 			} else if obj.IsModule() {
 				mod := obj.AsModule()
-				entry := &vm.ic[ip]
+				entry := &curIC[ip]
 				modVer := atomic.LoadUint64(&mod.Dict.VersionTag)
-				if entry.CodePtr == &code[0] && entry.Kind == ICKindModuleAttr && entry.ExpectedGlobalsVer == modVer {
+				if entry.Kind == ICKindModuleAttr && entry.ExpectedGlobalsVer == modVer {
 					stack[sp-1] = entry.CachedVal
 					ip++
 					continue
@@ -1626,7 +1905,6 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if v, slot, ok := mod.Dict.GetWithSlotHint(attrName, entry.SlotIndex); ok {
 					entry.Kind = ICKindModuleAttr
 					entry.ExpectedGlobalsVer = modVer
-					entry.CodePtr = &code[0]
 					entry.CachedVal = v
 					entry.SlotIndex = slot
 					stack[sp-1] = v
@@ -1657,11 +1935,38 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			}
 			if obj.IsInstance() {
 				instObj := obj.AsInstance()
+				instShape := instObj.Shape
+				pic := &curAttrPIC[ip]
+				if pic[0].Shape == instShape {
+					instObj.Slots[pic[0].SlotIndex] = v
+					sp -= 2
+					ip++
+					continue
+				}
+				if pic[1].Shape == instShape {
+					instObj.Slots[pic[1].SlotIndex] = v
+					sp -= 2
+					ip++
+					continue
+				}
+				if pic[2].Shape == instShape {
+					instObj.Slots[pic[2].SlotIndex] = v
+					sp -= 2
+					ip++
+					continue
+				}
+				if pic[3].Shape == instShape {
+					instObj.Slots[pic[3].SlotIndex] = v
+					sp -= 2
+					ip++
+					continue
+				}
 				instType := instObj.Header.Type
-				entry := vm.ic[ip]
-				if instObj.Shape.ID == entry.ExpectedShapeID && instType.VersionTag == entry.ExpectedTypeVer && entry.CodePtr == &code[0] {
+				entry := curIC[ip]
+				if instObj.Shape.ID == entry.ExpectedShapeID && instType.VersionTag == entry.ExpectedTypeVer {
 					if entry.Kind == ICKindInstanceSlot {
-						if instObj.SetSlot(entry.SlotIndex, v) {
+						if entry.SlotIndex >= 0 && entry.SlotIndex < len(instObj.Slots) {
+							instObj.Slots[entry.SlotIndex] = v
 							sp -= 2
 							ip++
 							continue
@@ -1676,7 +1981,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 						continue
 					}
 				}
-				vm.storeAttrInstanceSlow(instObj, obj, consts[uint16(inst)], v, ip, sp, frameIdx, &code[0])
+				vm.storeAttrInstanceSlow(instObj, obj, consts[uint16(inst)], v, ip, sp, frameIdx, curIC, curAttrPIC)
 			} else {
 				vm.execCtx.SP = sp
 				vm.activeFrameIdx = frameIdx
@@ -1698,8 +2003,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			bx := uint16(inst)
 			nameVal := consts[bx]
 			globVer := atomic.LoadUint64(&globals.VersionTag)
-			entry := &vm.ic[ip]
-			if entry.CodePtr == &code[0] && entry.ExpectedGlobalsVer == globVer {
+			entry := &curIC[ip]
+			if entry.ExpectedGlobalsVer == globVer {
 				if entry.Kind == ICKindGlobal {
 					stack[sp] = entry.CachedVal
 					sp++
@@ -1716,7 +2021,6 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			if v, slot, ok := globals.GetWithSlotHint(nameVal, entry.SlotIndex); ok {
 				entry.Kind = ICKindGlobal
 				entry.ExpectedGlobalsVer = globVer
-				entry.CodePtr = &code[0]
 				entry.CachedVal = v
 				entry.SlotIndex = slot
 				stack[sp] = v
@@ -1728,7 +2032,6 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				entry.Kind = ICKindBuiltin
 				entry.ExpectedGlobalsVer = globVer
 				entry.ExpectedBuiltinsVer = atomic.LoadUint64(&vm.builtins.VersionTag)
-				entry.CodePtr = &code[0]
 				entry.CachedVal = v
 				stack[sp] = v
 				sp++
@@ -1741,20 +2044,41 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			bx := uint16(inst)
 			nameVal := consts[bx]
 			sp--
-			globals.Set(nameVal, stack[sp])
+			valToStore := stack[sp]
+			if valToStore.IsString() {
+				valToStore.AsStringObj().Buf = nil
+			}
+			globals.Set(nameVal, valToStore)
 			ip++
 
 		case OP_LOAD_DEREF:
 			bx := int(uint16(inst))
-			stack[sp] = cells[bx].AsCell().Get()
+			cell := (*val.PyCell)(unsafe.Pointer(cells[bx].HeaderPtr()))
+			stack[sp] = cell.Value
 			sp++
 			ip++
 
 		case OP_STORE_DEREF:
 			bx := int(uint16(inst))
 			sp--
-			cells[bx].AsCell().Set(stack[sp])
+			valToStore := stack[sp]
+			if valToStore.IsString() {
+				valToStore.AsStringObj().Buf = nil
+			}
+			cell := (*val.PyCell)(unsafe.Pointer(cells[bx].HeaderPtr()))
+			cell.Value = valToStore
 			ip++
+
+		case OP_INC_DEREF_INT:
+			bx := int(uint16(inst))
+			cell := (*val.PyCell)(unsafe.Pointer(cells[bx].HeaderPtr()))
+			if cell.Value.IsInt64() {
+				cell.Value = val.Int64Val(cell.Value.AsInt64() + 1)
+				ip += 4
+				continue
+			}
+			cell.Value = val.Add(cell.Value, val.Int64Val(1))
+			ip += 4
 
 		case OP_LOAD_CLOSURE:
 			bx := int(uint16(inst))
@@ -1848,6 +2172,17 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				stop := it.RangeStop()
 				if cur < stop {
 					stack[sp-1] = val.RangeVal(cur+1, stop)
+					instNext := atomic.LoadUint32(&code[ip+1])
+					if DecodeOpcode(instNext) == OP_STORE_FAST {
+						reg := DecodeArgBx(instNext)
+						if reg < 256 {
+							locals[uint8(reg)] = val.Int64Val(int64(cur))
+						} else {
+							stack[baseOffset+int(reg)] = val.Int64Val(int64(cur))
+						}
+						ip += 2
+						continue
+					}
 					stack[sp] = val.Int64Val(int64(cur))
 					sp++
 					ip++
@@ -1885,7 +2220,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if vm.execCtx.HasException() {
 					exc := vm.execCtx.ActiveException
 					vm.execCtx.ClearException()
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, stack) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						if activeGen != nil {
 							activeGen.State = val.GenClosed
 						}
@@ -2013,6 +2348,29 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			cmpOp := uint8(inst >> 16)
 			b := stack[sp-1]
 			a := stack[sp-2]
+			if a.IsInt64() && b.IsInt64() {
+				ai := a.AsInt64()
+				bi := b.AsInt64()
+				switch cmpOp {
+				case CMP_EQ:
+					stack[sp-2] = val.BoolVal(ai == bi)
+				case CMP_NEQ:
+					stack[sp-2] = val.BoolVal(ai != bi)
+				case CMP_LT:
+					stack[sp-2] = val.BoolVal(ai < bi)
+				case CMP_LTE:
+					stack[sp-2] = val.BoolVal(ai <= bi)
+				case CMP_GT:
+					stack[sp-2] = val.BoolVal(ai > bi)
+				case CMP_GTE:
+					stack[sp-2] = val.BoolVal(ai >= bi)
+				default:
+					stack[sp-2] = val.BoolVal(false)
+				}
+				sp--
+				ip++
+				continue
+			}
 			var res val.Value
 			switch cmpOp {
 			case CMP_LT:
@@ -2047,7 +2405,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			a := stack[sp-2]
 			if (b.IsInt64() && b.AsInt64() == 0) || (b.IsFloat64() && b.AsFloat64() == 0.0) {
 				exc := val.NewZeroDivisionError("division by zero")
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, stack) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -2064,7 +2422,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			a := stack[sp-2]
 			if (b.IsInt64() && b.AsInt64() == 0) || (b.IsFloat64() && b.AsFloat64() == 0.0) {
 				exc := val.NewZeroDivisionError("integer division or modulo by zero")
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, stack) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -2081,7 +2439,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			a := stack[sp-2]
 			if (b.IsInt64() && b.AsInt64() == 0) || (b.IsFloat64() && b.AsFloat64() == 0.0) {
 				exc := val.NewZeroDivisionError("integer modulo by zero")
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, stack) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -2164,7 +2522,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					exc.AsInstance().SetAttr(val.InternString("__suppress_context__"), val.BoolVal(true))
 				}
 			}
-			if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, stack) {
+			if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 				if activeGen != nil {
 					activeGen.State = val.GenClosed
 				}
@@ -2242,7 +2600,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if vm.execCtx.HasException() {
 					exc := vm.execCtx.ActiveException
 					vm.execCtx.ClearException()
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, stack) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						if activeGen != nil {
 							activeGen.State = val.GenClosed
 						}
@@ -2275,7 +2633,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				continue
 			}
 			exc := val.NewTypeError(fmt.Sprintf("object %s can't be used in 'await' expression", top.Type().Name))
-			if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, stack) {
+			if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 				if activeCoro != nil {
 					activeCoro.State = val.CoroClosed
 				}
@@ -2293,7 +2651,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if fut.IsDone() {
 					res, exc := fut.Result()
 					if !exc.IsNone() && exc.HeaderPtr() != nil {
-						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, stack) {
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 							if activeCoro != nil {
 								activeCoro.State = val.CoroClosed
 							}
@@ -2337,7 +2695,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if vm.execCtx.HasException() {
 						exc := vm.execCtx.ActiveException
 						vm.execCtx.ClearException()
-						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, stack) {
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 							if activeCoro != nil {
 								activeCoro.State = val.CoroClosed
 							}
@@ -2370,7 +2728,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if vm.execCtx.HasException() {
 						exc := vm.execCtx.ActiveException
 						vm.execCtx.ClearException()
-						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, stack) {
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 							if activeCoro != nil {
 								activeCoro.State = val.CoroClosed
 							}
@@ -2522,6 +2880,83 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				ip = int(exitTarget)
 			}
 
+		case OP_FAST_SUB_INT_LOCAL_TO_LOCAL:
+			_ = locals[255]
+			dstReg := uint8(inst >> 16)
+			srcRegA := uint8(inst >> 8)
+			srcRegB := uint8(inst)
+			va := locals[srcRegA]
+			vb := locals[srcRegB]
+			if va.IsInt64() && vb.IsInt64() {
+				ai := va.AsInt64()
+				bi := vb.AsInt64()
+				diff := ai - bi
+				if ((ai ^ bi) & (ai ^ diff)) >= 0 {
+					locals[dstReg] = val.Int64Val(diff)
+					ip += 4
+					continue
+				}
+				locals[dstReg] = val.Sub(va, vb)
+				ip += 4
+				continue
+			}
+			DeoptimizeFastSub(code, ip, dstReg, srcRegA, srcRegB)
+			continue
+
+		case OP_FAST_CMP_EQ_JUMP_IF_FALSE:
+			_ = locals[255]
+			srcA := uint8(inst >> 16)
+			exitTarget := uint16(inst)
+			srcB := uint8(atomic.LoadUint32(&code[ip+1]) >> 16)
+			va := locals[srcA]
+			vb := locals[srcB]
+			if va.IsInt64() && vb.IsInt64() {
+				if va.AsInt64() != vb.AsInt64() {
+					ip = int(exitTarget)
+					continue
+				}
+				ip += 4
+				continue
+			}
+			DeoptimizeFastCmpEq(code, ip, srcA, srcB, exitTarget)
+			continue
+
+		case OP_FAST_SUBSCR_DEREF_LIST_LOCAL:
+			_ = locals[255]
+			dstReg := uint8(inst >> 16)
+			cellIdx := uint8(inst >> 8)
+			idxReg := uint8(inst)
+			if int(cellIdx) < len(cells) {
+				cell := (*val.PyCell)(unsafe.Pointer(cells[cellIdx].HeaderPtr()))
+				cVal := cell.Value
+				if cVal.IsList() {
+					iv := locals[idxReg]
+					if iv.IsInt64() {
+						idx := iv.AsInt64()
+						items := cVal.AsList().Items
+						if idx >= 0 && idx < int64(len(items)) {
+							locals[dstReg] = items[idx]
+							ip += 4
+							continue
+						}
+					}
+				}
+			}
+			DeoptimizeFastSubscr(code, ip, dstReg, cellIdx, idxReg)
+			continue
+
+		case OP_FAST_NEG_INT_LOCAL:
+			_ = locals[255]
+			reg := uint8(inst >> 16)
+			v := locals[reg]
+			if v.IsInt64() {
+				locals[reg] = val.Int64Val(-v.AsInt64())
+				ip += 3
+				continue
+			}
+			DeoptimizeFastNeg(code, ip, reg)
+			continue
+
 		default:
 			panic("vm: unknown opcode")
 		}
@@ -2534,7 +2969,7 @@ func isCallableConst(v val.Value) bool {
 }
 
 //go:noinline
-func (vm *VM) loadMethodSlow(obj, attrName val.Value, ip, sp, frameIdx int, codePtr *uint32, stack []val.Value) {
+func (vm *VM) loadMethodSlow(obj, attrName val.Value, ip, sp, frameIdx int, stack []val.Value, curIC []ICSlot, curMethodPIC [][4]val.MethodPICEntry) {
 	attrName = val.InternValue(attrName)
 
 	if obj.IsModule() {
@@ -2589,12 +3024,11 @@ func (vm *VM) loadMethodSlow(obj, attrName val.Value, ip, sp, frameIdx int, code
 		}
 
 		if slotIdx, ok := instObj.Shape.Lookup(attrName); ok {
-			vm.ic[ip] = ICSlot{
+			curIC[ip] = ICSlot{
 				ExpectedShapeID: instObj.Shape.ID,
 				Kind:            ICKindInstanceSlot,
 				SlotIndex:       slotIdx,
 				ExpectedTypeVer: instType.VersionTag,
-				CodePtr:         codePtr,
 			}
 			stack[sp-1] = val.UnboundVal()
 			stack[sp] = instObj.Slots[slotIdx]
@@ -2603,11 +3037,39 @@ func (vm *VM) loadMethodSlow(obj, attrName val.Value, ip, sp, frameIdx int, code
 
 		if foundInClass {
 			if descr.IsFunction() || descr.IsBuiltinFunc() || descr.Kind() == val.KindCode {
-				vm.ic[ip] = ICSlot{
+				pic := &curMethodPIC[ip]
+				var targetFn *val.PyFunction
+				var nativeFn val.VectorcallFunc
+				if descr.IsFunction() {
+					targetFn = descr.AsFunction()
+				} else if descr.IsBuiltinFunc() {
+					nativeFn = descr.AsBuiltinFunc().Fn
+				}
+				newEntry := val.MethodPICEntry{
+					Shape:       instObj.Shape,
+					TypeVersion: instType.VersionTag,
+					TargetFn:    targetFn,
+					NativeFn:    nativeFn,
+					TargetVal:   descr,
+				}
+				inserted := false
+				for k := 0; k < 4; k++ {
+					if pic[k].Shape == nil || pic[k].Shape == instObj.Shape {
+						pic[k] = newEntry
+						inserted = true
+						break
+					}
+				}
+				if !inserted {
+					pic[0] = pic[1]
+					pic[1] = pic[2]
+					pic[2] = pic[3]
+					pic[3] = newEntry
+				}
+				curIC[ip] = ICSlot{
 					ExpectedShapeID: instObj.Shape.ID,
 					Kind:            ICKindClassMethod,
 					ExpectedTypeVer: instType.VersionTag,
-					CodePtr:         codePtr,
 					CachedVal:       descr,
 				}
 				stack[sp-1] = obj
@@ -2668,8 +3130,97 @@ func (vm *VM) loadMethodSlow(obj, attrName val.Value, ip, sp, frameIdx int, code
 	panic("vm: AttributeError: '" + tp.Name + "' object has no attribute '" + attrName.AsString() + "'")
 }
 
+func (vm *VM) callMethodPICSlow(receiver, attrName val.Value, ip, newBase, argc, frameIdx int, stack []val.Value, curMethodPIC [][4]val.MethodPICEntry) {
+	attrName = val.InternValue(attrName)
+	totalArgs := argc + 1
+
+	if receiver.IsInstance() {
+		instObj := receiver.AsInstance()
+		instType := instObj.Header.Type
+
+		if slotIdx, ok := instObj.Shape.Lookup(attrName); ok {
+			callable := instObj.Slots[slotIdx]
+			vm.execCtx.SP = newBase + totalArgs
+			vm.activeFrameIdx = frameIdx
+			res := vm.callFromHook(&vm.execCtx, callable, newBase+1, argc, nil)
+			stack[newBase] = res
+			return
+		}
+
+		descr, _, foundInClass := instType.LookupMRO(attrName)
+		if foundInClass {
+			if descr.IsFunction() || descr.IsBuiltinFunc() {
+				pic := &curMethodPIC[ip]
+				var targetFn *val.PyFunction
+				var nativeFn val.VectorcallFunc
+				if descr.IsFunction() {
+					targetFn = descr.AsFunction()
+				} else if descr.IsBuiltinFunc() {
+					nativeFn = descr.AsBuiltinFunc().Fn
+				}
+				newEntry := val.MethodPICEntry{
+					Shape:       instObj.Shape,
+					TypeVersion: instType.VersionTag,
+					TargetFn:    targetFn,
+					NativeFn:    nativeFn,
+					TargetVal:   descr,
+				}
+				inserted := false
+				for k := 0; k < 4; k++ {
+					if pic[k].Shape == nil || pic[k].Shape == instObj.Shape {
+						pic[k] = newEntry
+						inserted = true
+						break
+					}
+				}
+				if !inserted {
+					pic[0] = pic[1]
+					pic[1] = pic[2]
+					pic[2] = pic[3]
+					pic[3] = newEntry
+				}
+
+				if descr.IsBuiltinFunc() {
+					vm.execCtx.SP = newBase + totalArgs
+					vm.activeFrameIdx = frameIdx
+					res := descr.AsBuiltinFunc().Fn(&vm.execCtx, descr, stack[newBase:newBase+totalArgs], nil)
+					stack[newBase] = res
+					return
+				}
+				if descr.IsFunction() {
+					vm.execCtx.SP = newBase + totalArgs
+					vm.activeFrameIdx = frameIdx
+					res := vm.callFromHook(&vm.execCtx, descr, newBase, totalArgs, nil)
+					stack[newBase] = res
+					return
+				}
+			}
+		}
+
+		vm.execCtx.SP = newBase + totalArgs
+		vm.activeFrameIdx = frameIdx
+		callable := val.GetAttrCtx(&vm.execCtx, receiver, attrName)
+		res := vm.callFromHook(&vm.execCtx, callable, newBase+1, argc, nil)
+		stack[newBase] = res
+		return
+	}
+
+	vm.execCtx.SP = newBase + totalArgs
+	vm.activeFrameIdx = frameIdx
+	callable := val.GetAttrCtx(&vm.execCtx, receiver, attrName)
+	if callable.IsBoundMethod() {
+		bm := callable.AsBoundMethod()
+		stack[newBase] = bm.Self
+		res := vm.callFromHook(&vm.execCtx, bm.Func, newBase, totalArgs, nil)
+		stack[newBase] = res
+		return
+	}
+	res := vm.callFromHook(&vm.execCtx, callable, newBase+1, argc, nil)
+	stack[newBase] = res
+}
+
 //go:noinline
-func (vm *VM) loadAttrInstanceSlow(instObj *val.PyInstance, obj, attrName val.Value, ip, sp, frameIdx int, codePtr *uint32) val.Value {
+func (vm *VM) loadAttrInstanceSlow(instObj *val.PyInstance, obj, attrName val.Value, ip, sp, frameIdx int, curIC []ICSlot, curAttrPIC [][4]AttrPICEntry) val.Value {
 	attrName = val.InternValue(attrName)
 	instType := instObj.Header.Type
 
@@ -2677,11 +3228,10 @@ func (vm *VM) loadAttrInstanceSlow(instObj *val.PyInstance, obj, attrName val.Va
 	if foundInClass {
 		descrType := descr.Type()
 		if descr.IsDataDescriptor() || (descrType.Slots.TpDescrGet != nil && descrType.Slots.TpDescrSet != nil) {
-			vm.ic[ip] = ICSlot{
+			curIC[ip] = ICSlot{
 				ExpectedShapeID: instObj.Shape.ID,
 				Kind:            ICKindDataDescriptor,
 				ExpectedTypeVer: instType.VersionTag,
-				CodePtr:         codePtr,
 				CachedVal:       descr,
 			}
 			vm.execCtx.SP = sp
@@ -2691,12 +3241,26 @@ func (vm *VM) loadAttrInstanceSlow(instObj *val.PyInstance, obj, attrName val.Va
 	}
 
 	if slotIdx, ok := instObj.Shape.Lookup(attrName); ok {
-		vm.ic[ip] = ICSlot{
+		pic := &curAttrPIC[ip]
+		inserted := false
+		for k := 0; k < 4; k++ {
+			if pic[k].Shape == nil || pic[k].Shape == instObj.Shape {
+				pic[k] = AttrPICEntry{Shape: instObj.Shape, SlotIndex: slotIdx}
+				inserted = true
+				break
+			}
+		}
+		if !inserted {
+			pic[0] = pic[1]
+			pic[1] = pic[2]
+			pic[2] = pic[3]
+			pic[3] = AttrPICEntry{Shape: instObj.Shape, SlotIndex: slotIdx}
+		}
+		curIC[ip] = ICSlot{
 			ExpectedShapeID: instObj.Shape.ID,
 			Kind:            ICKindInstanceSlot,
 			SlotIndex:       slotIdx,
 			ExpectedTypeVer: instType.VersionTag,
-			CodePtr:         codePtr,
 		}
 		val, _ := instObj.GetSlot(slotIdx)
 		return val
@@ -2718,18 +3282,17 @@ func (vm *VM) loadAttrInstanceSlow(instObj *val.PyInstance, obj, attrName val.Va
 }
 
 //go:noinline
-func (vm *VM) storeAttrInstanceSlow(instObj *val.PyInstance, obj, attrName, v val.Value, ip, sp, frameIdx int, codePtr *uint32) {
+func (vm *VM) storeAttrInstanceSlow(instObj *val.PyInstance, obj, attrName, v val.Value, ip, sp, frameIdx int, curIC []ICSlot, curAttrPIC [][4]AttrPICEntry) {
 	attrName = val.InternValue(attrName)
 	instType := instObj.Header.Type
 
 	if descr, _, foundInClass := instType.LookupMRO(attrName); foundInClass {
 		descrType := descr.Type()
 		if descrType.Slots.TpDescrSet != nil {
-			vm.ic[ip] = ICSlot{
+			curIC[ip] = ICSlot{
 				ExpectedShapeID: instObj.Shape.ID,
 				Kind:            ICKindDataDescriptor,
 				ExpectedTypeVer: instType.VersionTag,
-				CodePtr:         codePtr,
 				CachedVal:       descr,
 			}
 			vm.execCtx.SP = sp
@@ -2741,22 +3304,50 @@ func (vm *VM) storeAttrInstanceSlow(instObj *val.PyInstance, obj, attrName, v va
 
 	if slotIdx, ok := instObj.Shape.Lookup(attrName); ok {
 		instObj.SetSlot(slotIdx, v)
-		vm.ic[ip] = ICSlot{
+		pic := &curAttrPIC[ip]
+		inserted := false
+		for k := 0; k < 4; k++ {
+			if pic[k].Shape == nil || pic[k].Shape == instObj.Shape {
+				pic[k] = AttrPICEntry{Shape: instObj.Shape, SlotIndex: slotIdx}
+				inserted = true
+				break
+			}
+		}
+		if !inserted {
+			pic[0] = pic[1]
+			pic[1] = pic[2]
+			pic[2] = pic[3]
+			pic[3] = AttrPICEntry{Shape: instObj.Shape, SlotIndex: slotIdx}
+		}
+		curIC[ip] = ICSlot{
 			ExpectedShapeID: instObj.Shape.ID,
 			Kind:            ICKindInstanceSlot,
 			SlotIndex:       slotIdx,
 			ExpectedTypeVer: instType.VersionTag,
-			CodePtr:         codePtr,
 		}
 		return
 	}
 
 	slotIdx := instObj.SetAttr(attrName, v)
-	vm.ic[ip] = ICSlot{
+	pic := &curAttrPIC[ip]
+	inserted := false
+	for k := 0; k < 4; k++ {
+		if pic[k].Shape == nil || pic[k].Shape == instObj.Shape {
+			pic[k] = AttrPICEntry{Shape: instObj.Shape, SlotIndex: slotIdx}
+			inserted = true
+			break
+		}
+	}
+	if !inserted {
+		pic[0] = pic[1]
+		pic[1] = pic[2]
+		pic[2] = pic[3]
+		pic[3] = AttrPICEntry{Shape: instObj.Shape, SlotIndex: slotIdx}
+	}
+	curIC[ip] = ICSlot{
 		ExpectedShapeID: instObj.Shape.ID,
 		Kind:            ICKindInstanceSlot,
 		SlotIndex:       slotIdx,
 		ExpectedTypeVer: instType.VersionTag,
-		CodePtr:         codePtr,
 	}
 }

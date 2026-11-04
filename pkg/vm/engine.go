@@ -149,10 +149,17 @@ func (e *Engine) newVMInternal(stackCap, frameCap int) *VM {
 		stack:      make([]val.Value, stackCap),
 		frames:     make([]CallFrame, frameCap),
 		ic:         make([]ICSlot, DefaultICSlabSize),
+		methodPIC:  make([][4]val.MethodPICEntry, DefaultICSlabSize),
+		attrPIC:    make([][4]AttrPICEntry, DefaultICSlabSize),
 		internPool: e.internPool,
 		globals:    val.NewDictVal(64).AsDict(),
 		builtins:   e.builtins,
 		modules:    modules,
+	}
+	v.rootCache = VMCodeCache{
+		ic:        v.ic,
+		methodPIC: v.methodPIC,
+		attrPIC:   v.attrPIC,
 	}
 	v.execCtx.Stack = v.stack
 	v.execCtx.CallHook = v.callFromHook
