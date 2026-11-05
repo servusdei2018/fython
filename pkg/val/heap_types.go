@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"unsafe"
+	"weak"
 )
 
 // PyBigInt wraps an arbitrary-precision math/big.Int on the heap.
@@ -1775,4 +1776,233 @@ func FormatValue(v Value, spec string, conversion uint8) Value {
 	}
 
 	return NewStringVal(v.String())
+}
+
+// FrameVM abstracts VM execution stack access for PyFrame and PyLocalsProxy.
+type FrameVM interface {
+	GetStackVal(offset int) Value
+	SetStackVal(offset int, v Value)
+	MaterializeFrame(frameIdx int) Value
+}
+
+// CodeInspector abstracts inspection of KindCode objects across packages.
+type CodeInspector interface {
+	VarNames(code Value) []Value
+	CellVars(code Value) []Value
+	FreeVars(code Value) []Value
+	Name(code Value) string
+	QualName(code Value) string
+	FileName(code Value) string
+	FirstLineNo(code Value) int
+	ArgCount(code Value) int
+	PosOnlyArgCount(code Value) int
+	KWOnlyArgCount(code Value) int
+	Flags(code Value) uint32
+	LineAt(code Value, ip int) int
+	LineTable(code Value) []byte
+	LineSpans(code Value) []any
+	CodeBytes(code Value) []byte
+	Consts(code Value) []Value
+	StackSize(code Value) int
+}
+
+// CodeInspectorHook is configured by pkg/vm to resolve CodeObject metadata from KindCode Values.
+var CodeInspectorHook CodeInspector
+
+// PyFrame represents a lazily-materialized Python execution frame on the heap.
+// Header MUST be at byte offset 0.
+type PyFrame struct {
+	Header      ObjectHeader
+	VM          any     // *vm.VM implementing FrameVM
+	FrameIdx    int     // index on contiguous vm.frames slab if active
+	CO          Value   // KindCode wrapping *vm.CodeObject
+	BaseOffset  int     // stack slot offset
+	IP          int     // instruction pointer
+	Globals     *PyDict // frame globals dictionary
+	Cells       []Value // closure cells
+	Back        Value   // caller PyFrame (or None)
+	LocalsProxy Value   // cached FrameLocalsProxy (or None)
+	Detached    bool    // true if function has returned
+	SavedLocals *PyDict // locals snapshot after return
+	ExtraLocals *PyDict // variables dynamically added via f_locals
+}
+
+// PyLocalsProxy represents a live PEP 667 mapping view over vm.stack and closure cells.
+// Header MUST be at byte offset 0.
+type PyLocalsProxy struct {
+	Header ObjectHeader
+	Frame  *PyFrame
+}
+
+// PyTraceback represents a node in an exception traceback chain.
+// Header MUST be at byte offset 0.
+type PyTraceback struct {
+	Header ObjectHeader
+	Frame  Value // KindFrame
+	LineNo int
+	LastI  int
+	Next   Value // KindTraceback or None
+}
+
+// PyWeakRef represents a weak reference to an object.
+// Header MUST be at byte offset 0.
+type PyWeakRef struct {
+	Header   ObjectHeader
+	WP       weak.Pointer[ObjectHeader]
+	Callback Value
+	Hash     int64
+	HasHash  bool
+	IsDead   bool
+}
+
+// PyWeakProxy represents a transparent proxy forwarding to a weakly-referenced object.
+// Header MUST be at byte offset 0.
+type PyWeakProxy struct {
+	Header     ObjectHeader
+	WP         weak.Pointer[ObjectHeader]
+	Callback   Value
+	IsCallable bool
+}
+
+// Compile-time assertions that all new heap structs place Header at byte offset 0.
+var (
+	_ [0 - unsafe.Offsetof(PyFrame{}.Header)]byte
+	_ [0 - unsafe.Offsetof(PyLocalsProxy{}.Header)]byte
+	_ [0 - unsafe.Offsetof(PyTraceback{}.Header)]byte
+	_ [0 - unsafe.Offsetof(PyWeakRef{}.Header)]byte
+	_ [0 - unsafe.Offsetof(PyWeakProxy{}.Header)]byte
+)
+
+// Downcasters from Value:
+
+func (v Value) AsFrame() *PyFrame {
+	return (*PyFrame)(unsafe.Pointer(v.ptr))
+}
+
+func (v Value) AsLocalsProxy() *PyLocalsProxy {
+	return (*PyLocalsProxy)(unsafe.Pointer(v.ptr))
+}
+
+func (v Value) AsTraceback() *PyTraceback {
+	return (*PyTraceback)(unsafe.Pointer(v.ptr))
+}
+
+func (v Value) AsWeakRef() *PyWeakRef {
+	return (*PyWeakRef)(unsafe.Pointer(v.ptr))
+}
+
+func (v Value) AsWeakProxy() *PyWeakProxy {
+	return (*PyWeakProxy)(unsafe.Pointer(v.ptr))
+}
+
+// Detach snapshots the active stack locals into SavedLocals and marks the frame as detached.
+func (f *PyFrame) Detach() {
+	if f.Detached {
+		return
+	}
+	f.Detached = true
+	if f.Back.IsNone() && f.VM != nil && f.FrameIdx > 0 {
+		if vm, ok := f.VM.(FrameVM); ok {
+			f.Back = vm.MaterializeFrame(f.FrameIdx - 1)
+		}
+	}
+	snapshot := NewDictVal(16).AsDict()
+	if CodeInspectorHook != nil && f.CO.ptr != nil {
+		varnames := CodeInspectorHook.VarNames(f.CO)
+		if vm, ok := f.VM.(FrameVM); ok {
+			for i, name := range varnames {
+				v := vm.GetStackVal(f.BaseOffset + i)
+				if !v.IsNone() || v.ptr != nil {
+					snapshot.Set(name, v)
+				}
+			}
+		}
+		cellvars := CodeInspectorHook.CellVars(f.CO)
+		for i, name := range cellvars {
+			if i < len(f.Cells) && f.Cells[i].IsCell() {
+				snapshot.Set(name, f.Cells[i].AsCell().Value)
+			}
+		}
+		freevars := CodeInspectorHook.FreeVars(f.CO)
+		for j, name := range freevars {
+			cellIdx := len(cellvars) + j
+			if cellIdx < len(f.Cells) && f.Cells[cellIdx].IsCell() {
+				snapshot.Set(name, f.Cells[cellIdx].AsCell().Value)
+			}
+		}
+	}
+	if f.ExtraLocals != nil {
+		for _, e := range f.ExtraLocals.Entries {
+			if !e.Key.IsUnbound() {
+				snapshot.Set(e.Key, e.Value)
+			}
+		}
+	}
+	f.SavedLocals = snapshot
+}
+
+// NewPyFrame constructs an active heap PyFrame wrapping a CallFrame slot.
+func NewPyFrame(vm FrameVM, frameIdx int, baseOffset int, co Value, globals *PyDict, cells []Value) *PyFrame {
+	f := &PyFrame{
+		Header: ObjectHeader{
+			Kind: KindFrame,
+			Type: FrameType,
+		},
+		VM:          vm,
+		FrameIdx:    frameIdx,
+		CO:          co,
+		BaseOffset:  baseOffset,
+		Globals:     globals,
+		Cells:       cells,
+		Back:        NoneVal(),
+		LocalsProxy: NoneVal(),
+	}
+	return f
+}
+
+// NewFrameVal wraps a *PyFrame as a Value with KindFrame.
+func NewFrameVal(f *PyFrame) Value {
+	f.Header.Kind = KindFrame
+	f.Header.Type = FrameType
+	return Value{ptr: &f.Header}
+}
+
+// NewLocalsProxyVal wraps a *PyLocalsProxy as a Value with KindLocalsProxy.
+func NewLocalsProxyVal(p *PyLocalsProxy) Value {
+	p.Header.Kind = KindLocalsProxy
+	p.Header.Type = LocalsProxyType
+	return Value{ptr: &p.Header}
+}
+
+// NewTracebackVal constructs a new PyTraceback Value.
+func NewTracebackVal(frame Value, lineno int, lasti int, next Value) Value {
+	tb := &PyTraceback{
+		Header: ObjectHeader{
+			Kind: KindTraceback,
+			Type: TracebackType,
+		},
+		Frame:  frame,
+		LineNo: lineno,
+		LastI:  lasti,
+		Next:   next,
+	}
+	return Value{ptr: &tb.Header}
+}
+
+// NewWeakRefVal wraps a *PyWeakRef as a Value with KindWeakRef.
+func NewWeakRefVal(ref *PyWeakRef) Value {
+	ref.Header.Kind = KindWeakRef
+	ref.Header.Type = WeakRefType
+	return Value{ptr: &ref.Header}
+}
+
+// NewWeakProxyVal wraps a *PyWeakProxy as a Value with KindWeakProxy.
+func NewWeakProxyVal(proxy *PyWeakProxy) Value {
+	proxy.Header.Kind = KindWeakProxy
+	if proxy.IsCallable {
+		proxy.Header.Type = CallableWeakProxyType
+	} else {
+		proxy.Header.Type = WeakProxyType
+	}
+	return Value{ptr: &proxy.Header}
 }

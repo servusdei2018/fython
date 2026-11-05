@@ -284,11 +284,17 @@ func (p *Parser) parseFuncDefFull(isAsync bool, startPos uint32, decorators Expr
 
 	var paramNames []string
 	var defaults []ExprID
+	var kwDefaults []ExprID
+	var kwDefaultNames []string
 	var paramTypes []ExprID
+	posOnlyCount := 0
+	kwOnlyCount := 0
+	inKWOnly := false
 
 	for p.cur.Type != TOKEN_RPAREN && p.cur.Type != TOKEN_EOF {
 		// Positional-only separator
 		if p.match(TOKEN_SLASH) {
+			posOnlyCount = len(paramNames)
 			if !p.match(TOKEN_COMMA) {
 				break
 			}
@@ -296,6 +302,7 @@ func (p *Parser) parseFuncDefFull(isAsync bool, startPos uint32, decorators Expr
 		}
 		// Keyword-only separator or *args
 		if p.match(TOKEN_STAR) {
+			inKWOnly = true
 			if p.cur.Type == TOKEN_IDENT {
 				paramTok, err := p.expect(TOKEN_IDENT)
 				if err != nil {
@@ -342,6 +349,9 @@ func (p *Parser) parseFuncDefFull(isAsync bool, startPos uint32, decorators Expr
 			return StmtNone, err
 		}
 		paramNames = append(paramNames, p.tokenText(paramTok))
+		if inKWOnly {
+			kwOnlyCount++
+		}
 
 		// Optional type annotation: param: Type
 		if p.match(TOKEN_COLON) {
@@ -358,7 +368,12 @@ func (p *Parser) parseFuncDefFull(isAsync bool, startPos uint32, decorators Expr
 			if err != nil {
 				return StmtNone, err
 			}
-			defaults = append(defaults, defExpr)
+			if inKWOnly {
+				kwDefaults = append(kwDefaults, defExpr)
+				kwDefaultNames = append(kwDefaultNames, p.tokenText(paramTok))
+			} else {
+				defaults = append(defaults, defExpr)
+			}
 		}
 		if !p.match(TOKEN_COMMA) {
 			break
@@ -389,15 +404,19 @@ func (p *Parser) parseFuncDefFull(isAsync bool, startPos uint32, decorators Expr
 
 	fnIdx := uint32(len(p.arena.FuncDefs))
 	p.arena.FuncDefs = append(p.arena.FuncDefs, ASTFuncDef{
-		Name:       name,
-		ParamNames: p.arena.AddIdentSlice(paramNames),
-		Defaults:   p.arena.AddExprSlice(defaults),
-		Body:       p.arena.StmtSlices[bodySlice],
-		IsAsync:    isAsync,
-		TypeParams: p.arena.AddTypeParamSlice(typeParams),
-		Decorators: decorators,
-		Returns:    returnType,
-		ParamTypes: p.arena.AddExprSlice(paramTypes),
+		Name:           name,
+		ParamNames:     p.arena.AddIdentSlice(paramNames),
+		Defaults:       p.arena.AddExprSlice(defaults),
+		KWDefaults:     p.arena.AddExprSlice(kwDefaults),
+		KWDefaultNames: p.arena.AddIdentSlice(kwDefaultNames),
+		Body:           p.arena.StmtSlices[bodySlice],
+		IsAsync:        isAsync,
+		TypeParams:     p.arena.AddTypeParamSlice(typeParams),
+		Decorators:     decorators,
+		Returns:        returnType,
+		ParamTypes:     p.arena.AddExprSlice(paramTypes),
+		PosOnlyCount:   uint16(posOnlyCount),
+		KWOnlyCount:    uint16(kwOnlyCount),
 	})
 
 	kind := StmtKindFuncDef

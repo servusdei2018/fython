@@ -2,6 +2,7 @@ package compiler
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/servusdei2018/fython/pkg/val"
@@ -33,6 +34,47 @@ type Compiler struct {
 	activeLoop     *LoopContext
 	err            error
 	nextChildIdx   int
+	lineStarts     []int
+	lineSpans      []vm.LineSpanEntry
+	curLine        uint32
+	curCol         uint32
+	filename       string
+	qualnamePrefix string
+}
+
+func buildLineStarts(src []byte) []int {
+	starts := []int{0}
+	for i, b := range src {
+		if b == '\n' {
+			starts = append(starts, i+1)
+		}
+	}
+	return starts
+}
+
+func (c *Compiler) offsetToLineCol(pos uint32) (uint32, uint32) {
+	if len(c.lineStarts) == 0 {
+		c.lineStarts = buildLineStarts(c.src)
+	}
+	ipos := int(pos)
+	if ipos > len(c.src) {
+		ipos = len(c.src)
+	}
+	idx := sort.Search(len(c.lineStarts), func(i int) bool {
+		return c.lineStarts[i] > ipos
+	}) - 1
+	if idx < 0 {
+		idx = 0
+	}
+	line := uint32(idx + 1)
+	col := uint32(ipos - c.lineStarts[idx] + 1)
+	return line, col
+}
+
+func (c *Compiler) setSourcePos(pos uint32) {
+	if int(pos) <= len(c.src) {
+		c.curLine, c.curCol = c.offsetToLineCol(pos)
+	}
 }
 
 func (c *Compiler) nextChildScope(kind ScopeKind, name string) *Scope {
@@ -63,6 +105,11 @@ func (c *Compiler) addExceptionRange(startIP, endIP, targetIP, targetDepth int, 
 
 // Compile compiles Python source bytes into an executable *vm.CodeObject using the provided arena.
 func Compile(src []byte, arena *ASTArena) (*vm.CodeObject, error) {
+	return CompileWithFilename(src, arena, "<string>")
+}
+
+// CompileWithFilename compiles Python source bytes into an executable *vm.CodeObject with source filename.
+func CompileWithFilename(src []byte, arena *ASTArena, filename string) (*vm.CodeObject, error) {
 	parser := NewParser(src, arena)
 	topStmts, err := parser.ParseModule()
 	if err != nil {
@@ -74,12 +121,20 @@ func Compile(src []byte, arena *ASTArena) (*vm.CodeObject, error) {
 		return nil, err
 	}
 
+	if filename == "" {
+		filename = "<string>"
+	}
+
 	c := &Compiler{
-		src:       src,
-		arena:     arena,
-		scope:     topScope,
-		constPool: NewConstPool(),
-		code:      make([]uint32, 0, 64),
+		src:            src,
+		arena:          arena,
+		scope:          topScope,
+		constPool:      NewConstPool(),
+		code:           make([]uint32, 0, 64),
+		filename:       filename,
+		qualnamePrefix: "",
+		curLine:        1,
+		curCol:         1,
 	}
 
 	for _, stmtID := range topStmts {
@@ -93,14 +148,24 @@ func Compile(src []byte, arena *ASTArena) (*vm.CodeObject, error) {
 
 	c.peephole()
 
+	varNames := make([]val.Value, len(c.scope.FastLocals))
+	for i, fl := range c.scope.FastLocals {
+		varNames[i] = val.InternString(fl)
+	}
+
 	co := &vm.CodeObject{
 		Name:           "<module>",
+		QualName:       "<module>",
+		FileName:       filename,
+		FirstLineNo:    1,
 		Code:           c.code,
 		Consts:         c.constPool.Slice(),
+		VarNames:       varNames,
 		NumLocals:      len(c.scope.FastLocals),
 		NumParams:      0,
 		MaxStackSize:   c.maxStackDepth + 16,
 		ExceptionTable: c.exceptionTable,
+		LineSpans:      c.lineSpans,
 	}
 	return co, nil
 }
@@ -111,6 +176,12 @@ func CompileSource(src []byte) (*vm.CodeObject, error) {
 	return Compile(src, arena)
 }
 
+// CompileSourceWithFilename compiles Python source bytes with filename using a fresh ASTArena.
+func CompileSourceWithFilename(src []byte, filename string) (*vm.CodeObject, error) {
+	arena := NewASTArena(256)
+	return CompileWithFilename(src, arena, filename)
+}
+
 // CompileString compiles a Python source string.
 func CompileString(src string) (*vm.CodeObject, error) {
 	return CompileSource([]byte(src))
@@ -119,6 +190,25 @@ func CompileString(src string) (*vm.CodeObject, error) {
 func (c *Compiler) emit(inst uint32) int {
 	idx := len(c.code)
 	c.code = append(c.code, inst)
+	line := c.curLine
+	col := c.curCol
+	if line == 0 {
+		line = 1
+	}
+	if col == 0 {
+		col = 1
+	}
+	n := len(c.lineSpans)
+	if n > 0 && c.lineSpans[n-1].Line == line && c.lineSpans[n-1].Col == col && c.lineSpans[n-1].EndIP == uint32(idx) {
+		c.lineSpans[n-1].EndIP = uint32(idx + 1)
+	} else {
+		c.lineSpans = append(c.lineSpans, vm.LineSpanEntry{
+			StartIP: uint32(idx),
+			EndIP:   uint32(idx + 1),
+			Line:    line,
+			Col:     col,
+		})
+	}
 	return idx
 }
 
@@ -144,6 +234,7 @@ func (c *Compiler) compileStmt(stmtID StmtID) error {
 	if stmt == nil {
 		return nil
 	}
+	c.setSourcePos(stmt.Start)
 
 	switch stmt.Kind {
 	case StmtKindExpr:
@@ -1128,13 +1219,21 @@ func (c *Compiler) compileFuncDef(stmt *ASTStmt) error {
 	// Find child scope matching function name
 	fnScope := c.nextChildScope(ScopeFunction, fnDef.Name)
 
+	firstLine, _ := c.offsetToLineCol(stmt.Start)
+	qualName := c.qualnamePrefix + fnDef.Name
+
 	// Compile function code object
 	subCompiler := &Compiler{
-		src:       c.src,
-		arena:     c.arena,
-		scope:     fnScope,
-		constPool: NewConstPool(),
-		code:      make([]uint32, 0, 64),
+		src:            c.src,
+		arena:          c.arena,
+		scope:          fnScope,
+		constPool:      NewConstPool(),
+		code:           make([]uint32, 0, 64),
+		filename:       c.filename,
+		qualnamePrefix: qualName + ".<locals>.",
+		lineStarts:     c.lineStarts,
+		curLine:        firstLine,
+		curCol:         1,
 	}
 
 	tpCount := uint16(fnDef.TypeParams.Count)
@@ -1192,25 +1291,65 @@ func (c *Compiler) compileFuncDef(stmt *ASTStmt) error {
 	maxStack := numLocals + subCompiler.maxStackDepth + 16
 	var coFlags uint32
 	if fnScope.IsGenerator {
-		coFlags |= vm.FlagGenerator
+		coFlags |= vm.FlagGenerator | vm.CO_GENERATOR
 	}
 	if fnScope.IsCoroutine {
-		coFlags |= vm.FlagCoroutine
+		coFlags |= vm.FlagCoroutine | vm.CO_COROUTINE
 	}
+	coFlags |= vm.CO_OPTIMIZED | vm.CO_NEWLOCALS
+	if len(fnScope.FreeVars) == 0 && len(fnScope.CellVars) == 0 {
+		coFlags |= vm.CO_NOFREE
+	}
+	if c.qualnamePrefix != "" {
+		coFlags |= vm.CO_NESTED
+	}
+
+	varNames := make([]val.Value, 0, len(paramNames)+len(fnScope.FastLocals))
+	seenNames := make(map[string]bool)
+	for _, p := range paramNames {
+		clean := p
+		if strings.HasPrefix(clean, "**") {
+			clean = clean[2:]
+			coFlags |= vm.CO_VARKEYWORDS
+		} else if strings.HasPrefix(clean, "*") {
+			clean = clean[1:]
+			if clean != "" {
+				coFlags |= vm.CO_VARARGS
+			}
+		}
+		if clean != "" && !seenNames[clean] {
+			seenNames[clean] = true
+			varNames = append(varNames, val.InternString(clean))
+		}
+	}
+	for _, fl := range fnScope.FastLocals {
+		if !seenNames[fl] {
+			seenNames[fl] = true
+			varNames = append(varNames, val.InternString(fl))
+		}
+	}
+
 	fnCodeObj := &vm.CodeObject{
-		Name:           fnDef.Name,
-		Code:           subCompiler.code,
-		Consts:         subCompiler.constPool.Slice(),
-		ParamNames:     paramValSlice,
-		CellVars:       cellValSlice,
-		FreeVars:       freeValSlice,
-		NumLocals:      numLocals,
-		NumParams:      len(paramNames),
-		MaxStackSize:   maxStack,
-		IsGenerator:    fnScope.IsGenerator,
-		IsCoroutine:    fnScope.IsCoroutine,
-		Flags:          coFlags,
-		ExceptionTable: subCompiler.exceptionTable,
+		Name:            fnDef.Name,
+		QualName:        qualName,
+		FileName:        c.filename,
+		FirstLineNo:     int(firstLine),
+		PosOnlyArgCount: int(fnDef.PosOnlyCount),
+		KWOnlyArgCount:  int(fnDef.KWOnlyCount),
+		Code:            subCompiler.code,
+		Consts:          subCompiler.constPool.Slice(),
+		ParamNames:      paramValSlice,
+		VarNames:        varNames,
+		CellVars:        cellValSlice,
+		FreeVars:        freeValSlice,
+		NumLocals:       numLocals,
+		NumParams:       len(paramNames),
+		MaxStackSize:    maxStack,
+		IsGenerator:     fnScope.IsGenerator,
+		IsCoroutine:     fnScope.IsCoroutine,
+		Flags:           coFlags,
+		ExceptionTable:  subCompiler.exceptionTable,
+		LineSpans:       subCompiler.lineSpans,
 	}
 
 	var flags uint8
@@ -1313,6 +1452,21 @@ func (c *Compiler) compileFuncDef(stmt *ASTStmt) error {
 		c.emitOp(vm.OP_BUILD_TUPLE, 0, uint16(len(defaults)))
 	}
 
+	// Keyword-only defaults (if any)
+	kwDefaults := c.arena.GetExprSlice(fnDef.KWDefaults)
+	kwDefNames := c.arena.GetIdentSlice(fnDef.KWDefaultNames)
+	if len(kwDefaults) > 0 {
+		flags |= 0x08
+		for i, dExpr := range kwDefaults {
+			_, nameIdx := c.constPool.InternName(kwDefNames[i])
+			c.emitOp(vm.OP_LOAD_CONST, 0, nameIdx)
+			if err := c.compileExpr(dExpr); err != nil {
+				return err
+			}
+		}
+		c.emitOp(vm.OP_BUILD_MAP, 0, uint16(len(kwDefaults)))
+	}
+
 	// Closure cells (if FreeVars > 0)
 	if len(fnScope.FreeVars) > 0 {
 		flags |= 0x01
@@ -1350,13 +1504,21 @@ func (c *Compiler) compileClassDef(stmt *ASTStmt) error {
 
 	clsScope := c.nextChildScope(ScopeClass, clsDef.Name)
 
+	firstLine, _ := c.offsetToLineCol(stmt.Start)
+	clsQualName := c.qualnamePrefix + clsDef.Name
+
 	// Compile class body code object
 	subCompiler := &Compiler{
-		src:       c.src,
-		arena:     c.arena,
-		scope:     clsScope,
-		constPool: NewConstPool(),
-		code:      make([]uint32, 0, 64),
+		src:            c.src,
+		arena:          c.arena,
+		scope:          clsScope,
+		constPool:      NewConstPool(),
+		code:           make([]uint32, 0, 64),
+		filename:       c.filename,
+		qualnamePrefix: clsQualName + ".",
+		lineStarts:     c.lineStarts,
+		curLine:        firstLine,
+		curCol:         1,
 	}
 
 	clsTPCount := uint16(clsDef.TypeParams.Count)
@@ -1389,11 +1551,15 @@ func (c *Compiler) compileClassDef(stmt *ASTStmt) error {
 	subCompiler.peephole()
 
 	clsCodeObj := &vm.CodeObject{
-		Name:      clsDef.Name,
-		Code:      subCompiler.code,
-		Consts:    subCompiler.constPool.Slice(),
-		NumLocals: 0,
-		NumParams: 0,
+		Name:        clsDef.Name,
+		QualName:    clsQualName,
+		FileName:    c.filename,
+		FirstLineNo: int(firstLine),
+		Code:        subCompiler.code,
+		Consts:      subCompiler.constPool.Slice(),
+		NumLocals:   0,
+		NumParams:   0,
+		LineSpans:   subCompiler.lineSpans,
 	}
 	if len(clsScope.CellVars) > 0 {
 		clsCodeObj.CellVars = make([]val.Value, len(clsScope.CellVars))
@@ -1492,6 +1658,7 @@ func (c *Compiler) compileExpr(exprID ExprID) error {
 		c.emitOp(vm.OP_LOAD_CONST, 0, noneIdx)
 		return nil
 	}
+	c.setSourcePos(expr.Start)
 
 	switch expr.Kind {
 	case ExprKindInt:
@@ -2780,12 +2947,20 @@ func (c *Compiler) compileLambda(expr *ASTExpr) error {
 
 	lambdaScope := c.nextChildScope(ScopeFunction, "<lambda>")
 
+	firstLine, _ := c.offsetToLineCol(expr.Start)
+	lambdaQualName := c.qualnamePrefix + "<lambda>"
+
 	subCompiler := &Compiler{
-		src:       c.src,
-		arena:     c.arena,
-		scope:     lambdaScope,
-		constPool: NewConstPool(),
-		code:      make([]uint32, 0, 16),
+		src:            c.src,
+		arena:          c.arena,
+		scope:          lambdaScope,
+		constPool:      NewConstPool(),
+		code:           make([]uint32, 0, 16),
+		filename:       c.filename,
+		qualnamePrefix: lambdaQualName,
+		lineStarts:     c.lineStarts,
+		curLine:        firstLine,
+		curCol:         1,
 	}
 
 	for _, sID := range c.arena.StmtIDs[fnDef.Body.Start : fnDef.Body.Start+fnDef.Body.Count] {
@@ -2817,16 +2992,55 @@ func (c *Compiler) compileLambda(expr *ASTExpr) error {
 		numLocals = len(paramNames)
 	}
 
+	var coFlags uint32 = vm.CO_OPTIMIZED | vm.CO_NEWLOCALS
+	if len(lambdaScope.FreeVars) == 0 && len(lambdaScope.CellVars) == 0 {
+		coFlags |= vm.CO_NOFREE
+	}
+	if c.qualnamePrefix != "" {
+		coFlags |= vm.CO_NESTED
+	}
+
+	varNames := make([]val.Value, 0, len(paramNames)+len(lambdaScope.FastLocals))
+	seenNames := make(map[string]bool)
+	for _, p := range paramNames {
+		clean := p
+		if strings.HasPrefix(clean, "**") {
+			clean = clean[2:]
+			coFlags |= vm.CO_VARKEYWORDS
+		} else if strings.HasPrefix(clean, "*") {
+			clean = clean[1:]
+			if clean != "" {
+				coFlags |= vm.CO_VARARGS
+			}
+		}
+		if clean != "" && !seenNames[clean] {
+			seenNames[clean] = true
+			varNames = append(varNames, val.InternString(clean))
+		}
+	}
+	for _, fl := range lambdaScope.FastLocals {
+		if !seenNames[fl] {
+			seenNames[fl] = true
+			varNames = append(varNames, val.InternString(fl))
+		}
+	}
+
 	lambdaCodeObj := &vm.CodeObject{
 		Name:         "<lambda>",
+		QualName:     lambdaQualName,
+		FileName:     c.filename,
+		FirstLineNo:  int(firstLine),
 		Code:         subCompiler.code,
 		Consts:       subCompiler.constPool.Slice(),
 		ParamNames:   paramValSlice,
+		VarNames:     varNames,
 		CellVars:     cellValSlice,
 		FreeVars:     freeValSlice,
 		NumLocals:    numLocals,
 		NumParams:    len(paramNames),
 		MaxStackSize: numLocals + subCompiler.maxStackDepth + 16,
+		Flags:        coFlags,
+		LineSpans:    subCompiler.lineSpans,
 	}
 
 	if len(lambdaScope.FreeVars) > 0 {

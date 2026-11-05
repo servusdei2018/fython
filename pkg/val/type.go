@@ -295,39 +295,45 @@ func allocTypeVersion() uint64 {
 var (
 	builtinTypes [256]*PyType
 
-	TypeType         *PyType
-	ObjectType       *PyType
-	NoneType         *PyType
-	BoolType         *PyType
-	IntType          *PyType
-	FloatType        *PyType
-	StrType          *PyType
-	BigIntType       *PyType
-	ListType         *PyType
-	DictType         *PyType
-	TupleType        *PyType
-	CodeType         *PyType
-	FunctionType     *PyType
-	BuiltinFuncType  *PyType
-	BoundMethodType  *PyType
-	PropertyType     *PyType
-	ClassMethodType  *PyType
-	StaticMethodType *PyType
-	SuperType        *PyType
-	CellType         *PyType
-	IterType         *PyType
-	RangeType        *PyType
-	GeneratorType    *PyType
-	CoroutineType    *PyType
-	FutureType       *PyType
-	TaskType         *PyType
-	ChanType         *PyType
-	ModuleType       *PyType
-	BytesType        *PyType
-	ByteArrayType    *PyType
-	MemoryViewType   *PyType
-	SliceType        *PyType
-	SetType          *PyType
+	TypeType              *PyType
+	ObjectType            *PyType
+	NoneType              *PyType
+	BoolType              *PyType
+	IntType               *PyType
+	FloatType             *PyType
+	StrType               *PyType
+	BigIntType            *PyType
+	ListType              *PyType
+	DictType              *PyType
+	TupleType             *PyType
+	CodeType              *PyType
+	FunctionType          *PyType
+	BuiltinFuncType       *PyType
+	BoundMethodType       *PyType
+	PropertyType          *PyType
+	ClassMethodType       *PyType
+	StaticMethodType      *PyType
+	SuperType             *PyType
+	CellType              *PyType
+	IterType              *PyType
+	RangeType             *PyType
+	GeneratorType         *PyType
+	CoroutineType         *PyType
+	FutureType            *PyType
+	TaskType              *PyType
+	ChanType              *PyType
+	ModuleType            *PyType
+	BytesType             *PyType
+	ByteArrayType         *PyType
+	MemoryViewType        *PyType
+	SliceType             *PyType
+	SetType               *PyType
+	FrameType             *PyType
+	LocalsProxyType       *PyType
+	TracebackType         *PyType
+	WeakRefType           *PyType
+	WeakProxyType         *PyType
+	CallableWeakProxyType *PyType
 
 	// Built-in exception types
 	BaseExceptionType       *PyType
@@ -349,6 +355,7 @@ var (
 	ImportErrorType         *PyType
 	ModuleNotFoundErrorType *PyType
 	BufferErrorType         *PyType
+	ReferenceErrorType      *PyType
 
 	// PEP 695 Type Parameter types
 	TypeVarType       *PyType

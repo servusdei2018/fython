@@ -16,7 +16,7 @@ const (
 	// FycMagic is the 4-byte magic signature for Fython bytecode files ("FYTH" in ASCII).
 	FycMagic uint32 = 0x48545946
 	// FycVersion is the current bytecode format version.
-	FycVersion uint32 = 1
+	FycVersion uint32 = 2
 	// FycHeaderSize is the fixed size of the .fyc file header in bytes.
 	FycHeaderSize = 64
 )
@@ -78,8 +78,13 @@ func (sc *stringCollector) collectFromCodeObject(co *CodeObject) {
 		return
 	}
 	sc.add(co.Name)
+	sc.add(co.QualName)
+	sc.add(co.FileName)
 
 	for _, v := range co.ParamNames {
+		sc.add(v.AsString())
+	}
+	for _, v := range co.VarNames {
 		sc.add(v.AsString())
 	}
 	for _, v := range co.CellVars {
@@ -160,6 +165,23 @@ func encodeCodeObject(buf []byte, co *CodeObject, sc *stringCollector) []byte {
 	binary.LittleEndian.PutUint32(tmp4[:], nameIdx)
 	buf = append(buf, tmp4[:]...)
 
+	qualNameIdx := sc.add(co.QualName)
+	binary.LittleEndian.PutUint32(tmp4[:], qualNameIdx)
+	buf = append(buf, tmp4[:]...)
+
+	fileNameIdx := sc.add(co.FileName)
+	binary.LittleEndian.PutUint32(tmp4[:], fileNameIdx)
+	buf = append(buf, tmp4[:]...)
+
+	binary.LittleEndian.PutUint32(tmp4[:], uint32(co.FirstLineNo))
+	buf = append(buf, tmp4[:]...)
+
+	binary.LittleEndian.PutUint32(tmp4[:], uint32(co.PosOnlyArgCount))
+	buf = append(buf, tmp4[:]...)
+
+	binary.LittleEndian.PutUint32(tmp4[:], uint32(co.KWOnlyArgCount))
+	buf = append(buf, tmp4[:]...)
+
 	binary.LittleEndian.PutUint32(tmp4[:], uint32(co.NumLocals))
 	buf = append(buf, tmp4[:]...)
 
@@ -202,6 +224,14 @@ func encodeCodeObject(buf []byte, co *CodeObject, sc *stringCollector) []byte {
 		buf = append(buf, tmp4[:]...)
 	}
 
+	// VarNames
+	binary.LittleEndian.PutUint32(tmp4[:], uint32(len(co.VarNames)))
+	buf = append(buf, tmp4[:]...)
+	for _, v := range co.VarNames {
+		binary.LittleEndian.PutUint32(tmp4[:], sc.add(v.AsString()))
+		buf = append(buf, tmp4[:]...)
+	}
+
 	// CellVars
 	binary.LittleEndian.PutUint32(tmp4[:], uint32(len(co.CellVars)))
 	buf = append(buf, tmp4[:]...)
@@ -235,6 +265,20 @@ func encodeCodeObject(buf []byte, co *CodeObject, sc *stringCollector) []byte {
 			pushByte = 1
 		}
 		buf = append(buf, pushByte)
+	}
+
+	// LineSpans
+	binary.LittleEndian.PutUint32(tmp4[:], uint32(len(co.LineSpans)))
+	buf = append(buf, tmp4[:]...)
+	for _, sp := range co.LineSpans {
+		binary.LittleEndian.PutUint32(tmp4[:], sp.StartIP)
+		buf = append(buf, tmp4[:]...)
+		binary.LittleEndian.PutUint32(tmp4[:], sp.EndIP)
+		buf = append(buf, tmp4[:]...)
+		binary.LittleEndian.PutUint32(tmp4[:], sp.Line)
+		buf = append(buf, tmp4[:]...)
+		binary.LittleEndian.PutUint32(tmp4[:], sp.Col)
+		buf = append(buf, tmp4[:]...)
 	}
 
 	return buf
@@ -425,6 +469,37 @@ func decodeCodeObject(r *binaryReader, stringTable []val.Value) (*CodeObject, er
 	}
 	name := stringTable[nameIdx].AsString()
 
+	qualNameIdx, err := r.readUint32()
+	if err != nil {
+		return nil, err
+	}
+	if int(qualNameIdx) >= len(stringTable) {
+		return nil, ErrCorruptFycData
+	}
+	qualName := stringTable[qualNameIdx].AsString()
+
+	fileNameIdx, err := r.readUint32()
+	if err != nil {
+		return nil, err
+	}
+	if int(fileNameIdx) >= len(stringTable) {
+		return nil, ErrCorruptFycData
+	}
+	fileName := stringTable[fileNameIdx].AsString()
+
+	firstLineNo, err := r.readUint32()
+	if err != nil {
+		return nil, err
+	}
+	posOnlyArgCount, err := r.readUint32()
+	if err != nil {
+		return nil, err
+	}
+	kwOnlyArgCount, err := r.readUint32()
+	if err != nil {
+		return nil, err
+	}
+
 	numLocals, err := r.readUint32()
 	if err != nil {
 		return nil, err
@@ -485,6 +560,23 @@ func decodeCodeObject(r *binaryReader, stringTable []val.Value) (*CodeObject, er
 			return nil, ErrCorruptFycData
 		}
 		paramNames[i] = stringTable[idx]
+	}
+
+	// VarNames
+	varLen, err := r.readUint32()
+	if err != nil {
+		return nil, err
+	}
+	varNames := make([]val.Value, varLen)
+	for i := uint32(0); i < varLen; i++ {
+		idx, err := r.readUint32()
+		if err != nil {
+			return nil, err
+		}
+		if int(idx) >= len(stringTable) {
+			return nil, ErrCorruptFycData
+		}
+		varNames[i] = stringTable[idx]
 	}
 
 	// CellVars
@@ -560,20 +652,61 @@ func decodeCodeObject(r *binaryReader, stringTable []val.Value) (*CodeObject, er
 		}
 	}
 
+	// LineSpans
+	lineSpansLen, err := r.readUint32()
+	if err != nil {
+		return nil, err
+	}
+	var lineSpans []LineSpanEntry
+	if lineSpansLen > 0 {
+		lineSpans = make([]LineSpanEntry, lineSpansLen)
+		for i := uint32(0); i < lineSpansLen; i++ {
+			sIP, err := r.readUint32()
+			if err != nil {
+				return nil, err
+			}
+			eIP, err := r.readUint32()
+			if err != nil {
+				return nil, err
+			}
+			line, err := r.readUint32()
+			if err != nil {
+				return nil, err
+			}
+			col, err := r.readUint32()
+			if err != nil {
+				return nil, err
+			}
+			lineSpans[i] = LineSpanEntry{
+				StartIP: sIP,
+				EndIP:   eIP,
+				Line:    line,
+				Col:     col,
+			}
+		}
+	}
+
 	co := &CodeObject{
-		Name:           name,
-		Code:           code,
-		Consts:         consts,
-		ParamNames:     paramNames,
-		CellVars:       cellVars,
-		FreeVars:       freeVars,
-		NumLocals:      int(numLocals),
-		NumParams:      int(numParams),
-		MaxStackSize:   int(maxStackSize),
-		Flags:          flags,
-		IsGenerator:    (flags & FlagGenerator) != 0,
-		IsCoroutine:    (flags & FlagCoroutine) != 0,
-		ExceptionTable: excTable,
+		Name:            name,
+		QualName:        qualName,
+		FileName:        fileName,
+		FirstLineNo:     int(firstLineNo),
+		PosOnlyArgCount: int(posOnlyArgCount),
+		KWOnlyArgCount:  int(kwOnlyArgCount),
+		Code:            code,
+		Consts:          consts,
+		ParamNames:      paramNames,
+		VarNames:        varNames,
+		CellVars:        cellVars,
+		FreeVars:        freeVars,
+		NumLocals:       int(numLocals),
+		NumParams:       int(numParams),
+		MaxStackSize:    int(maxStackSize),
+		Flags:           flags,
+		IsGenerator:     (flags & FlagGenerator) != 0,
+		IsCoroutine:     (flags & FlagCoroutine) != 0,
+		ExceptionTable:  excTable,
+		LineSpans:       lineSpans,
 	}
 	co.Header.Kind = val.KindCode
 	co.Header.Type = val.CodeType

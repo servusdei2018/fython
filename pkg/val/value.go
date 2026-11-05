@@ -50,6 +50,11 @@ const (
 	KindNotImplemented // Static sentinel for NotImplemented singleton
 	KindClassMethod    // Heap-allocated classmethod descriptor (*PyClassMethod)
 	KindStaticMethod   // Heap-allocated staticmethod descriptor (*PyStaticMethod)
+	KindFrame          // Heap-allocated on-demand Python stack frame (*PyFrame)
+	KindLocalsProxy    // Heap-allocated PEP 667 frame locals proxy (*PyLocalsProxy)
+	KindTraceback      // Heap-allocated exception traceback node (*PyTraceback)
+	KindWeakRef        // Heap-allocated weak reference (*PyWeakRef)
+	KindWeakProxy      // Heap-allocated weak reference proxy (*PyWeakProxy)
 )
 
 // ObjectHeader Flags bitmask constants.
@@ -144,6 +149,16 @@ func (k Kind) String() string {
 		return "classmethod"
 	case KindStaticMethod:
 		return "staticmethod"
+	case KindFrame:
+		return "frame"
+	case KindLocalsProxy:
+		return "FrameLocalsProxy"
+	case KindTraceback:
+		return "traceback"
+	case KindWeakRef:
+		return "ReferenceType"
+	case KindWeakProxy:
+		return "ProxyType"
 	default:
 		return "unknown"
 	}
@@ -307,6 +322,10 @@ func (v Value) IsDict() bool {
 	return v.ptr != nil && v.ptr.Kind == KindDict
 }
 
+func (v Value) IsCode() bool {
+	return v.ptr != nil && v.ptr.Kind == KindCode
+}
+
 // IsInstance reports whether v is a heap-allocated PyInstance.
 func (v Value) IsInstance() bool {
 	return v.ptr != nil && v.ptr.Kind == KindInstance
@@ -390,6 +409,26 @@ func (v Value) IsFuture() bool {
 // IsTask reports whether v is a heap-allocated PyTask.
 func (v Value) IsTask() bool {
 	return v.ptr != nil && v.ptr.Kind == KindTask
+}
+
+func (v Value) IsFrame() bool {
+	return v.ptr != nil && v.ptr.Kind == KindFrame
+}
+
+func (v Value) IsLocalsProxy() bool {
+	return v.ptr != nil && v.ptr.Kind == KindLocalsProxy
+}
+
+func (v Value) IsTraceback() bool {
+	return v.ptr != nil && v.ptr.Kind == KindTraceback
+}
+
+func (v Value) IsWeakRef() bool {
+	return v.ptr != nil && v.ptr.Kind == KindWeakRef
+}
+
+func (v Value) IsWeakProxy() bool {
+	return v.ptr != nil && v.ptr.Kind == KindWeakProxy
 }
 
 // IsChan reports whether v is a heap-allocated PyChan.
@@ -822,6 +861,16 @@ func (v Value) String() string {
 		return fmt.Sprintf("<Future at %p>", v.ptr)
 	case KindTask:
 		return fmt.Sprintf("<Task at %p>", v.ptr)
+	case KindFrame:
+		return fmt.Sprintf("<frame at %p>", v.ptr)
+	case KindLocalsProxy:
+		return fmt.Sprintf("<FrameLocalsProxy at %p>", v.ptr)
+	case KindTraceback:
+		return fmt.Sprintf("<traceback object at %p>", v.ptr)
+	case KindWeakRef:
+		return fmt.Sprintf("<weakref at %p>", v.ptr)
+	case KindWeakProxy:
+		return fmt.Sprintf("<weakproxy at %p>", v.ptr)
 	case KindModule:
 		mod := v.AsModule()
 		if mod.File != "" {

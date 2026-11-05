@@ -735,6 +735,35 @@ func (vm *VM) initBuiltins() {
 		}
 		return val.NewListVal(listItems...)
 	}))
+
+	vm.builtins.Set(val.InternString("locals"), val.NewBuiltinFuncVal("locals", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		vmInstance := ctx.VM.(*VM)
+		frameIdx := vmInstance.activeFrameIdx
+		if frameIdx < 0 || frameIdx >= len(vmInstance.frames) {
+			return val.DictVal(vmInstance.globals)
+		}
+		fVal := vmInstance.materializeFrame(frameIdx)
+		if fVal.IsFrame() {
+			f := fVal.AsFrame()
+			if !f.LocalsProxy.IsNone() {
+				return f.LocalsProxy
+			}
+			proxy := &val.PyLocalsProxy{Frame: f}
+			f.LocalsProxy = val.NewLocalsProxyVal(proxy)
+			return f.LocalsProxy
+		}
+		return val.DictVal(vmInstance.globals)
+	}))
+
+	vm.builtins.Set(val.InternString("globals"), val.NewBuiltinFuncVal("globals", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		vmInstance := ctx.VM.(*VM)
+		frameIdx := vmInstance.activeFrameIdx
+		if frameIdx >= 0 && frameIdx < len(vmInstance.frames) && vmInstance.frames[frameIdx].globals != nil {
+			return val.DictVal(vmInstance.frames[frameIdx].globals)
+		}
+		return val.DictVal(vmInstance.globals)
+	}))
+
 	vm.builtins.Set(val.InternString("open"), val.NewBuiltinFuncVal("open", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
 			panic("TypeError: open() takes at least 1 argument")
@@ -762,6 +791,7 @@ func (vm *VM) initBuiltins() {
 	vm.builtins.Set(val.InternString("StopAsyncIteration"), val.TypeVal(val.StopAsyncIterationType))
 	vm.builtins.Set(val.InternString("GeneratorExit"), val.TypeVal(val.GeneratorExitType))
 	vm.builtins.Set(val.InternString("BufferError"), val.TypeVal(val.BufferErrorType))
+	vm.builtins.Set(val.InternString("ReferenceError"), val.TypeVal(val.ReferenceErrorType))
 	vm.builtins.Set(val.InternString("AssertionError"), val.TypeVal(val.AssertionErrorType))
 	vm.builtins.Set(val.InternString("BaseExceptionGroup"), val.TypeVal(val.BaseExceptionGroupType))
 	vm.builtins.Set(val.InternString("ExceptionGroup"), val.TypeVal(val.ExceptionGroupType))
@@ -1287,8 +1317,69 @@ func (vm *VM) resumeCoroutine(ctx *val.ExecContext, coro *val.PyCoroutine, sentV
 	return res, val.IterExhausted
 }
 
+func (vm *VM) syncActiveFrame(frameIdx int, co *CodeObject, code []uint32, consts []val.Value, ip int, baseOffset int, cells []val.Value, globals *val.PyDict, locals val.Value, cache *VMCodeCache) {
+	if frameIdx >= 0 && frameIdx < len(vm.frames) {
+		saved := &vm.frames[frameIdx]
+		saved.co = co
+		saved.code = code
+		saved.consts = consts
+		saved.ip = ip
+		saved.baseOffset = baseOffset
+		saved.cells = cells
+		saved.globals = globals
+		saved.locals = locals
+		saved.cache = cache
+		vm.activeFrameIdx = frameIdx
+		vm.activeCO = co
+		vm.activeBaseOffset = baseOffset
+		vm.activeCells = cells
+	}
+}
+
 func (vm *VM) unwindException(exc val.Value, curCO **CodeObject, ip *int, frameIdx *int, startFrameIdx int, baseOffset *int, sp *int, code *[]uint32, consts *[]val.Value, cells *[]val.Value, globals **val.PyDict, curLocals *val.Value, stack []val.Value, curIC *[]ICSlot, curMethodPIC *[][4]val.MethodPICEntry, curAttrPIC *[][4]AttrPICEntry) bool {
 	vm.lastException = exc
+
+	var curTB val.Value = val.NoneVal()
+	if exc.IsInstance() {
+		curTB, _ = exc.AsInstance().GetAttr(val.InternString("__traceback__"))
+	}
+
+	faultIP := *ip
+	faultCO := *curCO
+	faultFrameIdx := *frameIdx
+
+	if faultFrameIdx >= 0 && faultFrameIdx < len(vm.frames) {
+		fSlot := &vm.frames[faultFrameIdx]
+		fSlot.co = faultCO
+		if code != nil {
+			fSlot.code = *code
+		}
+		if consts != nil {
+			fSlot.consts = *consts
+		}
+		fSlot.ip = faultIP
+		fSlot.baseOffset = *baseOffset
+		if cells != nil {
+			fSlot.cells = *cells
+		}
+		if globals != nil {
+			fSlot.globals = *globals
+		}
+		if curLocals != nil {
+			fSlot.locals = *curLocals
+		}
+		vm.activeFrameIdx = faultFrameIdx
+	}
+
+	if curTB.IsNone() && faultCO != nil {
+		line := faultCO.LineAt(faultIP)
+		frameVal := vm.materializeFrame(faultFrameIdx)
+		curTB = val.NewTracebackVal(frameVal, line, faultIP, val.NoneVal())
+		if exc.IsInstance() {
+			exc.AsInstance().SetAttr(val.InternString("__traceback__"), curTB)
+		}
+	}
+
 	for {
 		co := *curCO
 		if co != nil && len(co.ExceptionTable) > 0 {
@@ -1323,6 +1414,11 @@ func (vm *VM) unwindException(exc val.Value, curCO **CodeObject, ip *int, frameI
 		}
 
 		if *frameIdx > startFrameIdx {
+			if curShadow := vm.frames[*frameIdx].shadowFrame; curShadow != nil {
+				curShadow.Detach()
+				vm.frames[*frameIdx].shadowFrame = nil
+			}
+
 			(*frameIdx)--
 			caller := &vm.frames[*frameIdx]
 			*curCO = caller.co
@@ -1334,8 +1430,23 @@ func (vm *VM) unwindException(exc val.Value, curCO **CodeObject, ip *int, frameI
 			if curLocals != nil {
 				*curLocals = caller.locals
 			}
-			*ip = caller.ip - 1
+			callerIP := caller.ip - 1
+			*ip = callerIP
+
+			if caller.co != nil {
+				line := caller.co.LineAt(callerIP)
+				frameVal := vm.materializeFrame(*frameIdx)
+				curTB = val.NewTracebackVal(frameVal, line, callerIP, curTB)
+				if exc.IsInstance() {
+					exc.AsInstance().SetAttr(val.InternString("__traceback__"), curTB)
+				}
+			}
 			continue
+		}
+
+		if curShadow := vm.frames[*frameIdx].shadowFrame; curShadow != nil {
+			curShadow.Detach()
+			vm.frames[*frameIdx].shadowFrame = nil
 		}
 
 		return false
@@ -1788,6 +1899,10 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				curIC = curCodeCache.ic
 				curMethodPIC = curCodeCache.methodPIC
 				curAttrPIC = curCodeCache.attrPIC
+				vm.activeCO = curCO
+				vm.activeBaseOffset = baseOffset
+				vm.activeCells = cells
+				vm.activeFrameIdx = frameIdx
 				ip = 0
 				continue
 
@@ -1861,21 +1976,25 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				curIC = curCodeCache.ic
 				curMethodPIC = curCodeCache.methodPIC
 				curAttrPIC = curCodeCache.attrPIC
+				vm.activeCO = curCO
+				vm.activeBaseOffset = baseOffset
+				vm.activeCells = cells
+				vm.activeFrameIdx = frameIdx
 				ip = 0
 				continue
 
 			case val.KindBuiltinFunc:
 				builtin := target.AsBuiltinFunc()
+				vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 				vm.execCtx.SP = newBase + argc
-				vm.activeFrameIdx = frameIdx
 				res := builtin.Fn(&vm.execCtx, target, stack[newBase:newBase+argc], nil)
 				stack[retSP] = res
 				sp = retSP + 1
 				ip++
 
 			default:
+				vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 				vm.execCtx.SP = newBase + argc
-				vm.activeFrameIdx = frameIdx
 				res := vm.callFromHook(&vm.execCtx, target, newBase, argc, nil)
 				stack[retSP] = res
 				sp = retSP + 1
@@ -2000,16 +2119,16 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 
 			case val.KindBuiltinFunc:
 				builtin := target.AsBuiltinFunc()
+				vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 				vm.execCtx.SP = newBase + totalArgs
-				vm.activeFrameIdx = frameIdx
 				res := builtin.Fn(&vm.execCtx, target, stack[newBase:newBase+totalArgs], kwnames)
 				stack[retSP] = res
 				sp = retSP + 1
 				ip++
 
 			default:
+				vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 				vm.execCtx.SP = newBase + totalArgs
-				vm.activeFrameIdx = frameIdx
 				res := vm.callFromHook(&vm.execCtx, target, newBase, totalArgs, kwnames)
 				stack[retSP] = res
 				sp = retSP + 1
@@ -2187,6 +2306,10 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				curIC = curCodeCache.ic
 				curMethodPIC = curCodeCache.methodPIC
 				curAttrPIC = curCodeCache.attrPIC
+				vm.activeCO = curCO
+				vm.activeBaseOffset = baseOffset
+				vm.activeCells = cells
+				vm.activeFrameIdx = frameIdx
 				ip = 0
 				continue
 
@@ -2247,21 +2370,25 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				curIC = curCodeCache.ic
 				curMethodPIC = curCodeCache.methodPIC
 				curAttrPIC = curCodeCache.attrPIC
+				vm.activeCO = curCO
+				vm.activeBaseOffset = baseOffset
+				vm.activeCells = cells
+				vm.activeFrameIdx = frameIdx
 				ip = 0
 				continue
 
 			case val.KindBuiltinFunc:
 				builtin := callable.AsBuiltinFunc()
+				vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 				vm.execCtx.SP = newBase + totalArgs
-				vm.activeFrameIdx = frameIdx
 				res := builtin.Fn(&vm.execCtx, callable, stack[newBase:newBase+totalArgs], nil)
 				stack[retSP] = res
 				sp = retSP + 1
 				ip++
 
 			default:
+				vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 				vm.execCtx.SP = newBase + totalArgs
-				vm.activeFrameIdx = frameIdx
 				res := vm.callFromHook(&vm.execCtx, callable, newBase, totalArgs, nil)
 				stack[retSP] = res
 				sp = retSP + 1
@@ -2362,8 +2489,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 						continue
 					}
 				} else if nativeFn != nil {
+					vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 					vm.execCtx.SP = newBase + totalArgs
-					vm.activeFrameIdx = frameIdx
 					res := nativeFn(&vm.execCtx, targetVal, stack[newBase:newBase+totalArgs], nil)
 					stack[retSP] = res
 					sp = retSP + 1
@@ -2372,6 +2499,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				}
 			}
 
+			vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 			vm.callMethodPICSlow(receiver, consts[methIdx], ip, newBase, argc, frameIdx, stack, curMethodPIC)
 			sp = retSP + 1
 			ip++
@@ -2379,6 +2507,10 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		case OP_RETURN:
 			sp--
 			retVal := stack[sp]
+			if curShadow := vm.frames[frameIdx].shadowFrame; curShadow != nil {
+				curShadow.Detach()
+				vm.frames[frameIdx].shadowFrame = nil
+			}
 			if activeGen != nil && frameIdx == startFrameIdx {
 				activeGen.RetVal = retVal
 				activeGen.State = val.GenClosed
@@ -2525,6 +2657,17 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				vm.execCtx.SP = sp
 				vm.activeFrameIdx = frameIdx
 				stack[sp-1] = val.GetAttrCtx(&vm.execCtx, obj, consts[uint16(inst)])
+			}
+			if vm.execCtx.HasException() {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if activeGen != nil {
+						activeGen.State = val.GenClosed
+					}
+					return val.NoneVal()
+				}
+				continue
 			}
 			ip++
 
@@ -2818,6 +2961,14 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				closureVal := stack[sp]
 				closureSlice = closureVal.AsTuple().Items
 			}
+			var kwdefaultsDict *val.PyDict
+			if (flags & 0x08) != 0 {
+				sp--
+				kwdefVal := stack[sp]
+				if kwdefVal.IsDict() {
+					kwdefaultsDict = kwdefVal.AsDict()
+				}
+			}
 			var defaultsSlice []val.Value
 			if (flags & 0x02) != 0 {
 				sp--
@@ -2831,8 +2982,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			}
 			callee := AsCodeObject(codeVal)
 			fnVal := val.NewFunctionValWithGlobalsAndClosure(callee.Name, codeVal, defaultsSlice, closureSlice, globals)
+			fn := fnVal.AsFunction()
+			fn.KwDefaults = kwdefaultsDict
 			if (flags & 0x04) != 0 {
-				fn := fnVal.AsFunction()
 				if fn.Dict == nil {
 					fn.Dict = val.NewDictVal(4).AsDict()
 				}

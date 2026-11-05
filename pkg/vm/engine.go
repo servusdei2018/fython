@@ -103,6 +103,42 @@ func (e *Engine) newSysModules() *val.PyDict {
 	}
 	sysMod.Dict.Set(val.InternString("path"), val.NewListVal(pathItems...))
 	sysMod.Dict.Set(val.InternString("version"), val.NewStringVal("Fython 3.14.0"))
+
+	// sys._getframe([depth=0])
+	sysMod.Dict.Set(val.InternString("_getframe"), val.NewBuiltinFuncVal("_getframe", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		depth := 0
+		if len(args) > 0 && args[0].IsInt64() {
+			depth = int(args[0].AsInt64())
+		}
+		if depth < 0 {
+			panic("ValueError: call stack is not deep enough")
+		}
+		vmInstance := ctx.VM.(*VM)
+		targetIdx := vmInstance.activeFrameIdx - depth
+		if targetIdx < 0 {
+			panic("ValueError: call stack is not deep enough")
+		}
+		fVal := vmInstance.materializeFrame(targetIdx)
+		if fVal.IsNone() {
+			panic("ValueError: call stack is not deep enough")
+		}
+		return fVal
+	}))
+
+	// sys.exc_info() -> (type, value, traceback)
+	sysMod.Dict.Set(val.InternString("exc_info"), val.NewBuiltinFuncVal("exc_info", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		vmInstance := ctx.VM.(*VM)
+		lastExc := vmInstance.lastException
+		if lastExc.IsNone() || lastExc.HeaderPtr() == nil {
+			return val.NewTupleVal(val.NoneVal(), val.NoneVal(), val.NoneVal())
+		}
+		tb := val.NoneVal()
+		if lastExc.IsInstance() {
+			tb, _ = lastExc.AsInstance().GetAttr(val.InternString("__traceback__"))
+		}
+		return val.NewTupleVal(val.TypeVal(lastExc.Type()), lastExc, tb)
+	}))
+
 	modules.Set(val.InternString("sys"), sysModVal)
 
 	// 2. Built-in builtins module
@@ -118,8 +154,27 @@ func (e *Engine) newSysModules() *val.PyDict {
 	modules.Set(val.InternString("os"), e.createOSModule())
 	modules.Set(val.InternString("io"), e.createIOModule())
 	modules.Set(val.InternString("asyncio"), e.createAsyncioModule())
+	modules.Set(val.InternString("_weakref"), e.createWeakrefCModule())
+	modules.Set(val.InternString("weakref"), e.createWeakrefModule())
+	modules.Set(val.InternString("traceback"), e.createTracebackModule())
+	modules.Set(val.InternString("inspect"), e.createInspectModule())
+	modules.Set(val.InternString("gc"), e.createGCModule())
+	modules.Set(val.InternString("types"), e.createTypesModule())
 
 	return modules
+}
+
+func (e *Engine) createTypesModule() val.Value {
+	modVal := val.NewModuleVal("types", "")
+	mod := modVal.AsModule()
+	mod.Dict.Set(val.InternString("FunctionType"), val.TypeVal(val.FunctionType))
+	mod.Dict.Set(val.InternString("BuiltinFunctionType"), val.TypeVal(val.BuiltinFuncType))
+	mod.Dict.Set(val.InternString("MethodType"), val.TypeVal(val.BoundMethodType))
+	mod.Dict.Set(val.InternString("ModuleType"), val.TypeVal(val.ModuleType))
+	mod.Dict.Set(val.InternString("TracebackType"), val.TypeVal(val.TracebackType))
+	mod.Dict.Set(val.InternString("FrameType"), val.TypeVal(val.FrameType))
+	mod.Dict.Set(val.InternString("CodeType"), val.TypeVal(val.CodeType))
+	return modVal
 }
 
 // SetAsyncMode sets the coroutine scheduling strategy for this Engine.

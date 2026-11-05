@@ -181,15 +181,19 @@ type ASTTypeAlias struct {
 
 // ASTFuncDef stores function definition metadata.
 type ASTFuncDef struct {
-	Name       string
-	ParamNames IdentSlice
-	Defaults   ExprSlice
-	Body       StmtSlice
-	IsAsync    bool
-	TypeParams TypeParamSlice
-	Decorators ExprSlice
-	Returns    ExprID
-	ParamTypes ExprSlice
+	Name           string
+	ParamNames     IdentSlice
+	Defaults       ExprSlice
+	KWDefaults     ExprSlice
+	KWDefaultNames IdentSlice
+	Body           StmtSlice
+	IsAsync        bool
+	TypeParams     TypeParamSlice
+	Decorators     ExprSlice
+	Returns        ExprID
+	ParamTypes     ExprSlice
+	PosOnlyCount   uint16
+	KWOnlyCount    uint16
 }
 
 // ASTClassDef stores class definition metadata.

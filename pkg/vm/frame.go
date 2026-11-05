@@ -1,6 +1,8 @@
 package vm
 
 import (
+	"encoding/binary"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -63,22 +65,40 @@ type ExceptionEntry struct {
 // CallFrame is an unboxed value struct stored in the contiguous VM.frames slab.
 // It is never heap-allocated per function call.
 type CallFrame struct {
-	co         *CodeObject
-	code       []uint32
-	consts     []val.Value
-	ip         int
-	baseOffset int
-	retSP      int // Caller's stack pointer where the return value will be written
-	cells      []val.Value
-	globals    *val.PyDict
-	locals     val.Value
-	cache      *VMCodeCache
+	co          *CodeObject
+	code        []uint32
+	consts      []val.Value
+	ip          int
+	baseOffset  int
+	retSP       int // Caller's stack pointer where the return value will be written
+	cells       []val.Value
+	globals     *val.PyDict
+	locals      val.Value
+	cache       *VMCodeCache
+	shadowFrame *val.PyFrame
 }
 
-// CodeObject Flags bitmask constants.
+// LineSpanEntry maps an instruction pointer range [StartIP, EndIP) to source line and column.
+type LineSpanEntry struct {
+	StartIP uint32
+	EndIP   uint32
+	Line    uint32
+	Col     uint32
+}
+
+// Standard Python CodeObject Flags bitmask constants.
 const (
-	FlagGenerator uint32 = 1 << 0
-	FlagCoroutine uint32 = 1 << 1
+	FlagGenerator      uint32 = 1 << 0
+	FlagCoroutine      uint32 = 1 << 1
+	CO_OPTIMIZED       uint32 = 0x0001
+	CO_NEWLOCALS       uint32 = 0x0002
+	CO_VARARGS         uint32 = 0x0004
+	CO_VARKEYWORDS     uint32 = 0x0008
+	CO_NESTED          uint32 = 0x0010
+	CO_GENERATOR       uint32 = 0x0020
+	CO_NOFREE          uint32 = 0x0040
+	CO_COROUTINE       uint32 = 0x0080
+	CO_ASYNC_GENERATOR uint32 = 0x0200
 )
 
 // CodeObject represents a compiled function or module bytecode unit.
@@ -88,9 +108,15 @@ type CodeObject struct {
 	Header           val.ObjectHeader
 	ID               uint32
 	Name             string
+	QualName         string
+	FileName         string
+	FirstLineNo      int
+	PosOnlyArgCount  int
+	KWOnlyArgCount   int
 	Code             []uint32
 	Consts           []val.Value
 	ParamNames       []val.Value
+	VarNames         []val.Value
 	CellVars         []val.Value
 	FreeVars         []val.Value
 	NumLocals        int
@@ -100,6 +126,7 @@ type CodeObject struct {
 	IsCoroutine      bool
 	Flags            uint32
 	ExceptionTable   []ExceptionEntry
+	LineSpans        []LineSpanEntry
 	Hotness          int32
 	IsTier2Optimized int32
 }
@@ -116,6 +143,39 @@ func (co *CodeObject) initID() uint32 {
 		return newID
 	}
 	return atomic.LoadUint32(&co.ID)
+}
+
+// LineAt resolves the 1-based source line number for instruction pointer ip.
+func (co *CodeObject) LineAt(ip int) int {
+	if co == nil {
+		return 1
+	}
+	uip := uint32(ip)
+	for i := len(co.LineSpans) - 1; i >= 0; i-- {
+		sp := &co.LineSpans[i]
+		if uip >= sp.StartIP && uip < sp.EndIP {
+			return int(sp.Line)
+		}
+	}
+	if co.FirstLineNo > 0 {
+		return co.FirstLineNo
+	}
+	return 1
+}
+
+// LineTableBytes encodes LineSpans into a compact byte slice representation.
+func (co *CodeObject) LineTableBytes() []byte {
+	if co == nil || len(co.LineSpans) == 0 {
+		return nil
+	}
+	buf := make([]byte, len(co.LineSpans)*16)
+	for i, sp := range co.LineSpans {
+		binary.LittleEndian.PutUint32(buf[i*16:], sp.StartIP)
+		binary.LittleEndian.PutUint32(buf[i*16+4:], sp.EndIP)
+		binary.LittleEndian.PutUint32(buf[i*16+8:], sp.Line)
+		binary.LittleEndian.PutUint32(buf[i*16+12:], sp.Col)
+	}
+	return buf
 }
 
 // VMCodeCache holds per-CodeObject inline caches isolated per VM instance (0 races, 0 cross-call thrashing).
@@ -202,9 +262,246 @@ func (vm *VM) Reset() {
 	for i := 0; i < sp; i++ {
 		vm.stack[i] = val.NoneVal()
 	}
+	for i := range vm.frames {
+		vm.frames[i].shadowFrame = nil
+	}
 	vm.execCtx.SP = 0
 	vm.activeFrameIdx = 0
 	vm.lastException = val.NoneVal()
+}
+
+// GetStackVal satisfies val.FrameVM.
+func (vm *VM) GetStackVal(offset int) val.Value {
+	if offset >= 0 && offset < len(vm.stack) {
+		return vm.stack[offset]
+	}
+	return val.NoneVal()
+}
+
+// SetStackVal satisfies val.FrameVM.
+func (vm *VM) SetStackVal(offset int, v val.Value) {
+	if offset >= 0 && offset < len(vm.stack) {
+		vm.stack[offset] = v
+	}
+}
+
+// MaterializeFrame satisfies val.FrameVM.
+func (vm *VM) MaterializeFrame(frameIdx int) val.Value {
+	return vm.materializeFrame(frameIdx)
+}
+
+func (vm *VM) materializeFrame(targetIdx int) val.Value {
+	if targetIdx < 0 || targetIdx >= len(vm.frames) {
+		return val.NoneVal()
+	}
+	fSlot := &vm.frames[targetIdx]
+	if fSlot.shadowFrame != nil {
+		return val.NewFrameVal(fSlot.shadowFrame)
+	}
+	co := fSlot.co
+	baseOffset := fSlot.baseOffset
+	cells := fSlot.cells
+	if co == nil && targetIdx == vm.activeFrameIdx {
+		co = vm.activeCO
+		baseOffset = vm.activeBaseOffset
+		cells = vm.activeCells
+	}
+	if co == nil && targetIdx == 0 {
+		co = &vm.rootCO
+	}
+	if co == nil {
+		return val.NoneVal()
+	}
+	codeVal := NewCodeVal(co)
+	globals := fSlot.globals
+	if globals == nil {
+		globals = vm.globals
+	}
+	pyFrame := val.NewPyFrame(
+		vm,
+		targetIdx,
+		baseOffset,
+		codeVal,
+		globals,
+		cells,
+	)
+	pyFrame.IP = fSlot.ip
+	if fSlot.locals.IsDict() {
+		pyFrame.ExtraLocals = fSlot.locals.AsDict()
+	}
+	fSlot.shadowFrame = pyFrame
+	return val.NewFrameVal(pyFrame)
+}
+
+type defaultCodeInspector struct{}
+
+func (defaultCodeInspector) VarNames(code val.Value) []val.Value {
+	co := AsCodeObject(code)
+	if co == nil {
+		return nil
+	}
+	if len(co.VarNames) > 0 {
+		return co.VarNames
+	}
+	return co.ParamNames
+}
+
+func (defaultCodeInspector) CellVars(code val.Value) []val.Value {
+	co := AsCodeObject(code)
+	if co == nil {
+		return nil
+	}
+	return co.CellVars
+}
+
+func (defaultCodeInspector) FreeVars(code val.Value) []val.Value {
+	co := AsCodeObject(code)
+	if co == nil {
+		return nil
+	}
+	return co.FreeVars
+}
+
+func (defaultCodeInspector) Name(code val.Value) string {
+	co := AsCodeObject(code)
+	if co == nil {
+		return ""
+	}
+	return co.Name
+}
+
+func (defaultCodeInspector) QualName(code val.Value) string {
+	co := AsCodeObject(code)
+	if co == nil {
+		return ""
+	}
+	if co.QualName != "" {
+		return co.QualName
+	}
+	return co.Name
+}
+
+func (defaultCodeInspector) FileName(code val.Value) string {
+	co := AsCodeObject(code)
+	if co == nil {
+		return "<string>"
+	}
+	if co.FileName != "" {
+		return co.FileName
+	}
+	return "<string>"
+}
+
+func (defaultCodeInspector) FirstLineNo(code val.Value) int {
+	co := AsCodeObject(code)
+	if co == nil || co.FirstLineNo <= 0 {
+		return 1
+	}
+	return co.FirstLineNo
+}
+
+func (defaultCodeInspector) ArgCount(code val.Value) int {
+	co := AsCodeObject(code)
+	if co == nil {
+		return 0
+	}
+	argCount := 0
+	for _, p := range co.ParamNames {
+		s := p.AsString()
+		if strings.HasPrefix(s, "*") {
+			break
+		}
+		argCount++
+	}
+	return argCount
+}
+
+func (defaultCodeInspector) PosOnlyArgCount(code val.Value) int {
+	co := AsCodeObject(code)
+	if co == nil {
+		return 0
+	}
+	return co.PosOnlyArgCount
+}
+
+func (defaultCodeInspector) KWOnlyArgCount(code val.Value) int {
+	co := AsCodeObject(code)
+	if co == nil {
+		return 0
+	}
+	return co.KWOnlyArgCount
+}
+
+func (defaultCodeInspector) Flags(code val.Value) uint32 {
+	co := AsCodeObject(code)
+	if co == nil {
+		return 0
+	}
+	return co.Flags
+}
+
+func (defaultCodeInspector) LineAt(code val.Value, ip int) int {
+	co := AsCodeObject(code)
+	if co == nil {
+		return 1
+	}
+	return co.LineAt(ip)
+}
+
+func (defaultCodeInspector) LineTable(code val.Value) []byte {
+	co := AsCodeObject(code)
+	if co == nil {
+		return nil
+	}
+	return co.LineTableBytes()
+}
+
+func (defaultCodeInspector) LineSpans(code val.Value) []any {
+	co := AsCodeObject(code)
+	if co == nil {
+		return nil
+	}
+	out := make([]any, len(co.LineSpans))
+	for i, sp := range co.LineSpans {
+		out[i] = val.NewTupleVal(
+			val.Int64Val(int64(sp.StartIP)),
+			val.Int64Val(int64(sp.EndIP)),
+			val.Int64Val(int64(sp.Line)),
+		)
+	}
+	return out
+}
+
+func (defaultCodeInspector) CodeBytes(code val.Value) []byte {
+	co := AsCodeObject(code)
+	if co == nil {
+		return nil
+	}
+	b := make([]byte, len(co.Code)*4)
+	for i, inst := range co.Code {
+		binary.LittleEndian.PutUint32(b[i*4:], inst)
+	}
+	return b
+}
+
+func (defaultCodeInspector) Consts(code val.Value) []val.Value {
+	co := AsCodeObject(code)
+	if co == nil {
+		return nil
+	}
+	return co.Consts
+}
+
+func (defaultCodeInspector) StackSize(code val.Value) int {
+	co := AsCodeObject(code)
+	if co == nil {
+		return 0
+	}
+	return co.MaxStackSize
+}
+
+func init() {
+	val.CodeInspectorHook = defaultCodeInspector{}
 }
 
 // LastException returns the most recent unhandled exception Value, or NoneVal.

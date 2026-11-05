@@ -403,10 +403,72 @@ func functionTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Va
 func functionTpGetAttr(ctx *ExecContext, obj, name Value) Value {
 	fn := obj.AsFunction()
 	nameStr := name.AsString()
-	if nameStr == "__name__" {
+	switch nameStr {
+	case "__name__":
 		return InternString(fn.Name)
-	}
-	if nameStr == "__annotations__" {
+	case "__qualname__":
+		if fn.Dict != nil {
+			if v, ok := fn.Dict.Get(name); ok {
+				return v
+			}
+		}
+		if CodeInspectorHook != nil && fn.Code.ptr != nil {
+			qn := CodeInspectorHook.QualName(fn.Code)
+			if qn != "" {
+				return InternString(qn)
+			}
+		}
+		return InternString(fn.Name)
+	case "__code__":
+		return fn.Code
+	case "__defaults__":
+		if fn.Dict != nil {
+			if v, ok := fn.Dict.Get(name); ok {
+				return v
+			}
+		}
+		if len(fn.Defaults) > 0 {
+			return NewTupleVal(fn.Defaults...)
+		}
+		return NoneVal()
+	case "__kwdefaults__":
+		if fn.Dict != nil {
+			if v, ok := fn.Dict.Get(name); ok {
+				return v
+			}
+		}
+		if fn.KwDefaults != nil {
+			return ObjectVal(&fn.KwDefaults.Header)
+		}
+		return NoneVal()
+	case "__closure__":
+		if fn.Dict != nil {
+			if v, ok := fn.Dict.Get(name); ok {
+				return v
+			}
+		}
+		if len(fn.Closure) > 0 {
+			return NewTupleVal(fn.Closure...)
+		}
+		return NoneVal()
+	case "__globals__":
+		if fn.Globals != nil {
+			return ObjectVal(&fn.Globals.Header)
+		}
+		return NewDictVal(4)
+	case "__dict__":
+		if fn.Dict == nil {
+			fn.Dict = NewDictVal(4).AsDict()
+		}
+		return ObjectVal(&fn.Dict.Header)
+	case "__doc__":
+		if fn.Dict != nil {
+			if v, ok := fn.Dict.Get(name); ok {
+				return v
+			}
+		}
+		return NoneVal()
+	case "__annotations__":
 		if fn.Dict != nil {
 			if ann, ok := fn.Dict.Get(name); ok {
 				return ann
@@ -444,6 +506,29 @@ func functionTpGetAttr(ctx *ExecContext, obj, name Value) Value {
 
 func functionTpSetAttr(ctx *ExecContext, obj, name, value Value) Value {
 	fn := obj.AsFunction()
+	nameStr := name.AsString()
+	switch nameStr {
+	case "__defaults__":
+		if value.IsTuple() {
+			fn.Defaults = value.AsTuple().Items
+		} else if value.IsNone() {
+			fn.Defaults = nil
+		}
+	case "__kwdefaults__":
+		if value.IsDict() {
+			fn.KwDefaults = value.AsDict()
+		} else if value.IsNone() {
+			fn.KwDefaults = nil
+		}
+	case "__code__":
+		if value.IsCode() {
+			fn.Code = value
+		}
+	case "__name__":
+		if value.IsAnyString() {
+			fn.Name = value.AsString()
+		}
+	}
 	if fn.Dict == nil {
 		fn.Dict = NewDictVal(4).AsDict()
 	}
@@ -1293,6 +1378,469 @@ func typeMpSubscript(ctx *ExecContext, a, b Value) Value {
 	return TypeVal(t)
 }
 
+func codeTpGetAttr(ctx *ExecContext, obj, name Value) Value {
+	nameStr := name.AsString()
+	if CodeInspectorHook != nil {
+		switch nameStr {
+		case "co_name":
+			return InternString(CodeInspectorHook.Name(obj))
+		case "co_qualname":
+			return InternString(CodeInspectorHook.QualName(obj))
+		case "co_filename":
+			return InternString(CodeInspectorHook.FileName(obj))
+		case "co_firstlineno":
+			return Int64Val(int64(CodeInspectorHook.FirstLineNo(obj)))
+		case "co_argcount":
+			return Int64Val(int64(CodeInspectorHook.ArgCount(obj)))
+		case "co_posonlyargcount":
+			return Int64Val(int64(CodeInspectorHook.PosOnlyArgCount(obj)))
+		case "co_kwonlyargcount":
+			return Int64Val(int64(CodeInspectorHook.KWOnlyArgCount(obj)))
+		case "co_varnames":
+			return NewTupleVal(CodeInspectorHook.VarNames(obj)...)
+		case "co_cellvars":
+			return NewTupleVal(CodeInspectorHook.CellVars(obj)...)
+		case "co_freevars":
+			return NewTupleVal(CodeInspectorHook.FreeVars(obj)...)
+		case "co_flags":
+			return Int64Val(int64(CodeInspectorHook.Flags(obj)))
+		case "co_linetable":
+			return NewBytesVal(CodeInspectorHook.LineTable(obj))
+		case "co_code":
+			return NewBytesVal(CodeInspectorHook.CodeBytes(obj))
+		case "co_consts":
+			return NewTupleVal(CodeInspectorHook.Consts(obj)...)
+		case "co_stacksize":
+			return Int64Val(int64(CodeInspectorHook.StackSize(obj)))
+		case "co_lines":
+			return NewBuiltinFuncVal("co_lines", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+				spans := CodeInspectorHook.LineSpans(obj)
+				items := make([]Value, len(spans))
+				for i, s := range spans {
+					if v, ok := s.(Value); ok {
+						items[i] = v
+					}
+				}
+				return NewIterVal(NewTupleVal(items...))
+			})
+		}
+	}
+	panic("val: AttributeError: 'code' object has no attribute '" + nameStr + "'")
+}
+
+func frameTpGetAttr(ctx *ExecContext, obj, name Value) Value {
+	f := obj.AsFrame()
+	nameStr := name.AsString()
+	switch nameStr {
+	case "f_back":
+		if f.Back.IsNone() && !f.Detached && f.VM != nil {
+			if vm, ok := f.VM.(FrameVM); ok {
+				f.Back = vm.MaterializeFrame(f.FrameIdx - 1)
+			}
+		}
+		return f.Back
+	case "f_code":
+		return f.CO
+	case "f_globals":
+		if f.Globals != nil {
+			return ObjectVal(&f.Globals.Header)
+		}
+		return NewDictVal(4)
+	case "f_locals":
+		if f.LocalsProxy.IsLocalsProxy() {
+			return f.LocalsProxy
+		}
+		proxy := &PyLocalsProxy{Frame: f}
+		f.LocalsProxy = NewLocalsProxyVal(proxy)
+		return f.LocalsProxy
+	case "f_lineno":
+		if CodeInspectorHook != nil && f.CO.ptr != nil {
+			return Int64Val(int64(CodeInspectorHook.LineAt(f.CO, f.IP)))
+		}
+		return Int64Val(1)
+	case "f_lasti":
+		return Int64Val(int64(f.IP))
+	case "f_trace":
+		return NoneVal()
+	}
+	panic("val: AttributeError: 'frame' object has no attribute '" + nameStr + "'")
+}
+
+func tracebackTpGetAttr(ctx *ExecContext, obj, name Value) Value {
+	tb := obj.AsTraceback()
+	switch name.AsString() {
+	case "tb_frame":
+		return tb.Frame
+	case "tb_lineno":
+		return Int64Val(int64(tb.LineNo))
+	case "tb_lasti":
+		return Int64Val(int64(tb.LastI))
+	case "tb_next":
+		return tb.Next
+	}
+	panic("val: AttributeError: 'traceback' object has no attribute '" + name.AsString() + "'")
+}
+
+func localsProxyCollectPairs(p *PyLocalsProxy) []DictEntry {
+	f := p.Frame
+	var entries []DictEntry
+	seen := make(map[string]bool)
+
+	if !f.Detached {
+		if CodeInspectorHook != nil && f.CO.ptr != nil {
+			varnames := CodeInspectorHook.VarNames(f.CO)
+			if vm, ok := f.VM.(FrameVM); ok {
+				for i, name := range varnames {
+					s := name.AsString()
+					if seen[s] {
+						continue
+					}
+					v := vm.GetStackVal(f.BaseOffset + i)
+					if !v.IsNone() || v.ptr != nil {
+						seen[s] = true
+						entries = append(entries, DictEntry{
+							Hash:   HashValue(name),
+							Active: true,
+							Key:    name,
+							Value:  v,
+						})
+					}
+				}
+			}
+			cellvars := CodeInspectorHook.CellVars(f.CO)
+			for i, name := range cellvars {
+				s := name.AsString()
+				if seen[s] {
+					continue
+				}
+				if i < len(f.Cells) && f.Cells[i].IsCell() {
+					seen[s] = true
+					entries = append(entries, DictEntry{
+						Hash:   HashValue(name),
+						Active: true,
+						Key:    name,
+						Value:  f.Cells[i].AsCell().Value,
+					})
+				}
+			}
+			freevars := CodeInspectorHook.FreeVars(f.CO)
+			for j, name := range freevars {
+				s := name.AsString()
+				if seen[s] {
+					continue
+				}
+				cellIdx := len(cellvars) + j
+				if cellIdx < len(f.Cells) && f.Cells[cellIdx].IsCell() {
+					seen[s] = true
+					entries = append(entries, DictEntry{
+						Hash:   HashValue(name),
+						Active: true,
+						Key:    name,
+						Value:  f.Cells[cellIdx].AsCell().Value,
+					})
+				}
+			}
+		}
+		if f.ExtraLocals != nil {
+			for _, e := range f.ExtraLocals.Entries {
+				if !e.Key.IsUnbound() {
+					s := e.Key.AsString()
+					if !seen[s] {
+						seen[s] = true
+						entries = append(entries, e)
+					}
+				}
+			}
+		}
+	} else {
+		if f.SavedLocals != nil {
+			for _, e := range f.SavedLocals.Entries {
+				if !e.Key.IsUnbound() {
+					entries = append(entries, e)
+				}
+			}
+		}
+	}
+	return entries
+}
+
+func localsProxyMpSubscript(ctx *ExecContext, obj, key Value) Value {
+	p := obj.AsLocalsProxy()
+	f := p.Frame
+	keyStr := key.AsString()
+
+	if !f.Detached {
+		if CodeInspectorHook != nil && f.CO.ptr != nil {
+			varnames := CodeInspectorHook.VarNames(f.CO)
+			for i, name := range varnames {
+				if name.AsString() == keyStr {
+					if vm, ok := f.VM.(FrameVM); ok {
+						v := vm.GetStackVal(f.BaseOffset + i)
+						if !v.IsNone() || v.ptr != nil {
+							return v
+						}
+					}
+				}
+			}
+			cellvars := CodeInspectorHook.CellVars(f.CO)
+			for i, name := range cellvars {
+				if name.AsString() == keyStr {
+					if i < len(f.Cells) && f.Cells[i].IsCell() {
+						return f.Cells[i].AsCell().Value
+					}
+				}
+			}
+			freevars := CodeInspectorHook.FreeVars(f.CO)
+			for j, name := range freevars {
+				if name.AsString() == keyStr {
+					cellIdx := len(cellvars) + j
+					if cellIdx < len(f.Cells) && f.Cells[cellIdx].IsCell() {
+						return f.Cells[cellIdx].AsCell().Value
+					}
+				}
+			}
+		}
+		if f.ExtraLocals != nil {
+			if v, ok := f.ExtraLocals.Get(key); ok {
+				return v
+			}
+		}
+	} else {
+		if f.SavedLocals != nil {
+			if v, ok := f.SavedLocals.Get(key); ok {
+				return v
+			}
+		}
+	}
+	panic("KeyError: '" + keyStr + "'")
+}
+
+func localsProxyMpAssSubscript(ctx *ExecContext, obj, key, val Value) Value {
+	p := obj.AsLocalsProxy()
+	f := p.Frame
+	keyStr := key.AsString()
+
+	if !f.Detached {
+		if CodeInspectorHook != nil && f.CO.ptr != nil {
+			varnames := CodeInspectorHook.VarNames(f.CO)
+			for i, name := range varnames {
+				if name.AsString() == keyStr {
+					if vm, ok := f.VM.(FrameVM); ok {
+						vm.SetStackVal(f.BaseOffset+i, val)
+						return NoneVal()
+					}
+				}
+			}
+			cellvars := CodeInspectorHook.CellVars(f.CO)
+			for i, name := range cellvars {
+				if name.AsString() == keyStr {
+					if i < len(f.Cells) && f.Cells[i].IsCell() {
+						f.Cells[i].AsCell().Value = val
+						return NoneVal()
+					}
+				}
+			}
+			freevars := CodeInspectorHook.FreeVars(f.CO)
+			for j, name := range freevars {
+				if name.AsString() == keyStr {
+					cellIdx := len(cellvars) + j
+					if cellIdx < len(f.Cells) && f.Cells[cellIdx].IsCell() {
+						f.Cells[cellIdx].AsCell().Value = val
+						return NoneVal()
+					}
+				}
+			}
+		}
+		if f.ExtraLocals == nil {
+			f.ExtraLocals = NewDictVal(4).AsDict()
+		}
+		f.ExtraLocals.Set(InternString(keyStr), val)
+		return NoneVal()
+	}
+
+	if f.SavedLocals == nil {
+		f.SavedLocals = NewDictVal(4).AsDict()
+	}
+	f.SavedLocals.Set(InternString(keyStr), val)
+	return NoneVal()
+}
+
+func localsProxyContains(ctx *ExecContext, obj, key Value) bool {
+	p := obj.AsLocalsProxy()
+	f := p.Frame
+	keyStr := key.AsString()
+
+	if !f.Detached {
+		if CodeInspectorHook != nil && f.CO.ptr != nil {
+			varnames := CodeInspectorHook.VarNames(f.CO)
+			for i, name := range varnames {
+				if name.AsString() == keyStr {
+					if vm, ok := f.VM.(FrameVM); ok {
+						v := vm.GetStackVal(f.BaseOffset + i)
+						if !v.IsNone() || v.ptr != nil {
+							return true
+						}
+					}
+				}
+			}
+			cellvars := CodeInspectorHook.CellVars(f.CO)
+			for i, name := range cellvars {
+				if name.AsString() == keyStr {
+					if i < len(f.Cells) && f.Cells[i].IsCell() {
+						return true
+					}
+				}
+			}
+			freevars := CodeInspectorHook.FreeVars(f.CO)
+			for j, name := range freevars {
+				if name.AsString() == keyStr {
+					cellIdx := len(cellvars) + j
+					if cellIdx < len(f.Cells) && f.Cells[cellIdx].IsCell() {
+						return true
+					}
+				}
+			}
+		}
+		if f.ExtraLocals != nil {
+			if _, ok := f.ExtraLocals.Get(key); ok {
+				return true
+			}
+		}
+		return false
+	}
+
+	if f.SavedLocals != nil {
+		_, ok := f.SavedLocals.Get(key)
+		return ok
+	}
+	return false
+}
+
+func reprVal(v Value) string {
+	if v.IsAnyString() {
+		return strconv.Quote(v.AsString())
+	}
+	return v.String()
+}
+
+func localsProxyRepr(o Value) string {
+	entries := localsProxyCollectPairs(o.AsLocalsProxy())
+	var sb strings.Builder
+	sb.WriteByte('{')
+	for i, e := range entries {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteString(reprVal(e.Key))
+		sb.WriteString(": ")
+		sb.WriteString(reprVal(e.Value))
+	}
+	sb.WriteByte('}')
+	return sb.String()
+}
+
+func weakRefTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+	ref := callable.AsWeakRef()
+	if ref.IsDead {
+		return NoneVal()
+	}
+	hdr := ref.WP.Value()
+	if hdr == nil {
+		ref.IsDead = true
+		return NoneVal()
+	}
+	return ObjectVal(hdr)
+}
+
+func weakRefTpHash(o Value) int64 {
+	ref := o.AsWeakRef()
+	if ref.HasHash {
+		return ref.Hash
+	}
+	hdr := ref.WP.Value()
+	if hdr == nil {
+		panic("TypeError: cannot compute hash of dead weakref")
+	}
+	h := int64(HashValue(ObjectVal(hdr)))
+	ref.Hash = h
+	ref.HasHash = true
+	return h
+}
+
+func weakRefEqual(a, b Value) bool {
+	if a.ptr == nil || b.ptr == nil || a.ptr.Kind != KindWeakRef || b.ptr.Kind != KindWeakRef {
+		return false
+	}
+	refA := a.AsWeakRef()
+	refB := b.AsWeakRef()
+	hdrA := refA.WP.Value()
+	hdrB := refB.WP.Value()
+
+	if hdrA != nil && hdrB != nil {
+		return hdrA == hdrB
+	}
+	if hdrA == nil && hdrB == nil {
+		return refA.Callback == refB.Callback
+	}
+	return false
+}
+
+func weakRefTpGetAttr(ctx *ExecContext, obj, name Value) Value {
+	ref := obj.AsWeakRef()
+	if name.AsString() == "__callback__" {
+		return ref.Callback
+	}
+	panic("val: AttributeError: 'ReferenceType' object has no attribute '" + name.AsString() + "'")
+}
+
+func weakProxyGetTarget(ctx *ExecContext, obj Value) (Value, bool) {
+	p := obj.AsWeakProxy()
+	hdr := p.WP.Value()
+	if hdr == nil {
+		if ctx != nil {
+			ctx.Raise(NewException(ReferenceErrorType, "weakly-referenced object no longer exists"))
+		} else {
+			panic("ReferenceError: weakly-referenced object no longer exists")
+		}
+		return Value{}, false
+	}
+	return ObjectVal(hdr), true
+}
+
+func weakProxyTpGetAttr(ctx *ExecContext, obj, name Value) Value {
+	target, ok := weakProxyGetTarget(ctx, obj)
+	if !ok {
+		return NoneVal()
+	}
+	return GetAttrCtx(ctx, target, name)
+}
+
+func weakProxyTpSetAttr(ctx *ExecContext, obj, name, value Value) Value {
+	target, ok := weakProxyGetTarget(ctx, obj)
+	if !ok {
+		return NoneVal()
+	}
+	SetAttrCtx(ctx, target, name, value)
+	return NoneVal()
+}
+
+func weakProxyTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+	target, ok := weakProxyGetTarget(ctx, callable)
+	if !ok {
+		return NoneVal()
+	}
+	if ctx != nil && ctx.CallHook != nil {
+		base := ctx.SP
+		ctx.Stack[base] = target
+		copy(ctx.Stack[base+1:base+1+len(args)], args)
+		return ctx.CallHook(ctx, target, base+1, len(args), kwnames)
+	}
+	if tpCall := target.Type().Slots.TpCall; tpCall != nil {
+		return tpCall(ctx, target, args, kwnames)
+	}
+	panic("TypeError: '" + target.Type().Name + "' object is not callable")
+}
+
 func init() {
 	initTypes()
 }
@@ -1549,6 +2097,22 @@ func initTypes() {
 		if a.IsAnyString() {
 			return a
 		}
+		if ctx != nil && a.Type() != nil && a.Type() != StrType {
+			if strFn, _, ok := a.Type().LookupMRO(InternString("__str__")); ok {
+				res := ctx.Invoke1(strFn, a)
+				if res.IsAnyString() {
+					return res
+				}
+				return NewStringVal(res.String())
+			}
+			if reprFn, _, ok := a.Type().LookupMRO(InternString("__repr__")); ok {
+				res := ctx.Invoke1(reprFn, a)
+				if res.IsAnyString() {
+					return res
+				}
+				return NewStringVal(res.String())
+			}
+		}
 		return NewStringVal(a.String())
 	}
 
@@ -1613,6 +2177,118 @@ func initTypes() {
 
 	CodeType = MustNewType("code", []*PyType{ObjectType}, nil)
 	CodeType.Slots.TpCall = functionTpCall
+	CodeType.Slots.TpGetAttr = codeTpGetAttr
+
+	FrameType = MustNewType("frame", []*PyType{ObjectType}, nil)
+	FrameType.Slots.TpGetAttr = frameTpGetAttr
+
+	TracebackType = MustNewType("traceback", []*PyType{ObjectType}, nil)
+	TracebackType.Slots.TpGetAttr = tracebackTpGetAttr
+
+	LocalsProxyType = MustNewType("FrameLocalsProxy", []*PyType{ObjectType}, nil)
+	LocalsProxyType.Slots.MpSubscript = localsProxyMpSubscript
+	LocalsProxyType.Slots.MpAssSubscript = localsProxyMpAssSubscript
+	LocalsProxyType.Slots.SqLen = func(ctx *ExecContext, o Value) int64 {
+		return int64(len(localsProxyCollectPairs(o.AsLocalsProxy())))
+	}
+	LocalsProxyType.Slots.TpIter = func(ctx *ExecContext, o Value) Value {
+		entries := localsProxyCollectPairs(o.AsLocalsProxy())
+		keys := make([]Value, len(entries))
+		for i, e := range entries {
+			keys[i] = e.Key
+		}
+		return NewIterVal(NewListVal(keys...))
+	}
+	LocalsProxyType.Dict.Set(DunderContains, NewBuiltinFuncVal("__contains__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: descriptor '__contains__' of 'FrameLocalsProxy' object needs 2 arguments")
+		}
+		return BoolVal(localsProxyContains(ctx, args[0], args[1]))
+	}))
+	LocalsProxyType.Dict.Set(InternString("__str__"), NewBuiltinFuncVal("__str__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: descriptor '__str__' of 'FrameLocalsProxy' object needs an argument")
+		}
+		return NewStringVal(localsProxyRepr(args[0]))
+	}))
+	LocalsProxyType.Dict.Set(InternString("__repr__"), NewBuiltinFuncVal("__repr__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: descriptor '__repr__' of 'FrameLocalsProxy' object needs an argument")
+		}
+		return NewStringVal(localsProxyRepr(args[0]))
+	}))
+	LocalsProxyType.Dict.Set(InternString("keys"), NewBuiltinFuncVal("keys", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: keys() takes at least 1 argument")
+		}
+		entries := localsProxyCollectPairs(args[0].AsLocalsProxy())
+		keys := make([]Value, len(entries))
+		for i, e := range entries {
+			keys[i] = e.Key
+		}
+		return NewListVal(keys...)
+	}))
+	LocalsProxyType.Dict.Set(InternString("values"), NewBuiltinFuncVal("values", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: values() takes at least 1 argument")
+		}
+		entries := localsProxyCollectPairs(args[0].AsLocalsProxy())
+		vals := make([]Value, len(entries))
+		for i, e := range entries {
+			vals[i] = e.Value
+		}
+		return NewListVal(vals...)
+	}))
+	LocalsProxyType.Dict.Set(InternString("items"), NewBuiltinFuncVal("items", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: items() takes at least 1 argument")
+		}
+		entries := localsProxyCollectPairs(args[0].AsLocalsProxy())
+		items := make([]Value, len(entries))
+		for i, e := range entries {
+			items[i] = NewTupleVal(e.Key, e.Value)
+		}
+		return NewListVal(items...)
+	}))
+	LocalsProxyType.Dict.Set(InternString("get"), NewBuiltinFuncVal("get", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: get() takes at least 1 argument")
+		}
+		defVal := NoneVal()
+		if len(args) >= 3 {
+			defVal = args[2]
+		}
+		key := args[1]
+		if localsProxyContains(ctx, args[0], key) {
+			return localsProxyMpSubscript(ctx, args[0], key)
+		}
+		return defVal
+	}))
+
+	WeakRefType = MustNewType("ReferenceType", []*PyType{ObjectType}, nil)
+	WeakRefType.Slots.TpCall = weakRefTpCall
+	WeakRefType.Slots.TpGetAttr = weakRefTpGetAttr
+	WeakRefType.Dict.Set(DunderEq, NewBuiltinFuncVal("__eq__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			return BoolVal(false)
+		}
+		return BoolVal(weakRefEqual(args[0], args[1]))
+	}))
+	WeakRefType.Dict.Set(InternString("__hash__"), NewBuiltinFuncVal("__hash__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: descriptor '__hash__' of 'ReferenceType' object needs an argument")
+		}
+		return Int64Val(weakRefTpHash(args[0]))
+	}))
+
+	WeakProxyType = MustNewType("ProxyType", []*PyType{ObjectType}, nil)
+	WeakProxyType.Slots.TpGetAttr = weakProxyTpGetAttr
+	WeakProxyType.Slots.TpSetAttr = weakProxyTpSetAttr
+
+	CallableWeakProxyType = MustNewType("CallableProxyType", []*PyType{WeakProxyType}, nil)
+	CallableWeakProxyType.Slots.TpGetAttr = weakProxyTpGetAttr
+	CallableWeakProxyType.Slots.TpSetAttr = weakProxyTpSetAttr
+	CallableWeakProxyType.Slots.TpCall = weakProxyTpCall
 
 	FunctionType = MustNewType("function", []*PyType{ObjectType}, nil)
 	FunctionType.Slots.TpDescrGet = functionDescrGet
@@ -1866,6 +2542,25 @@ func initTypes() {
 		}
 		return NoneVal()
 	}))
+	BaseExceptionType.Dict.Set(InternString("__str__"), NewBuiltinFuncVal("__str__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			return NewStringVal("")
+		}
+		self := args[0]
+		if self.IsInstance() {
+			if argsVal, ok := self.AsInstance().GetAttr(InternString("args")); ok && argsVal.IsTuple() {
+				items := argsVal.AsTuple().Items
+				if len(items) == 1 {
+					return StrType.Slots.TpCall(ctx, TypeVal(StrType), []Value{items[0]}, nil)
+				}
+				if len(items) > 1 {
+					return StrType.Slots.TpCall(ctx, TypeVal(StrType), []Value{argsVal}, nil)
+				}
+			}
+		}
+		return NewStringVal("")
+	}))
+	BaseExceptionType.InvalidateVersion()
 	ExceptionType = MustNewType("Exception", []*PyType{BaseExceptionType}, nil)
 	TypeErrorType = MustNewType("TypeError", []*PyType{ExceptionType}, nil)
 	ValueErrorType = MustNewType("ValueError", []*PyType{ExceptionType}, nil)
@@ -1881,6 +2576,7 @@ func initTypes() {
 	ImportErrorType = MustNewType("ImportError", []*PyType{ExceptionType}, nil)
 	ModuleNotFoundErrorType = MustNewType("ModuleNotFoundError", []*PyType{ImportErrorType}, nil)
 	BufferErrorType = MustNewType("BufferError", []*PyType{ExceptionType}, nil)
+	ReferenceErrorType = MustNewType("ReferenceError", []*PyType{ExceptionType}, nil)
 	AssertionErrorType = MustNewType("AssertionError", []*PyType{ExceptionType}, nil)
 	BaseExceptionGroupType = MustNewType("BaseExceptionGroup", []*PyType{BaseExceptionType}, nil)
 	ExceptionGroupType = MustNewType("ExceptionGroup", []*PyType{BaseExceptionGroupType, ExceptionType}, nil)
@@ -2210,6 +2906,11 @@ func initTypes() {
 	builtinTypes[KindClassMethod] = ClassMethodType
 	builtinTypes[KindStaticMethod] = StaticMethodType
 	builtinTypes[KindNotImplemented] = NotImplementedType
+	builtinTypes[KindFrame] = FrameType
+	builtinTypes[KindLocalsProxy] = LocalsProxyType
+	builtinTypes[KindTraceback] = TracebackType
+	builtinTypes[KindWeakRef] = WeakRefType
+	builtinTypes[KindWeakProxy] = WeakProxyType
 
 	tagNone.Type = NoneType
 	tagBool.Type = BoolType
