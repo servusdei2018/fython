@@ -50,6 +50,11 @@ const (
 	TOKEN_FROM
 	TOKEN_ASYNC
 	TOKEN_AWAIT
+	TOKEN_MATCH
+	TOKEN_CASE
+	TOKEN_TYPE
+	TOKEN_ASSERT
+	TOKEN_DEL
 
 	// Delimiters
 	TOKEN_LPAREN   // (
@@ -62,8 +67,10 @@ const (
 	TOKEN_COMMA    // ,
 	TOKEN_DOT      // .
 	TOKEN_SEMI     // ;
+	TOKEN_ELLIPSIS // ...
+	TOKEN_ARROW    // ->
 
-	// Operators
+	// Arithmetic, Comparison & Augmented Assignment Operators
 	TOKEN_ASSIGN       // =
 	TOKEN_PLUS         // +
 	TOKEN_MINUS        // -
@@ -85,6 +92,29 @@ const (
 	TOKEN_SLASHSLASHEQ // //=
 	TOKEN_PERCENTEQ    // %=
 	TOKEN_STARSTAREQ   // **=
+
+	// Matrix & Assignment Expressions
+	TOKEN_WALRUS // :=
+	TOKEN_AT     // @
+	TOKEN_ATEQ   // @=
+
+	// Bitwise & Shift Operators
+	TOKEN_AMP      // &
+	TOKEN_AMPEQ    // &=
+	TOKEN_PIPE     // |
+	TOKEN_PIPEEQ   // |=
+	TOKEN_CARET    // ^
+	TOKEN_CARETEQ  // ^=
+	TOKEN_TILDE    // ~
+	TOKEN_LSHIFT   // <<
+	TOKEN_LSHIFTEQ // <<=
+	TOKEN_RSHIFT   // >>
+	TOKEN_RSHIFTEQ // >>=
+
+	// Formatted String Literals
+	TOKEN_FSTRING_START
+	TOKEN_FSTRING_MIDDLE
+	TOKEN_FSTRING_END
 )
 
 // String returns a human-readable representation of the token type.
@@ -236,6 +266,54 @@ func (t TokenType) String() string {
 		return "%="
 	case TOKEN_STARSTAREQ:
 		return "**="
+	case TOKEN_MATCH:
+		return "match"
+	case TOKEN_CASE:
+		return "case"
+	case TOKEN_TYPE:
+		return "type"
+	case TOKEN_ASSERT:
+		return "assert"
+	case TOKEN_DEL:
+		return "del"
+	case TOKEN_ELLIPSIS:
+		return "..."
+	case TOKEN_ARROW:
+		return "->"
+	case TOKEN_WALRUS:
+		return ":="
+	case TOKEN_AT:
+		return "@"
+	case TOKEN_ATEQ:
+		return "@="
+	case TOKEN_AMP:
+		return "&"
+	case TOKEN_AMPEQ:
+		return "&="
+	case TOKEN_PIPE:
+		return "|"
+	case TOKEN_PIPEEQ:
+		return "|="
+	case TOKEN_CARET:
+		return "^"
+	case TOKEN_CARETEQ:
+		return "^="
+	case TOKEN_TILDE:
+		return "~"
+	case TOKEN_LSHIFT:
+		return "<<"
+	case TOKEN_LSHIFTEQ:
+		return "<<="
+	case TOKEN_RSHIFT:
+		return ">>"
+	case TOKEN_RSHIFTEQ:
+		return ">>="
+	case TOKEN_FSTRING_START:
+		return "FSTRING_START"
+	case TOKEN_FSTRING_MIDDLE:
+		return "FSTRING_MIDDLE"
+	case TOKEN_FSTRING_END:
+		return "FSTRING_END"
 	default:
 		return "UNKNOWN"
 	}

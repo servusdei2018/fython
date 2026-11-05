@@ -17,33 +17,35 @@ const (
 	KindBool
 	KindInt64
 	KindFloat64
-	KindInlineStr   // Strings <= 7 bytes packed into Value.num
-	KindBigInt      // Heap-allocated math/big.Int wrapper
-	KindString      // Heap-allocated string > 7 bytes
-	KindList        // Heap-allocated dynamic array of Value
-	KindDict        // Heap-allocated hash table
-	KindCode        // Heap-allocated VM bytecode object
-	KindInstance    // Heap-allocated Python object instance (Shape + flat Slots)
-	KindType        // Heap-allocated Python type / class object (*PyType)
-	KindFunction    // Heap-allocated Python bytecode function (*PyFunction)
-	KindBuiltinFunc // Heap-allocated native Go function (*PyBuiltinFunc)
-	KindBoundMethod // Heap-allocated bound method (*PyBoundMethod)
-	KindProperty    // Heap-allocated @property data descriptor (*PyProperty)
-	KindSuper       // Heap-allocated super() proxy object (*PySuper)
-	KindTuple       // Heap-allocated immutable tuple (*PyTuple)
-	KindCell        // Heap-allocated closure Cell (*PyCell)
-	KindIter        // Heap-allocated sequence/generator iterator (*PyIter)
-	KindGenerator   // Heap-allocated detached generator frame (*PyGenerator)
-	KindRange       // Unboxed range(start, stop) packed in Value.num
-	KindChan        // Heap-allocated Go channel wrapper (*PyChan)
-	KindModule      // Heap-allocated Python module (*PyModule)
-	KindBytes       // Heap-allocated immutable bytes (*PyBytes)
-	KindByteArray   // Heap-allocated mutable bytearray (*PyByteArray)
-	KindMemoryView  // Heap-allocated buffer memoryview (*PyMemoryView)
-	KindSlice       // Heap-allocated slice object (*PySlice)
-	KindCoroutine   // Heap-allocated detached coroutine frame (*PyCoroutine)
-	KindFuture      // Heap-allocated async Future (*PyFuture)
-	KindTask        // Heap-allocated async Task (*PyTask)
+	KindInlineStr      // Strings <= 7 bytes packed into Value.num
+	KindBigInt         // Heap-allocated math/big.Int wrapper
+	KindString         // Heap-allocated string > 7 bytes
+	KindList           // Heap-allocated dynamic array of Value
+	KindDict           // Heap-allocated hash table
+	KindCode           // Heap-allocated VM bytecode object
+	KindInstance       // Heap-allocated Python object instance (Shape + flat Slots)
+	KindType           // Heap-allocated Python type / class object (*PyType)
+	KindFunction       // Heap-allocated Python bytecode function (*PyFunction)
+	KindBuiltinFunc    // Heap-allocated native Go function (*PyBuiltinFunc)
+	KindBoundMethod    // Heap-allocated bound method (*PyBoundMethod)
+	KindProperty       // Heap-allocated @property data descriptor (*PyProperty)
+	KindSuper          // Heap-allocated super() proxy object (*PySuper)
+	KindTuple          // Heap-allocated immutable tuple (*PyTuple)
+	KindCell           // Heap-allocated closure Cell (*PyCell)
+	KindIter           // Heap-allocated sequence/generator iterator (*PyIter)
+	KindGenerator      // Heap-allocated detached generator frame (*PyGenerator)
+	KindRange          // Unboxed range(start, stop) packed in Value.num
+	KindChan           // Heap-allocated Go channel wrapper (*PyChan)
+	KindModule         // Heap-allocated Python module (*PyModule)
+	KindBytes          // Heap-allocated immutable bytes (*PyBytes)
+	KindByteArray      // Heap-allocated mutable bytearray (*PyByteArray)
+	KindMemoryView     // Heap-allocated buffer memoryview (*PyMemoryView)
+	KindSlice          // Heap-allocated slice object (*PySlice)
+	KindCoroutine      // Heap-allocated detached coroutine frame (*PyCoroutine)
+	KindFuture         // Heap-allocated async Future (*PyFuture)
+	KindTask           // Heap-allocated async Task (*PyTask)
+	KindSet            // Heap-allocated set (*PySet)
+	KindExceptionGroup // Heap-allocated exception group (*PyExceptionGroup)
 )
 
 // ObjectHeader Flags bitmask constants.
@@ -119,6 +121,10 @@ func (k Kind) String() string {
 		return "Future"
 	case KindTask:
 		return "Task"
+	case KindSet:
+		return "set"
+	case KindExceptionGroup:
+		return "ExceptionGroup"
 	default:
 		return "unknown"
 	}
@@ -396,6 +402,26 @@ func (v Value) AsSlice() *PySlice {
 	return (*PySlice)(unsafe.Pointer(v.ptr))
 }
 
+// IsSet reports whether v is a heap-allocated PySet.
+func (v Value) IsSet() bool {
+	return v.ptr != nil && v.ptr.Kind == KindSet
+}
+
+// AsSet performs an offset-0 downcast from Value to *PySet.
+func (v Value) AsSet() *PySet {
+	return (*PySet)(unsafe.Pointer(v.ptr))
+}
+
+// IsExceptionGroup reports whether v is a heap-allocated PyExceptionGroup.
+func (v Value) IsExceptionGroup() bool {
+	return v.ptr != nil && v.ptr.Kind == KindExceptionGroup
+}
+
+// AsExceptionGroup performs an offset-0 downcast from Value to *PyExceptionGroup.
+func (v Value) AsExceptionGroup() *PyExceptionGroup {
+	return (*PyExceptionGroup)(unsafe.Pointer(v.ptr))
+}
+
 // IsRange reports whether v is an unboxed range Value.
 func (v Value) IsRange() bool {
 	return v.ptr == &tagRange
@@ -470,6 +496,8 @@ func (v Value) IsTruthy() bool {
 		return len(v.AsList().Items) > 0
 	case KindDict:
 		return v.AsDict().Len() > 0
+	case KindSet:
+		return v.AsSet().Len() > 0
 	case KindTuple:
 		return len(v.AsTuple().Items) > 0
 	case KindBytes:
@@ -702,6 +730,26 @@ func (v Value) String() string {
 		}
 		sb.WriteString("}")
 		return sb.String()
+	case KindSet:
+		s := v.AsSet()
+		if s == nil || s.Len() == 0 {
+			return "set()"
+		}
+		var sb strings.Builder
+		sb.WriteString("{")
+		first := true
+		for item := range s.Entries {
+			if !first {
+				sb.WriteString(", ")
+			}
+			first = false
+			sb.WriteString(item.String())
+		}
+		sb.WriteString("}")
+		return sb.String()
+	case KindExceptionGroup:
+		eg := v.AsExceptionGroup()
+		return fmt.Sprintf("ExceptionGroup(%q, %v)", eg.Message, eg.Exceptions)
 	case KindType:
 		return "<class '" + v.AsType().Name + "'>"
 	case KindFunction:

@@ -239,7 +239,22 @@ func (inst *PyInstance) GetAttr(name Value) (Value, bool) {
 	}
 	val := inst.Slots[idx]
 	inst.mu.RUnlock()
+	if val.IsUnbound() {
+		return NoneVal(), false
+	}
 	return val, true
+}
+
+// DeleteAttr removes an attribute from the instance by marking its slot unbound.
+func (inst *PyInstance) DeleteAttr(name Value) bool {
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+	idx, ok := inst.Shape.Lookup(name)
+	if !ok || idx >= len(inst.Slots) || inst.Slots[idx].IsUnbound() {
+		return false
+	}
+	inst.Slots[idx] = UnboundVal()
+	return true
 }
 
 // SetAttr sets or adds an attribute on the instance, transitioning its Shape if the attribute is new in a thread-safe manner.

@@ -3,6 +3,8 @@ package val
 import (
 	"errors"
 	"math/big"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -1406,4 +1408,338 @@ func (d *PyDict) Values() []Value {
 		}
 	}
 	return vals
+}
+
+// PySet represents a heap-allocated Python set.
+type PySet struct {
+	Header  ObjectHeader
+	mu      sync.RWMutex
+	Entries map[Value]struct{}
+}
+
+// NewSetVal constructs a new PySet Value.
+func NewSetVal(items ...Value) Value {
+	s := &PySet{
+		Header: ObjectHeader{
+			Kind: KindSet,
+			Type: SetType,
+		},
+		Entries: make(map[Value]struct{}, len(items)),
+	}
+	for _, item := range items {
+		s.Entries[item] = struct{}{}
+	}
+	return Value{ptr: &s.Header}
+}
+
+// Add adds an element to the set.
+func (s *PySet) Add(v Value) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Entries == nil {
+		s.Entries = make(map[Value]struct{})
+	}
+	s.Entries[v] = struct{}{}
+}
+
+// Contains reports whether v is an element of the set.
+func (s *PySet) Contains(v Value) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.Entries == nil {
+		return false
+	}
+	_, ok := s.Entries[v]
+	return ok
+}
+
+// Len returns the count of elements in the set.
+func (s *PySet) Len() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.Entries)
+}
+
+// Items returns a slice of all elements in the set.
+func (s *PySet) Items() []Value {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	res := make([]Value, 0, len(s.Entries))
+	for k := range s.Entries {
+		res = append(res, k)
+	}
+	return res
+}
+
+// Union returns a new set containing all elements from both s and other.
+func (s *PySet) Union(other *PySet) Value {
+	res := NewSetVal().AsSet()
+	for _, it := range s.Items() {
+		res.Add(it)
+	}
+	if other != nil {
+		for _, it := range other.Items() {
+			res.Add(it)
+		}
+	}
+	return Value{ptr: &res.Header}
+}
+
+// Intersection returns a new set containing elements present in both s and other.
+func (s *PySet) Intersection(other *PySet) Value {
+	res := NewSetVal().AsSet()
+	if other != nil {
+		for _, it := range s.Items() {
+			if other.Contains(it) {
+				res.Add(it)
+			}
+		}
+	}
+	return Value{ptr: &res.Header}
+}
+
+// SymmetricDifference returns a new set with elements in either s or other, but not both.
+func (s *PySet) SymmetricDifference(other *PySet) Value {
+	res := NewSetVal().AsSet()
+	for _, it := range s.Items() {
+		if other == nil || !other.Contains(it) {
+			res.Add(it)
+		}
+	}
+	if other != nil {
+		for _, it := range other.Items() {
+			if !s.Contains(it) {
+				res.Add(it)
+			}
+		}
+	}
+	return Value{ptr: &res.Header}
+}
+
+// PyExceptionGroup represents a PEP 654 ExceptionGroup / BaseExceptionGroup.
+type PyExceptionGroup struct {
+	Header     ObjectHeader
+	Message    string
+	Exceptions []Value
+}
+
+// NewExceptionGroupVal constructs a new PyExceptionGroup Value.
+func NewExceptionGroupVal(cls *PyType, msg string, excs []Value) Value {
+	if cls == nil {
+		cls = ExceptionGroupType
+	}
+	eg := &PyExceptionGroup{
+		Header: ObjectHeader{
+			Kind: KindExceptionGroup,
+			Type: cls,
+		},
+		Message:    msg,
+		Exceptions: excs,
+	}
+	return Value{ptr: &eg.Header}
+}
+
+// Split partitions the exception group according to matching condition against targetType.
+// Returns (matchingGroup, restGroup).
+func (eg *PyExceptionGroup) Split(targetType *PyType) (Value, Value) {
+	var matches []Value
+	var rest []Value
+	for _, exc := range eg.Exceptions {
+		matched := false
+		if exc.IsType() {
+			matched = IsSubclass(exc.AsType(), targetType)
+		} else if exc.ptr != nil && exc.Type() != nil {
+			matched = IsSubclass(exc.Type(), targetType)
+		}
+		if matched {
+			matches = append(matches, exc)
+		} else {
+			rest = append(rest, exc)
+		}
+	}
+	var matchVal Value
+	if len(matches) > 0 {
+		matchVal = NewExceptionGroupVal(eg.Header.Type, eg.Message, matches)
+	} else {
+		matchVal = NoneVal()
+	}
+	var restVal Value
+	if len(rest) > 0 {
+		restVal = NewExceptionGroupVal(eg.Header.Type, eg.Message, rest)
+	} else {
+		restVal = NoneVal()
+	}
+	return matchVal, restVal
+}
+
+// PyTypeVar represents a PEP 695 TypeVar.
+type PyTypeVar struct {
+	Header ObjectHeader
+	Name   string
+	Bound  Value
+}
+
+func NewTypeVarVal(name string, bound Value) Value {
+	tv := &PyTypeVar{
+		Header: ObjectHeader{
+			Kind: KindInstance,
+			Type: TypeVarType,
+		},
+		Name:  name,
+		Bound: bound,
+	}
+	return Value{ptr: &tv.Header}
+}
+
+// PyTypeVarTuple represents a PEP 695 TypeVarTuple.
+type PyTypeVarTuple struct {
+	Header ObjectHeader
+	Name   string
+}
+
+func NewTypeVarTupleVal(name string) Value {
+	tvt := &PyTypeVarTuple{
+		Header: ObjectHeader{
+			Kind: KindInstance,
+			Type: TypeVarTupleType,
+		},
+		Name: name,
+	}
+	return Value{ptr: &tvt.Header}
+}
+
+// PyParamSpec represents a PEP 695 ParamSpec.
+type PyParamSpec struct {
+	Header ObjectHeader
+	Name   string
+}
+
+func NewParamSpecVal(name string) Value {
+	ps := &PyParamSpec{
+		Header: ObjectHeader{
+			Kind: KindInstance,
+			Type: ParamSpecType,
+		},
+		Name: name,
+	}
+	return Value{ptr: &ps.Header}
+}
+
+// PyTypeAliasType represents a PEP 695 TypeAliasType.
+type PyTypeAliasType struct {
+	Header     ObjectHeader
+	Name       string
+	Value      Value
+	TypeParams []Value
+}
+
+func NewTypeAliasTypeVal(name string, val Value, typeParams []Value) Value {
+	tat := &PyTypeAliasType{
+		Header: ObjectHeader{
+			Kind: KindInstance,
+			Type: TypeAliasTypeType,
+		},
+		Name:       name,
+		Value:      val,
+		TypeParams: typeParams,
+	}
+	return Value{ptr: &tat.Header}
+}
+
+// FormatValue formats a Value according to format specifier spec and optional conversion ('s', 'r', 'a').
+// Zero-allocation fast path for Int64, Float64, and strings.
+func FormatValue(v Value, spec string, conversion uint8) Value {
+	if conversion == 's' || conversion == 'r' || conversion == 'a' {
+		v = NewStringVal(v.String())
+	}
+	if spec == "" {
+		if v.IsAnyString() {
+			return v
+		}
+		if v.IsInt64() {
+			n := v.AsInt64()
+			if n >= 0 && n < 10 {
+				return NewStringVal(string(byte('0' + n)))
+			}
+			return NewStringVal(strconv.FormatInt(n, 10))
+		}
+		if v.IsFloat64() {
+			return NewStringVal(strconv.FormatFloat(v.AsFloat64(), 'g', -1, 64))
+		}
+		if v.IsBool() {
+			if v.IsTruthy() {
+				return NewStringVal("True")
+			}
+			return NewStringVal("False")
+		}
+		if v.IsNone() {
+			return NewStringVal("None")
+		}
+		return NewStringVal(v.String())
+	}
+
+	// Fast path for ints with common formats like %d, x, X, b, o, padding
+	if v.IsInt64() {
+		n := v.AsInt64()
+		switch spec {
+		case "d":
+			return NewStringVal(strconv.FormatInt(n, 10))
+		case "x":
+			return NewStringVal(strconv.FormatInt(n, 16))
+		case "X":
+			return NewStringVal(strings.ToUpper(strconv.FormatInt(n, 16)))
+		case "b":
+			return NewStringVal(strconv.FormatInt(n, 2))
+		case "o":
+			return NewStringVal(strconv.FormatInt(n, 8))
+		}
+		if strings.HasPrefix(spec, "0") {
+			if width, err := strconv.Atoi(strings.TrimRight(spec[1:], "d")); err == nil {
+				s := strconv.FormatInt(n, 10)
+				if len(s) < width {
+					s = strings.Repeat("0", width-len(s)) + s
+				}
+				return NewStringVal(s)
+			}
+		}
+		if width, err := strconv.Atoi(strings.TrimRight(spec, "d")); err == nil {
+			s := strconv.FormatInt(n, 10)
+			if len(s) < width {
+				s = strings.Repeat(" ", width-len(s)) + s
+			}
+			return NewStringVal(s)
+		}
+	}
+
+	// Fast path for floats e.g. .2f
+	if v.IsFloat64() {
+		f := v.AsFloat64()
+		if strings.HasPrefix(spec, ".") && strings.HasSuffix(spec, "f") {
+			if prec, err := strconv.Atoi(spec[1 : len(spec)-1]); err == nil {
+				return NewStringVal(strconv.FormatFloat(f, 'f', prec, 64))
+			}
+		}
+	}
+
+	// String padding e.g. >10, <10, ^10
+	if v.IsAnyString() {
+		s := v.AsString()
+		if len(spec) > 1 && (spec[0] == '>' || spec[0] == '<' || spec[0] == '^') {
+			if width, err := strconv.Atoi(spec[1:]); err == nil && width > len(s) {
+				pad := width - len(s)
+				switch spec[0] {
+				case '>':
+					return NewStringVal(strings.Repeat(" ", pad) + s)
+				case '<':
+					return NewStringVal(s + strings.Repeat(" ", pad))
+				case '^':
+					left := pad / 2
+					right := pad - left
+					return NewStringVal(strings.Repeat(" ", left) + s + strings.Repeat(" ", right))
+				}
+			}
+		}
+	}
+
+	return NewStringVal(v.String())
 }

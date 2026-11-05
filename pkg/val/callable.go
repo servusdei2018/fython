@@ -35,6 +35,7 @@ type PyFunction struct {
 	KwDefaults *PyDict
 	Closure    []Value
 	Globals    *PyDict
+	Dict       *PyDict
 }
 
 // MethodPICEntry represents a single slot in a 4-way Polymorphic Inline Cache for method calls.
@@ -254,6 +255,57 @@ func functionTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Va
 		return ctx.CallHook(ctx, callable, base, len(args), kwnames)
 	}
 	panic("val: cannot call Python bytecode function without active VM ExecContext")
+}
+
+func functionTpGetAttr(ctx *ExecContext, obj, name Value) Value {
+	fn := obj.AsFunction()
+	nameStr := name.AsString()
+	if nameStr == "__name__" {
+		return InternString(fn.Name)
+	}
+	if nameStr == "__annotations__" {
+		if fn.Dict != nil {
+			if ann, ok := fn.Dict.Get(name); ok {
+				return ann
+			}
+		}
+		// Lazy PEP 649 deferred annotation evaluation
+		if fn.Dict != nil {
+			if annotateFn, ok := fn.Dict.Get(InternString("__annotate__")); ok {
+				var annDict Value
+				if ctx != nil && ctx.CallHook != nil {
+					base := ctx.SP
+					ctx.Stack[base] = Int64Val(1) // format 1 = inspect.VALUE
+					annDict = ctx.CallHook(ctx, annotateFn, base, 1, nil)
+				}
+				if annDict.IsDict() {
+					fn.Dict.Set(name, annDict)
+					return annDict
+				}
+			}
+		}
+		emptyDict := NewDictVal(4)
+		if fn.Dict == nil {
+			fn.Dict = NewDictVal(4).AsDict()
+		}
+		fn.Dict.Set(name, emptyDict)
+		return emptyDict
+	}
+	if fn.Dict != nil {
+		if v, ok := fn.Dict.Get(name); ok {
+			return v
+		}
+	}
+	panic("val: AttributeError: 'function' object has no attribute '" + nameStr + "'")
+}
+
+func functionTpSetAttr(ctx *ExecContext, obj, name, value Value) Value {
+	fn := obj.AsFunction()
+	if fn.Dict == nil {
+		fn.Dict = NewDictVal(4).AsDict()
+	}
+	fn.Dict.Set(InternValue(name), value)
+	return NoneVal()
 }
 
 func builtinFuncTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
@@ -1009,6 +1061,19 @@ func sliceTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value
 	panic("TypeError: slice() takes at least 1 argument")
 }
 
+func typeMpSubscript(ctx *ExecContext, a, b Value) Value {
+	clsName := a.Type().Name
+	if a.IsType() {
+		clsName = a.AsType().Name
+	}
+	argName := b.Type().Name
+	if b.IsType() {
+		argName = b.AsType().Name
+	}
+	t := MustNewType(clsName+"["+argName+"]", []*PyType{ObjectType}, nil)
+	return TypeVal(t)
+}
+
 func init() {
 	initTypes()
 }
@@ -1062,6 +1127,7 @@ func initTypes() {
 	TypeType.Slots.TpGetAttr = typeGetAttr
 	TypeType.Slots.TpSetAttr = typeSetAttr
 	TypeType.Slots.TpCall = typeTpCall
+	TypeType.Slots.MpSubscript = typeMpSubscript
 
 	// 3. Construct built-in primitive and heap object types.
 	NoneType = MustNewType("NoneType", []*PyType{ObjectType}, nil)
@@ -1203,6 +1269,8 @@ func initTypes() {
 	FunctionType = MustNewType("function", []*PyType{ObjectType}, nil)
 	FunctionType.Slots.TpDescrGet = functionDescrGet
 	FunctionType.Slots.TpCall = functionTpCall
+	FunctionType.Slots.TpGetAttr = functionTpGetAttr
+	FunctionType.Slots.TpSetAttr = functionTpSetAttr
 
 	BuiltinFuncType = MustNewType("builtin_function_or_method", []*PyType{ObjectType}, nil)
 	BuiltinFuncType.Slots.TpDescrGet = functionDescrGet
@@ -1451,6 +1519,94 @@ func initTypes() {
 	ImportErrorType = MustNewType("ImportError", []*PyType{ExceptionType}, nil)
 	ModuleNotFoundErrorType = MustNewType("ModuleNotFoundError", []*PyType{ImportErrorType}, nil)
 	BufferErrorType = MustNewType("BufferError", []*PyType{ExceptionType}, nil)
+	AssertionErrorType = MustNewType("AssertionError", []*PyType{ExceptionType}, nil)
+	BaseExceptionGroupType = MustNewType("BaseExceptionGroup", []*PyType{BaseExceptionType}, nil)
+	ExceptionGroupType = MustNewType("ExceptionGroup", []*PyType{BaseExceptionGroupType, ExceptionType}, nil)
+	egCall := func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		cls := ExceptionGroupType
+		if callable.IsType() {
+			cls = callable.AsType()
+		}
+		msg := ""
+		if len(args) > 0 {
+			msg = args[0].AsString()
+		}
+		var excs []Value
+		if len(args) > 1 {
+			if args[1].IsList() {
+				excs = append(excs, args[1].AsList().Items...)
+			} else if args[1].IsTuple() {
+				excs = append(excs, args[1].AsTuple().Items...)
+			}
+		}
+		return NewExceptionGroupVal(cls, msg, excs)
+	}
+	BaseExceptionGroupType.Slots.TpCall = egCall
+	ExceptionGroupType.Slots.TpCall = egCall
+
+	// Set Type
+	SetType = MustNewType("set", []*PyType{ObjectType}, nil)
+	SetType.Slots.SqLen = func(ctx *ExecContext, o Value) int64 {
+		if o.IsSet() {
+			return int64(o.AsSet().Len())
+		}
+		return 0
+	}
+	SetType.Dict.Set(InternString("add"), NewBuiltinFuncVal("add", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: add() takes exactly 1 argument")
+		}
+		if args[0].IsSet() {
+			args[0].AsSet().Add(args[1])
+		}
+		return NoneVal()
+	}))
+
+	// PEP 695 Type Parameter types
+	TypeVarType = MustNewType("TypeVar", []*PyType{ObjectType}, nil)
+	TypeVarType.Slots.TpCall = func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		name := ""
+		bound := NoneVal()
+		if len(args) > 0 {
+			name = args[0].AsString()
+		}
+		if len(args) > 1 {
+			bound = args[1]
+		}
+		return NewTypeVarVal(name, bound)
+	}
+	TypeVarTupleType = MustNewType("TypeVarTuple", []*PyType{ObjectType}, nil)
+	TypeVarTupleType.Slots.TpCall = func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		name := ""
+		if len(args) > 0 {
+			name = args[0].AsString()
+		}
+		return NewTypeVarTupleVal(name)
+	}
+	ParamSpecType = MustNewType("ParamSpec", []*PyType{ObjectType}, nil)
+	ParamSpecType.Slots.TpCall = func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		name := ""
+		if len(args) > 0 {
+			name = args[0].AsString()
+		}
+		return NewParamSpecVal(name)
+	}
+	TypeAliasTypeType = MustNewType("TypeAliasType", []*PyType{ObjectType}, nil)
+	TypeAliasTypeType.Slots.TpCall = func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		name := ""
+		var targetVal Value
+		var typeParams []Value
+		if len(args) > 0 {
+			name = args[0].AsString()
+		}
+		if len(args) > 1 {
+			targetVal = args[1]
+		}
+		if len(args) > 2 && args[2].IsTuple() {
+			typeParams = args[2].AsTuple().Items
+		}
+		return NewTypeAliasTypeVal(name, targetVal, typeParams)
+	}
 
 	// Binary Types and Slice Type
 	BytesType = MustNewType("bytes", []*PyType{ObjectType}, nil)

@@ -132,6 +132,13 @@ func (st *SymbolTable) visitStmt(stmtID StmtID) error {
 		fnDef := &st.arena.FuncDefs[stmt.Extra]
 		st.cur.Bound[fnDef.Name] = true
 
+		// Evaluate decorators in enclosing scope
+		for _, dec := range st.arena.GetExprSlice(fnDef.Decorators) {
+			if err := st.visitExpr(dec); err != nil {
+				return err
+			}
+		}
+
 		// Evaluate defaults in enclosing scope
 		for _, defExpr := range st.arena.GetExprSlice(fnDef.Defaults) {
 			if err := st.visitExpr(defExpr); err != nil {
@@ -145,6 +152,15 @@ func (st *SymbolTable) visitStmt(stmtID StmtID) error {
 			fnScope.IsCoroutine = true
 		}
 		st.Scopes = append(st.Scopes, fnScope)
+
+		// Type parameters
+		for _, tp := range st.arena.GetTypeParamSlice(fnDef.TypeParams) {
+			fnScope.Bound[tp.Name] = true
+			if tp.Bound != ExprNone {
+				_ = st.visitExpr(tp.Bound)
+			}
+		}
+
 		params := st.arena.GetIdentSlice(fnDef.ParamNames)
 		fnScope.ParamNames = append(fnScope.ParamNames, params...)
 		for _, p := range params {
@@ -153,8 +169,6 @@ func (st *SymbolTable) visitStmt(stmtID StmtID) error {
 
 		saved := st.cur
 		st.cur = fnScope
-		bodyStmts := st.arena.GetStmtSlice(fnDef.Body.Start) // Body.Start in StmtSlice
-		_ = bodyStmts
 		for _, sID := range st.arena.StmtIDs[fnDef.Body.Start : fnDef.Body.Start+fnDef.Body.Count] {
 			if err := st.visitStmt(sID); err != nil {
 				return err
@@ -166,9 +180,21 @@ func (st *SymbolTable) visitStmt(stmtID StmtID) error {
 		clsDef := &st.arena.ClassDefs[stmt.Extra]
 		st.cur.Bound[clsDef.Name] = true
 
-		// Evaluate bases in enclosing scope
+		// Evaluate decorators in enclosing scope
+		for _, dec := range st.arena.GetExprSlice(clsDef.Decorators) {
+			if err := st.visitExpr(dec); err != nil {
+				return err
+			}
+		}
+
+		// Evaluate bases and keywords in enclosing scope
 		for _, bExpr := range st.arena.GetExprSlice(clsDef.Bases) {
 			if err := st.visitExpr(bExpr); err != nil {
+				return err
+			}
+		}
+		for _, kwExpr := range st.arena.GetExprSlice(clsDef.Keywords) {
+			if err := st.visitExpr(kwExpr); err != nil {
 				return err
 			}
 		}
@@ -176,6 +202,14 @@ func (st *SymbolTable) visitStmt(stmtID StmtID) error {
 		// Class scope
 		clsScope := NewScope(ScopeClass, clsDef.Name, st.cur)
 		st.Scopes = append(st.Scopes, clsScope)
+
+		// Type parameters
+		for _, tp := range st.arena.GetTypeParamSlice(clsDef.TypeParams) {
+			clsScope.Bound[tp.Name] = true
+			if tp.Bound != ExprNone {
+				_ = st.visitExpr(tp.Bound)
+			}
+		}
 
 		saved := st.cur
 		st.cur = clsScope
@@ -204,7 +238,16 @@ func (st *SymbolTable) visitStmt(stmtID StmtID) error {
 		if err := st.visitExpr(stmt.Expr2); err != nil {
 			return err
 		}
-		st.bindTarget(stmt.Expr1)
+		count := stmt.Extra >> 16
+		if count > 1 {
+			start := stmt.Extra & 0xFFFF
+			targets := st.arena.ExprIDs[start : start+count]
+			for _, t := range targets {
+				st.bindTarget(t)
+			}
+		} else {
+			st.bindTarget(stmt.Expr1)
+		}
 
 	case StmtKindAugAssign:
 		if err := st.visitExpr(stmt.Expr2); err != nil {
@@ -376,9 +419,151 @@ func (st *SymbolTable) visitStmt(stmtID StmtID) error {
 				st.cur.Bound[target] = true
 			}
 		}
+
+	case StmtKindMatch:
+		matchStmt := &st.arena.MatchStmts[stmt.Extra]
+		if err := st.visitExpr(matchStmt.Subject); err != nil {
+			return err
+		}
+		for _, matchCase := range st.arena.GetMatchCaseSlice(matchStmt.Cases) {
+			if err := st.bindAndVisitPattern(matchCase.Pattern); err != nil {
+				return err
+			}
+			if matchCase.Guard != ExprNone {
+				if err := st.visitExpr(matchCase.Guard); err != nil {
+					return err
+				}
+			}
+			for _, sID := range st.arena.GetStmtSliceDirect(matchCase.Body) {
+				if err := st.visitStmt(sID); err != nil {
+					return err
+				}
+			}
+		}
+
+	case StmtKindTypeAlias:
+		alias := &st.arena.TypeAliases[stmt.Extra]
+		st.cur.Bound[alias.Name] = true
+		for _, tp := range st.arena.GetTypeParamSlice(alias.TypeParams) {
+			st.cur.Bound[tp.Name] = true
+			if tp.Bound != ExprNone {
+				_ = st.visitExpr(tp.Bound)
+			}
+		}
+		if err := st.visitExpr(alias.Value); err != nil {
+			return err
+		}
+
+	case StmtKindAssert:
+		if err := st.visitExpr(stmt.Expr1); err != nil {
+			return err
+		}
+		if stmt.Expr2 != ExprNone {
+			return st.visitExpr(stmt.Expr2)
+		}
+
+	case StmtKindDelete:
+		st.visitDelete(stmt.Expr1)
 	}
 
 	return nil
+}
+
+func (st *SymbolTable) bindAndVisitPattern(patID PatternID) error {
+	pat := st.arena.GetPattern(patID)
+	if pat == nil {
+		return nil
+	}
+	switch pat.Kind {
+	case PatternKindValue:
+		if pat.Expr1 != ExprNone {
+			return st.visitExpr(pat.Expr1)
+		}
+	case PatternKindSingleton:
+		if pat.Expr1 != ExprNone {
+			return st.visitExpr(pat.Expr1)
+		}
+	case PatternKindCapture:
+		if pat.Name != "" && pat.Name != "_" {
+			st.cur.Bound[pat.Name] = true
+		}
+	case PatternKindWildcard:
+		// _ does not bind
+	case PatternKindAs:
+		if pat.Expr1 != ExprNone {
+			if err := st.bindAndVisitPattern(PatternID(pat.Expr1)); err != nil {
+				return err
+			}
+		}
+		if pat.Name != "" && pat.Name != "_" {
+			st.cur.Bound[pat.Name] = true
+		}
+	case PatternKindOr:
+		count := uint32(pat.Expr1)
+		for i := uint32(0); i < count; i++ {
+			subID := st.arena.PatternIDs[pat.Extra+i]
+			if err := st.bindAndVisitPattern(subID); err != nil {
+				return err
+			}
+		}
+	case PatternKindSequence:
+		count := uint32(pat.Expr1)
+		for i := uint32(0); i < count; i++ {
+			subID := st.arena.PatternIDs[pat.Extra+i]
+			if err := st.bindAndVisitPattern(subID); err != nil {
+				return err
+			}
+		}
+	case PatternKindMapping:
+		count := uint32(pat.Expr2)
+		for i := uint32(0); i < count; i++ {
+			subID := st.arena.PatternIDs[pat.Extra+i]
+			if err := st.bindAndVisitPattern(subID); err != nil {
+				return err
+			}
+		}
+		if pat.Name != "" && pat.Name != "_" {
+			st.cur.Bound[pat.Name] = true
+		}
+	case PatternKindClass:
+		if pat.Expr1 != ExprNone {
+			if err := st.visitExpr(pat.Expr1); err != nil {
+				return err
+			}
+		}
+		posCount := uint32(pat.Expr2) >> 16
+		kwCount := uint32(pat.Expr2) & 0xFFFF
+		totalCount := posCount + kwCount
+		for i := uint32(0); i < totalCount; i++ {
+			subID := st.arena.PatternIDs[pat.Extra+i]
+			if err := st.bindAndVisitPattern(subID); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (st *SymbolTable) visitDelete(exprID ExprID) {
+	expr := st.arena.GetExpr(exprID)
+	if expr == nil {
+		return
+	}
+	switch expr.Kind {
+	case ExprKindName:
+		name := string(st.src[expr.Start:expr.End])
+		st.cur.Bound[name] = true
+	case ExprKindTuple, ExprKindList:
+		slice := st.arena.ExprSlices[expr.Extra]
+		for _, elem := range st.arena.ExprIDs[slice.Start : slice.Start+slice.Count] {
+			st.visitDelete(elem)
+		}
+	case ExprKindAttribute:
+		_ = st.visitExpr(expr.Left)
+	case ExprKindSubscript:
+		_ = st.visitExpr(expr.Left)
+		_ = st.visitExpr(expr.Right)
+	}
 }
 
 func (st *SymbolTable) bindTarget(targetID ExprID) {
@@ -395,6 +580,8 @@ func (st *SymbolTable) bindTarget(targetID ExprID) {
 		for _, elemID := range st.arena.ExprIDs[slice.Start : slice.Start+slice.Count] {
 			st.bindTarget(elemID)
 		}
+	case ExprKindStarred:
+		st.bindTarget(expr.Left)
 	case ExprKindAttribute:
 		_ = st.visitExpr(expr.Left)
 	case ExprKindSubscript:
@@ -478,12 +665,11 @@ func (st *SymbolTable) visitExpr(exprID ExprID) error {
 			}
 		}
 
-	case ExprKindListComp, ExprKindDictComp:
+	case ExprKindListComp, ExprKindDictComp, ExprKindSetComp:
 		comp := &st.arena.Comps[expr.Extra]
 		if err := st.visitExpr(comp.Iter); err != nil {
 			return err
 		}
-		// Comprehension introduces a nested scope
 		compScope := NewScope(ScopeComprehension, "<comprehension>", st.cur)
 		st.Scopes = append(st.Scopes, compScope)
 
@@ -495,7 +681,7 @@ func (st *SymbolTable) visitExpr(exprID ExprID) error {
 				return err
 			}
 		}
-		if expr.Kind == ExprKindListComp {
+		if expr.Kind == ExprKindListComp || expr.Kind == ExprKindSetComp {
 			if err := st.visitExpr(expr.Left); err != nil {
 				return err
 			}
@@ -508,6 +694,98 @@ func (st *SymbolTable) visitExpr(exprID ExprID) error {
 			}
 		}
 		st.cur = saved
+
+	case ExprKindGeneratorExp:
+		comp := &st.arena.Comps[expr.Extra]
+		if err := st.visitExpr(comp.Iter); err != nil {
+			return err
+		}
+		genScope := NewScope(ScopeFunction, "<genexpr>", st.cur)
+		genScope.IsGenerator = true
+		st.Scopes = append(st.Scopes, genScope)
+
+		saved := st.cur
+		st.cur = genScope
+		st.bindTarget(comp.Target)
+		for _, ifCond := range st.arena.GetExprSlice(comp.IfConds) {
+			if err := st.visitExpr(ifCond); err != nil {
+				return err
+			}
+		}
+		if err := st.visitExpr(expr.Left); err != nil {
+			return err
+		}
+		st.cur = saved
+
+	case ExprKindLambda:
+		fnDef := &st.arena.FuncDefs[expr.Extra]
+		for _, defExpr := range st.arena.GetExprSlice(fnDef.Defaults) {
+			if err := st.visitExpr(defExpr); err != nil {
+				return err
+			}
+		}
+		lambdaScope := NewScope(ScopeFunction, "<lambda>", st.cur)
+		st.Scopes = append(st.Scopes, lambdaScope)
+		params := st.arena.GetIdentSlice(fnDef.ParamNames)
+		lambdaScope.ParamNames = append(lambdaScope.ParamNames, params...)
+		for _, p := range params {
+			lambdaScope.Bound[p] = true
+		}
+		saved := st.cur
+		st.cur = lambdaScope
+		if err := st.visitExpr(expr.Left); err != nil {
+			st.cur = saved
+			return err
+		}
+		st.cur = saved
+
+	case ExprKindStarred:
+		return st.visitExpr(expr.Left)
+
+	case ExprKindNamedExpr:
+		if err := st.visitExpr(expr.Right); err != nil {
+			return err
+		}
+		targetScope := st.cur
+		for targetScope != nil && targetScope.Kind == ScopeComprehension {
+			targetScope = targetScope.Parent
+		}
+		if targetScope != nil {
+			targetExpr := st.arena.GetExpr(expr.Left)
+			if targetExpr != nil && targetExpr.Kind == ExprKindName {
+				name := string(st.src[targetExpr.Start:targetExpr.End])
+				targetScope.Bound[name] = true
+			}
+		}
+		return st.visitExpr(expr.Left)
+
+	case ExprKindJoinedStr:
+		fs := &st.arena.FStrings[expr.Extra]
+		for _, pExpr := range st.arena.GetExprSlice(fs.Pieces) {
+			if err := st.visitExpr(pExpr); err != nil {
+				return err
+			}
+		}
+
+	case ExprKindFormattedValue:
+		fv := &st.arena.FormattedValues[expr.Extra]
+		if err := st.visitExpr(fv.Value); err != nil {
+			return err
+		}
+		if fv.FormatSpec != ExprNone {
+			return st.visitExpr(fv.FormatSpec)
+		}
+
+	case ExprKindSet:
+		slice := st.arena.ExprSlices[expr.Extra]
+		for _, elem := range st.arena.ExprIDs[slice.Start : slice.Start+slice.Count] {
+			if err := st.visitExpr(elem); err != nil {
+				return err
+			}
+		}
+
+	case ExprKindEllipsis:
+		return nil
 
 	case ExprKindYield:
 		st.cur.IsGenerator = true
@@ -571,6 +849,49 @@ func (st *SymbolTable) resolveScope(s *Scope) error {
 		}
 		for name := range s.Used {
 			s.Symbols[name] = &Symbol{Name: name, Storage: StorageGlobal}
+		}
+		return nil
+	}
+
+	if s.Kind == ScopeComprehension {
+		for name := range s.Bound {
+			s.Symbols[name] = &Symbol{Name: name, Storage: StorageFastLocal}
+			s.FastLocals = append(s.FastLocals, name)
+			if s.Parent != nil && s.Parent.Kind == ScopeFunction {
+				if !containsString(s.Parent.FastLocals, name) && !s.Parent.Bound[name] {
+					s.Parent.FastLocals = append(s.Parent.FastLocals, name)
+					s.Parent.Symbols[name] = &Symbol{
+						Name:    name,
+						Storage: StorageFastLocal,
+						Offset:  len(s.Parent.FastLocals) - 1,
+					}
+				}
+			}
+		}
+		for name := range s.Used {
+			if s.Symbols[name] != nil {
+				continue
+			}
+			if s.Parent != nil && s.Parent.Kind == ScopeFunction && s.Parent.Bound[name] {
+				s.Symbols[name] = &Symbol{Name: name, Storage: StorageFastLocal}
+			} else if st.isBoundInFunctionAncestors(s.Parent, name) {
+				s.Symbols[name] = &Symbol{Name: name, Storage: StorageFree}
+				s.FreeVars = append(s.FreeVars, name)
+				st.markAncestorCell(s.Parent, name)
+			} else {
+				s.Symbols[name] = &Symbol{Name: name, Storage: StorageGlobal}
+			}
+		}
+		offset := 0
+		if s.Parent != nil && s.Parent.Kind == ScopeFunction {
+			offset = len(s.Parent.FastLocals)
+		}
+		for _, fl := range s.FastLocals {
+			sym := s.Symbols[fl]
+			if sym != nil {
+				sym.Offset = offset
+				offset++
+			}
 		}
 		return nil
 	}
@@ -712,7 +1033,7 @@ func (st *SymbolTable) isBoundInFunctionAncestors(start *Scope, name string) boo
 		if p.Kind == ScopeModule {
 			return false
 		}
-		if p.Kind == ScopeFunction || p.Kind == ScopeComprehension {
+		if p.Kind == ScopeFunction {
 			if p.Bound[name] {
 				return true
 			}
@@ -725,7 +1046,7 @@ func (st *SymbolTable) isCapturedByDescendants(s *Scope, name string) bool {
 	var check func(cur *Scope) bool
 	check = func(cur *Scope) bool {
 		for _, child := range cur.Children {
-			if child.Kind == ScopeFunction || child.Kind == ScopeComprehension {
+			if child.Kind == ScopeFunction {
 				if child.ExplicitG[name] {
 					continue
 				}

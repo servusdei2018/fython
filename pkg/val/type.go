@@ -277,10 +277,14 @@ var (
 	ByteArrayType   *PyType
 	MemoryViewType  *PyType
 	SliceType       *PyType
+	SetType         *PyType
 
 	// Built-in exception types
 	BaseExceptionType       *PyType
 	ExceptionType           *PyType
+	BaseExceptionGroupType  *PyType
+	ExceptionGroupType      *PyType
+	AssertionErrorType      *PyType
 	TypeErrorType           *PyType
 	ValueErrorType          *PyType
 	KeyErrorType            *PyType
@@ -295,6 +299,12 @@ var (
 	ImportErrorType         *PyType
 	ModuleNotFoundErrorType *PyType
 	BufferErrorType         *PyType
+
+	// PEP 695 Type Parameter types
+	TypeVarType       *PyType
+	TypeVarTupleType  *PyType
+	ParamSpecType     *PyType
+	TypeAliasTypeType *PyType
 )
 
 // Pre-interned canonical dunder names used for slot synchronization.
@@ -762,6 +772,45 @@ func objectGetAttr(ctx *ExecContext, obj, name Value) Value {
 
 	if tp.dunderGetAttr.ptr != nil {
 		return ctx.Invoke2(tp.dunderGetAttr, obj, interned)
+	}
+
+	if interned.AsString() == "__annotations__" {
+		if obj.IsType() {
+			cls := obj.AsType()
+			if annotateFn, ok := cls.Dict.Get(InternString("__annotate__")); ok {
+				var annDict Value
+				if ctx != nil && ctx.CallHook != nil {
+					base := ctx.SP
+					ctx.Stack[base] = Int64Val(1)
+					annDict = ctx.CallHook(ctx, annotateFn, base, 1, nil)
+				}
+				if annDict.IsDict() {
+					cls.Dict.Set(interned, annDict)
+					return annDict
+				}
+			}
+			emptyDict := NewDictVal(4)
+			cls.Dict.Set(interned, emptyDict)
+			return emptyDict
+		}
+		if obj.IsInstance() {
+			inst := obj.AsInstance()
+			if annotateFn, ok := inst.GetAttr(InternString("__annotate__")); ok {
+				var annDict Value
+				if ctx != nil && ctx.CallHook != nil {
+					base := ctx.SP
+					ctx.Stack[base] = Int64Val(1)
+					annDict = ctx.CallHook(ctx, annotateFn, base, 1, nil)
+				}
+				if annDict.IsDict() {
+					inst.SetAttr(interned, annDict)
+					return annDict
+				}
+			}
+			emptyDict := NewDictVal(4)
+			inst.SetAttr(interned, emptyDict)
+			return emptyDict
+		}
 	}
 
 	panic("val: AttributeError: '" + tp.Name + "' object has no attribute '" + interned.AsString() + "'")

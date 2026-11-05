@@ -2,7 +2,16 @@ package compiler
 
 import (
 	"fmt"
+	"strings"
 )
+
+type fstringState struct {
+	quote      byte
+	isTriple   bool
+	raw        bool
+	braceDepth int
+	parenDepth int
+}
 
 // Lexer implements a zero-copy Python tokenizer with indentation state machine.
 type Lexer struct {
@@ -16,19 +25,21 @@ type Lexer struct {
 	atBOL           bool // at Beginning of Line
 	hasTokensOnLine bool
 	err             error
+	fstringStack    []fstringState
 }
 
 // NewLexer creates a new Lexer for the source buffer.
 func NewLexer(src []byte) *Lexer {
 	return &Lexer{
-		src:         src,
-		pos:         0,
-		line:        1,
-		col:         1,
-		indentStack: []int{0},
-		parenDepth:  0,
-		pendingToks: make([]Token, 0, 8),
-		atBOL:       true,
+		src:          src,
+		pos:          0,
+		line:         1,
+		col:          1,
+		indentStack:  []int{0},
+		parenDepth:   0,
+		pendingToks:  make([]Token, 0, 8),
+		atBOL:        true,
+		fstringStack: make([]fstringState, 0, 4),
 	}
 }
 
@@ -49,6 +60,7 @@ func (l *Lexer) Reset(src []byte) {
 	l.atBOL = true
 	l.hasTokensOnLine = false
 	l.err = nil
+	l.fstringStack = l.fstringStack[:0]
 }
 
 // NextToken returns the next zero-copy Token.
@@ -60,6 +72,14 @@ func (l *Lexer) NextToken() Token {
 	}
 
 	for l.pos < len(l.src) {
+		if len(l.fstringStack) > 0 {
+			top := &l.fstringStack[len(l.fstringStack)-1]
+			if top.braceDepth == 0 {
+				l.hasTokensOnLine = true
+				return l.readFStringMiddle(top)
+			}
+		}
+
 		if l.atBOL && l.parenDepth == 0 {
 			l.handleBOL()
 			if len(l.pendingToks) > 0 {
@@ -139,12 +159,8 @@ func (l *Lexer) NextToken() Token {
 
 		// Identifier or Keyword (or prefixed string)
 		if isIdentStart(ch) {
-			// Check for string prefix (r, b, f, etc.) followed by quote
-			if (ch == 'r' || ch == 'R' || ch == 'b' || ch == 'B' || ch == 'f' || ch == 'F') &&
-				l.pos+1 < len(l.src) && (l.src[l.pos+1] == '\'' || l.src[l.pos+1] == '"') {
-				l.pos++
-				l.col++
-				return l.readString(startPos, tokLine, tokCol)
+			if tok, ok := l.tryReadPrefixedString(startPos, tokLine, tokCol); ok {
+				return tok
 			}
 
 			for l.pos < len(l.src) && isIdentPart(l.src[l.pos]) {
@@ -174,6 +190,17 @@ func (l *Lexer) NextToken() Token {
 
 		// Operators & Delimiters
 		return l.readOperatorOrDelimiter(startPos, tokLine, tokCol)
+	}
+
+	if len(l.fstringStack) > 0 {
+		l.err = fmt.Errorf("SyntaxError: unterminated f-string at line %d", l.line)
+		return Token{
+			Type:  TOKEN_ERROR,
+			Start: uint32(l.pos),
+			End:   uint32(l.pos),
+			Line:  l.line,
+			Col:   l.col,
+		}
 	}
 
 	// At EOF: unwind indentation stack
@@ -397,6 +424,188 @@ func (l *Lexer) readString(startPos uint32, line, col uint32) Token {
 	return Token{Type: TOKEN_ERROR, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
 }
 
+func (l *Lexer) tryReadPrefixedString(startPos uint32, line, col uint32) (Token, bool) {
+	pos := l.pos
+	var pfx [2]byte
+	pfxLen := 0
+	for pos < len(l.src) && pfxLen < 2 && isIdentStart(l.src[pos]) {
+		pfx[pfxLen] = l.src[pos]
+		pfxLen++
+		pos++
+	}
+	if pfxLen == 0 || pos >= len(l.src) {
+		return Token{}, false
+	}
+	quote := l.src[pos]
+	if quote != '\'' && quote != '"' {
+		if pfxLen == 2 && (l.src[pos-1] == '\'' || l.src[pos-1] == '"') {
+			pfxLen = 1
+			pos--
+			quote = l.src[pos]
+		} else {
+			return Token{}, false
+		}
+	}
+
+	isFString := false
+	isRaw := false
+	isValid := false
+
+	pStr := strings.ToLower(string(pfx[:pfxLen]))
+	switch pStr {
+	case "f":
+		isFString = true
+		isValid = true
+	case "r":
+		isRaw = true
+		isValid = true
+	case "b", "u":
+		isValid = true
+	case "fr", "rf":
+		isFString = true
+		isRaw = true
+		isValid = true
+	case "br", "rb":
+		isRaw = true
+		isValid = true
+	}
+
+	if !isValid {
+		return Token{}, false
+	}
+
+	l.pos = pos
+	l.col += uint32(pfxLen)
+
+	if isFString {
+		quoteChar := l.src[l.pos]
+		isTriple := false
+		if l.pos+2 < len(l.src) && l.src[l.pos+1] == quoteChar && l.src[l.pos+2] == quoteChar {
+			isTriple = true
+			l.pos += 3
+			l.col += 3
+		} else {
+			l.pos++
+			l.col++
+		}
+		l.fstringStack = append(l.fstringStack, fstringState{
+			quote:      quoteChar,
+			isTriple:   isTriple,
+			raw:        isRaw,
+			braceDepth: 0,
+			parenDepth: 0,
+		})
+		return Token{Type: TOKEN_FSTRING_START, Start: startPos, End: uint32(l.pos), Line: line, Col: col}, true
+	}
+
+	return l.readString(startPos, line, col), true
+}
+
+func (l *Lexer) readFStringMiddle(top *fstringState) Token {
+	startPos := uint32(l.pos)
+	line := l.line
+	col := l.col
+
+	if l.pos >= len(l.src) {
+		l.err = fmt.Errorf("SyntaxError: unterminated f-string at line %d", line)
+		return Token{Type: TOKEN_ERROR, Start: startPos, End: startPos, Line: line, Col: col}
+	}
+
+	// Check for closing quote
+	if top.isTriple {
+		if l.pos+2 < len(l.src) && l.src[l.pos] == top.quote && l.src[l.pos+1] == top.quote && l.src[l.pos+2] == top.quote {
+			l.pos += 3
+			l.col += 3
+			l.fstringStack = l.fstringStack[:len(l.fstringStack)-1]
+			return Token{Type: TOKEN_FSTRING_END, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
+		}
+	} else {
+		if l.src[l.pos] == top.quote {
+			l.pos++
+			l.col++
+			l.fstringStack = l.fstringStack[:len(l.fstringStack)-1]
+			return Token{Type: TOKEN_FSTRING_END, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
+		}
+	}
+
+	// Check for {
+	if l.src[l.pos] == '{' {
+		if l.pos+1 < len(l.src) && l.src[l.pos+1] == '{' {
+			l.pos += 2
+			l.col += 2
+			return Token{Type: TOKEN_FSTRING_MIDDLE, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
+		}
+		l.pos++
+		l.col++
+		top.braceDepth = 1
+		top.parenDepth = 0
+		return Token{Type: TOKEN_LBRACE, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
+	}
+
+	// Check for }
+	if l.src[l.pos] == '}' {
+		if l.pos+1 < len(l.src) && l.src[l.pos+1] == '}' {
+			l.pos += 2
+			l.col += 2
+			return Token{Type: TOKEN_FSTRING_MIDDLE, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
+		}
+		l.pos++
+		l.col++
+		l.err = fmt.Errorf("SyntaxError: f-string: single '}' is not allowed at line %d, col %d", line, col)
+		return Token{Type: TOKEN_ERROR, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
+	}
+
+	for l.pos < len(l.src) {
+		ch := l.src[l.pos]
+		if top.isTriple {
+			if l.pos+2 < len(l.src) && ch == top.quote && l.src[l.pos+1] == top.quote && l.src[l.pos+2] == top.quote {
+				break
+			}
+		} else {
+			if ch == top.quote {
+				break
+			}
+		}
+
+		if ch == '{' || ch == '}' {
+			break
+		}
+
+		if ch == '\\' {
+			if !top.raw {
+				l.pos++
+				l.col++
+				if l.pos < len(l.src) {
+					if l.src[l.pos] == '\n' {
+						l.line++
+						l.col = 1
+					} else {
+						l.col++
+					}
+					l.pos++
+				}
+				continue
+			}
+		}
+
+		if ch == '\n' {
+			if !top.isTriple {
+				l.err = fmt.Errorf("SyntaxError: unterminated f-string at line %d", line)
+				return Token{Type: TOKEN_ERROR, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
+			}
+			l.line++
+			l.col = 1
+			l.pos++
+			continue
+		}
+
+		l.pos++
+		l.col++
+	}
+
+	return Token{Type: TOKEN_FSTRING_MIDDLE, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
+}
+
 func (l *Lexer) readOperatorOrDelimiter(startPos uint32, line, col uint32) Token {
 	ch := l.src[l.pos]
 	l.pos++
@@ -405,33 +614,70 @@ func (l *Lexer) readOperatorOrDelimiter(startPos uint32, line, col uint32) Token
 	switch ch {
 	case '(':
 		l.parenDepth++
+		if len(l.fstringStack) > 0 {
+			l.fstringStack[len(l.fstringStack)-1].parenDepth++
+		}
 		return Token{Type: TOKEN_LPAREN, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
 	case ')':
 		if l.parenDepth > 0 {
 			l.parenDepth--
 		}
+		if len(l.fstringStack) > 0 {
+			top := &l.fstringStack[len(l.fstringStack)-1]
+			if top.parenDepth > 0 {
+				top.parenDepth--
+			}
+		}
 		return Token{Type: TOKEN_RPAREN, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
 	case '[':
 		l.parenDepth++
+		if len(l.fstringStack) > 0 {
+			l.fstringStack[len(l.fstringStack)-1].parenDepth++
+		}
 		return Token{Type: TOKEN_LBRACKET, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
 	case ']':
 		if l.parenDepth > 0 {
 			l.parenDepth--
 		}
+		if len(l.fstringStack) > 0 {
+			top := &l.fstringStack[len(l.fstringStack)-1]
+			if top.parenDepth > 0 {
+				top.parenDepth--
+			}
+		}
 		return Token{Type: TOKEN_RBRACKET, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
 	case '{':
 		l.parenDepth++
+		if len(l.fstringStack) > 0 {
+			l.fstringStack[len(l.fstringStack)-1].braceDepth++
+		}
 		return Token{Type: TOKEN_LBRACE, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
 	case '}':
 		if l.parenDepth > 0 {
 			l.parenDepth--
 		}
+		if len(l.fstringStack) > 0 {
+			top := &l.fstringStack[len(l.fstringStack)-1]
+			if top.braceDepth > 0 {
+				top.braceDepth--
+			}
+		}
 		return Token{Type: TOKEN_RBRACE, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
 	case ':':
+		if l.pos < len(l.src) && l.src[l.pos] == '=' {
+			l.pos++
+			l.col++
+			return Token{Type: TOKEN_WALRUS, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
+		}
 		return Token{Type: TOKEN_COLON, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
 	case ',':
 		return Token{Type: TOKEN_COMMA, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
 	case '.':
+		if l.pos+1 < len(l.src) && l.src[l.pos] == '.' && l.src[l.pos+1] == '.' {
+			l.pos += 2
+			l.col += 2
+			return Token{Type: TOKEN_ELLIPSIS, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
+		}
 		return Token{Type: TOKEN_DOT, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
 	case ';':
 		return Token{Type: TOKEN_SEMI, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
@@ -445,6 +691,11 @@ func (l *Lexer) readOperatorOrDelimiter(startPos uint32, line, col uint32) Token
 		return Token{Type: TOKEN_PLUS, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
 
 	case '-':
+		if l.pos < len(l.src) && l.src[l.pos] == '>' {
+			l.pos++
+			l.col++
+			return Token{Type: TOKEN_ARROW, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
+		}
 		if l.pos < len(l.src) && l.src[l.pos] == '=' {
 			l.pos++
 			l.col++
@@ -513,6 +764,16 @@ func (l *Lexer) readOperatorOrDelimiter(startPos uint32, line, col uint32) Token
 		return Token{Type: TOKEN_ERROR, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
 
 	case '<':
+		if l.pos < len(l.src) && l.src[l.pos] == '<' {
+			l.pos++
+			l.col++
+			if l.pos < len(l.src) && l.src[l.pos] == '=' {
+				l.pos++
+				l.col++
+				return Token{Type: TOKEN_LSHIFTEQ, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
+			}
+			return Token{Type: TOKEN_LSHIFT, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
+		}
 		if l.pos < len(l.src) && l.src[l.pos] == '=' {
 			l.pos++
 			l.col++
@@ -521,12 +782,57 @@ func (l *Lexer) readOperatorOrDelimiter(startPos uint32, line, col uint32) Token
 		return Token{Type: TOKEN_LT, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
 
 	case '>':
+		if l.pos < len(l.src) && l.src[l.pos] == '>' {
+			l.pos++
+			l.col++
+			if l.pos < len(l.src) && l.src[l.pos] == '=' {
+				l.pos++
+				l.col++
+				return Token{Type: TOKEN_RSHIFTEQ, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
+			}
+			return Token{Type: TOKEN_RSHIFT, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
+		}
 		if l.pos < len(l.src) && l.src[l.pos] == '=' {
 			l.pos++
 			l.col++
 			return Token{Type: TOKEN_GTE, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
 		}
 		return Token{Type: TOKEN_GT, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
+
+	case '@':
+		if l.pos < len(l.src) && l.src[l.pos] == '=' {
+			l.pos++
+			l.col++
+			return Token{Type: TOKEN_ATEQ, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
+		}
+		return Token{Type: TOKEN_AT, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
+
+	case '&':
+		if l.pos < len(l.src) && l.src[l.pos] == '=' {
+			l.pos++
+			l.col++
+			return Token{Type: TOKEN_AMPEQ, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
+		}
+		return Token{Type: TOKEN_AMP, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
+
+	case '|':
+		if l.pos < len(l.src) && l.src[l.pos] == '=' {
+			l.pos++
+			l.col++
+			return Token{Type: TOKEN_PIPEEQ, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
+		}
+		return Token{Type: TOKEN_PIPE, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
+
+	case '^':
+		if l.pos < len(l.src) && l.src[l.pos] == '=' {
+			l.pos++
+			l.col++
+			return Token{Type: TOKEN_CARETEQ, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
+		}
+		return Token{Type: TOKEN_CARET, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
+
+	case '~':
+		return Token{Type: TOKEN_TILDE, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
 
 	default:
 		return Token{Type: TOKEN_ERROR, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
@@ -617,6 +923,16 @@ func lookupKeyword(s string) TokenType {
 		return TOKEN_ASYNC
 	case "await":
 		return TOKEN_AWAIT
+	case "match":
+		return TOKEN_MATCH
+	case "case":
+		return TOKEN_CASE
+	case "type":
+		return TOKEN_TYPE
+	case "assert":
+		return TOKEN_ASSERT
+	case "del":
+		return TOKEN_DEL
 	default:
 		return TOKEN_IDENT
 	}

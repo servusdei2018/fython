@@ -157,6 +157,16 @@ func (p *Parser) parseStmt() (StmtID, error) {
 		return p.parseFromImportStmt()
 	case TOKEN_ASYNC:
 		return p.parseAsyncStmt()
+	case TOKEN_AT:
+		return p.parseDecoratedStmt()
+	case TOKEN_MATCH:
+		return p.parseMatchStmt()
+	case TOKEN_TYPE:
+		return p.parseTypeStmt()
+	case TOKEN_ASSERT:
+		return p.parseAssertStmt()
+	case TOKEN_DEL:
+		return p.parseDeleteStmt()
 	default:
 		return p.parseSimpleStmt()
 	}
@@ -211,12 +221,43 @@ func (p *Parser) parseAsyncStmt() (StmtID, error) {
 	}
 }
 
+func (p *Parser) parseDecoratedStmt() (StmtID, error) {
+	var decs []ExprID
+	for p.cur.Type == TOKEN_AT {
+		p.advance() // '@'
+		decExpr, err := p.parsePrimary()
+		if err != nil {
+			return StmtNone, err
+		}
+		p.match(TOKEN_NEWLINE)
+		decs = append(decs, decExpr)
+	}
+	decSlice := p.arena.AddExprSlice(decs)
+	if p.cur.Type == TOKEN_DEF {
+		startTok, _ := p.expect(TOKEN_DEF)
+		return p.parseFuncDefFull(false, startTok.Start, decSlice)
+	}
+	if p.cur.Type == TOKEN_ASYNC {
+		asyncTok, _ := p.expect(TOKEN_ASYNC)
+		return p.parseFuncDefFull(true, asyncTok.Start, decSlice)
+	}
+	if p.cur.Type == TOKEN_CLASS {
+		startTok, _ := p.expect(TOKEN_CLASS)
+		return p.parseClassDefFull(startTok.Start, decSlice)
+	}
+	return StmtNone, fmt.Errorf("SyntaxError: expected def or class after decorator at line %d, col %d", p.cur.Line, p.cur.Col)
+}
+
 func (p *Parser) parseFuncDef() (StmtID, error) {
 	startTok, _ := p.expect(TOKEN_DEF)
-	return p.parseFuncDefInternal(false, startTok.Start)
+	return p.parseFuncDefFull(false, startTok.Start, ExprSlice{})
 }
 
 func (p *Parser) parseFuncDefInternal(isAsync bool, startPos uint32) (StmtID, error) {
+	return p.parseFuncDefFull(isAsync, startPos, ExprSlice{})
+}
+
+func (p *Parser) parseFuncDefFull(isAsync bool, startPos uint32, decorators ExprSlice) (StmtID, error) {
 	if isAsync {
 		if _, err := p.expect(TOKEN_DEF); err != nil {
 			return StmtNone, err
@@ -228,19 +269,90 @@ func (p *Parser) parseFuncDefInternal(isAsync bool, startPos uint32) (StmtID, er
 	}
 	name := p.tokenText(nameTok)
 
+	// PEP 695: Inline type parameters [T, *Ts, **P]
+	var typeParams []ASTTypeParam
+	if p.cur.Type == TOKEN_LBRACKET {
+		typeParams, err = p.parseTypeParams()
+		if err != nil {
+			return StmtNone, err
+		}
+	}
+
 	if _, err := p.expect(TOKEN_LPAREN); err != nil {
 		return StmtNone, err
 	}
 
 	var paramNames []string
 	var defaults []ExprID
+	var paramTypes []ExprID
 
 	for p.cur.Type != TOKEN_RPAREN && p.cur.Type != TOKEN_EOF {
+		// Positional-only separator
+		if p.match(TOKEN_SLASH) {
+			if !p.match(TOKEN_COMMA) {
+				break
+			}
+			continue
+		}
+		// Keyword-only separator or *args
+		if p.match(TOKEN_STAR) {
+			if p.cur.Type == TOKEN_IDENT {
+				paramTok, err := p.expect(TOKEN_IDENT)
+				if err != nil {
+					return StmtNone, err
+				}
+				paramNames = append(paramNames, "*"+p.tokenText(paramTok))
+				if p.match(TOKEN_COLON) {
+					ann, err := p.parseTernary()
+					if err != nil {
+						return StmtNone, err
+					}
+					paramTypes = append(paramTypes, ann)
+				}
+			} else {
+				paramNames = append(paramNames, "*")
+			}
+			if !p.match(TOKEN_COMMA) {
+				break
+			}
+			continue
+		}
+		// **kwargs
+		if p.match(TOKEN_STARSTAR) {
+			paramTok, err := p.expect(TOKEN_IDENT)
+			if err != nil {
+				return StmtNone, err
+			}
+			paramNames = append(paramNames, "**"+p.tokenText(paramTok))
+			if p.match(TOKEN_COLON) {
+				ann, err := p.parseTernary()
+				if err != nil {
+					return StmtNone, err
+				}
+				paramTypes = append(paramTypes, ann)
+			}
+			if !p.match(TOKEN_COMMA) {
+				break
+			}
+			continue
+		}
+
 		paramTok, err := p.expect(TOKEN_IDENT)
 		if err != nil {
 			return StmtNone, err
 		}
 		paramNames = append(paramNames, p.tokenText(paramTok))
+
+		// Optional type annotation: param: Type
+		if p.match(TOKEN_COLON) {
+			ann, err := p.parseTernary()
+			if err != nil {
+				return StmtNone, err
+			}
+			paramTypes = append(paramTypes, ann)
+		}
+
+		// Optional default value: = default
 		if p.match(TOKEN_ASSIGN) {
 			defExpr, err := p.parseTernary()
 			if err != nil {
@@ -256,6 +368,16 @@ func (p *Parser) parseFuncDefInternal(isAsync bool, startPos uint32) (StmtID, er
 	if _, err := p.expect(TOKEN_RPAREN); err != nil {
 		return StmtNone, err
 	}
+
+	// Optional return annotation: -> Ret
+	var returnType ExprID = ExprNone
+	if p.match(TOKEN_ARROW) {
+		returnType, err = p.parseTernary()
+		if err != nil {
+			return StmtNone, err
+		}
+	}
+
 	if _, err := p.expect(TOKEN_COLON); err != nil {
 		return StmtNone, err
 	}
@@ -272,6 +394,10 @@ func (p *Parser) parseFuncDefInternal(isAsync bool, startPos uint32) (StmtID, er
 		Defaults:   p.arena.AddExprSlice(defaults),
 		Body:       p.arena.StmtSlices[bodySlice],
 		IsAsync:    isAsync,
+		TypeParams: p.arena.AddTypeParamSlice(typeParams),
+		Decorators: decorators,
+		Returns:    returnType,
+		ParamTypes: p.arena.AddExprSlice(paramTypes),
 	})
 
 	kind := StmtKindFuncDef
@@ -289,20 +415,45 @@ func (p *Parser) parseFuncDefInternal(isAsync bool, startPos uint32) (StmtID, er
 
 func (p *Parser) parseClassDef() (StmtID, error) {
 	startTok, _ := p.expect(TOKEN_CLASS)
+	return p.parseClassDefFull(startTok.Start, ExprSlice{})
+}
+
+func (p *Parser) parseClassDefFull(startPos uint32, decorators ExprSlice) (StmtID, error) {
 	nameTok, err := p.expect(TOKEN_IDENT)
 	if err != nil {
 		return StmtNone, err
 	}
 	name := p.tokenText(nameTok)
 
+	// PEP 695: Inline type parameters [T]
+	var typeParams []ASTTypeParam
+	if p.cur.Type == TOKEN_LBRACKET {
+		typeParams, err = p.parseTypeParams()
+		if err != nil {
+			return StmtNone, err
+		}
+	}
+
 	var bases []ExprID
+	var keywords []ExprID
 	if p.match(TOKEN_LPAREN) {
 		for p.cur.Type != TOKEN_RPAREN && p.cur.Type != TOKEN_EOF {
-			baseExpr, err := p.parseTernary()
-			if err != nil {
-				return StmtNone, err
+			// Check for keyword arg: metaclass=Meta
+			if p.cur.Type == TOKEN_IDENT && p.peek().Type == TOKEN_ASSIGN {
+				p.advance() // ident
+				p.advance() // =
+				kwVal, err := p.parseTernary()
+				if err != nil {
+					return StmtNone, err
+				}
+				keywords = append(keywords, kwVal)
+			} else {
+				baseExpr, err := p.parseTernary()
+				if err != nil {
+					return StmtNone, err
+				}
+				bases = append(bases, baseExpr)
 			}
-			bases = append(bases, baseExpr)
 			if !p.match(TOKEN_COMMA) {
 				break
 			}
@@ -323,14 +474,17 @@ func (p *Parser) parseClassDef() (StmtID, error) {
 
 	clsIdx := uint32(len(p.arena.ClassDefs))
 	p.arena.ClassDefs = append(p.arena.ClassDefs, ASTClassDef{
-		Name:  name,
-		Bases: p.arena.AddExprSlice(bases),
-		Body:  p.arena.StmtSlices[bodySlice],
+		Name:       name,
+		Bases:      p.arena.AddExprSlice(bases),
+		Body:       p.arena.StmtSlices[bodySlice],
+		TypeParams: p.arena.AddTypeParamSlice(typeParams),
+		Decorators: decorators,
+		Keywords:   p.arena.AddExprSlice(keywords),
 	})
 
 	return p.arena.AllocStmt(ASTStmt{
 		Kind:  StmtKindClassDef,
-		Start: startTok.Start,
+		Start: startPos,
 		End:   p.arena.GetStmtSlice(bodySlice)[len(p.arena.GetStmtSlice(bodySlice))-1].endInArena(p.arena),
 		Extra: clsIdx,
 	}), nil
@@ -556,6 +710,10 @@ func (p *Parser) parseTryStmt() (StmtID, error) {
 	var handlers []ASTExceptHandler
 	for p.cur.Type == TOKEN_EXCEPT {
 		p.advance() // 'except'
+		isStar := false
+		if p.match(TOKEN_STAR) {
+			isStar = true
+		}
 		var excType ExprID
 		var excName string
 		if p.cur.Type != TOKEN_COLON {
@@ -581,9 +739,10 @@ func (p *Parser) parseTryStmt() (StmtID, error) {
 			return StmtNone, err
 		}
 		handlers = append(handlers, ASTExceptHandler{
-			Type: excType,
-			Name: excName,
-			Body: p.arena.StmtSlices[hBody],
+			Type:   excType,
+			Name:   excName,
+			Body:   p.arena.StmtSlices[hBody],
+			IsStar: isStar,
 		})
 	}
 
@@ -955,22 +1114,55 @@ func (p *Parser) parseSimpleStmt() (StmtID, error) {
 		return StmtNone, err
 	}
 
-	// Check for assignment: target = expr
-	if p.match(TOKEN_ASSIGN) {
-		val, err := p.parseExpr()
+	// Annotated assignment: target: Type [= Val]
+	if p.match(TOKEN_COLON) {
+		ann, err := p.parseTernary()
 		if err != nil {
 			return StmtNone, err
+		}
+		var val ExprID = ExprNone
+		if p.match(TOKEN_ASSIGN) {
+			val, err = p.parseExpr()
+			if err != nil {
+				return StmtNone, err
+			}
 		}
 		p.match(TOKEN_SEMI)
 		p.match(TOKEN_NEWLINE)
 		return p.arena.AllocStmt(ASTStmt{
-			Kind:  StmtKindAssign,
+			Kind:  StmtKindAnnAssign,
 			Expr1: expr,
 			Expr2: val,
+			Extra: uint32(ann),
 		}), nil
 	}
 
-	// Augmented assignment: +=, -=, *=, /=, %=, etc.
+	// Check for assignment: target = expr (and multi-target a = b = c = 1)
+	if p.match(TOKEN_ASSIGN) {
+		targets := []ExprID{expr}
+		val, err := p.parseExpr()
+		if err != nil {
+			return StmtNone, err
+		}
+		for p.match(TOKEN_ASSIGN) {
+			targets = append(targets, val)
+			val, err = p.parseExpr()
+			if err != nil {
+				return StmtNone, err
+			}
+		}
+		p.match(TOKEN_SEMI)
+		p.match(TOKEN_NEWLINE)
+		targetSlice := p.arena.AddExprSlice(targets)
+		return p.arena.AllocStmt(ASTStmt{
+			Kind:  StmtKindAssign,
+			Expr1: targets[0],
+			Expr2: val,
+			Extra: targetSlice.Start | (targetSlice.Count << 16),
+		}), nil
+	}
+
+	// Augmented assignment: +=, -=, *=, /=, %=, &=, |=, ^=, <<=, >>=, @=, etc.
 	if p.isAugAssignOp(p.cur.Type) {
 		opTok := p.advance()
 		val, err := p.parseExpr()
@@ -997,7 +1189,9 @@ func (p *Parser) parseSimpleStmt() (StmtID, error) {
 
 func (p *Parser) isAugAssignOp(t TokenType) bool {
 	return t == TOKEN_PLUSEQ || t == TOKEN_MINUSEQ || t == TOKEN_STAREQ ||
-		t == TOKEN_SLASHEQ || t == TOKEN_SLASHSLASHEQ || t == TOKEN_PERCENTEQ || t == TOKEN_STARSTAREQ
+		t == TOKEN_SLASHEQ || t == TOKEN_SLASHSLASHEQ || t == TOKEN_PERCENTEQ || t == TOKEN_STARSTAREQ ||
+		t == TOKEN_AMPEQ || t == TOKEN_PIPEEQ || t == TOKEN_CARETEQ ||
+		t == TOKEN_LSHIFTEQ || t == TOKEN_RSHIFTEQ || t == TOKEN_ATEQ
 }
 
 func (s StmtID) endInArena(arena *ASTArena) uint32 {
@@ -1008,13 +1202,625 @@ func (s StmtID) endInArena(arena *ASTArena) uint32 {
 	return stmt.End
 }
 
+func (p *Parser) parseMatchStmt() (StmtID, error) {
+	startTok, _ := p.expect(TOKEN_MATCH)
+	subject, err := p.parseTernary()
+	if err != nil {
+		return StmtNone, err
+	}
+	if _, err := p.expect(TOKEN_COLON); err != nil {
+		return StmtNone, err
+	}
+	if _, err := p.expect(TOKEN_NEWLINE); err != nil {
+		return StmtNone, err
+	}
+	if _, err := p.expect(TOKEN_INDENT); err != nil {
+		return StmtNone, err
+	}
+	var cases []ASTMatchCase
+	for p.cur.Type == TOKEN_CASE {
+		p.advance() // 'case'
+		pat, err := p.parsePattern()
+		if err != nil {
+			return StmtNone, err
+		}
+		var guard ExprID = ExprNone
+		if p.match(TOKEN_IF) {
+			guard, err = p.parseTernary()
+			if err != nil {
+				return StmtNone, err
+			}
+		}
+		if _, err := p.expect(TOKEN_COLON); err != nil {
+			return StmtNone, err
+		}
+		caseBody, err := p.parseSuite()
+		if err != nil {
+			return StmtNone, err
+		}
+		cases = append(cases, ASTMatchCase{
+			Pattern: pat,
+			Guard:   guard,
+			Body:    p.arena.StmtSlices[caseBody],
+		})
+	}
+	if _, err := p.expect(TOKEN_DEDENT); err != nil {
+		return StmtNone, err
+	}
+	caseSlice := p.arena.AddMatchCaseSlice(cases)
+	matchIdx := p.arena.AllocMatchStmt(ASTMatchStmt{
+		Subject: subject,
+		Cases:   caseSlice,
+	})
+	return p.arena.AllocStmt(ASTStmt{
+		Kind:  StmtKindMatch,
+		Start: startTok.Start,
+		Expr1: subject,
+		Extra: matchIdx,
+	}), nil
+}
+
+func (p *Parser) parsePattern() (PatternID, error) {
+	pat, err := p.parsePatternAs()
+	if err != nil {
+		return PatternNone, err
+	}
+	if p.match(TOKEN_PIPE) {
+		pats := []PatternID{pat}
+		for {
+			nextPat, err := p.parsePatternAs()
+			if err != nil {
+				return PatternNone, err
+			}
+			pats = append(pats, nextPat)
+			if !p.match(TOKEN_PIPE) {
+				break
+			}
+		}
+		patSlice := p.arena.AddPatternSlice(pats)
+		return p.arena.AllocPattern(ASTPattern{
+			Kind:  PatternKindOr,
+			Extra: patSlice.Start,
+			Expr1: ExprID(patSlice.Count),
+		}), nil
+	}
+	return pat, nil
+}
+
+func (p *Parser) parsePatternAs() (PatternID, error) {
+	pat, err := p.parsePatternAtom()
+	if err != nil {
+		return PatternNone, err
+	}
+	if p.match(TOKEN_AS) {
+		nameTok, err := p.expect(TOKEN_IDENT)
+		if err != nil {
+			return PatternNone, err
+		}
+		return p.arena.AllocPattern(ASTPattern{
+			Kind:  PatternKindAs,
+			Expr1: ExprID(pat),
+			Name:  p.tokenText(nameTok),
+		}), nil
+	}
+	return pat, nil
+}
+
+func (p *Parser) parsePatternAtom() (PatternID, error) {
+	tok := p.cur
+	switch tok.Type {
+	case TOKEN_IDENT:
+		name := p.tokenText(tok)
+		p.advance()
+		if name == "_" {
+			return p.arena.AllocPattern(ASTPattern{
+				Kind: PatternKindWildcard,
+			}), nil
+		}
+		if p.cur.Type == TOKEN_DOT {
+			expr, err := p.parseDottedNameExpr(name, tok.Start)
+			if err != nil {
+				return PatternNone, err
+			}
+			return p.arena.AllocPattern(ASTPattern{
+				Kind:  PatternKindValue,
+				Expr1: expr,
+			}), nil
+		}
+		if p.match(TOKEN_LPAREN) {
+			clsExpr := p.arena.AllocExpr(ASTExpr{
+				Kind:  ExprKindName,
+				Start: tok.Start,
+				End:   tok.End,
+			})
+			return p.parseClassPattern(clsExpr)
+		}
+		return p.arena.AllocPattern(ASTPattern{
+			Kind: PatternKindCapture,
+			Name: name,
+		}), nil
+
+	case TOKEN_INT, TOKEN_FLOAT, TOKEN_STRING:
+		atom, err := p.parseAtom()
+		if err != nil {
+			return PatternNone, err
+		}
+		return p.arena.AllocPattern(ASTPattern{
+			Kind:  PatternKindValue,
+			Expr1: atom,
+		}), nil
+
+	case TOKEN_MINUS:
+		p.advance()
+		num, err := p.parseAtom()
+		if err != nil {
+			return PatternNone, err
+		}
+		neg := p.arena.AllocExpr(ASTExpr{
+			Kind: ExprKindUnary,
+			Op:   uint8(TOKEN_MINUS),
+			Left: num,
+		})
+		return p.arena.AllocPattern(ASTPattern{
+			Kind:  PatternKindValue,
+			Expr1: neg,
+		}), nil
+
+	case TOKEN_NONE, TOKEN_TRUE, TOKEN_FALSE:
+		atom, err := p.parseAtom()
+		if err != nil {
+			return PatternNone, err
+		}
+		return p.arena.AllocPattern(ASTPattern{
+			Kind:  PatternKindSingleton,
+			Expr1: atom,
+		}), nil
+
+	case TOKEN_LBRACKET:
+		return p.parseSequencePattern(TOKEN_RBRACKET)
+
+	case TOKEN_LPAREN:
+		return p.parseSequencePattern(TOKEN_RPAREN)
+
+	case TOKEN_LBRACE:
+		return p.parseMappingPattern()
+
+	default:
+		return PatternNone, fmt.Errorf("SyntaxError: invalid pattern at line %d, col %d", tok.Line, tok.Col)
+	}
+}
+
+func (p *Parser) parseSequencePattern(closeTok TokenType) (PatternID, error) {
+	p.advance() // '[' or '('
+	var pats []PatternID
+	starIdx := int32(-1)
+	for p.cur.Type != closeTok && p.cur.Type != TOKEN_EOF {
+		if p.match(TOKEN_STAR) {
+			if starIdx >= 0 {
+				return PatternNone, fmt.Errorf("SyntaxError: multiple starred subpatterns at line %d", p.cur.Line)
+			}
+			starIdx = int32(len(pats))
+			nameTok, err := p.expect(TOKEN_IDENT)
+			if err != nil {
+				return PatternNone, err
+			}
+			capturePat := p.arena.AllocPattern(ASTPattern{
+				Kind: PatternKindCapture,
+				Name: p.tokenText(nameTok),
+			})
+			pats = append(pats, capturePat)
+		} else {
+			sub, err := p.parsePattern()
+			if err != nil {
+				return PatternNone, err
+			}
+			pats = append(pats, sub)
+		}
+		if !p.match(TOKEN_COMMA) {
+			break
+		}
+	}
+	if _, err := p.expect(closeTok); err != nil {
+		return PatternNone, err
+	}
+	patSlice := p.arena.AddPatternSlice(pats)
+	return p.arena.AllocPattern(ASTPattern{
+		Kind:    PatternKindSequence,
+		Extra:   patSlice.Start,
+		Expr1:   ExprID(patSlice.Count),
+		StarIdx: starIdx,
+	}), nil
+}
+
+func (p *Parser) parseMappingPattern() (PatternID, error) {
+	p.advance() // '{'
+	var keys []ExprID
+	var pats []PatternID
+	restName := ""
+	for p.cur.Type != TOKEN_RBRACE && p.cur.Type != TOKEN_EOF {
+		if p.match(TOKEN_STARSTAR) {
+			nameTok, err := p.expect(TOKEN_IDENT)
+			if err != nil {
+				return PatternNone, err
+			}
+			restName = p.tokenText(nameTok)
+			p.match(TOKEN_COMMA)
+			break
+		}
+		keyExpr, err := p.parseTernary()
+		if err != nil {
+			return PatternNone, err
+		}
+		if _, err := p.expect(TOKEN_COLON); err != nil {
+			return PatternNone, err
+		}
+		subPat, err := p.parsePattern()
+		if err != nil {
+			return PatternNone, err
+		}
+		keys = append(keys, keyExpr)
+		pats = append(pats, subPat)
+		if !p.match(TOKEN_COMMA) {
+			break
+		}
+	}
+	if _, err := p.expect(TOKEN_RBRACE); err != nil {
+		return PatternNone, err
+	}
+	keySlice := p.arena.AddExprSlice(keys)
+	patSlice := p.arena.AddPatternSlice(pats)
+	return p.arena.AllocPattern(ASTPattern{
+		Kind:  PatternKindMapping,
+		Expr1: ExprID(keySlice.Start),
+		Expr2: ExprID(keySlice.Count),
+		Extra: patSlice.Start,
+		Name:  restName,
+	}), nil
+}
+
+func (p *Parser) parseClassPattern(clsExpr ExprID) (PatternID, error) {
+	var posPats []PatternID
+	var kwNames []string
+	var kwPats []PatternID
+	parsingKW := false
+	for p.cur.Type != TOKEN_RPAREN && p.cur.Type != TOKEN_EOF {
+		if p.cur.Type == TOKEN_IDENT && p.peek().Type == TOKEN_ASSIGN {
+			parsingKW = true
+			nameTok := p.advance()
+			p.advance() // '='
+			valPat, err := p.parsePattern()
+			if err != nil {
+				return PatternNone, err
+			}
+			kwNames = append(kwNames, p.tokenText(nameTok))
+			kwPats = append(kwPats, valPat)
+		} else {
+			if parsingKW {
+				return PatternNone, fmt.Errorf("SyntaxError: positional subpattern follows keyword at line %d", p.cur.Line)
+			}
+			posPat, err := p.parsePattern()
+			if err != nil {
+				return PatternNone, err
+			}
+			posPats = append(posPats, posPat)
+		}
+		if !p.match(TOKEN_COMMA) {
+			break
+		}
+	}
+	if _, err := p.expect(TOKEN_RPAREN); err != nil {
+		return PatternNone, err
+	}
+	posSlice := p.arena.AddPatternSlice(posPats)
+	kwSlice := p.arena.AddPatternSlice(kwPats)
+	kwIdentSlice := p.arena.AddIdentSlice(kwNames)
+	return p.arena.AllocPattern(ASTPattern{
+		Kind:    PatternKindClass,
+		Expr1:   clsExpr,
+		Extra:   posSlice.Start,
+		Expr2:   ExprID((uint32(posSlice.Count) << 16) | uint32(kwSlice.Count)),
+		Name:    "",
+		StarIdx: int32(kwIdentSlice.Start),
+	}), nil
+}
+
+func (p *Parser) parseDottedNameExpr(name string, startPos uint32) (ExprID, error) {
+	expr := p.arena.AllocExpr(ASTExpr{
+		Kind:  ExprKindName,
+		Start: startPos,
+		End:   p.cur.Start,
+	})
+	for p.match(TOKEN_DOT) {
+		attrTok, err := p.expect(TOKEN_IDENT)
+		if err != nil {
+			return ExprNone, err
+		}
+		expr = p.arena.AllocExpr(ASTExpr{
+			Kind:  ExprKindAttribute,
+			Left:  expr,
+			Start: attrTok.Start,
+			End:   attrTok.End,
+		})
+	}
+	return expr, nil
+}
+
+func (p *Parser) parseTypeStmt() (StmtID, error) {
+	startTok, _ := p.expect(TOKEN_TYPE)
+	nameTok, err := p.expect(TOKEN_IDENT)
+	if err != nil {
+		return StmtNone, err
+	}
+	name := p.tokenText(nameTok)
+	var typeParams []ASTTypeParam
+	if p.cur.Type == TOKEN_LBRACKET {
+		typeParams, err = p.parseTypeParams()
+		if err != nil {
+			return StmtNone, err
+		}
+	}
+	if _, err := p.expect(TOKEN_ASSIGN); err != nil {
+		return StmtNone, err
+	}
+	valExpr, err := p.parseExpr()
+	if err != nil {
+		return StmtNone, err
+	}
+	p.match(TOKEN_SEMI)
+	p.match(TOKEN_NEWLINE)
+	taIdx := p.arena.AllocTypeAlias(ASTTypeAlias{
+		Name:       name,
+		TypeParams: p.arena.AddTypeParamSlice(typeParams),
+		Value:      valExpr,
+	})
+	return p.arena.AllocStmt(ASTStmt{
+		Kind:  StmtKindTypeAlias,
+		Start: startTok.Start,
+		Expr1: valExpr,
+		Extra: taIdx,
+	}), nil
+}
+
+func (p *Parser) parseTypeParams() ([]ASTTypeParam, error) {
+	if _, err := p.expect(TOKEN_LBRACKET); err != nil {
+		return nil, err
+	}
+	var tps []ASTTypeParam
+	for p.cur.Type != TOKEN_RBRACKET && p.cur.Type != TOKEN_EOF {
+		var kind TypeParamKind
+		if p.match(TOKEN_STARSTAR) {
+			kind = TypeParamParamSpec
+		} else if p.match(TOKEN_STAR) {
+			kind = TypeParamTypeVarTuple
+		} else {
+			kind = TypeParamTypeVar
+		}
+		nameTok, err := p.expect(TOKEN_IDENT)
+		if err != nil {
+			return nil, err
+		}
+		var bound ExprID = ExprNone
+		if kind == TypeParamTypeVar && p.match(TOKEN_COLON) {
+			bound, err = p.parseTernary()
+			if err != nil {
+				return nil, err
+			}
+		}
+		tps = append(tps, ASTTypeParam{
+			Kind:  kind,
+			Name:  p.tokenText(nameTok),
+			Bound: bound,
+		})
+		if !p.match(TOKEN_COMMA) {
+			break
+		}
+	}
+	if _, err := p.expect(TOKEN_RBRACKET); err != nil {
+		return nil, err
+	}
+	return tps, nil
+}
+
+func (p *Parser) parseAssertStmt() (StmtID, error) {
+	startTok, _ := p.expect(TOKEN_ASSERT)
+	cond, err := p.parseTernary()
+	if err != nil {
+		return StmtNone, err
+	}
+	var msg ExprID = ExprNone
+	if p.match(TOKEN_COMMA) {
+		msg, err = p.parseTernary()
+		if err != nil {
+			return StmtNone, err
+		}
+	}
+	p.match(TOKEN_SEMI)
+	p.match(TOKEN_NEWLINE)
+	return p.arena.AllocStmt(ASTStmt{
+		Kind:  StmtKindAssert,
+		Start: startTok.Start,
+		Expr1: cond,
+		Expr2: msg,
+	}), nil
+}
+
+func (p *Parser) parseDeleteStmt() (StmtID, error) {
+	startTok, _ := p.expect(TOKEN_DEL)
+	target, err := p.parseExpr()
+	if err != nil {
+		return StmtNone, err
+	}
+	p.match(TOKEN_SEMI)
+	p.match(TOKEN_NEWLINE)
+	return p.arena.AllocStmt(ASTStmt{
+		Kind:  StmtKindDelete,
+		Start: startTok.Start,
+		Expr1: target,
+	}), nil
+}
+
+func (p *Parser) parseFString() (ExprID, error) {
+	startTok, _ := p.expect(TOKEN_FSTRING_START)
+	var pieces []ExprID
+	for p.cur.Type != TOKEN_FSTRING_END && p.cur.Type != TOKEN_EOF {
+		if p.cur.Type == TOKEN_FSTRING_MIDDLE {
+			midTok := p.advance()
+			pieces = append(pieces, p.arena.AllocExpr(ASTExpr{
+				Kind:  ExprKindString,
+				Start: midTok.Start,
+				End:   midTok.End,
+			}))
+		} else if p.match(TOKEN_LBRACE) {
+			exprStart := p.cur.Start
+			valExpr, err := p.parseTernary()
+			if err != nil {
+				return ExprNone, err
+			}
+			debugText := ""
+			if p.match(TOKEN_ASSIGN) {
+				debugText = string(p.src[exprStart:p.cur.Start])
+			}
+			var formatSpec ExprID = ExprNone
+			if p.match(TOKEN_COLON) {
+				formatSpec, err = p.parseFormatSpec()
+				if err != nil {
+					return ExprNone, err
+				}
+			}
+			if _, err := p.expect(TOKEN_RBRACE); err != nil {
+				return ExprNone, err
+			}
+			fvIdx := p.arena.AllocFormattedValue(ASTFormattedValue{
+				Value:      valExpr,
+				FormatSpec: formatSpec,
+				DebugText:  debugText,
+			})
+			pieces = append(pieces, p.arena.AllocExpr(ASTExpr{
+				Kind:  ExprKindFormattedValue,
+				Left:  valExpr,
+				Right: formatSpec,
+				Extra: fvIdx,
+			}))
+		} else {
+			break
+		}
+	}
+	p.expect(TOKEN_FSTRING_END)
+	fsIdx := p.arena.AllocFString(ASTFString{
+		Pieces: p.arena.AddExprSlice(pieces),
+	})
+	return p.arena.AllocExpr(ASTExpr{
+		Kind:  ExprKindJoinedStr,
+		Start: startTok.Start,
+		Extra: fsIdx,
+	}), nil
+}
+
+func (p *Parser) parseFormatSpec() (ExprID, error) {
+	if p.cur.Type == TOKEN_FSTRING_MIDDLE {
+		midTok := p.advance()
+		return p.arena.AllocExpr(ASTExpr{
+			Kind:  ExprKindString,
+			Start: midTok.Start,
+			End:   midTok.End,
+		}), nil
+	}
+	return ExprNone, nil
+}
+
+func (p *Parser) parseLambda() (ExprID, error) {
+	startTok, _ := p.expect(TOKEN_LAMBDA)
+	var paramNames []string
+	var defaults []ExprID
+	if p.cur.Type != TOKEN_COLON {
+		for p.cur.Type != TOKEN_COLON && p.cur.Type != TOKEN_EOF {
+			if p.match(TOKEN_STARSTAR) {
+				pTok, err := p.expect(TOKEN_IDENT)
+				if err != nil {
+					return ExprNone, err
+				}
+				paramNames = append(paramNames, "**"+p.tokenText(pTok))
+			} else if p.match(TOKEN_STAR) {
+				if p.cur.Type == TOKEN_IDENT {
+					pTok := p.advance()
+					paramNames = append(paramNames, "*"+p.tokenText(pTok))
+				} else {
+					paramNames = append(paramNames, "*")
+				}
+			} else {
+				pTok, err := p.expect(TOKEN_IDENT)
+				if err != nil {
+					return ExprNone, err
+				}
+				paramNames = append(paramNames, p.tokenText(pTok))
+				if p.match(TOKEN_ASSIGN) {
+					defVal, err := p.parseTernary()
+					if err != nil {
+						return ExprNone, err
+					}
+					defaults = append(defaults, defVal)
+				}
+			}
+			if !p.match(TOKEN_COMMA) {
+				break
+			}
+		}
+	}
+	if _, err := p.expect(TOKEN_COLON); err != nil {
+		return ExprNone, err
+	}
+	bodyExpr, err := p.parseTernary()
+	if err != nil {
+		return ExprNone, err
+	}
+	retStmt := p.arena.AllocStmt(ASTStmt{
+		Kind:  StmtKindReturn,
+		Expr1: bodyExpr,
+	})
+	bodySlice := p.arena.AddStmtSlice([]StmtID{retStmt})
+	fnIdx := uint32(len(p.arena.FuncDefs))
+	p.arena.FuncDefs = append(p.arena.FuncDefs, ASTFuncDef{
+		Name:       "<lambda>",
+		ParamNames: p.arena.AddIdentSlice(paramNames),
+		Defaults:   p.arena.AddExprSlice(defaults),
+		Body:       p.arena.StmtSlices[bodySlice],
+	})
+	return p.arena.AllocExpr(ASTExpr{
+		Kind:  ExprKindLambda,
+		Start: startTok.Start,
+		Extra: fnIdx,
+	}), nil
+}
+
+func (p *Parser) parseWalrus() (ExprID, error) {
+	expr, err := p.parseTernary()
+	if err != nil {
+		return ExprNone, err
+	}
+	if p.match(TOKEN_WALRUS) {
+		val, err := p.parseTernary()
+		if err != nil {
+			return ExprNone, err
+		}
+		return p.arena.AllocExpr(ASTExpr{
+			Kind:  ExprKindNamedExpr,
+			Left:  expr,
+			Right: val,
+		}), nil
+	}
+	return expr, nil
+}
+
 // Expression Parsing (Pratt Precedence)
 
 func (p *Parser) parseExpr() (ExprID, error) {
 	if p.cur.Type == TOKEN_YIELD {
 		return p.parseYield()
 	}
-	first, err := p.parseTernary()
+	if p.cur.Type == TOKEN_LAMBDA {
+		return p.parseLambda()
+	}
+	first, err := p.parseWalrus()
 	if err != nil {
 		return ExprNone, err
 	}
@@ -1024,10 +1830,11 @@ func (p *Parser) parseExpr() (ExprID, error) {
 		for p.match(TOKEN_COMMA) {
 			if p.cur.Type == TOKEN_NEWLINE || p.cur.Type == TOKEN_SEMI || p.cur.Type == TOKEN_EOF ||
 				p.cur.Type == TOKEN_ASSIGN || p.cur.Type == TOKEN_RPAREN || p.cur.Type == TOKEN_RBRACKET ||
-				p.cur.Type == TOKEN_RBRACE || p.cur.Type == TOKEN_COLON {
+				p.cur.Type == TOKEN_RBRACE || p.cur.Type == TOKEN_COLON ||
+				(p.parsingForTarget && p.cur.Type == TOKEN_IN) {
 				break
 			}
-			item, err := p.parseTernary()
+			item, err := p.parseWalrus()
 			if err != nil {
 				return ExprNone, err
 			}
@@ -1185,7 +1992,87 @@ func (p *Parser) parseComparison() (ExprID, error) {
 }
 
 func (p *Parser) parseBitOr() (ExprID, error) {
-	return p.parseAddSub()
+	left, err := p.parseBitXor()
+	if err != nil {
+		return ExprNone, err
+	}
+	for p.cur.Type == TOKEN_PIPE {
+		p.advance()
+		right, err := p.parseBitXor()
+		if err != nil {
+			return ExprNone, err
+		}
+		left = p.arena.AllocExpr(ASTExpr{
+			Kind:  ExprKindBinary,
+			Op:    uint8(TOKEN_PIPE),
+			Left:  left,
+			Right: right,
+		})
+	}
+	return left, nil
+}
+
+func (p *Parser) parseBitXor() (ExprID, error) {
+	left, err := p.parseBitAnd()
+	if err != nil {
+		return ExprNone, err
+	}
+	for p.cur.Type == TOKEN_CARET {
+		p.advance()
+		right, err := p.parseBitAnd()
+		if err != nil {
+			return ExprNone, err
+		}
+		left = p.arena.AllocExpr(ASTExpr{
+			Kind:  ExprKindBinary,
+			Op:    uint8(TOKEN_CARET),
+			Left:  left,
+			Right: right,
+		})
+	}
+	return left, nil
+}
+
+func (p *Parser) parseBitAnd() (ExprID, error) {
+	left, err := p.parseShift()
+	if err != nil {
+		return ExprNone, err
+	}
+	for p.cur.Type == TOKEN_AMP {
+		p.advance()
+		right, err := p.parseShift()
+		if err != nil {
+			return ExprNone, err
+		}
+		left = p.arena.AllocExpr(ASTExpr{
+			Kind:  ExprKindBinary,
+			Op:    uint8(TOKEN_AMP),
+			Left:  left,
+			Right: right,
+		})
+	}
+	return left, nil
+}
+
+func (p *Parser) parseShift() (ExprID, error) {
+	left, err := p.parseAddSub()
+	if err != nil {
+		return ExprNone, err
+	}
+	for p.cur.Type == TOKEN_LSHIFT || p.cur.Type == TOKEN_RSHIFT {
+		opTok := p.advance()
+		right, err := p.parseAddSub()
+		if err != nil {
+			return ExprNone, err
+		}
+		left = p.arena.AllocExpr(ASTExpr{
+			Kind:  ExprKindBinary,
+			Op:    uint8(opTok.Type),
+			Left:  left,
+			Right: right,
+		})
+	}
+	return left, nil
 }
 
 func (p *Parser) parseAddSub() (ExprID, error) {
@@ -1215,7 +2102,8 @@ func (p *Parser) parseMulDiv() (ExprID, error) {
 		return ExprNone, err
 	}
 	for p.cur.Type == TOKEN_STAR || p.cur.Type == TOKEN_SLASH ||
-		p.cur.Type == TOKEN_SLASHSLASH || p.cur.Type == TOKEN_PERCENT {
+		p.cur.Type == TOKEN_SLASHSLASH || p.cur.Type == TOKEN_PERCENT ||
+		p.cur.Type == TOKEN_AT {
 		opTok := p.advance()
 		right, err := p.parseUnary()
 		if err != nil {
@@ -1244,7 +2132,7 @@ func (p *Parser) parseUnary() (ExprID, error) {
 			Left:  operand,
 		}), nil
 	}
-	if p.cur.Type == TOKEN_PLUS || p.cur.Type == TOKEN_MINUS {
+	if p.cur.Type == TOKEN_PLUS || p.cur.Type == TOKEN_MINUS || p.cur.Type == TOKEN_TILDE {
 		opTok := p.advance()
 		operand, err := p.parseUnary()
 		if err != nil {
@@ -1293,7 +2181,24 @@ func (p *Parser) parsePrimary() (ExprID, error) {
 			var kwArgs []ExprID
 
 			for p.cur.Type != TOKEN_RPAREN && p.cur.Type != TOKEN_EOF {
-				if p.cur.Type == TOKEN_IDENT && p.peek().Type == TOKEN_ASSIGN {
+				if p.match(TOKEN_STARSTAR) {
+					kwVal, err := p.parseTernary()
+					if err != nil {
+						return ExprNone, err
+					}
+					kwNames = append(kwNames, "") // "" indicates **kwargs
+					kwArgs = append(kwArgs, kwVal)
+				} else if p.match(TOKEN_STAR) {
+					arg, err := p.parseTernary()
+					if err != nil {
+						return ExprNone, err
+					}
+					starred := p.arena.AllocExpr(ASTExpr{
+						Kind: ExprKindStarred,
+						Left: arg,
+					})
+					posArgs = append(posArgs, starred)
+				} else if p.cur.Type == TOKEN_IDENT && p.peek().Type == TOKEN_ASSIGN {
 					nameTok := p.advance()
 					p.advance() // =
 					kwVal, err := p.parseTernary()
@@ -1306,6 +2211,41 @@ func (p *Parser) parsePrimary() (ExprID, error) {
 					arg, err := p.parseTernary()
 					if err != nil {
 						return ExprNone, err
+					}
+					if p.match(TOKEN_FOR) {
+						p.parsingForTarget = true
+						target, err := p.parseExpr()
+						p.parsingForTarget = false
+						if err != nil {
+							return ExprNone, err
+						}
+						if _, err := p.expect(TOKEN_IN); err != nil {
+							return ExprNone, err
+						}
+						iter, err := p.parseOr()
+						if err != nil {
+							return ExprNone, err
+						}
+						var ifs []ExprID
+						for p.match(TOKEN_IF) {
+							ifCond, err := p.parseOr()
+							if err != nil {
+								return ExprNone, err
+							}
+							ifs = append(ifs, ifCond)
+						}
+						compIdx := uint32(len(p.arena.Comps))
+						p.arena.Comps = append(p.arena.Comps, ASTComp{
+							Target:  target,
+							Iter:    iter,
+							IfConds: p.arena.AddExprSlice(ifs),
+							IsDict:  false,
+						})
+						arg = p.arena.AllocExpr(ASTExpr{
+							Kind:  ExprKindGeneratorExp,
+							Left:  arg,
+							Extra: compIdx,
+						})
 					}
 					posArgs = append(posArgs, arg)
 				}
@@ -1533,6 +2473,28 @@ func (p *Parser) parseAtom() (ExprID, error) {
 			End:   tok.End,
 		}), nil
 
+	case TOKEN_FSTRING_START:
+		return p.parseFString()
+
+	case TOKEN_ELLIPSIS:
+		tok := p.advance()
+		return p.arena.AllocExpr(ASTExpr{
+			Kind:  ExprKindEllipsis,
+			Start: tok.Start,
+			End:   tok.End,
+		}), nil
+
+	case TOKEN_STAR:
+		p.advance()
+		sub, err := p.parsePrimary()
+		if err != nil {
+			return ExprNone, err
+		}
+		return p.arena.AllocExpr(ASTExpr{
+			Kind: ExprKindStarred,
+			Left: sub,
+		}), nil
+
 	case TOKEN_LPAREN:
 		p.advance()
 		if p.match(TOKEN_RPAREN) {
@@ -1544,16 +2506,54 @@ func (p *Parser) parseAtom() (ExprID, error) {
 				Extra: sliceIdx,
 			}), nil
 		}
-		first, err := p.parseTernary()
+		first, err := p.parseWalrus()
 		if err != nil {
 			return ExprNone, err
+		}
+		if p.match(TOKEN_FOR) {
+			p.parsingForTarget = true
+			target, err := p.parseExpr()
+			p.parsingForTarget = false
+			if err != nil {
+				return ExprNone, err
+			}
+			if _, err := p.expect(TOKEN_IN); err != nil {
+				return ExprNone, err
+			}
+			iter, err := p.parseOr()
+			if err != nil {
+				return ExprNone, err
+			}
+			var ifs []ExprID
+			for p.match(TOKEN_IF) {
+				ifCond, err := p.parseOr()
+				if err != nil {
+					return ExprNone, err
+				}
+				ifs = append(ifs, ifCond)
+			}
+			if _, err := p.expect(TOKEN_RPAREN); err != nil {
+				return ExprNone, err
+			}
+			compIdx := uint32(len(p.arena.Comps))
+			p.arena.Comps = append(p.arena.Comps, ASTComp{
+				Target:  target,
+				Iter:    iter,
+				IfConds: p.arena.AddExprSlice(ifs),
+				IsDict:  false,
+			})
+			return p.arena.AllocExpr(ASTExpr{
+				Kind:  ExprKindGeneratorExp,
+				Left:  first,
+				Extra: compIdx,
+			}), nil
 		}
 		if p.match(TOKEN_COMMA) {
 			// Tuple literal (a, ...)
 			var items []ExprID
 			items = append(items, first)
 			for p.cur.Type != TOKEN_RPAREN && p.cur.Type != TOKEN_EOF {
-				item, err := p.parseTernary()
+				item, err := p.parseWalrus()
 				if err != nil {
 					return ExprNone, err
 				}
@@ -1589,7 +2589,7 @@ func (p *Parser) parseAtom() (ExprID, error) {
 				Extra: sliceIdx,
 			}), nil
 		}
-		first, err := p.parseTernary()
+		first, err := p.parseWalrus()
 		if err != nil {
 			return ExprNone, err
 		}
@@ -1637,7 +2637,7 @@ func (p *Parser) parseAtom() (ExprID, error) {
 		var items []ExprID
 		items = append(items, first)
 		for p.match(TOKEN_COMMA) && p.cur.Type != TOKEN_RBRACKET && p.cur.Type != TOKEN_EOF {
-			item, err := p.parseTernary()
+			item, err := p.parseWalrus()
 			if err != nil {
 				return ExprNone, err
 			}
@@ -1662,19 +2662,136 @@ func (p *Parser) parseAtom() (ExprID, error) {
 				Kind: ExprKindDict,
 			}), nil
 		}
+		if p.match(TOKEN_STARSTAR) {
+			v, err := p.parseTernary()
+			if err != nil {
+				return ExprNone, err
+			}
+			dictStart := uint32(len(p.arena.DictPairs))
+			p.arena.DictPairs = append(p.arena.DictPairs, ASTDictPair{Key: ExprNone, Value: v})
+			for p.match(TOKEN_COMMA) && p.cur.Type != TOKEN_RBRACE && p.cur.Type != TOKEN_EOF {
+				if p.match(TOKEN_STARSTAR) {
+					v2, err := p.parseTernary()
+					if err != nil {
+						return ExprNone, err
+					}
+					p.arena.DictPairs = append(p.arena.DictPairs, ASTDictPair{Key: ExprNone, Value: v2})
+				} else {
+					k, err := p.parseTernary()
+					if err != nil {
+						return ExprNone, err
+					}
+					if _, err := p.expect(TOKEN_COLON); err != nil {
+						return ExprNone, err
+					}
+					v2, err := p.parseTernary()
+					if err != nil {
+						return ExprNone, err
+					}
+					p.arena.DictPairs = append(p.arena.DictPairs, ASTDictPair{Key: k, Value: v2})
+				}
+			}
+			if _, err := p.expect(TOKEN_RBRACE); err != nil {
+				return ExprNone, err
+			}
+			count := uint32(len(p.arena.DictPairs)) - dictStart
+			return p.arena.AllocExpr(ASTExpr{
+				Kind:  ExprKindDict,
+				Extra: dictStart,
+				Op:    uint8(count),
+			}), nil
+		}
+
 		firstKey, err := p.parseTernary()
 		if err != nil {
 			return ExprNone, err
 		}
-		if _, err := p.expect(TOKEN_COLON); err != nil {
-			return ExprNone, err
-		}
-		firstVal, err := p.parseTernary()
-		if err != nil {
-			return ExprNone, err
+
+		if p.match(TOKEN_COLON) {
+			firstVal, err := p.parseTernary()
+			if err != nil {
+				return ExprNone, err
+			}
+
+			// Check for dict comprehension: {k: v for target in iter if cond}
+			if p.match(TOKEN_FOR) {
+				p.parsingForTarget = true
+				target, err := p.parseExpr()
+				p.parsingForTarget = false
+				if err != nil {
+					return ExprNone, err
+				}
+				if _, err := p.expect(TOKEN_IN); err != nil {
+					return ExprNone, err
+				}
+				iter, err := p.parseOr()
+				if err != nil {
+					return ExprNone, err
+				}
+				var ifs []ExprID
+				for p.match(TOKEN_IF) {
+					ifCond, err := p.parseOr()
+					if err != nil {
+						return ExprNone, err
+					}
+					ifs = append(ifs, ifCond)
+				}
+				if _, err := p.expect(TOKEN_RBRACE); err != nil {
+					return ExprNone, err
+				}
+				compIdx := uint32(len(p.arena.Comps))
+				p.arena.Comps = append(p.arena.Comps, ASTComp{
+					Target:  target,
+					Iter:    iter,
+					IfConds: p.arena.AddExprSlice(ifs),
+					IsDict:  true,
+				})
+				return p.arena.AllocExpr(ASTExpr{
+					Kind:  ExprKindDictComp,
+					Left:  firstKey,
+					Right: firstVal,
+					Extra: compIdx,
+				}), nil
+			}
+
+			// Regular dict literal {k: v, ...}
+			dictStart := uint32(len(p.arena.DictPairs))
+			p.arena.DictPairs = append(p.arena.DictPairs, ASTDictPair{Key: firstKey, Value: firstVal})
+
+			for p.match(TOKEN_COMMA) && p.cur.Type != TOKEN_RBRACE && p.cur.Type != TOKEN_EOF {
+				if p.match(TOKEN_STARSTAR) {
+					v, err := p.parseTernary()
+					if err != nil {
+						return ExprNone, err
+					}
+					p.arena.DictPairs = append(p.arena.DictPairs, ASTDictPair{Key: ExprNone, Value: v})
+				} else {
+					k, err := p.parseTernary()
+					if err != nil {
+						return ExprNone, err
+					}
+					if _, err := p.expect(TOKEN_COLON); err != nil {
+						return ExprNone, err
+					}
+					v, err := p.parseTernary()
+					if err != nil {
+						return ExprNone, err
+					}
+					p.arena.DictPairs = append(p.arena.DictPairs, ASTDictPair{Key: k, Value: v})
+				}
+			}
+			if _, err := p.expect(TOKEN_RBRACE); err != nil {
+				return ExprNone, err
+			}
+			count := uint32(len(p.arena.DictPairs)) - dictStart
+			return p.arena.AllocExpr(ASTExpr{
+				Kind:  ExprKindDict,
+				Extra: dictStart,
+				Op:    uint8(count),
+			}), nil
 		}
 
-		// Check for dict comprehension: {k: v for target in iter if cond}
+		// Check for set comprehension: {elt for target in iter if cond}
 		if p.match(TOKEN_FOR) {
 			p.parsingForTarget = true
 			target, err := p.parseExpr()
@@ -1705,42 +2822,34 @@ func (p *Parser) parseAtom() (ExprID, error) {
 				Target:  target,
 				Iter:    iter,
 				IfConds: p.arena.AddExprSlice(ifs),
-				IsDict:  true,
+				IsDict:  false,
 			})
 			return p.arena.AllocExpr(ASTExpr{
-				Kind:  ExprKindDictComp,
+				Kind:  ExprKindSetComp,
 				Left:  firstKey,
-				Right: firstVal,
 				Extra: compIdx,
 			}), nil
 		}
 
-		// Regular dict literal {k: v, ...}
-		dictStart := uint32(len(p.arena.DictPairs))
-		p.arena.DictPairs = append(p.arena.DictPairs, ASTDictPair{Key: firstKey, Value: firstVal})
-
+		// Regular set literal {a, b, ...}
+		var items []ExprID
+		items = append(items, firstKey)
 		for p.match(TOKEN_COMMA) && p.cur.Type != TOKEN_RBRACE && p.cur.Type != TOKEN_EOF {
-			k, err := p.parseTernary()
+			item, err := p.parseTernary()
 			if err != nil {
 				return ExprNone, err
 			}
-			if _, err := p.expect(TOKEN_COLON); err != nil {
-				return ExprNone, err
-			}
-			v, err := p.parseTernary()
-			if err != nil {
-				return ExprNone, err
-			}
-			p.arena.DictPairs = append(p.arena.DictPairs, ASTDictPair{Key: k, Value: v})
+			items = append(items, item)
 		}
 		if _, err := p.expect(TOKEN_RBRACE); err != nil {
 			return ExprNone, err
 		}
-		count := uint32(len(p.arena.DictPairs)) - dictStart
+		p.arena.AddExprSlice(items)
+		sliceIdx := uint32(len(p.arena.ExprSlices) - 1)
 		return p.arena.AllocExpr(ASTExpr{
-			Kind:  ExprKindDict,
-			Extra: dictStart,
-			Op:    uint8(count),
+			Kind:  ExprKindSet,
+			Extra: sliceIdx,
+			Op:    uint8(len(items)),
 		}), nil
 
 	case TOKEN_YIELD:

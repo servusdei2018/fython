@@ -87,6 +87,44 @@ const (
 	OP_FAST_CMP_EQ_JUMP_IF_FALSE
 	OP_FAST_NEG_INT_LOCAL
 	OP_FAST_SUBSCR_DEREF_LIST_LOCAL
+
+	// String Formatting & Interpolation
+	OP_FORMAT_VALUE
+	OP_BUILD_STRING
+
+	// Structural Pattern Matching
+	OP_MATCH_SEQUENCE
+	OP_MATCH_MAPPING
+	OP_MATCH_KEYS
+	OP_MATCH_CLASS
+
+	// Sequence & Extended Argument Unpacking
+	OP_UNPACK_EX
+	OP_CALL_FUNCTION_EX
+
+	// Bitwise, Shift & Matrix Arithmetic
+	OP_BINARY_AND
+	OP_BINARY_OR
+	OP_BINARY_XOR
+	OP_BINARY_LSHIFT
+	OP_BINARY_RSHIFT
+	OP_UNARY_INVERT
+	OP_BINARY_MATMUL
+
+	// Collection Construction & Mutation
+	OP_BUILD_SET
+	OP_SET_ADD
+	OP_BUILD_MAP_UNPACK
+	OP_LIST_EXTEND
+
+	// Identifier & Attribute Deletion
+	OP_DELETE_FAST
+	OP_DELETE_GLOBAL
+	OP_DELETE_ATTR
+	OP_DELETE_SUBSCR
+
+	// Exception Groups
+	OP_CHECK_EXC_MATCH_STAR
 )
 
 // Comparison operation codes for OP_COMPARE_OP (passed in ArgA field).
@@ -249,6 +287,54 @@ func (op Opcode) String() string {
 		return "OP_FAST_NEG_INT_LOCAL"
 	case OP_FAST_SUBSCR_DEREF_LIST_LOCAL:
 		return "OP_FAST_SUBSCR_DEREF_LIST_LOCAL"
+	case OP_FORMAT_VALUE:
+		return "OP_FORMAT_VALUE"
+	case OP_BUILD_STRING:
+		return "OP_BUILD_STRING"
+	case OP_MATCH_SEQUENCE:
+		return "OP_MATCH_SEQUENCE"
+	case OP_MATCH_MAPPING:
+		return "OP_MATCH_MAPPING"
+	case OP_MATCH_KEYS:
+		return "OP_MATCH_KEYS"
+	case OP_MATCH_CLASS:
+		return "OP_MATCH_CLASS"
+	case OP_UNPACK_EX:
+		return "OP_UNPACK_EX"
+	case OP_BINARY_AND:
+		return "OP_BINARY_AND"
+	case OP_BINARY_OR:
+		return "OP_BINARY_OR"
+	case OP_BINARY_XOR:
+		return "OP_BINARY_XOR"
+	case OP_BINARY_LSHIFT:
+		return "OP_BINARY_LSHIFT"
+	case OP_BINARY_RSHIFT:
+		return "OP_BINARY_RSHIFT"
+	case OP_UNARY_INVERT:
+		return "OP_UNARY_INVERT"
+	case OP_BUILD_SET:
+		return "OP_BUILD_SET"
+	case OP_SET_ADD:
+		return "OP_SET_ADD"
+	case OP_DELETE_FAST:
+		return "OP_DELETE_FAST"
+	case OP_DELETE_GLOBAL:
+		return "OP_DELETE_GLOBAL"
+	case OP_DELETE_ATTR:
+		return "OP_DELETE_ATTR"
+	case OP_DELETE_SUBSCR:
+		return "OP_DELETE_SUBSCR"
+	case OP_CHECK_EXC_MATCH_STAR:
+		return "OP_CHECK_EXC_MATCH_STAR"
+	case OP_BUILD_MAP_UNPACK:
+		return "OP_BUILD_MAP_UNPACK"
+	case OP_LIST_EXTEND:
+		return "OP_LIST_EXTEND"
+	case OP_BINARY_MATMUL:
+		return "OP_BINARY_MATMUL"
+	case OP_CALL_FUNCTION_EX:
+		return "OP_CALL_FUNCTION_EX"
 	default:
 		return "OP_UNKNOWN"
 	}

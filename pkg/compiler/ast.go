@@ -38,6 +38,15 @@ const (
 	ExprKindYieldFrom
 	ExprKindSlice
 	ExprKindAwait
+	ExprKindJoinedStr
+	ExprKindFormattedValue
+	ExprKindSet
+	ExprKindSetComp
+	ExprKindGeneratorExp
+	ExprKindLambda
+	ExprKindStarred
+	ExprKindNamedExpr
+	ExprKindEllipsis
 )
 
 // ASTExpr represents a flat, unboxed expression node stored in contiguous arena slices.
@@ -80,6 +89,11 @@ const (
 	StmtKindAsyncFuncDef
 	StmtKindAsyncFor
 	StmtKindAsyncWith
+	StmtKindMatch
+	StmtKindTypeAlias
+	StmtKindAssert
+	StmtKindDelete
+	StmtKindAnnAssign
 )
 
 // ASTStmt represents a flat, unboxed statement node stored in contiguous arena slices.
@@ -136,6 +150,35 @@ type ASTDictPair struct {
 	Value ExprID
 }
 
+// TypeParamKind identifies the variant of a PEP 695 type parameter.
+type TypeParamKind uint8
+
+const (
+	TypeParamTypeVar TypeParamKind = iota
+	TypeParamTypeVarTuple
+	TypeParamParamSpec
+)
+
+// ASTTypeParam stores a single type parameter (e.g. T, *Ts, **P).
+type ASTTypeParam struct {
+	Kind  TypeParamKind
+	Name  string
+	Bound ExprID
+}
+
+// TypeParamSlice references a contiguous sequence of ASTTypeParam handles in ASTArena.TypeParams.
+type TypeParamSlice struct {
+	Start uint32
+	Count uint32
+}
+
+// ASTTypeAlias stores a PEP 695 type alias (e.g. `type Alias[T] = Value`).
+type ASTTypeAlias struct {
+	Name       string
+	TypeParams TypeParamSlice
+	Value      ExprID
+}
+
 // ASTFuncDef stores function definition metadata.
 type ASTFuncDef struct {
 	Name       string
@@ -143,13 +186,20 @@ type ASTFuncDef struct {
 	Defaults   ExprSlice
 	Body       StmtSlice
 	IsAsync    bool
+	TypeParams TypeParamSlice
+	Decorators ExprSlice
+	Returns    ExprID
+	ParamTypes ExprSlice
 }
 
 // ASTClassDef stores class definition metadata.
 type ASTClassDef struct {
-	Name  string
-	Bases ExprSlice
-	Body  StmtSlice
+	Name       string
+	Bases      ExprSlice
+	Body       StmtSlice
+	TypeParams TypeParamSlice
+	Decorators ExprSlice
+	Keywords   ExprSlice
 }
 
 // ASTElif stores an elif condition and body.
@@ -160,9 +210,79 @@ type ASTElif struct {
 
 // ASTExceptHandler stores an except clause.
 type ASTExceptHandler struct {
-	Type ExprID // Exception type expression, or ExprNone for bare except:
-	Name string // as name, or empty string
-	Body StmtSlice
+	Type   ExprID // Exception type expression, or ExprNone for bare except:
+	Name   string // as name, or empty string
+	Body   StmtSlice
+	IsStar bool // PEP 654 except*
+}
+
+// PatternID is an unboxed 32-bit handle referencing an ASTPattern in ASTArena.Patterns.
+type PatternID uint32
+
+const PatternNone PatternID = 0
+
+// PatternKind discriminates the variant of a PEP 634 match pattern.
+type PatternKind uint8
+
+const (
+	PatternKindNone PatternKind = iota
+	PatternKindValue
+	PatternKindSingleton
+	PatternKindCapture
+	PatternKindWildcard
+	PatternKindAs
+	PatternKindOr
+	PatternKindSequence
+	PatternKindMapping
+	PatternKindClass
+)
+
+// ASTPattern represents a structural pattern node stored in flat arena storage.
+type ASTPattern struct {
+	Kind    PatternKind
+	Expr1   ExprID // Literal/Singleton value, class type expr, or subpattern
+	Expr2   ExprID // Target expr or rest target
+	Extra   uint32 // Index into PatternSlices, IdentSlice, etc.
+	Name    string // Capture / As name
+	StarIdx int32  // For sequence patterns (-1 if none)
+}
+
+// PatternSlice references a contiguous sequence of PatternIDs in ASTArena.PatternIDs.
+type PatternSlice struct {
+	Start uint32
+	Count uint32
+}
+
+// ASTMatchCase stores a single case pattern [if guard]: body in a match statement.
+type ASTMatchCase struct {
+	Pattern PatternID
+	Guard   ExprID
+	Body    StmtSlice
+}
+
+// MatchCaseSlice references a contiguous sequence of ASTMatchCases in ASTArena.MatchCases.
+type MatchCaseSlice struct {
+	Start uint32
+	Count uint32
+}
+
+// ASTMatchStmt stores match statement metadata.
+type ASTMatchStmt struct {
+	Subject ExprID
+	Cases   MatchCaseSlice
+}
+
+// ASTFormattedValue stores an interpolation field inside an f-string.
+type ASTFormattedValue struct {
+	Value      ExprID
+	Conversion uint8 // 0, 's', 'r', 'a'
+	FormatSpec ExprID
+	DebugText  string
+}
+
+// ASTFString stores a PEP 701 f-string composed of literal strings and formatted values.
+type ASTFString struct {
+	Pieces ExprSlice
 }
 
 // ExceptSlice references a contiguous sequence of ASTExceptHandler handles in ASTArena.ExceptHandlers.
@@ -242,6 +362,23 @@ type ASTArena struct {
 	AliasSlices    []AliasSlice
 	Imports        []ASTImport
 	ImportFroms    []ASTImportFrom
+
+	// Structural Pattern Matching
+	Patterns        []ASTPattern
+	PatternIDs      []PatternID
+	PatternSlices   []PatternSlice
+	MatchCases      []ASTMatchCase
+	MatchCaseSlices []MatchCaseSlice
+	MatchStmts      []ASTMatchStmt
+
+	// Formatted String Expressions
+	FormattedValues []ASTFormattedValue
+	FStrings        []ASTFString
+
+	// Generics & Type Aliases
+	TypeParams      []ASTTypeParam
+	TypeParamSlices []TypeParamSlice
+	TypeAliases     []ASTTypeAlias
 }
 
 // NewASTArena constructs an ASTArena with pre-allocated capacity for zero-allocation parsing.
@@ -250,29 +387,40 @@ func NewASTArena(initialCap int) *ASTArena {
 		initialCap = 256
 	}
 	return &ASTArena{
-		Exprs:          make([]ASTExpr, 0, initialCap*2),
-		Stmts:          make([]ASTStmt, 0, initialCap),
-		ExprIDs:        make([]ExprID, 0, initialCap*2),
-		StmtIDs:        make([]StmtID, 0, initialCap*2),
-		StmtSlices:     make([]StmtSlice, 0, initialCap/2),
-		ExprSlices:     make([]ExprSlice, 0, initialCap/2),
-		IdentSlices:    make([]IdentSlice, 0, initialCap/4),
-		Idents:         make([]string, 0, initialCap),
-		IntConsts:      make([]int64, 0, initialCap/2),
-		FloatConsts:    make([]float64, 0, initialCap/4),
-		Calls:          make([]ASTCall, 0, initialCap/4),
-		Comps:          make([]ASTComp, 0, initialCap/8),
-		DictPairs:      make([]ASTDictPair, 0, initialCap/2),
-		FuncDefs:       make([]ASTFuncDef, 0, initialCap/8),
-		ClassDefs:      make([]ASTClassDef, 0, initialCap/16),
-		Elifs:          make([]ASTElif, 0, initialCap/8),
-		ExceptHandlers: make([]ASTExceptHandler, 0, initialCap/8),
-		WithItems:      make([]ASTWithItem, 0, initialCap/8),
-		TryStmts:       make([]ASTTry, 0, initialCap/8),
-		Aliases:        make([]ASTAlias, 0, initialCap/4),
-		AliasSlices:    make([]AliasSlice, 0, initialCap/8),
-		Imports:        make([]ASTImport, 0, initialCap/8),
-		ImportFroms:    make([]ASTImportFrom, 0, initialCap/8),
+		Exprs:           make([]ASTExpr, 0, initialCap*2),
+		Stmts:           make([]ASTStmt, 0, initialCap),
+		ExprIDs:         make([]ExprID, 0, initialCap*2),
+		StmtIDs:         make([]StmtID, 0, initialCap*2),
+		StmtSlices:      make([]StmtSlice, 0, initialCap/2),
+		ExprSlices:      make([]ExprSlice, 0, initialCap/2),
+		IdentSlices:     make([]IdentSlice, 0, initialCap/4),
+		Idents:          make([]string, 0, initialCap),
+		IntConsts:       make([]int64, 0, initialCap/2),
+		FloatConsts:     make([]float64, 0, initialCap/4),
+		Calls:           make([]ASTCall, 0, initialCap/4),
+		Comps:           make([]ASTComp, 0, initialCap/8),
+		DictPairs:       make([]ASTDictPair, 0, initialCap/2),
+		FuncDefs:        make([]ASTFuncDef, 0, initialCap/8),
+		ClassDefs:       make([]ASTClassDef, 0, initialCap/16),
+		Elifs:           make([]ASTElif, 0, initialCap/8),
+		ExceptHandlers:  make([]ASTExceptHandler, 0, initialCap/8),
+		WithItems:       make([]ASTWithItem, 0, initialCap/8),
+		TryStmts:        make([]ASTTry, 0, initialCap/8),
+		Aliases:         make([]ASTAlias, 0, initialCap/4),
+		AliasSlices:     make([]AliasSlice, 0, initialCap/8),
+		Imports:         make([]ASTImport, 0, initialCap/8),
+		ImportFroms:     make([]ASTImportFrom, 0, initialCap/8),
+		Patterns:        make([]ASTPattern, 0, initialCap/4),
+		PatternIDs:      make([]PatternID, 0, initialCap/4),
+		PatternSlices:   make([]PatternSlice, 0, initialCap/8),
+		MatchCases:      make([]ASTMatchCase, 0, initialCap/4),
+		MatchCaseSlices: make([]MatchCaseSlice, 0, initialCap/8),
+		MatchStmts:      make([]ASTMatchStmt, 0, initialCap/8),
+		FormattedValues: make([]ASTFormattedValue, 0, initialCap/4),
+		FStrings:        make([]ASTFString, 0, initialCap/8),
+		TypeParams:      make([]ASTTypeParam, 0, initialCap/8),
+		TypeParamSlices: make([]TypeParamSlice, 0, initialCap/8),
+		TypeAliases:     make([]ASTTypeAlias, 0, initialCap/8),
 	}
 }
 
@@ -301,6 +449,17 @@ func (a *ASTArena) Reset() {
 	a.AliasSlices = a.AliasSlices[:0]
 	a.Imports = a.Imports[:0]
 	a.ImportFroms = a.ImportFroms[:0]
+	a.Patterns = a.Patterns[:0]
+	a.PatternIDs = a.PatternIDs[:0]
+	a.PatternSlices = a.PatternSlices[:0]
+	a.MatchCases = a.MatchCases[:0]
+	a.MatchCaseSlices = a.MatchCaseSlices[:0]
+	a.MatchStmts = a.MatchStmts[:0]
+	a.FormattedValues = a.FormattedValues[:0]
+	a.FStrings = a.FStrings[:0]
+	a.TypeParams = a.TypeParams[:0]
+	a.TypeParamSlices = a.TypeParamSlices[:0]
+	a.TypeAliases = a.TypeAliases[:0]
 }
 
 // AllocExpr appends an ASTExpr and returns its 1-based ExprID handle.
@@ -365,6 +524,14 @@ func (a *ASTArena) GetStmtSlice(sliceIdx uint32) []StmtID {
 		return nil
 	}
 	s := a.StmtSlices[sliceIdx]
+	return a.StmtIDs[s.Start : s.Start+s.Count]
+}
+
+// GetStmtSliceDirect retrieves the contiguous StmtIDs directly for a StmtSlice descriptor.
+func (a *ASTArena) GetStmtSliceDirect(s StmtSlice) []StmtID {
+	if s.Start+s.Count > uint32(len(a.StmtIDs)) {
+		return nil
+	}
 	return a.StmtIDs[s.Start : s.Start+s.Count]
 }
 
@@ -496,4 +663,138 @@ func (a *ASTArena) GetImportFrom(idx uint32) *ASTImportFrom {
 		return nil
 	}
 	return &a.ImportFroms[idx]
+}
+
+// AllocPattern appends an ASTPattern and returns its 1-based PatternID handle.
+func (a *ASTArena) AllocPattern(p ASTPattern) PatternID {
+	id := PatternID(len(a.Patterns) + 1)
+	a.Patterns = append(a.Patterns, p)
+	return id
+}
+
+// GetPattern retrieves a pointer to the ASTPattern for id.
+func (a *ASTArena) GetPattern(id PatternID) *ASTPattern {
+	if id == 0 || int(id) > len(a.Patterns) {
+		return nil
+	}
+	return &a.Patterns[id-1]
+}
+
+// AddPatternSlice records a slice of PatternIDs and returns the PatternSlice descriptor.
+func (a *ASTArena) AddPatternSlice(ids []PatternID) PatternSlice {
+	start := uint32(len(a.PatternIDs))
+	a.PatternIDs = append(a.PatternIDs, ids...)
+	return PatternSlice{
+		Start: start,
+		Count: uint32(len(ids)),
+	}
+}
+
+// GetPatternSlice retrieves the contiguous PatternIDs for a PatternSlice descriptor.
+func (a *ASTArena) GetPatternSlice(s PatternSlice) []PatternID {
+	return a.PatternIDs[s.Start : s.Start+s.Count]
+}
+
+// AllocMatchCase records an ASTMatchCase and returns its index.
+func (a *ASTArena) AllocMatchCase(c ASTMatchCase) uint32 {
+	idx := uint32(len(a.MatchCases))
+	a.MatchCases = append(a.MatchCases, c)
+	return idx
+}
+
+// AddMatchCaseSlice records a slice of ASTMatchCase and returns a MatchCaseSlice descriptor.
+func (a *ASTArena) AddMatchCaseSlice(cases []ASTMatchCase) MatchCaseSlice {
+	start := uint32(len(a.MatchCases))
+	a.MatchCases = append(a.MatchCases, cases...)
+	return MatchCaseSlice{
+		Start: start,
+		Count: uint32(len(cases)),
+	}
+}
+
+// GetMatchCaseSlice retrieves the contiguous ASTMatchCase slice for a MatchCaseSlice descriptor.
+func (a *ASTArena) GetMatchCaseSlice(s MatchCaseSlice) []ASTMatchCase {
+	return a.MatchCases[s.Start : s.Start+s.Count]
+}
+
+// AllocMatchStmt records an ASTMatchStmt and returns its index.
+func (a *ASTArena) AllocMatchStmt(m ASTMatchStmt) uint32 {
+	idx := uint32(len(a.MatchStmts))
+	a.MatchStmts = append(a.MatchStmts, m)
+	return idx
+}
+
+// GetMatchStmt retrieves an ASTMatchStmt by index.
+func (a *ASTArena) GetMatchStmt(idx uint32) *ASTMatchStmt {
+	if int(idx) >= len(a.MatchStmts) {
+		return nil
+	}
+	return &a.MatchStmts[idx]
+}
+
+// AllocFormattedValue records an ASTFormattedValue and returns its index.
+func (a *ASTArena) AllocFormattedValue(fv ASTFormattedValue) uint32 {
+	idx := uint32(len(a.FormattedValues))
+	a.FormattedValues = append(a.FormattedValues, fv)
+	return idx
+}
+
+// GetFormattedValue retrieves an ASTFormattedValue by index.
+func (a *ASTArena) GetFormattedValue(idx uint32) *ASTFormattedValue {
+	if int(idx) >= len(a.FormattedValues) {
+		return nil
+	}
+	return &a.FormattedValues[idx]
+}
+
+// AllocFString records an ASTFString and returns its index.
+func (a *ASTArena) AllocFString(fs ASTFString) uint32 {
+	idx := uint32(len(a.FStrings))
+	a.FStrings = append(a.FStrings, fs)
+	return idx
+}
+
+// GetFString retrieves an ASTFString by index.
+func (a *ASTArena) GetFString(idx uint32) *ASTFString {
+	if int(idx) >= len(a.FStrings) {
+		return nil
+	}
+	return &a.FStrings[idx]
+}
+
+// AllocTypeParam records an ASTTypeParam and returns its index.
+func (a *ASTArena) AllocTypeParam(tp ASTTypeParam) uint32 {
+	idx := uint32(len(a.TypeParams))
+	a.TypeParams = append(a.TypeParams, tp)
+	return idx
+}
+
+// AddTypeParamSlice records a contiguous sequence of ASTTypeParams and returns a TypeParamSlice descriptor.
+func (a *ASTArena) AddTypeParamSlice(tps []ASTTypeParam) TypeParamSlice {
+	start := uint32(len(a.TypeParams))
+	a.TypeParams = append(a.TypeParams, tps...)
+	return TypeParamSlice{
+		Start: start,
+		Count: uint32(len(tps)),
+	}
+}
+
+// GetTypeParamSlice retrieves the contiguous ASTTypeParams for a TypeParamSlice descriptor.
+func (a *ASTArena) GetTypeParamSlice(s TypeParamSlice) []ASTTypeParam {
+	return a.TypeParams[s.Start : s.Start+s.Count]
+}
+
+// AllocTypeAlias records an ASTTypeAlias and returns its index.
+func (a *ASTArena) AllocTypeAlias(ta ASTTypeAlias) uint32 {
+	idx := uint32(len(a.TypeAliases))
+	a.TypeAliases = append(a.TypeAliases, ta)
+	return idx
+}
+
+// GetTypeAlias retrieves an ASTTypeAlias by index.
+func (a *ASTArena) GetTypeAlias(idx uint32) *ASTTypeAlias {
+	if int(idx) >= len(a.TypeAliases) {
+		return nil
+	}
+	return &a.TypeAliases[idx]
 }

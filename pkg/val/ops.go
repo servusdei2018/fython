@@ -672,3 +672,112 @@ func NormalizeSliceIndices(startVal, stopVal, stepVal Value, length int) (start,
 
 	return start, stop, step, sliceLen, nil
 }
+
+// BitAnd performs Python bitwise and (a & b).
+func BitAnd(ctx *ExecContext, a, b Value) Value {
+	if (a.ptr == &tagInt64 || a.ptr == &tagBool) && (b.ptr == &tagInt64 || b.ptr == &tagBool) {
+		return Int64Val(int64(a.num) & int64(b.num))
+	}
+	if a.IsSet() && b.IsSet() {
+		return a.AsSet().Intersection(b.AsSet())
+	}
+	if m, _, ok := a.Type().LookupMRO(InternString("__and__")); ok {
+		if ctx != nil {
+			return ctx.Invoke2(m, a, b)
+		}
+	}
+	panic("TypeError: unsupported operand type(s) for &: '" + a.Type().Name + "' and '" + b.Type().Name + "'")
+}
+
+// BitOr performs Python bitwise or (a | b).
+func BitOr(ctx *ExecContext, a, b Value) Value {
+	if (a.ptr == &tagInt64 || a.ptr == &tagBool) && (b.ptr == &tagInt64 || b.ptr == &tagBool) {
+		return Int64Val(int64(a.num) | int64(b.num))
+	}
+	if a.IsSet() && b.IsSet() {
+		return a.AsSet().Union(b.AsSet())
+	}
+	if a.IsType() || b.IsType() {
+		nameA := a.Type().Name
+		if a.IsType() {
+			nameA = a.AsType().Name
+		}
+		nameB := b.Type().Name
+		if b.IsType() {
+			nameB = b.AsType().Name
+		}
+		u := MustNewType(nameA+" | "+nameB, []*PyType{ObjectType}, nil)
+		return TypeVal(u)
+	}
+	if m, _, ok := a.Type().LookupMRO(InternString("__or__")); ok {
+		if ctx != nil {
+			return ctx.Invoke2(m, a, b)
+		}
+	}
+	panic("TypeError: unsupported operand type(s) for |: '" + a.Type().Name + "' and '" + b.Type().Name + "'")
+}
+
+// BitXor performs Python bitwise xor (a ^ b).
+func BitXor(ctx *ExecContext, a, b Value) Value {
+	if (a.ptr == &tagInt64 || a.ptr == &tagBool) && (b.ptr == &tagInt64 || b.ptr == &tagBool) {
+		return Int64Val(int64(a.num) ^ int64(b.num))
+	}
+	if a.IsSet() && b.IsSet() {
+		return a.AsSet().SymmetricDifference(b.AsSet())
+	}
+	if m, _, ok := a.Type().LookupMRO(InternString("__xor__")); ok {
+		if ctx != nil {
+			return ctx.Invoke2(m, a, b)
+		}
+	}
+	panic("TypeError: unsupported operand type(s) for ^: '" + a.Type().Name + "' and '" + b.Type().Name + "'")
+}
+
+// LShift performs Python left shift (a << b).
+func LShift(ctx *ExecContext, a, b Value) Value {
+	if (a.ptr == &tagInt64 || a.ptr == &tagBool) && (b.ptr == &tagInt64 || b.ptr == &tagBool) {
+		return Int64Val(int64(a.num) << uint64(b.num))
+	}
+	if m, _, ok := a.Type().LookupMRO(InternString("__lshift__")); ok {
+		if ctx != nil {
+			return ctx.Invoke2(m, a, b)
+		}
+	}
+	panic("TypeError: unsupported operand type(s) for <<: '" + a.Type().Name + "' and '" + b.Type().Name + "'")
+}
+
+// RShift performs Python right shift (a >> b).
+func RShift(ctx *ExecContext, a, b Value) Value {
+	if (a.ptr == &tagInt64 || a.ptr == &tagBool) && (b.ptr == &tagInt64 || b.ptr == &tagBool) {
+		return Int64Val(int64(a.num) >> uint64(b.num))
+	}
+	if m, _, ok := a.Type().LookupMRO(InternString("__rshift__")); ok {
+		if ctx != nil {
+			return ctx.Invoke2(m, a, b)
+		}
+	}
+	panic("TypeError: unsupported operand type(s) for >>: '" + a.Type().Name + "' and '" + b.Type().Name + "'")
+}
+
+// Invert performs Python bitwise invert (~a).
+func Invert(ctx *ExecContext, a Value) Value {
+	if a.ptr == &tagInt64 || a.ptr == &tagBool {
+		return Int64Val(^int64(a.num))
+	}
+	if m, _, ok := a.Type().LookupMRO(InternString("__invert__")); ok {
+		if ctx != nil {
+			return ctx.Invoke1(m, a)
+		}
+	}
+	panic("TypeError: bad operand type for unary ~: '" + a.Type().Name + "'")
+}
+
+// MatMul performs Python matrix multiplication (a @ b).
+func MatMul(ctx *ExecContext, a, b Value) Value {
+	if m, _, ok := a.Type().LookupMRO(InternString("__matmul__")); ok {
+		if ctx != nil {
+			return ctx.Invoke2(m, a, b)
+		}
+	}
+	panic("TypeError: unsupported operand type(s) for @: '" + a.Type().Name + "' and '" + b.Type().Name + "'")
+}

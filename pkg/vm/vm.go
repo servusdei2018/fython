@@ -2,6 +2,7 @@ package vm
 
 import (
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"unsafe"
 
@@ -317,6 +318,40 @@ func (vm *VM) initBuiltins() {
 	vm.builtins.Set(val.InternString("StopAsyncIteration"), val.TypeVal(val.StopAsyncIterationType))
 	vm.builtins.Set(val.InternString("GeneratorExit"), val.TypeVal(val.GeneratorExitType))
 	vm.builtins.Set(val.InternString("BufferError"), val.TypeVal(val.BufferErrorType))
+	vm.builtins.Set(val.InternString("AssertionError"), val.TypeVal(val.AssertionErrorType))
+	vm.builtins.Set(val.InternString("BaseExceptionGroup"), val.TypeVal(val.BaseExceptionGroupType))
+	vm.builtins.Set(val.InternString("ExceptionGroup"), val.TypeVal(val.ExceptionGroupType))
+	vm.builtins.Set(val.InternString("set"), val.NewBuiltinFuncVal("set", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) == 0 {
+			return val.NewSetVal()
+		}
+		arg := args[0]
+		if arg.IsSet() {
+			return arg
+		}
+		if arg.IsList() {
+			return val.NewSetVal(arg.AsList().Items...)
+		}
+		if arg.IsTuple() {
+			return val.NewSetVal(arg.AsTuple().Items...)
+		}
+		var items []val.Value
+		if arg.IsIter() {
+			it := arg.AsIter()
+			for {
+				v, ok := it.Next()
+				if !ok {
+					break
+				}
+				items = append(items, v)
+			}
+		}
+		return val.NewSetVal(items...)
+	}))
+	vm.builtins.Set(val.InternString("TypeVar"), val.TypeVal(val.TypeVarType))
+	vm.builtins.Set(val.InternString("TypeVarTuple"), val.TypeVal(val.TypeVarTupleType))
+	vm.builtins.Set(val.InternString("ParamSpec"), val.TypeVal(val.ParamSpecType))
+	vm.builtins.Set(val.InternString("TypeAliasType"), val.TypeVal(val.TypeAliasTypeType))
 
 	vm.builtins.Set(val.InternString("isinstance"), val.NewBuiltinFuncVal("isinstance", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
@@ -2138,8 +2173,20 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				defVal := stack[sp]
 				defaultsSlice = defVal.AsTuple().Items
 			}
+			var annotateVal val.Value
+			if (flags & 0x04) != 0 {
+				sp--
+				annotateVal = stack[sp]
+			}
 			callee := AsCodeObject(codeVal)
 			fnVal := val.NewFunctionValWithGlobalsAndClosure(callee.Name, codeVal, defaultsSlice, closureSlice, globals)
+			if (flags & 0x04) != 0 {
+				fn := fnVal.AsFunction()
+				if fn.Dict == nil {
+					fn.Dict = val.NewDictVal(4).AsDict()
+				}
+				fn.Dict.Set(val.InternString("__annotate__"), annotateVal)
+			}
 			stack[sp] = fnVal
 			sp++
 			ip++
@@ -2956,6 +3003,374 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			}
 			DeoptimizeFastNeg(code, ip, reg)
 			continue
+
+		case OP_FORMAT_VALUE:
+			conversion := uint8(inst >> 16)
+			hasSpec := uint16(inst) != 0
+			var specStr string
+			if hasSpec {
+				specVal := stack[sp-1]
+				sp--
+				specStr = specVal.AsString()
+			}
+			valToFormat := stack[sp-1]
+			stack[sp-1] = val.FormatValue(valToFormat, specStr, conversion)
+			ip++
+
+		case OP_BUILD_STRING:
+			count := int(uint16(inst))
+			sp -= count
+			if count == 0 {
+				stack[sp] = val.NewStringVal("")
+				sp++
+				ip++
+				continue
+			}
+			var b strings.Builder
+			for i := 0; i < count; i++ {
+				b.WriteString(stack[sp+i].AsString())
+			}
+			stack[sp] = val.NewStringVal(b.String())
+			sp++
+			ip++
+
+		case OP_MATCH_SEQUENCE:
+			subject := stack[sp-1]
+			isSeq := (subject.IsList() || subject.IsTuple()) && !subject.IsString() && !subject.IsBytes()
+			stack[sp] = val.BoolVal(isSeq)
+			sp++
+			ip++
+
+		case OP_MATCH_MAPPING:
+			subject := stack[sp-1]
+			isMap := subject.IsDict()
+			stack[sp] = val.BoolVal(isMap)
+			sp++
+			ip++
+
+		case OP_MATCH_KEYS:
+			keysTuple := stack[sp-1]
+			subject := stack[sp-2]
+			sp--
+			if subject.IsDict() && keysTuple.IsTuple() {
+				d := subject.AsDict()
+				keys := keysTuple.AsTuple().Items
+				var vals []val.Value
+				allFound := true
+				for _, k := range keys {
+					if v, ok := d.Get(k); ok {
+						vals = append(vals, v)
+					} else {
+						allFound = false
+						break
+					}
+				}
+				if allFound {
+					stack[sp-1] = val.NewTupleVal(vals...)
+					stack[sp] = val.BoolVal(true)
+					sp++
+				} else {
+					stack[sp-1] = val.NoneVal()
+					stack[sp] = val.BoolVal(false)
+					sp++
+				}
+			} else {
+				stack[sp-1] = val.NoneVal()
+				stack[sp] = val.BoolVal(false)
+				sp++
+			}
+			ip++
+
+		case OP_MATCH_CLASS:
+			nargs := int(uint8(inst >> 16))
+			kwTuple := stack[sp-1]
+			clsType := stack[sp-2]
+			subject := stack[sp-3]
+			sp -= 2
+			isInst := subject.IsInstance() && clsType.IsType() && val.IsSubclass(subject.Type(), clsType.AsType())
+			if isInst {
+				instObj := subject.AsInstance()
+				var vals []val.Value
+				ok := true
+				if nargs > 0 {
+					if matchArgs, hasMA := clsType.AsType().Dict.Get(val.InternString("__match_args__")); hasMA && matchArgs.IsTuple() {
+						maItems := matchArgs.AsTuple().Items
+						for i := 0; i < nargs; i++ {
+							if i < len(maItems) {
+								attrName := maItems[i]
+								if v, found := instObj.GetAttr(attrName); found {
+									vals = append(vals, v)
+								} else {
+									ok = false
+									break
+								}
+							}
+						}
+					}
+				}
+				if ok && kwTuple.IsTuple() {
+					for _, kw := range kwTuple.AsTuple().Items {
+						if v, found := instObj.GetAttr(kw); found {
+							vals = append(vals, v)
+						} else {
+							ok = false
+							break
+						}
+					}
+				}
+				if ok {
+					stack[sp-1] = val.NewTupleVal(vals...)
+					stack[sp] = val.BoolVal(true)
+					sp++
+				} else {
+					stack[sp-1] = val.NoneVal()
+					stack[sp] = val.BoolVal(false)
+					sp++
+				}
+			} else {
+				stack[sp-1] = val.NoneVal()
+				stack[sp] = val.BoolVal(false)
+				sp++
+			}
+			ip++
+
+		case OP_UNPACK_EX:
+			beforeCount := int(uint8(inst >> 16))
+			afterCount := int(uint16(inst))
+			sp--
+			seq := stack[sp]
+			var items []val.Value
+			if seq.IsTuple() {
+				items = seq.AsTuple().Items
+			} else if seq.IsList() {
+				items = seq.AsList().Items
+			} else {
+				panic("vm: TypeError: cannot unpack non-iterable object")
+			}
+			minNeeded := beforeCount + afterCount
+			if len(items) < minNeeded {
+				panic("vm: ValueError: not enough values to unpack")
+			}
+			midLen := len(items) - beforeCount - afterCount
+			midItems := make([]val.Value, midLen)
+			copy(midItems, items[beforeCount:beforeCount+midLen])
+			midList := val.NewListVal(midItems...)
+
+			for i := len(items) - 1; i >= len(items)-afterCount; i-- {
+				stack[sp] = items[i]
+				sp++
+			}
+			stack[sp] = midList
+			sp++
+			for i := beforeCount - 1; i >= 0; i-- {
+				stack[sp] = items[i]
+				sp++
+			}
+			ip++
+
+		case OP_BINARY_AND:
+			b := stack[sp-1]
+			a := stack[sp-2]
+			sp--
+			stack[sp-1] = val.BitAnd(&vm.execCtx, a, b)
+			ip++
+
+		case OP_BINARY_OR:
+			b := stack[sp-1]
+			a := stack[sp-2]
+			sp--
+			stack[sp-1] = val.BitOr(&vm.execCtx, a, b)
+			ip++
+
+		case OP_BINARY_XOR:
+			b := stack[sp-1]
+			a := stack[sp-2]
+			sp--
+			stack[sp-1] = val.BitXor(&vm.execCtx, a, b)
+			ip++
+
+		case OP_BINARY_LSHIFT:
+			b := stack[sp-1]
+			a := stack[sp-2]
+			sp--
+			stack[sp-1] = val.LShift(&vm.execCtx, a, b)
+			ip++
+
+		case OP_BINARY_RSHIFT:
+			b := stack[sp-1]
+			a := stack[sp-2]
+			sp--
+			stack[sp-1] = val.RShift(&vm.execCtx, a, b)
+			ip++
+
+		case OP_BINARY_MATMUL:
+			b := stack[sp-1]
+			a := stack[sp-2]
+			sp--
+			stack[sp-1] = val.MatMul(&vm.execCtx, a, b)
+			ip++
+
+		case OP_UNARY_INVERT:
+			a := stack[sp-1]
+			stack[sp-1] = val.Invert(&vm.execCtx, a)
+			ip++
+
+		case OP_BUILD_SET:
+			count := int(uint16(inst))
+			sp -= count
+			setVal := val.NewSetVal(stack[sp : sp+count]...)
+			stack[sp] = setVal
+			sp++
+			ip++
+
+		case OP_SET_ADD:
+			offset := int(uint16(inst))
+			item := stack[sp-1]
+			sp--
+			setVal := stack[sp-offset]
+			setVal.AsSet().Add(item)
+			ip++
+
+		case OP_DELETE_FAST:
+			reg := uint16(inst)
+			if reg < 256 {
+				locals[uint8(reg)] = val.UnboundVal()
+			} else {
+				stack[baseOffset+int(reg)] = val.UnboundVal()
+			}
+			ip++
+
+		case OP_DELETE_GLOBAL:
+			bx := uint16(inst)
+			nameVal := consts[bx]
+			globals.Delete(nameVal)
+			ip++
+
+		case OP_DELETE_ATTR:
+			bx := uint16(inst)
+			attrName := consts[bx]
+			sp--
+			obj := stack[sp]
+			if obj.IsInstance() {
+				obj.AsInstance().DeleteAttr(attrName)
+			}
+			ip++
+
+		case OP_DELETE_SUBSCR:
+			key := stack[sp-1]
+			obj := stack[sp-2]
+			sp -= 2
+			if obj.IsDict() {
+				obj.AsDict().Delete(key)
+			}
+			ip++
+
+		case OP_CHECK_EXC_MATCH_STAR:
+			targetType := stack[sp-1]
+			exc := stack[sp-2]
+			if exc.IsExceptionGroup() {
+				eg := exc.AsExceptionGroup()
+				var targetCls *val.PyType
+				if targetType.IsType() {
+					targetCls = targetType.AsType()
+				}
+				matched, rest := eg.Split(targetCls)
+				if !matched.IsNone() {
+					stack[sp-2] = rest
+					stack[sp-1] = matched
+					stack[sp] = val.BoolVal(true)
+					sp++
+				} else {
+					stack[sp-1] = val.BoolVal(false)
+				}
+			} else {
+				matches := false
+				if targetType.IsType() {
+					matches = val.IsSubclass(exc.Type(), targetType.AsType())
+				}
+				if matches {
+					stack[sp-2] = val.NoneVal()
+					stack[sp-1] = exc
+					stack[sp] = val.BoolVal(true)
+					sp++
+				} else {
+					stack[sp-1] = val.BoolVal(false)
+				}
+			}
+			ip++
+
+		case OP_BUILD_MAP_UNPACK:
+			count := int(uint16(inst))
+			sp -= count
+			resVal := val.NewDictVal(8)
+			resDict := resVal.AsDict()
+			for i := 0; i < count; i++ {
+				d := stack[sp+i]
+				if d.IsDict() {
+					pyD := d.AsDict()
+					for _, k := range pyD.Keys() {
+						if v, ok := pyD.Get(k); ok {
+							resDict.Set(k, v)
+						}
+					}
+				}
+			}
+			stack[sp] = resVal
+			sp++
+			ip++
+
+		case OP_LIST_EXTEND:
+			offset := int(uint16(inst))
+			iterVal := stack[sp-1]
+			sp--
+			listVal := stack[sp-offset]
+			if listVal.IsList() {
+				lst := listVal.AsList()
+				if iterVal.IsList() {
+					lst.Items = append(lst.Items, iterVal.AsList().Items...)
+				} else if iterVal.IsTuple() {
+					lst.Items = append(lst.Items, iterVal.AsTuple().Items...)
+				} else if iterVal.IsSet() {
+					lst.Items = append(lst.Items, iterVal.AsSet().Items()...)
+				}
+			}
+			ip++
+
+		case OP_CALL_FUNCTION_EX:
+			hasKW := (inst>>16)&0x01 != 0
+			var kwDictVal val.Value
+			var argsVal val.Value
+			var callable val.Value
+			if hasKW {
+				kwDictVal = stack[sp-1]
+				argsVal = stack[sp-2]
+				callable = stack[sp-3]
+				sp -= 3
+			} else {
+				argsVal = stack[sp-1]
+				callable = stack[sp-2]
+				sp -= 2
+			}
+			var argsSlice []val.Value
+			if argsVal.IsTuple() {
+				argsSlice = append(argsSlice, argsVal.AsTuple().Items...)
+			} else if argsVal.IsList() {
+				argsSlice = append(argsSlice, argsVal.AsList().Items...)
+			}
+			var kwnames []val.Value
+			if hasKW && kwDictVal.IsDict() {
+				pyD := kwDictVal.AsDict()
+				for _, k := range pyD.Keys() {
+					if v, ok := pyD.Get(k); ok {
+						kwnames = append(kwnames, k)
+						argsSlice = append(argsSlice, v)
+					}
+				}
+			}
+			res := vm.Vectorcall(callable, argsSlice, kwnames)
+			stack[sp] = res
+			sp++
+			ip++
 
 		default:
 			panic("vm: unknown opcode")
