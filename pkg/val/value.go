@@ -46,6 +46,10 @@ const (
 	KindTask           // Heap-allocated async Task (*PyTask)
 	KindSet            // Heap-allocated set (*PySet)
 	KindExceptionGroup // Heap-allocated exception group (*PyExceptionGroup)
+	KindMemberDescr    // Heap-allocated member descriptor for __slots__ (*PyMemberDescr)
+	KindNotImplemented // Static sentinel for NotImplemented singleton
+	KindClassMethod    // Heap-allocated classmethod descriptor (*PyClassMethod)
+	KindStaticMethod   // Heap-allocated staticmethod descriptor (*PyStaticMethod)
 )
 
 // ObjectHeader Flags bitmask constants.
@@ -56,6 +60,13 @@ const (
 	// FlagDataDescriptor marks a descriptor object (such as @property or custom __set__)
 	// as a data descriptor that takes precedence over instance attributes.
 	FlagDataDescriptor uint8 = 1 << 1
+)
+
+const (
+	// FlagForbidDynamicAttrs marks a type whose instances forbid dynamic attribute addition (due to __slots__).
+	FlagForbidDynamicAttrs uint32 = 1 << 2
+	// FlagCustomGetAttribute marks a type that defines a custom __getattribute__ requiring inline cache bypass.
+	FlagCustomGetAttribute uint32 = 1 << 3
 )
 
 // String returns the human-readable name of the Kind.
@@ -125,6 +136,14 @@ func (k Kind) String() string {
 		return "set"
 	case KindExceptionGroup:
 		return "ExceptionGroup"
+	case KindMemberDescr:
+		return "member_descriptor"
+	case KindNotImplemented:
+		return "NotImplementedType"
+	case KindClassMethod:
+		return "classmethod"
+	case KindStaticMethod:
+		return "staticmethod"
 	default:
 		return "unknown"
 	}
@@ -156,13 +175,14 @@ var (
 
 // Static sentinel headers for unboxed primitive types.
 var (
-	tagNone      = ObjectHeader{Kind: KindNone}
-	tagBool      = ObjectHeader{Kind: KindBool}
-	tagInt64     = ObjectHeader{Kind: KindInt64}
-	tagFloat64   = ObjectHeader{Kind: KindFloat64}
-	tagInlineStr = ObjectHeader{Kind: KindInlineStr}
-	tagUnbound   = ObjectHeader{Kind: KindNone}
-	tagRange     = ObjectHeader{Kind: KindRange}
+	tagNone           = ObjectHeader{Kind: KindNone}
+	tagBool           = ObjectHeader{Kind: KindBool}
+	tagInt64          = ObjectHeader{Kind: KindInt64}
+	tagFloat64        = ObjectHeader{Kind: KindFloat64}
+	tagInlineStr      = ObjectHeader{Kind: KindInlineStr}
+	tagUnbound        = ObjectHeader{Kind: KindNone}
+	tagRange          = ObjectHeader{Kind: KindRange}
+	tagNotImplemented = ObjectHeader{Kind: KindNotImplemented}
 )
 
 // NoneVal constructs the singleton None Value (0 allocations).
@@ -170,14 +190,24 @@ func NoneVal() Value {
 	return Value{num: 0, ptr: &tagNone}
 }
 
+// NotImplementedVal constructs the singleton NotImplemented Value (0 allocations).
+func NotImplementedVal() Value {
+	return Value{num: 0, ptr: &tagNotImplemented}
+}
+
+// IsNotImplemented reports whether v is the NotImplemented singleton via pointer equality.
+func (v Value) IsNotImplemented() bool {
+	return v.ptr == &tagNotImplemented
+}
+
 // UnboundVal constructs a zero-allocation internal sentinel for unbound method receivers in OP_LOAD_METHOD.
 func UnboundVal() Value {
 	return Value{num: 0, ptr: &tagUnbound}
 }
 
-// IsUnbound reports whether v is the unbound receiver sentinel via a single pointer equality check.
+// IsUnbound reports whether v is the unbound receiver sentinel or uninitialized slot.
 func (v Value) IsUnbound() bool {
-	return v.ptr == &tagUnbound
+	return v.ptr == &tagUnbound || v.ptr == nil
 }
 
 // BoolVal constructs an unboxed boolean Value (0 allocations).
@@ -315,6 +345,21 @@ func (v Value) IsSuper() bool {
 // IsTuple reports whether v is a heap-allocated PyTuple.
 func (v Value) IsTuple() bool {
 	return v.ptr != nil && v.ptr.Kind == KindTuple
+}
+
+// IsMemberDescr reports whether v is a heap-allocated PyMemberDescr.
+func (v Value) IsMemberDescr() bool {
+	return v.ptr != nil && v.ptr.Kind == KindMemberDescr
+}
+
+// IsClassMethod reports whether v is a heap-allocated PyClassMethod.
+func (v Value) IsClassMethod() bool {
+	return v.ptr != nil && v.ptr.Kind == KindClassMethod
+}
+
+// IsStaticMethod reports whether v is a heap-allocated PyStaticMethod.
+func (v Value) IsStaticMethod() bool {
+	return v.ptr != nil && v.ptr.Kind == KindStaticMethod
 }
 
 // IsCell reports whether v is a heap-allocated PyCell.
@@ -524,6 +569,12 @@ func Equals(a, b Value) bool {
 		}
 		// Identical heap object pointer.
 		return true
+	}
+
+	// Custom __eq__ dispatch on user classes
+	if (a.Type() != nil && a.Type().dunderEq.ptr != nil) || (b.Type() != nil && b.Type().dunderEq.ptr != nil) {
+		res := RichCompare(nil, a, b, CmpEQ)
+		return res.AsBool()
 	}
 
 	// Fast path: two distinct interned heap strings can never be equal.
@@ -786,6 +837,11 @@ func (v Value) String() string {
 	case KindSlice:
 		sl := v.AsSlice()
 		return fmt.Sprintf("slice(%s, %s, %s)", sl.Start.String(), sl.Stop.String(), sl.Step.String())
+	case KindMemberDescr:
+		md := v.AsMemberDescr()
+		return fmt.Sprintf("<member '%s' of '%s' objects>", md.Name.AsString(), md.Owner.Name)
+	case KindNotImplemented:
+		return "NotImplemented"
 	default:
 		return fmt.Sprintf("<%s object at %p>", v.Type().Name, v.ptr)
 	}

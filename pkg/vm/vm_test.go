@@ -218,11 +218,11 @@ func TestVMInstanceAttrInlineCache(t *testing.T) {
 		val.Int64Val(1), // 1: 1
 	}
 	code := []uint32{
-		/* 00 */ Encode(OP_LOAD_FAST, 0, 0), // push obj (for store target)
-		/* 01 */ Encode(OP_LOAD_FAST, 0, 0), // push obj (for load source)
-		/* 02 */ Encode(OP_LOAD_ATTR, 0, 0), // pop obj, push obj.counter_value
-		/* 03 */ Encode(OP_LOAD_CONST, 0, 1), // push 1
-		/* 04 */ Encode(OP_BINARY_ADD, 0, 0), // obj.counter_value + 1
+		/* 00 */ Encode(OP_LOAD_FAST, 0, 0), // push obj (for load source)
+		/* 01 */ Encode(OP_LOAD_ATTR, 0, 0), // pop obj, push obj.counter_value
+		/* 02 */ Encode(OP_LOAD_CONST, 0, 1), // push 1
+		/* 03 */ Encode(OP_BINARY_ADD, 0, 0), // obj.counter_value + 1 (value)
+		/* 04 */ Encode(OP_LOAD_FAST, 0, 0), // push obj (target)
 		/* 05 */ Encode(OP_STORE_ATTR, 0, 0), // obj.counter_value = result
 		/* 06 */ Encode(OP_LOAD_FAST, 0, 0), // push obj
 		/* 07 */ Encode(OP_LOAD_ATTR, 0, 0), // push obj.counter_value
@@ -235,10 +235,10 @@ func TestVMInstanceAttrInlineCache(t *testing.T) {
 		t.Fatalf("first run result = %v, want 1", res)
 	}
 
-	// Verify inline cache slots at ip=2, ip=5, ip=7 are populated with obj.Shape.ID
-	if v.ic[2].ExpectedShapeID != obj.Shape.ID || v.ic[5].ExpectedShapeID != obj.Shape.ID || v.ic[7].ExpectedShapeID != obj.Shape.ID {
-		t.Fatalf("inline cache not populated with expected shape ID %d: ic[2]=%+v ic[5]=%+v ic[7]=%+v",
-			obj.Shape.ID, v.ic[2], v.ic[5], v.ic[7])
+	// Verify inline cache slots at ip=1, ip=5, ip=7 are populated with obj.Shape.ID
+	if v.ic[1].ExpectedShapeID != obj.Shape.ID || v.ic[5].ExpectedShapeID != obj.Shape.ID || v.ic[7].ExpectedShapeID != obj.Shape.ID {
+		t.Fatalf("inline cache not populated with expected shape ID %d: ic[1]=%+v ic[5]=%+v ic[7]=%+v",
+			obj.Shape.ID, v.ic[1], v.ic[5], v.ic[7])
 	}
 
 	// Subsequent runs must hit the Shape inline cache with 0 allocations
@@ -277,19 +277,19 @@ func BenchmarkInstanceAttrAccess(b *testing.B) {
 		val.Int64Val(1),         // 3: 1
 	}
 	code := []uint32{
-		/* 00 */ Encode(OP_LOAD_FAST, 0, 0), // push obj
-		/* 01 */ Encode(OP_LOAD_CONST, 0, 1), // push 0
+		/* 00 */ Encode(OP_LOAD_CONST, 0, 1), // push 0 (value)
+		/* 01 */ Encode(OP_LOAD_FAST, 0, 0), // push obj (target)
 		/* 02 */ Encode(OP_STORE_ATTR, 0, 0), // obj.counter = 0
 		/* 03 */ Encode(OP_LOAD_FAST, 0, 0), // loop: push obj
 		/* 04 */ Encode(OP_LOAD_ATTR, 0, 0), // push obj.counter
 		/* 05 */ Encode(OP_LOAD_CONST, 0, 2), // push 1000
 		/* 06 */ Encode(OP_COMPARE_LT, 0, 0), // obj.counter < 1000
 		/* 07 */ Encode(OP_JUMP_IF_FALSE, 0, 15), // if false jump to 15
-		/* 08 */ Encode(OP_LOAD_FAST, 0, 0), // push obj (for store)
-		/* 09 */ Encode(OP_LOAD_FAST, 0, 0), // push obj (for load)
-		/* 10 */ Encode(OP_LOAD_ATTR, 0, 0), // push obj.counter
-		/* 11 */ Encode(OP_LOAD_CONST, 0, 3), // push 1
-		/* 12 */ Encode(OP_BINARY_ADD, 0, 0), // obj.counter + 1
+		/* 08 */ Encode(OP_LOAD_FAST, 0, 0), // push obj (for load)
+		/* 09 */ Encode(OP_LOAD_ATTR, 0, 0), // push obj.counter
+		/* 10 */ Encode(OP_LOAD_CONST, 0, 3), // push 1
+		/* 11 */ Encode(OP_BINARY_ADD, 0, 0), // obj.counter + 1 (value)
+		/* 12 */ Encode(OP_LOAD_FAST, 0, 0), // push obj (target)
 		/* 13 */ Encode(OP_STORE_ATTR, 0, 0), // obj.counter = obj.counter + 1
 		/* 14 */ Encode(OP_JUMP, 0, 3), // jump to 3
 		/* 15 */ Encode(OP_LOAD_FAST, 0, 0), // push obj
@@ -481,10 +481,10 @@ func TestPropertyDescriptorPrecedence(t *testing.T) {
 	fset := val.NewFunctionVal("fset", NewCodeVal(&CodeObject{
 		Consts: []val.Value{rawAttr, val.Int64Val(1)},
 		Code: []uint32{
-			Encode(OP_LOAD_FAST, 0, 0),
 			Encode(OP_LOAD_FAST, 0, 1),
 			Encode(OP_LOAD_CONST, 0, 1),
 			Encode(OP_BINARY_ADD, 0, 0),
+			Encode(OP_LOAD_FAST, 0, 0),
 			Encode(OP_STORE_ATTR, 0, 0),
 			Encode(OP_LOAD_CONST, 0, 1),
 			Encode(OP_RETURN, 0, 0),
@@ -511,8 +511,8 @@ func TestPropertyDescriptorPrecedence(t *testing.T) {
 		val.Int64Val(4), // 2: 4
 	}
 	code := []uint32{
-		Encode(OP_LOAD_CONST, 0, 0),
 		Encode(OP_LOAD_CONST, 0, 2),
+		Encode(OP_LOAD_CONST, 0, 0),
 		Encode(OP_STORE_ATTR, 0, 1), // inst.x = 4
 		Encode(OP_LOAD_CONST, 0, 0),
 		Encode(OP_LOAD_ATTR, 0, 1), // push inst.x
@@ -765,11 +765,11 @@ func BenchmarkMethodCallLoop(b *testing.B) {
 		Name:   "increment",
 		Consts: []val.Value{countAttr},
 		Code: []uint32{
-			/* 00 */ Encode(OP_LOAD_FAST, 0, 0), // push self (store target)
-			/* 01 */ Encode(OP_LOAD_FAST, 0, 0), // push self (load source)
-			/* 02 */ Encode(OP_LOAD_ATTR, 0, 0), // push self.count
-			/* 03 */ Encode(OP_LOAD_FAST, 0, 1), // push delta
-			/* 04 */ Encode(OP_BINARY_ADD, 0, 0), // self.count + delta
+			/* 00 */ Encode(OP_LOAD_FAST, 0, 0), // push self (load source)
+			/* 01 */ Encode(OP_LOAD_ATTR, 0, 0), // push self.count
+			/* 02 */ Encode(OP_LOAD_FAST, 0, 1), // push delta
+			/* 03 */ Encode(OP_BINARY_ADD, 0, 0), // self.count + delta (value)
+			/* 04 */ Encode(OP_LOAD_FAST, 0, 0), // push self (store target)
 			/* 05 */ Encode(OP_STORE_ATTR, 0, 0), // self.count = self.count + delta
 			/* 06 */ Encode(OP_LOAD_FAST, 0, 0), // push self
 			/* 07 */ Encode(OP_LOAD_ATTR, 0, 0), // push self.count
@@ -799,8 +799,8 @@ func BenchmarkMethodCallLoop(b *testing.B) {
 		val.Int64Val(1),     // 4: 1
 	}
 	code := []uint32{
-		/* 00 */ Encode(OP_LOAD_FAST, 0, 0), // push obj
-		/* 01 */ Encode(OP_LOAD_CONST, 0, 2), // push 0
+		/* 00 */ Encode(OP_LOAD_CONST, 0, 2), // push 0 (value)
+		/* 01 */ Encode(OP_LOAD_FAST, 0, 0), // push obj (target)
 		/* 02 */ Encode(OP_STORE_ATTR, 0, 0), // obj.count = 0
 		/* 03 */ Encode(OP_LOAD_CONST, 0, 2), // push 0
 		/* 04 */ Encode(OP_STORE_FAST, 0, 1), // i = 0

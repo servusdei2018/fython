@@ -125,6 +125,11 @@ const (
 
 	// Exception Groups
 	OP_CHECK_EXC_MATCH_STAR
+
+	// Dynamic Name Resolution (Class/Module Scope)
+	OP_LOAD_NAME
+	OP_STORE_NAME
+	OP_DELETE_NAME
 )
 
 // Comparison operation codes for OP_COMPARE_OP (passed in ArgA field).
@@ -327,6 +332,12 @@ func (op Opcode) String() string {
 		return "OP_DELETE_SUBSCR"
 	case OP_CHECK_EXC_MATCH_STAR:
 		return "OP_CHECK_EXC_MATCH_STAR"
+	case OP_LOAD_NAME:
+		return "OP_LOAD_NAME"
+	case OP_STORE_NAME:
+		return "OP_STORE_NAME"
+	case OP_DELETE_NAME:
+		return "OP_DELETE_NAME"
 	case OP_BUILD_MAP_UNPACK:
 		return "OP_BUILD_MAP_UNPACK"
 	case OP_LIST_EXTEND:

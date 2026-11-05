@@ -57,11 +57,40 @@ func addInt64Overflow(ai, bi int64) Value {
 
 //go:noinline
 func addSlow(ctx *ExecContext, a, b Value) Value {
-	// Direct TypeSlot dispatch (includes str, list, bigint, and custom __add__ classes).
-	if nbAdd := a.Type().Slots.NbAdd; nbAdd != nil {
-		return nbAdd(ctx, a, b)
+	aType := a.Type()
+	bType := b.Type()
+	isStrictSub := aType != bType && IsSubclass(bType, aType)
+
+	// 1. Subclass reflected precedence
+	if isStrictSub && bType.dunderRAdd.ptr != nil {
+		res := ctx.Invoke2(bType.dunderRAdd, b, a)
+		if !res.IsNotImplemented() {
+			return res
+		}
 	}
-	panic("val.Add: unsupported operand types")
+
+	// 2. Forward __add__
+	if nbAdd := aType.Slots.NbAdd; nbAdd != nil {
+		res := nbAdd(ctx, a, b)
+		if !res.IsNotImplemented() {
+			return res
+		}
+	} else if aType.dunderAdd.ptr != nil {
+		res := ctx.Invoke2(aType.dunderAdd, a, b)
+		if !res.IsNotImplemented() {
+			return res
+		}
+	}
+
+	// 3. Reflected __radd__
+	if !isStrictSub && bType.dunderRAdd.ptr != nil {
+		res := ctx.Invoke2(bType.dunderRAdd, b, a)
+		if !res.IsNotImplemented() {
+			return res
+		}
+	}
+
+	panic("val: TypeError: unsupported operand type(s) for +: '" + aType.Name + "' and '" + bType.Name + "'")
 }
 
 func numericNbAdd(ctx *ExecContext, a, b Value) Value {
@@ -154,10 +183,40 @@ func subInt64Overflow(ai, bi int64) Value {
 
 //go:noinline
 func subSlow(ctx *ExecContext, a, b Value) Value {
-	if nbSub := a.Type().Slots.NbSub; nbSub != nil {
-		return nbSub(ctx, a, b)
+	aType := a.Type()
+	bType := b.Type()
+	isStrictSub := aType != bType && IsSubclass(bType, aType)
+
+	// 1. Subclass reflected precedence
+	if isStrictSub && bType.dunderRSub.ptr != nil {
+		res := ctx.Invoke2(bType.dunderRSub, b, a)
+		if !res.IsNotImplemented() {
+			return res
+		}
 	}
-	panic("val.Sub: unsupported operand types")
+
+	// 2. Forward __sub__
+	if nbSub := aType.Slots.NbSub; nbSub != nil {
+		res := nbSub(ctx, a, b)
+		if !res.IsNotImplemented() {
+			return res
+		}
+	} else if aType.dunderSub.ptr != nil {
+		res := ctx.Invoke2(aType.dunderSub, a, b)
+		if !res.IsNotImplemented() {
+			return res
+		}
+	}
+
+	// 3. Reflected __rsub__
+	if !isStrictSub && bType.dunderRSub.ptr != nil {
+		res := ctx.Invoke2(bType.dunderRSub, b, a)
+		if !res.IsNotImplemented() {
+			return res
+		}
+	}
+
+	panic("val: TypeError: unsupported operand type(s) for -: '" + aType.Name + "' and '" + bType.Name + "'")
 }
 
 func numericNbSub(ctx *ExecContext, a, b Value) Value {
@@ -244,10 +303,40 @@ func mulInt64Overflow(ai, bi int64) Value {
 
 //go:noinline
 func mulSlow(ctx *ExecContext, a, b Value) Value {
-	if nbMul := a.Type().Slots.NbMul; nbMul != nil {
-		return nbMul(ctx, a, b)
+	aType := a.Type()
+	bType := b.Type()
+	isStrictSub := aType != bType && IsSubclass(bType, aType)
+
+	// 1. Subclass reflected precedence
+	if isStrictSub && bType.dunderRMul.ptr != nil {
+		res := ctx.Invoke2(bType.dunderRMul, b, a)
+		if !res.IsNotImplemented() {
+			return res
+		}
 	}
-	panic("val.Mul: unsupported operand types")
+
+	// 2. Forward __mul__
+	if nbMul := aType.Slots.NbMul; nbMul != nil {
+		res := nbMul(ctx, a, b)
+		if !res.IsNotImplemented() {
+			return res
+		}
+	} else if aType.dunderMul.ptr != nil {
+		res := ctx.Invoke2(aType.dunderMul, a, b)
+		if !res.IsNotImplemented() {
+			return res
+		}
+	}
+
+	// 3. Reflected __rmul__
+	if !isStrictSub && bType.dunderRMul.ptr != nil {
+		res := ctx.Invoke2(bType.dunderRMul, b, a)
+		if !res.IsNotImplemented() {
+			return res
+		}
+	}
+
+	panic("val: TypeError: unsupported operand type(s) for *: '" + aType.Name + "' and '" + bType.Name + "'")
 }
 
 func numericNbMul(ctx *ExecContext, a, b Value) Value {
@@ -277,42 +366,213 @@ func numericNbMul(ctx *ExecContext, a, b Value) Value {
 }
 
 // LessThan performs Python less-than comparison (a < b) and returns a KindBool Value.
-func LessThan(a, b Value) Value {
+const (
+	CmpLT uint8 = iota
+	CmpLTE
+	CmpEQ
+	CmpNEQ
+	CmpGT
+	CmpGTE
+	CmpIN
+	CmpNOTIN
+	CmpIS
+	CmpISNOT
+)
+
+// RichCompare performs complete Python 3 rich comparisons (a <op> b)
+// with subclass reflected precedence and NotImplemented fallback.
+func RichCompare(ctx *ExecContext, a, b Value, op uint8) Value {
+	// Fast path for identical integers
 	if a.ptr == &tagInt64 && b.ptr == &tagInt64 {
-		if int64(a.num) < int64(b.num) {
-			return Value{num: 1, ptr: &tagBool}
+		ai := int64(a.num)
+		bi := int64(b.num)
+		switch op {
+		case CmpLT:
+			return BoolVal(ai < bi)
+		case CmpLTE:
+			return BoolVal(ai <= bi)
+		case CmpEQ:
+			return BoolVal(ai == bi)
+		case CmpNEQ:
+			return BoolVal(ai != bi)
+		case CmpGT:
+			return BoolVal(ai > bi)
+		case CmpGTE:
+			return BoolVal(ai >= bi)
+		case CmpIS:
+			return BoolVal(ai == bi)
+		case CmpISNOT:
+			return BoolVal(ai != bi)
 		}
-		return Value{num: 0, ptr: &tagBool}
 	}
 
-	if a.ptr == &tagFloat64 && b.ptr == &tagFloat64 {
-		return BoolVal(math.Float64frombits(a.num) < math.Float64frombits(b.num))
+	// Identity comparisons: IS, IS_NOT
+	if op == CmpIS {
+		return BoolVal(a.ptr == b.ptr && a.num == b.num)
 	}
-	if a.ptr == &tagInt64 && b.ptr == &tagFloat64 {
-		return BoolVal(float64(int64(a.num)) < math.Float64frombits(b.num))
-	}
-	if a.ptr == &tagFloat64 && b.ptr == &tagInt64 {
-		return BoolVal(math.Float64frombits(a.num) < float64(int64(b.num)))
+	if op == CmpISNOT {
+		return BoolVal(a.ptr != b.ptr || a.num != b.num)
 	}
 
-	return lessThanSlow(a, b)
-}
+	// Containment tests: IN, NOT_IN
+	if op == CmpIN {
+		return In(a, b)
+	}
+	if op == CmpNOTIN {
+		return NotIn(a, b)
+	}
 
-//go:noinline
-func lessThanSlow(a, b Value) Value {
-	if a.ptr.Kind == KindBigInt || b.ptr.Kind == KindBigInt {
-		if a.ptr == &tagFloat64 || b.ptr == &tagFloat64 {
-			return BoolVal(toFloat64(a) < toFloat64(b))
+	aType := a.Type()
+	bType := b.Type()
+
+	var reflectedOp uint8
+	switch op {
+	case CmpLT:
+		reflectedOp = CmpGT
+	case CmpLTE:
+		reflectedOp = CmpGTE
+	case CmpEQ:
+		reflectedOp = CmpEQ
+	case CmpNEQ:
+		reflectedOp = CmpNEQ
+	case CmpGT:
+		reflectedOp = CmpLT
+	case CmpGTE:
+		reflectedOp = CmpLTE
+	}
+
+	getOpDunder := func(tp *PyType, operation uint8) Value {
+		if tp == nil {
+			return Value{}
 		}
-		bigA := toBigInt(a)
-		bigB := toBigInt(b)
-		return BoolVal(bigA.Cmp(bigB) < 0)
+		switch operation {
+		case CmpLT:
+			return tp.dunderLt
+		case CmpLTE:
+			return tp.dunderLe
+		case CmpEQ:
+			return tp.dunderEq
+		case CmpNEQ:
+			return tp.dunderNe
+		case CmpGT:
+			return tp.dunderGt
+		case CmpGTE:
+			return tp.dunderGe
+		}
+		return Value{}
 	}
+
+	isStrictSub := aType != bType && IsSubclass(bType, aType)
+
+	// 1. If b is a strict subclass of a and defines the reflected comparison, try b first!
+	if isStrictSub {
+		if rFn := getOpDunder(bType, reflectedOp); rFn.ptr != nil {
+			res := ctx.Invoke2(rFn, b, a)
+			if !res.IsNotImplemented() {
+				return res
+			}
+		}
+	}
+
+	// 2. Try a's comparison operator
+	if fn := getOpDunder(aType, op); fn.ptr != nil {
+		res := ctx.Invoke2(fn, a, b)
+		if !res.IsNotImplemented() {
+			return res
+		}
+	}
+
+	// 3. Try b's reflected comparison operator (if not tried already)
+	if !isStrictSub {
+		if rFn := getOpDunder(bType, reflectedOp); rFn.ptr != nil {
+			res := ctx.Invoke2(rFn, b, a)
+			if !res.IsNotImplemented() {
+				return res
+			}
+		}
+	}
+
+	// 4. Primitive / Built-in type fallbacks
+	if a.ptr == &tagFloat64 || b.ptr == &tagFloat64 || a.ptr == &tagInt64 || b.ptr == &tagInt64 || a.ptr.Kind == KindBigInt || b.ptr.Kind == KindBigInt {
+		if (a.ptr == &tagFloat64 || a.ptr == &tagInt64 || a.ptr == &tagBool || a.ptr.Kind == KindBigInt) &&
+			(b.ptr == &tagFloat64 || b.ptr == &tagInt64 || b.ptr == &tagBool || b.ptr.Kind == KindBigInt) {
+			af := toFloat64(a)
+			bf := toFloat64(b)
+			switch op {
+			case CmpLT:
+				return BoolVal(af < bf)
+			case CmpLTE:
+				return BoolVal(af <= bf)
+			case CmpEQ:
+				return BoolVal(af == bf)
+			case CmpNEQ:
+				return BoolVal(af != bf)
+			case CmpGT:
+				return BoolVal(af > bf)
+			case CmpGTE:
+				return BoolVal(af >= bf)
+			}
+		}
+	}
+
 	if (a.ptr == &tagInlineStr || a.ptr.Kind == KindString) &&
 		(b.ptr == &tagInlineStr || b.ptr.Kind == KindString) {
-		return BoolVal(a.AsString() < b.AsString())
+		as := a.AsString()
+		bs := b.AsString()
+		switch op {
+		case CmpLT:
+			return BoolVal(as < bs)
+		case CmpLTE:
+			return BoolVal(as <= bs)
+		case CmpEQ:
+			return BoolVal(as == bs)
+		case CmpNEQ:
+			return BoolVal(as != bs)
+		case CmpGT:
+			return BoolVal(as > bs)
+		case CmpGTE:
+			return BoolVal(as >= bs)
+		}
 	}
-	panic("val.LessThan: unsupported operand types")
+
+	// 5. Final fallback for EQ / NEQ is identity comparison
+	if op == CmpEQ {
+		return BoolVal(a.ptr == b.ptr && a.num == b.num)
+	}
+	if op == CmpNEQ {
+		return BoolVal(a.ptr != b.ptr || a.num != b.num)
+	}
+
+	opSymbols := [...]string{"<", "<=", "==", "!=", ">", ">="}
+	symbol := "comparison"
+	if int(op) < len(opSymbols) {
+		symbol = opSymbols[op]
+	}
+	panic("val: TypeError: '" + symbol + "' not supported between instances of '" + aType.Name + "' and '" + bType.Name + "'")
+}
+
+func LessThan(a, b Value) Value {
+	return RichCompare(nil, a, b, CmpLT)
+}
+
+// GreaterThan performs Python greater-than comparison (a > b).
+func GreaterThan(a, b Value) Value {
+	return RichCompare(nil, a, b, CmpGT)
+}
+
+// LessOrEqual performs Python less-or-equal comparison (a <= b).
+func LessOrEqual(a, b Value) Value {
+	return RichCompare(nil, a, b, CmpLTE)
+}
+
+// GreaterOrEqual performs Python greater-or-equal comparison (a >= b).
+func GreaterOrEqual(a, b Value) Value {
+	return RichCompare(nil, a, b, CmpGTE)
+}
+
+// NotEquals performs Python inequality comparison (a != b).
+func NotEquals(a, b Value) Value {
+	return RichCompare(nil, a, b, CmpNEQ)
 }
 
 // GetItemCtx evaluates obj[key] via MpSubscript or SqItem type slots.
@@ -495,26 +755,6 @@ func Pow(a, b Value) Value {
 	return Float64Val(math.Pow(af, bf))
 }
 
-// GreaterThan performs Python greater-than comparison (a > b).
-func GreaterThan(a, b Value) Value {
-	return LessThan(b, a)
-}
-
-// LessOrEqual performs Python less-or-equal comparison (a <= b).
-func LessOrEqual(a, b Value) Value {
-	return BoolVal(!GreaterThan(a, b).AsBool())
-}
-
-// GreaterOrEqual performs Python greater-or-equal comparison (a >= b).
-func GreaterOrEqual(a, b Value) Value {
-	return BoolVal(!LessThan(a, b).AsBool())
-}
-
-// NotEquals performs Python inequality comparison (a != b).
-func NotEquals(a, b Value) Value {
-	return BoolVal(!Equals(a, b))
-}
-
 // Is performs Python identity comparison (a is b).
 func Is(a, b Value) Value {
 	return BoolVal(a.ptr == b.ptr && a.num == b.num)
@@ -527,6 +767,10 @@ func IsNot(a, b Value) Value {
 
 // In performs Python containment test (item in container).
 func In(item, container Value) Value {
+	if container.Type() != nil && container.Type().dunderContains.ptr != nil {
+		res := (&ExecContext{}).Invoke2(container.Type().dunderContains, container, item)
+		return BoolVal(res.AsBool())
+	}
 	if container.IsList() {
 		return BoolVal(container.AsList().Contains(item))
 	}

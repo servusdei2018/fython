@@ -270,6 +270,9 @@ func (inst *PyInstance) SetAttr(name, value Value) int {
 		}
 		return idx
 	}
+	if inst.Header.Type != nil && (inst.Header.Type.Flags&uint32(FlagForbidDynamicAttrs)) != 0 {
+		panic("val: AttributeError: '" + inst.Header.Type.Name + "' object has no attribute '" + name.AsString() + "'")
+	}
 	newShape := inst.Shape.Transition(name)
 	slotIdx := newShape.SlotIndex
 	if slotIdx < len(inst.Slots) {

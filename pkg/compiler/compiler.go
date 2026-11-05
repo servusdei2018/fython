@@ -445,7 +445,11 @@ func (c *Compiler) compileNameLoad(name string) error {
 	sym := c.scope.Symbols[name]
 	if sym == nil {
 		_, idx := c.constPool.InternName(name)
-		c.emitOp(vm.OP_LOAD_GLOBAL, 0, idx)
+		if c.scope.Kind == ScopeClass {
+			c.emitOp(vm.OP_LOAD_NAME, 0, idx)
+		} else {
+			c.emitOp(vm.OP_LOAD_GLOBAL, 0, idx)
+		}
 		return nil
 	}
 	switch sym.Storage {
@@ -455,10 +459,18 @@ func (c *Compiler) compileNameLoad(name string) error {
 		c.emitOp(vm.OP_LOAD_DEREF, 0, uint16(sym.Offset))
 	case StorageGlobal:
 		_, idx := c.constPool.InternName(name)
-		c.emitOp(vm.OP_LOAD_GLOBAL, 0, idx)
+		if c.scope.Kind == ScopeClass {
+			c.emitOp(vm.OP_LOAD_NAME, 0, idx)
+		} else {
+			c.emitOp(vm.OP_LOAD_GLOBAL, 0, idx)
+		}
 	default:
 		_, idx := c.constPool.InternName(name)
-		c.emitOp(vm.OP_LOAD_GLOBAL, 0, idx)
+		if c.scope.Kind == ScopeClass {
+			c.emitOp(vm.OP_LOAD_NAME, 0, idx)
+		} else {
+			c.emitOp(vm.OP_LOAD_GLOBAL, 0, idx)
+		}
 	}
 	return nil
 }
@@ -467,7 +479,11 @@ func (c *Compiler) compileNameStore(name string) error {
 	sym := c.scope.Symbols[name]
 	if sym == nil {
 		_, idx := c.constPool.InternName(name)
-		c.emitOp(vm.OP_STORE_GLOBAL, 0, idx)
+		if c.scope.Kind == ScopeClass {
+			c.emitOp(vm.OP_STORE_NAME, 0, idx)
+		} else {
+			c.emitOp(vm.OP_STORE_GLOBAL, 0, idx)
+		}
 		return nil
 	}
 	switch sym.Storage {
@@ -477,10 +493,18 @@ func (c *Compiler) compileNameStore(name string) error {
 		c.emitOp(vm.OP_STORE_DEREF, 0, uint16(sym.Offset))
 	case StorageGlobal:
 		_, idx := c.constPool.InternName(name)
-		c.emitOp(vm.OP_STORE_GLOBAL, 0, idx)
+		if c.scope.Kind == ScopeClass {
+			c.emitOp(vm.OP_STORE_NAME, 0, idx)
+		} else {
+			c.emitOp(vm.OP_STORE_GLOBAL, 0, idx)
+		}
 	default:
 		_, idx := c.constPool.InternName(name)
-		c.emitOp(vm.OP_STORE_GLOBAL, 0, idx)
+		if c.scope.Kind == ScopeClass {
+			c.emitOp(vm.OP_STORE_NAME, 0, idx)
+		} else {
+			c.emitOp(vm.OP_STORE_GLOBAL, 0, idx)
+		}
 	}
 	return nil
 }
@@ -1371,6 +1395,12 @@ func (c *Compiler) compileClassDef(stmt *ASTStmt) error {
 		NumLocals: 0,
 		NumParams: 0,
 	}
+	if len(clsScope.CellVars) > 0 {
+		clsCodeObj.CellVars = make([]val.Value, len(clsScope.CellVars))
+		for i, cv := range clsScope.CellVars {
+			clsCodeObj.CellVars[i] = val.InternString(cv)
+		}
+	}
 
 	// Push class body code object
 	coVal := vm.NewCodeVal(clsCodeObj)
@@ -1391,8 +1421,60 @@ func (c *Compiler) compileClassDef(stmt *ASTStmt) error {
 	}
 	c.emitOp(vm.OP_BUILD_TUPLE, 0, uint16(len(bases)))
 
-	// Build class
-	c.emitOp(vm.OP_BUILD_CLASS, 0, 0)
+	// Check keywords (e.g. metaclass=Meta or kw=val)
+	kwNames := c.arena.GetIdentSlice(clsDef.KWNames)
+	kwArgs := c.arena.GetExprSlice(clsDef.KWArgs)
+	hasKW := len(kwArgs) > 0
+	if hasKW {
+		hasUnpack := false
+		for _, name := range kwNames {
+			if name == "" {
+				hasUnpack = true
+				break
+			}
+		}
+		if hasUnpack {
+			numDicts := uint16(0)
+			currentKeys := 0
+			for i, name := range kwNames {
+				if name == "" {
+					if currentKeys > 0 {
+						c.emitOp(vm.OP_BUILD_MAP, 0, uint16(currentKeys))
+						numDicts++
+						currentKeys = 0
+					}
+					if err := c.compileExpr(kwArgs[i]); err != nil {
+						return err
+					}
+					numDicts++
+				} else {
+					nameConst := c.constPool.Add(val.InternString(name))
+					c.emitOp(vm.OP_LOAD_CONST, 0, nameConst)
+					if err := c.compileExpr(kwArgs[i]); err != nil {
+						return err
+					}
+					currentKeys++
+				}
+			}
+			if currentKeys > 0 {
+				c.emitOp(vm.OP_BUILD_MAP, 0, uint16(currentKeys))
+				numDicts++
+			}
+			c.emitOp(vm.OP_BUILD_MAP_UNPACK, 0, numDicts)
+		} else {
+			for i, name := range kwNames {
+				nameConst := c.constPool.Add(val.InternString(name))
+				c.emitOp(vm.OP_LOAD_CONST, 0, nameConst)
+				if err := c.compileExpr(kwArgs[i]); err != nil {
+					return err
+				}
+			}
+			c.emitOp(vm.OP_BUILD_MAP, 0, uint16(len(kwArgs)))
+		}
+		c.emitOp(vm.OP_BUILD_CLASS, 1, 0)
+	} else {
+		c.emitOp(vm.OP_BUILD_CLASS, 0, 0)
+	}
 
 	// Apply decorators in reverse order
 	for i := len(decorators) - 1; i >= 0; i-- {
@@ -2518,6 +2600,9 @@ func (c *Compiler) compileDeleteTarget(targetID ExprID) error {
 		sym := c.scope.Symbols[name]
 		if sym != nil && sym.Storage == StorageFastLocal {
 			c.emitOp(vm.OP_DELETE_FAST, 0, uint16(sym.Offset))
+		} else if c.scope.Kind == ScopeClass {
+			_, idx := c.constPool.InternName(name)
+			c.emitOp(vm.OP_DELETE_NAME, 0, idx)
 		} else {
 			_, idx := c.constPool.InternName(name)
 			c.emitOp(vm.OP_DELETE_GLOBAL, 0, idx)

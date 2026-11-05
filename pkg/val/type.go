@@ -232,6 +232,54 @@ type PyType struct {
 	dunderNext    Value
 	dunderEnter   Value
 	dunderExit    Value
+
+	// Rich comparisons
+	dunderLt Value
+	dunderLe Value
+	dunderEq Value
+	dunderNe Value
+	dunderGt Value
+	dunderGe Value
+
+	// Reflected arithmetic
+	dunderRAdd      Value
+	dunderRSub      Value
+	dunderRMul      Value
+	dunderRMatMul   Value
+	dunderRTruediv  Value
+	dunderRFloordiv Value
+	dunderRMod      Value
+	dunderRPow      Value
+	dunderRLShift   Value
+	dunderRRShift   Value
+	dunderRAnd      Value
+	dunderRXor      Value
+	dunderROr       Value
+
+	// In-place arithmetic
+	dunderIAdd      Value
+	dunderISub      Value
+	dunderIMul      Value
+	dunderIMatMul   Value
+	dunderITruediv  Value
+	dunderIFloordiv Value
+	dunderIMod      Value
+	dunderIPow      Value
+	dunderILShift   Value
+	dunderIRShift   Value
+	dunderIAnd      Value
+	dunderIXor      Value
+	dunderIOr       Value
+
+	// Reflection, attributes & lifecycle
+	dunderGetAttribute Value
+	dunderDelAttr      Value
+	dunderDir          Value
+	dunderContains     Value
+	dunderMissing      Value
+	dunderNew          Value
+	dunderInitSubclass Value
+	dunderSetName      Value
 }
 
 // Compile-time assertion that PyType.Header is at byte offset 0.
@@ -247,37 +295,39 @@ func allocTypeVersion() uint64 {
 var (
 	builtinTypes [256]*PyType
 
-	TypeType        *PyType
-	ObjectType      *PyType
-	NoneType        *PyType
-	BoolType        *PyType
-	IntType         *PyType
-	FloatType       *PyType
-	StrType         *PyType
-	BigIntType      *PyType
-	ListType        *PyType
-	DictType        *PyType
-	TupleType       *PyType
-	CodeType        *PyType
-	FunctionType    *PyType
-	BuiltinFuncType *PyType
-	BoundMethodType *PyType
-	PropertyType    *PyType
-	SuperType       *PyType
-	CellType        *PyType
-	IterType        *PyType
-	RangeType       *PyType
-	GeneratorType   *PyType
-	CoroutineType   *PyType
-	FutureType      *PyType
-	TaskType        *PyType
-	ChanType        *PyType
-	ModuleType      *PyType
-	BytesType       *PyType
-	ByteArrayType   *PyType
-	MemoryViewType  *PyType
-	SliceType       *PyType
-	SetType         *PyType
+	TypeType         *PyType
+	ObjectType       *PyType
+	NoneType         *PyType
+	BoolType         *PyType
+	IntType          *PyType
+	FloatType        *PyType
+	StrType          *PyType
+	BigIntType       *PyType
+	ListType         *PyType
+	DictType         *PyType
+	TupleType        *PyType
+	CodeType         *PyType
+	FunctionType     *PyType
+	BuiltinFuncType  *PyType
+	BoundMethodType  *PyType
+	PropertyType     *PyType
+	ClassMethodType  *PyType
+	StaticMethodType *PyType
+	SuperType        *PyType
+	CellType         *PyType
+	IterType         *PyType
+	RangeType        *PyType
+	GeneratorType    *PyType
+	CoroutineType    *PyType
+	FutureType       *PyType
+	TaskType         *PyType
+	ChanType         *PyType
+	ModuleType       *PyType
+	BytesType        *PyType
+	ByteArrayType    *PyType
+	MemoryViewType   *PyType
+	SliceType        *PyType
+	SetType          *PyType
 
 	// Built-in exception types
 	BaseExceptionType       *PyType
@@ -305,6 +355,10 @@ var (
 	TypeVarTupleType  *PyType
 	ParamSpecType     *PyType
 	TypeAliasTypeType *PyType
+
+	// Metaclass & Descriptors
+	MemberDescrType    *PyType
+	NotImplementedType *PyType
 )
 
 // Pre-interned canonical dunder names used for slot synchronization.
@@ -326,6 +380,59 @@ var (
 	DunderNext    Value
 	DunderEnter   Value
 	DunderExit    Value
+
+	// Rich comparisons
+	DunderLt Value
+	DunderLe Value
+	DunderEq Value
+	DunderNe Value
+	DunderGt Value
+	DunderGe Value
+
+	// Reflected arithmetic
+	DunderRAdd      Value
+	DunderRSub      Value
+	DunderRMul      Value
+	DunderRMatMul   Value
+	DunderRTruediv  Value
+	DunderRFloordiv Value
+	DunderRMod      Value
+	DunderRDivMod   Value
+	DunderRPow      Value
+	DunderRLShift   Value
+	DunderRRShift   Value
+	DunderRAnd      Value
+	DunderRXor      Value
+	DunderROr       Value
+
+	// In-place arithmetic
+	DunderIAdd      Value
+	DunderISub      Value
+	DunderIMul      Value
+	DunderIMatMul   Value
+	DunderITruediv  Value
+	DunderIFloordiv Value
+	DunderIMod      Value
+	DunderIPow      Value
+	DunderILShift   Value
+	DunderIRShift   Value
+	DunderIAnd      Value
+	DunderIXor      Value
+	DunderIOr       Value
+
+	// Reflection, attributes & lifecycle
+	DunderGetAttribute Value
+	DunderDelAttr      Value
+	DunderDir          Value
+	DunderContains     Value
+	DunderMissing      Value
+	DunderNew          Value
+	DunderSetName      Value
+	DunderInitSubclass Value
+	DunderPrepare      Value
+	DunderMroEntries   Value
+	DunderOrigBases    Value
+	DunderSlots        Value
 )
 
 // TypeVal wraps a *PyType as a Value of KindType.
@@ -423,6 +530,14 @@ func ComputeMRO(cls *PyType) ([]*PyType, error) {
 // NewType constructs a new user-defined or built-in *PyType, computes its C3 MRO,
 // links it into its bases' Subclasses lists, and populates its TypeSlots.
 func NewType(name string, bases []*PyType, dict *PyDict) (*PyType, error) {
+	return NewTypeWithMeta(name, bases, dict, TypeType)
+}
+
+// NewTypeWithMeta constructs a new *PyType with a custom metaclass.
+func NewTypeWithMeta(name string, bases []*PyType, dict *PyDict, meta *PyType) (*PyType, error) {
+	if meta == nil {
+		meta = TypeType
+	}
 	if len(bases) == 0 && ObjectType != nil {
 		bases = []*PyType{ObjectType}
 	}
@@ -441,7 +556,7 @@ func NewType(name string, bases []*PyType, dict *PyDict) (*PyType, error) {
 	t := &PyType{
 		Header: ObjectHeader{
 			Kind: KindType,
-			Type: TypeType,
+			Type: meta,
 		},
 		Name:       name,
 		Bases:      bases,
@@ -459,6 +574,87 @@ func NewType(name string, bases []*PyType, dict *PyDict) (*PyType, error) {
 
 	for _, b := range bases {
 		b.Subclasses = append(b.Subclasses, t)
+	}
+
+	// Process __slots__
+	if slotsVal, hasSlots := dict.Get(DunderSlots); hasSlots {
+		var slotNames []string
+		if slotsVal.IsAnyString() {
+			slotNames = append(slotNames, slotsVal.AsString())
+		} else if slotsVal.IsTuple() {
+			for _, item := range slotsVal.AsTuple().Items {
+				if item.IsAnyString() {
+					slotNames = append(slotNames, item.AsString())
+				}
+			}
+		} else if slotsVal.IsList() {
+			for _, item := range slotsVal.AsList().Items {
+				if item.IsAnyString() {
+					slotNames = append(slotNames, item.AsString())
+				}
+			}
+		} else if slotsVal.IsIter() {
+			it := slotsVal.AsIter()
+			for {
+				item, ok := it.Next()
+				if !ok {
+					break
+				}
+				if item.IsAnyString() {
+					slotNames = append(slotNames, item.AsString())
+				}
+			}
+		}
+
+		hasDict := false
+		var cleanSlots []string
+		for _, sn := range slotNames {
+			if sn == "__dict__" {
+				hasDict = true
+			} else {
+				cleanSlots = append(cleanSlots, sn)
+			}
+		}
+
+		baseSlotCount := 0
+		for _, b := range bases {
+			if b != ObjectType && b != nil && b.RootShape != nil {
+				baseSlotCount += len(b.RootShape.Attrs)
+			}
+		}
+
+		totalSlots := baseSlotCount + len(cleanSlots)
+		newAttrs := make([]ShapeAttr, totalSlots)
+		curIdx := 0
+		for _, b := range bases {
+			if b != ObjectType && b != nil && b.RootShape != nil {
+				for _, a := range b.RootShape.Attrs {
+					newAttrs[curIdx] = ShapeAttr{Name: a.Name, Index: curIdx}
+					curIdx++
+				}
+			}
+		}
+
+		for _, sn := range cleanSlots {
+			internedName := InternString(sn)
+			newAttrs[curIdx] = ShapeAttr{Name: internedName, Index: curIdx}
+			descr := NewMemberDescr(t, internedName, curIdx)
+			t.Dict.Set(internedName, descr)
+			curIdx++
+		}
+
+		t.RootShape = &Shape{
+			ID:        allocShapeID(),
+			Type:      t,
+			SlotIndex: totalSlots - 1,
+			Attrs:     newAttrs,
+		}
+		empty := make([]ShapeTransition, 0, 4)
+		t.RootShape.transitions.Store(&empty)
+
+		if !hasDict {
+			t.Flags |= uint32(FlagForbidDynamicAttrs)
+		}
 	}
 
 	t.Slots.TpGetAttr = objectGetAttr
@@ -700,7 +896,261 @@ func (t *PyType) syncDunderSlots() {
 	} else {
 		t.dunderExit = Value{}
 	}
+
+	// Rich comparisons
+	if fn, _, ok := t.LookupMRO(DunderLt); ok {
+		t.dunderLt = fn
+	} else {
+		t.dunderLt = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderLe); ok {
+		t.dunderLe = fn
+	} else {
+		t.dunderLe = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderEq); ok {
+		t.dunderEq = fn
+	} else {
+		t.dunderEq = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderNe); ok {
+		t.dunderNe = fn
+	} else {
+		t.dunderNe = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderGt); ok {
+		t.dunderGt = fn
+	} else {
+		t.dunderGt = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderGe); ok {
+		t.dunderGe = fn
+	} else {
+		t.dunderGe = Value{}
+	}
+
+	// Reflected arithmetic
+	if fn, _, ok := t.LookupMRO(DunderRAdd); ok {
+		t.dunderRAdd = fn
+	} else {
+		t.dunderRAdd = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderRSub); ok {
+		t.dunderRSub = fn
+	} else {
+		t.dunderRSub = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderRMul); ok {
+		t.dunderRMul = fn
+	} else {
+		t.dunderRMul = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderRMatMul); ok {
+		t.dunderRMatMul = fn
+	} else {
+		t.dunderRMatMul = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderRTruediv); ok {
+		t.dunderRTruediv = fn
+	} else {
+		t.dunderRTruediv = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderRFloordiv); ok {
+		t.dunderRFloordiv = fn
+	} else {
+		t.dunderRFloordiv = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderRMod); ok {
+		t.dunderRMod = fn
+	} else {
+		t.dunderRMod = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderRPow); ok {
+		t.dunderRPow = fn
+	} else {
+		t.dunderRPow = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderRLShift); ok {
+		t.dunderRLShift = fn
+	} else {
+		t.dunderRLShift = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderRRShift); ok {
+		t.dunderRRShift = fn
+	} else {
+		t.dunderRRShift = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderRAnd); ok {
+		t.dunderRAnd = fn
+	} else {
+		t.dunderRAnd = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderRXor); ok {
+		t.dunderRXor = fn
+	} else {
+		t.dunderRXor = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderROr); ok {
+		t.dunderROr = fn
+	} else {
+		t.dunderROr = Value{}
+	}
+
+	// In-place arithmetic
+	if fn, _, ok := t.LookupMRO(DunderIAdd); ok {
+		t.dunderIAdd = fn
+	} else {
+		t.dunderIAdd = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderISub); ok {
+		t.dunderISub = fn
+	} else {
+		t.dunderISub = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderIMul); ok {
+		t.dunderIMul = fn
+	} else {
+		t.dunderIMul = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderIMatMul); ok {
+		t.dunderIMatMul = fn
+	} else {
+		t.dunderIMatMul = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderITruediv); ok {
+		t.dunderITruediv = fn
+	} else {
+		t.dunderITruediv = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderIFloordiv); ok {
+		t.dunderIFloordiv = fn
+	} else {
+		t.dunderIFloordiv = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderIMod); ok {
+		t.dunderIMod = fn
+	} else {
+		t.dunderIMod = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderIPow); ok {
+		t.dunderIPow = fn
+	} else {
+		t.dunderIPow = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderILShift); ok {
+		t.dunderILShift = fn
+	} else {
+		t.dunderILShift = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderIRShift); ok {
+		t.dunderIRShift = fn
+	} else {
+		t.dunderIRShift = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderIAnd); ok {
+		t.dunderIAnd = fn
+	} else {
+		t.dunderIAnd = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderIXor); ok {
+		t.dunderIXor = fn
+	} else {
+		t.dunderIXor = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderIOr); ok {
+		t.dunderIOr = fn
+	} else {
+		t.dunderIOr = Value{}
+	}
+
+	// Reflection, attributes & lifecycle
+	if fn, owner, ok := t.LookupMRO(DunderGetAttribute); ok && owner != ObjectType {
+		t.dunderGetAttribute = fn
+		t.Flags |= uint32(FlagCustomGetAttribute)
+	} else {
+		t.dunderGetAttribute = Value{}
+		t.Flags &= ^uint32(FlagCustomGetAttribute)
+	}
+	if fn, _, ok := t.LookupMRO(DunderDelAttr); ok {
+		t.dunderDelAttr = fn
+	} else {
+		t.dunderDelAttr = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderDir); ok {
+		t.dunderDir = fn
+	} else {
+		t.dunderDir = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderContains); ok {
+		t.dunderContains = fn
+	} else {
+		t.dunderContains = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderMissing); ok {
+		t.dunderMissing = fn
+	} else {
+		t.dunderMissing = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderNew); ok {
+		t.dunderNew = fn
+	} else {
+		t.dunderNew = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderInitSubclass); ok {
+		t.dunderInitSubclass = fn
+	} else {
+		t.dunderInitSubclass = Value{}
+	}
+	if fn, _, ok := t.LookupMRO(DunderSetName); ok {
+		t.dunderSetName = fn
+	} else {
+		t.dunderSetName = Value{}
+	}
 }
+
+func (t *PyType) DunderLtVal() Value { return t.dunderLt }
+func (t *PyType) DunderLeVal() Value { return t.dunderLe }
+func (t *PyType) DunderEqVal() Value { return t.dunderEq }
+func (t *PyType) DunderNeVal() Value { return t.dunderNe }
+func (t *PyType) DunderGtVal() Value { return t.dunderGt }
+func (t *PyType) DunderGeVal() Value { return t.dunderGe }
+
+func (t *PyType) DunderRAddVal() Value      { return t.dunderRAdd }
+func (t *PyType) DunderRSubVal() Value      { return t.dunderRSub }
+func (t *PyType) DunderRMulVal() Value      { return t.dunderRMul }
+func (t *PyType) DunderRMatMulVal() Value   { return t.dunderRMatMul }
+func (t *PyType) DunderRTruedivVal() Value  { return t.dunderRTruediv }
+func (t *PyType) DunderRFloordivVal() Value { return t.dunderRFloordiv }
+func (t *PyType) DunderRModVal() Value      { return t.dunderRMod }
+func (t *PyType) DunderRPowVal() Value      { return t.dunderRPow }
+func (t *PyType) DunderRLShiftVal() Value   { return t.dunderRLShift }
+func (t *PyType) DunderRRShiftVal() Value   { return t.dunderRRShift }
+func (t *PyType) DunderRAndVal() Value      { return t.dunderRAnd }
+func (t *PyType) DunderRXorVal() Value      { return t.dunderRXor }
+func (t *PyType) DunderROrVal() Value       { return t.dunderROr }
+
+func (t *PyType) DunderIAddVal() Value      { return t.dunderIAdd }
+func (t *PyType) DunderISubVal() Value      { return t.dunderISub }
+func (t *PyType) DunderIMulVal() Value      { return t.dunderIMul }
+func (t *PyType) DunderIMatMulVal() Value   { return t.dunderIMatMul }
+func (t *PyType) DunderITruedivVal() Value  { return t.dunderITruediv }
+func (t *PyType) DunderIFloordivVal() Value { return t.dunderIFloordiv }
+func (t *PyType) DunderIModVal() Value      { return t.dunderIMod }
+func (t *PyType) DunderIPowVal() Value      { return t.dunderIPow }
+func (t *PyType) DunderILShiftVal() Value   { return t.dunderILShift }
+func (t *PyType) DunderIRShiftVal() Value   { return t.dunderIRShift }
+func (t *PyType) DunderIAndVal() Value      { return t.dunderIAnd }
+func (t *PyType) DunderIXorVal() Value      { return t.dunderIXor }
+func (t *PyType) DunderIOrVal() Value       { return t.dunderIOr }
+
+func (t *PyType) DunderGetAttributeVal() Value { return t.dunderGetAttribute }
+func (t *PyType) DunderDelAttrVal() Value      { return t.dunderDelAttr }
+func (t *PyType) DunderDirVal() Value          { return t.dunderDir }
+func (t *PyType) DunderContainsVal() Value     { return t.dunderContains }
+func (t *PyType) DunderMissingVal() Value      { return t.dunderMissing }
+func (t *PyType) DunderNewVal() Value          { return t.dunderNew }
+func (t *PyType) DunderInitSubclassVal() Value { return t.dunderInitSubclass }
+func (t *PyType) DunderSetNameVal() Value      { return t.dunderSetName }
 
 // DunderEnterVal returns the cached __enter__ callable for t.
 func (t *PyType) DunderEnterVal() Value {
@@ -743,8 +1193,20 @@ func (t *PyType) DunderInitVal() Value {
 // objectGetAttr implements the standard Python object.__getattribute__ protocol,
 // enforcing data descriptor precedence -> instance Shape slots -> non-data descriptors.
 func objectGetAttr(ctx *ExecContext, obj, name Value) Value {
+	tp := obj.Type()
+	if tp.dunderGetAttribute.ptr != nil {
+		return ctx.Invoke2(tp.dunderGetAttribute, obj, name)
+	}
+	return defaultObjectGetAttr(ctx, obj, name)
+}
+
+func defaultObjectGetAttr(ctx *ExecContext, obj, name Value) Value {
 	interned := InternValue(name)
 	tp := obj.Type()
+
+	if interned.AsString() == "__class__" {
+		return TypeVal(tp)
+	}
 
 	descr, _, foundInClass := tp.LookupMRO(interned)
 	if foundInClass {
@@ -840,6 +1302,16 @@ func objectSetAttr(ctx *ExecContext, obj, name, value Value) Value {
 		return NoneVal()
 	}
 
+	if obj.IsType() {
+		cls := obj.AsType()
+		if cls.Dict == nil {
+			cls.Dict = NewDictVal(16).AsDict()
+		}
+		cls.Dict.Set(interned, value)
+		cls.syncDunderSlots()
+		return NoneVal()
+	}
+
 	panic("val: AttributeError: '" + tp.Name + "' object cannot set attribute '" + interned.AsString() + "'")
 }
 
@@ -847,12 +1319,62 @@ func objectSetAttr(ctx *ExecContext, obj, name, value Value) Value {
 func typeGetAttr(ctx *ExecContext, typeObj, name Value) Value {
 	cls := typeObj.AsType()
 	interned := InternValue(name)
+	meta := cls.Header.Type
+	if meta == nil {
+		meta = TypeType
+	}
+
+	// 1. Check metaclass MRO for data descriptors
+	if descr, _, ok := meta.LookupMRO(interned); ok {
+		descrType := descr.Type()
+		if descr.IsDataDescriptor() || (descrType.Slots.TpDescrGet != nil && descrType.Slots.TpDescrSet != nil) {
+			if descrType.Slots.TpDescrGet != nil {
+				return descrType.Slots.TpDescrGet(ctx, descr, typeObj, meta)
+			}
+		}
+	}
+
+	// 2. Check class MRO
 	if descr, _, ok := cls.LookupMRO(interned); ok {
 		if descrGet := descr.Type().Slots.TpDescrGet; descrGet != nil {
 			return descrGet(ctx, descr, NoneVal(), cls)
 		}
 		return descr
 	}
+
+	// 3. Check metaclass MRO for non-data descriptors and class attributes
+	if descr, _, ok := meta.LookupMRO(interned); ok {
+		if descrGet := descr.Type().Slots.TpDescrGet; descrGet != nil {
+			return descrGet(ctx, descr, typeObj, meta)
+		}
+		return descr
+	}
+
+	// 4. Builtin type reflection attributes
+	switch interned.AsString() {
+	case "__class__":
+		return TypeVal(meta)
+	case "__bases__":
+		basesItems := make([]Value, len(cls.Bases))
+		for i, b := range cls.Bases {
+			basesItems[i] = TypeVal(b)
+		}
+		return NewTupleVal(basesItems...)
+	case "__name__":
+		return InternString(cls.Name)
+	case "__mro__":
+		mroItems := make([]Value, len(cls.MRO))
+		for i, m := range cls.MRO {
+			mroItems[i] = TypeVal(m)
+		}
+		return NewTupleVal(mroItems...)
+	}
+
+	// 5. Fallback to metaclass __getattr__ if defined
+	if meta.dunderGetAttr.ptr != nil {
+		return ctx.Invoke2(meta.dunderGetAttr, typeObj, interned)
+	}
+
 	panic("val: AttributeError: type object '" + cls.Name + "' has no attribute '" + interned.AsString() + "'")
 }
 

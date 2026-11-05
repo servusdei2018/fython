@@ -1397,8 +1397,19 @@ func (d *PyDict) Keys() []Value {
 	return keys
 }
 
+// DictVal wraps an existing *PyDict as a Value.
+func DictVal(d *PyDict) Value {
+	if d == nil {
+		return NoneVal()
+	}
+	return Value{num: 0, ptr: &d.Header}
+}
+
 // Values returns a slice of all active values in PyDict in a thread-safe manner.
 func (d *PyDict) Values() []Value {
+	if d == nil {
+		return nil
+	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	vals := make([]Value, 0, d.used)
@@ -1408,6 +1419,28 @@ func (d *PyDict) Values() []Value {
 		}
 	}
 	return vals
+}
+
+// DictItem represents a key-value pair in PyDict.
+type DictItem struct {
+	Key   Value
+	Value Value
+}
+
+// Items returns a slice of all active key-value pairs in PyDict in a thread-safe manner.
+func (d *PyDict) Items() []DictItem {
+	if d == nil {
+		return nil
+	}
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	items := make([]DictItem, 0, d.used)
+	for i := range d.Entries {
+		if d.Entries[i].Active {
+			items = append(items, DictItem{Key: d.Entries[i].Key, Value: d.Entries[i].Value})
+		}
+	}
+	return items
 }
 
 // PySet represents a heap-allocated Python set.

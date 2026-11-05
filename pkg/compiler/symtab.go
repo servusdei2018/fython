@@ -164,6 +164,15 @@ func (st *SymbolTable) visitStmt(stmtID StmtID) error {
 		params := st.arena.GetIdentSlice(fnDef.ParamNames)
 		fnScope.ParamNames = append(fnScope.ParamNames, params...)
 		for _, p := range params {
+			clean := p
+			if strings.HasPrefix(p, "**") {
+				clean = p[2:]
+			} else if strings.HasPrefix(p, "*") {
+				clean = p[1:]
+			}
+			if clean != "" {
+				fnScope.Bound[clean] = true
+			}
 			fnScope.Bound[p] = true
 		}
 
@@ -624,6 +633,16 @@ func (st *SymbolTable) visitExpr(exprID ExprID) error {
 		if err := st.visitExpr(call.Func); err != nil {
 			return err
 		}
+		// Zero-arg super() implicitly references __class__
+		if call.PosArgs.Count == 0 && call.KWArgs.Count == 0 {
+			fExpr := st.arena.GetExpr(call.Func)
+			if fExpr != nil && fExpr.Kind == ExprKindName {
+				fName := string(st.src[fExpr.Start:fExpr.End])
+				if fName == "super" {
+					st.cur.Used["__class__"] = true
+				}
+			}
+		}
 		for _, arg := range st.arena.GetExprSlice(call.PosArgs) {
 			if err := st.visitExpr(arg); err != nil {
 				return err
@@ -729,6 +748,15 @@ func (st *SymbolTable) visitExpr(exprID ExprID) error {
 		params := st.arena.GetIdentSlice(fnDef.ParamNames)
 		lambdaScope.ParamNames = append(lambdaScope.ParamNames, params...)
 		for _, p := range params {
+			clean := p
+			if strings.HasPrefix(p, "**") {
+				clean = p[2:]
+			} else if strings.HasPrefix(p, "*") {
+				clean = p[1:]
+			}
+			if clean != "" {
+				lambdaScope.Bound[clean] = true
+			}
 			lambdaScope.Bound[p] = true
 		}
 		saved := st.cur
@@ -844,11 +872,18 @@ func (st *SymbolTable) resolveScope(s *Scope) error {
 	}
 
 	if s.Kind == ScopeClass {
+		for idx, cv := range s.CellVars {
+			s.Symbols[cv] = &Symbol{Name: cv, Storage: StorageCell, Offset: idx}
+		}
 		for name := range s.Bound {
-			s.Symbols[name] = &Symbol{Name: name, Storage: StorageGlobal}
+			if s.Symbols[name] == nil {
+				s.Symbols[name] = &Symbol{Name: name, Storage: StorageGlobal}
+			}
 		}
 		for name := range s.Used {
-			s.Symbols[name] = &Symbol{Name: name, Storage: StorageGlobal}
+			if s.Symbols[name] == nil {
+				s.Symbols[name] = &Symbol{Name: name, Storage: StorageGlobal}
+			}
 		}
 		return nil
 	}
@@ -906,15 +941,24 @@ func (st *SymbolTable) resolveScope(s *Scope) error {
 
 	// 2. Process variables bound in this function
 	for _, param := range s.ParamNames {
-		if s.ExplicitG[param] || s.ExplicitNL[param] {
+		clean := param
+		if strings.HasPrefix(param, "**") {
+			clean = param[2:]
+		} else if strings.HasPrefix(param, "*") {
+			clean = param[1:]
+		}
+		if clean == "" {
 			continue
 		}
-		if st.isCapturedByDescendants(s, param) {
-			s.Symbols[param] = &Symbol{Name: param, Storage: StorageCell}
-			s.CellVars = append(s.CellVars, param)
+		if s.ExplicitG[clean] || s.ExplicitNL[clean] {
+			continue
+		}
+		if st.isCapturedByDescendants(s, clean) {
+			s.Symbols[clean] = &Symbol{Name: clean, Storage: StorageCell}
+			s.CellVars = append(s.CellVars, clean)
 		} else {
-			s.Symbols[param] = &Symbol{Name: param, Storage: StorageFastLocal}
-			s.FastLocals = append(s.FastLocals, param)
+			s.Symbols[clean] = &Symbol{Name: clean, Storage: StorageFastLocal}
+			s.FastLocals = append(s.FastLocals, clean)
 		}
 	}
 
@@ -961,7 +1005,13 @@ func (st *SymbolTable) resolveScope(s *Scope) error {
 	// Parameters and FastLocals: 0 .. NumLocals-1
 	offset := 0
 	for _, p := range s.ParamNames {
-		sym := s.Symbols[p]
+		clean := p
+		if strings.HasPrefix(p, "**") {
+			clean = p[2:]
+		} else if strings.HasPrefix(p, "*") {
+			clean = p[1:]
+		}
+		sym := s.Symbols[clean]
 		if sym != nil && sym.Storage == StorageFastLocal {
 			sym.Offset = offset
 			offset++
@@ -993,6 +1043,18 @@ func (st *SymbolTable) resolveScope(s *Scope) error {
 
 func (st *SymbolTable) markAncestorCell(start *Scope, name string) {
 	for p := start; p != nil; p = p.Parent {
+		if p.Kind == ScopeClass && name == "__class__" {
+			sym := p.Symbols[name]
+			if sym == nil {
+				sym = &Symbol{Name: name}
+				p.Symbols[name] = sym
+			}
+			sym.Storage = StorageCell
+			if !containsString(p.CellVars, name) {
+				p.CellVars = append(p.CellVars, name)
+			}
+			return
+		}
 		if p.Kind == ScopeModule || p.Kind == ScopeClass {
 			continue
 		}
@@ -1033,6 +1095,12 @@ func (st *SymbolTable) isBoundInFunctionAncestors(start *Scope, name string) boo
 		if p.Kind == ScopeModule {
 			return false
 		}
+		if p.Kind == ScopeClass {
+			if name == "__class__" {
+				return true
+			}
+			continue
+		}
 		if p.Kind == ScopeFunction {
 			if p.Bound[name] {
 				return true
@@ -1068,7 +1136,7 @@ func (st *SymbolTable) isCapturedByDescendants(s *Scope, name string) bool {
 
 func isParam(params []string, name string) bool {
 	for _, p := range params {
-		if p == name {
+		if p == name || p == "*"+name || p == "**"+name {
 			return true
 		}
 	}

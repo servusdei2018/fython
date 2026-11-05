@@ -200,6 +200,8 @@ type ASTClassDef struct {
 	TypeParams TypeParamSlice
 	Decorators ExprSlice
 	Keywords   ExprSlice
+	KWNames    IdentSlice
+	KWArgs     ExprSlice
 }
 
 // ASTElif stores an elif condition and body.

@@ -436,10 +436,13 @@ func (p *Parser) parseClassDefFull(startPos uint32, decorators ExprSlice) (StmtI
 
 	var bases []ExprID
 	var keywords []ExprID
+	var kwNames []string
+	var kwArgs []ExprID
 	if p.match(TOKEN_LPAREN) {
 		for p.cur.Type != TOKEN_RPAREN && p.cur.Type != TOKEN_EOF {
-			// Check for keyword arg: metaclass=Meta
-			if p.cur.Type == TOKEN_IDENT && p.peek().Type == TOKEN_ASSIGN {
+			// Check for keyword arg: name = expr
+			if (p.cur.Type == TOKEN_IDENT || p.cur.Type == TOKEN_TYPE) && p.peek().Type == TOKEN_ASSIGN {
+				kwName := p.tokenText(p.cur)
 				p.advance() // ident
 				p.advance() // =
 				kwVal, err := p.parseTernary()
@@ -447,6 +450,30 @@ func (p *Parser) parseClassDefFull(startPos uint32, decorators ExprSlice) (StmtI
 					return StmtNone, err
 				}
 				keywords = append(keywords, kwVal)
+				kwNames = append(kwNames, kwName)
+				kwArgs = append(kwArgs, kwVal)
+			} else if p.cur.Type == TOKEN_STARSTAR {
+				p.advance() // **
+				kwVal, err := p.parseTernary()
+				if err != nil {
+					return StmtNone, err
+				}
+				keywords = append(keywords, kwVal)
+				kwNames = append(kwNames, "") // empty name indicates **unpack
+				kwArgs = append(kwArgs, kwVal)
+			} else if p.cur.Type == TOKEN_STAR {
+				startTok := p.cur
+				p.advance() // *
+				starVal, err := p.parseTernary()
+				if err != nil {
+					return StmtNone, err
+				}
+				starredExpr := p.arena.AllocExpr(ASTExpr{
+					Kind:  ExprKindStarred,
+					Left:  starVal,
+					Start: startTok.Start,
+				})
+				bases = append(bases, starredExpr)
 			} else {
 				baseExpr, err := p.parseTernary()
 				if err != nil {
@@ -480,6 +507,8 @@ func (p *Parser) parseClassDefFull(startPos uint32, decorators ExprSlice) (StmtI
 		TypeParams: p.arena.AddTypeParamSlice(typeParams),
 		Decorators: decorators,
 		Keywords:   p.arena.AddExprSlice(keywords),
+		KWNames:    p.arena.AddIdentSlice(kwNames),
+		KWArgs:     p.arena.AddExprSlice(kwArgs),
 	})
 
 	return p.arena.AllocStmt(ASTStmt{
@@ -1139,26 +1168,40 @@ func (p *Parser) parseSimpleStmt() (StmtID, error) {
 
 	// Check for assignment: target = expr (and multi-target a = b = c = 1)
 	if p.match(TOKEN_ASSIGN) {
-		targets := []ExprID{expr}
 		val, err := p.parseExpr()
 		if err != nil {
 			return StmtNone, err
 		}
-		for p.match(TOKEN_ASSIGN) {
-			targets = append(targets, val)
+		if p.match(TOKEN_ASSIGN) {
+			targets := []ExprID{expr, val}
 			val, err = p.parseExpr()
 			if err != nil {
 				return StmtNone, err
 			}
+			for p.match(TOKEN_ASSIGN) {
+				targets = append(targets, val)
+				val, err = p.parseExpr()
+				if err != nil {
+					return StmtNone, err
+				}
+			}
+			p.match(TOKEN_SEMI)
+			p.match(TOKEN_NEWLINE)
+			targetSlice := p.arena.AddExprSlice(targets)
+			return p.arena.AllocStmt(ASTStmt{
+				Kind:  StmtKindAssign,
+				Expr1: targets[0],
+				Expr2: val,
+				Extra: targetSlice.Start | (targetSlice.Count << 16),
+			}), nil
 		}
 		p.match(TOKEN_SEMI)
 		p.match(TOKEN_NEWLINE)
-		targetSlice := p.arena.AddExprSlice(targets)
 		return p.arena.AllocStmt(ASTStmt{
 			Kind:  StmtKindAssign,
-			Expr1: targets[0],
+			Expr1: expr,
 			Expr2: val,
-			Extra: targetSlice.Start | (targetSlice.Count << 16),
+			Extra: 1 << 16,
 		}), nil
 	}
 
@@ -1309,7 +1352,7 @@ func (p *Parser) parsePatternAs() (PatternID, error) {
 func (p *Parser) parsePatternAtom() (PatternID, error) {
 	tok := p.cur
 	switch tok.Type {
-	case TOKEN_IDENT:
+	case TOKEN_IDENT, TOKEN_TYPE:
 		name := p.tokenText(tok)
 		p.advance()
 		if name == "_" {
@@ -2439,7 +2482,7 @@ func (p *Parser) parseAtom() (ExprID, error) {
 			End:   tok.End,
 		}), nil
 
-	case TOKEN_IDENT:
+	case TOKEN_IDENT, TOKEN_TYPE:
 		p.advance()
 		return p.arena.AllocExpr(ASTExpr{
 			Kind:  ExprKindName,

@@ -71,6 +71,7 @@ type CallFrame struct {
 	retSP      int // Caller's stack pointer where the return value will be written
 	cells      []val.Value
 	globals    *val.PyDict
+	locals     val.Value
 	cache      *VMCodeCache
 }
 
@@ -143,26 +144,29 @@ func AsCodeObject(v val.Value) *CodeObject {
 // VM represents a single execution thread with contiguous Value, CallFrame, and ICSlot slabs,
 // plus a VM-managed string interning pool and zero-allocation Vectorcall execution context.
 type VM struct {
-	engine         *Engine
-	stack          []val.Value
-	frames         []CallFrame
-	ic             []ICSlot
-	methodPIC      [][4]val.MethodPICEntry
-	attrPIC        [][4]AttrPICEntry
-	codeCaches     []VMCodeCache
-	builtinRange   val.Value
-	internPool     *val.InternPool
-	execCtx        val.ExecContext
-	activeFrameIdx int
-	kwScratch      [64]val.Value
-	kwSet          [64]bool
-	globals        *val.PyDict
-	builtins       *val.PyDict
-	modules        *val.PyDict
-	lastException  val.Value
-	coroFreeList   []*val.PyCoroutine
-	rootCO         CodeObject
-	rootCache      VMCodeCache
+	engine           *Engine
+	stack            []val.Value
+	frames           []CallFrame
+	ic               []ICSlot
+	methodPIC        [][4]val.MethodPICEntry
+	attrPIC          [][4]AttrPICEntry
+	codeCaches       []VMCodeCache
+	builtinRange     val.Value
+	internPool       *val.InternPool
+	execCtx          val.ExecContext
+	activeFrameIdx   int
+	activeCO         *CodeObject
+	activeBaseOffset int
+	activeCells      []val.Value
+	kwScratch        [64]val.Value
+	kwSet            [64]bool
+	globals          *val.PyDict
+	builtins         *val.PyDict
+	modules          *val.PyDict
+	lastException    val.Value
+	coroFreeList     []*val.PyCoroutine
+	rootCO           CodeObject
+	rootCache        VMCodeCache
 }
 
 func (vm *VM) getCodeCache(co *CodeObject) *VMCodeCache {

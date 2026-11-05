@@ -2,6 +2,7 @@ package vm
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"unsafe"
@@ -19,21 +20,218 @@ func (vm *VM) Run(code []uint32, consts []val.Value, numLocals int) val.Value {
 		NumLocals:    numLocals,
 		MaxStackSize: numLocals + 64,
 	}
-	return vm.runLoopWithGlobals(&vm.rootCO, 0, numLocals, 0, nil, vm.globals, vm.stack, nil, nil)
+	return vm.runLoopWithGlobals(&vm.rootCO, 0, numLocals, 0, nil, vm.globals, val.NoneVal(), vm.stack, nil, nil)
 }
 
 // RunCode executes a *CodeObject on the VM.
 func (vm *VM) RunCode(co *CodeObject) val.Value {
-	return vm.runLoopWithGlobals(co, 0, co.NumLocals, 0, nil, vm.globals, vm.stack, nil, nil)
+	return vm.runLoopWithGlobals(co, 0, co.NumLocals, 0, nil, vm.globals, val.NoneVal(), vm.stack, nil, nil)
 }
 
 // RunCodeWithGlobals executes a *CodeObject using a custom module globals dictionary.
 func (vm *VM) RunCodeWithGlobals(co *CodeObject, globals *val.PyDict) val.Value {
-	return vm.runLoopWithGlobals(co, 0, co.NumLocals, 0, nil, globals, vm.stack, nil, nil)
+	return vm.runLoopWithGlobals(co, 0, co.NumLocals, 0, nil, globals, val.NoneVal(), vm.stack, nil, nil)
 }
 
 func (vm *VM) runClassBody(co *CodeObject, classDict *val.PyDict) {
-	vm.runLoopWithGlobals(co, 0, co.NumLocals, 0, nil, classDict, vm.stack, nil, nil)
+	vm.runLoopWithGlobals(co, 0, co.NumLocals, 0, nil, vm.globals, val.DictVal(classDict), vm.stack, nil, nil)
+}
+
+func (vm *VM) runClassBodyWithLocals(co *CodeObject, globals *val.PyDict, namespace val.Value, cells []val.Value) {
+	vm.runLoopWithGlobals(co, 0, co.NumLocals, 0, cells, globals, namespace, vm.stack, nil, nil)
+}
+
+func (vm *VM) buildClass(classBody, nameVal val.Value, origBases []val.Value, kwdsVal val.Value, globals *val.PyDict) val.Value {
+	// Step 1: Base Resolution via __mro_entries__ (PEP 560)
+	var resolvedBases []val.Value
+	hasMROEntries := false
+	for _, b := range origBases {
+		if !b.IsType() {
+			bType := b.Type()
+			if mroEntryFn, _, ok := bType.LookupMRO(val.DunderMroEntries); ok {
+				hasMROEntries = true
+				tupleVal := val.NewTupleVal(origBases...)
+				entries := vm.Vectorcall(mroEntryFn, []val.Value{b, tupleVal}, nil)
+				if !entries.IsTuple() {
+					panic("TypeError: __mro_entries__ must return a tuple")
+				}
+				resolvedBases = append(resolvedBases, entries.AsTuple().Items...)
+				continue
+			}
+		}
+		resolvedBases = append(resolvedBases, b)
+	}
+
+	// Step 2: Determine the Most Derived Metaclass
+	var explicitMeta val.Value
+	var kwdsDict *val.PyDict
+	if kwdsVal.IsDict() {
+		kwdsDict = kwdsVal.AsDict()
+		if metaV, ok := kwdsDict.Get(val.InternString("metaclass")); ok {
+			explicitMeta = metaV
+			kwdsDict.Delete(val.InternString("metaclass"))
+		}
+	}
+
+	var meta *val.PyType
+	var metaCallable val.Value
+
+	if !explicitMeta.IsNone() && explicitMeta.HeaderPtr() != nil {
+		if explicitMeta.IsType() {
+			meta = explicitMeta.AsType()
+		} else {
+			metaCallable = explicitMeta
+		}
+	}
+
+	if meta == nil && metaCallable.HeaderPtr() == nil {
+		meta = val.TypeType
+	}
+
+	if meta != nil {
+		for _, b := range resolvedBases {
+			if b.IsType() {
+				bMeta := b.AsType().Header.Type
+				if bMeta == nil {
+					bMeta = val.TypeType
+				}
+				if val.IsSubclass(bMeta, meta) {
+					meta = bMeta
+				} else if val.IsSubclass(meta, bMeta) {
+					// meta is already a subclass of bMeta, keep meta
+				} else {
+					panic("TypeError: metaclass conflict: the metaclass of a derived class must be a (non-strict) subclass of the metaclasses of all its bases")
+				}
+			}
+		}
+	}
+
+	// Step 3: __prepare__ Hook
+	var namespace val.Value
+	if meta != nil {
+		deferCatch := func() (v val.Value, ok bool) {
+			defer func() {
+				if r := recover(); r != nil {
+					ok = false
+				}
+			}()
+			return val.GetAttrCtx(&vm.execCtx, val.TypeVal(meta), val.DunderPrepare), true
+		}
+		if prepCallable, ok := deferCatch(); ok && !prepCallable.IsNone() && prepCallable.HeaderPtr() != nil {
+			prepArgs := []val.Value{nameVal, val.NewTupleVal(resolvedBases...)}
+			var prepKWNames []val.Value
+			if kwdsDict != nil {
+				for _, item := range kwdsDict.Items() {
+					prepArgs = append(prepArgs, item.Value)
+					prepKWNames = append(prepKWNames, item.Key)
+				}
+			}
+			namespace = vm.Vectorcall(prepCallable, prepArgs, prepKWNames)
+		}
+	}
+	if namespace.IsNone() || namespace.HeaderPtr() == nil {
+		namespace = val.NewDictVal(16)
+	}
+
+	// Step 4: Class Body Execution & Zero-Arg super() (__class__ Cell)
+	var co *CodeObject
+	if classBody.Kind() == val.KindCode {
+		co = AsCodeObject(classBody)
+	} else if classBody.IsFunction() {
+		co = AsCodeObject(classBody.AsFunction().Code)
+	} else {
+		panic("TypeError: class body must be code object or function")
+	}
+
+	var bodyCells []val.Value
+	var classCell val.Value
+	classCellIdx := -1
+
+	if len(co.CellVars) > 0 {
+		bodyCells = make([]val.Value, len(co.CellVars))
+		for i, cv := range co.CellVars {
+			c := val.NewCellVal(val.UnboundVal())
+			bodyCells[i] = c
+			if cv.AsString() == "__class__" {
+				classCell = c
+				classCellIdx = i
+			}
+		}
+	}
+
+	if classCellIdx >= 0 {
+		if namespace.IsDict() {
+			namespace.AsDict().Set(val.InternString("__classcell__"), classCell)
+		}
+	}
+
+	if globals == nil {
+		globals = vm.globals
+	}
+	vm.runClassBodyWithLocals(co, globals, namespace, bodyCells)
+
+	// Step 5: Class Creation via Metaclass
+	createArgs := []val.Value{nameVal, val.NewTupleVal(resolvedBases...), namespace}
+	var createKWNames []val.Value
+	if kwdsDict != nil {
+		for _, item := range kwdsDict.Items() {
+			createArgs = append(createArgs, item.Value)
+			createKWNames = append(createKWNames, item.Key)
+		}
+	}
+
+	if metaCallable.HeaderPtr() == nil && meta != nil {
+		metaCallable = val.TypeVal(meta)
+	}
+	newClsVal := vm.Vectorcall(metaCallable, createArgs, createKWNames)
+
+	// Step 6: Bind __class__ Closure Cell
+	if classCellIdx >= 0 {
+		bodyCells[classCellIdx].AsCell().Value = newClsVal
+	}
+	if namespace.IsDict() {
+		if cc, ok := namespace.AsDict().Get(val.InternString("__classcell__")); ok {
+			if cc.IsCell() {
+				cc.AsCell().Value = newClsVal
+			}
+		}
+	}
+
+	// Step 7: Descriptor Notification (__set_name__)
+	if newClsVal.IsType() {
+		newCls := newClsVal.AsType()
+		if newCls.Dict != nil {
+			for _, item := range newCls.Dict.Items() {
+				attrVal := item.Value
+				if !attrVal.IsNone() && attrVal.HeaderPtr() != nil {
+					if setNameFn, _, ok := attrVal.Type().LookupMRO(val.DunderSetName); ok {
+						vm.Vectorcall(setNameFn, []val.Value{attrVal, newClsVal, item.Key}, nil)
+					}
+				}
+			}
+		}
+
+		// Step 8: Subclass Notification (__init_subclass__)
+		if len(newCls.Bases) > 0 {
+			if initSubclassFn, _, ok := newCls.LookupMROAfter(newCls, val.DunderInitSubclass); ok {
+				initArgs := []val.Value{newClsVal}
+				var initKWNames []val.Value
+				if kwdsDict != nil {
+					for _, item := range kwdsDict.Items() {
+						initArgs = append(initArgs, item.Value)
+						initKWNames = append(initKWNames, item.Key)
+					}
+				}
+				vm.Vectorcall(initSubclassFn, initArgs, initKWNames)
+			}
+		}
+
+		if hasMROEntries {
+			newCls.Dict.Set(val.DunderOrigBases, val.NewTupleVal(origBases...))
+		}
+	}
+
+	return newClsVal
 }
 
 // Vectorcall invokes a Python or native callable using a contiguous argument slice and optional keyword names.
@@ -69,7 +267,7 @@ func (vm *VM) callFromHook(ctx *val.ExecContext, callable val.Value, argBase int
 		spAfterBind := vm.bindFunctionArgs(co, fn.Defaults, fn.KwDefaults, ctx.Stack, argBase, nargs, kwnames)
 		savedSP := ctx.SP
 		cells := vm.setupCalleeCells(co, callable, ctx.Stack, argBase, nargs)
-		res := vm.runLoopWithGlobals(co, argBase, spAfterBind, vm.activeFrameIdx, cells, fnGlobals, ctx.Stack, nil, nil)
+		res := vm.runLoopWithGlobals(co, argBase, spAfterBind, vm.activeFrameIdx, cells, fnGlobals, val.NoneVal(), ctx.Stack, nil, nil)
 		ctx.SP = savedSP
 		return res
 
@@ -84,7 +282,7 @@ func (vm *VM) callFromHook(ctx *val.ExecContext, callable val.Value, argBase int
 		spAfterBind := vm.bindFunctionArgs(co, nil, nil, ctx.Stack, argBase, nargs, kwnames)
 		savedSP := ctx.SP
 		cells := vm.setupCalleeCells(co, callable, ctx.Stack, argBase, nargs)
-		res := vm.runLoopWithGlobals(co, argBase, spAfterBind, vm.activeFrameIdx, cells, vm.globals, ctx.Stack, nil, nil)
+		res := vm.runLoopWithGlobals(co, argBase, spAfterBind, vm.activeFrameIdx, cells, vm.globals, val.NoneVal(), ctx.Stack, nil, nil)
 		ctx.SP = savedSP
 		return res
 
@@ -115,10 +313,39 @@ func (vm *VM) bindFunctionArgs(co *CodeObject, defaults []val.Value, kwDefaults 
 		numLocals = numParams
 	}
 
+	paramNames := co.ParamNames
+	varKWIdx := -1
+	varArgsIdx := -1
+	posParamCount := 0
+	for p := 0; p < len(paramNames); p++ {
+		pnStr := paramNames[p].AsString()
+		if strings.HasPrefix(pnStr, "**") {
+			varKWIdx = p
+		} else if strings.HasPrefix(pnStr, "*") {
+			if pnStr != "*" {
+				varArgsIdx = p
+			}
+		} else {
+			posParamCount++
+		}
+	}
+
 	if len(kwnames) == 0 {
-		if nargs < numParams && len(defaults) > 0 {
-			defStart := numParams - len(defaults)
-			for i := nargs; i < numParams; i++ {
+		if varArgsIdx >= 0 {
+			if nargs > posParamCount {
+				extra := make([]val.Value, nargs-posParamCount)
+				copy(extra, stack[argBase+posParamCount:argBase+nargs])
+				stack[argBase+varArgsIdx] = val.NewTupleVal(extra...)
+			} else {
+				stack[argBase+varArgsIdx] = val.NewTupleVal()
+			}
+		}
+		if varKWIdx >= 0 {
+			stack[argBase+varKWIdx] = val.NewDictVal(4)
+		}
+		if nargs < posParamCount && len(defaults) > 0 {
+			defStart := posParamCount - len(defaults)
+			for i := nargs; i < posParamCount; i++ {
 				if i >= defStart {
 					stack[argBase+i] = defaults[i-defStart]
 				}
@@ -138,36 +365,71 @@ func (vm *VM) bindFunctionArgs(co *CodeObject, defaults []val.Value, kwDefaults 
 
 	// Copy keyword argument values into VM scratch buffer before rearranging in-place.
 	copy(vm.kwScratch[:kwCount], stack[argBase+posCount:argBase+nargs])
-	for i := posCount; i < numParams; i++ {
+	for i := 0; i < numParams; i++ {
 		vm.kwSet[i] = false
 	}
+	for i := 0; i < posCount && i < numParams; i++ {
+		vm.kwSet[i] = true
+	}
 
-	paramNames := co.ParamNames
+	var kwDict *val.PyDict
 	for i := 0; i < kwCount; i++ {
 		kwName := kwnames[i]
 		kwVal := vm.kwScratch[i]
 		foundIdx := -1
 		for p := 0; p < len(paramNames); p++ {
+			if p == varArgsIdx || p == varKWIdx {
+				continue
+			}
 			pn := paramNames[p]
 			if (pn.HeaderPtr() == kwName.HeaderPtr() && pn == kwName) || val.StringEquals(pn, kwName) {
 				foundIdx = p
 				break
 			}
 		}
-		if foundIdx < 0 {
+		if foundIdx >= 0 {
+			if foundIdx < posCount || vm.kwSet[foundIdx] {
+				panic("vm: TypeError: multiple values for argument '" + kwName.AsString() + "'")
+			}
+			stack[argBase+foundIdx] = kwVal
+			vm.kwSet[foundIdx] = true
+		} else if varKWIdx >= 0 {
+			if kwDict == nil {
+				kwDict = val.NewDictVal(4).AsDict()
+			}
+			kwDict.Set(kwName, kwVal)
+		} else {
 			panic("vm: TypeError: unexpected keyword argument '" + kwName.AsString() + "'")
 		}
-		if foundIdx < posCount || vm.kwSet[foundIdx] {
-			panic("vm: TypeError: multiple values for argument '" + kwName.AsString() + "'")
-		}
-		stack[argBase+foundIdx] = kwVal
-		vm.kwSet[foundIdx] = true
 	}
 
-	defStart := numParams - len(defaults)
-	for i := posCount; i < numParams; i++ {
+	if varKWIdx >= 0 {
+		if kwDict == nil {
+			stack[argBase+varKWIdx] = val.NewDictVal(4)
+		} else {
+			stack[argBase+varKWIdx] = val.DictVal(kwDict)
+		}
+		vm.kwSet[varKWIdx] = true
+	}
+
+	if varArgsIdx >= 0 {
+		if posCount > posParamCount {
+			extra := make([]val.Value, posCount-posParamCount)
+			copy(extra, stack[argBase+posParamCount:argBase+posCount])
+			stack[argBase+varArgsIdx] = val.NewTupleVal(extra...)
+		} else {
+			stack[argBase+varArgsIdx] = val.NewTupleVal()
+		}
+		vm.kwSet[varArgsIdx] = true
+	}
+
+	defStart := posParamCount - len(defaults)
+	for i := 0; i < len(paramNames); i++ {
+		if i == varArgsIdx || i == varKWIdx {
+			continue
+		}
 		if !vm.kwSet[i] {
-			if i >= defStart && len(defaults) > 0 {
+			if i >= defStart && i < posParamCount && len(defaults) > 0 {
 				stack[argBase+i] = defaults[i-defStart]
 			} else if kwDefaults != nil && i < len(paramNames) {
 				if v, ok := kwDefaults.Get(paramNames[i]); ok {
@@ -291,6 +553,188 @@ func (vm *VM) initBuiltins() {
 	vm.builtins.Set(val.InternString("bytearray"), val.TypeVal(val.ByteArrayType))
 	vm.builtins.Set(val.InternString("memoryview"), val.TypeVal(val.MemoryViewType))
 	vm.builtins.Set(val.InternString("slice"), val.TypeVal(val.SliceType))
+	vm.builtins.Set(val.InternString("type"), val.TypeVal(val.TypeType))
+	vm.builtins.Set(val.InternString("classmethod"), val.TypeVal(val.ClassMethodType))
+	vm.builtins.Set(val.InternString("staticmethod"), val.TypeVal(val.StaticMethodType))
+	vm.builtins.Set(val.InternString("NotImplemented"), val.NotImplementedVal())
+
+	vm.builtins.Set(val.InternString("super"), val.NewBuiltinFuncVal("super", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) == 2 {
+			if !args[0].IsType() {
+				panic("TypeError: super() argument 1 must be type, not " + args[0].Type().Name)
+			}
+			return val.NewSuperVal(args[0].AsType(), args[1])
+		}
+		if len(args) == 1 {
+			if !args[0].IsType() {
+				panic("TypeError: super() argument 1 must be type, not " + args[0].Type().Name)
+			}
+			return val.NewSuperVal(args[0].AsType(), val.NoneVal())
+		}
+		if len(args) == 0 {
+			vmInstance := ctx.VM.(*VM)
+			co := vmInstance.activeCO
+			if co == nil {
+				panic("RuntimeError: super(): no active code object")
+			}
+			base := vmInstance.activeBaseOffset
+			activeCells := vmInstance.activeCells
+
+			if base >= len(vmInstance.stack) {
+				panic("RuntimeError: super(): no arguments")
+			}
+			self := vmInstance.stack[base]
+			if self.IsNone() && self.HeaderPtr() == nil {
+				panic("RuntimeError: super(): no arguments")
+			}
+
+			var thisClass *val.PyType
+			found := false
+
+			for i, fv := range co.FreeVars {
+				if fv.AsString() == "__class__" {
+					idx := len(co.CellVars) + i
+					if idx < len(activeCells) {
+						c := activeCells[idx]
+						if c.IsCell() && !c.AsCell().Value.IsUnbound() && c.AsCell().Value.IsType() {
+							thisClass = c.AsCell().Value.AsType()
+							found = true
+							break
+						}
+					}
+				}
+			}
+			if !found {
+				for i, cv := range co.CellVars {
+					if cv.AsString() == "__class__" {
+						if i < len(activeCells) {
+							c := activeCells[i]
+							if c.IsCell() && !c.AsCell().Value.IsUnbound() && c.AsCell().Value.IsType() {
+								thisClass = c.AsCell().Value.AsType()
+								found = true
+								break
+							}
+						}
+					}
+				}
+			}
+
+			if !found || thisClass == nil {
+				panic("RuntimeError: super(): __class__ cell not found")
+			}
+
+			return val.NewSuperVal(thisClass, self)
+		}
+		panic(fmt.Sprintf("TypeError: super() takes at most 2 arguments (%d given)", len(args)))
+	}))
+
+	vm.builtins.Set(val.InternString("__build_class__"), val.NewBuiltinFuncVal("__build_class__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 2 {
+			panic("TypeError: __build_class__: not enough arguments")
+		}
+		classBody := args[0]
+		nameVal := args[1]
+		var bases []val.Value
+		var kwdsDict *val.PyDict
+		if len(kwnames) > 0 {
+			kwdsDict = val.NewDictVal(len(kwnames)).AsDict()
+			kwStart := len(args) - len(kwnames)
+			if kwStart > 2 {
+				bases = args[2:kwStart]
+			}
+			for i, kn := range kwnames {
+				kwdsDict.Set(kn, args[kwStart+i])
+			}
+		} else if len(args) > 2 {
+			bases = args[2:]
+		}
+		vmInstance := ctx.VM.(*VM)
+		return vmInstance.buildClass(classBody, nameVal, bases, val.DictVal(kwdsDict), vmInstance.globals)
+	}))
+
+	vm.builtins.Set(val.InternString("dir"), val.NewBuiltinFuncVal("dir", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) == 0 {
+			vmInstance := ctx.VM.(*VM)
+			namesMap := make(map[string]bool)
+			co := vmInstance.activeCO
+			if co != nil {
+				for _, p := range co.ParamNames {
+					namesMap[p.AsString()] = true
+				}
+				for _, c := range co.CellVars {
+					namesMap[c.AsString()] = true
+				}
+				for _, f := range co.FreeVars {
+					namesMap[f.AsString()] = true
+				}
+			}
+			var sortedNames []string
+			for k := range namesMap {
+				sortedNames = append(sortedNames, k)
+			}
+			sort.Strings(sortedNames)
+			var listItems []val.Value
+			for _, k := range sortedNames {
+				listItems = append(listItems, val.InternString(k))
+			}
+			return val.NewListVal(listItems...)
+		}
+
+		obj := args[0]
+		tp := obj.Type()
+		if dirFn, _, ok := tp.LookupMRO(val.DunderDir); ok {
+			return ctx.Invoke1(dirFn, obj)
+		}
+
+		namesMap := make(map[string]bool)
+		for _, base := range tp.MRO {
+			if base.Dict != nil {
+				for _, item := range base.Dict.Items() {
+					if item.Key.IsAnyString() {
+						namesMap[item.Key.AsString()] = true
+					}
+				}
+			}
+		}
+		if obj.IsInstance() {
+			inst := obj.AsInstance()
+			for cur := inst.Shape; cur != nil; cur = cur.Parent {
+				if !cur.AttrName.IsNone() && cur.AttrName.AsString() != "" {
+					namesMap[cur.AttrName.AsString()] = true
+				}
+			}
+		} else if obj.IsType() {
+			t := obj.AsType()
+			for _, base := range t.MRO {
+				if base.Dict != nil {
+					for _, item := range base.Dict.Items() {
+						if item.Key.IsAnyString() {
+							namesMap[item.Key.AsString()] = true
+						}
+					}
+				}
+			}
+		} else if obj.IsModule() {
+			mod := obj.AsModule()
+			if mod.Dict != nil {
+				for _, item := range mod.Dict.Items() {
+					if item.Key.IsAnyString() {
+						namesMap[item.Key.AsString()] = true
+					}
+				}
+			}
+		}
+		var sortedNames []string
+		for k := range namesMap {
+			sortedNames = append(sortedNames, k)
+		}
+		sort.Strings(sortedNames)
+		var listItems []val.Value
+		for _, k := range sortedNames {
+			listItems = append(listItems, val.InternString(k))
+		}
+		return val.NewListVal(listItems...)
+	}))
 	vm.builtins.Set(val.InternString("open"), val.NewBuiltinFuncVal("open", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
 			panic("TypeError: open() takes at least 1 argument")
@@ -591,11 +1035,40 @@ func (vm *VM) bindFunctionArgsToSlice(co *CodeObject, defaults []val.Value, kwDe
 	}
 	nargs := len(src)
 
+	paramNames := co.ParamNames
+	varKWIdx := -1
+	varArgsIdx := -1
+	posParamCount := 0
+	for p := 0; p < len(paramNames); p++ {
+		pnStr := paramNames[p].AsString()
+		if strings.HasPrefix(pnStr, "**") {
+			varKWIdx = p
+		} else if strings.HasPrefix(pnStr, "*") {
+			if pnStr != "*" {
+				varArgsIdx = p
+			}
+		} else {
+			posParamCount++
+		}
+	}
+
 	if len(kwnames) == 0 {
 		copy(dst[:nargs], src)
-		if nargs < numParams && len(defaults) > 0 {
-			defStart := numParams - len(defaults)
-			for i := nargs; i < numParams; i++ {
+		if varArgsIdx >= 0 {
+			if nargs > posParamCount {
+				extra := make([]val.Value, nargs-posParamCount)
+				copy(extra, src[posParamCount:nargs])
+				dst[varArgsIdx] = val.NewTupleVal(extra...)
+			} else {
+				dst[varArgsIdx] = val.NewTupleVal()
+			}
+		}
+		if varKWIdx >= 0 {
+			dst[varKWIdx] = val.NewDictVal(4)
+		}
+		if nargs < posParamCount && len(defaults) > 0 {
+			defStart := posParamCount - len(defaults)
+			for i := nargs; i < posParamCount; i++ {
 				if i >= defStart {
 					dst[i] = defaults[i-defStart]
 				}
@@ -615,36 +1088,71 @@ func (vm *VM) bindFunctionArgsToSlice(co *CodeObject, defaults []val.Value, kwDe
 
 	copy(dst[:posCount], src[:posCount])
 	copy(vm.kwScratch[:kwCount], src[posCount:nargs])
-	for i := posCount; i < numParams; i++ {
+	for i := 0; i < numParams; i++ {
 		vm.kwSet[i] = false
 	}
+	for i := 0; i < posCount && i < numParams; i++ {
+		vm.kwSet[i] = true
+	}
 
-	paramNames := co.ParamNames
+	var kwDict *val.PyDict
 	for i := 0; i < kwCount; i++ {
 		kwName := kwnames[i]
 		kwVal := vm.kwScratch[i]
 		foundIdx := -1
 		for p := 0; p < len(paramNames); p++ {
+			if p == varArgsIdx || p == varKWIdx {
+				continue
+			}
 			pn := paramNames[p]
 			if (pn.HeaderPtr() == kwName.HeaderPtr() && pn == kwName) || val.StringEquals(pn, kwName) {
 				foundIdx = p
 				break
 			}
 		}
-		if foundIdx < 0 {
+		if foundIdx >= 0 {
+			if foundIdx < posCount || vm.kwSet[foundIdx] {
+				panic("vm: TypeError: multiple values for argument '" + kwName.AsString() + "'")
+			}
+			dst[foundIdx] = kwVal
+			vm.kwSet[foundIdx] = true
+		} else if varKWIdx >= 0 {
+			if kwDict == nil {
+				kwDict = val.NewDictVal(4).AsDict()
+			}
+			kwDict.Set(kwName, kwVal)
+		} else {
 			panic("vm: TypeError: unexpected keyword argument '" + kwName.AsString() + "'")
 		}
-		if foundIdx < posCount || vm.kwSet[foundIdx] {
-			panic("vm: TypeError: multiple values for argument '" + kwName.AsString() + "'")
-		}
-		dst[foundIdx] = kwVal
-		vm.kwSet[foundIdx] = true
 	}
 
-	defStart := numParams - len(defaults)
-	for i := posCount; i < numParams; i++ {
+	if varKWIdx >= 0 {
+		if kwDict == nil {
+			dst[varKWIdx] = val.NewDictVal(4)
+		} else {
+			dst[varKWIdx] = val.DictVal(kwDict)
+		}
+		vm.kwSet[varKWIdx] = true
+	}
+
+	if varArgsIdx >= 0 {
+		if posCount > posParamCount {
+			extra := make([]val.Value, posCount-posParamCount)
+			copy(extra, src[posParamCount:posCount])
+			dst[varArgsIdx] = val.NewTupleVal(extra...)
+		} else {
+			dst[varArgsIdx] = val.NewTupleVal()
+		}
+		vm.kwSet[varArgsIdx] = true
+	}
+
+	defStart := posParamCount - len(defaults)
+	for i := 0; i < len(paramNames); i++ {
+		if i == varArgsIdx || i == varKWIdx {
+			continue
+		}
 		if !vm.kwSet[i] {
-			if i >= defStart && len(defaults) > 0 {
+			if i >= defStart && i < posParamCount && len(defaults) > 0 {
 				dst[i] = defaults[i-defStart]
 			} else if kwDefaults != nil && i < len(paramNames) {
 				if v, ok := kwDefaults.Get(paramNames[i]); ok {
@@ -719,7 +1227,7 @@ func (vm *VM) resumeGenerator(ctx *val.ExecContext, gen *val.PyGenerator, sentVa
 
 	gen.State = val.GenRunning
 	co := AsCodeObject(gen.Code)
-	res := vm.runLoopWithGlobals(co, gen.Base, gen.SP, 0, gen.Cells, gen.Globals, gen.Stack, gen, nil)
+	res := vm.runLoopWithGlobals(co, gen.Base, gen.SP, 0, gen.Cells, gen.Globals, val.NoneVal(), gen.Stack, gen, nil)
 	if gen.State == val.GenSuspended {
 		return res, val.IterYielded
 	}
@@ -763,7 +1271,7 @@ func (vm *VM) resumeCoroutine(ctx *val.ExecContext, coro *val.PyCoroutine, sentV
 
 	coro.State = val.CoroRunning
 	co := AsCodeObject(coro.Code)
-	res := vm.runLoopWithGlobals(co, coro.Base, coro.SP, 0, coro.Cells, coro.Globals, coro.Stack, nil, coro)
+	res := vm.runLoopWithGlobals(co, coro.Base, coro.SP, 0, coro.Cells, coro.Globals, val.NoneVal(), coro.Stack, nil, coro)
 	if coro.State == val.CoroSuspended {
 		return res, val.IterYielded
 	}
@@ -779,7 +1287,7 @@ func (vm *VM) resumeCoroutine(ctx *val.ExecContext, coro *val.PyCoroutine, sentV
 	return res, val.IterExhausted
 }
 
-func (vm *VM) unwindException(exc val.Value, curCO **CodeObject, ip *int, frameIdx *int, startFrameIdx int, baseOffset *int, sp *int, code *[]uint32, consts *[]val.Value, cells *[]val.Value, globals **val.PyDict, stack []val.Value, curIC *[]ICSlot, curMethodPIC *[][4]val.MethodPICEntry, curAttrPIC *[][4]AttrPICEntry) bool {
+func (vm *VM) unwindException(exc val.Value, curCO **CodeObject, ip *int, frameIdx *int, startFrameIdx int, baseOffset *int, sp *int, code *[]uint32, consts *[]val.Value, cells *[]val.Value, globals **val.PyDict, curLocals *val.Value, stack []val.Value, curIC *[]ICSlot, curMethodPIC *[][4]val.MethodPICEntry, curAttrPIC *[][4]AttrPICEntry) bool {
 	vm.lastException = exc
 	for {
 		co := *curCO
@@ -823,6 +1331,9 @@ func (vm *VM) unwindException(exc val.Value, curCO **CodeObject, ip *int, frameI
 			*baseOffset = caller.baseOffset
 			*cells = caller.cells
 			*globals = caller.globals
+			if curLocals != nil {
+				*curLocals = caller.locals
+			}
 			*ip = caller.ip - 1
 			continue
 		}
@@ -837,7 +1348,7 @@ func (vm *VM) runLoop(code []uint32, consts []val.Value, startBase int, startSP 
 		Consts:    consts,
 		NumLocals: startSP - startBase,
 	}
-	return vm.runLoopWithGlobals(&vm.rootCO, startBase, startSP, startFrameIdx, nil, vm.globals, vm.stack, nil, nil)
+	return vm.runLoopWithGlobals(&vm.rootCO, startBase, startSP, startFrameIdx, nil, vm.globals, val.NoneVal(), vm.stack, nil, nil)
 }
 
 func ensureStack(stack []val.Value, minCap int) []val.Value {
@@ -853,11 +1364,17 @@ func ensureStack(stack []val.Value, minCap int) []val.Value {
 	return newStack
 }
 
-func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, startFrameIdx int, startCells []val.Value, startGlobals *val.PyDict, stack []val.Value, activeGen *val.PyGenerator, activeCoro *val.PyCoroutine) val.Value {
+func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, startFrameIdx int, startCells []val.Value, startGlobals *val.PyDict, startLocals val.Value, stack []val.Value, activeGen *val.PyGenerator, activeCoro *val.PyCoroutine) val.Value {
 	savedCtxStack := vm.execCtx.Stack
 	vm.execCtx.Stack = stack
+	savedActiveCO := vm.activeCO
+	savedActiveBaseOffset := vm.activeBaseOffset
+	savedActiveCells := vm.activeCells
 	defer func() {
 		vm.execCtx.Stack = savedCtxStack
+		vm.activeCO = savedActiveCO
+		vm.activeBaseOffset = savedActiveBaseOffset
+		vm.activeCells = savedActiveCells
 	}()
 
 	curCO := co
@@ -873,10 +1390,14 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		ip = activeCoro.IP
 	}
 	cells := startCells
+	vm.activeCO = curCO
+	vm.activeBaseOffset = baseOffset
+	vm.activeCells = cells
 	globals := startGlobals
 	if globals == nil {
 		globals = vm.globals
 	}
+	curLocals := startLocals
 
 	if baseOffset+256 > len(stack) {
 		stack = ensureStack(stack, baseOffset+256)
@@ -1235,7 +1756,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.retSP = retSP
 				saved.cells = cells
 				saved.globals = globals
+				saved.locals = curLocals
 				saved.cache = curCodeCache
+				curLocals = val.NoneVal()
 				frameIdx++
 				curCO = callee
 				code = callee.Code
@@ -1294,7 +1817,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.retSP = retSP
 				saved.cells = cells
 				saved.globals = globals
+				saved.locals = curLocals
 				saved.cache = curCodeCache
+				curLocals = val.NoneVal()
 				frameIdx++
 				curCO = callee
 				if argc == callee.NumParams && len(fn.Defaults) == 0 {
@@ -1393,7 +1918,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.retSP = retSP
 				saved.cells = cells
 				saved.globals = globals
+				saved.locals = curLocals
 				saved.cache = curCodeCache
+				curLocals = val.NoneVal()
 				frameIdx++
 				curCO = callee
 				sp = vm.bindFunctionArgs(callee, fn.Defaults, fn.KwDefaults, stack, newBase, totalArgs, kwnames)
@@ -1445,7 +1972,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.retSP = retSP
 				saved.cells = cells
 				saved.globals = globals
+				saved.locals = curLocals
 				saved.cache = curCodeCache
+				curLocals = val.NoneVal()
 				frameIdx++
 				curCO = callee
 				sp = vm.bindFunctionArgs(callee, nil, nil, stack, newBase, totalArgs, kwnames)
@@ -1614,7 +2143,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.retSP = retSP
 				saved.cells = cells
 				saved.globals = globals
+				saved.locals = curLocals
 				saved.cache = curCodeCache
+				curLocals = val.NoneVal()
 				frameIdx++
 				curCO = callee
 				if totalArgs == callee.NumParams && len(fn.Defaults) == 0 {
@@ -1684,7 +2215,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.retSP = retSP
 				saved.cells = cells
 				saved.globals = globals
+				saved.locals = curLocals
 				saved.cache = curCodeCache
+				curLocals = val.NoneVal()
 				frameIdx++
 				curCO = callee
 				code = callee.Code
@@ -1781,7 +2314,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 						saved.retSP = retSP
 						saved.cells = cells
 						saved.globals = globals
+						saved.locals = curLocals
 						saved.cache = curCodeCache
+						curLocals = val.NoneVal()
 						frameIdx++
 						curCO = callee
 						if totalArgs == callee.NumParams && len(targetFn.Defaults) == 0 {
@@ -1870,6 +2405,10 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			_ = locals[255]
 			cells = caller.cells
 			globals = caller.globals
+			curLocals = caller.locals
+			vm.activeCO = curCO
+			vm.activeBaseOffset = baseOffset
+			vm.activeCells = cells
 			stack[caller.retSP] = retVal
 			sp = caller.retSP + 1
 			if caller.cache != nil {
@@ -1886,46 +2425,79 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			obj := stack[sp-1]
 			if obj.IsInstance() {
 				instObj := obj.AsInstance()
+				instType := instObj.Header.Type
+				if instType.Flags&val.FlagCustomGetAttribute != 0 {
+					vm.execCtx.SP = sp
+					vm.activeFrameIdx = frameIdx
+					vm.activeCO = curCO
+					vm.activeBaseOffset = baseOffset
+					vm.activeCells = cells
+					stack[sp-1] = val.GetAttrCtx(&vm.execCtx, obj, consts[uint16(inst)])
+					ip++
+					continue
+				}
 				instShape := instObj.Shape
 				pic := &curAttrPIC[ip]
 				if pic[0].Shape == instShape {
-					stack[sp-1] = instObj.Slots[pic[0].SlotIndex]
-					ip++
-					continue
+					v := instObj.Slots[pic[0].SlotIndex]
+					if !v.IsUnbound() {
+						stack[sp-1] = v
+						ip++
+						continue
+					}
 				}
 				if pic[1].Shape == instShape {
-					stack[sp-1] = instObj.Slots[pic[1].SlotIndex]
-					ip++
-					continue
+					v := instObj.Slots[pic[1].SlotIndex]
+					if !v.IsUnbound() {
+						stack[sp-1] = v
+						ip++
+						continue
+					}
 				}
 				if pic[2].Shape == instShape {
-					stack[sp-1] = instObj.Slots[pic[2].SlotIndex]
-					ip++
-					continue
+					v := instObj.Slots[pic[2].SlotIndex]
+					if !v.IsUnbound() {
+						stack[sp-1] = v
+						ip++
+						continue
+					}
 				}
 				if pic[3].Shape == instShape {
-					stack[sp-1] = instObj.Slots[pic[3].SlotIndex]
-					ip++
-					continue
+					v := instObj.Slots[pic[3].SlotIndex]
+					if !v.IsUnbound() {
+						stack[sp-1] = v
+						ip++
+						continue
+					}
 				}
-				instType := instObj.Header.Type
 				entry := curIC[ip]
 				if instObj.Shape.ID == entry.ExpectedShapeID && instType.VersionTag == entry.ExpectedTypeVer {
 					if entry.Kind == ICKindInstanceSlot {
 						if entry.SlotIndex >= 0 && entry.SlotIndex < len(instObj.Slots) {
-							stack[sp-1] = instObj.Slots[entry.SlotIndex]
-							ip++
-							continue
+							v := instObj.Slots[entry.SlotIndex]
+							if !v.IsUnbound() {
+								stack[sp-1] = v
+								ip++
+								continue
+							}
 						}
 					}
 					if entry.Kind == ICKindDataDescriptor {
 						vm.execCtx.SP = sp
 						vm.activeFrameIdx = frameIdx
+						vm.activeCO = curCO
+						vm.activeBaseOffset = baseOffset
+						vm.activeCells = cells
 						stack[sp-1] = entry.CachedVal.Type().Slots.TpDescrGet(&vm.execCtx, entry.CachedVal, obj, instType)
 						ip++
 						continue
 					}
 				}
+				vm.execCtx.SP = sp
+				vm.activeFrameIdx = frameIdx
+				vm.activeCO = curCO
+				vm.activeBaseOffset = baseOffset
+				vm.activeCells = cells
 				stack[sp-1] = vm.loadAttrInstanceSlow(instObj, obj, consts[uint16(inst)], ip, sp, frameIdx, curIC, curAttrPIC)
 			} else if obj.IsModule() {
 				mod := obj.AsModule()
@@ -1957,17 +2529,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			ip++
 
 		case OP_STORE_ATTR:
-			a := stack[sp-2]
-			b := stack[sp-1]
-			var obj val.Value
-			var v val.Value
-			if a.IsInstance() || a.IsType() || a.IsSuper() {
-				obj = a
-				v = b
-			} else {
-				obj = b
-				v = a
-			}
+			v := stack[sp-2]
+			obj := stack[sp-1]
 			if obj.IsInstance() {
 				instObj := obj.AsInstance()
 				instShape := instObj.Shape
@@ -2021,6 +2584,17 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				vm.execCtx.SP = sp
 				vm.activeFrameIdx = frameIdx
 				val.SetAttrCtx(&vm.execCtx, obj, consts[uint16(inst)], v)
+			}
+			if vm.execCtx.HasException() {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if activeGen != nil {
+						activeGen.State = val.GenClosed
+					}
+					return val.NoneVal()
+				}
+				continue
 			}
 			sp -= 2
 			ip++
@@ -2084,6 +2658,83 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				valToStore.AsStringObj().Buf = nil
 			}
 			globals.Set(nameVal, valToStore)
+			ip++
+
+		case OP_LOAD_NAME:
+			bx := uint16(inst)
+			nameVal := consts[bx]
+			found := false
+			var res val.Value
+
+			if !curLocals.IsNone() && curLocals.HeaderPtr() != nil {
+				if curLocals.Type() == val.DictType {
+					if v, ok := curLocals.AsDict().Get(nameVal); ok {
+						res = v
+						found = true
+					}
+				} else {
+					vm.execCtx.SP = sp
+					vm.activeFrameIdx = frameIdx
+					vm.activeCO = curCO
+					vm.activeBaseOffset = baseOffset
+					vm.activeCells = cells
+					deferCatch := func() (v val.Value, ok bool) {
+						defer func() {
+							if r := recover(); r != nil {
+								ok = false
+							}
+						}()
+						return val.GetItemCtx(&vm.execCtx, curLocals, nameVal), true
+					}
+					if v, ok := deferCatch(); ok {
+						res = v
+						found = true
+					}
+				}
+			}
+
+			if !found && globals != nil {
+				if v, ok := globals.Get(nameVal); ok {
+					res = v
+					found = true
+				}
+			}
+
+			if !found && vm.builtins != nil {
+				if v, ok := vm.builtins.Get(nameVal); ok {
+					res = v
+					found = true
+				}
+			}
+
+			if !found {
+				panic("NameError: name '" + nameVal.AsString() + "' is not defined")
+			}
+
+			stack[sp] = res
+			sp++
+			ip++
+
+		case OP_STORE_NAME:
+			bx := uint16(inst)
+			nameVal := consts[bx]
+			sp--
+			valToStore := stack[sp]
+
+			if !curLocals.IsNone() && curLocals.HeaderPtr() != nil {
+				if curLocals.Type() == val.DictType {
+					curLocals.AsDict().Set(nameVal, valToStore)
+				} else {
+					vm.execCtx.SP = sp
+					vm.activeFrameIdx = frameIdx
+					vm.activeCO = curCO
+					vm.activeBaseOffset = baseOffset
+					vm.activeCells = cells
+					val.SetItemCtx(&vm.execCtx, curLocals, nameVal, valToStore)
+				}
+			} else if globals != nil {
+				globals.Set(nameVal, valToStore)
+			}
 			ip++
 
 		case OP_LOAD_DEREF:
@@ -2267,7 +2918,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if vm.execCtx.HasException() {
 					exc := vm.execCtx.ActiveException
 					vm.execCtx.ClearException()
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						if activeGen != nil {
 							activeGen.State = val.GenClosed
 						}
@@ -2342,31 +2993,43 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			ip++
 
 		case OP_BUILD_CLASS:
-			basesVal := stack[sp-1]
-			nameVal := stack[sp-2]
-			classBody := stack[sp-3]
-			sp -= 3
+			argA := uint8(inst >> 16)
+			var kwdsVal val.Value
+			var basesVal val.Value
+			var nameVal val.Value
+			var classBody val.Value
 
-			classDict := val.NewDictVal(8).AsDict()
-			var bases []*val.PyType
+			if argA == 1 {
+				kwdsVal = stack[sp-1]
+				basesVal = stack[sp-2]
+				nameVal = stack[sp-3]
+				classBody = stack[sp-4]
+				sp -= 4
+			} else {
+				kwdsVal = val.NoneVal()
+				basesVal = stack[sp-1]
+				nameVal = stack[sp-2]
+				classBody = stack[sp-3]
+				sp -= 3
+			}
+
+			var origBases []val.Value
 			if basesVal.IsTuple() {
-				for _, b := range basesVal.AsTuple().Items {
-					if b.IsType() {
-						bases = append(bases, b.AsType())
-					}
-				}
-			} else if basesVal.IsType() {
-				bases = []*val.PyType{basesVal.AsType()}
+				origBases = basesVal.AsTuple().Items
+			} else if basesVal.IsList() {
+				origBases = basesVal.AsList().Items
+			} else if !basesVal.IsNone() {
+				origBases = []val.Value{basesVal}
 			}
 
-			if classBody.Kind() == val.KindCode {
-				vm.runClassBody(AsCodeObject(classBody), classDict)
-			} else if classBody.IsFunction() {
-				vm.runClassBody(AsCodeObject(classBody.AsFunction().Code), classDict)
-			}
+			vm.execCtx.SP = sp
+			vm.activeFrameIdx = frameIdx
+			vm.activeCO = curCO
+			vm.activeBaseOffset = baseOffset
+			vm.activeCells = cells
 
-			newCls := val.MustNewType(nameVal.AsString(), bases, classDict)
-			stack[sp] = val.TypeVal(newCls)
+			newClsVal := vm.buildClass(classBody, nameVal, origBases, kwdsVal, globals)
+			stack[sp] = newClsVal
 			sp++
 			ip++
 
@@ -2419,19 +3082,14 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				continue
 			}
 			var res val.Value
+			vm.execCtx.SP = sp
+			vm.activeFrameIdx = frameIdx
+			vm.activeCO = curCO
+			vm.activeBaseOffset = baseOffset
+			vm.activeCells = cells
 			switch cmpOp {
-			case CMP_LT:
-				res = val.LessThan(a, b)
-			case CMP_LTE:
-				res = val.LessOrEqual(a, b)
-			case CMP_EQ:
-				res = val.BoolVal(val.Equals(a, b))
-			case CMP_NEQ:
-				res = val.NotEquals(a, b)
-			case CMP_GT:
-				res = val.GreaterThan(a, b)
-			case CMP_GTE:
-				res = val.GreaterOrEqual(a, b)
+			case CMP_LT, CMP_LTE, CMP_EQ, CMP_NEQ, CMP_GT, CMP_GTE:
+				res = val.RichCompare(&vm.execCtx, a, b, cmpOp)
 			case CMP_IN:
 				res = val.In(a, b)
 			case CMP_NOT_IN:
@@ -2452,7 +3110,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			a := stack[sp-2]
 			if (b.IsInt64() && b.AsInt64() == 0) || (b.IsFloat64() && b.AsFloat64() == 0.0) {
 				exc := val.NewZeroDivisionError("division by zero")
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -2469,7 +3127,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			a := stack[sp-2]
 			if (b.IsInt64() && b.AsInt64() == 0) || (b.IsFloat64() && b.AsFloat64() == 0.0) {
 				exc := val.NewZeroDivisionError("integer division or modulo by zero")
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -2486,7 +3144,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			a := stack[sp-2]
 			if (b.IsInt64() && b.AsInt64() == 0) || (b.IsFloat64() && b.AsFloat64() == 0.0) {
 				exc := val.NewZeroDivisionError("integer modulo by zero")
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -2569,7 +3227,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					exc.AsInstance().SetAttr(val.InternString("__suppress_context__"), val.BoolVal(true))
 				}
 			}
-			if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+			if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 				if activeGen != nil {
 					activeGen.State = val.GenClosed
 				}
@@ -2647,7 +3305,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if vm.execCtx.HasException() {
 					exc := vm.execCtx.ActiveException
 					vm.execCtx.ClearException()
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						if activeGen != nil {
 							activeGen.State = val.GenClosed
 						}
@@ -2680,7 +3338,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				continue
 			}
 			exc := val.NewTypeError(fmt.Sprintf("object %s can't be used in 'await' expression", top.Type().Name))
-			if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+			if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 				if activeCoro != nil {
 					activeCoro.State = val.CoroClosed
 				}
@@ -2698,7 +3356,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if fut.IsDone() {
 					res, exc := fut.Result()
 					if !exc.IsNone() && exc.HeaderPtr() != nil {
-						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 							if activeCoro != nil {
 								activeCoro.State = val.CoroClosed
 							}
@@ -2742,7 +3400,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if vm.execCtx.HasException() {
 						exc := vm.execCtx.ActiveException
 						vm.execCtx.ClearException()
-						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 							if activeCoro != nil {
 								activeCoro.State = val.CoroClosed
 							}
@@ -2775,7 +3433,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if vm.execCtx.HasException() {
 						exc := vm.execCtx.ActiveException
 						vm.execCtx.ClearException()
-						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 							if activeCoro != nil {
 								activeCoro.State = val.CoroClosed
 							}
@@ -3246,6 +3904,32 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			globals.Delete(nameVal)
 			ip++
 
+		case OP_DELETE_NAME:
+			bx := uint16(inst)
+			nameVal := consts[bx]
+			deleted := false
+			if !curLocals.IsNone() && curLocals.HeaderPtr() != nil {
+				if curLocals.IsDict() {
+					deleted = curLocals.AsDict().Delete(nameVal)
+				} else {
+					vm.execCtx.SP = sp
+					vm.activeFrameIdx = frameIdx
+					vm.activeCO = curCO
+					vm.activeBaseOffset = baseOffset
+					vm.activeCells = cells
+					if delItemFn, _, ok := curLocals.Type().LookupMRO(val.InternString("__delitem__")); ok {
+						vm.Vectorcall(delItemFn, []val.Value{curLocals, nameVal}, nil)
+						deleted = true
+					}
+				}
+			} else if globals != nil {
+				deleted = globals.Delete(nameVal)
+			}
+			if !deleted {
+				panic("NameError: name '" + nameVal.AsString() + "' is not defined")
+			}
+			ip++
+
 		case OP_DELETE_ATTR:
 			bx := uint16(inst)
 			attrName := consts[bx]
@@ -3678,6 +4362,9 @@ func (vm *VM) loadAttrInstanceSlow(instObj *val.PyInstance, obj, attrName val.Va
 			ExpectedTypeVer: instType.VersionTag,
 		}
 		val, _ := instObj.GetSlot(slotIdx)
+		if val.IsUnbound() {
+			panic("AttributeError: '" + instType.Name + "' object has no attribute '" + attrName.AsString() + "'")
+		}
 		return val
 	}
 
@@ -3740,6 +4427,11 @@ func (vm *VM) storeAttrInstanceSlow(instObj *val.PyInstance, obj, attrName, v va
 			SlotIndex:       slotIdx,
 			ExpectedTypeVer: instType.VersionTag,
 		}
+		return
+	}
+
+	if instType.Flags&val.FlagForbidDynamicAttrs != 0 {
+		vm.execCtx.Raise(val.NewAttributeError("'" + instType.Name + "' object has no attribute '" + attrName.AsString() + "'"))
 		return
 	}
 
