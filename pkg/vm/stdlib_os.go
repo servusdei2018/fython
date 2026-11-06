@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/servusdei2018/fython/pkg/val"
 )
@@ -82,7 +83,7 @@ func (e *Engine) createOSModule() val.Value {
 	osMod.Dict.Set(val.InternString("getcwd"), val.NewBuiltinFuncVal("getcwd", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		wd, err := os.Getwd()
 		if err != nil {
-			panic("OSError: " + err.Error())
+			raiseOSError(err, "")
 		}
 		return val.NewStringVal(wd)
 	}))
@@ -92,9 +93,9 @@ func (e *Engine) createOSModule() val.Value {
 		if len(args) < 1 {
 			panic("TypeError: chdir() takes 1 argument")
 		}
-		path := args[0].AsString()
+		path := pathArg(ctx, args[0])
 		if err := os.Chdir(path); err != nil {
-			panic("OSError: " + err.Error())
+			raiseOSError(err, path)
 		}
 		return val.NoneVal()
 	}))
@@ -103,11 +104,11 @@ func (e *Engine) createOSModule() val.Value {
 	osMod.Dict.Set(val.InternString("listdir"), val.NewBuiltinFuncVal("listdir", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		dir := "."
 		if len(args) >= 1 && !args[0].IsNone() {
-			dir = args[0].AsString()
+			dir = pathArg(ctx, args[0])
 		}
 		entries, err := os.ReadDir(dir)
 		if err != nil {
-			panic("FileNotFoundError: " + err.Error())
+			raiseOSError(err, dir)
 		}
 		items := make([]val.Value, len(entries))
 		for i, ent := range entries {
@@ -121,9 +122,9 @@ func (e *Engine) createOSModule() val.Value {
 		if len(args) < 1 {
 			panic("TypeError: mkdir() takes 1 argument")
 		}
-		path := args[0].AsString()
+		path := pathArg(ctx, args[0])
 		if err := os.Mkdir(path, 0777); err != nil {
-			panic("FileExistsError: " + err.Error())
+			raiseOSError(err, path)
 		}
 		return val.NoneVal()
 	}))
@@ -133,14 +134,20 @@ func (e *Engine) createOSModule() val.Value {
 		if len(args) < 1 {
 			panic("TypeError: makedirs() takes at least 1 argument")
 		}
-		path := args[0].AsString()
+		path := pathArg(ctx, args[0])
 		existOk := false
-		if len(args) >= 2 {
+		if v, ok := kwArg(args, kwnames, "exist_ok"); ok {
+			existOk = v.IsTruthy()
+		} else if len(args) >= 2 {
 			existOk = args[1].IsTruthy()
 		}
+		args = posArgs(args, kwnames)
+		if _, serr := os.Stat(path); serr == nil && !existOk {
+			panic(newOSError(syscall.EEXIST, path, true))
+		}
 		err := os.MkdirAll(path, 0777)
-		if err != nil && !existOk {
-			panic("OSError: " + err.Error())
+		if err != nil {
+			raiseOSError(err, path)
 		}
 		return val.NoneVal()
 	}))
@@ -150,9 +157,9 @@ func (e *Engine) createOSModule() val.Value {
 		if len(args) < 1 {
 			panic("TypeError: remove() takes 1 argument")
 		}
-		path := args[0].AsString()
+		path := pathArg(ctx, args[0])
 		if err := os.Remove(path); err != nil {
-			panic("FileNotFoundError: " + err.Error())
+			raiseOSError(err, path)
 		}
 		return val.NoneVal()
 	})
@@ -164,9 +171,9 @@ func (e *Engine) createOSModule() val.Value {
 		if len(args) < 1 {
 			panic("TypeError: rmdir() takes 1 argument")
 		}
-		path := args[0].AsString()
+		path := pathArg(ctx, args[0])
 		if err := os.Remove(path); err != nil {
-			panic("OSError: " + err.Error())
+			raiseOSError(err, path)
 		}
 		return val.NoneVal()
 	}))
@@ -176,10 +183,10 @@ func (e *Engine) createOSModule() val.Value {
 		if len(args) < 2 {
 			panic("TypeError: rename() takes 2 arguments")
 		}
-		src := args[0].AsString()
-		dst := args[1].AsString()
+		src := pathArg(ctx, args[0])
+		dst := pathArg(ctx, args[1])
 		if err := os.Rename(src, dst); err != nil {
-			panic("OSError: " + err.Error())
+			raiseOSError(err, src)
 		}
 		return val.NoneVal()
 	}))
@@ -189,30 +196,12 @@ func (e *Engine) createOSModule() val.Value {
 		return val.Int64Val(int64(os.Getpid()))
 	}))
 
-	// stat(path)
-	osMod.Dict.Set(val.InternString("stat"), val.NewBuiltinFuncVal("stat", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		if len(args) < 1 {
-			panic("TypeError: stat() takes 1 argument")
-		}
-		path := args[0].AsString()
-		info, err := os.Stat(path)
-		if err != nil {
-			panic("FileNotFoundError: " + err.Error())
-		}
-		statDictVal := val.NewDictVal(8)
-		statDict := statDictVal.AsDict()
-		statDict.Set(val.InternString("st_size"), val.Int64Val(info.Size()))
-		statDict.Set(val.InternString("st_mtime"), val.Float64Val(float64(info.ModTime().UnixNano())/1e9))
-		statDict.Set(val.InternString("st_mode"), val.Int64Val(int64(info.Mode())))
-		return statDictVal
-	}))
-
 	// Low-level fd operations
 	osMod.Dict.Set(val.InternString("open"), val.NewBuiltinFuncVal("open", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
 			panic("TypeError: open() takes at least 2 arguments")
 		}
-		name := args[0].AsString()
+		name := pathArg(ctx, args[0])
 		flag := int(args[1].AsInt64())
 		perm := os.FileMode(0666)
 		if len(args) >= 3 {
@@ -220,7 +209,7 @@ func (e *Engine) createOSModule() val.Value {
 		}
 		f, err := os.OpenFile(name, flag, perm)
 		if err != nil {
-			panic("OSError: " + err.Error())
+			raiseOSError(err, name)
 		}
 		fdMutex.Lock()
 		fd := fdNext
@@ -289,103 +278,14 @@ func (e *Engine) createOSModule() val.Value {
 		}
 		writtenN, err := f.Write(data)
 		if err != nil {
-			panic("OSError: " + err.Error())
+			raiseOSError(err, "")
 		}
 		return val.Int64Val(int64(writtenN))
 	}))
 
-	// os.path submodule
-	pathModVal := val.NewModuleVal("os.path", "")
-	pathMod := pathModVal.AsModule()
-
-	pathMod.Dict.Set(val.InternString("join"), val.NewBuiltinFuncVal("join", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		parts := make([]string, len(args))
-		for i, a := range args {
-			parts[i] = a.AsString()
-		}
-		return val.NewStringVal(filepath.Join(parts...))
-	}))
-
-	pathMod.Dict.Set(val.InternString("split"), val.NewBuiltinFuncVal("split", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		if len(args) < 1 {
-			panic("TypeError: split() takes 1 argument")
-		}
-		p := args[0].AsString()
-		dir, file := filepath.Split(p)
-		return val.NewTupleVal(val.NewStringVal(strings.TrimSuffix(dir, string(filepath.Separator))), val.NewStringVal(file))
-	}))
-
-	pathMod.Dict.Set(val.InternString("splitext"), val.NewBuiltinFuncVal("splitext", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		if len(args) < 1 {
-			panic("TypeError: splitext() takes 1 argument")
-		}
-		p := args[0].AsString()
-		ext := filepath.Ext(p)
-		base := strings.TrimSuffix(p, ext)
-		return val.NewTupleVal(val.NewStringVal(base), val.NewStringVal(ext))
-	}))
-
-	pathMod.Dict.Set(val.InternString("basename"), val.NewBuiltinFuncVal("basename", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		if len(args) < 1 {
-			panic("TypeError: basename() takes 1 argument")
-		}
-		return val.NewStringVal(filepath.Base(args[0].AsString()))
-	}))
-
-	pathMod.Dict.Set(val.InternString("dirname"), val.NewBuiltinFuncVal("dirname", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		if len(args) < 1 {
-			panic("TypeError: dirname() takes 1 argument")
-		}
-		return val.NewStringVal(filepath.Dir(args[0].AsString()))
-	}))
-
-	pathMod.Dict.Set(val.InternString("exists"), val.NewBuiltinFuncVal("exists", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		if len(args) < 1 {
-			panic("TypeError: exists() takes 1 argument")
-		}
-		_, err := os.Stat(args[0].AsString())
-		return val.BoolVal(err == nil)
-	}))
-
-	pathMod.Dict.Set(val.InternString("isfile"), val.NewBuiltinFuncVal("isfile", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		if len(args) < 1 {
-			panic("TypeError: isfile() takes 1 argument")
-		}
-		info, err := os.Stat(args[0].AsString())
-		return val.BoolVal(err == nil && !info.IsDir())
-	}))
-
-	pathMod.Dict.Set(val.InternString("isdir"), val.NewBuiltinFuncVal("isdir", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		if len(args) < 1 {
-			panic("TypeError: isdir() takes 1 argument")
-		}
-		info, err := os.Stat(args[0].AsString())
-		return val.BoolVal(err == nil && info.IsDir())
-	}))
-
-	pathMod.Dict.Set(val.InternString("abspath"), val.NewBuiltinFuncVal("abspath", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		if len(args) < 1 {
-			panic("TypeError: abspath() takes 1 argument")
-		}
-		abs, err := filepath.Abs(args[0].AsString())
-		if err != nil {
-			return args[0]
-		}
-		return val.NewStringVal(abs)
-	}))
-
-	pathMod.Dict.Set(val.InternString("getsize"), val.NewBuiltinFuncVal("getsize", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		if len(args) < 1 {
-			panic("TypeError: getsize() takes 1 argument")
-		}
-		info, err := os.Stat(args[0].AsString())
-		if err != nil {
-			panic("FileNotFoundError: " + err.Error())
-		}
-		return val.Int64Val(info.Size())
-	}))
-
-	osMod.Dict.Set(val.InternString("path"), pathModVal)
+	// os.path is bound to the upstream posixpath module on first import of os
+	// (see bindOSPath); it cannot load while the engine builds its modules.
+	installPosix(osMod)
 
 	return osModVal
 }

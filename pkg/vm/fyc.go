@@ -16,7 +16,7 @@ const (
 	// FycMagic is the 4-byte magic signature for Fython bytecode files ("FYTH" in ASCII).
 	FycMagic uint32 = 0x48545946
 	// FycVersion is the current bytecode format version.
-	FycVersion uint32 = 2
+	FycVersion uint32 = 4
 	// FycHeaderSize is the fixed size of the .fyc file header in bytes.
 	FycHeaderSize = 64
 )
@@ -32,6 +32,7 @@ const (
 	TagTuple
 	TagCode
 	TagBytes
+	TagComplex
 )
 
 // FycHeader represents the 64-byte deterministic header of a .fyc file.
@@ -307,6 +308,13 @@ func encodeValue(buf []byte, v val.Value, sc *stringCollector) []byte {
 	case val.KindFloat64:
 		buf = append(buf, TagFloat64)
 		binary.LittleEndian.PutUint64(tmp8[:], math.Float64bits(v.AsFloat64()))
+		buf = append(buf, tmp8[:]...)
+
+	case val.KindComplex:
+		buf = append(buf, TagComplex)
+		binary.LittleEndian.PutUint64(tmp8[:], math.Float64bits(v.AsComplex().Real))
+		buf = append(buf, tmp8[:]...)
+		binary.LittleEndian.PutUint64(tmp8[:], math.Float64bits(v.AsComplex().Imag))
 		buf = append(buf, tmp8[:]...)
 
 	case val.KindInlineStr, val.KindString:
@@ -742,6 +750,17 @@ func decodeValue(r *binaryReader, stringTable []val.Value) (val.Value, error) {
 			return val.NoneVal(), err
 		}
 		return val.Float64Val(math.Float64frombits(bits)), nil
+
+	case TagComplex:
+		re, err := r.readUint64()
+		if err != nil {
+			return val.NoneVal(), err
+		}
+		im, err := r.readUint64()
+		if err != nil {
+			return val.NoneVal(), err
+		}
+		return val.NewComplexVal(math.Float64frombits(re), math.Float64frombits(im)), nil
 
 	case TagString:
 		idx, err := r.readUint32()

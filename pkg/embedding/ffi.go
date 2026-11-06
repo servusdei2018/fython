@@ -203,7 +203,7 @@ func (sb *StructBinding[T]) Type() *val.PyType {
 func (sb *StructBinding[T]) Wrap(ptr *T) val.Value {
 	obj := &PyGoStruct[T]{
 		Header: val.ObjectHeader{
-			Kind: val.KindInstance,
+			Kind: val.KindNative,
 			Type: sb.pyType,
 		},
 		Ptr: ptr,

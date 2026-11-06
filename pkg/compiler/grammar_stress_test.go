@@ -116,8 +116,8 @@ val_c = c.val
 	if !ok {
 		t.Fatalf("IntOrStr global not found")
 	}
-	if !aliasVal.IsInstance() {
-		t.Fatalf("expected IntOrStr to be TypeAliasType instance, got %v", aliasVal)
+	if aliasVal.Type() == nil || aliasVal.Type().Name != "TypeAliasType" {
+		t.Fatalf("expected IntOrStr to be a TypeAliasType, got %v", aliasVal)
 	}
 }
 
@@ -161,6 +161,41 @@ ret_type = ann["return"]
 	if retType != retVal {
 		t.Fatalf("expected ret_type == ReturnType, got %v vs %v", retType, retVal)
 	}
+}
+
+func TestLexerParserStress(t *testing.T) {
+	src := `
+z = 3j
+cplx_ok = (z * z == -9) and z.imag == 3.0
+spec = f"{-42:=+6d}"
+alt = f"{255:#x}|{255:#b}"
+named = "\N{BULLET}"
+
+def one_line(flag):
+    try: a = 1; b = a + 1
+    except ValueError: b = -1
+    return b
+one = one_line(True)
+
+class Late:
+    attr: Undefined1
+    other: list[Undefined1]
+    # class-level annotations are evaluated lazily
+Undefined1 = int
+class_ann = Late.__annotations__
+class_ann_ok = class_ann == {"attr": int, "other": list[int]}
+mod_ann: Undefined2
+Undefined2 = str
+mod_ann_ok = __annotate__(1) == {"mod_ann": str}
+`
+	_, v := runPython(t, src)
+	checkGlobalBool(t, v, "cplx_ok", true)
+	checkGlobalString(t, v, "spec", "-   42")
+	checkGlobalString(t, v, "alt", "0xff|0b11111111")
+	checkGlobalString(t, v, "named", "\u2022")
+	checkGlobalInt(t, v, "one", 2)
+	checkGlobalBool(t, v, "class_ann_ok", true)
+	checkGlobalBool(t, v, "mod_ann_ok", true)
 }
 
 func TestExtendedUnpacking(t *testing.T) {

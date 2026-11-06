@@ -8,6 +8,24 @@ import (
 	"github.com/servusdei2018/fython/pkg/val"
 )
 
+// FormatException formats a Python exception Value and its __traceback__ chain into a human-readable traceback string.
+func (vm *VM) FormatException(exc val.Value) string {
+	if exc.IsNone() || exc.HeaderPtr() == nil {
+		return ""
+	}
+	var tb val.Value = val.NoneVal()
+	if exc.IsInstance() {
+		tb, _ = exc.AsInstance().GetAttr(val.InternString("__traceback__"))
+	}
+	var sb strings.Builder
+	sb.WriteString("Traceback (most recent call last):\n")
+	for _, l := range formatTracebackChain(tb) {
+		sb.WriteString(l)
+	}
+	sb.WriteString(formatExceptionMessage(&vm.execCtx, exc))
+	return sb.String()
+}
+
 func formatTracebackChain(tbVal val.Value) []string {
 	var lines []string
 	curr := tbVal

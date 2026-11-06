@@ -9,8 +9,12 @@ type fstringState struct {
 	quote      byte
 	isTriple   bool
 	raw        bool
+	isTemplate bool
 	braceDepth int
 	parenDepth int
+	// inSpec is set once a top-level ':' opens a format spec; there '#' is
+	// literal spec text (e.g. "{n:#x}"), not a comment.
+	inSpec bool
 }
 
 // Lexer implements a zero-copy Python tokenizer with indentation state machine.
@@ -101,6 +105,16 @@ func (l *Lexer) NextToken() Token {
 			continue
 		}
 
+		// '#' inside a format spec is spec text
+		if ch == '#' && len(l.fstringStack) > 0 && l.fstringStack[len(l.fstringStack)-1].inSpec {
+			l.hasTokensOnLine = true
+			start := uint32(l.pos)
+			line, col := l.line, l.col
+			l.pos++
+			l.col++
+			return Token{Type: TOKEN_FSTRING_MIDDLE, Start: start, End: uint32(l.pos), Line: line, Col: col}
+		}
+
 		// Comment
 		if ch == '#' {
 			for l.pos < len(l.src) && l.src[l.pos] != '\n' && l.src[l.pos] != '\r' {
@@ -134,10 +148,14 @@ func (l *Lexer) NextToken() Token {
 			l.pos++
 			l.line++
 			l.col = 1
-			l.atBOL = true
 
-			// If blank line or inside parentheses/brackets/braces, suppress NEWLINE token
-			if !l.hasTokensOnLine || l.parenDepth > 0 {
+			// If inside parentheses/brackets/braces, suppress NEWLINE token and ignore indentation
+			if l.parenDepth > 0 {
+				continue
+			}
+
+			l.atBOL = true
+			if !l.hasTokensOnLine {
 				continue
 			}
 			l.hasTokensOnLine = false
@@ -371,6 +389,11 @@ func (l *Lexer) readNumber(startPos uint32, line, col uint32) Token {
 	if isFloat {
 		tokType = TOKEN_FLOAT
 	}
+	if l.pos < len(l.src) && (l.src[l.pos] == 'j' || l.src[l.pos] == 'J') {
+		l.pos++
+		l.col++
+		tokType = TOKEN_IMAG
+	}
 	return Token{Type: tokType, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
 }
 
@@ -449,6 +472,7 @@ func (l *Lexer) tryReadPrefixedString(startPos uint32, line, col uint32) (Token,
 
 	isFString := false
 	isRaw := false
+	isTemplate := false
 	isValid := false
 
 	pStr := strings.ToLower(string(pfx[:pfxLen]))
@@ -461,12 +485,21 @@ func (l *Lexer) tryReadPrefixedString(startPos uint32, line, col uint32) (Token,
 		isValid = true
 	case "b", "u":
 		isValid = true
+	case "t":
+		isFString = true
+		isTemplate = true
+		isValid = true
 	case "fr", "rf":
 		isFString = true
 		isRaw = true
 		isValid = true
 	case "br", "rb":
 		isRaw = true
+		isValid = true
+	case "tr", "rt":
+		isFString = true
+		isRaw = true
+		isTemplate = true
 		isValid = true
 	}
 
@@ -492,10 +525,15 @@ func (l *Lexer) tryReadPrefixedString(startPos uint32, line, col uint32) (Token,
 			quote:      quoteChar,
 			isTriple:   isTriple,
 			raw:        isRaw,
+			isTemplate: isTemplate,
 			braceDepth: 0,
 			parenDepth: 0,
 		})
-		return Token{Type: TOKEN_FSTRING_START, Start: startPos, End: uint32(l.pos), Line: line, Col: col}, true
+		tokType := TOKEN_FSTRING_START
+		if isTemplate {
+			tokType = TOKEN_TSTRING_START
+		}
+		return Token{Type: tokType, Start: startPos, End: uint32(l.pos), Line: line, Col: col}, true
 	}
 
 	return l.readString(startPos, line, col), true
@@ -537,8 +575,10 @@ func (l *Lexer) readFStringMiddle(top *fstringState) Token {
 		}
 		l.pos++
 		l.col++
+		l.parenDepth++
 		top.braceDepth = 1
 		top.parenDepth = 0
+		top.inSpec = false
 		return Token{Type: TOKEN_LBRACE, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
 	}
 
@@ -582,7 +622,20 @@ func (l *Lexer) readFStringMiddle(top *fstringState) Token {
 					} else {
 						l.col++
 					}
+					isN := l.src[l.pos] == 'N'
 					l.pos++
+					// \N{NAME}: the braces belong to the escape, not to a
+					// replacement field.
+					if isN && l.pos < len(l.src) && l.src[l.pos] == '{' {
+						j := l.pos + 1
+						for j < len(l.src) && l.src[j] != '}' && l.src[j] != '\n' && l.src[j] != top.quote {
+							j++
+						}
+						if j < len(l.src) && l.src[j] == '}' {
+							l.col += uint32(j + 1 - l.pos)
+							l.pos = j + 1
+						}
+					}
 				}
 				continue
 			}
@@ -664,7 +717,17 @@ func (l *Lexer) readOperatorOrDelimiter(startPos uint32, line, col uint32) Token
 		}
 		return Token{Type: TOKEN_RBRACE, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
 	case ':':
-		if l.pos < len(l.src) && l.src[l.pos] == '=' {
+		atSpecStart := false
+		if len(l.fstringStack) > 0 {
+			top := &l.fstringStack[len(l.fstringStack)-1]
+			// A ':' at the top level of a replacement field starts the format
+			// spec, so ":=" there is a colon followed by spec text, not walrus.
+			atSpecStart = top.parenDepth == 0 && top.braceDepth <= 1
+			if atSpecStart {
+				top.inSpec = true
+			}
+		}
+		if !atSpecStart && l.pos < len(l.src) && l.src[l.pos] == '=' {
 			l.pos++
 			l.col++
 			return Token{Type: TOKEN_WALRUS, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
@@ -761,7 +824,7 @@ func (l *Lexer) readOperatorOrDelimiter(startPos uint32, line, col uint32) Token
 			l.col++
 			return Token{Type: TOKEN_NEQ, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
 		}
-		return Token{Type: TOKEN_ERROR, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
+		return Token{Type: TOKEN_EXCLAIM, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
 
 	case '<':
 		if l.pos < len(l.src) && l.src[l.pos] == '<' {

@@ -65,6 +65,10 @@ func exactTypeAndValueEqual(a, b val.Value) bool {
 		// math.Float64bits ensures exact IEEE-754 bit-pattern equality (differentiating 0.0 vs -0.0)
 		return math.Float64bits(a.AsFloat64()) == math.Float64bits(b.AsFloat64())
 
+	case val.KindComplex:
+		return math.Float64bits(a.AsComplex().Real) == math.Float64bits(b.AsComplex().Real) &&
+			math.Float64bits(a.AsComplex().Imag) == math.Float64bits(b.AsComplex().Imag)
+
 	case val.KindInlineStr, val.KindString:
 		return a.AsString() == b.AsString()
 

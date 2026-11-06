@@ -1,0 +1,22 @@
+The pure-Python modules under lib/ are from CPython 3.15.0 (tag v3.15.0),
+https://github.com/python/cpython, except the overlay listed below.
+Their license is lib/LICENSE (PSF License Version 2, together with
+the historical CNRI and BeOpen licenses in that file). Copyright notices
+inside individual modules, including Google's notice in abc.py and
+_collections_abc.py and Steve Purcell's notice in unittest, are part of
+those sources and are left unchanged.
+
+Changes from CPython:
+
+- Extension modules that CPython implements in C are reimplemented in Go
+  (for example _typing, _abc, _collections, _functools, _sre, _thread,
+  _contextvars, _signal, errno, and the builtin types). os, gettext, and
+  shutil are native Go modules too; gettext is a pass-through catalog and
+  shutil provides only get_terminal_size. os.path is bound to the
+  unmodified posixpath module on first import of os.
+- lib/ast.py is a Fython stand-in. CPython's ast.py is "from _ast import *",
+  and _ast is not implemented. annotationlib.py builds AST nodes at import.
+
+go generate ./pkg/stdlib/ re-downloads the pinned tag and refreshes
+lib/LICENSE and the upstream modules. It does not overwrite the
+overlay above.

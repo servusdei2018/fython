@@ -2,6 +2,7 @@ package compiler
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -51,22 +52,72 @@ type Symbol struct {
 
 // Scope represents a lexical environment in the symbol table tree.
 type Scope struct {
-	Kind        ScopeKind
-	Name        string
-	Parent      *Scope
-	Children    []*Scope
-	Symbols     map[string]*Symbol
-	Bound       map[string]bool
-	ExplicitG   map[string]bool // global x
-	ExplicitNL  map[string]bool // nonlocal x
-	Used        map[string]bool
-	IsGenerator bool
-	IsCoroutine bool
+	Kind           ScopeKind
+	Name           string
+	Parent         *Scope
+	Children       []*Scope
+	Symbols        map[string]*Symbol
+	Bound          map[string]bool
+	ExplicitG      map[string]bool // global x
+	ExplicitNL     map[string]bool // nonlocal x
+	Used           map[string]bool
+	IsGenerator    bool
+	IsCoroutine    bool
+	HasAnnotations bool
+
+	// PEP 649: AnnScope is the synthetic __annotate__(format) function scope
+	// owning every annotation expression of this module or class body.
+	AnnScope *Scope
+	// AnnOwner is the module/class scope an __annotate__ scope belongs to.
+	AnnOwner *Scope
+	// CanSeeClass marks a class-level __annotate__ scope: names that are not
+	// local resolve through the implicit __classdict__ cell first.
+	CanSeeClass bool
+	// AnnEntries lists the annotated simple names of this body in source order.
+	AnnEntries []*AnnEntry
+	// AnnByStmt maps an annotated statement to its entry.
+	AnnByStmt map[StmtID]*AnnEntry
+	// AnnHasCond reports that some annotation sits inside conditional control
+	// flow and is tracked through __conditional_annotations__.
+	AnnHasCond bool
 
 	ParamNames []string
 	CellVars   []string
 	FreeVars   []string
 	FastLocals []string
+	// ClosureSlots is the cell index used by OP_LOAD_CLOSURE.
+	// Class scopes keep this even when a name is also a namespace binding
+	// (Symbols stays StorageGlobal for load/store).
+	ClosureSlots map[string]int
+	// NumSlots is the total number of fast-local frame slots (params + locals).
+	NumSlots int
+	// CompID identifies an inlined comprehension (its arena index) so the
+	// compiler can find the hidden slots that preserve shadowed locals.
+	CompID uint32
+}
+
+// AnnEntry is one `name: annotation` statement in a module or class body.
+type AnnEntry struct {
+	Stmt StmtID
+	Name string
+	Expr ExprID
+	Idx  int
+	Cond bool
+}
+
+// Implicit names of the PEP 649 machinery.
+const (
+	annFormatParam     = ".format"
+	annClassDictName   = "__classdict__"
+	annCondAnnotations = "__conditional_annotations__"
+	annModuleAnnotate  = "__annotate__"
+	annClassAnnotate   = "__annotate_func__"
+)
+
+// compSaveName is the hidden fast-local that holds the enclosing function's
+// value of name while comprehension compID rebinds it (PEP 709).
+func compSaveName(compID uint32, name string) string {
+	return fmt.Sprintf(".save%d.%s", compID, name)
 }
 
 // NewScope creates a new Scope node in the symbol table tree.
@@ -94,6 +145,9 @@ type SymbolTable struct {
 	top    *Scope
 	cur    *Scope
 	Scopes []*Scope
+	// condDepth is >0 while visiting statements nested in control flow
+	// (if/for/while/try/with/match) of the current scope.
+	condDepth int
 }
 
 // BuildSymbolTable analyzes the AST and returns the resolved top-level Scope.
@@ -121,10 +175,38 @@ func BuildSymbolTable(src []byte, arena *ASTArena, topStmts []StmtID) (*Scope, e
 	return st.top, nil
 }
 
+// BuildSymbolTableForExpr analyzes an expression AST and returns the resolved top-level Scope.
+func BuildSymbolTableForExpr(src []byte, arena *ASTArena, exprID ExprID) (*Scope, error) {
+	st := &SymbolTable{
+		src:   src,
+		arena: arena,
+		top:   NewScope(ScopeModule, "<module>", nil),
+	}
+	st.cur = st.top
+	st.Scopes = append(st.Scopes, st.top)
+
+	if err := st.visitExpr(exprID); err != nil {
+		return nil, err
+	}
+
+	if err := st.resolveScope(st.top); err != nil {
+		return nil, err
+	}
+
+	return st.top, nil
+}
+
 func (st *SymbolTable) visitStmt(stmtID StmtID) error {
 	stmt := st.arena.GetStmt(stmtID)
 	if stmt == nil {
 		return nil
+	}
+
+	switch stmt.Kind {
+	case StmtKindIf, StmtKindFor, StmtKindAsyncFor, StmtKindWhile, StmtKindTry,
+		StmtKindWith, StmtKindAsyncWith, StmtKindMatch:
+		st.condDepth++
+		defer func() { st.condDepth-- }()
 	}
 
 	switch stmt.Kind {
@@ -176,14 +258,14 @@ func (st *SymbolTable) visitStmt(stmtID StmtID) error {
 			fnScope.Bound[p] = true
 		}
 
-		saved := st.cur
-		st.cur = fnScope
+		saved, savedCond := st.cur, st.condDepth
+		st.cur, st.condDepth = fnScope, 0
 		for _, sID := range st.arena.StmtIDs[fnDef.Body.Start : fnDef.Body.Start+fnDef.Body.Count] {
 			if err := st.visitStmt(sID); err != nil {
 				return err
 			}
 		}
-		st.cur = saved
+		st.cur, st.condDepth = saved, savedCond
 
 	case StmtKindClassDef:
 		clsDef := &st.arena.ClassDefs[stmt.Extra]
@@ -220,14 +302,14 @@ func (st *SymbolTable) visitStmt(stmtID StmtID) error {
 			}
 		}
 
-		saved := st.cur
-		st.cur = clsScope
+		saved, savedCond := st.cur, st.condDepth
+		st.cur, st.condDepth = clsScope, 0
 		for _, sID := range st.arena.StmtIDs[clsDef.Body.Start : clsDef.Body.Start+clsDef.Body.Count] {
 			if err := st.visitStmt(sID); err != nil {
 				return err
 			}
 		}
-		st.cur = saved
+		st.cur, st.condDepth = saved, savedCond
 
 	case StmtKindGlobal:
 		slice := st.arena.IdentSlices[stmt.Extra]
@@ -473,6 +555,53 @@ func (st *SymbolTable) visitStmt(stmtID StmtID) error {
 
 	case StmtKindDelete:
 		st.visitDelete(stmt.Expr1)
+
+	case StmtKindAnnAssign:
+		if stmt.Expr2 != ExprNone {
+			if err := st.visitExpr(stmt.Expr2); err != nil {
+				return err
+			}
+			st.bindTarget(stmt.Expr1)
+		} else if st.cur.Kind == ScopeFunction {
+			st.bindTarget(stmt.Expr1)
+		}
+		annExprID := ExprID(stmt.Extra)
+		if annExprID != ExprNone && (st.cur.Kind == ScopeClass || st.cur.Kind == ScopeModule) {
+			targetExpr := st.arena.GetExpr(stmt.Expr1)
+			if targetExpr != nil && targetExpr.Kind == ExprKindName {
+				owner := st.cur
+				owner.HasAnnotations = true
+				if owner.AnnScope == nil {
+					as := NewScope(ScopeFunction, "__annotate__", owner)
+					as.ParamNames = []string{annFormatParam}
+					as.Bound[annFormatParam] = true
+					as.AnnOwner = owner
+					as.CanSeeClass = owner.Kind == ScopeClass
+					owner.AnnScope = as
+					owner.AnnByStmt = make(map[StmtID]*AnnEntry)
+					st.Scopes = append(st.Scopes, as)
+				}
+				entry := &AnnEntry{
+					Stmt: stmtID,
+					Name: string(st.src[targetExpr.Start:targetExpr.End]),
+					Expr: annExprID,
+					Idx:  len(owner.AnnEntries),
+					Cond: st.condDepth > 0,
+				}
+				if entry.Cond {
+					owner.AnnHasCond = true
+				}
+				owner.AnnEntries = append(owner.AnnEntries, entry)
+				owner.AnnByStmt[stmtID] = entry
+				savedCur := st.cur
+				st.cur = owner.AnnScope
+				err := st.visitExpr(annExprID)
+				st.cur = savedCur
+				if err != nil {
+					return err
+				}
+			}
+		}
 	}
 
 	return nil
@@ -673,7 +802,7 @@ func (st *SymbolTable) visitExpr(exprID ExprID) error {
 
 	case ExprKindDict:
 		start := expr.Extra
-		count := uint32(expr.Op)
+		count := uint32(expr.Right)
 		for i := uint32(0); i < count; i++ {
 			pair := &st.arena.DictPairs[start+i]
 			if err := st.visitExpr(pair.Key); err != nil {
@@ -690,13 +819,24 @@ func (st *SymbolTable) visitExpr(exprID ExprID) error {
 			return err
 		}
 		compScope := NewScope(ScopeComprehension, "<comprehension>", st.cur)
+		compScope.CompID = expr.Extra
 		st.Scopes = append(st.Scopes, compScope)
 
 		saved := st.cur
 		st.cur = compScope
-		st.bindTarget(comp.Target)
-		for _, ifCond := range st.arena.GetExprSlice(comp.IfConds) {
-			if err := st.visitExpr(ifCond); err != nil {
+		currComp := comp
+		for {
+			st.bindTarget(currComp.Target)
+			for _, ifCond := range st.arena.GetExprSlice(currComp.IfConds) {
+				if err := st.visitExpr(ifCond); err != nil {
+					return err
+				}
+			}
+			if currComp.Next == 0 {
+				break
+			}
+			currComp = &st.arena.Comps[currComp.Next-1]
+			if err := st.visitExpr(currComp.Iter); err != nil {
 				return err
 			}
 		}
@@ -725,9 +865,19 @@ func (st *SymbolTable) visitExpr(exprID ExprID) error {
 
 		saved := st.cur
 		st.cur = genScope
-		st.bindTarget(comp.Target)
-		for _, ifCond := range st.arena.GetExprSlice(comp.IfConds) {
-			if err := st.visitExpr(ifCond); err != nil {
+		currGenComp := comp
+		for {
+			st.bindTarget(currGenComp.Target)
+			for _, ifCond := range st.arena.GetExprSlice(currGenComp.IfConds) {
+				if err := st.visitExpr(ifCond); err != nil {
+					return err
+				}
+			}
+			if currGenComp.Next == 0 {
+				break
+			}
+			currGenComp = &st.arena.Comps[currGenComp.Next-1]
+			if err := st.visitExpr(currGenComp.Iter); err != nil {
 				return err
 			}
 		}
@@ -761,9 +911,19 @@ func (st *SymbolTable) visitExpr(exprID ExprID) error {
 		}
 		saved := st.cur
 		st.cur = lambdaScope
-		if err := st.visitExpr(expr.Left); err != nil {
-			st.cur = saved
-			return err
+		// The parser stores a lambda body as a synthesized `return <expr>`
+		// statement; Left is unused.
+		for _, sID := range st.arena.StmtIDs[fnDef.Body.Start : fnDef.Body.Start+fnDef.Body.Count] {
+			if err := st.visitStmt(sID); err != nil {
+				st.cur = saved
+				return err
+			}
+		}
+		if expr.Left != ExprNone {
+			if err := st.visitExpr(expr.Left); err != nil {
+				st.cur = saved
+				return err
+			}
 		}
 		st.cur = saved
 
@@ -787,7 +947,7 @@ func (st *SymbolTable) visitExpr(exprID ExprID) error {
 		}
 		return st.visitExpr(expr.Left)
 
-	case ExprKindJoinedStr:
+	case ExprKindJoinedStr, ExprKindTemplateStr:
 		fs := &st.arena.FStrings[expr.Extra]
 		for _, pExpr := range st.arena.GetExprSlice(fs.Pieces) {
 			if err := st.visitExpr(pExpr); err != nil {
@@ -872,13 +1032,44 @@ func (st *SymbolTable) resolveScope(s *Scope) error {
 	}
 
 	if s.Kind == ScopeClass {
+		if s.ClosureSlots == nil {
+			s.ClosureSlots = make(map[string]int)
+		}
 		for idx, cv := range s.CellVars {
 			s.Symbols[cv] = &Symbol{Name: cv, Storage: StorageCell, Offset: idx}
+			s.ClosureSlots[cv] = idx
 		}
+		// Namespace bindings win for load/store. A nested method can still
+		// close over an enclosing function local of the same name.
 		for name := range s.Bound {
-			if s.Symbols[name] == nil {
-				s.Symbols[name] = &Symbol{Name: name, Storage: StorageGlobal}
+			if sym := s.Symbols[name]; sym != nil && sym.Storage == StorageCell {
+				continue
 			}
+			s.Symbols[name] = &Symbol{Name: name, Storage: StorageGlobal}
+		}
+		for name := range s.Used {
+			if s.Bound[name] || containsString(s.FreeVars, name) {
+				continue
+			}
+			if sym := s.Symbols[name]; sym != nil && sym.Storage == StorageCell {
+				continue
+			}
+			if st.isBoundInFunctionAncestors(s.Parent, name) {
+				s.FreeVars = append(s.FreeVars, name)
+				st.markAncestorCell(s.Parent, name)
+			}
+		}
+		for idx, fv := range s.FreeVars {
+			off := len(s.CellVars) + idx
+			if sym := s.Symbols[fv]; sym != nil && sym.Storage == StorageCell {
+				s.ClosureSlots[fv] = sym.Offset
+				continue
+			}
+			s.ClosureSlots[fv] = off
+			if s.Bound[fv] {
+				continue
+			}
+			s.Symbols[fv] = &Symbol{Name: fv, Storage: StorageFree, Offset: off}
 		}
 		for name := range s.Used {
 			if s.Symbols[name] == nil {
@@ -889,9 +1080,27 @@ func (st *SymbolTable) resolveScope(s *Scope) error {
 	}
 
 	if s.Kind == ScopeComprehension {
+		boundNames := make([]string, 0, len(s.Bound))
 		for name := range s.Bound {
+			boundNames = append(boundNames, name)
+		}
+		sort.Strings(boundNames)
+		for _, name := range boundNames {
 			s.Symbols[name] = &Symbol{Name: name, Storage: StorageFastLocal}
 			s.FastLocals = append(s.FastLocals, name)
+			fn := s.Parent
+			for fn != nil && fn.Kind == ScopeComprehension {
+				fn = fn.Parent
+			}
+			if fn != nil && fn.Kind == ScopeFunction && (fn.Bound[name] || isParam(fn.ParamNames, name)) {
+				// The comprehension shares this slot with a local of the
+				// enclosing function. Reserve a hidden slot to restore it.
+				hidden := compSaveName(s.CompID, name)
+				if fn.Symbols[hidden] == nil {
+					fn.Symbols[hidden] = &Symbol{Name: hidden, Storage: StorageFastLocal}
+					fn.FastLocals = append(fn.FastLocals, hidden)
+				}
+			}
 			if s.Parent != nil && s.Parent.Kind == ScopeFunction {
 				if !containsString(s.Parent.FastLocals, name) && !s.Parent.Bound[name] {
 					s.Parent.FastLocals = append(s.Parent.FastLocals, name)
@@ -928,6 +1137,7 @@ func (st *SymbolTable) resolveScope(s *Scope) error {
 				offset++
 			}
 		}
+		s.NumSlots = offset
 		return nil
 	}
 
@@ -953,9 +1163,13 @@ func (st *SymbolTable) resolveScope(s *Scope) error {
 		if s.ExplicitG[clean] || s.ExplicitNL[clean] {
 			continue
 		}
-		if st.isCapturedByDescendants(s, clean) {
-			s.Symbols[clean] = &Symbol{Name: clean, Storage: StorageCell}
-			s.CellVars = append(s.CellVars, clean)
+		if st.isCapturedByDescendants(s, clean) || (s.Symbols[clean] != nil && s.Symbols[clean].Storage == StorageCell) {
+			if s.Symbols[clean] == nil || s.Symbols[clean].Storage != StorageCell {
+				s.Symbols[clean] = &Symbol{Name: clean, Storage: StorageCell}
+			}
+			if !containsString(s.CellVars, clean) {
+				s.CellVars = append(s.CellVars, clean)
+			}
 		} else {
 			s.Symbols[clean] = &Symbol{Name: clean, Storage: StorageFastLocal}
 			s.FastLocals = append(s.FastLocals, clean)
@@ -973,12 +1187,30 @@ func (st *SymbolTable) resolveScope(s *Scope) error {
 		if isParam(s.ParamNames, name) {
 			continue
 		}
-		if st.isCapturedByDescendants(s, name) {
-			s.Symbols[name] = &Symbol{Name: name, Storage: StorageCell}
-			s.CellVars = append(s.CellVars, name)
+		if st.isCapturedByDescendants(s, name) || (s.Symbols[name] != nil && s.Symbols[name].Storage == StorageCell) {
+			if s.Symbols[name] == nil || s.Symbols[name].Storage != StorageCell {
+				s.Symbols[name] = &Symbol{Name: name, Storage: StorageCell}
+			}
+			if !containsString(s.CellVars, name) {
+				s.CellVars = append(s.CellVars, name)
+			}
 		} else {
 			s.Symbols[name] = &Symbol{Name: name, Storage: StorageFastLocal}
 			s.FastLocals = append(s.FastLocals, name)
+		}
+	}
+
+	// PEP 649: a class-level __annotate__ closes over the class namespace
+	// (and the conditional-annotation set) through implicit class cells.
+	if s.CanSeeClass && s.AnnOwner != nil {
+		implicit := []string{annClassDictName}
+		if s.AnnOwner.AnnHasCond {
+			implicit = append(implicit, annCondAnnotations)
+		}
+		for _, name := range implicit {
+			s.Symbols[name] = &Symbol{Name: name, Storage: StorageFree}
+			s.FreeVars = append(s.FreeVars, name)
+			st.markAncestorCell(s.Parent, name)
 		}
 	}
 
@@ -1011,19 +1243,36 @@ func (st *SymbolTable) resolveScope(s *Scope) error {
 		} else if strings.HasPrefix(p, "*") {
 			clean = p[1:]
 		}
+		if clean == "" {
+			continue
+		}
+		// Every parameter occupies the frame slot matching its ParamNames index,
+		// including cell parameters (their initial value is copied into the cell).
 		sym := s.Symbols[clean]
 		if sym != nil && sym.Storage == StorageFastLocal {
 			sym.Offset = offset
-			offset++
 		}
+		offset++
 	}
+	// Assign every non-parameter fast local a fresh slot. Offset 0 is a real
+	// slot (the first parameter), so it cannot mean "unassigned". A symbol
+	// that already carries an offset — for example a comprehension target
+	// injected before this scope is resolved — must still be renumbered,
+	// or it collides with whichever local is visited last.
+	seen := make(map[*Symbol]struct{}, len(s.FastLocals))
 	for _, fl := range s.FastLocals {
 		sym := s.Symbols[fl]
-		if sym != nil && sym.Offset == 0 && !isParam(s.ParamNames, fl) {
-			sym.Offset = offset
-			offset++
+		if sym == nil || sym.Storage != StorageFastLocal || isParam(s.ParamNames, fl) {
+			continue
 		}
+		if _, ok := seen[sym]; ok {
+			continue
+		}
+		seen[sym] = struct{}{}
+		sym.Offset = offset
+		offset++
 	}
+	s.NumSlots = offset
 
 	// Cell offsets: 0 .. len(CellVars)-1
 	for idx, cv := range s.CellVars {
@@ -1043,7 +1292,7 @@ func (st *SymbolTable) resolveScope(s *Scope) error {
 
 func (st *SymbolTable) markAncestorCell(start *Scope, name string) {
 	for p := start; p != nil; p = p.Parent {
-		if p.Kind == ScopeClass && name == "__class__" {
+		if p.Kind == ScopeClass && (name == "__class__" || name == annClassDictName || name == annCondAnnotations) {
 			sym := p.Symbols[name]
 			if sym == nil {
 				sym = &Symbol{Name: name}
@@ -1055,7 +1304,15 @@ func (st *SymbolTable) markAncestorCell(start *Scope, name string) {
 			}
 			return
 		}
-		if p.Kind == ScopeModule || p.Kind == ScopeClass {
+		if p.Kind == ScopeModule {
+			continue
+		}
+		if p.Kind == ScopeClass {
+			// Class bodies are not an enclosing scope, but they must carry
+			// the cell so methods created inside the class can close over it.
+			if !containsString(p.FreeVars, name) {
+				p.FreeVars = append(p.FreeVars, name)
+			}
 			continue
 		}
 		if p.Bound[name] {
@@ -1124,6 +1381,9 @@ func (st *SymbolTable) isCapturedByDescendants(s *Scope, name string) bool {
 				if child.ExplicitNL[name] {
 					return true
 				}
+			}
+			if child.Kind == ScopeClass && containsString(child.FreeVars, name) {
+				return true
 			}
 			if check(child) {
 				return true

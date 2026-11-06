@@ -354,8 +354,12 @@ func (e *Engine) createAsyncioModule() val.Value {
 			panic("TypeError: run() takes at least 1 argument")
 		}
 		target := args[0]
+		var parent *val.PyContext
+		if ctx != nil && ctx.VM != nil {
+			parent = ctx.VM.(*VM).ActiveContext()
+		}
 		loop := NewEventLoop(e, e.asyncMode)
-		res, err := loop.RunUntilComplete(target)
+		res, err := loop.RunUntilCompleteIn(target, parent)
 		if err != nil {
 			panic(err.Error())
 		}
@@ -402,7 +406,11 @@ func (e *Engine) createAsyncioModule() val.Value {
 			loop = NewEventLoop(e, e.asyncMode)
 			SetCurrentEventLoop(loop)
 		}
-		task := loop.CreateTask(args[0])
+		var parent *val.PyContext
+		if ctx != nil && ctx.VM != nil {
+			parent = ctx.VM.(*VM).ActiveContext()
+		}
+		task := loop.CreateTaskIn(args[0], parent)
 		return val.ObjectVal(&task.Header)
 	}))
 
@@ -445,7 +453,11 @@ func (e *Engine) createAsyncioModule() val.Value {
 			var childFut *val.PyFuture
 
 			if aw.IsCoroutine() {
-				task := loop.CreateTask(aw)
+				var parent *val.PyContext
+				if ctx != nil && ctx.VM != nil {
+					parent = ctx.VM.(*VM).ActiveContext()
+				}
+				task := loop.CreateTaskIn(aw, parent)
 				childFut = &task.Future
 			} else if aw.IsTask() {
 				childFut = &aw.AsTask().Future

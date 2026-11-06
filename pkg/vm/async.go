@@ -136,11 +136,24 @@ func NewEventLoop(e *Engine, mode AsyncMode) *EventLoop {
 }
 
 // CreateTask wraps a coroutine in a PyTask and enqueues it on the EventLoop.
+// The task gets an empty context. Prefer CreateTaskIn to propagate the caller.
 func (l *EventLoop) CreateTask(coroVal val.Value) *val.PyTask {
+	return l.CreateTaskIn(coroVal, nil)
+}
+
+// CreateTaskIn wraps a coroutine and stores a shallow copy of parent.
+// A nil parent starts from an empty context. The copy shares the parent's
+// snapshot, so spawn stays O(1) until the task calls ContextVar.set.
+func (l *EventLoop) CreateTaskIn(coroVal val.Value, parent *val.PyContext) *val.PyTask {
 	coro := coroVal.AsCoroutine()
 	taskVal := val.NewTaskVal(coro)
 	task := taskVal.AsTask()
 	task.Loop = l
+	if parent == nil {
+		task.Context = val.NewPyContext()
+	} else {
+		task.Context = parent.ShallowCopy()
+	}
 	l.queue.Push(task)
 	return task
 }
@@ -159,6 +172,10 @@ func (l *EventLoop) ScheduleCallback(callable val.Value, args ...val.Value) {
 
 // RunUntilComplete runs the EventLoop until the specified awaitable (coroutine, future, or task) completes.
 func (l *EventLoop) RunUntilComplete(target val.Value) (val.Value, error) {
+	return l.RunUntilCompleteIn(target, nil)
+}
+
+func (l *EventLoop) RunUntilCompleteIn(target val.Value, parent *val.PyContext) (val.Value, error) {
 	prevLoop := GetCurrentEventLoop()
 	SetCurrentEventLoop(l)
 	defer func() {
@@ -174,7 +191,7 @@ func (l *EventLoop) RunUntilComplete(target val.Value) (val.Value, error) {
 
 	var rootTask *val.PyTask
 	if target.IsCoroutine() {
-		rootTask = l.CreateTask(target)
+		rootTask = l.CreateTaskIn(target, parent)
 	} else if target.IsTask() {
 		rootTask = target.AsTask()
 		l.queue.Push(rootTask)
@@ -290,6 +307,11 @@ func (l *EventLoop) stepTask(vm *VM, task *val.PyTask) {
 	if coro == nil || coro.State == val.CoroClosed {
 		return
 	}
+	if task.Context != nil {
+		prev := vm.context
+		vm.context = task.Context
+		defer func() { vm.context = prev }()
+	}
 
 	sent := task.NextSent
 	task.NextSent = val.NoneVal()
@@ -312,9 +334,10 @@ func (l *EventLoop) stepTask(vm *VM, task *val.PyTask) {
 			l.queue.Push(task)
 		}
 	} else if status == val.IterError {
-		exc := vm.LastException()
+		exc := vm.execCtx.ActiveException
+		vm.execCtx.ClearException()
 		if exc.IsNone() || exc.HeaderPtr() == nil {
-			exc = vm.execCtx.ActiveException
+			exc = vm.LastException()
 		}
 		task.SetException(exc)
 		vm.releaseCoroutine(coro)

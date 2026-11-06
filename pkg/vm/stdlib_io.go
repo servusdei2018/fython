@@ -18,31 +18,39 @@ var (
 	ioInitOnce   sync.Once
 )
 
+// Compile-time layout assertions: Header must be at offset 0 so that the
+// val.Value -> *PyInstance downcast is valid for these native objects.
+var (
+	_ [0 - unsafe.Offsetof(pyBytesIO{}.inst)]byte
+	_ [0 - unsafe.Offsetof(pyStringIO{}.inst)]byte
+	_ [0 - unsafe.Offsetof(pyFile{}.inst)]byte
+)
+
 type pyBytesIO struct {
-	Header val.ObjectHeader
-	Shape  *val.Shape
-	buf    []byte
-	pos    int
-	mu     sync.RWMutex
+	inst val.PyInstance // must be first: Header lives at offset 0
+	buf  []byte
+	pos  int
+	mu   sync.RWMutex
 }
 
 type pyStringIO struct {
-	Header val.ObjectHeader
-	Shape  *val.Shape
-	buf    []byte
-	pos    int
-	mu     sync.RWMutex
+	inst val.PyInstance // must be first: Header lives at offset 0
+	buf  []byte
+	pos  int
+	mu   sync.RWMutex
 }
 
 type pyFile struct {
-	Header   val.ObjectHeader
-	Shape    *val.Shape
+	inst     val.PyInstance // must be first: Header lives at offset 0
 	f        *os.File
 	reader   *bufio.Reader
 	writeBuf []byte
 	binary   bool
 	isClosed bool
-	mu       sync.Mutex
+	// unbuffered files (sys.stdout, sys.stderr) flush after every write.
+	unbuffered bool
+	name       string
+	mu         sync.Mutex
 }
 
 func (pf *pyFile) flushLocked() {
@@ -276,6 +284,23 @@ func initIOTypes() {
 			return val.Int64Val(int64(sio.pos))
 		}))
 
+		for _, t := range []*val.PyType{StringIOType, BytesIOType} {
+			noop := val.NewBuiltinFuncVal("flush", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+				return val.NoneVal()
+			})
+			no := val.NewBuiltinFuncVal("isatty", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+				return val.BoolVal(false)
+			})
+			yes := val.NewBuiltinFuncVal("seekable", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+				return val.BoolVal(true)
+			})
+			t.Dict.Set(val.InternString("flush"), noop)
+			t.Dict.Set(val.InternString("isatty"), no)
+			t.Dict.Set(val.InternString("readable"), yes)
+			t.Dict.Set(val.InternString("writable"), yes)
+			t.Dict.Set(val.InternString("seekable"), yes)
+			t.InvalidateVersion()
+		}
 		StringIOType.Dict.Set(val.InternString("close"), val.NewBuiltinFuncVal("close", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			sio := (*pyStringIO)(val.AsPointer(args[0]))
 			sio.mu.Lock()
@@ -449,7 +474,7 @@ func initIOTypes() {
 				}
 			}
 			written := len(pf.writeBuf) - oldLen
-			if len(pf.writeBuf) >= 65536 {
+			if pf.unbuffered || len(pf.writeBuf) >= 65536 {
 				pf.flushLocked()
 			}
 			pf.mu.Unlock()
@@ -467,6 +492,21 @@ func initIOTypes() {
 			return val.NoneVal()
 		}))
 
+		FileType.Dict.Set(val.InternString("isatty"), val.NewBuiltinFuncVal("isatty", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			pf := (*pyFile)(val.AsPointer(args[0]))
+			if pf.f == nil {
+				return val.BoolVal(false)
+			}
+			info, err := pf.f.Stat()
+			return val.BoolVal(err == nil && info.Mode()&os.ModeCharDevice != 0)
+		}))
+		FileType.Dict.Set(val.InternString("fileno"), val.NewBuiltinFuncVal("fileno", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			pf := (*pyFile)(val.AsPointer(args[0]))
+			if pf.f == nil {
+				panic("OSError: file has no descriptor")
+			}
+			return val.Int64Val(int64(pf.f.Fd()))
+		}))
 		FileType.Dict.Set(val.InternString("close"), val.NewBuiltinFuncVal("close", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			pf := (*pyFile)(val.AsPointer(args[0]))
 			pf.mu.Lock()
@@ -509,18 +549,27 @@ func openFileBuiltin(file string, mode string) val.Value {
 	}
 
 	pf := &pyFile{
-		Header: val.ObjectHeader{
-			Kind: val.KindInstance,
-			Type: FileType,
-		},
-		Shape:    FileType.RootShape,
+		inst:     val.PyInstance{Header: val.ObjectHeader{Kind: val.KindInstance, Type: FileType}, Shape: FileType.RootShape},
 		f:        f,
 		reader:   bufio.NewReader(f),
 		writeBuf: writeBuf,
 		binary:   binary,
 	}
 
-	return val.ObjectVal(&pf.Header)
+	return val.ObjectVal(&pf.inst.Header)
+}
+
+// newStdStream wraps one of the process's standard streams as a text file.
+func newStdStream(f *os.File, name string, writable bool) val.Value {
+	initIOTypes()
+	pf := &pyFile{
+		inst:       val.PyInstance{Header: val.ObjectHeader{Kind: val.KindInstance, Type: FileType}, Shape: FileType.RootShape},
+		f:          f,
+		reader:     bufio.NewReader(f),
+		unbuffered: writable,
+		name:       name,
+	}
+	return val.ObjectVal(&pf.inst.Header)
 }
 
 func (e *Engine) createIOModule() val.Value {
@@ -541,14 +590,13 @@ func (e *Engine) createIOModule() val.Value {
 			}
 		}
 		bio := &pyBytesIO{
-			Header: val.ObjectHeader{
-				Kind: val.KindInstance,
-				Type: BytesIOType,
+			inst: val.PyInstance{
+				Header: val.ObjectHeader{Kind: val.KindInstance, Type: BytesIOType},
+				Shape:  BytesIOType.RootShape,
 			},
-			Shape: BytesIOType.RootShape,
-			buf:   initBytes,
+			buf: initBytes,
 		}
-		return val.ObjectVal(&bio.Header)
+		return val.ObjectVal(&bio.inst.Header)
 	}))
 
 	// StringIO constructor
@@ -560,14 +608,13 @@ func (e *Engine) createIOModule() val.Value {
 			initBytes = make([]byte, 0, 8192)
 		}
 		sio := &pyStringIO{
-			Header: val.ObjectHeader{
-				Kind: val.KindInstance,
-				Type: StringIOType,
+			inst: val.PyInstance{
+				Header: val.ObjectHeader{Kind: val.KindInstance, Type: StringIOType},
+				Shape:  StringIOType.RootShape,
 			},
-			Shape: StringIOType.RootShape,
-			buf:   initBytes,
+			buf: initBytes,
 		}
-		return val.ObjectVal(&sio.Header)
+		return val.ObjectVal(&sio.inst.Header)
 	}))
 
 	// open

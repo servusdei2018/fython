@@ -11,6 +11,11 @@ import (
 
 func init() {
 	vm.DefaultEngine().SetCompileHook(CompileSource)
+	hook := func(src []byte, filename string, mode int) (*vm.CodeObject, error) {
+		return CompileSourceMode(src, filename, CompileMode(mode))
+	}
+	vm.SetDynamicCompileHook(hook)
+	vm.DefaultEngine().SetDynamicCompileHook(hook)
 }
 
 // LoopContext tracks jump patch locations for break and continue statements.
@@ -19,6 +24,7 @@ type LoopContext struct {
 	Breaks    []int
 	Continues []int
 	Parent    *LoopContext
+	IsFor     bool
 }
 
 // Compiler compiles an ASTArena + SymbolTable into 32-bit VM bytecode.
@@ -40,6 +46,7 @@ type Compiler struct {
 	curCol         uint32
 	filename       string
 	qualnamePrefix string
+	isExec         bool
 }
 
 func buildLineStarts(src []byte) []int {
@@ -137,6 +144,23 @@ func CompileWithFilename(src []byte, arena *ASTArena, filename string) (*vm.Code
 		curCol:         1,
 	}
 
+	if topScope.HasAnnotations {
+		if err := c.emitModuleAnnotatePrologue(); err != nil {
+			return nil, err
+		}
+	}
+
+	modDoc := val.NoneVal()
+	if docStr, hasDoc := c.extractDocstringFromSlice(topStmts); hasDoc {
+		docVal := val.NewStringVal(docStr)
+		modDoc = docVal
+		docIdx := c.constPool.Add(docVal)
+		c.emitOp(vm.OP_LOAD_CONST, 0, docIdx)
+		if err := c.compileNameStore("__doc__"); err != nil {
+			return nil, err
+		}
+	}
+
 	for _, stmtID := range topStmts {
 		if err := c.compileStmt(stmtID); err != nil {
 			return nil, err
@@ -161,9 +185,10 @@ func CompileWithFilename(src []byte, arena *ASTArena, filename string) (*vm.Code
 		Code:           c.code,
 		Consts:         c.constPool.Slice(),
 		VarNames:       varNames,
-		NumLocals:      len(c.scope.FastLocals),
+		NumLocals:      frameLocalCount(c.scope),
 		NumParams:      0,
 		MaxStackSize:   c.maxStackDepth + 16,
+		Doc:            modDoc,
 		ExceptionTable: c.exceptionTable,
 		LineSpans:      c.lineSpans,
 	}
@@ -185,6 +210,144 @@ func CompileSourceWithFilename(src []byte, filename string) (*vm.CodeObject, err
 // CompileString compiles a Python source string.
 func CompileString(src string) (*vm.CodeObject, error) {
 	return CompileSource([]byte(src))
+}
+
+// CompileMode represents the compilation mode for code objects.
+type CompileMode int
+
+const (
+	ModeExec CompileMode = iota
+	ModeEval
+	ModeSingle
+)
+
+// CompileSourceMode compiles Python source bytes with the specified mode.
+func CompileSourceMode(src []byte, filename string, mode CompileMode) (*vm.CodeObject, error) {
+	arena := NewASTArena(256)
+	if filename == "" {
+		filename = "<string>"
+	}
+	if mode == ModeEval {
+		parser := NewParser(src, arena)
+		exprID, err := parser.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		topScope, err := BuildSymbolTableForExpr(src, arena, exprID)
+		if err != nil {
+			return nil, err
+		}
+		c := &Compiler{
+			src:            src,
+			arena:          arena,
+			scope:          topScope,
+			constPool:      NewConstPool(),
+			code:           make([]uint32, 0, 64),
+			filename:       filename,
+			qualnamePrefix: "",
+			isExec:         true,
+			curLine:        1,
+			curCol:         1,
+		}
+		if err := c.compileExpr(exprID); err != nil {
+			return nil, err
+		}
+		c.emitOp(vm.OP_RETURN, 0, 0)
+		c.peephole()
+		varNames := make([]val.Value, len(c.scope.FastLocals))
+		for i, fl := range c.scope.FastLocals {
+			varNames[i] = val.InternString(fl)
+		}
+		co := &vm.CodeObject{
+			Name:           "<module>",
+			QualName:       "<module>",
+			FileName:       filename,
+			FirstLineNo:    1,
+			Code:           c.code,
+			Consts:         c.constPool.Slice(),
+			VarNames:       varNames,
+			NumLocals:      frameLocalCount(c.scope),
+			NumParams:      0,
+			MaxStackSize:   c.maxStackDepth + 16,
+			ExceptionTable: c.exceptionTable,
+			LineSpans:      c.lineSpans,
+		}
+		return co, nil
+	}
+
+	parser := NewParser(src, arena)
+	topStmts, err := parser.ParseModule()
+	if err != nil {
+		return nil, err
+	}
+	topScope, err := BuildSymbolTable(src, arena, topStmts)
+	if err != nil {
+		return nil, err
+	}
+	c := &Compiler{
+		src:            src,
+		arena:          arena,
+		scope:          topScope,
+		constPool:      NewConstPool(),
+		code:           make([]uint32, 0, 64),
+		filename:       filename,
+		qualnamePrefix: "",
+		isExec:         true,
+		curLine:        1,
+		curCol:         1,
+	}
+	if topScope.HasAnnotations {
+		if err := c.emitModuleAnnotatePrologue(); err != nil {
+			return nil, err
+		}
+	}
+	for _, stmtID := range topStmts {
+		if err := c.compileStmt(stmtID); err != nil {
+			return nil, err
+		}
+	}
+	c.emitReturnNone()
+	c.peephole()
+	varNames := make([]val.Value, len(c.scope.FastLocals))
+	for i, fl := range c.scope.FastLocals {
+		varNames[i] = val.InternString(fl)
+	}
+	co := &vm.CodeObject{
+		Name:           "<module>",
+		QualName:       "<module>",
+		FileName:       filename,
+		FirstLineNo:    1,
+		Code:           c.code,
+		Consts:         c.constPool.Slice(),
+		VarNames:       varNames,
+		NumLocals:      frameLocalCount(c.scope),
+		NumParams:      0,
+		MaxStackSize:   c.maxStackDepth + 16,
+		Doc:            val.NoneVal(),
+		ExceptionTable: c.exceptionTable,
+		LineSpans:      c.lineSpans,
+	}
+	return co, nil
+}
+
+func (c *Compiler) extractDocstringFromSlice(stmts []StmtID) (string, bool) {
+	if len(stmts) == 0 {
+		return "", false
+	}
+	firstStmt := c.arena.GetStmt(stmts[0])
+	if firstStmt == nil || firstStmt.Kind != StmtKindExpr || firstStmt.Expr1 == ExprNone {
+		return "", false
+	}
+	expr := c.arena.GetExpr(firstStmt.Expr1)
+	if expr == nil || expr.Kind != ExprKindString {
+		return "", false
+	}
+	rawStr := string(c.src[expr.Start:expr.End])
+	lowerPrefix := strings.ToLower(rawStr)
+	if strings.HasPrefix(lowerPrefix, "b") || strings.HasPrefix(lowerPrefix, "rb") || strings.HasPrefix(lowerPrefix, "br") {
+		return "", false
+	}
+	return parseStringLiteral(rawStr), true
 }
 
 func (c *Compiler) emit(inst uint32) int {
@@ -282,7 +445,20 @@ func (c *Compiler) compileStmt(stmtID StmtID) error {
 			if err := c.compileExpr(stmt.Expr2); err != nil {
 				return err
 			}
-			return c.compileStoreTarget(stmt.Expr1)
+			if err := c.compileStoreTarget(stmt.Expr1); err != nil {
+				return err
+			}
+		}
+		// PEP 649: the annotation itself is evaluated lazily by the
+		// synthesized __annotate__. Annotations nested in control flow only
+		// record that they were reached.
+		if entry := c.scope.AnnByStmt[stmtID]; entry != nil && entry.Cond {
+			if err := c.compileNameLoad(annCondAnnotations); err != nil {
+				return err
+			}
+			c.emitOp(vm.OP_LOAD_CONST, 0, c.constPool.Add(val.Int64Val(int64(entry.Idx))))
+			c.emitOp(vm.OP_SET_ADD, 0, 1)
+			c.emitOp(vm.OP_POP_TOP, 0, 0)
 		}
 		return nil
 
@@ -333,6 +509,9 @@ func (c *Compiler) compileStmt(stmtID StmtID) error {
 	case StmtKindBreak:
 		if c.activeLoop == nil {
 			return fmt.Errorf("SyntaxError: 'break' outside loop")
+		}
+		if c.activeLoop.IsFor {
+			c.emitOp(vm.OP_POP_TOP, 0, 0)
 		}
 		jumpIdx := c.emitOp(vm.OP_JUMP, 0, 0)
 		c.activeLoop.Breaks = append(c.activeLoop.Breaks, jumpIdx)
@@ -532,11 +711,58 @@ func (c *Compiler) compileStoreTarget(targetID ExprID) error {
 	return nil
 }
 
+// closureSlot is the cell index of name in the current scope.
+// Class scopes consult ClosureSlots first so a namespace binding and a
+// free-var passthrough of the same name stay distinct.
+func (c *Compiler) closureSlot(name string) (uint16, error) {
+	if c.scope == nil {
+		return 0, fmt.Errorf("compile error: missing closure cell for '%s'", name)
+	}
+	if c.scope.ClosureSlots != nil {
+		if off, ok := c.scope.ClosureSlots[name]; ok {
+			return uint16(off), nil
+		}
+	}
+	sym := c.scope.Symbols[name]
+	if sym != nil && (sym.Storage == StorageCell || sym.Storage == StorageFree) {
+		return uint16(sym.Offset), nil
+	}
+	return 0, fmt.Errorf("compile error: missing closure cell for '%s'", name)
+}
+
+func (c *Compiler) emitLoadClosure(name string) error {
+	off, err := c.closureSlot(name)
+	if err != nil {
+		return err
+	}
+	c.emitOp(vm.OP_LOAD_CLOSURE, 0, off)
+	return nil
+}
+
 func (c *Compiler) compileNameLoad(name string) error {
 	sym := c.scope.Symbols[name]
+	if c.scope.CanSeeClass && name != annClassDictName && name != annCondAnnotations &&
+		(sym == nil || sym.Storage == StorageGlobal || sym.Storage == StorageFree) {
+		// PEP 649: names in a class-level __annotate__ resolve through the
+		// class namespace first, then closure/globals.
+		cdSym := c.scope.Symbols[annClassDictName]
+		if cdSym != nil {
+			_, idx := c.constPool.InternName(name)
+			c.emitOp(vm.OP_LOAD_DEREF, 0, uint16(cdSym.Offset))
+			if sym != nil && sym.Storage == StorageFree {
+				if sym.Offset > 0xFF {
+					return fmt.Errorf("SyntaxError: too many closure variables in annotation scope")
+				}
+				c.emitOp(vm.OP_LOAD_FROM_DICT_OR_DEREF, uint8(sym.Offset), idx)
+			} else {
+				c.emitOp(vm.OP_LOAD_FROM_DICT_OR_GLOBALS, 0, idx)
+			}
+			return nil
+		}
+	}
 	if sym == nil {
 		_, idx := c.constPool.InternName(name)
-		if c.scope.Kind == ScopeClass {
+		if c.scope.Kind == ScopeClass || (c.scope.Kind == ScopeModule && !c.scope.ExplicitG[name]) {
 			c.emitOp(vm.OP_LOAD_NAME, 0, idx)
 		} else {
 			c.emitOp(vm.OP_LOAD_GLOBAL, 0, idx)
@@ -550,14 +776,14 @@ func (c *Compiler) compileNameLoad(name string) error {
 		c.emitOp(vm.OP_LOAD_DEREF, 0, uint16(sym.Offset))
 	case StorageGlobal:
 		_, idx := c.constPool.InternName(name)
-		if c.scope.Kind == ScopeClass {
+		if c.scope.Kind == ScopeClass || (c.scope.Kind == ScopeModule && !c.scope.ExplicitG[name]) {
 			c.emitOp(vm.OP_LOAD_NAME, 0, idx)
 		} else {
 			c.emitOp(vm.OP_LOAD_GLOBAL, 0, idx)
 		}
 	default:
 		_, idx := c.constPool.InternName(name)
-		if c.scope.Kind == ScopeClass {
+		if c.scope.Kind == ScopeClass || (c.scope.Kind == ScopeModule && !c.scope.ExplicitG[name]) {
 			c.emitOp(vm.OP_LOAD_NAME, 0, idx)
 		} else {
 			c.emitOp(vm.OP_LOAD_GLOBAL, 0, idx)
@@ -570,7 +796,7 @@ func (c *Compiler) compileNameStore(name string) error {
 	sym := c.scope.Symbols[name]
 	if sym == nil {
 		_, idx := c.constPool.InternName(name)
-		if c.scope.Kind == ScopeClass {
+		if c.scope.Kind == ScopeClass || (c.isExec && c.scope.Kind == ScopeModule && !c.scope.ExplicitG[name]) {
 			c.emitOp(vm.OP_STORE_NAME, 0, idx)
 		} else {
 			c.emitOp(vm.OP_STORE_GLOBAL, 0, idx)
@@ -584,14 +810,14 @@ func (c *Compiler) compileNameStore(name string) error {
 		c.emitOp(vm.OP_STORE_DEREF, 0, uint16(sym.Offset))
 	case StorageGlobal:
 		_, idx := c.constPool.InternName(name)
-		if c.scope.Kind == ScopeClass {
+		if c.scope.Kind == ScopeClass || (c.isExec && c.scope.Kind == ScopeModule && !c.scope.ExplicitG[name]) {
 			c.emitOp(vm.OP_STORE_NAME, 0, idx)
 		} else {
 			c.emitOp(vm.OP_STORE_GLOBAL, 0, idx)
 		}
 	default:
 		_, idx := c.constPool.InternName(name)
-		if c.scope.Kind == ScopeClass {
+		if c.scope.Kind == ScopeClass || (c.isExec && c.scope.Kind == ScopeModule && !c.scope.ExplicitG[name]) {
 			c.emitOp(vm.OP_STORE_NAME, 0, idx)
 		} else {
 			c.emitOp(vm.OP_STORE_GLOBAL, 0, idx)
@@ -679,9 +905,6 @@ func (c *Compiler) compileWhileStmt(stmt *ASTStmt) error {
 	endTarget := len(c.code)
 	c.patchJump(jumpExit, endTarget)
 
-	for _, b := range loopCtx.Breaks {
-		c.patchJump(b, endTarget)
-	}
 	for _, cont := range loopCtx.Continues {
 		c.patchJump(cont, loopStart)
 	}
@@ -694,6 +917,11 @@ func (c *Compiler) compileWhileStmt(stmt *ASTStmt) error {
 				return err
 			}
 		}
+	}
+
+	afterElseTarget := len(c.code)
+	for _, b := range loopCtx.Breaks {
+		c.patchJump(b, afterElseTarget)
 	}
 
 	return nil
@@ -709,29 +937,35 @@ func (c *Compiler) compileForStmt(stmt *ASTStmt) error {
 	loopCtx := &LoopContext{
 		LoopStart: loopStart,
 		Parent:    c.activeLoop,
+		IsFor:     true,
 	}
 	c.activeLoop = loopCtx
 
 	forIterJump := c.emitOp(vm.OP_FOR_ITER, 0, 0)
 
+	c.stackDepth++
+	if c.stackDepth > c.maxStackDepth {
+		c.maxStackDepth = c.stackDepth
+	}
+
 	if err := c.compileStoreTarget(stmt.Expr1); err != nil {
+		c.stackDepth--
 		return err
 	}
 
 	for _, sID := range c.arena.GetStmtSlice(stmt.Body) {
 		if err := c.compileStmt(sID); err != nil {
+			c.stackDepth--
 			return err
 		}
 	}
 
+	c.stackDepth--
 	c.emitOp(vm.OP_JUMP, 0, uint16(loopStart))
 
 	endTarget := len(c.code)
 	c.patchJump(forIterJump, endTarget)
 
-	for _, b := range loopCtx.Breaks {
-		c.patchJump(b, endTarget)
-	}
 	for _, cont := range loopCtx.Continues {
 		c.patchJump(cont, loopStart)
 	}
@@ -744,6 +978,11 @@ func (c *Compiler) compileForStmt(stmt *ASTStmt) error {
 				return err
 			}
 		}
+	}
+
+	afterElseTarget := len(c.code)
+	for _, b := range loopCtx.Breaks {
+		c.patchJump(b, afterElseTarget)
 	}
 
 	return nil
@@ -838,14 +1077,44 @@ func (c *Compiler) compileAsyncForStmt(stmt *ASTStmt) error {
 	return nil
 }
 
+// frameLocalCount is the frame size required by this scope. Cell parameters
+// reserve slots without being listed in FastLocals, and temps may sit past
+// both, so the slice length alone is not the slot count.
+func frameLocalCount(s *Scope) int {
+	if s == nil {
+		return 0
+	}
+	n := len(s.FastLocals)
+	if s.NumSlots > n {
+		n = s.NumSlots
+	}
+	return n
+}
+
 func (c *Compiler) allocTempLocal() int {
-	offset := len(c.scope.FastLocals)
+	// len(FastLocals) is not a free slot. Captured parameters are omitted
+	// from that slice but still consume frame slots, so indexing by length
+	// overwrites the last real local. Which name sorts last follows map
+	// iteration order and changes from compile to compile.
+	offset := 0
+	if c.scope.NumSlots > offset {
+		offset = c.scope.NumSlots
+	}
+	for _, name := range c.scope.FastLocals {
+		sym := c.scope.Symbols[name]
+		if sym != nil && sym.Storage == StorageFastLocal && sym.Offset >= offset {
+			offset = sym.Offset + 1
+		}
+	}
 	name := fmt.Sprintf(".temp_%d", offset)
 	c.scope.FastLocals = append(c.scope.FastLocals, name)
 	c.scope.Symbols[name] = &Symbol{
 		Name:    name,
 		Storage: StorageFastLocal,
 		Offset:  offset,
+	}
+	if offset >= c.scope.NumSlots {
+		c.scope.NumSlots = offset + 1
 	}
 	return offset
 }
@@ -969,11 +1238,17 @@ func (c *Compiler) compileTryStmt(stmt *ASTStmt) error {
 		c.addExceptionRange(tryStart, handlersEnd, finExcTarget, depth, false)
 
 		// Run finally body on exception, then re-raise
+		c.stackDepth++
+		if c.stackDepth > c.maxStackDepth {
+			c.maxStackDepth = c.stackDepth
+		}
 		for _, sID := range c.arena.StmtIDs[tryStmt.Finally.Start : tryStmt.Finally.Start+tryStmt.Finally.Count] {
 			if err := c.compileStmt(sID); err != nil {
+				c.stackDepth--
 				return err
 			}
 		}
+		c.stackDepth--
 		c.emitOp(vm.OP_RAISE, 1, 0)
 		c.patchJump(afterFin, len(c.code))
 	}
@@ -1283,7 +1558,7 @@ func (c *Compiler) compileFuncDef(stmt *ASTStmt) error {
 		freeValSlice[i] = val.InternString(fv)
 	}
 
-	numLocals := len(fnScope.FastLocals)
+	numLocals := frameLocalCount(fnScope)
 	if numLocals < len(paramNames) {
 		numLocals = len(paramNames)
 	}
@@ -1329,6 +1604,14 @@ func (c *Compiler) compileFuncDef(stmt *ASTStmt) error {
 		}
 	}
 
+	fnDoc := val.NoneVal()
+	if fnDef.Body.Count > 0 {
+		bodySlice := c.arena.StmtIDs[fnDef.Body.Start : fnDef.Body.Start+fnDef.Body.Count]
+		if docStr, hasDoc := c.extractDocstringFromSlice(bodySlice); hasDoc {
+			fnDoc = val.NewStringVal(docStr)
+		}
+	}
+
 	fnCodeObj := &vm.CodeObject{
 		Name:            fnDef.Name,
 		QualName:        qualName,
@@ -1348,6 +1631,7 @@ func (c *Compiler) compileFuncDef(stmt *ASTStmt) error {
 		IsGenerator:     fnScope.IsGenerator,
 		IsCoroutine:     fnScope.IsCoroutine,
 		Flags:           coFlags,
+		Doc:             fnDoc,
 		ExceptionTable:  subCompiler.exceptionTable,
 		LineSpans:       subCompiler.lineSpans,
 	}
@@ -1379,6 +1663,18 @@ func (c *Compiler) compileFuncDef(stmt *ASTStmt) error {
 			code:      make([]uint32, 0, 32),
 		}
 
+		// PEP 749: only VALUE (1) and VALUE_WITH_FAKE_GLOBALS (2) are
+		// supported; anything else raises NotImplementedError so that
+		// annotationlib can emulate STRING/FORWARDREF.
+		annCompiler.emitOp(vm.OP_LOAD_FAST, 0, 0)
+		annCompiler.emitOp(vm.OP_LOAD_CONST, 0, annCompiler.constPool.Add(val.Int64Val(2)))
+		annCompiler.emitOp(vm.OP_COMPARE_OP, vm.CMP_GT, 0)
+		annSkip := annCompiler.emitOp(vm.OP_JUMP_IF_FALSE, 0, 0)
+		_, niIdx := annCompiler.constPool.InternName("NotImplementedError")
+		annCompiler.emitOp(vm.OP_LOAD_GLOBAL, 0, niIdx)
+		annCompiler.emitOp(vm.OP_RAISE, 1, 0)
+		annCompiler.patchJump(annSkip, len(annCompiler.code))
+
 		if fnDef.TypeParams.Count > 0 {
 			tps := c.arena.TypeParams[fnDef.TypeParams.Start : fnDef.TypeParams.Start+uint32(fnDef.TypeParams.Count)]
 			for _, tp := range tps {
@@ -1404,6 +1700,7 @@ func (c *Compiler) compileFuncDef(stmt *ASTStmt) error {
 		pairCount := uint16(0)
 		for i, pName := range pNames {
 			if i < len(pTypes) && pTypes[i] != ExprNone {
+				pName = strings.TrimLeft(pName, "*")
 				_, pNameIdx := annCompiler.constPool.InternName(pName)
 				annCompiler.emitOp(vm.OP_LOAD_CONST, 0, pNameIdx)
 				if err := annCompiler.compileExpr(pTypes[i]); err != nil {
@@ -1429,7 +1726,7 @@ func (c *Compiler) compileFuncDef(stmt *ASTStmt) error {
 			Code:         annCompiler.code,
 			Consts:       annCompiler.constPool.Slice(),
 			NumParams:    1,
-			NumLocals:    len(annScope.FastLocals),
+			NumLocals:    frameLocalCount(annScope),
 			MaxStackSize: 16,
 		}
 		annVal := vm.NewCodeVal(annCodeObj)
@@ -1471,9 +1768,9 @@ func (c *Compiler) compileFuncDef(stmt *ASTStmt) error {
 	if len(fnScope.FreeVars) > 0 {
 		flags |= 0x01
 		for _, fv := range fnScope.FreeVars {
-			// Load cell from current scope
-			sym := c.scope.Symbols[fv]
-			c.emitOp(vm.OP_LOAD_CLOSURE, 0, uint16(sym.Offset))
+			if err := c.emitLoadClosure(fv); err != nil {
+				return err
+			}
 		}
 		c.emitOp(vm.OP_BUILD_TUPLE, 0, uint16(len(fnScope.FreeVars)))
 	}
@@ -1542,8 +1839,36 @@ func (c *Compiler) compileClassDef(stmt *ASTStmt) error {
 		}
 	}
 
-	for _, sID := range c.arena.StmtIDs[clsDef.Body.Start : clsDef.Body.Start+clsDef.Body.Count] {
+	if clsScope != nil && clsScope.HasAnnotations {
+		// PEP 649: capture the class namespace for the deferred __annotate__.
+		subCompiler.emitOp(vm.OP_LOAD_LOCALS, 0, 0)
+		if err := subCompiler.compileNameStore(annClassDictName); err != nil {
+			return err
+		}
+		if clsScope.AnnHasCond {
+			subCompiler.emitOp(vm.OP_BUILD_SET, 0, 0)
+			if err := subCompiler.compileNameStore(annCondAnnotations); err != nil {
+				return err
+			}
+		}
+	}
+
+	clsBodySlice := c.arena.StmtIDs[clsDef.Body.Start : clsDef.Body.Start+clsDef.Body.Count]
+	if docStr, hasDoc := c.extractDocstringFromSlice(clsBodySlice); hasDoc {
+		docIdx := subCompiler.constPool.Add(val.NewStringVal(docStr))
+		subCompiler.emitOp(vm.OP_LOAD_CONST, 0, docIdx)
+		if err := subCompiler.compileNameStore("__doc__"); err != nil {
+			return err
+		}
+	}
+
+	for _, sID := range clsBodySlice {
 		if err := subCompiler.compileStmt(sID); err != nil {
+			return err
+		}
+	}
+	if clsScope != nil && clsScope.HasAnnotations {
+		if err := subCompiler.emitAnnotateFunction(); err != nil {
 			return err
 		}
 	}
@@ -1551,27 +1876,46 @@ func (c *Compiler) compileClassDef(stmt *ASTStmt) error {
 	subCompiler.peephole()
 
 	clsCodeObj := &vm.CodeObject{
-		Name:        clsDef.Name,
-		QualName:    clsQualName,
-		FileName:    c.filename,
-		FirstLineNo: int(firstLine),
-		Code:        subCompiler.code,
-		Consts:      subCompiler.constPool.Slice(),
-		NumLocals:   0,
-		NumParams:   0,
-		LineSpans:   subCompiler.lineSpans,
+		Name:         clsDef.Name,
+		QualName:     clsQualName,
+		FileName:     c.filename,
+		FirstLineNo:  int(firstLine),
+		Code:         subCompiler.code,
+		Consts:       subCompiler.constPool.Slice(),
+		NumLocals:    frameLocalCount(subCompiler.scope),
+		NumParams:    0,
+		MaxStackSize: subCompiler.maxStackDepth + 16,
+		LineSpans:    subCompiler.lineSpans,
 	}
-	if len(clsScope.CellVars) > 0 {
+	if clsScope != nil && len(clsScope.CellVars) > 0 {
 		clsCodeObj.CellVars = make([]val.Value, len(clsScope.CellVars))
 		for i, cv := range clsScope.CellVars {
 			clsCodeObj.CellVars[i] = val.InternString(cv)
 		}
 	}
+	if clsScope != nil && len(clsScope.FreeVars) > 0 {
+		clsCodeObj.FreeVars = make([]val.Value, len(clsScope.FreeVars))
+		for i, fv := range clsScope.FreeVars {
+			clsCodeObj.FreeVars[i] = val.InternString(fv)
+		}
+	}
 
-	// Push class body code object
+	// Push class body. Free vars arrive as a function closure so the
+	// class body can pass enclosing cells into methods.
 	coVal := vm.NewCodeVal(clsCodeObj)
 	coIdx := c.constPool.Add(coVal)
-	c.emitOp(vm.OP_LOAD_CONST, 0, coIdx)
+	if clsScope != nil && len(clsScope.FreeVars) > 0 {
+		for _, fv := range clsScope.FreeVars {
+			if err := c.emitLoadClosure(fv); err != nil {
+				return err
+			}
+		}
+		c.emitOp(vm.OP_BUILD_TUPLE, 0, uint16(len(clsScope.FreeVars)))
+		c.emitOp(vm.OP_LOAD_CONST, 0, coIdx)
+		c.emitOp(vm.OP_MAKE_FUNCTION, 0x01, 0)
+	} else {
+		c.emitOp(vm.OP_LOAD_CONST, 0, coIdx)
+	}
 
 	// Push class name string
 	nameVal, nameIdx := c.constPool.InternName(clsDef.Name)
@@ -1671,15 +2015,29 @@ func (c *Compiler) compileExpr(exprID ExprID) error {
 		idx := c.constPool.Add(val.Float64Val(v))
 		c.emitOp(vm.OP_LOAD_CONST, 0, idx)
 
+	case ExprKindBigInt:
+		idx := c.constPool.Add(val.NewBigIntVal(c.arena.BigConsts[expr.Extra]))
+		c.emitOp(vm.OP_LOAD_CONST, 0, idx)
+
+	case ExprKindImag:
+		v := c.arena.FloatConsts[expr.Extra]
+		idx := c.constPool.Add(val.NewComplexVal(0, v))
+		c.emitOp(vm.OP_LOAD_CONST, 0, idx)
+
 	case ExprKindString:
 		rawStr := string(c.src[expr.Start:expr.End])
-		if strings.HasPrefix(rawStr, "b") || strings.HasPrefix(rawStr, "B") {
+		if expr.Op&1 == 0 && isBytesToken(rawStr) {
 			parsedBytes := parseBytesLiteral(rawStr)
 			idx := c.constPool.Add(val.NewBytesVal(parsedBytes))
 			c.emitOp(vm.OP_LOAD_CONST, 0, idx)
 			return nil
 		}
-		parsedStr := parseStringLiteral(rawStr)
+		var parsedStr string
+		if expr.Op&1 != 0 {
+			parsedStr = decodeFStringPart(rawStr, expr.Op&2 != 0)
+		} else {
+			parsedStr = parseStringLiteral(rawStr)
+		}
 		idx := c.constPool.Add(val.NewStringVal(parsedStr))
 		c.emitOp(vm.OP_LOAD_CONST, 0, idx)
 
@@ -1818,25 +2176,15 @@ func (c *Compiler) compileExpr(exprID ExprID) error {
 
 	case ExprKindList:
 		slice := c.arena.ExprSlices[expr.Extra]
-		for _, elem := range c.arena.GetExprSlice(slice) {
-			if err := c.compileExpr(elem); err != nil {
-				return err
-			}
-		}
-		c.emitOp(vm.OP_BUILD_LIST, 0, uint16(slice.Count))
+		return c.compileSequenceDisplay(c.arena.GetExprSlice(slice), vm.OP_BUILD_LIST)
 
 	case ExprKindTuple:
 		slice := c.arena.ExprSlices[expr.Extra]
-		for _, elem := range c.arena.GetExprSlice(slice) {
-			if err := c.compileExpr(elem); err != nil {
-				return err
-			}
-		}
-		c.emitOp(vm.OP_BUILD_TUPLE, 0, uint16(slice.Count))
+		return c.compileSequenceDisplay(c.arena.GetExprSlice(slice), vm.OP_BUILD_TUPLE)
 
 	case ExprKindDict:
 		start := expr.Extra
-		count := uint32(expr.Op)
+		count := uint32(expr.Right)
 		hasUnpack := false
 		for i := uint32(0); i < count; i++ {
 			if c.arena.DictPairs[start+i].Key == ExprNone {
@@ -1943,6 +2291,16 @@ func (c *Compiler) compileExpr(exprID ExprID) error {
 		}
 		c.emitOp(vm.OP_BUILD_STRING, 0, uint16(len(pieces)))
 
+	case ExprKindTemplateStr:
+		fs := c.arena.GetFString(expr.Extra)
+		if fs == nil {
+			idx := c.constPool.Add(val.NewStringVal(""))
+			c.emitOp(vm.OP_LOAD_CONST, 0, idx)
+			c.emitOp(vm.OP_BUILD_TEMPLATE, 0, 0)
+			return nil
+		}
+		return c.compileTemplate(fs)
+
 	case ExprKindFormattedValue:
 		fv := c.arena.GetFormattedValue(expr.Extra)
 		if fv == nil {
@@ -1983,12 +2341,7 @@ func (c *Compiler) compileExpr(exprID ExprID) error {
 
 	case ExprKindSet:
 		slice := c.arena.ExprSlices[expr.Extra]
-		for _, elem := range c.arena.GetExprSlice(slice) {
-			if err := c.compileExpr(elem); err != nil {
-				return err
-			}
-		}
-		c.emitOp(vm.OP_BUILD_SET, 0, uint16(slice.Count))
+		return c.compileSequenceDisplay(c.arena.GetExprSlice(slice), vm.OP_BUILD_SET)
 
 	case ExprKindSetComp:
 		return c.compileSetComp(expr)
@@ -2014,6 +2367,50 @@ func (c *Compiler) compileExpr(exprID ExprID) error {
 		c.emitOp(vm.OP_LOAD_GLOBAL, 0, idx)
 	}
 
+	return nil
+}
+
+// compileSequenceDisplay compiles a list, tuple, or set display.
+// Starred elements are unpacked (PEP 448). Displays without stars keep
+// the direct BUILD_* opcodes.
+func (c *Compiler) compileSequenceDisplay(elemIDs []ExprID, finish vm.Opcode) error {
+	hasStar := false
+	for _, id := range elemIDs {
+		if e := c.arena.GetExpr(id); e != nil && e.Kind == ExprKindStarred {
+			hasStar = true
+			break
+		}
+	}
+	if !hasStar {
+		for _, id := range elemIDs {
+			if err := c.compileExpr(id); err != nil {
+				return err
+			}
+		}
+		c.emitOp(finish, 0, uint16(len(elemIDs)))
+		return nil
+	}
+	c.emitOp(vm.OP_BUILD_LIST, 0, 0)
+	for _, id := range elemIDs {
+		e := c.arena.GetExpr(id)
+		if e != nil && e.Kind == ExprKindStarred {
+			if err := c.compileExpr(e.Left); err != nil {
+				return err
+			}
+			c.emitOp(vm.OP_LIST_EXTEND, 0, 1)
+			continue
+		}
+		if err := c.compileExpr(id); err != nil {
+			return err
+		}
+		c.emitOp(vm.OP_LIST_APPEND, 0, 1)
+	}
+	switch finish {
+	case vm.OP_BUILD_TUPLE:
+		c.emitOp(vm.OP_LIST_TO_TUPLE, 0, 0)
+	case vm.OP_BUILD_SET:
+		c.emitOp(vm.OP_LIST_TO_SET, 0, 0)
+	}
 	return nil
 }
 
@@ -2167,105 +2564,173 @@ func (c *Compiler) compileCall(expr *ASTExpr) error {
 	return nil
 }
 
-func (c *Compiler) compileListComp(expr *ASTExpr) error {
-	comp := &c.arena.Comps[expr.Extra]
+// compTargetNames lists the identifiers a comprehension's clauses bind.
+func (c *Compiler) compTargetNames(idx uint32) []string {
+	var names []string
+	seen := map[string]bool{}
+	var walk func(id ExprID)
+	walk = func(id ExprID) {
+		e := c.arena.GetExpr(id)
+		if e == nil {
+			return
+		}
+		switch e.Kind {
+		case ExprKindName:
+			n := string(c.src[e.Start:e.End])
+			if !seen[n] {
+				seen[n] = true
+				names = append(names, n)
+			}
+		case ExprKindStarred:
+			walk(e.Left)
+		case ExprKindTuple, ExprKindList:
+			slice := c.arena.ExprSlices[e.Extra]
+			for _, sub := range c.arena.ExprIDs[slice.Start : slice.Start+slice.Count] {
+				walk(sub)
+			}
+		}
+	}
+	for {
+		comp := &c.arena.Comps[idx]
+		walk(comp.Target)
+		if comp.Next == 0 {
+			break
+		}
+		idx = comp.Next - 1
+	}
+	return names
+}
 
+// compSaveLocals copies the enclosing function's value of every local the
+// comprehension is about to rebind into its hidden slot. The copy is raw, so
+// an unbound local stays unbound. It returns the matching restore pairs.
+func (c *Compiler) compSaveLocals(idx uint32) (restore func()) {
+	if c.scope == nil || c.scope.Kind != ScopeFunction {
+		return func() {}
+	}
+	type pair struct{ from, to uint16 }
+	var pairs []pair
+	for _, name := range c.compTargetNames(idx) {
+		sym := c.scope.Symbols[name]
+		hidden := c.scope.Symbols[compSaveName(idx, name)]
+		if sym == nil || hidden == nil || sym.Storage != StorageFastLocal || hidden.Storage != StorageFastLocal {
+			continue
+		}
+		c.emitOp(vm.OP_LOAD_FAST, 0, uint16(sym.Offset))
+		c.emitOp(vm.OP_STORE_FAST, 0, uint16(hidden.Offset))
+		pairs = append(pairs, pair{uint16(hidden.Offset), uint16(sym.Offset)})
+	}
+	return func() {
+		for _, p := range pairs {
+			c.emitOp(vm.OP_LOAD_FAST, 0, p.from)
+			c.emitOp(vm.OP_STORE_FAST, 0, p.to)
+		}
+	}
+}
+
+func (c *Compiler) compileListComp(expr *ASTExpr) error {
+	restore := c.compSaveLocals(expr.Extra)
+	defer restore()
 	// 1. Build initial empty list
 	c.emitOp(vm.OP_BUILD_LIST, 0, 0)
 
-	// 2. Evaluate iter
-	if err := c.compileExpr(comp.Iter); err != nil {
-		return err
-	}
-	c.emitOp(vm.OP_GET_ITER, 0, 0)
-
-	// 3. Loop header
-	loopStart := len(c.code)
-	jumpEnd := c.emitOp(vm.OP_FOR_ITER, 0, 0)
-
-	// 4. Store target
-	if err := c.compileStoreTarget(comp.Target); err != nil {
-		return err
-	}
-
-	// 5. If conditions
-	var ifSkips []int
-	for _, ifCond := range c.arena.GetExprSlice(comp.IfConds) {
-		if err := c.compileExpr(ifCond); err != nil {
+	var compileClause func(currIdx uint32, depth int) error
+	compileClause = func(currIdx uint32, depth int) error {
+		curr := &c.arena.Comps[currIdx]
+		if err := c.compileExpr(curr.Iter); err != nil {
 			return err
 		}
-		ifSkips = append(ifSkips, c.emitOp(vm.OP_JUMP_IF_FALSE, 0, 0))
+		c.emitOp(vm.OP_GET_ITER, 0, 0)
+
+		loopStart := len(c.code)
+		jumpEnd := c.emitOp(vm.OP_FOR_ITER, 0, 0)
+
+		if err := c.compileStoreTarget(curr.Target); err != nil {
+			return err
+		}
+
+		var ifSkips []int
+		for _, ifCond := range c.arena.GetExprSlice(curr.IfConds) {
+			if err := c.compileExpr(ifCond); err != nil {
+				return err
+			}
+			ifSkips = append(ifSkips, c.emitOp(vm.OP_JUMP_IF_FALSE, 0, 0))
+		}
+
+		if curr.Next != 0 {
+			if err := compileClause(curr.Next-1, depth+1); err != nil {
+				return err
+			}
+		} else {
+			if err := c.compileExpr(expr.Left); err != nil {
+				return err
+			}
+			c.emitOp(vm.OP_LIST_APPEND, 0, uint16(depth+1))
+		}
+
+		c.emitOp(vm.OP_JUMP, 0, uint16(loopStart))
+		for _, skip := range ifSkips {
+			c.patchJump(skip, loopStart)
+		}
+		c.patchJump(jumpEnd, len(c.code))
+		return nil
 	}
 
-	// 6. Evaluate element & append to list
-	// Stack: [list, iter, elt]
-	if err := c.compileExpr(expr.Left); err != nil {
-		return err
-	}
-	c.emitOp(vm.OP_LIST_APPEND, 0, 2)
-
-	// 7. Loop back
-	c.emitOp(vm.OP_JUMP, 0, uint16(loopStart))
-
-	// 8. Patch jumps
-	for _, skip := range ifSkips {
-		c.patchJump(skip, loopStart) // continue to next iteration
-	}
-	c.patchJump(jumpEnd, len(c.code))
-
-	return nil
+	return compileClause(expr.Extra, 1)
 }
 
 func (c *Compiler) compileDictComp(expr *ASTExpr) error {
-	comp := &c.arena.Comps[expr.Extra]
-
+	restore := c.compSaveLocals(expr.Extra)
+	defer restore()
 	// 1. Build initial empty dict
 	c.emitOp(vm.OP_BUILD_MAP, 0, 0)
 
-	// 2. Evaluate iter
-	if err := c.compileExpr(comp.Iter); err != nil {
-		return err
-	}
-	c.emitOp(vm.OP_GET_ITER, 0, 0)
-
-	// 3. Loop header
-	loopStart := len(c.code)
-	jumpEnd := c.emitOp(vm.OP_FOR_ITER, 0, 0)
-
-	// 4. Store target
-	if err := c.compileStoreTarget(comp.Target); err != nil {
-		return err
-	}
-
-	// 5. If conditions
-	var ifSkips []int
-	for _, ifCond := range c.arena.GetExprSlice(comp.IfConds) {
-		if err := c.compileExpr(ifCond); err != nil {
+	var compileClause func(currIdx uint32, depth int) error
+	compileClause = func(currIdx uint32, depth int) error {
+		curr := &c.arena.Comps[currIdx]
+		if err := c.compileExpr(curr.Iter); err != nil {
 			return err
 		}
-		ifSkips = append(ifSkips, c.emitOp(vm.OP_JUMP_IF_FALSE, 0, 0))
+		c.emitOp(vm.OP_GET_ITER, 0, 0)
+
+		loopStart := len(c.code)
+		jumpEnd := c.emitOp(vm.OP_FOR_ITER, 0, 0)
+
+		if err := c.compileStoreTarget(curr.Target); err != nil {
+			return err
+		}
+
+		var ifSkips []int
+		for _, ifCond := range c.arena.GetExprSlice(curr.IfConds) {
+			if err := c.compileExpr(ifCond); err != nil {
+				return err
+			}
+			ifSkips = append(ifSkips, c.emitOp(vm.OP_JUMP_IF_FALSE, 0, 0))
+		}
+
+		if curr.Next != 0 {
+			if err := compileClause(curr.Next-1, depth+1); err != nil {
+				return err
+			}
+		} else {
+			if err := c.compileExpr(expr.Left); err != nil {
+				return err
+			}
+			if err := c.compileExpr(expr.Right); err != nil {
+				return err
+			}
+			c.emitOp(vm.OP_MAP_ADD, 0, uint16(depth+2))
+		}
+
+		c.emitOp(vm.OP_JUMP, 0, uint16(loopStart))
+		for _, skip := range ifSkips {
+			c.patchJump(skip, loopStart)
+		}
+		c.patchJump(jumpEnd, len(c.code))
+		return nil
 	}
 
-	// 6. Evaluate key and value & add to dict
-	// Stack: [dict, iter, key, val]
-	if err := c.compileExpr(expr.Left); err != nil {
-		return err
-	}
-	if err := c.compileExpr(expr.Right); err != nil {
-		return err
-	}
-	c.emitOp(vm.OP_MAP_ADD, 0, 3)
-
-	// 7. Loop back
-	c.emitOp(vm.OP_JUMP, 0, uint16(loopStart))
-
-	// 8. Patch jumps
-	for _, skip := range ifSkips {
-		c.patchJump(skip, loopStart)
-	}
-	c.patchJump(jumpEnd, len(c.code))
-
-	return nil
+	return compileClause(expr.Extra, 1)
 }
 
 // peephole optimizes bytecode by eliminating redundant jumps.
@@ -2287,101 +2752,75 @@ func (c *Compiler) peephole() {
 	}
 }
 
-func parseStringLiteral(s string) string {
-	// Strip quotes
-	if strings.HasPrefix(s, "'''") || strings.HasPrefix(s, `"""`) {
-		if len(s) >= 6 {
-			s = s[3 : len(s)-3]
-		}
-	} else if (strings.HasPrefix(s, "'") && strings.HasSuffix(s, "'")) ||
-		(strings.HasPrefix(s, `"`) && strings.HasSuffix(s, `"`)) {
-		if len(s) >= 2 {
-			s = s[1 : len(s)-1]
-		}
+func decodeTemplateLiteral(s string, raw bool) string {
+	if s == "{{" || s == "}}" {
+		return s[:1]
 	}
-
-	// Basic escape processing
-	var b strings.Builder
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\\' && i+1 < len(s) {
-			i++
-			switch s[i] {
-			case 'n':
-				b.WriteByte('\n')
-			case 't':
-				b.WriteByte('\t')
-			case 'r':
-				b.WriteByte('\r')
-			case '\\':
-				b.WriteByte('\\')
-			case '\'':
-				b.WriteByte('\'')
-			case '"':
-				b.WriteByte('"')
-			default:
-				b.WriteByte('\\')
-				b.WriteByte(s[i])
-			}
-		} else {
-			b.WriteByte(s[i])
-		}
-	}
-	return b.String()
+	return decodeFStringPart(s, raw)
 }
 
-func parseBytesLiteral(s string) []byte {
-	if strings.HasPrefix(s, "b") || strings.HasPrefix(s, "B") {
-		s = s[1:]
-	}
-	// Strip quotes
-	if strings.HasPrefix(s, "'''") || strings.HasPrefix(s, `"""`) {
-		if len(s) >= 6 {
-			s = s[3 : len(s)-3]
-		}
-	} else if (strings.HasPrefix(s, "'") && strings.HasSuffix(s, "'")) ||
-		(strings.HasPrefix(s, `"`) && strings.HasSuffix(s, `"`)) {
-		if len(s) >= 2 {
-			s = s[1 : len(s)-1]
+func (c *Compiler) compileTemplate(fs *ASTFString) error {
+	pieces := c.arena.GetExprSlice(fs.Pieces)
+	n := 0
+	for _, id := range pieces {
+		if e := c.arena.GetExpr(id); e != nil && e.Kind == ExprKindFormattedValue {
+			n++
 		}
 	}
-
-	var res []byte
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\\' && i+1 < len(s) {
-			i++
-			switch s[i] {
-			case 'n':
-				res = append(res, '\n')
-			case 't':
-				res = append(res, '\t')
-			case 'r':
-				res = append(res, '\r')
-			case '\\':
-				res = append(res, '\\')
-			case '\'':
-				res = append(res, '\'')
-			case '"':
-				res = append(res, '"')
-			case 'x':
-				if i+2 < len(s) {
-					hexStr := s[i+1 : i+3]
-					var b byte
-					if _, err := fmt.Sscanf(hexStr, "%x", &b); err == nil {
-						res = append(res, b)
-						i += 2
-						continue
-					}
-				}
-				res = append(res, '\\', s[i])
-			default:
-				res = append(res, '\\', s[i])
+	i := 0
+	emitRun := func() {
+		var b strings.Builder
+		for i < len(pieces) {
+			e := c.arena.GetExpr(pieces[i])
+			if e == nil || e.Kind != ExprKindString {
+				break
 			}
-		} else {
-			res = append(res, s[i])
+			b.WriteString(decodeTemplateLiteral(string(c.src[e.Start:e.End]), fs.Raw))
+			i++
 		}
+		idx := c.constPool.Add(val.NewStringVal(b.String()))
+		c.emitOp(vm.OP_LOAD_CONST, 0, idx)
 	}
-	return res
+	emitRun()
+	for i < len(pieces) {
+		e := c.arena.GetExpr(pieces[i])
+		if e == nil || e.Kind != ExprKindFormattedValue {
+			return fmt.Errorf("compiler: malformed template string")
+		}
+		i++
+		fv := c.arena.GetFormattedValue(e.Extra)
+		if fv == nil {
+			return fmt.Errorf("compiler: missing template interpolation")
+		}
+		if err := c.compileExpr(fv.Value); err != nil {
+			return err
+		}
+		exprIdx := c.constPool.Add(val.NewStringVal(fv.Expression))
+		c.emitOp(vm.OP_LOAD_CONST, 0, exprIdx)
+		if fv.Conversion == 0 {
+			noneIdx := c.constPool.Add(val.NoneVal())
+			c.emitOp(vm.OP_LOAD_CONST, 0, noneIdx)
+		} else {
+			convIdx := c.constPool.Add(val.NewStringVal(string([]byte{fv.Conversion})))
+			c.emitOp(vm.OP_LOAD_CONST, 0, convIdx)
+		}
+		spec := ""
+		if fv.FormatSpec != ExprNone {
+			if se := c.arena.GetExpr(fv.FormatSpec); se != nil {
+				spec = decodeTemplateLiteral(string(c.src[se.Start:se.End]), fs.Raw)
+			}
+		}
+		specIdx := c.constPool.Add(val.NewStringVal(spec))
+		c.emitOp(vm.OP_LOAD_CONST, 0, specIdx)
+		emitRun()
+	}
+	c.emitOp(vm.OP_BUILD_TEMPLATE, 0, uint16(n))
+	return nil
 }
+
+func parseStringLiteral(s string) string { return decodeStringToken(s) }
+
+func parseBytesLiteral(s string) []byte { return decodeBytesToken(s) }
 
 func (c *Compiler) compileMatchStmt(stmt *ASTStmt) error {
 	matchStmt := c.arena.GetMatchStmt(stmt.Extra)
@@ -2767,7 +3206,7 @@ func (c *Compiler) compileDeleteTarget(targetID ExprID) error {
 		sym := c.scope.Symbols[name]
 		if sym != nil && sym.Storage == StorageFastLocal {
 			c.emitOp(vm.OP_DELETE_FAST, 0, uint16(sym.Offset))
-		} else if c.scope.Kind == ScopeClass {
+		} else if c.scope.Kind == ScopeClass || (c.scope.Kind == ScopeModule && !c.scope.ExplicitG[name]) {
 			_, idx := c.constPool.InternName(name)
 			c.emitOp(vm.OP_DELETE_NAME, 0, idx)
 		} else {
@@ -2801,52 +3240,54 @@ func (c *Compiler) compileDeleteTarget(targetID ExprID) error {
 }
 
 func (c *Compiler) compileSetComp(expr *ASTExpr) error {
-	comp := &c.arena.Comps[expr.Extra]
-
+	restore := c.compSaveLocals(expr.Extra)
+	defer restore()
 	// 1. Build initial empty set
 	c.emitOp(vm.OP_BUILD_SET, 0, 0)
 
-	// 2. Evaluate iter
-	if err := c.compileExpr(comp.Iter); err != nil {
-		return err
-	}
-	c.emitOp(vm.OP_GET_ITER, 0, 0)
-
-	// 3. Loop header
-	loopStart := len(c.code)
-	jumpEnd := c.emitOp(vm.OP_FOR_ITER, 0, 0)
-
-	// 4. Store target
-	if err := c.compileStoreTarget(comp.Target); err != nil {
-		return err
-	}
-
-	// 5. If conditions
-	var ifSkips []int
-	for _, ifCond := range c.arena.GetExprSlice(comp.IfConds) {
-		if err := c.compileExpr(ifCond); err != nil {
+	var compileClause func(currIdx uint32, depth int) error
+	compileClause = func(currIdx uint32, depth int) error {
+		curr := &c.arena.Comps[currIdx]
+		if err := c.compileExpr(curr.Iter); err != nil {
 			return err
 		}
-		ifSkips = append(ifSkips, c.emitOp(vm.OP_JUMP_IF_FALSE, 0, 0))
+		c.emitOp(vm.OP_GET_ITER, 0, 0)
+
+		loopStart := len(c.code)
+		jumpEnd := c.emitOp(vm.OP_FOR_ITER, 0, 0)
+
+		if err := c.compileStoreTarget(curr.Target); err != nil {
+			return err
+		}
+
+		var ifSkips []int
+		for _, ifCond := range c.arena.GetExprSlice(curr.IfConds) {
+			if err := c.compileExpr(ifCond); err != nil {
+				return err
+			}
+			ifSkips = append(ifSkips, c.emitOp(vm.OP_JUMP_IF_FALSE, 0, 0))
+		}
+
+		if curr.Next != 0 {
+			if err := compileClause(curr.Next-1, depth+1); err != nil {
+				return err
+			}
+		} else {
+			if err := c.compileExpr(expr.Left); err != nil {
+				return err
+			}
+			c.emitOp(vm.OP_SET_ADD, 0, uint16(depth+1))
+		}
+
+		c.emitOp(vm.OP_JUMP, 0, uint16(loopStart))
+		for _, skip := range ifSkips {
+			c.patchJump(skip, loopStart)
+		}
+		c.patchJump(jumpEnd, len(c.code))
+		return nil
 	}
 
-	// 6. Evaluate element & add to set
-	// Stack: [set, iter, elt]
-	if err := c.compileExpr(expr.Left); err != nil {
-		return err
-	}
-	c.emitOp(vm.OP_SET_ADD, 0, 2)
-
-	// 7. Loop back
-	c.emitOp(vm.OP_JUMP, 0, uint16(loopStart))
-
-	// 8. Patch jumps
-	for _, skip := range ifSkips {
-		c.patchJump(skip, loopStart)
-	}
-	c.patchJump(jumpEnd, len(c.code))
-
-	return nil
+	return compileClause(expr.Extra, 1)
 }
 
 func (c *Compiler) compileGenExp(expr *ASTExpr) error {
@@ -2874,39 +3315,71 @@ func (c *Compiler) compileGenExp(expr *ASTExpr) error {
 
 	// Load parameter 0 (.0)
 	subCompiler.emitOp(vm.OP_LOAD_FAST, 0, 0)
-	loopStart := len(subCompiler.code)
-	jumpEnd := subCompiler.emitOp(vm.OP_FOR_ITER, 0, 0)
 
-	if err := subCompiler.compileStoreTarget(comp.Target); err != nil {
-		return err
-	}
+	var compileClause func(currIdx uint32) error
+	compileClause = func(currIdx uint32) error {
+		curr := &c.arena.Comps[currIdx]
+		loopStart := len(subCompiler.code)
+		jumpEnd := subCompiler.emitOp(vm.OP_FOR_ITER, 0, 0)
 
-	var ifSkips []int
-	for _, ifCond := range c.arena.GetExprSlice(comp.IfConds) {
-		if err := subCompiler.compileExpr(ifCond); err != nil {
+		if err := subCompiler.compileStoreTarget(curr.Target); err != nil {
 			return err
 		}
-		ifSkips = append(ifSkips, subCompiler.emitOp(vm.OP_JUMP_IF_FALSE, 0, 0))
+
+		var ifSkips []int
+		for _, ifCond := range c.arena.GetExprSlice(curr.IfConds) {
+			if err := subCompiler.compileExpr(ifCond); err != nil {
+				return err
+			}
+			ifSkips = append(ifSkips, subCompiler.emitOp(vm.OP_JUMP_IF_FALSE, 0, 0))
+		}
+
+		if curr.Next != 0 {
+			nextIdx := curr.Next - 1
+			nextComp := &c.arena.Comps[nextIdx]
+			if err := subCompiler.compileExpr(nextComp.Iter); err != nil {
+				return err
+			}
+			subCompiler.emitOp(vm.OP_GET_ITER, 0, 0)
+			if err := compileClause(nextIdx); err != nil {
+				return err
+			}
+		} else {
+			if err := subCompiler.compileExpr(expr.Left); err != nil {
+				return err
+			}
+			subCompiler.emitOp(vm.OP_YIELD_VALUE, 0, 0)
+			subCompiler.emitOp(vm.OP_POP_TOP, 0, 0)
+		}
+
+		subCompiler.emitOp(vm.OP_JUMP, 0, uint16(loopStart))
+		for _, skip := range ifSkips {
+			subCompiler.patchJump(skip, loopStart)
+		}
+		subCompiler.patchJump(jumpEnd, len(subCompiler.code))
+		return nil
 	}
 
-	if err := subCompiler.compileExpr(expr.Left); err != nil {
+	if err := compileClause(expr.Extra); err != nil {
 		return err
 	}
-	subCompiler.emitOp(vm.OP_YIELD_VALUE, 0, 0)
-	subCompiler.emitOp(vm.OP_POP_TOP, 0, 0)
-	subCompiler.emitOp(vm.OP_JUMP, 0, uint16(loopStart))
-
-	for _, skip := range ifSkips {
-		subCompiler.patchJump(skip, loopStart)
-	}
-	subCompiler.patchJump(jumpEnd, len(subCompiler.code))
 	subCompiler.emitReturnNone()
 	subCompiler.peephole()
 
 	paramNames := []val.Value{val.InternString(".0")}
-	numLocals := len(genScope.FastLocals)
+	numLocals := frameLocalCount(genScope)
 	if numLocals < 1 {
 		numLocals = 1
+	}
+
+	cellValSlice := make([]val.Value, len(genScope.CellVars))
+	for i, cv := range genScope.CellVars {
+		cellValSlice[i] = val.InternString(cv)
+	}
+
+	freeValSlice := make([]val.Value, len(genScope.FreeVars))
+	for i, fv := range genScope.FreeVars {
+		freeValSlice[i] = val.InternString(fv)
 	}
 
 	genCodeObj := &vm.CodeObject{
@@ -2914,6 +3387,8 @@ func (c *Compiler) compileGenExp(expr *ASTExpr) error {
 		Code:         subCompiler.code,
 		Consts:       subCompiler.constPool.Slice(),
 		ParamNames:   paramNames,
+		CellVars:     cellValSlice,
+		FreeVars:     freeValSlice,
 		NumLocals:    numLocals,
 		NumParams:    1,
 		MaxStackSize: numLocals + subCompiler.maxStackDepth + 16,
@@ -2921,9 +3396,20 @@ func (c *Compiler) compileGenExp(expr *ASTExpr) error {
 		Flags:        vm.FlagGenerator,
 	}
 
+	var flags uint8
+	if len(genScope.FreeVars) > 0 {
+		flags |= 0x01
+		for _, fv := range genScope.FreeVars {
+			if err := c.emitLoadClosure(fv); err != nil {
+				return err
+			}
+		}
+		c.emitOp(vm.OP_BUILD_TUPLE, 0, uint16(len(genScope.FreeVars)))
+	}
+
 	codeIdx := c.constPool.Add(vm.NewCodeVal(genCodeObj))
 	c.emitOp(vm.OP_LOAD_CONST, 0, codeIdx)
-	c.emitOp(vm.OP_MAKE_FUNCTION, 0, 0)
+	c.emitOp(vm.OP_MAKE_FUNCTION, flags, 0)
 	c.emitOp(vm.OP_LOAD_FAST, 0, uint16(iterSlot))
 	c.emitOp(vm.OP_CALL, 1, vm.CallFromStack)
 
@@ -2987,7 +3473,7 @@ func (c *Compiler) compileLambda(expr *ASTExpr) error {
 		freeValSlice[i] = val.InternString(fv)
 	}
 
-	numLocals := len(lambdaScope.FastLocals)
+	numLocals := frameLocalCount(lambdaScope)
 	if numLocals < len(paramNames) {
 		numLocals = len(paramNames)
 	}
@@ -3046,12 +3532,8 @@ func (c *Compiler) compileLambda(expr *ASTExpr) error {
 	if len(lambdaScope.FreeVars) > 0 {
 		flags |= 0x01
 		for _, fv := range lambdaScope.FreeVars {
-			sym := c.scope.Symbols[fv]
-			if sym != nil && (sym.Storage == StorageCell || sym.Storage == StorageFree) {
-				c.emitOp(vm.OP_LOAD_CLOSURE, 0, uint16(sym.Offset))
-			} else {
-				_, idx := c.constPool.InternName(fv)
-				c.emitOp(vm.OP_LOAD_GLOBAL, 0, idx)
+			if err := c.emitLoadClosure(fv); err != nil {
+				return err
 			}
 		}
 		c.emitOp(vm.OP_BUILD_TUPLE, 0, uint16(len(lambdaScope.FreeVars)))
@@ -3063,4 +3545,144 @@ func (c *Compiler) compileLambda(expr *ASTExpr) error {
 	c.emitOp(vm.OP_MAKE_FUNCTION, flags, 0)
 
 	return nil
+}
+
+// emitModuleAnnotatePrologue installs the module's deferred __annotate__ (and
+// the __conditional_annotations__ set) before any other module code runs.
+func (c *Compiler) emitModuleAnnotatePrologue() error {
+	if err := c.emitAnnotateFunction(); err != nil {
+		return err
+	}
+	if c.scope.AnnHasCond {
+		c.emitOp(vm.OP_BUILD_SET, 0, 0)
+		return c.compileNameStore(annCondAnnotations)
+	}
+	return nil
+}
+
+// emitAnnotateFunction synthesizes `__annotate__(format)` for the module or
+// class body being compiled (c.scope) and stores it under __annotate__ (module)
+// or __annotate_func__ (class). PEP 649/749: only VALUE (1) and
+// VALUE_WITH_FAKE_GLOBALS (2) are supported natively; larger formats raise
+// NotImplementedError so annotationlib can emulate STRING and FORWARDREF.
+func (c *Compiler) emitAnnotateFunction() error {
+	owner := c.scope
+	as := owner.AnnScope
+	if as == nil || len(owner.AnnEntries) == 0 {
+		return nil
+	}
+	isClass := owner.Kind == ScopeClass
+
+	qualPrefix := c.qualnamePrefix
+	sub := &Compiler{
+		src:            c.src,
+		arena:          c.arena,
+		scope:          as,
+		constPool:      NewConstPool(),
+		code:           make([]uint32, 0, 32),
+		filename:       c.filename,
+		qualnamePrefix: qualPrefix + "__annotate__.<locals>.",
+		lineStarts:     c.lineStarts,
+		curLine:        c.curLine,
+		curCol:         1,
+	}
+
+	sub.emitOp(vm.OP_LOAD_FAST, 0, 0)
+	sub.emitOp(vm.OP_LOAD_CONST, 0, sub.constPool.Add(val.Int64Val(2)))
+	sub.emitOp(vm.OP_COMPARE_OP, vm.CMP_GT, 0)
+	skip := sub.emitOp(vm.OP_JUMP_IF_FALSE, 0, 0)
+	_, niIdx := sub.constPool.InternName("NotImplementedError")
+	sub.emitOp(vm.OP_LOAD_GLOBAL, 0, niIdx)
+	sub.emitOp(vm.OP_RAISE, 1, 0)
+	sub.patchJump(skip, len(sub.code))
+
+	sub.emitOp(vm.OP_BUILD_MAP, 0, 0)
+	for _, e := range owner.AnnEntries {
+		sub.setSourcePos(c.arena.GetExpr(e.Expr).Start)
+		skipEntry := -1
+		if e.Cond {
+			sub.emitOp(vm.OP_LOAD_CONST, 0, sub.constPool.Add(val.Int64Val(int64(e.Idx))))
+			if err := sub.compileNameLoad(annCondAnnotations); err != nil {
+				return err
+			}
+			sub.emitOp(vm.OP_COMPARE_OP, vm.CMP_IN, 0)
+			skipEntry = sub.emitOp(vm.OP_JUMP_IF_FALSE, 0, 0)
+		}
+		_, keyIdx := sub.constPool.InternName(e.Name)
+		sub.emitOp(vm.OP_LOAD_CONST, 0, keyIdx)
+		if err := sub.compileExpr(e.Expr); err != nil {
+			return err
+		}
+		sub.emitOp(vm.OP_MAP_ADD, 0, 2)
+		if skipEntry >= 0 {
+			sub.patchJump(skipEntry, len(sub.code))
+		}
+	}
+	sub.emitOp(vm.OP_RETURN, 0, 0)
+	sub.peephole()
+
+	formatName := val.InternString("format")
+	cellVals := make([]val.Value, len(as.CellVars))
+	for i, cv := range as.CellVars {
+		cellVals[i] = val.InternString(cv)
+	}
+	freeVals := make([]val.Value, len(as.FreeVars))
+	for i, fv := range as.FreeVars {
+		freeVals[i] = val.InternString(fv)
+	}
+	numLocals := frameLocalCount(as)
+	if numLocals < 1 {
+		numLocals = 1
+	}
+	flags := uint32(vm.CO_OPTIMIZED | vm.CO_NEWLOCALS)
+	if len(as.FreeVars) == 0 && len(as.CellVars) == 0 {
+		flags |= vm.CO_NOFREE
+	}
+	if c.qualnamePrefix != "" {
+		flags |= vm.CO_NESTED
+	}
+	varNames := []val.Value{formatName}
+	for _, fl := range as.FastLocals {
+		if fl != annFormatParam {
+			varNames = append(varNames, val.InternString(fl))
+		}
+	}
+	co := &vm.CodeObject{
+		Name:            "__annotate__",
+		QualName:        qualPrefix + "__annotate__",
+		FileName:        c.filename,
+		FirstLineNo:     int(c.curLine),
+		PosOnlyArgCount: 1,
+		Code:            sub.code,
+		Consts:          sub.constPool.Slice(),
+		ParamNames:      []val.Value{formatName},
+		VarNames:        varNames,
+		CellVars:        cellVals,
+		FreeVars:        freeVals,
+		NumLocals:       numLocals,
+		NumParams:       1,
+		MaxStackSize:    numLocals + sub.maxStackDepth + 16,
+		Flags:           flags,
+		ExceptionTable:  sub.exceptionTable,
+		LineSpans:       sub.lineSpans,
+	}
+	coIdx := c.constPool.Add(vm.NewCodeVal(co))
+
+	if len(as.FreeVars) > 0 {
+		for _, fv := range as.FreeVars {
+			if err := c.emitLoadClosure(fv); err != nil {
+				return err
+			}
+		}
+		c.emitOp(vm.OP_BUILD_TUPLE, 0, uint16(len(as.FreeVars)))
+		c.emitOp(vm.OP_LOAD_CONST, 0, coIdx)
+		c.emitOp(vm.OP_MAKE_FUNCTION, 0x01, 0)
+	} else {
+		c.emitOp(vm.OP_LOAD_CONST, 0, coIdx)
+		c.emitOp(vm.OP_MAKE_FUNCTION, 0, 0)
+	}
+	if isClass {
+		return c.compileNameStore(annClassAnnotate)
+	}
+	return c.compileNameStore(annModuleAnnotate)
 }

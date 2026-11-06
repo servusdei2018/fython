@@ -3,9 +3,11 @@ package vm
 import (
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
+	"github.com/servusdei2018/fython/pkg/stdlib"
 	"github.com/servusdei2018/fython/pkg/val"
 )
 
@@ -51,6 +53,19 @@ func (e *Engine) findModuleFile(moduleName string, searchDirs []string) (string,
 	relPath := filepath.Join(parts...)
 
 	for _, dir := range searchDirs {
+		if strings.HasPrefix(dir, "stdlib:") {
+			vfsDir := strings.TrimPrefix(dir, "stdlib:")
+			initPath := path.Join(vfsDir, path.Join(parts...), "__init__.py")
+			if _, err := stdlib.StdlibFS.ReadFile(initPath); err == nil {
+				return "stdlib:" + initPath, true, true
+			}
+			modPath := path.Join(vfsDir, path.Join(parts...)+".py")
+			if _, err := stdlib.StdlibFS.ReadFile(modPath); err == nil {
+				return "stdlib:" + modPath, false, true
+			}
+			continue
+		}
+
 		// 1. Check directory package: dir/pkg/__init__.py
 		initPath := filepath.Join(dir, relPath, "__init__.py")
 		if info, err := os.Stat(initPath); err == nil && !info.IsDir() {
@@ -62,6 +77,11 @@ func (e *Engine) findModuleFile(moduleName string, searchDirs []string) (string,
 		if info, err := os.Stat(modPath); err == nil && !info.IsDir() {
 			return modPath, false, true
 		}
+	}
+
+	// 3. Check embedded stdlib
+	if vfsPath, isPkg, found := stdlib.FindModule(moduleName); found {
+		return "stdlib:" + vfsPath, isPkg, true
 	}
 
 	return "", false, false
@@ -94,6 +114,23 @@ func (e *Engine) LoadOrCompileModule(filePath, moduleName string) (*CodeObject, 
 				return nil, fmt.Errorf("Engine: no compileHook set to compile virtual module '%s'", moduleName)
 			}
 			co, err := e.compileHook([]byte(srcStr))
+			if err != nil {
+				return nil, err
+			}
+			e.codeCache.Store(cacheKey, co)
+			return co, nil
+		}
+
+		if strings.HasPrefix(filePath, "stdlib:") {
+			vfsPath := strings.TrimPrefix(filePath, "stdlib:")
+			src, err := stdlib.ReadModule(vfsPath)
+			if err != nil {
+				return nil, fmt.Errorf("ModuleNotFoundError: No module named '%s' (%v)", moduleName, err)
+			}
+			if e.compileHook == nil {
+				return nil, fmt.Errorf("Engine: no compileHook set to compile stdlib file '%s'", filePath)
+			}
+			co, err := e.compileHook(src)
 			if err != nil {
 				return nil, err
 			}
@@ -161,6 +198,13 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 
 	parts := strings.Split(canonicalName, ".")
 
+	if canonicalName == "os" || canonicalName == "os.path" || canonicalName == "posixpath" || canonicalName == "genericpath" {
+		vm.ensureOSPath()
+		if vmHasException(vm) {
+			return val.NoneVal(), nil
+		}
+	}
+
 	// Check if already fully imported in sys.modules
 	internedFull := val.InternString(canonicalName)
 	if existing, ok := vm.modules.Get(internedFull); ok {
@@ -207,6 +251,10 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 			// Check if virtual module exists for currName
 			if _, ok := vm.engine.virtualModules.Load(currName); ok {
 				found = true
+			} else if vfsPath, isPkg, ok := stdlib.FindModule(currName); ok {
+				filePath = "stdlib:" + vfsPath
+				isPackage = isPkg
+				found = true
 			}
 		}
 
@@ -228,8 +276,12 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 			mod.Package = strings.Join(parts[:i], ".")
 		}
 		if isPackage {
+			pkgPath := filepath.Dir(filePath)
+			if strings.HasPrefix(filePath, "stdlib:") {
+				pkgPath = "stdlib:" + path.Dir(strings.TrimPrefix(filePath, "stdlib:"))
+			}
 			mod.Dict.Set(val.InternString("__package__"), val.NewStringVal(currName))
-			mod.Dict.Set(val.InternString("__path__"), val.NewListVal(val.NewStringVal(filepath.Dir(filePath))))
+			mod.Dict.Set(val.InternString("__path__"), val.NewListVal(val.NewStringVal(pkgPath)))
 		} else {
 			if mod.Package != "" {
 				mod.Dict.Set(val.InternString("__package__"), val.NewStringVal(mod.Package))
@@ -248,6 +300,10 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 
 		// Execute module bytecode
 		vm.RunCodeWithGlobals(co, mod.Dict)
+		if !vm.unhandledException.IsNone() && vm.unhandledException.HeaderPtr() != nil {
+			vm.modules.Delete(internedCurr)
+			return val.NoneVal(), nil
+		}
 
 		parentVal = modVal
 	}
@@ -330,4 +386,48 @@ func (vm *VM) ImportStar(modVal val.Value, callerGlobals *val.PyDict) error {
 		}
 	}
 	return nil
+}
+
+func vmHasException(vm *VM) bool {
+	return !vm.unhandledException.IsNone() && vm.unhandledException.HeaderPtr() != nil
+}
+
+var (
+	pathAttr    = val.InternString("path")
+	osModName   = val.InternString("os")
+	osPathName  = val.InternString("os.path")
+	posixpathNm = "posixpath"
+)
+
+// ensureOSPath binds os.path to the upstream posixpath module. posixpath
+// imports os itself, so it cannot load while the engine builds its native
+// modules; the first import of os (or os.path) triggers it instead. A
+// failed load leaves os.path unset and the exception pending on the VM.
+func (vm *VM) ensureOSPath() {
+	osVal, ok := vm.modules.Get(osModName)
+	if !ok || !osVal.IsModule() {
+		return
+	}
+	osMod := osVal.AsModule()
+	if _, bound := osMod.Dict.Get(pathAttr); bound || vm.bindingOSPath {
+		return
+	}
+	vm.engine.osPathMu.Lock()
+	defer vm.engine.osPathMu.Unlock()
+	if _, bound := osMod.Dict.Get(pathAttr); bound {
+		return
+	}
+	vm.bindingOSPath = true
+	defer func() { vm.bindingOSPath = false }()
+
+	pv, err := vm.ImportModule(posixpathNm, 0, true, nil)
+	if err != nil {
+		vm.unhandledException = panicToPyException(err)
+		return
+	}
+	if vmHasException(vm) || !pv.IsModule() {
+		return
+	}
+	osMod.Dict.Set(pathAttr, pv)
+	vm.modules.Set(osPathName, pv)
 }

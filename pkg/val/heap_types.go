@@ -4,7 +4,6 @@ import (
 	"errors"
 	"math/big"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -32,6 +31,7 @@ type PyList struct {
 	Header ObjectHeader
 	Items  []Value
 	mu     sync.RWMutex
+	Attrs  *PyDict
 }
 
 // DictEntry represents a key-value pair stored in the dense, insertion-ordered PyDict array.
@@ -62,6 +62,11 @@ type PyDict struct {
 	indexShift uint8 // 0: uint8 slots, 1: uint16 slots, 2: uint32 slots
 	VersionTag uint64
 	mu         sync.RWMutex
+	Attrs      *PyDict
+	// Live, when non-nil, turns this dict into a zero-copy view over a
+	// Shape-backed instance: every read and write is resolved through
+	// Live.Shape and Live.Slots (see NewInstanceDictProxy).
+	Live *PyInstance
 }
 
 // PyCell wraps a shared mutable Value on the heap for closures and nonlocal variables.
@@ -153,10 +158,14 @@ func NewModuleVal(name, file string) Value {
 type IterKind uint8
 
 const (
-	IterKindList IterKind = iota
+	IterKindInvalid IterKind = iota
+	IterKindList
 	IterKindTuple
 	IterKindDict
 	IterKindRange
+	IterKindFunc
+	IterKindGenerator
+	IterKindString
 )
 
 // PyIter represents a zero-allocation iterator over lists, tuples, dicts, or ranges.
@@ -169,6 +178,7 @@ type PyIter struct {
 	Cur    int64
 	Stop   int64
 	Step   int64
+	NextFn func() (Value, bool)
 }
 
 // GenState classifies the lifecycle state of a PyGenerator.
@@ -250,6 +260,29 @@ type PyFuture struct {
 	Callbacks []func(Value)
 	mu        sync.Mutex
 	doneChan  chan struct{}
+	// Attrs is the lazily created __dict__ (Futures and Tasks accept
+	// arbitrary attributes, like CPython's _asyncio objects).
+	Attrs *PyDict
+}
+
+// AsyncAttrs returns the attribute dict of a Future/Task Value, creating it
+// when create is true. It returns nil for other kinds or when absent.
+func AsyncAttrs(obj Value, create bool) *PyDict {
+	var f *PyFuture
+	switch obj.Kind() {
+	case KindFuture:
+		f = obj.AsFuture()
+	case KindTask:
+		f = &obj.AsTask().Future
+	default:
+		return nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.Attrs == nil && create {
+		f.Attrs = NewDictVal(8).AsDict()
+	}
+	return f.Attrs
 }
 
 // PyTask represents an asyncio Task scheduling a Coroutine on an EventLoop.
@@ -260,6 +293,8 @@ type PyTask struct {
 	Coro     *PyCoroutine
 	Loop     any
 	NextSent Value
+	// Context is the task's isolated context, a shallow copy taken at spawn.
+	Context *PyContext
 }
 
 // Compile-time assertions that every heap object places Header at offset 0.
@@ -653,6 +688,9 @@ func (c *PyChan) Close() bool {
 
 // NewIterVal constructs a heap-allocated KindIter Value wrapping an iterable.
 func NewIterVal(obj Value) Value {
+	if obj.IsIter() {
+		return obj
+	}
 	it := &PyIter{
 		Header: ObjectHeader{Kind: KindIter, Type: IterType},
 		Obj:    obj,
@@ -663,6 +701,20 @@ func NewIterVal(obj Value) Value {
 		it.Kind = IterKindTuple
 	} else if obj.IsDict() {
 		it.Kind = IterKindDict
+	} else if obj.IsRange() {
+		it.Kind = IterKindRange
+		it.Cur = int64(obj.RangeStart())
+		it.Stop = int64(obj.RangeStop())
+		it.Step = 1
+	} else if obj.IsGenerator() {
+		it.Kind = IterKindGenerator
+	} else if obj.IsSet() {
+		it.Kind = IterKindList
+		it.Obj = NewListVal(obj.AsSet().Items()...)
+	} else if obj.IsAnyString() {
+		it.Kind = IterKindString
+	} else {
+		it.Kind = IterKindInvalid
 	}
 	return Value{num: 0, ptr: &it.Header}
 }
@@ -675,6 +727,16 @@ func NewRangeIterVal(start, stop, step int64) Value {
 		Cur:    start,
 		Stop:   stop,
 		Step:   step,
+	}
+	return Value{num: 0, ptr: &it.Header}
+}
+
+// NewIterValWithNext constructs a heap-allocated KindIter Value with a custom Next function.
+func NewIterValWithNext(nextFn func() (Value, bool)) Value {
+	it := &PyIter{
+		Header: ObjectHeader{Kind: KindIter, Type: IterType},
+		Kind:   IterKindFunc,
+		NextFn: nextFn,
 	}
 	return Value{num: 0, ptr: &it.Header}
 }
@@ -705,6 +767,9 @@ func (it *PyIter) Next() (Value, bool) {
 		return res, true
 	case IterKindDict:
 		dict := it.Obj.AsDict()
+		if dict.Live != nil {
+			return dict.liveIterNext(it)
+		}
 		dict.mu.RLock()
 		for it.Idx < len(dict.Entries) {
 			entry := &dict.Entries[it.Idx]
@@ -723,6 +788,26 @@ func (it *PyIter) Next() (Value, bool) {
 		}
 		res := Int64Val(it.Cur)
 		it.Cur += it.Step
+		return res, true
+	case IterKindGenerator:
+		gen := it.Obj.AsGenerator()
+		v, status := gen.Send(nil, NoneVal())
+		if status == IterExhausted {
+			return NoneVal(), false
+		}
+		return v, true
+	case IterKindFunc:
+		if it.NextFn != nil {
+			return it.NextFn()
+		}
+		return NoneVal(), false
+	case IterKindString:
+		s := it.Obj.AsString()
+		if it.Idx >= len(s) {
+			return NoneVal(), false
+		}
+		res := NewStringVal(string(s[it.Idx]))
+		it.Idx++
 		return res, true
 	default:
 		return NoneVal(), false
@@ -768,13 +853,34 @@ func (g *PyGenerator) Send(ctx *ExecContext, val Value) (Value, IterStatus) {
 
 // Close closes the generator and marks it GenClosed.
 func (g *PyGenerator) Close(ctx *ExecContext) {
+	if g.State == GenClosed || g.State == GenCreated {
+		g.State = GenClosed
+		return
+	}
+	if g.State == GenSuspended && ctx != nil {
+		_, status := g.Throw(ctx, NewInstanceOfType(GeneratorExitType))
+		if status == IterYielded {
+			g.State = GenClosed
+			ctx.Raise(NewRuntimeError("generator ignored GeneratorExit"))
+			return
+		}
+		if ctx.HasException() {
+			exc := ctx.ActiveException
+			if IsInstance(exc, GeneratorExitType) || IsInstance(exc, StopIterationType) {
+				ctx.ClearException()
+			}
+		}
+	}
 	g.State = GenClosed
 }
 
 // Throw resumes the generator by raising an exception at the point of suspension.
 func (g *PyGenerator) Throw(ctx *ExecContext, exc Value) (Value, IterStatus) {
 	if g.State == GenClosed {
-		return NoneVal(), IterExhausted
+		if ctx != nil {
+			ctx.Raise(exc)
+		}
+		return NoneVal(), IterError
 	}
 	if ctx != nil {
 		ctx.Raise(exc)
@@ -1018,6 +1124,16 @@ func NewRuntimeError(msg string) Value {
 	return NewException(RuntimeErrorType, msg)
 }
 
+// NewImportError constructs an ImportError instance.
+func NewImportError(msg string) Value {
+	return NewException(ImportErrorType, msg)
+}
+
+// NewModuleNotFoundError constructs a ModuleNotFoundError instance.
+func NewModuleNotFoundError(msg string) Value {
+	return NewException(ModuleNotFoundErrorType, msg)
+}
+
 // NewStopIteration constructs a StopIteration instance.
 func NewStopIteration(retVal Value) Value {
 	inst := NewInstanceOfType(StopIterationType)
@@ -1141,6 +1257,10 @@ func (d *PyDict) resize(minEntries int) {
 // Set inserts or updates a key-value pair in PyDict while preserving insertion order
 // and keeping the first-inserted key on value updates (Python dict invariant) in a thread-safe manner.
 func (d *PyDict) Set(key, value Value) {
+	if d.Live != nil {
+		d.Live.SetAttr(InternValue(key), value)
+		return
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.setLocked(key, value)
@@ -1232,6 +1352,9 @@ func (d *PyDict) setLocked(key, value Value) {
 
 // Get retrieves a value by key from PyDict in a thread-safe manner with 0 heap allocations.
 func (d *PyDict) Get(key Value) (Value, bool) {
+	if d.Live != nil {
+		return d.Live.GetAttr(key)
+	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return d.getLocked(key)
@@ -1240,6 +1363,9 @@ func (d *PyDict) Get(key Value) (Value, bool) {
 // GetWithSlot returns the value, slot index inside Entries, and whether the key was found.
 // This allows inline cache revalidation in O(1) without re-hashing when dict version changes.
 func (d *PyDict) GetWithSlot(key Value) (Value, int, bool) {
+	if d.Live != nil {
+		return d.liveGetWithSlot(key)
+	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return d.getWithSlotLocked(key)
@@ -1247,6 +1373,9 @@ func (d *PyDict) GetWithSlot(key Value) (Value, int, bool) {
 
 // GetWithSlotHint checks the cached slot index first under RLock before falling back to full lookup.
 func (d *PyDict) GetWithSlotHint(key Value, slotHint int) (Value, int, bool) {
+	if d.Live != nil {
+		return d.liveGetWithSlot(key)
+	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	if slotHint >= 0 && slotHint < len(d.Entries) {
@@ -1342,6 +1471,9 @@ func (d *PyDict) getLocked(key Value) (Value, bool) {
 
 // Delete removes key from PyDict if present, returning true if an entry was removed in a thread-safe manner.
 func (d *PyDict) Delete(key Value) bool {
+	if d.Live != nil {
+		return d.Live.DeleteAttr(InternValue(key))
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.deleteLocked(key)
@@ -1379,6 +1511,9 @@ func (d *PyDict) deleteLocked(key Value) bool {
 
 // Len returns the number of active entries in PyDict in a thread-safe manner.
 func (d *PyDict) Len() int {
+	if d.Live != nil {
+		return d.liveLen()
+	}
 	d.mu.RLock()
 	n := d.used
 	d.mu.RUnlock()
@@ -1387,6 +1522,14 @@ func (d *PyDict) Len() int {
 
 // Keys returns a slice of all active keys in PyDict in a thread-safe manner.
 func (d *PyDict) Keys() []Value {
+	if d.Live != nil {
+		items := d.liveItems()
+		keys := make([]Value, len(items))
+		for i := range items {
+			keys[i] = items[i].Key
+		}
+		return keys
+	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	keys := make([]Value, 0, d.used)
@@ -1411,6 +1554,14 @@ func (d *PyDict) Values() []Value {
 	if d == nil {
 		return nil
 	}
+	if d.Live != nil {
+		items := d.liveItems()
+		vals := make([]Value, len(items))
+		for i := range items {
+			vals[i] = items[i].Value
+		}
+		return vals
+	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	vals := make([]Value, 0, d.used)
@@ -1432,6 +1583,9 @@ type DictItem struct {
 func (d *PyDict) Items() []DictItem {
 	if d == nil {
 		return nil
+	}
+	if d.Live != nil {
+		return d.liveItems()
 	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -1462,6 +1616,14 @@ func NewSetVal(items ...Value) Value {
 	}
 	for _, item := range items {
 		s.Entries[item] = struct{}{}
+	}
+	return Value{ptr: &s.Header}
+}
+
+// SetVal wraps an existing *PySet into a Value.
+func SetVal(s *PySet) Value {
+	if s == nil {
+		return NoneVal()
 	}
 	return Value{ptr: &s.Header}
 }
@@ -1550,6 +1712,81 @@ func (s *PySet) SymmetricDifference(other *PySet) Value {
 	return Value{ptr: &res.Header}
 }
 
+// Remove removes v from the set. Returns true if present.
+func (s *PySet) Remove(v Value) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Entries == nil {
+		return false
+	}
+	if _, ok := s.Entries[v]; ok {
+		delete(s.Entries, v)
+		return true
+	}
+	return false
+}
+
+// Discard removes v from the set if present.
+func (s *PySet) Discard(v Value) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Entries != nil {
+		delete(s.Entries, v)
+	}
+}
+
+// Clear removes all elements from the set.
+func (s *PySet) Clear() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Entries = make(map[Value]struct{})
+}
+
+// Pop removes and returns an arbitrary element from the set.
+func (s *PySet) Pop() (Value, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k := range s.Entries {
+		delete(s.Entries, k)
+		return k, true
+	}
+	return NoneVal(), false
+}
+
+// Difference returns a new set with elements in s that are not in other.
+func (s *PySet) Difference(other *PySet) Value {
+	res := NewSetVal().AsSet()
+	for _, it := range s.Items() {
+		if other == nil || !other.Contains(it) {
+			res.Add(it)
+		}
+	}
+	return Value{ptr: &res.Header}
+}
+
+// IsSubset reports whether every element in s is in other.
+func (s *PySet) IsSubset(other *PySet) bool {
+	if other == nil {
+		return s.Len() == 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for k := range s.Entries {
+		if !other.Contains(k) {
+			return false
+		}
+	}
+	return true
+}
+
+// IsSuperset reports whether every element in other is in s.
+func (s *PySet) IsSuperset(other *PySet) bool {
+	if other == nil {
+		return true
+	}
+	return other.IsSubset(s)
+}
+
 // PyExceptionGroup represents a PEP 654 ExceptionGroup / BaseExceptionGroup.
 type PyExceptionGroup struct {
 	Header     ObjectHeader
@@ -1606,17 +1843,26 @@ func (eg *PyExceptionGroup) Split(targetType *PyType) (Value, Value) {
 	return matchVal, restVal
 }
 
-// PyTypeVar represents a PEP 695 TypeVar.
+// PyTypeVar represents a PEP 484 / PEP 695 type variable.
 type PyTypeVar struct {
-	Header ObjectHeader
-	Name   string
-	Bound  Value
+	Header              ObjectHeader
+	Name                string
+	Bound               Value
+	Constraints         []Value
+	Default             Value
+	Covariant           bool
+	Contravariant       bool
+	InferVariance       bool
+	Module              string
+	EvaluateBound       Value
+	EvaluateConstraints Value
+	EvaluateDefault     Value
 }
 
 func NewTypeVarVal(name string, bound Value) Value {
 	tv := &PyTypeVar{
 		Header: ObjectHeader{
-			Kind: KindInstance,
+			Kind: KindNative,
 			Type: TypeVarType,
 		},
 		Name:  name,
@@ -1625,16 +1871,18 @@ func NewTypeVarVal(name string, bound Value) Value {
 	return Value{ptr: &tv.Header}
 }
 
-// PyTypeVarTuple represents a PEP 695 TypeVarTuple.
+// PyTypeVarTuple represents a PEP 646 TypeVarTuple.
 type PyTypeVarTuple struct {
-	Header ObjectHeader
-	Name   string
+	Header  ObjectHeader
+	Name    string
+	Default Value
+	Module  string
 }
 
 func NewTypeVarTupleVal(name string) Value {
 	tvt := &PyTypeVarTuple{
 		Header: ObjectHeader{
-			Kind: KindInstance,
+			Kind: KindNative,
 			Type: TypeVarTupleType,
 		},
 		Name: name,
@@ -1642,16 +1890,24 @@ func NewTypeVarTupleVal(name string) Value {
 	return Value{ptr: &tvt.Header}
 }
 
-// PyParamSpec represents a PEP 695 ParamSpec.
+// PyParamSpec represents a PEP 612 ParamSpec.
 type PyParamSpec struct {
-	Header ObjectHeader
-	Name   string
+	Header        ObjectHeader
+	Name          string
+	Bound         Value
+	Default       Value
+	Covariant     bool
+	Contravariant bool
+	InferVariance bool
+	Module        string
+	Args          Value
+	Kwargs        Value
 }
 
 func NewParamSpecVal(name string) Value {
 	ps := &PyParamSpec{
 		Header: ObjectHeader{
-			Kind: KindInstance,
+			Kind: KindNative,
 			Type: ParamSpecType,
 		},
 		Name: name,
@@ -1670,7 +1926,7 @@ type PyTypeAliasType struct {
 func NewTypeAliasTypeVal(name string, val Value, typeParams []Value) Value {
 	tat := &PyTypeAliasType{
 		Header: ObjectHeader{
-			Kind: KindInstance,
+			Kind: KindNative,
 			Type: TypeAliasTypeType,
 		},
 		Name:       name,
@@ -1698,7 +1954,7 @@ func FormatValue(v Value, spec string, conversion uint8) Value {
 			return NewStringVal(strconv.FormatInt(n, 10))
 		}
 		if v.IsFloat64() {
-			return NewStringVal(strconv.FormatFloat(v.AsFloat64(), 'g', -1, 64))
+			return NewStringVal(FloatRepr(v.AsFloat64()))
 		}
 		if v.IsBool() {
 			if v.IsTruthy() {
@@ -1712,70 +1968,19 @@ func FormatValue(v Value, spec string, conversion uint8) Value {
 		return NewStringVal(v.String())
 	}
 
-	// Fast path for ints with common formats like %d, x, X, b, o, padding
-	if v.IsInt64() {
-		n := v.AsInt64()
-		switch spec {
-		case "d":
-			return NewStringVal(strconv.FormatInt(n, 10))
-		case "x":
-			return NewStringVal(strconv.FormatInt(n, 16))
-		case "X":
-			return NewStringVal(strings.ToUpper(strconv.FormatInt(n, 16)))
-		case "b":
-			return NewStringVal(strconv.FormatInt(n, 2))
-		case "o":
-			return NewStringVal(strconv.FormatInt(n, 8))
-		}
-		if strings.HasPrefix(spec, "0") {
-			if width, err := strconv.Atoi(strings.TrimRight(spec[1:], "d")); err == nil {
-				s := strconv.FormatInt(n, 10)
-				if len(s) < width {
-					s = strings.Repeat("0", width-len(s)) + s
-				}
-				return NewStringVal(s)
-			}
-		}
-		if width, err := strconv.Atoi(strings.TrimRight(spec, "d")); err == nil {
-			s := strconv.FormatInt(n, 10)
-			if len(s) < width {
-				s = strings.Repeat(" ", width-len(s)) + s
-			}
-			return NewStringVal(s)
-		}
+	switch {
+	case v.IsInt64():
+		return NewStringVal(FormatInt64Spec(v.AsInt64(), spec))
+	case v.Kind() == KindBigInt:
+		return NewStringVal(FormatIntSpec(&v.AsBigInt().Val, spec))
+	case v.IsBool():
+		return NewStringVal(FormatBoolSpec(v.AsBool(), spec))
+	case v.IsFloat64():
+		return NewStringVal(FormatFloatSpec(v.AsFloat64(), spec))
+	case v.IsAnyString():
+		return NewStringVal(FormatStrSpec(v.AsString(), spec))
 	}
-
-	// Fast path for floats e.g. .2f
-	if v.IsFloat64() {
-		f := v.AsFloat64()
-		if strings.HasPrefix(spec, ".") && strings.HasSuffix(spec, "f") {
-			if prec, err := strconv.Atoi(spec[1 : len(spec)-1]); err == nil {
-				return NewStringVal(strconv.FormatFloat(f, 'f', prec, 64))
-			}
-		}
-	}
-
-	// String padding e.g. >10, <10, ^10
-	if v.IsAnyString() {
-		s := v.AsString()
-		if len(spec) > 1 && (spec[0] == '>' || spec[0] == '<' || spec[0] == '^') {
-			if width, err := strconv.Atoi(spec[1:]); err == nil && width > len(s) {
-				pad := width - len(s)
-				switch spec[0] {
-				case '>':
-					return NewStringVal(strings.Repeat(" ", pad) + s)
-				case '<':
-					return NewStringVal(s + strings.Repeat(" ", pad))
-				case '^':
-					left := pad / 2
-					right := pad - left
-					return NewStringVal(strings.Repeat(" ", left) + s + strings.Repeat(" ", right))
-				}
-			}
-		}
-	}
-
-	return NewStringVal(v.String())
+	panic("TypeError: unsupported format string passed to " + v.Type().Name + ".__format__")
 }
 
 // FrameVM abstracts VM execution stack access for PyFrame and PyLocalsProxy.
@@ -1804,6 +2009,7 @@ type CodeInspector interface {
 	CodeBytes(code Value) []byte
 	Consts(code Value) []Value
 	StackSize(code Value) int
+	Doc(code Value) Value
 }
 
 // CodeInspectorHook is configured by pkg/vm to resolve CodeObject metadata from KindCode Values.
@@ -2005,4 +2211,140 @@ func NewWeakProxyVal(proxy *PyWeakProxy) Value {
 		proxy.Header.Type = WeakProxyType
 	}
 	return Value{ptr: &proxy.Header}
+}
+
+// PyMappingProxy represents a read-only mappingproxy view of a dictionary or mapping.
+type PyMappingProxy struct {
+	Header  ObjectHeader
+	Mapping Value
+}
+
+// NewMappingProxyVal wraps a mapping Value in a read-only PyMappingProxy.
+func NewMappingProxyVal(mapping Value) Value {
+	proxy := &PyMappingProxy{
+		Header: ObjectHeader{
+			Kind: KindMappingProxy,
+			Type: MappingProxyType,
+		},
+		Mapping: mapping,
+	}
+	return Value{ptr: &proxy.Header}
+}
+
+// AsMappingProxy performs a downcast from Value to *PyMappingProxy.
+func (v Value) AsMappingProxy() *PyMappingProxy {
+	return (*PyMappingProxy)(unsafe.Pointer(v.ptr))
+}
+
+// IsMappingProxy returns true if v is a KindMappingProxy.
+func (v Value) IsMappingProxy() bool {
+	return v.Kind() == KindMappingProxy
+}
+
+// NewInstanceDictProxy returns a dict Value that is a live, zero-copy view of
+// inst's Shape-backed attribute storage. Writes go through the same path as
+// setattr/delattr, so the instance is never deoptimized into a hash table.
+func NewInstanceDictProxy(inst *PyInstance) Value {
+	d := &PyDict{
+		Header: ObjectHeader{Kind: KindDict, Type: DictType},
+		Live:   inst,
+	}
+	return Value{num: 0, ptr: &d.Header}
+}
+
+func (d *PyDict) liveGetWithSlot(key Value) (Value, int, bool) {
+	inst := d.Live
+	inst.mu.RLock()
+	defer inst.mu.RUnlock()
+	idx, ok := inst.Shape.Lookup(key)
+	if !ok || idx >= len(inst.Slots) || inst.Slots[idx].IsUnbound() {
+		return NoneVal(), -1, false
+	}
+	return inst.Slots[idx], idx, true
+}
+
+func (d *PyDict) liveLen() int {
+	inst := d.Live
+	inst.mu.RLock()
+	defer inst.mu.RUnlock()
+	n := 0
+	for _, a := range inst.Shape.Attrs {
+		if a.Index < len(inst.Slots) && !inst.Slots[a.Index].IsUnbound() {
+			n++
+		}
+	}
+	return n
+}
+
+func (d *PyDict) liveItems() []DictItem {
+	inst := d.Live
+	inst.mu.RLock()
+	defer inst.mu.RUnlock()
+	items := make([]DictItem, 0, len(inst.Shape.Attrs))
+	for _, a := range inst.Shape.Attrs {
+		if a.Index < len(inst.Slots) && !inst.Slots[a.Index].IsUnbound() {
+			items = append(items, DictItem{Key: a.Name, Value: inst.Slots[a.Index]})
+		}
+	}
+	return items
+}
+
+func (d *PyDict) liveIterNext(it *PyIter) (Value, bool) {
+	inst := d.Live
+	inst.mu.RLock()
+	defer inst.mu.RUnlock()
+	attrs := inst.Shape.Attrs
+	for it.Idx < len(attrs) {
+		a := attrs[it.Idx]
+		it.Idx++
+		if a.Index < len(inst.Slots) && !inst.Slots[a.Index].IsUnbound() {
+			return a.Name, true
+		}
+	}
+	return NoneVal(), false
+}
+
+// ActiveEntries returns a snapshot of all live entries in insertion order.
+// It is the supported way to enumerate a dict from outside the package because
+// it also works for instance-backed live dicts.
+func (d *PyDict) ActiveEntries() []DictEntry {
+	if d == nil {
+		return nil
+	}
+	if d.Live != nil {
+		items := d.liveItems()
+		out := make([]DictEntry, len(items))
+		for i, it := range items {
+			out[i] = DictEntry{Hash: HashValue(it.Key), Active: true, Key: it.Key, Value: it.Value}
+		}
+		return out
+	}
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	out := make([]DictEntry, 0, d.used)
+	for i := range d.Entries {
+		if d.Entries[i].Active {
+			out = append(out, d.Entries[i])
+		}
+	}
+	return out
+}
+
+// Clear removes every entry, preserving the live-instance mode if set.
+func (d *PyDict) Clear() {
+	if d.Live != nil {
+		for _, it := range d.liveItems() {
+			d.Live.DeleteAttr(it.Key)
+		}
+		return
+	}
+	d.mu.Lock()
+	d.Entries = d.Entries[:0]
+	for i := range d.indices {
+		d.indices[i] = 0
+	}
+	d.used = 0
+	d.filled = 0
+	atomic.AddUint64(&d.VersionTag, 1)
+	d.mu.Unlock()
 }

@@ -2,8 +2,10 @@ package vm
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"sync"
+	"unicode"
 
 	"github.com/servusdei2018/fython/pkg/val"
 )
@@ -151,6 +153,31 @@ func initInspectTypes() {
 	})
 }
 
+func callableCode(args []val.Value) *CodeObject {
+	if len(args) < 1 {
+		return nil
+	}
+	v := args[0]
+	for i := 0; i < 8; i++ {
+		if v.IsBoundMethod() {
+			v = v.AsBoundMethod().Func
+			continue
+		}
+		if !v.IsFunction() {
+			return nil
+		}
+		fn := v.AsFunction()
+		if fn.Dict != nil {
+			if w, ok := fn.Dict.Get(val.InternString("__wrapped__")); ok && w.HeaderPtr() != nil && w.HeaderPtr() != v.HeaderPtr() {
+				v = w
+				continue
+			}
+		}
+		return AsCodeObject(fn.Code)
+	}
+	return nil
+}
+
 func (e *Engine) createInspectModule() val.Value {
 	initInspectTypes()
 
@@ -160,6 +187,13 @@ func (e *Engine) createInspectModule() val.Value {
 	mod.Dict.Set(val.InternString("Parameter"), val.TypeVal(ParameterType))
 	mod.Dict.Set(val.InternString("Signature"), val.TypeVal(SignatureType))
 	mod.Dict.Set(val.InternString("_empty"), EmptyObject)
+
+	mod.Dict.Set(val.InternString("cleandoc"), val.NewBuiltinFuncVal("cleandoc", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) != 1 || !args[0].IsAnyString() {
+			panic("TypeError: cleandoc() argument must be a str")
+		}
+		return val.NewStringVal(cleanDoc(args[0].AsString()))
+	}))
 
 	// currentframe() -> frame
 	mod.Dict.Set(val.InternString("currentframe"), val.NewBuiltinFuncVal("currentframe", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -219,6 +253,30 @@ func (e *Engine) createInspectModule() val.Value {
 		return val.BoolVal(args[0].IsType())
 	}))
 
+	mod.Dict.Set(val.InternString("isabstract"), val.NewBuiltinFuncVal("isabstract", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 || !args[0].IsType() {
+			return val.BoolVal(false)
+		}
+		am, _, ok := args[0].AsType().LookupMRO(val.InternString("__abstractmethods__"))
+		if !ok || am.IsNone() {
+			return val.BoolVal(false)
+		}
+		n := 0
+		switch {
+		case am.IsSet():
+			n = am.AsSet().Len()
+		case am.IsTuple():
+			n = len(am.AsTuple().Items)
+		case am.IsList():
+			n = am.AsList().Len()
+		default:
+			if tp := am.Type(); tp != nil && tp.Slots.SqLen != nil {
+				n = int(tp.Slots.SqLen(ctx, am))
+			}
+		}
+		return val.BoolVal(n != 0)
+	}))
+
 	// isgenerator(obj)
 	mod.Dict.Set(val.InternString("isgenerator"), val.NewBuiltinFuncVal("isgenerator", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
@@ -233,6 +291,19 @@ func (e *Engine) createInspectModule() val.Value {
 			return val.BoolVal(false)
 		}
 		return val.BoolVal(args[0].IsCoroutine())
+	}))
+
+	mod.Dict.Set(val.InternString("isgeneratorfunction"), val.NewBuiltinFuncVal("isgeneratorfunction", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		co := callableCode(args)
+		return val.BoolVal(co != nil && co.IsGenerator && !co.IsCoroutine)
+	}))
+	mod.Dict.Set(val.InternString("iscoroutinefunction"), val.NewBuiltinFuncVal("iscoroutinefunction", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		co := callableCode(args)
+		return val.BoolVal(co != nil && co.IsCoroutine && !co.IsGenerator)
+	}))
+	mod.Dict.Set(val.InternString("isasyncgenfunction"), val.NewBuiltinFuncVal("isasyncgenfunction", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		co := callableCode(args)
+		return val.BoolVal(co != nil && co.IsGenerator && co.IsCoroutine)
 	}))
 
 	// iscode(obj)
@@ -429,4 +500,52 @@ func (e *Engine) createInspectModule() val.Value {
 	}))
 
 	return modVal
+}
+
+// cleanDoc mirrors inspect.cleandoc: expand tabs, strip the common
+// indentation of lines after the first, and drop leading/trailing blank lines.
+func cleanDoc(doc string) string {
+	var sb strings.Builder
+	col := 0
+	for _, r := range doc {
+		switch r {
+		case '\t':
+			n := 8 - col%8
+			sb.WriteString(strings.Repeat(" ", n))
+			col += n
+		case '\n', '\r':
+			sb.WriteRune(r)
+			col = 0
+		default:
+			sb.WriteRune(r)
+			col++
+		}
+	}
+	lines := strings.Split(sb.String(), "\n")
+	margin := math.MaxInt
+	for _, l := range lines[1:] {
+		trimmed := strings.TrimLeftFunc(l, unicode.IsSpace)
+		if trimmed != "" {
+			if ind := len(l) - len(trimmed); ind < margin {
+				margin = ind
+			}
+		}
+	}
+	lines[0] = strings.TrimLeftFunc(lines[0], unicode.IsSpace)
+	if margin < math.MaxInt {
+		for i := 1; i < len(lines); i++ {
+			if len(lines[i]) >= margin {
+				lines[i] = lines[i][margin:]
+			} else {
+				lines[i] = ""
+			}
+		}
+	}
+	for len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	for len(lines) > 0 && lines[0] == "" {
+		lines = lines[1:]
+	}
+	return strings.Join(lines, "\n")
 }

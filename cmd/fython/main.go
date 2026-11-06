@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 
 	"github.com/servusdei2018/fython/internal/cli"
@@ -16,6 +17,13 @@ func main() {
 	parser.FatalIfErrorf(err)
 	err = c.Run()
 	if err != nil {
+		var exit *cli.ErrExit
+		if errors.As(err, &exit) {
+			if exit.Message != "" {
+				os.Stderr.WriteString(exit.Message + "\n")
+			}
+			os.Exit(exit.Code)
+		}
 		os.Stderr.WriteString(err.Error() + "\n")
 		os.Exit(1)
 	}

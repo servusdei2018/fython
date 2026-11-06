@@ -130,6 +130,25 @@ const (
 	OP_LOAD_NAME
 	OP_STORE_NAME
 	OP_DELETE_NAME
+
+	// Starred displays build a list, then convert when the display is not a list.
+	OP_LIST_TO_TUPLE
+	OP_LIST_TO_SET
+
+	// PEP 750 template strings. ArgBx is the interpolation count.
+	// Stack layout, bottom to top: string0, (value, expression, conversion, format_spec) * N, stringN.
+	OP_BUILD_TEMPLATE
+
+	// PEP 649 / 749 deferred annotations.
+	// OP_LOAD_LOCALS pushes the namespace mapping of the running class body.
+	OP_LOAD_LOCALS
+	// OP_LOAD_FROM_DICT_OR_GLOBALS pops a mapping and looks up consts[ArgBx]
+	// in it; on a miss it falls back to the frame's globals (honouring
+	// dict-subclass __missing__) and then builtins.
+	OP_LOAD_FROM_DICT_OR_GLOBALS
+	// OP_LOAD_FROM_DICT_OR_DEREF pops a mapping and looks up consts[ArgBx] in
+	// it; on a miss it loads closure cell ArgA.
+	OP_LOAD_FROM_DICT_OR_DEREF
 )
 
 // Comparison operation codes for OP_COMPARE_OP (passed in ArgA field).
@@ -342,6 +361,18 @@ func (op Opcode) String() string {
 		return "OP_BUILD_MAP_UNPACK"
 	case OP_LIST_EXTEND:
 		return "OP_LIST_EXTEND"
+	case OP_LIST_TO_TUPLE:
+		return "OP_LIST_TO_TUPLE"
+	case OP_LIST_TO_SET:
+		return "OP_LIST_TO_SET"
+	case OP_BUILD_TEMPLATE:
+		return "OP_BUILD_TEMPLATE"
+	case OP_LOAD_LOCALS:
+		return "OP_LOAD_LOCALS"
+	case OP_LOAD_FROM_DICT_OR_GLOBALS:
+		return "OP_LOAD_FROM_DICT_OR_GLOBALS"
+	case OP_LOAD_FROM_DICT_OR_DEREF:
+		return "OP_LOAD_FROM_DICT_OR_DEREF"
 	case OP_BINARY_MATMUL:
 		return "OP_BINARY_MATMUL"
 	case OP_CALL_FUNCTION_EX:

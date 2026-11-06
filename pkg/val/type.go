@@ -2,6 +2,7 @@ package val
 
 import (
 	"errors"
+	"sync"
 	"sync/atomic"
 	"unsafe"
 )
@@ -21,6 +22,10 @@ type ExecContext struct {
 	ActiveException Value
 	VM              any
 }
+
+// AcquireExecContextHook allows standalone comparison/hashing helpers in pkg/val
+// to obtain a temporary VM ExecContext when invoked without an explicit ctx.
+var AcquireExecContextHook func() (*ExecContext, func())
 
 func (ctx *ExecContext) Raise(exc Value) {
 	if ctx != nil {
@@ -47,6 +52,11 @@ func (ctx *ExecContext) Invoke0(callable Value) Value {
 		}
 		return fn(ctx, callable, nil, nil)
 	}
+	if (ctx == nil || ctx.CallHook == nil) && AcquireExecContextHook != nil {
+		tmpCtx, release := AcquireExecContextHook()
+		defer release()
+		return tmpCtx.Invoke0(callable)
+	}
 	if ctx != nil && ctx.CallHook != nil {
 		return ctx.CallHook(ctx, callable, ctx.SP, 0, nil)
 	}
@@ -67,6 +77,11 @@ func (ctx *ExecContext) Invoke1(callable, a Value) Value {
 		if ctx.CallHook != nil {
 			return ctx.CallHook(ctx, callable, base, 1, nil)
 		}
+	}
+	if !callable.IsBuiltinFunc() && (ctx == nil || ctx.CallHook == nil) && AcquireExecContextHook != nil {
+		tmpCtx, release := AcquireExecContextHook()
+		defer release()
+		return tmpCtx.Invoke1(callable, a)
 	}
 	var buf [1]Value
 	buf[0] = a
@@ -91,6 +106,11 @@ func (ctx *ExecContext) Invoke2(callable, a, b Value) Value {
 		if ctx.CallHook != nil {
 			return ctx.CallHook(ctx, callable, base, 2, nil)
 		}
+	}
+	if !callable.IsBuiltinFunc() && (ctx == nil || ctx.CallHook == nil) && AcquireExecContextHook != nil {
+		tmpCtx, release := AcquireExecContextHook()
+		defer release()
+		return tmpCtx.Invoke2(callable, a, b)
 	}
 	var buf [2]Value
 	buf[0] = a
@@ -118,6 +138,11 @@ func (ctx *ExecContext) Invoke3(callable, a, b, c Value) Value {
 			return ctx.CallHook(ctx, callable, base, 3, nil)
 		}
 	}
+	if !callable.IsBuiltinFunc() && (ctx == nil || ctx.CallHook == nil) && AcquireExecContextHook != nil {
+		tmpCtx, release := AcquireExecContextHook()
+		defer release()
+		return tmpCtx.Invoke3(callable, a, b, c)
+	}
 	var buf [3]Value
 	buf[0] = a
 	buf[1] = b
@@ -127,6 +152,27 @@ func (ctx *ExecContext) Invoke3(callable, a, b, c Value) Value {
 	}
 	if tpCall := callable.Type().Slots.TpCall; tpCall != nil {
 		return tpCall(ctx, callable, buf[:], nil)
+	}
+	panic("val: object is not callable")
+}
+
+// Call invokes callable with arbitrary positional arguments and keyword names.
+func (ctx *ExecContext) Call(callable Value, args []Value, kwnames []Value) Value {
+	if ctx != nil && ctx.CallHook != nil && ctx.SP+len(args) <= len(ctx.Stack) {
+		base := ctx.SP
+		copy(ctx.Stack[base:], args)
+		return ctx.CallHook(ctx, callable, base, len(args), kwnames)
+	}
+	if !callable.IsBuiltinFunc() && (ctx == nil || ctx.CallHook == nil) && AcquireExecContextHook != nil {
+		tmpCtx, release := AcquireExecContextHook()
+		defer release()
+		return tmpCtx.Call(callable, args, kwnames)
+	}
+	if callable.IsBuiltinFunc() {
+		return callable.AsBuiltinFunc().Fn(ctx, callable, args, kwnames)
+	}
+	if tpCall := callable.Type().Slots.TpCall; tpCall != nil {
+		return tpCall(ctx, callable, args, kwnames)
 	}
 	panic("val: object is not callable")
 }
@@ -280,6 +326,7 @@ type PyType struct {
 	dunderNew          Value
 	dunderInitSubclass Value
 	dunderSetName      Value
+	dunderHash         Value
 }
 
 // Compile-time assertion that PyType.Header is at byte offset 0.
@@ -328,34 +375,88 @@ var (
 	MemoryViewType        *PyType
 	SliceType             *PyType
 	SetType               *PyType
+	ComplexType           *PyType
 	FrameType             *PyType
 	LocalsProxyType       *PyType
 	TracebackType         *PyType
 	WeakRefType           *PyType
 	WeakProxyType         *PyType
 	CallableWeakProxyType *PyType
+	EllipsisType          *PyType
+	MappingProxyType      *PyType
+	FrozenDictType        *PyType
+	SentinelType          *PyType
 
 	// Built-in exception types
-	BaseExceptionType       *PyType
-	ExceptionType           *PyType
-	BaseExceptionGroupType  *PyType
-	ExceptionGroupType      *PyType
-	AssertionErrorType      *PyType
-	TypeErrorType           *PyType
-	ValueErrorType          *PyType
-	KeyErrorType            *PyType
-	IndexErrorType          *PyType
-	ZeroDivisionErrorType   *PyType
-	NameErrorType           *PyType
-	AttributeErrorType      *PyType
-	RuntimeErrorType        *PyType
-	StopIterationType       *PyType
-	StopAsyncIterationType  *PyType
-	GeneratorExitType       *PyType
-	ImportErrorType         *PyType
-	ModuleNotFoundErrorType *PyType
-	BufferErrorType         *PyType
-	ReferenceErrorType      *PyType
+	BaseExceptionType             *PyType
+	ExceptionType                 *PyType
+	BaseExceptionGroupType        *PyType
+	ExceptionGroupType            *PyType
+	AssertionErrorType            *PyType
+	TypeErrorType                 *PyType
+	ValueErrorType                *PyType
+	KeyErrorType                  *PyType
+	IndexErrorType                *PyType
+	ZeroDivisionErrorType         *PyType
+	NameErrorType                 *PyType
+	AttributeErrorType            *PyType
+	RuntimeErrorType              *PyType
+	StopIterationType             *PyType
+	StopAsyncIterationType        *PyType
+	GeneratorExitType             *PyType
+	ImportErrorType               *PyType
+	ModuleNotFoundErrorType       *PyType
+	BufferErrorType               *PyType
+	ReferenceErrorType            *PyType
+	ArithmeticErrorType           *PyType
+	FloatingPointErrorType        *PyType
+	OverflowErrorType             *PyType
+	LookupErrorType               *PyType
+	OSErrorType                   *PyType
+	IOErrorType                   *PyType
+	EnvironmentErrorType          *PyType
+	FileNotFoundErrorType         *PyType
+	PermissionErrorType           *PyType
+	FileExistsErrorType           *PyType
+	IsADirectoryErrorType         *PyType
+	NotADirectoryErrorType        *PyType
+	InterruptedErrorType          *PyType
+	ProcessLookupErrorType        *PyType
+	TimeoutErrorType              *PyType
+	ConnectionErrorType           *PyType
+	BrokenPipeErrorType           *PyType
+	ConnectionAbortedErrorType    *PyType
+	ConnectionRefusedErrorType    *PyType
+	ConnectionResetErrorType      *PyType
+	BlockingIOErrorType           *PyType
+	ChildProcessErrorType         *PyType
+	UnboundLocalErrorType         *PyType
+	NotImplementedErrorType       *PyType
+	RecursionErrorType            *PyType
+	SyntaxErrorType               *PyType
+	IndentationErrorType          *PyType
+	TabErrorType                  *PyType
+	SystemErrorType               *PyType
+	SystemExitType                *PyType
+	KeyboardInterruptType         *PyType
+	EOFErrorType                  *PyType
+	MemoryErrorType               *PyType
+	UnicodeErrorType              *PyType
+	UnicodeDecodeErrorType        *PyType
+	UnicodeEncodeErrorType        *PyType
+	UnicodeTranslateErrorType     *PyType
+	WarningType                   *PyType
+	UserWarningType               *PyType
+	DeprecationWarningType        *PyType
+	PendingDeprecationWarningType *PyType
+	SyntaxWarningType             *PyType
+	RuntimeWarningType            *PyType
+	FutureWarningType             *PyType
+	ImportWarningType             *PyType
+	UnicodeWarningType            *PyType
+	BytesWarningType              *PyType
+	ResourceWarningType           *PyType
+	EncodingWarningType           *PyType
 
 	// PEP 695 Type Parameter types
 	TypeVarType       *PyType
@@ -579,93 +680,140 @@ func NewTypeWithMeta(name string, bases []*PyType, dict *PyDict, meta *PyType) (
 	}
 	t.MRO = mro
 
+	subclassesMu.Lock()
 	for _, b := range bases {
 		b.Subclasses = append(b.Subclasses, t)
 	}
+	subclassesMu.Unlock()
+
+	// Python data model: defining __eq__ without __hash__ implicitly sets __hash__ = None.
+	if DunderEq.ptr != nil {
+		if _, hasEq := dict.Get(DunderEq); hasEq {
+			hashKey := InternString("__hash__")
+			if _, hasHash := dict.Get(hashKey); !hasHash {
+				dict.Set(hashKey, NoneVal())
+			}
+		}
+	}
+
+	// Collect inherited fixed slots from base RootShapes (including primitive backing slots and parent __slots__)
+	var inheritedAttrs []ShapeAttr
+	seenAttr := func(n Value) bool {
+		for _, a := range inheritedAttrs {
+			if a.Name == n || StringEquals(a.Name, n) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, b := range mro[1:] {
+		if b != ObjectType && b != nil && b.RootShape != nil {
+			for _, a := range b.RootShape.Attrs {
+				if !seenAttr(a.Name) {
+					inheritedAttrs = append(inheritedAttrs, ShapeAttr{Name: a.Name, Index: len(inheritedAttrs)})
+				}
+			}
+		}
+	}
 
 	// Process __slots__
-	if slotsVal, hasSlots := dict.Get(DunderSlots); hasSlots {
-		var slotNames []string
-		if slotsVal.IsAnyString() {
-			slotNames = append(slotNames, slotsVal.AsString())
-		} else if slotsVal.IsTuple() {
-			for _, item := range slotsVal.AsTuple().Items {
-				if item.IsAnyString() {
-					slotNames = append(slotNames, item.AsString())
-				}
-			}
-		} else if slotsVal.IsList() {
-			for _, item := range slotsVal.AsList().Items {
-				if item.IsAnyString() {
-					slotNames = append(slotNames, item.AsString())
-				}
-			}
-		} else if slotsVal.IsIter() {
-			it := slotsVal.AsIter()
-			for {
-				item, ok := it.Next()
-				if !ok {
-					break
-				}
-				if item.IsAnyString() {
-					slotNames = append(slotNames, item.AsString())
-				}
-			}
-		}
-
-		hasDict := false
+	slotsVal, hasSlots := dict.Get(DunderSlots)
+	if hasSlots || len(inheritedAttrs) > 0 {
 		var cleanSlots []string
-		for _, sn := range slotNames {
-			if sn == "__dict__" {
-				hasDict = true
-			} else {
-				cleanSlots = append(cleanSlots, sn)
+		hasDict := !hasSlots
+		if hasSlots {
+			var slotNames []string
+			if slotsVal.IsAnyString() {
+				slotNames = append(slotNames, slotsVal.AsString())
+			} else if slotsVal.IsTuple() {
+				for _, item := range slotsVal.AsTuple().Items {
+					if item.IsAnyString() {
+						slotNames = append(slotNames, item.AsString())
+					}
+				}
+			} else if slotsVal.IsList() {
+				for _, item := range slotsVal.AsList().Items {
+					if item.IsAnyString() {
+						slotNames = append(slotNames, item.AsString())
+					}
+				}
+			} else if slotsVal.IsIter() {
+				it := slotsVal.AsIter()
+				for {
+					item, ok := it.Next()
+					if !ok {
+						break
+					}
+					if item.IsAnyString() {
+						slotNames = append(slotNames, item.AsString())
+					}
+				}
 			}
-		}
 
-		baseSlotCount := 0
-		for _, b := range bases {
-			if b != ObjectType && b != nil && b.RootShape != nil {
-				baseSlotCount += len(b.RootShape.Attrs)
-			}
-		}
-
-		totalSlots := baseSlotCount + len(cleanSlots)
-		newAttrs := make([]ShapeAttr, totalSlots)
-		curIdx := 0
-		for _, b := range bases {
-			if b != ObjectType && b != nil && b.RootShape != nil {
-				for _, a := range b.RootShape.Attrs {
-					newAttrs[curIdx] = ShapeAttr{Name: a.Name, Index: curIdx}
-					curIdx++
+			for _, sn := range slotNames {
+				if sn == "__dict__" {
+					hasDict = true
+				} else if sn == "__weakref__" {
+					continue
+				} else {
+					internedSn := InternString(sn)
+					if !seenAttr(internedSn) {
+						cleanSlots = append(cleanSlots, sn)
+					}
 				}
 			}
 		}
 
-		for _, sn := range cleanSlots {
-			internedName := InternString(sn)
-			newAttrs[curIdx] = ShapeAttr{Name: internedName, Index: curIdx}
-			descr := NewMemberDescr(t, internedName, curIdx)
-			t.Dict.Set(internedName, descr)
-			curIdx++
+		totalSlots := len(inheritedAttrs) + len(cleanSlots)
+		if totalSlots > 0 {
+			newAttrs := make([]ShapeAttr, totalSlots)
+			curIdx := 0
+			for _, a := range inheritedAttrs {
+				newAttrs[curIdx] = ShapeAttr{Name: a.Name, Index: curIdx}
+				curIdx++
+			}
+			for _, sn := range cleanSlots {
+				internedName := InternString(sn)
+				newAttrs[curIdx] = ShapeAttr{Name: internedName, Index: curIdx}
+				descr := NewMemberDescr(t, internedName, curIdx)
+				t.Dict.Set(internedName, descr)
+				curIdx++
+			}
+
+			t.RootShape = &Shape{
+				ID:        allocShapeID(),
+				Type:      t,
+				SlotIndex: totalSlots - 1,
+				Attrs:     newAttrs,
+			}
+			empty := make([]ShapeTransition, 0, 4)
+			t.RootShape.transitions.Store(&empty)
 		}
 
-		t.RootShape = &Shape{
-			ID:        allocShapeID(),
-			Type:      t,
-			SlotIndex: totalSlots - 1,
-			Attrs:     newAttrs,
-		}
-		empty := make([]ShapeTransition, 0, 4)
-		t.RootShape.transitions.Store(&empty)
-
-		if !hasDict {
+		if hasSlots && !hasDict {
 			t.Flags |= uint32(FlagForbidDynamicAttrs)
 		}
 	}
 
-	t.Slots.TpGetAttr = objectGetAttr
-	t.Slots.TpSetAttr = objectSetAttr
+	isTypeSubclass := false
+	for _, b := range t.MRO {
+		if b == TypeType {
+			isTypeSubclass = true
+			break
+		}
+	}
+	if isTypeSubclass {
+		t.Slots.TpGetAttr = typeGetAttr
+		t.Slots.TpSetAttr = typeSetAttr
+		t.Slots.MpSubscript = typeMpSubscript
+		// Metaclasses inherit type.__call__ unless they override __call__ (synced below).
+		if TypeType != nil && TypeType.Slots.TpCall != nil {
+			t.Slots.TpCall = TypeType.Slots.TpCall
+		}
+	} else {
+		t.Slots.TpGetAttr = objectGetAttr
+		t.Slots.TpSetAttr = objectSetAttr
+	}
 	t.syncDunderSlots()
 
 	return t, nil
@@ -684,7 +832,7 @@ func MustNewType(name string, bases []*PyType, dict *PyDict) *PyType {
 func (t *PyType) LookupMRO(internedName Value) (Value, *PyType, bool) {
 	for _, cls := range t.MRO {
 		if cls.Dict != nil {
-			if v, ok := cls.Dict.Get(internedName); ok {
+			if v, ok := cls.Dict.Get(internedName); ok && v.ptr != nil && !v.IsUnbound() {
 				return v, cls, true
 			}
 		}
@@ -705,7 +853,7 @@ func (t *PyType) LookupMROAfter(startClass *PyType, internedName Value) (Value, 
 	for i := startIdx; i < len(mro); i++ {
 		cls := mro[i]
 		if cls.Dict != nil {
-			if v, ok := cls.Dict.Get(internedName); ok {
+			if v, ok := cls.Dict.Get(internedName); ok && v.ptr != nil && !v.IsUnbound() {
 				return v, cls, true
 			}
 		}
@@ -737,10 +885,17 @@ func (t *PyType) SetAttrStr(name string, value Value) {
 func (t *PyType) InvalidateVersion() {
 	t.VersionTag = allocTypeVersion()
 	t.syncDunderSlots()
-	for _, sub := range t.Subclasses {
+	subclassesMu.RLock()
+	subs := append([]*PyType(nil), t.Subclasses...)
+	subclassesMu.RUnlock()
+	for _, sub := range subs {
 		sub.InvalidateVersion()
 	}
 }
+
+// subclassesMu guards every PyType.Subclasses slice; types are created
+// concurrently when several VMs are instantiated at once.
+var subclassesMu sync.RWMutex
 
 // Dunder slot trampolines that dispatch through cached dunder callables on *PyType
 // without runtime string or dictionary lookups.
@@ -800,6 +955,16 @@ func dunderTpDescrGetSlot(ctx *ExecContext, descr, obj Value, owner *PyType) Val
 }
 
 func dunderTpDescrSetSlot(ctx *ExecContext, descr, obj, value Value) {
+	if value.IsUnbound() {
+		if delFn, _, ok := descr.Type().LookupMRO(InternString("__delete__")); ok {
+			ctx.Invoke2(delFn, descr, obj)
+			return
+		}
+		panic("val: AttributeError: __delete__")
+	}
+	if descr.Type().dunderSet.ptr == nil {
+		panic("val: AttributeError: __set__")
+	}
 	ctx.Invoke3(descr.Type().dunderSet, descr, obj, value)
 }
 
@@ -851,6 +1016,11 @@ func (t *PyType) syncDunderSlots() {
 	if fn, _, ok := t.LookupMRO(DunderSet); ok {
 		t.dunderSet = fn
 		t.Slots.TpDescrSet = dunderTpDescrSetSlot
+	} else if _, _, ok := t.LookupMRO(InternString("__delete__")); ok {
+		t.dunderSet = Value{}
+		t.Slots.TpDescrSet = dunderTpDescrSetSlot
+	} else {
+		t.dunderSet = Value{}
 	}
 	if fn, _, ok := t.LookupMRO(DunderInit); ok {
 		t.dunderInit = fn
@@ -862,15 +1032,22 @@ func (t *PyType) syncDunderSlots() {
 	} else {
 		t.dunderGetAttr = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderSetAttr); ok {
+	if fn, owner, ok := t.LookupMRO(DunderSetAttr); ok && owner != ObjectType && owner != TypeType {
 		t.dunderSetAttr = fn
+		t.Flags |= FlagCustomSetAttr
 	} else {
 		t.dunderSetAttr = Value{}
+		t.Flags &= ^FlagCustomSetAttr
 	}
-	if fn, _, ok := t.LookupMRO(DunderIter); ok {
+	if fn, owner, ok := t.LookupMRO(DunderIter); ok {
 		t.dunderIter = fn
-		t.Slots.TpIter = func(ctx *ExecContext, o Value) Value {
-			return ctx.Invoke1(t.dunderIter, o)
+		// Builtin collections publish __iter__ as a method that calls the
+		// native slot. Replacing that slot with a wrapper around the method
+		// recurses. Heap classes that define __iter__ still need the wrapper.
+		if t.Slots.TpIter == nil || (owner == t && ((t.Flags&FlagHeapType) != 0 || fn.IsFunction())) {
+			t.Slots.TpIter = func(ctx *ExecContext, o Value) Value {
+				return ctx.Invoke1(t.dunderIter, o)
+			}
 		}
 	} else {
 		t.dunderIter = Value{}
@@ -915,12 +1092,12 @@ func (t *PyType) syncDunderSlots() {
 	} else {
 		t.dunderLe = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderEq); ok {
+	if fn, owner, ok := t.LookupMRO(DunderEq); ok && owner != ObjectType {
 		t.dunderEq = fn
 	} else {
 		t.dunderEq = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderNe); ok {
+	if fn, owner, ok := t.LookupMRO(DunderNe); ok && owner != ObjectType {
 		t.dunderNe = fn
 	} else {
 		t.dunderNe = Value{}
@@ -1078,10 +1255,15 @@ func (t *PyType) syncDunderSlots() {
 		t.dunderGetAttribute = Value{}
 		t.Flags &= ^uint32(FlagCustomGetAttribute)
 	}
-	if fn, _, ok := t.LookupMRO(DunderDelAttr); ok {
+	if fn, owner, ok := t.LookupMRO(DunderDelAttr); ok && owner != ObjectType && owner != TypeType {
 		t.dunderDelAttr = fn
 	} else {
 		t.dunderDelAttr = Value{}
+	}
+	if fn, owner, ok := t.LookupMRO(InternString("__hash__")); ok && owner != ObjectType {
+		t.dunderHash = fn
+	} else {
+		t.dunderHash = Value{}
 	}
 	if fn, _, ok := t.LookupMRO(DunderDir); ok {
 		t.dunderDir = fn
@@ -1189,7 +1371,7 @@ func IsInstance(v Value, cls *PyType) bool {
 
 // HasInit reports whether t defines or inherits an __init__ method.
 func (t *PyType) HasInit() bool {
-	return t.dunderInit.ptr != nil
+	return t.dunderInit.ptr != nil && t.dunderInit.ptr != ObjectInitBuiltin.ptr
 }
 
 // DunderInitVal returns the cached __init__ callable for t.
@@ -1226,8 +1408,34 @@ func defaultObjectGetAttr(ctx *ExecContext, obj, name Value) Value {
 	}
 
 	if obj.IsInstance() {
-		if val, ok := obj.AsInstance().GetAttr(interned); ok {
-			return val
+		if inst := obj.AsInstance(); inst.Shape != nil {
+			if val, ok := inst.GetAttr(interned); ok {
+				return val
+			}
+		}
+	}
+
+	if obj.IsDict() && tp != DictType {
+		if d := obj.AsDict(); d.Attrs != nil {
+			if val, ok := d.Attrs.Get(interned); ok {
+				return val
+			}
+		}
+	}
+
+	if obj.IsList() && tp != ListType {
+		if l := obj.AsList(); l.Attrs != nil {
+			if val, ok := l.Attrs.Get(interned); ok {
+				return val
+			}
+		}
+	}
+
+	if k := obj.Kind(); k == KindFuture || k == KindTask {
+		if d := AsyncAttrs(obj, false); d != nil {
+			if val, ok := d.Get(interned); ok {
+				return val
+			}
 		}
 	}
 
@@ -1239,28 +1447,52 @@ func defaultObjectGetAttr(ctx *ExecContext, obj, name Value) Value {
 		return descr
 	}
 
+	if interned.AsString() == "__dict__" && obj.IsInstance() && (tp.Flags&FlagForbidDynamicAttrs) == 0 {
+		inst := obj.AsInstance()
+		if inst.Shape != nil {
+			return NewInstanceDictProxy(inst)
+		}
+	}
+
 	if tp.dunderGetAttr.ptr != nil {
 		return ctx.Invoke2(tp.dunderGetAttr, obj, interned)
 	}
 
+	if interned.AsString() == "__func__" || interned.AsString() == "__wrapped__" {
+		if obj.Kind() == KindStaticMethod {
+			return obj.AsStaticMethod().Callable
+		}
+		if obj.Kind() == KindClassMethod {
+			return obj.AsClassMethod().Callable
+		}
+		if obj.Kind() == KindBoundMethod {
+			return obj.AsBoundMethod().Func
+		}
+	}
+
+	if interned.AsString() == "__dict__" {
+		if k := obj.Kind(); k == KindFuture || k == KindTask {
+			return Value{num: uint64(KindDict), ptr: &AsyncAttrs(obj, true).Header}
+		}
+		if obj.IsDict() && tp != DictType {
+			d := obj.AsDict()
+			if d.Attrs == nil {
+				d.Attrs = NewDictVal(8).AsDict()
+			}
+			return Value{num: uint64(KindDict), ptr: &d.Attrs.Header}
+		}
+		if obj.IsList() && tp != ListType {
+			l := obj.AsList()
+			if l.Attrs == nil {
+				l.Attrs = NewDictVal(8).AsDict()
+			}
+			return Value{num: uint64(KindDict), ptr: &l.Attrs.Header}
+		}
+	}
+
 	if interned.AsString() == "__annotations__" {
 		if obj.IsType() {
-			cls := obj.AsType()
-			if annotateFn, ok := cls.Dict.Get(InternString("__annotate__")); ok {
-				var annDict Value
-				if ctx != nil && ctx.CallHook != nil {
-					base := ctx.SP
-					ctx.Stack[base] = Int64Val(1)
-					annDict = ctx.CallHook(ctx, annotateFn, base, 1, nil)
-				}
-				if annDict.IsDict() {
-					cls.Dict.Set(interned, annDict)
-					return annDict
-				}
-			}
-			emptyDict := NewDictVal(4)
-			cls.Dict.Set(interned, emptyDict)
-			return emptyDict
+			return TypeAnnotations(ctx, obj.AsType())
 		}
 		if obj.IsInstance() {
 			inst := obj.AsInstance()
@@ -1282,6 +1514,10 @@ func defaultObjectGetAttr(ctx *ExecContext, obj, name Value) Value {
 		}
 	}
 
+	if interned.AsString() == "__doc__" {
+		return NoneVal()
+	}
+
 	panic("val: AttributeError: '" + tp.Name + "' object has no attribute '" + interned.AsString() + "'")
 }
 
@@ -1296,6 +1532,11 @@ func objectSetAttr(ctx *ExecContext, obj, name, value Value) Value {
 		return NoneVal()
 	}
 
+	if obj.IsInstance() && obj.AsInstance().Shape != nil && interned.AsString() == "__class__" {
+		AssignInstanceClass(obj, value)
+		return NoneVal()
+	}
+
 	if descr, _, foundInClass := tp.LookupMRO(interned); foundInClass {
 		descrType := descr.Type()
 		if descrType.Slots.TpDescrSet != nil {
@@ -1304,8 +1545,35 @@ func objectSetAttr(ctx *ExecContext, obj, name, value Value) Value {
 		}
 	}
 
-	if obj.IsInstance() {
+	if obj.IsInstance() && obj.AsInstance().Shape != nil {
+		if interned.AsString() == "__dict__" && (tp.Flags&FlagForbidDynamicAttrs) == 0 {
+			ReplaceInstanceDict(ctx, obj.AsInstance(), value)
+			return NoneVal()
+		}
 		obj.AsInstance().SetAttr(interned, value)
+		return NoneVal()
+	}
+
+	if obj.IsDict() && tp != DictType {
+		d := obj.AsDict()
+		if d.Attrs == nil {
+			d.Attrs = NewDictVal(8).AsDict()
+		}
+		d.Attrs.Set(interned, value)
+		return NoneVal()
+	}
+
+	if obj.IsList() && tp != ListType {
+		l := obj.AsList()
+		if l.Attrs == nil {
+			l.Attrs = NewDictVal(8).AsDict()
+		}
+		l.Attrs.Set(interned, value)
+		return NoneVal()
+	}
+
+	if k := obj.Kind(); k == KindFuture || k == KindTask {
+		AsyncAttrs(obj, true).Set(interned, value)
 		return NoneVal()
 	}
 
@@ -1341,6 +1609,19 @@ func typeGetAttr(ctx *ExecContext, typeObj, name Value) Value {
 		}
 	}
 
+	// __doc__ on a class is never inherited from parent classes via MRO.
+	if interned.AsString() == "__doc__" {
+		if cls.Dict != nil {
+			if descr, ok := cls.Dict.Get(interned); ok {
+				if descrGet := descr.Type().Slots.TpDescrGet; descrGet != nil {
+					return descrGet(ctx, descr, NoneVal(), cls)
+				}
+				return descr
+			}
+		}
+		return NoneVal()
+	}
+
 	// 2. Check class MRO
 	if descr, _, ok := cls.LookupMRO(interned); ok {
 		if descrGet := descr.Type().Slots.TpDescrGet; descrGet != nil {
@@ -1369,6 +1650,23 @@ func typeGetAttr(ctx *ExecContext, typeObj, name Value) Value {
 		return NewTupleVal(basesItems...)
 	case "__name__":
 		return InternString(cls.Name)
+	case "__qualname__":
+		if qn, ok := cls.Dict.Get(InternString("__qualname__")); ok {
+			return qn
+		}
+		return InternString(cls.Name)
+	case "__type_params__":
+		if tp, ok := cls.Dict.Get(InternString("__type_params__")); ok {
+			return tp
+		}
+		return NewTupleVal()
+	case "__module__":
+		if modVal, ok := cls.Dict.Get(InternString("__module__")); ok {
+			return modVal
+		}
+		return InternString("builtins")
+	case "__dict__":
+		return NewMappingProxyVal(ObjectVal(&cls.Dict.Header))
 	case "__mro__":
 		mroItems := make([]Value, len(cls.MRO))
 		for i, m := range cls.MRO {
@@ -1388,16 +1686,124 @@ func typeGetAttr(ctx *ExecContext, typeObj, name Value) Value {
 // typeSetAttr implements attribute assignment on a *PyType object, invalidating VersionTag.
 func typeSetAttr(ctx *ExecContext, typeObj, name, value Value) Value {
 	cls := typeObj.AsType()
-	cls.SetAttr(name, value)
+	interned := InternValue(name)
+	meta := cls.Header.Type
+	if meta == nil {
+		meta = TypeType
+	}
+	if meta != TypeType && meta.dunderSetAttr.ptr != nil {
+		ctx.Invoke3(meta.dunderSetAttr, typeObj, interned, value)
+		return NoneVal()
+	}
+	if descr, _, ok := meta.LookupMRO(interned); ok {
+		descrType := descr.Type()
+		if descrType.Slots.TpDescrSet != nil {
+			descrType.Slots.TpDescrSet(ctx, descr, typeObj, value)
+			return NoneVal()
+		}
+	}
+	cls.SetAttr(interned, value)
 	return NoneVal()
+}
+
+// objectDelAttr implements the standard Python attribute deletion protocol,
+// dispatching through __delattr__ and data descriptor __delete__ before removing slots.
+func objectDelAttr(ctx *ExecContext, obj, name Value) {
+	interned := InternValue(name)
+	tp := obj.Type()
+
+	if obj.IsType() {
+		cls := obj.AsType()
+		meta := cls.Header.Type
+		if meta == nil {
+			meta = TypeType
+		}
+		if meta != TypeType && meta.dunderDelAttr.ptr != nil {
+			ctx.Invoke2(meta.dunderDelAttr, obj, interned)
+			return
+		}
+		if descr, _, ok := meta.LookupMRO(interned); ok {
+			if descrSet := descr.Type().Slots.TpDescrSet; descrSet != nil {
+				descrSet(ctx, descr, obj, UnboundVal())
+				return
+			}
+		}
+		if cls.Dict != nil && cls.Dict.Delete(interned) {
+			cls.InvalidateVersion()
+			return
+		}
+		panic(NewAttributeError("type object '" + cls.Name + "' has no attribute '" + interned.AsString() + "'"))
+	}
+
+	if tp.dunderDelAttr.ptr != nil {
+		ctx.Invoke2(tp.dunderDelAttr, obj, interned)
+		return
+	}
+
+	if descr, _, foundInClass := tp.LookupMRO(interned); foundInClass {
+		descrType := descr.Type()
+		if descrType.Slots.TpDescrSet != nil {
+			descrType.Slots.TpDescrSet(ctx, descr, obj, UnboundVal())
+			return
+		}
+	}
+
+	if obj.IsInstance() {
+		if !obj.AsInstance().DeleteAttr(interned) {
+			panic(NewAttributeError("'" + tp.Name + "' object has no attribute '" + interned.AsString() + "'"))
+		}
+		return
+	}
+
+	if obj.IsModule() {
+		if !obj.AsModule().Dict.Delete(interned) {
+			panic(NewAttributeError("module '" + obj.AsModule().Name + "' has no attribute '" + interned.AsString() + "'"))
+		}
+		return
+	}
+
+	if obj.IsDict() && obj.AsDict().Attrs != nil && obj.AsDict().Attrs.Delete(interned) {
+		return
+	}
+
+	if obj.IsList() && obj.AsList().Attrs != nil && obj.AsList().Attrs.Delete(interned) {
+		return
+	}
+
+	if d := AsyncAttrs(obj, false); d != nil && d.Delete(interned) {
+		return
+	}
+
+	panic(NewAttributeError("'" + tp.Name + "' object has no attribute '" + interned.AsString() + "'"))
 }
 
 // moduleGetAttr implements attribute lookup on a *PyModule object.
 func moduleGetAttr(ctx *ExecContext, obj, name Value) Value {
+	if obj.Kind() != KindModule {
+		// Instances of ModuleType subclasses are plain PyInstances.
+		return objectGetAttr(ctx, obj, name)
+	}
 	mod := obj.AsModule()
 	interned := InternValue(name)
+	if interned.AsString() == "__dict__" {
+		return DictVal(mod.Dict)
+	}
 	if v, ok := mod.Dict.Get(interned); ok {
 		return v
+	}
+	switch interned.AsString() {
+	case "__name__":
+		return InternString(mod.Name)
+	case "__doc__":
+		return NoneVal()
+	case "__file__":
+		if mod.File != "" {
+			return NewStringVal(mod.File)
+		}
+	case "__annotations__":
+		return ModuleAnnotations(ctx, mod)
+	case "__annotate__":
+		return NoneVal()
 	}
 	if ModuleType != nil {
 		if descr, _, ok := ModuleType.LookupMRO(interned); ok {
@@ -1412,8 +1818,69 @@ func moduleGetAttr(ctx *ExecContext, obj, name Value) Value {
 
 // moduleSetAttr implements attribute assignment on a *PyModule object.
 func moduleSetAttr(ctx *ExecContext, obj, name, value Value) Value {
+	if obj.Kind() != KindModule {
+		return objectSetAttr(ctx, obj, name, value)
+	}
 	mod := obj.AsModule()
 	interned := InternValue(name)
 	mod.Dict.Set(interned, value)
 	return NoneVal()
+}
+
+// ReplaceInstanceDict implements `obj.__dict__ = mapping`: it tombstones the
+// instance's dynamic attributes and re-populates them from mapping through the
+// regular Shape transitions, keeping the instance Shape-backed.
+func ReplaceInstanceDict(ctx *ExecContext, inst *PyInstance, mapping Value) {
+	if !mapping.IsDict() {
+		panic("TypeError: __dict__ must be set to a dictionary, not a '" + mapping.Type().Name + "'")
+	}
+	entries := mapping.AsDict().ActiveEntries()
+	tp := inst.Header.Type
+	inst.mu.RLock()
+	names := make([]Value, 0, len(inst.Shape.Attrs))
+	for _, a := range inst.Shape.Attrs {
+		names = append(names, a.Name)
+	}
+	inst.mu.RUnlock()
+	for _, n := range names {
+		if tp != nil {
+			if _, _, isClassAttr := tp.LookupMRO(n); isClassAttr {
+				continue
+			}
+		}
+		inst.DeleteAttr(n)
+	}
+	for _, e := range entries {
+		inst.SetAttr(InternValue(e.Key), e.Value)
+	}
+}
+
+// AssignInstanceClass implements `obj.__class__ = cls` for Shape-backed
+// instances by replaying the instance's attributes onto the new class's root
+// shape, so slot layouts and inline caches stay consistent.
+func AssignInstanceClass(obj, value Value) {
+	if !value.IsType() {
+		panic("TypeError: __class__ must be set to a class, not '" + value.Type().Name + "' object")
+	}
+	newT := value.AsType()
+	old := obj.AsInstance()
+	fresh := NewInstanceOfType(newT)
+	if !fresh.IsInstance() {
+		panic("TypeError: __class__ assignment only supported for heap types or ModuleType subclasses")
+	}
+	fi := fresh.AsInstance()
+	old.mu.RLock()
+	attrs := append([]ShapeAttr(nil), old.Shape.Attrs...)
+	slots := append([]Value(nil), old.Slots...)
+	old.mu.RUnlock()
+	for _, a := range attrs {
+		if a.Index < len(slots) && slots[a.Index].ptr != nil {
+			fi.SetAttr(a.Name, slots[a.Index])
+		}
+	}
+	old.mu.Lock()
+	old.Shape = fi.Shape
+	old.Slots = fi.Slots
+	old.Header.Type = newT
+	old.mu.Unlock()
 }

@@ -28,7 +28,12 @@ func (e *Engine) createTimeModule() val.Value {
 		}
 		secs := toFloat(args[0])
 		if secs > 0 {
-			time.Sleep(time.Duration(secs * float64(time.Second)))
+			d := time.Duration(secs * float64(time.Second))
+			if vm, ok := ctx.VM.(*VM); ok && vm.engine.signals.owner.Load() == vm {
+				vm.sleepInterruptibly(d)
+			} else {
+				time.Sleep(d)
+			}
 		}
 		return val.NoneVal()
 	}))

@@ -111,6 +111,7 @@ type CodeObject struct {
 	QualName         string
 	FileName         string
 	FirstLineNo      int
+	Doc              val.Value
 	PosOnlyArgCount  int
 	KWOnlyArgCount   int
 	Code             []uint32
@@ -204,29 +205,32 @@ func AsCodeObject(v val.Value) *CodeObject {
 // VM represents a single execution thread with contiguous Value, CallFrame, and ICSlot slabs,
 // plus a VM-managed string interning pool and zero-allocation Vectorcall execution context.
 type VM struct {
-	engine           *Engine
-	stack            []val.Value
-	frames           []CallFrame
-	ic               []ICSlot
-	methodPIC        [][4]val.MethodPICEntry
-	attrPIC          [][4]AttrPICEntry
-	codeCaches       []VMCodeCache
-	builtinRange     val.Value
-	internPool       *val.InternPool
-	execCtx          val.ExecContext
-	activeFrameIdx   int
-	activeCO         *CodeObject
-	activeBaseOffset int
-	activeCells      []val.Value
-	kwScratch        [64]val.Value
-	kwSet            [64]bool
-	globals          *val.PyDict
-	builtins         *val.PyDict
-	modules          *val.PyDict
-	lastException    val.Value
-	coroFreeList     []*val.PyCoroutine
-	rootCO           CodeObject
-	rootCache        VMCodeCache
+	engine             *Engine
+	stack              []val.Value
+	frames             []CallFrame
+	ic                 []ICSlot
+	methodPIC          [][4]val.MethodPICEntry
+	attrPIC            [][4]AttrPICEntry
+	codeCaches         []VMCodeCache
+	builtinRange       val.Value
+	internPool         *val.InternPool
+	execCtx            val.ExecContext
+	activeFrameIdx     int
+	activeCO           *CodeObject
+	activeBaseOffset   int
+	activeCells        []val.Value
+	kwScratch          [64]val.Value
+	kwSet              [64]bool
+	globals            *val.PyDict
+	builtins           *val.PyDict
+	modules            *val.PyDict
+	lastException      val.Value
+	unhandledException val.Value
+	context            *val.PyContext
+	bindingOSPath      bool
+	coroFreeList       []*val.PyCoroutine
+	rootCO             CodeObject
+	rootCache          VMCodeCache
 }
 
 func (vm *VM) getCodeCache(co *CodeObject) *VMCodeCache {
@@ -266,8 +270,23 @@ func (vm *VM) Reset() {
 		vm.frames[i].shadowFrame = nil
 	}
 	vm.execCtx.SP = 0
+	vm.execCtx.Stack = vm.stack
+	vm.execCtx.ClearException()
 	vm.activeFrameIdx = 0
+	vm.activeCO = nil
+	vm.activeBaseOffset = 0
+	vm.activeCells = nil
 	vm.lastException = val.NoneVal()
+	vm.unhandledException = val.NoneVal()
+	vm.context = val.NewPyContext()
+}
+
+// ActiveContext returns the context ContextVar reads and writes on this VM.
+func (vm *VM) ActiveContext() *val.PyContext {
+	if vm.context == nil {
+		vm.context = val.NewPyContext()
+	}
+	return vm.context
 }
 
 // GetStackVal satisfies val.FrameVM.
@@ -500,8 +519,43 @@ func (defaultCodeInspector) StackSize(code val.Value) int {
 	return co.MaxStackSize
 }
 
+func (defaultCodeInspector) Doc(code val.Value) val.Value {
+	co := AsCodeObject(code)
+	if co == nil || co.Doc.HeaderPtr() == nil {
+		return val.NoneVal()
+	}
+	return co.Doc
+}
+
+var standaloneVMPool = sync.Pool{
+	New: func() any {
+		return NewVMWithCapacity(512, 32)
+	},
+}
+
 func init() {
 	val.CodeInspectorHook = defaultCodeInspector{}
+	val.AcquireExecContextHook = func() (*val.ExecContext, func()) {
+		v := standaloneVMPool.Get().(*VM)
+		v.Reset()
+		return &v.execCtx, func() {
+			v.Reset()
+			standaloneVMPool.Put(v)
+		}
+	}
+}
+
+// UnhandledException returns the uncaught Python exception from the most recent execution, or NoneVal.
+func (vm *VM) UnhandledException() val.Value {
+	if vm.unhandledException.HeaderPtr() == nil {
+		return val.NoneVal()
+	}
+	return vm.unhandledException
+}
+
+// ClearUnhandledException resets the unhandled exception state on the VM.
+func (vm *VM) ClearUnhandledException() {
+	vm.unhandledException = val.NoneVal()
 }
 
 // LastException returns the most recent unhandled exception Value, or NoneVal.

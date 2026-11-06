@@ -55,6 +55,10 @@ const (
 	KindTraceback      // Heap-allocated exception traceback node (*PyTraceback)
 	KindWeakRef        // Heap-allocated weak reference (*PyWeakRef)
 	KindWeakProxy      // Heap-allocated weak reference proxy (*PyWeakProxy)
+	KindEllipsis       // Static sentinel for Ellipsis singleton
+	KindMappingProxy   // Heap-allocated mappingproxy wrapper (*PyMappingProxy)
+	KindNative         // Heap-allocated native Go object with custom struct
+	KindComplex        // Heap-allocated complex number (*PyComplex)
 )
 
 // ObjectHeader Flags bitmask constants.
@@ -72,6 +76,12 @@ const (
 	FlagForbidDynamicAttrs uint32 = 1 << 2
 	// FlagCustomGetAttribute marks a type that defines a custom __getattribute__ requiring inline cache bypass.
 	FlagCustomGetAttribute uint32 = 1 << 3
+	// FlagHeapType marks a dynamically constructed Python class (as opposed to a static built-in type).
+	FlagHeapType uint32 = 1 << 4
+	// FlagInitSubclassKwDone marks that __init_subclass__ has already been invoked with keyword arguments.
+	FlagInitSubclassKwDone uint32 = 1 << 5
+	// FlagCustomSetAttr marks a type that defines a custom __setattr__ requiring inline cache bypass.
+	FlagCustomSetAttr uint32 = 1 << 6
 )
 
 // String returns the human-readable name of the Kind.
@@ -159,6 +169,14 @@ func (k Kind) String() string {
 		return "ReferenceType"
 	case KindWeakProxy:
 		return "ProxyType"
+	case KindEllipsis:
+		return "ellipsis"
+	case KindMappingProxy:
+		return "mappingproxy"
+	case KindNative:
+		return "object"
+	case KindComplex:
+		return "complex"
 	default:
 		return "unknown"
 	}
@@ -198,6 +216,7 @@ var (
 	tagUnbound        = ObjectHeader{Kind: KindNone}
 	tagRange          = ObjectHeader{Kind: KindRange}
 	tagNotImplemented = ObjectHeader{Kind: KindNotImplemented}
+	tagEllipsis       = ObjectHeader{Kind: KindEllipsis}
 )
 
 // NoneVal constructs the singleton None Value (0 allocations).
@@ -213,6 +232,16 @@ func NotImplementedVal() Value {
 // IsNotImplemented reports whether v is the NotImplemented singleton via pointer equality.
 func (v Value) IsNotImplemented() bool {
 	return v.ptr == &tagNotImplemented
+}
+
+// EllipsisVal constructs the singleton Ellipsis Value (0 allocations).
+func EllipsisVal() Value {
+	return Value{num: 0, ptr: &tagEllipsis}
+}
+
+// IsEllipsis reports whether v is the Ellipsis singleton via pointer equality.
+func (v Value) IsEllipsis() bool {
+	return v.ptr == &tagEllipsis
 }
 
 // UnboundVal constructs a zero-allocation internal sentinel for unbound method receivers in OP_LOAD_METHOD.
@@ -249,13 +278,19 @@ func ObjectVal(hdr *ObjectHeader) Value {
 	return Value{num: 0, ptr: hdr}
 }
 
-// Kind returns the Value's Kind directly from its ObjectHeader with zero branching.
+// Kind returns the Value's Kind directly from its ObjectHeader.
 func (v Value) Kind() Kind {
+	if v.ptr == nil {
+		return KindNone
+	}
 	return v.ptr.Kind
 }
 
 // Type resolves the Value to its *PyType (either via v.ptr.Type or the static builtinTypes lookup table).
 func (v Value) Type() *PyType {
+	if v.ptr == nil {
+		return NoneType
+	}
 	if t := v.ptr.Type; t != nil {
 		return t
 	}
@@ -531,12 +566,12 @@ func (v Value) RangeStop() int32 {
 
 // IsDataDescriptor reports whether v has FlagDataDescriptor set in its ObjectHeader.
 func (v Value) IsDataDescriptor() bool {
-	return (v.ptr.Flags & FlagDataDescriptor) != 0
+	return v.ptr != nil && (v.ptr.Flags&FlagDataDescriptor) != 0
 }
 
 // IsInterned reports whether v has FlagInterned set in its ObjectHeader, or is an inline string.
 func (v Value) IsInterned() bool {
-	return v.ptr == &tagInlineStr || (v.ptr.Flags&FlagInterned) != 0
+	return v.ptr == &tagInlineStr || (v.ptr != nil && (v.ptr.Flags&FlagInterned) != 0)
 }
 
 // AsBool extracts the boolean payload from a KindBool Value.
@@ -592,9 +627,31 @@ func (v Value) IsTruthy() bool {
 		return len(v.AsMemoryView().Buf) > 0
 	case KindSlice:
 		return true
+	case KindComplex:
+		c := v.AsComplex()
+		return c.Real != 0 || c.Imag != 0
+	case KindInstance, KindNative:
+		return objectTruthy(v)
 	default:
 		return true
 	}
+}
+
+// objectTruthy applies __bool__, then __len__ (via SqLen), to instances and
+// native objects. Objects defining neither are truthy.
+func objectTruthy(v Value) bool {
+	t := v.Type()
+	if t == nil {
+		return true
+	}
+	if fn, _, ok := t.LookupMRO(InternString("__bool__")); ok {
+		var ctx *ExecContext
+		return (*ExecContext).Invoke1(ctx, fn, v).IsTruthy()
+	}
+	if sqLen := t.Slots.SqLen; sqLen != nil {
+		return sqLen(nil, v) != 0
+	}
+	return true
 }
 
 // Equals performs Python value equality comparison (a == b).
@@ -613,7 +670,21 @@ func Equals(a, b Value) bool {
 	// Custom __eq__ dispatch on user classes
 	if (a.Type() != nil && a.Type().dunderEq.ptr != nil) || (b.Type() != nil && b.Type().dunderEq.ptr != nil) {
 		res := RichCompare(nil, a, b, CmpEQ)
-		return res.AsBool()
+		return res.IsTruthy()
+	}
+
+	return equalsStructural(a, b)
+}
+
+func equalsStructural(a, b Value) bool {
+	if a.ptr == b.ptr {
+		if a.ptr == &tagInt64 || a.ptr == &tagBool || a.ptr == &tagNone || a.ptr == &tagInlineStr {
+			return a.num == b.num
+		}
+		if a.ptr == &tagFloat64 {
+			return math.Float64frombits(a.num) == math.Float64frombits(b.num)
+		}
+		return true
 	}
 
 	// Fast path: two distinct interned heap strings can never be equal.
@@ -654,6 +725,59 @@ func Equals(a, b Value) bool {
 		sa := a.AsSlice()
 		sb := b.AsSlice()
 		return Equals(sa.Start, sb.Start) && Equals(sa.Stop, sb.Stop) && Equals(sa.Step, sb.Step)
+	}
+	if a.ptr.Kind == KindTuple && b.ptr.Kind == KindTuple {
+		ia := a.AsTuple().Items
+		ib := b.AsTuple().Items
+		if len(ia) != len(ib) {
+			return false
+		}
+		for i := range ia {
+			if !Equals(ia[i], ib[i]) {
+				return false
+			}
+		}
+		return true
+	}
+	if a.ptr.Kind == KindList && b.ptr.Kind == KindList {
+		ia := a.AsList().Items
+		ib := b.AsList().Items
+		if len(ia) != len(ib) {
+			return false
+		}
+		for i := range ia {
+			if !Equals(ia[i], ib[i]) {
+				return false
+			}
+		}
+		return true
+	}
+	if a.ptr.Kind == KindDict && b.ptr.Kind == KindDict {
+		da := a.AsDict()
+		db := b.AsDict()
+		if da.Len() != db.Len() {
+			return false
+		}
+		for _, item := range da.Items() {
+			vb, ok := db.Get(item.Key)
+			if !ok || !Equals(item.Value, vb) {
+				return false
+			}
+		}
+		return true
+	}
+	if a.ptr.Kind == KindSet && b.ptr.Kind == KindSet {
+		sa := a.AsSet()
+		sb := b.AsSet()
+		if sa.Len() != sb.Len() {
+			return false
+		}
+		for _, k := range sa.Items() {
+			if !sb.Contains(k) {
+				return false
+			}
+		}
+		return true
 	}
 
 	// Numeric cross-type equality (int64, float64, bool, bigint).
@@ -756,12 +880,73 @@ func HashValue(v Value) uint32 {
 		f, _ := bi.Float64()
 		return mix64To32(math.Float64bits(f))
 	}
+	if v.ptr.Kind == KindComplex {
+		return hashComplex(v.AsComplex())
+	}
+	if v.ptr.Kind == KindTuple && (v.ptr.Type == nil || v.ptr.Type == TupleType || v.ptr.Type.dunderHash.ptr == nil) {
+		if v.ptr.Hash != 0 {
+			return v.ptr.Hash
+		}
+		items := v.AsTuple().Items
+		var acc uint64 = 0x345678
+		for _, it := range items {
+			acc = (acc ^ uint64(HashValue(it))) * 1000003
+		}
+		acc ^= uint64(len(items))
+		h := mix64To32(acc)
+		v.ptr.Hash = h
+		return h
+	}
+	if v.ptr.Kind == KindBytes {
+		if v.ptr.Hash != 0 {
+			return v.ptr.Hash
+		}
+		data := v.AsBytes().Data
+		h := fnvOffset32
+		for i := 0; i < len(data); i++ {
+			h ^= uint32(data[i])
+			h *= fnvPrime32
+		}
+		if h == 0 {
+			h = 1
+		}
+		v.ptr.Hash = h
+		return h
+	}
+	tp := v.Type()
+	if tp != nil && tp.dunderHash.ptr != nil {
+		if tp.dunderHash.IsNone() {
+			panic(NewTypeError("unhashable type: '" + tp.Name + "'"))
+		}
+		var ctx *ExecContext
+		res := ctx.Invoke1(tp.dunderHash, v)
+		if res.ptr == &tagInt64 || res.ptr == &tagBool {
+			f := float64(int64(res.num))
+			if f == 0.0 {
+				return mix64To32(0)
+			}
+			return mix64To32(math.Float64bits(f))
+		}
+		if res.ptr != nil && res.ptr.Kind == KindBigInt {
+			return HashValue(res)
+		}
+		panic(NewTypeError("__hash__ method should return an integer"))
+	}
+	if v.ptr.Kind == KindList || v.ptr.Kind == KindDict || v.ptr.Kind == KindSet || v.ptr.Kind == KindByteArray {
+		typeName := v.Kind().String()
+		if tp != nil {
+			typeName = tp.Name
+		}
+		panic(NewTypeError("unhashable type: '" + typeName + "'"))
+	}
 	return mix64To32(uint64(uintptr(unsafe.Pointer(v.ptr))))
 }
 
 // String returns the Python string representation of Value.
 func (v Value) String() string {
 	switch v.Kind() {
+	case KindBigInt:
+		return v.AsBigInt().Val.String()
 	case KindNone:
 		return "None"
 	case KindBool:
@@ -772,7 +957,7 @@ func (v Value) String() string {
 	case KindInt64:
 		return strconv.FormatInt(v.AsInt64(), 10)
 	case KindFloat64:
-		return strconv.FormatFloat(v.AsFloat64(), 'g', -1, 64)
+		return FloatRepr(v.AsFloat64())
 	case KindInlineStr, KindString:
 		return v.AsString()
 	case KindList:
@@ -807,7 +992,7 @@ func (v Value) String() string {
 		sb.WriteString("{")
 		d := v.AsDict()
 		first := true
-		for _, e := range d.Entries {
+		for _, e := range d.ActiveEntries() {
 			if !e.Key.IsUnbound() {
 				if !first {
 					sb.WriteString(", ")
@@ -840,8 +1025,11 @@ func (v Value) String() string {
 	case KindExceptionGroup:
 		eg := v.AsExceptionGroup()
 		return fmt.Sprintf("ExceptionGroup(%q, %v)", eg.Message, eg.Exceptions)
+	case KindComplex:
+		c := v.AsComplex()
+		return ComplexRepr(c.Real, c.Imag)
 	case KindType:
-		return "<class '" + v.AsType().Name + "'>"
+		return TypeRepr(v.AsType())
 	case KindFunction:
 		return "<function " + v.AsFunction().Name + ">"
 	case KindBuiltinFunc:
@@ -878,9 +1066,9 @@ func (v Value) String() string {
 		}
 		return fmt.Sprintf("<module '%s'>", mod.Name)
 	case KindBytes:
-		return fmt.Sprintf("b%q", string(v.AsBytes().Data))
+		return bytesRepr(v.AsBytes().Data)
 	case KindByteArray:
-		return fmt.Sprintf("bytearray(b%q)", string(v.AsByteArray().Data))
+		return "bytearray(" + bytesRepr(v.AsByteArray().Data) + ")"
 	case KindMemoryView:
 		return fmt.Sprintf("<memory at %p>", v.ptr)
 	case KindSlice:
@@ -891,7 +1079,74 @@ func (v Value) String() string {
 		return fmt.Sprintf("<member '%s' of '%s' objects>", md.Name.AsString(), md.Owner.Name)
 	case KindNotImplemented:
 		return "NotImplemented"
+	case KindEllipsis:
+		return "Ellipsis"
+	case KindMappingProxy:
+		mp := v.AsMappingProxy()
+		return fmt.Sprintf("mappingproxy(%s)", mp.Mapping.String())
 	default:
 		return fmt.Sprintf("<%s object at %p>", v.Type().Name, v.ptr)
 	}
+}
+
+// bytesRepr formats data as a Python bytes literal.
+func bytesRepr(data []byte) string {
+	quote := byte('\'')
+	hasSingle, hasDouble := false, false
+	for _, b := range data {
+		switch b {
+		case '\'':
+			hasSingle = true
+		case '"':
+			hasDouble = true
+		}
+	}
+	if hasSingle && !hasDouble {
+		quote = '"'
+	}
+	const hexDigits = "0123456789abcdef"
+	buf := make([]byte, 0, len(data)+3)
+	buf = append(buf, 'b', quote)
+	for _, b := range data {
+		switch {
+		case b == quote || b == '\\':
+			buf = append(buf, '\\', b)
+		case b == '\t':
+			buf = append(buf, '\\', 't')
+		case b == '\n':
+			buf = append(buf, '\\', 'n')
+		case b == '\r':
+			buf = append(buf, '\\', 'r')
+		case b < 0x20 || b >= 0x7f:
+			buf = append(buf, '\\', 'x', hexDigits[b>>4], hexDigits[b&15])
+		default:
+			buf = append(buf, b)
+		}
+	}
+	return string(append(buf, quote))
+}
+
+// TypeQualName returns "module.qualname" (or just "qualname" for builtins),
+// the form used inside union and generic-alias reprs.
+func TypeQualName(t *PyType) string {
+	qual := t.Name
+	module := ""
+	if t.Dict != nil {
+		if q, ok := t.Dict.Get(InternString("__qualname__")); ok && q.IsAnyString() {
+			qual = q.AsString()
+		}
+		if m, ok := t.Dict.Get(InternString("__module__")); ok && m.IsAnyString() {
+			module = m.AsString()
+		}
+	}
+	if module != "" && module != "builtins" {
+		return module + "." + qual
+	}
+	return qual
+}
+
+// TypeRepr formats a class like CPython: <class 'module.qualname'>, or
+// <class 'qualname'> for builtins.
+func TypeRepr(t *PyType) string {
+	return "<class '" + TypeQualName(t) + "'>"
 }

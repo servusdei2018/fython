@@ -384,7 +384,7 @@ func writeJSONValue(sb *strings.Builder, v val.Value, indent int, level int) err
 		if math.IsNaN(f) || math.IsInf(f, 0) {
 			return errors.New("ValueError: Out of range float values are not JSON compliant")
 		}
-		sb.WriteString(strconv.FormatFloat(f, 'g', -1, 64))
+		sb.WriteString(val.FloatRepr(f))
 		return nil
 	}
 	if v.IsAnyString() {
@@ -462,7 +462,7 @@ func writeJSONValue(sb *strings.Builder, v val.Value, indent int, level int) err
 		d := v.AsDict()
 		first := true
 		sb.WriteString("{")
-		for _, e := range d.Entries {
+		for _, e := range d.ActiveEntries() {
 			if !e.Active {
 				continue
 			}

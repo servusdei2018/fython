@@ -1,5 +1,7 @@
 package compiler
 
+import "math/big"
+
 // ExprID is a lightweight unboxed 32-bit handle referencing an ASTExpr inside ASTArena.
 type ExprID uint32
 
@@ -18,6 +20,8 @@ const (
 	ExprKindNone ExprKind = iota
 	ExprKindInt
 	ExprKindFloat
+	ExprKindImag
+	ExprKindBigInt
 	ExprKindString
 	ExprKindBool
 	ExprKindNoneLit
@@ -47,6 +51,7 @@ const (
 	ExprKindStarred
 	ExprKindNamedExpr
 	ExprKindEllipsis
+	ExprKindTemplateStr
 )
 
 // ASTExpr represents a flat, unboxed expression node stored in contiguous arena slices.
@@ -142,6 +147,7 @@ type ASTComp struct {
 	Iter    ExprID
 	IfConds ExprSlice
 	IsDict  bool
+	Next    uint32 // 1-based index to next ASTComp in chain; 0 if terminal
 }
 
 // ASTDictPair stores a single {key: value} mapping in a dict literal.
@@ -278,17 +284,21 @@ type ASTMatchStmt struct {
 	Cases   MatchCaseSlice
 }
 
-// ASTFormattedValue stores an interpolation field inside an f-string.
+// ASTFormattedValue stores an interpolation field inside an f-string or t-string.
 type ASTFormattedValue struct {
 	Value      ExprID
 	Conversion uint8 // 0, 's', 'r', 'a'
 	FormatSpec ExprID
 	DebugText  string
+	// Expression is the source text of the interpolation, excluding conversion and format spec.
+	Expression string
 }
 
-// ASTFString stores a PEP 701 f-string composed of literal strings and formatted values.
+// ASTFString stores a PEP 701 f-string or PEP 750 t-string.
+// Raw is set for rt/tr template literals so literal parts keep backslashes.
 type ASTFString struct {
 	Pieces ExprSlice
+	Raw    bool
 }
 
 // ExceptSlice references a contiguous sequence of ASTExceptHandler handles in ASTArena.ExceptHandlers.
@@ -355,6 +365,7 @@ type ASTArena struct {
 	Idents         []string
 	IntConsts      []int64
 	FloatConsts    []float64
+	BigConsts      []*big.Int
 	Calls          []ASTCall
 	Comps          []ASTComp
 	DictPairs      []ASTDictPair
@@ -442,6 +453,7 @@ func (a *ASTArena) Reset() {
 	a.Idents = a.Idents[:0]
 	a.IntConsts = a.IntConsts[:0]
 	a.FloatConsts = a.FloatConsts[:0]
+	a.BigConsts = a.BigConsts[:0]
 	a.Calls = a.Calls[:0]
 	a.Comps = a.Comps[:0]
 	a.DictPairs = a.DictPairs[:0]
@@ -502,6 +514,13 @@ func (a *ASTArena) GetStmt(id StmtID) *ASTStmt {
 func (a *ASTArena) AllocInt(v int64) uint32 {
 	idx := uint32(len(a.IntConsts))
 	a.IntConsts = append(a.IntConsts, v)
+	return idx
+}
+
+// AllocBig appends a big integer constant and returns its index.
+func (a *ASTArena) AllocBig(v *big.Int) uint32 {
+	idx := uint32(len(a.BigConsts))
+	a.BigConsts = append(a.BigConsts, v)
 	return idx
 }
 

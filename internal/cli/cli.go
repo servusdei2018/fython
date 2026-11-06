@@ -108,6 +108,7 @@ func (c *CLI) Run() error {
 			v := vm.NewVM()
 			v.SetGlobal("__name__", val.NewStringVal("__main__"))
 			v.RunCode(co)
+			return unhandledError(v)
 		}
 		return nil
 	case ModeModule:
@@ -127,7 +128,7 @@ func (c *CLI) Run() error {
 				if err != nil {
 					return err
 				}
-				co, err := compiler.CompileSource(src)
+				co, err := compiler.CompileSourceWithFilename(src, inv.Script)
 				if err != nil {
 					return err
 				}
@@ -135,12 +136,45 @@ func (c *CLI) Run() error {
 				v.SetGlobal("__name__", val.NewStringVal("__main__"))
 				v.SetGlobal("__file__", val.NewStringVal(inv.Script))
 				v.RunCode(co)
+				return unhandledError(v)
 			}
 		}
 		return nil
 	default:
 		return nil
 	}
+}
+
+// ErrUncaughtException signals that the program terminated with an uncaught Python exception.
+type ErrUncaughtException struct{ Traceback string }
+
+func (e *ErrUncaughtException) Error() string { return strings.TrimRight(e.Traceback, "\n") }
+
+// ErrExit reports that the program ended with SystemExit.
+type ErrExit struct {
+	Code    int
+	Message string
+}
+
+func (e *ErrExit) Error() string { return e.Message }
+
+func unhandledError(v *vm.VM) error {
+	exc := v.UnhandledException()
+	if exc.IsNone() || exc.HeaderPtr() == nil {
+		return nil
+	}
+	if exc.IsInstance() && val.IsSubclass(exc.Type(), val.SystemExitType) {
+		code, _ := exc.AsInstance().GetAttr(val.InternString("code"))
+		switch {
+		case code.IsNone():
+			return &ErrExit{}
+		case code.IsInt64():
+			return &ErrExit{Code: int(code.AsInt64())}
+		default:
+			return &ErrExit{Code: 1, Message: val.PyStr(nil, code)}
+		}
+	}
+	return &ErrUncaughtException{Traceback: v.FormatException(exc)}
 }
 
 // NewParser constructs a configured Kong parser for CLI.

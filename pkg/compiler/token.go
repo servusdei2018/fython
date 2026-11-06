@@ -14,6 +14,7 @@ const (
 	TOKEN_IDENT
 	TOKEN_INT
 	TOKEN_FLOAT
+	TOKEN_IMAG
 	TOKEN_STRING
 
 	// Keywords
@@ -69,6 +70,7 @@ const (
 	TOKEN_SEMI     // ;
 	TOKEN_ELLIPSIS // ...
 	TOKEN_ARROW    // ->
+	TOKEN_EXCLAIM  // !
 
 	// Arithmetic, Comparison & Augmented Assignment Operators
 	TOKEN_ASSIGN       // =
@@ -115,6 +117,9 @@ const (
 	TOKEN_FSTRING_START
 	TOKEN_FSTRING_MIDDLE
 	TOKEN_FSTRING_END
+
+	// PEP 750 template string literals. Middles and ends reuse the f-string tokens.
+	TOKEN_TSTRING_START
 )
 
 // String returns a human-readable representation of the token type.
@@ -136,6 +141,8 @@ func (t TokenType) String() string {
 		return "INT"
 	case TOKEN_FLOAT:
 		return "FLOAT"
+	case TOKEN_IMAG:
+		return "IMAG"
 	case TOKEN_STRING:
 		return "STRING"
 	case TOKEN_DEF:
@@ -280,6 +287,8 @@ func (t TokenType) String() string {
 		return "..."
 	case TOKEN_ARROW:
 		return "->"
+	case TOKEN_EXCLAIM:
+		return "!"
 	case TOKEN_WALRUS:
 		return ":="
 	case TOKEN_AT:
@@ -314,6 +323,8 @@ func (t TokenType) String() string {
 		return "FSTRING_MIDDLE"
 	case TOKEN_FSTRING_END:
 		return "FSTRING_END"
+	case TOKEN_TSTRING_START:
+		return "TSTRING_START"
 	default:
 		return "UNKNOWN"
 	}

@@ -1,7 +1,13 @@
 package vm
 
 import (
+	"fmt"
+	"math"
+	"os"
+	"path/filepath"
+	"runtime"
 	"sync"
+	"sync/atomic"
 
 	"github.com/servusdei2018/fython/pkg/val"
 )
@@ -47,29 +53,58 @@ func (cs *CompilerSingleflight) Do(key string, fn func() (*CodeObject, error)) (
 // It manages the thread-safe string intern table, root shape, builtins,
 // code object cache, module singleflight compiler, and pools lightweight *VM execution contexts.
 type Engine struct {
-	internPool      *val.InternPool
-	rootShape       *val.Shape
-	builtins        *val.PyDict
-	vmPool          sync.Pool
-	codeCache       sync.Map // maps canonical path or module name -> *CodeObject
-	singleflight    CompilerSingleflight
-	sharedModules   *val.PyDict
-	isSharedModules bool
-	searchPaths     []string
-	compileHook     func(src []byte) (*CodeObject, error)
-	virtualModules  sync.Map
-	asyncMode       AsyncMode
-	coroPool        sync.Pool
+	internPool         *val.InternPool
+	rootShape          *val.Shape
+	builtins           *val.PyDict
+	vmPool             sync.Pool
+	codeCache          sync.Map // maps canonical path or module name -> *CodeObject
+	singleflight       CompilerSingleflight
+	sharedModules      *val.PyDict
+	isSharedModules    bool
+	searchPaths        []string
+	compileHook        func(src []byte) (*CodeObject, error)
+	dynamicCompileHook func(src []byte, filename string, mode int) (*CodeObject, error)
+	virtualModules     sync.Map
+	asyncMode          AsyncMode
+	coroPool           sync.Pool
+	osPathMu           sync.Mutex
+	signals            sigState
+	stdStreams         [3]atomic.Pointer[val.Value]
+}
+
+var (
+	defaultDynamicCompileHook func(src []byte, filename string, mode int) (*CodeObject, error)
+)
+
+// SetDynamicCompileHook sets the global default callback for dynamic eval/exec compilation.
+func SetDynamicCompileHook(fn func(src []byte, filename string, mode int) (*CodeObject, error)) {
+	defaultDynamicCompileHook = fn
 }
 
 // NewEngine creates and initializes a shared Engine instance.
 func NewEngine() *Engine {
+	searchPaths := []string{"."}
+	if p := os.Getenv("FYTHONPATH"); p != "" {
+		for _, dir := range filepath.SplitList(p) {
+			if dir != "" {
+				searchPaths = append(searchPaths, dir)
+			}
+		}
+	} else if p := os.Getenv("PYTHONPATH"); p != "" {
+		for _, dir := range filepath.SplitList(p) {
+			if dir != "" {
+				searchPaths = append(searchPaths, dir)
+			}
+		}
+	}
+
 	e := &Engine{
-		internPool:  val.NewInternPool(256),
-		rootShape:   val.NewRootShape(),
-		builtins:    val.NewDictVal(64).AsDict(),
-		searchPaths: []string{"."},
-		asyncMode:   AsyncModeSingleThread,
+		internPool:         val.NewInternPool(256),
+		rootShape:          val.NewRootShape(),
+		builtins:           val.NewDictVal(64).AsDict(),
+		searchPaths:        searchPaths,
+		asyncMode:          AsyncModeSingleThread,
+		dynamicCompileHook: defaultDynamicCompileHook,
 	}
 	// Temporary bootstrap VM to populate e.builtins
 	bootVM := &VM{
@@ -77,6 +112,8 @@ func NewEngine() *Engine {
 		globals:  val.NewDictVal(16).AsDict(),
 	}
 	bootVM.initBuiltins()
+	builtinsDict := e.builtins
+	val.FunctionBuiltinsHook = func() val.Value { return val.DictVal(builtinsDict) }
 
 	e.sharedModules = e.newSysModules()
 
@@ -102,7 +139,61 @@ func (e *Engine) newSysModules() *val.PyDict {
 		pathItems[i] = val.NewStringVal(p)
 	}
 	sysMod.Dict.Set(val.InternString("path"), val.NewListVal(pathItems...))
-	sysMod.Dict.Set(val.InternString("version"), val.NewStringVal("Fython 3.14.0"))
+	sysMod.Dict.Set(val.InternString("version"), val.NewStringVal("3.14.0 (main, fython)"))
+	sysMod.Dict.Set(val.InternString("version_info"), val.NewTupleVal(val.Int64Val(3), val.Int64Val(14), val.Int64Val(0), val.InternString("final"), val.Int64Val(0)))
+	sysMod.Dict.Set(val.InternString("hexversion"), val.Int64Val(0x030e00f0))
+	sysMod.Dict.Set(val.InternString("platform"), val.InternString(runtime.GOOS))
+	sysMod.Dict.Set(val.InternString("byteorder"), val.InternString("little"))
+	sysMod.Dict.Set(val.InternString("maxsize"), val.Int64Val(9223372036854775807))
+	sysMod.Dict.Set(val.InternString("float_info"), newFloatInfo())
+	sysMod.Dict.Set(val.InternString("warnoptions"), val.NewListVal())
+	flags := val.NewInstanceOfType(val.ObjectType)
+	flags.AsInstance().SetAttr(val.InternString("context_aware_warnings"), val.Int64Val(0))
+	sysMod.Dict.Set(val.InternString("flags"), flags)
+
+	// Builtin module names
+	builtinNames := []val.Value{
+		val.InternString("sys"), val.InternString("builtins"), val.InternString("_abc"),
+		val.InternString("_collections"), val.InternString("itertools"), val.InternString("_functools"),
+		val.InternString("_operator"), val.InternString("operator"), val.InternString("_sre"),
+		val.InternString("re"), val.InternString("_types"), val.InternString("types"),
+		val.InternString("_io"), val.InternString("io"), val.InternString("os"),
+		val.InternString("time"), val.InternString("math"), val.InternString("json"),
+		val.InternString("gc"), val.InternString("_weakref"), val.InternString("weakref"),
+		val.InternString("traceback"), val.InternString("inspect"), val.InternString("asyncio"),
+		val.InternString("_thread"), val.InternString("_typing"), val.InternString("_colorize"),
+		val.InternString("_contextvars"), val.InternString("unicodedata"),
+	}
+	sysMod.Dict.Set(val.InternString("builtin_module_names"), val.NewTupleVal(builtinNames...))
+
+	// sys.intern(string)
+	sysMod.Dict.Set(val.InternString("intern"), val.NewBuiltinFuncVal("intern", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: intern() requires 1 argument")
+		}
+		return val.InternString(args[0].AsString())
+	}))
+
+	// sys.exit([code])
+	sysMod.Dict.Set(val.InternString("exit"), val.NewBuiltinFuncVal("exit", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		code := val.NoneVal()
+		var items []val.Value
+		if len(args) > 0 {
+			code = args[0]
+			items = []val.Value{code}
+		}
+		exc := val.NewException(val.SystemExitType, "")
+		inst := exc.AsInstance()
+		inst.SetAttr(val.InternString("args"), val.NewTupleVal(items...))
+		inst.SetAttr(val.InternString("code"), code)
+		panic(exc)
+	}))
+
+	// sys.stdout, stderr, stdin
+	ioMod := e.createIOModule()
+	sysMod.Dict.Set(val.InternString("stdout"), e.stdStream(1))
+	sysMod.Dict.Set(val.InternString("stderr"), e.stdStream(2))
+	sysMod.Dict.Set(val.InternString("stdin"), e.stdStream(0))
 
 	// sys._getframe([depth=0])
 	sysMod.Dict.Set(val.InternString("_getframe"), val.NewBuiltinFuncVal("_getframe", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -152,7 +243,8 @@ func (e *Engine) newSysModules() *val.PyDict {
 	modules.Set(val.InternString("math"), e.createMathModule())
 	modules.Set(val.InternString("time"), e.createTimeModule())
 	modules.Set(val.InternString("os"), e.createOSModule())
-	modules.Set(val.InternString("io"), e.createIOModule())
+	modules.Set(val.InternString("io"), ioMod)
+	modules.Set(val.InternString("_io"), ioMod)
 	modules.Set(val.InternString("asyncio"), e.createAsyncioModule())
 	modules.Set(val.InternString("_weakref"), e.createWeakrefCModule())
 	modules.Set(val.InternString("weakref"), e.createWeakrefModule())
@@ -160,21 +252,27 @@ func (e *Engine) newSysModules() *val.PyDict {
 	modules.Set(val.InternString("inspect"), e.createInspectModule())
 	modules.Set(val.InternString("gc"), e.createGCModule())
 	modules.Set(val.InternString("types"), e.createTypesModule())
+	modules.Set(val.InternString("_types"), e.createTypesModule())
+	modules.Set(val.InternString("_abc"), e.createABCModule())
+	modules.Set(val.InternString("_collections"), e.createCollectionsModule())
+	modules.Set(val.InternString("itertools"), e.createItertoolsModule())
+	modules.Set(val.InternString("_functools"), e.createFunctoolsModule())
+	modules.Set(val.InternString("operator"), e.createOperatorModule())
+	modules.Set(val.InternString("_operator"), e.createOperatorModule())
+	modules.Set(val.InternString("_sre"), e.createSREModule())
+	modules.Set(val.InternString("unicodedata"), e.createUnicodedataModule())
+	modules.Set(val.InternString("re"), e.createReModule())
+	modules.Set(val.InternString("_ast"), e.createASTModule())
+	modules.Set(val.InternString("_thread"), e.createThreadModule())
+	modules.Set(val.InternString("_typing"), e.createTypingModule())
+	modules.Set(val.InternString("_colorize"), e.createColorizeModule())
+	modules.Set(val.InternString("_contextvars"), e.createContextVarsModule())
+	modules.Set(val.InternString("_signal"), e.createSignalModule())
+	modules.Set(val.InternString("errno"), e.createErrnoModule())
+	modules.Set(val.InternString("gettext"), e.createGettextModule())
+	modules.Set(val.InternString("shutil"), e.createShutilModule())
 
 	return modules
-}
-
-func (e *Engine) createTypesModule() val.Value {
-	modVal := val.NewModuleVal("types", "")
-	mod := modVal.AsModule()
-	mod.Dict.Set(val.InternString("FunctionType"), val.TypeVal(val.FunctionType))
-	mod.Dict.Set(val.InternString("BuiltinFunctionType"), val.TypeVal(val.BuiltinFuncType))
-	mod.Dict.Set(val.InternString("MethodType"), val.TypeVal(val.BoundMethodType))
-	mod.Dict.Set(val.InternString("ModuleType"), val.TypeVal(val.ModuleType))
-	mod.Dict.Set(val.InternString("TracebackType"), val.TypeVal(val.TracebackType))
-	mod.Dict.Set(val.InternString("FrameType"), val.TypeVal(val.FrameType))
-	mod.Dict.Set(val.InternString("CodeType"), val.TypeVal(val.CodeType))
-	return modVal
 }
 
 // SetAsyncMode sets the coroutine scheduling strategy for this Engine.
@@ -210,6 +308,7 @@ func (e *Engine) newVMInternal(stackCap, frameCap int) *VM {
 		globals:    val.NewDictVal(64).AsDict(),
 		builtins:   e.builtins,
 		modules:    modules,
+		context:    val.NewPyContext(),
 	}
 	v.rootCache = VMCodeCache{
 		ic:        v.ic,
@@ -219,6 +318,11 @@ func (e *Engine) newVMInternal(stackCap, frameCap int) *VM {
 	v.execCtx.Stack = v.stack
 	v.execCtx.CallHook = v.callFromHook
 	v.execCtx.VM = v
+	if !e.isSharedModules {
+		mainModVal := val.NewModuleVal("__main__", "")
+		mainModVal.AsModule().Dict = v.globals
+		modules.Set(val.InternString("__main__"), mainModVal)
+	}
 	return v
 }
 
@@ -229,6 +333,7 @@ func (e *Engine) AcquireVM() *VM {
 
 // ReleaseVM resets a *VM and returns it to the Engine's sync.Pool.
 func (e *Engine) ReleaseVM(v *VM) {
+	e.signals.owner.CompareAndSwap(v, nil)
 	v.Reset()
 	e.vmPool.Put(v)
 }
@@ -284,7 +389,56 @@ func (e *Engine) SetCompileHook(fn func(src []byte) (*CodeObject, error)) {
 	e.compileHook = fn
 }
 
+// SetDynamicCompileHook sets the source compilation callback for eval/exec.
+func (e *Engine) SetDynamicCompileHook(fn func(src []byte, filename string, mode int) (*CodeObject, error)) {
+	e.dynamicCompileHook = fn
+}
+
+// CompileDynamic compiles Python source bytes dynamically using the configured hook.
+func (e *Engine) CompileDynamic(src []byte, filename string, mode int) (*CodeObject, error) {
+	if e.dynamicCompileHook != nil {
+		return e.dynamicCompileHook(src, filename, mode)
+	}
+	if defaultDynamicCompileHook != nil {
+		return defaultDynamicCompileHook(src, filename, mode)
+	}
+	return nil, fmt.Errorf("Engine: dynamic compilation hook not set")
+}
+
 // RegisterVirtualModule registers in-memory source code under the given module name.
 func (e *Engine) RegisterVirtualModule(name string, src string) {
 	e.virtualModules.Store(name, src)
+}
+
+// stdStream returns the shared sys.stdin/stdout/stderr file object for fd.
+func (e *Engine) stdStream(fd int) val.Value {
+	if p := e.stdStreams[fd].Load(); p != nil {
+		return *p
+	}
+	files := [3]*os.File{os.Stdin, os.Stdout, os.Stderr}
+	names := [3]string{"<stdin>", "<stdout>", "<stderr>"}
+	v := newStdStream(files[fd], names[fd], fd != 0)
+	if e.stdStreams[fd].CompareAndSwap(nil, &v) {
+		return v
+	}
+	return *e.stdStreams[fd].Load()
+}
+
+// newFloatInfo builds sys.float_info (IEEE 754 double).
+func newFloatInfo() val.Value {
+	info := val.NewInstanceOfType(val.ObjectType)
+	inst := info.AsInstance()
+	set := func(name string, v val.Value) { inst.SetAttr(val.InternString(name), v) }
+	set("max", val.Float64Val(math.MaxFloat64))
+	set("max_exp", val.Int64Val(1024))
+	set("max_10_exp", val.Int64Val(308))
+	set("min", val.Float64Val(2.2250738585072014e-308))
+	set("min_exp", val.Int64Val(-1021))
+	set("min_10_exp", val.Int64Val(-307))
+	set("dig", val.Int64Val(15))
+	set("mant_dig", val.Int64Val(53))
+	set("epsilon", val.Float64Val(2.220446049250313e-16))
+	set("radix", val.Int64Val(2))
+	set("rounds", val.Int64Val(1))
+	return info
 }
