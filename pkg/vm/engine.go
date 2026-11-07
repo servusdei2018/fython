@@ -146,9 +146,12 @@ func (e *Engine) newSysModules() *val.PyDict {
 	sysMod.Dict.Set(val.InternString("byteorder"), val.InternString("little"))
 	sysMod.Dict.Set(val.InternString("maxsize"), val.Int64Val(9223372036854775807))
 	sysMod.Dict.Set(val.InternString("float_info"), newFloatInfo())
+	sysMod.Dict.Set(val.InternString("hash_info"), newHashInfo())
 	sysMod.Dict.Set(val.InternString("warnoptions"), val.NewListVal())
 	flags := val.NewInstanceOfType(val.ObjectType)
 	flags.AsInstance().SetAttr(val.InternString("context_aware_warnings"), val.Int64Val(0))
+	flags.AsInstance().SetAttr(val.InternString("warn_default_encoding"), val.Int64Val(0))
+	flags.AsInstance().SetAttr(val.InternString("utf8_mode"), val.Int64Val(1))
 	sysMod.Dict.Set(val.InternString("flags"), flags)
 
 	// Builtin module names
@@ -235,6 +238,16 @@ func (e *Engine) newSysModules() *val.PyDict {
 		return val.NewTupleVal(val.TypeVal(lastExc.Type()), lastExc, tb)
 	}))
 
+	// sys.exception() -> value
+	sysMod.Dict.Set(val.InternString("exception"), val.NewBuiltinFuncVal("exception", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		vmInstance := ctx.VM.(*VM)
+		lastExc := vmInstance.lastException
+		if lastExc.IsNone() || lastExc.HeaderPtr() == nil {
+			return val.NoneVal()
+		}
+		return lastExc
+	}))
+
 	modules.Set(val.InternString("sys"), sysModVal)
 
 	// 2. Built-in builtins module
@@ -277,6 +290,13 @@ func (e *Engine) newSysModules() *val.PyDict {
 	posixMod := e.createPosixModule()
 	modules.Set(val.InternString("posix"), posixMod)
 	modules.Set(val.InternString("nt"), posixMod)
+	modules.Set(val.InternString("_posixsubprocess"), e.createPosixSubprocessModule())
+	modules.Set(val.InternString("select"), e.createSelectModule())
+	modules.Set(val.InternString("_string"), e.createStringModule())
+	modules.Set(val.InternString("_codecs"), e.createCodecsModule())
+	modules.Set(val.InternString("_socket"), e.createSocketModule())
+	modules.Set(val.InternString("_ssl"), e.createSSLModule())
+	modules.Set(val.InternString("_sqlite3"), e.createSqlite3Module())
 	modules.Set(val.InternString("_random"), e.createRandomModule())
 	modules.Set(val.InternString("_datetime"), e.createDateTimeModule())
 	modules.Set(val.InternString("binascii"), e.createBinasciiModule())
@@ -286,6 +306,9 @@ func (e *Engine) newSysModules() *val.PyDict {
 	modules.Set(val.InternString("zlib"), e.createZlibModule())
 	modules.Set(val.InternString("errno"), e.createErrnoModule())
 	modules.Set(val.InternString("gettext"), e.createGettextModule())
+	localeMod := e.createLocaleModule()
+	modules.Set(val.InternString("locale"), localeMod)
+	modules.Set(val.InternString("_locale"), localeMod)
 	importlibMod := e.createImportlibModule()
 	modules.Set(val.InternString("importlib"), importlibMod)
 	if utilVal, ok := importlibMod.AsModule().Dict.Get(val.InternString("util")); ok {
@@ -293,6 +316,29 @@ func (e *Engine) newSysModules() *val.PyDict {
 	}
 
 	return modules
+}
+
+func (e *Engine) createLocaleModule() val.Value {
+	modVal := val.NewModuleVal("locale", "Locale support")
+	mod := modVal.AsModule()
+	mod.Dict.Set(val.InternString("getencoding"), val.NewBuiltinFuncVal("getencoding", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.NewStringVal("utf-8")
+	}))
+	mod.Dict.Set(val.InternString("getpreferredencoding"), val.NewBuiltinFuncVal("getpreferredencoding", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.NewStringVal("utf-8")
+	}))
+	mod.Dict.Set(val.InternString("setlocale"), val.NewBuiltinFuncVal("setlocale", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.NewStringVal("C")
+	}))
+	mod.Dict.Set(val.InternString("LC_ALL"), val.Int64Val(0))
+	mod.Dict.Set(val.InternString("LC_CTYPE"), val.Int64Val(1))
+	mod.Dict.Set(val.InternString("LC_NUMERIC"), val.Int64Val(2))
+	mod.Dict.Set(val.InternString("LC_TIME"), val.Int64Val(3))
+	mod.Dict.Set(val.InternString("LC_COLLATE"), val.Int64Val(4))
+	mod.Dict.Set(val.InternString("LC_MONETARY"), val.Int64Val(5))
+	mod.Dict.Set(val.InternString("LC_MESSAGES"), val.Int64Val(6))
+	mod.Dict.Set(val.InternString("Error"), val.TypeVal(val.ValueErrorType))
+	return modVal
 }
 
 func (e *Engine) createImportlibModule() val.Value {
@@ -499,5 +545,21 @@ func newFloatInfo() val.Value {
 	set("epsilon", val.Float64Val(2.220446049250313e-16))
 	set("radix", val.Int64Val(2))
 	set("rounds", val.Int64Val(1))
+	return info
+}
+
+func newHashInfo() val.Value {
+	info := val.NewInstanceOfType(val.ObjectType)
+	inst := info.AsInstance()
+	set := func(name string, v val.Value) { inst.SetAttr(val.InternString(name), v) }
+	set("width", val.Int64Val(64))
+	set("modulus", val.Int64Val(2305843009213693951))
+	set("inf", val.Int64Val(314159))
+	set("nan", val.Int64Val(0))
+	set("imag", val.Int64Val(1000003))
+	set("algorithm", val.InternString("siphash13"))
+	set("hash_bits", val.Int64Val(64))
+	set("seed_bits", val.Int64Val(128))
+	set("cutoff", val.Int64Val(0))
 	return info
 }

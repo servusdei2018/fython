@@ -12,11 +12,11 @@ import (
 
 const (
 	// DefaultStackSize is the default pre-allocated Value slab capacity per VM instance.
-	DefaultStackSize = 4096
+	DefaultStackSize = 65536
 	// DefaultFrameSlabSize is the default pre-allocated CallFrame slab capacity per VM instance.
 	DefaultFrameSlabSize = 256
 	// DefaultICSlabSize is the default pre-allocated Inline Cache side-table capacity per VM instance.
-	DefaultICSlabSize = 4096
+	DefaultICSlabSize = 65536
 )
 
 // ICKind identifies the cached resolution category in an ICSlot.
@@ -529,7 +529,7 @@ func (defaultCodeInspector) Doc(code val.Value) val.Value {
 
 var standaloneVMPool = sync.Pool{
 	New: func() any {
-		return NewVMWithCapacity(512, 32)
+		return NewVM()
 	},
 }
 

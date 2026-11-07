@@ -2,6 +2,7 @@ package vm
 
 import (
 	"bufio"
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -168,6 +169,81 @@ func initIOTypes() {
 			return val.NoneVal()
 		}))
 
+		BytesIOType.Dict.Set(val.InternString("readline"), val.NewBuiltinFuncVal("readline", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			bio := (*pyBytesIO)(val.AsPointer(args[0]))
+			bio.mu.Lock()
+			defer bio.mu.Unlock()
+			if bio.pos >= len(bio.buf) {
+				return val.NewBytesVal(nil)
+			}
+			start := bio.pos
+			nl := -1
+			for i := start; i < len(bio.buf); i++ {
+				if bio.buf[i] == '\n' {
+					nl = i
+					break
+				}
+			}
+			if nl >= 0 {
+				bio.pos = nl + 1
+				res := make([]byte, nl+1-start)
+				copy(res, bio.buf[start:nl+1])
+				return val.NewBytesVal(res)
+			}
+			bio.pos = len(bio.buf)
+			res := make([]byte, len(bio.buf)-start)
+			copy(res, bio.buf[start:])
+			return val.NewBytesVal(res)
+		}))
+
+		BytesIOType.Dict.Set(val.InternString("readlines"), val.NewBuiltinFuncVal("readlines", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			bio := (*pyBytesIO)(val.AsPointer(args[0]))
+			bio.mu.Lock()
+			defer bio.mu.Unlock()
+			var lines []val.Value
+			for bio.pos < len(bio.buf) {
+				start := bio.pos
+				nl := -1
+				for i := start; i < len(bio.buf); i++ {
+					if bio.buf[i] == '\n' {
+						nl = i
+						break
+					}
+				}
+				if nl >= 0 {
+					bio.pos = nl + 1
+					res := make([]byte, nl+1-start)
+					copy(res, bio.buf[start:nl+1])
+					lines = append(lines, val.NewBytesVal(res))
+				} else {
+					bio.pos = len(bio.buf)
+					res := make([]byte, len(bio.buf)-start)
+					copy(res, bio.buf[start:])
+					lines = append(lines, val.NewBytesVal(res))
+				}
+			}
+			return val.NewListVal(lines...)
+		}))
+
+		BytesIOType.Dict.Set(val.InternString("truncate"), val.NewBuiltinFuncVal("truncate", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			bio := (*pyBytesIO)(val.AsPointer(args[0]))
+			bio.mu.Lock()
+			defer bio.mu.Unlock()
+			size := bio.pos
+			if len(args) > 1 && !args[1].IsNone() && args[1].IsInt64() {
+				size = int(args[1].AsInt64())
+			}
+			if size < 0 {
+				panic("ValueError: Negative size not allowed")
+			}
+			if size < len(bio.buf) {
+				bio.buf = bio.buf[:size]
+			} else if size > len(bio.buf) {
+				bio.buf = append(bio.buf, make([]byte, size-len(bio.buf))...)
+			}
+			return val.Int64Val(int64(len(bio.buf)))
+		}))
+
 		// StringIO
 		StringIOType = val.MustNewType("StringIO", []*val.PyType{val.ObjectType}, nil)
 		StringIOType.Dict.Set(val.InternString("read"), val.NewBuiltinFuncVal("read", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -322,6 +398,50 @@ func initIOTypes() {
 			}
 			sio.pos = len(sio.buf)
 			return val.NewStringVal(string(sio.buf[start:]))
+		}))
+
+		StringIOType.Dict.Set(val.InternString("readlines"), val.NewBuiltinFuncVal("readlines", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			sio := (*pyStringIO)(val.AsPointer(args[0]))
+			sio.mu.Lock()
+			defer sio.mu.Unlock()
+			var lines []val.Value
+			for sio.pos < len(sio.buf) {
+				start := sio.pos
+				nl := -1
+				for i := start; i < len(sio.buf); i++ {
+					if sio.buf[i] == '\n' {
+						nl = i
+						break
+					}
+				}
+				if nl >= 0 {
+					sio.pos = nl + 1
+					lines = append(lines, val.NewStringVal(string(sio.buf[start:nl+1])))
+				} else {
+					sio.pos = len(sio.buf)
+					lines = append(lines, val.NewStringVal(string(sio.buf[start:])))
+				}
+			}
+			return val.NewListVal(lines...)
+		}))
+
+		StringIOType.Dict.Set(val.InternString("truncate"), val.NewBuiltinFuncVal("truncate", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			sio := (*pyStringIO)(val.AsPointer(args[0]))
+			sio.mu.Lock()
+			defer sio.mu.Unlock()
+			size := sio.pos
+			if len(args) > 1 && !args[1].IsNone() && args[1].IsInt64() {
+				size = int(args[1].AsInt64())
+			}
+			if size < 0 {
+				panic("ValueError: Negative size not allowed")
+			}
+			if size < len(sio.buf) {
+				sio.buf = sio.buf[:size]
+			} else if size > len(sio.buf) {
+				sio.buf = append(sio.buf, make([]byte, size-len(sio.buf))...)
+			}
+			return val.Int64Val(int64(len(sio.buf)))
 		}))
 
 		StringIOType.Slots.TpIter = func(ctx *val.ExecContext, o val.Value) val.Value {
@@ -546,6 +666,12 @@ func initIOTypes() {
 			return val.NoneVal()
 		}))
 
+		FileType.Dict.Set(val.InternString("encoding"), val.NewStringVal("utf-8"))
+		FileType.Dict.Set(val.InternString("errors"), val.NewStringVal("strict"))
+		FileType.Dict.Set(val.InternString("closed"), val.BoolVal(false))
+		FileType.Dict.Set(val.InternString("mode"), val.NewStringVal("r"))
+		FileType.Dict.Set(val.InternString("name"), val.NewStringVal(""))
+
 		FileType.Dict.Set(val.InternString("isatty"), val.NewBuiltinFuncVal("isatty", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			pf := (*pyFile)(val.AsPointer(args[0]))
 			if pf.f == nil {
@@ -596,11 +722,28 @@ func initIOTypes() {
 			}
 			return val.NoneVal()
 		}))
+
+		FileType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) == 0 {
+				panic("TypeError: TextIOWrapper() missing required argument 'buffer'")
+			}
+			bufVal := args[0]
+			if bufVal.Type() == FileType {
+				pf := (*pyFile)(val.AsPointer(bufVal))
+				pf.binary = false
+				return bufVal
+			}
+			return bufVal
+		}
 	})
 }
 
 // openFileBuiltin opens a file and returns a Python File Value.
 func openFileBuiltin(file string, mode string) val.Value {
+	return openFileBuiltinVal(val.NewStringVal(file), mode)
+}
+
+func openFileBuiltinVal(fileVal val.Value, mode string) val.Value {
 	initIOTypes()
 	if mode == "" {
 		mode = "r"
@@ -608,17 +751,31 @@ func openFileBuiltin(file string, mode string) val.Value {
 	flag := os.O_RDONLY
 	binary := strings.Contains(mode, "b")
 
-	if strings.Contains(mode, "w") {
-		flag = os.O_CREATE | os.O_WRONLY | os.O_TRUNC
-	} else if strings.Contains(mode, "a") {
-		flag = os.O_CREATE | os.O_WRONLY | os.O_APPEND
-	} else if strings.Contains(mode, "+") {
-		flag = os.O_RDWR
-	}
-
-	f, err := os.OpenFile(file, flag, 0666)
-	if err != nil {
-		panic("FileNotFoundError: " + err.Error())
+	var f *os.File
+	var err error
+	if fileVal.IsInt64() {
+		fd := int(fileVal.AsInt64())
+		fdMutex.Lock()
+		existing, ok := fdMap[fd]
+		fdMutex.Unlock()
+		if ok {
+			f = existing
+		} else {
+			f = os.NewFile(uintptr(fd), fmt.Sprintf("<fdopen %d>", fd))
+		}
+	} else {
+		if strings.Contains(mode, "w") {
+			flag = os.O_CREATE | os.O_WRONLY | os.O_TRUNC
+		} else if strings.Contains(mode, "a") {
+			flag = os.O_CREATE | os.O_WRONLY | os.O_APPEND
+		} else if strings.Contains(mode, "+") {
+			flag = os.O_RDWR
+		}
+		pathStr := fileVal.AsString()
+		f, err = os.OpenFile(pathStr, flag, 0666)
+		if err != nil {
+			panic("FileNotFoundError: " + err.Error())
+		}
 	}
 
 	var writeBuf []byte
@@ -735,15 +892,438 @@ func (e *Engine) createIOModule() val.Value {
 	ioBaseType.Dict.Set(val.InternString("writable"), val.NewBuiltinFuncVal("writable", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		return val.BoolVal(false)
 	}))
+	ioBaseType.Dict.Set(val.InternString("_checkClosed"), val.NewBuiltinFuncVal("_checkClosed", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) > 0 {
+			clVal := val.GetAttrCtx(ctx, args[0], val.InternString("closed"))
+			if clVal.IsTruthy() {
+				panic("ValueError: I/O operation on closed file.")
+			}
+		}
+		return val.NoneVal()
+	}))
+	ioBaseType.Dict.Set(val.InternString("_checkReadable"), val.NewBuiltinFuncVal("_checkReadable", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) > 0 {
+			if fn, _, ok := args[0].Type().LookupMRO(val.InternString("readable")); ok {
+				res := ctx.Invoke1(fn, args[0])
+				if !res.IsTruthy() {
+					panic("OSError: File or stream is not readable.")
+				}
+			}
+		}
+		return val.NoneVal()
+	}))
+	ioBaseType.Dict.Set(val.InternString("_checkWritable"), val.NewBuiltinFuncVal("_checkWritable", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) > 0 {
+			if fn, _, ok := args[0].Type().LookupMRO(val.InternString("writable")); ok {
+				res := ctx.Invoke1(fn, args[0])
+				if !res.IsTruthy() {
+					panic("OSError: File or stream is not writable.")
+				}
+			}
+		}
+		return val.NoneVal()
+	}))
+	ioBaseType.Dict.Set(val.InternString("_checkSeekable"), val.NewBuiltinFuncVal("_checkSeekable", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) > 0 {
+			if fn, _, ok := args[0].Type().LookupMRO(val.InternString("seekable")); ok {
+				res := ctx.Invoke1(fn, args[0])
+				if !res.IsTruthy() {
+					panic("OSError: File or stream is not seekable.")
+				}
+			}
+		}
+		return val.NoneVal()
+	}))
 
 	rawIOBaseType := val.MustNewType("RawIOBase", []*val.PyType{ioBaseType}, nil)
 	bufferedIOBaseType := val.MustNewType("BufferedIOBase", []*val.PyType{ioBaseType}, nil)
 	textIOBaseType := val.MustNewType("TextIOBase", []*val.PyType{ioBaseType}, nil)
 
+	// BufferedReader
+	bufferedReaderType := val.MustNewType("BufferedReader", []*val.PyType{bufferedIOBaseType}, nil)
+	bufferedReaderType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) == 0 {
+			panic("TypeError: BufferedReader() missing required argument 'raw'")
+		}
+		inst := val.NewInstanceOfType(bufferedReaderType)
+		inst.AsInstance().SetAttr(val.InternString("raw"), args[0])
+		return inst
+	}
+	bufferedReaderType.Dict.Set(val.InternString("read"), val.NewBuiltinFuncVal("read", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) == 0 {
+			panic("TypeError: read() missing self")
+		}
+		rawVal, _ := args[0].AsInstance().GetAttr(val.InternString("raw"))
+		size := -1
+		if len(args) > 1 && !args[1].IsNone() {
+			size = int(args[1].AsInt64())
+		}
+		readintoFn, _, hasReadinto := rawVal.Type().LookupMRO(val.InternString("readinto"))
+		if hasReadinto {
+			if size >= 0 {
+				buf := val.NewByteArrayVal(make([]byte, size))
+				nVal := ctx.Invoke2(readintoFn, rawVal, buf)
+				n := int(nVal.AsInt64())
+				return val.NewBytesVal(buf.AsByteArray().Data[:n])
+			}
+			var accumulated []byte
+			for {
+				chunk := val.NewByteArrayVal(make([]byte, 8192))
+				nVal := ctx.Invoke2(readintoFn, rawVal, chunk)
+				if nVal.IsNone() || nVal.AsInt64() == 0 {
+					break
+				}
+				n := int(nVal.AsInt64())
+				accumulated = append(accumulated, chunk.AsByteArray().Data[:n]...)
+			}
+			return val.NewBytesVal(accumulated)
+		}
+		if readFn, _, hasRead := rawVal.Type().LookupMRO(val.InternString("read")); hasRead {
+			if size >= 0 {
+				return ctx.Invoke2(readFn, rawVal, val.Int64Val(int64(size)))
+			}
+			return ctx.Invoke1(readFn, rawVal)
+		}
+		panic("AttributeError: raw object has no read or readinto")
+	}))
+	bufferedReaderType.Dict.Set(val.InternString("readline"), val.NewBuiltinFuncVal("readline", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) == 0 {
+			panic("TypeError: readline() missing self")
+		}
+		rawVal, _ := args[0].AsInstance().GetAttr(val.InternString("raw"))
+		readintoFn, _, hasReadinto := rawVal.Type().LookupMRO(val.InternString("readinto"))
+		var line []byte
+		if hasReadinto {
+			oneByte := val.NewByteArrayVal(make([]byte, 1))
+			for {
+				nVal := ctx.Invoke2(readintoFn, rawVal, oneByte)
+				if nVal.IsNone() || nVal.AsInt64() == 0 {
+					break
+				}
+				b := oneByte.AsByteArray().Data[0]
+				line = append(line, b)
+				if b == '\n' {
+					break
+				}
+			}
+		}
+		return val.NewBytesVal(line)
+	}))
+	bufferedReaderType.Dict.Set(val.InternString("readinto"), val.NewBuiltinFuncVal("readinto", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 2 {
+			panic("TypeError: readinto() takes 1 argument")
+		}
+		rawVal, _ := args[0].AsInstance().GetAttr(val.InternString("raw"))
+		if fn, _, ok := rawVal.Type().LookupMRO(val.InternString("readinto")); ok {
+			return ctx.Invoke2(fn, rawVal, args[1])
+		}
+		panic("AttributeError: raw object has no readinto")
+	}))
+	bufferedReaderType.Dict.Set(val.InternString("flush"), val.NewBuiltinFuncVal("flush", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) > 0 {
+			if rawVal, ok := args[0].AsInstance().GetAttr(val.InternString("raw")); ok {
+				if fn, _, has := rawVal.Type().LookupMRO(val.InternString("flush")); has {
+					return ctx.Invoke1(fn, rawVal)
+				}
+			}
+		}
+		return val.NoneVal()
+	}))
+	bufferedReaderType.Dict.Set(val.InternString("close"), val.NewBuiltinFuncVal("close", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) > 0 {
+			if rawVal, ok := args[0].AsInstance().GetAttr(val.InternString("raw")); ok {
+				if fn, _, has := rawVal.Type().LookupMRO(val.InternString("close")); has {
+					return ctx.Invoke1(fn, rawVal)
+				}
+			}
+		}
+		return val.NoneVal()
+	}))
+	bufferedReaderType.Dict.Set(val.InternString("fileno"), val.NewBuiltinFuncVal("fileno", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) > 0 {
+			if rawVal, ok := args[0].AsInstance().GetAttr(val.InternString("raw")); ok {
+				if fn, _, has := rawVal.Type().LookupMRO(val.InternString("fileno")); has {
+					return ctx.Invoke1(fn, rawVal)
+				}
+			}
+		}
+		panic("UnsupportedOperation: fileno")
+	}))
+	bufferedReaderType.Dict.Set(val.InternString("readable"), val.NewBuiltinFuncVal("readable", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.BoolVal(true)
+	}))
+	bufferedReaderType.Dict.Set(val.InternString("writable"), val.NewBuiltinFuncVal("writable", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.BoolVal(false)
+	}))
+	bufferedReaderType.Dict.Set(val.InternString("closed"), val.NewPropertyVal(
+		val.NewBuiltinFuncVal("closed", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) > 0 {
+				if rawVal, ok := args[0].AsInstance().GetAttr(val.InternString("raw")); ok {
+					return val.GetAttrCtx(ctx, rawVal, val.InternString("closed"))
+				}
+			}
+			return val.BoolVal(false)
+		}),
+		val.NoneVal(),
+		val.NoneVal(),
+	))
+
+	// BufferedWriter
+	bufferedWriterType := val.MustNewType("BufferedWriter", []*val.PyType{bufferedIOBaseType}, nil)
+	bufferedWriterType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) == 0 {
+			panic("TypeError: BufferedWriter() missing required argument 'raw'")
+		}
+		inst := val.NewInstanceOfType(bufferedWriterType)
+		inst.AsInstance().SetAttr(val.InternString("raw"), args[0])
+		return inst
+	}
+	bufferedWriterType.Dict.Set(val.InternString("write"), val.NewBuiltinFuncVal("write", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 2 {
+			panic("TypeError: write() takes 1 argument")
+		}
+		rawVal, _ := args[0].AsInstance().GetAttr(val.InternString("raw"))
+		if fn, _, ok := rawVal.Type().LookupMRO(val.InternString("write")); ok {
+			return ctx.Invoke2(fn, rawVal, args[1])
+		}
+		panic("AttributeError: raw object has no write")
+	}))
+	bufferedWriterType.Dict.Set(val.InternString("flush"), val.NewBuiltinFuncVal("flush", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) > 0 {
+			if rawVal, ok := args[0].AsInstance().GetAttr(val.InternString("raw")); ok {
+				if fn, _, has := rawVal.Type().LookupMRO(val.InternString("flush")); has {
+					return ctx.Invoke1(fn, rawVal)
+				}
+			}
+		}
+		return val.NoneVal()
+	}))
+	bufferedWriterType.Dict.Set(val.InternString("close"), val.NewBuiltinFuncVal("close", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) > 0 {
+			if rawVal, ok := args[0].AsInstance().GetAttr(val.InternString("raw")); ok {
+				if fn, _, has := rawVal.Type().LookupMRO(val.InternString("close")); has {
+					return ctx.Invoke1(fn, rawVal)
+				}
+			}
+		}
+		return val.NoneVal()
+	}))
+	bufferedWriterType.Dict.Set(val.InternString("fileno"), val.NewBuiltinFuncVal("fileno", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) > 0 {
+			if rawVal, ok := args[0].AsInstance().GetAttr(val.InternString("raw")); ok {
+				if fn, _, has := rawVal.Type().LookupMRO(val.InternString("fileno")); has {
+					return ctx.Invoke1(fn, rawVal)
+				}
+			}
+		}
+		panic("UnsupportedOperation: fileno")
+	}))
+	bufferedWriterType.Dict.Set(val.InternString("readable"), val.NewBuiltinFuncVal("readable", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.BoolVal(false)
+	}))
+	bufferedWriterType.Dict.Set(val.InternString("writable"), val.NewBuiltinFuncVal("writable", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.BoolVal(true)
+	}))
+	bufferedWriterType.Dict.Set(val.InternString("closed"), val.NewPropertyVal(
+		val.NewBuiltinFuncVal("closed", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) > 0 {
+				if rawVal, ok := args[0].AsInstance().GetAttr(val.InternString("raw")); ok {
+					return val.GetAttrCtx(ctx, rawVal, val.InternString("closed"))
+				}
+			}
+			return val.BoolVal(false)
+		}),
+		val.NoneVal(),
+		val.NoneVal(),
+	))
+
+	// BufferedRWPair
+	bufferedRWPairType := val.MustNewType("BufferedRWPair", []*val.PyType{bufferedIOBaseType}, nil)
+	bufferedRWPairType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 2 {
+			panic("TypeError: BufferedRWPair() takes at least 2 arguments")
+		}
+		inst := val.NewInstanceOfType(bufferedRWPairType)
+		inst.AsInstance().SetAttr(val.InternString("reader"), args[0])
+		inst.AsInstance().SetAttr(val.InternString("writer"), args[1])
+		return inst
+	}
+	bufferedRWPairType.Dict.Set(val.InternString("read"), val.NewBuiltinFuncVal("read", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		rVal, _ := args[0].AsInstance().GetAttr(val.InternString("reader"))
+		if fn, _, ok := rVal.Type().LookupMRO(val.InternString("read")); ok {
+			if len(args) > 1 {
+				return ctx.Invoke2(fn, rVal, args[1])
+			}
+			return ctx.Invoke1(fn, rVal)
+		}
+		panic("AttributeError: reader has no read")
+	}))
+	bufferedRWPairType.Dict.Set(val.InternString("readline"), val.NewBuiltinFuncVal("readline", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		rVal, _ := args[0].AsInstance().GetAttr(val.InternString("reader"))
+		if fn, _, ok := rVal.Type().LookupMRO(val.InternString("readline")); ok {
+			if len(args) > 1 {
+				return ctx.Invoke2(fn, rVal, args[1])
+			}
+			return ctx.Invoke1(fn, rVal)
+		}
+		panic("AttributeError: reader has no readline")
+	}))
+	bufferedRWPairType.Dict.Set(val.InternString("write"), val.NewBuiltinFuncVal("write", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		wVal, _ := args[0].AsInstance().GetAttr(val.InternString("writer"))
+		if fn, _, ok := wVal.Type().LookupMRO(val.InternString("write")); ok {
+			return ctx.Invoke2(fn, wVal, args[1])
+		}
+		panic("AttributeError: writer has no write")
+	}))
+	bufferedRWPairType.Dict.Set(val.InternString("flush"), val.NewBuiltinFuncVal("flush", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		wVal, _ := args[0].AsInstance().GetAttr(val.InternString("writer"))
+		if fn, _, ok := wVal.Type().LookupMRO(val.InternString("flush")); ok {
+			return ctx.Invoke1(fn, wVal)
+		}
+		return val.NoneVal()
+	}))
+	bufferedRWPairType.Dict.Set(val.InternString("close"), val.NewBuiltinFuncVal("close", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		rVal, _ := args[0].AsInstance().GetAttr(val.InternString("reader"))
+		wVal, _ := args[0].AsInstance().GetAttr(val.InternString("writer"))
+		if fn, _, ok := rVal.Type().LookupMRO(val.InternString("close")); ok {
+			ctx.Invoke1(fn, rVal)
+		}
+		if fn, _, ok := wVal.Type().LookupMRO(val.InternString("close")); ok {
+			ctx.Invoke1(fn, wVal)
+		}
+		return val.NoneVal()
+	}))
+	bufferedRWPairType.Dict.Set(val.InternString("fileno"), val.NewBuiltinFuncVal("fileno", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		wVal, _ := args[0].AsInstance().GetAttr(val.InternString("writer"))
+		if fn, _, ok := wVal.Type().LookupMRO(val.InternString("fileno")); ok {
+			return ctx.Invoke1(fn, wVal)
+		}
+		panic("UnsupportedOperation: fileno")
+	}))
+	bufferedRWPairType.Dict.Set(val.InternString("readable"), val.NewBuiltinFuncVal("readable", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.BoolVal(true)
+	}))
+	bufferedRWPairType.Dict.Set(val.InternString("writable"), val.NewBuiltinFuncVal("writable", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.BoolVal(true)
+	}))
+	bufferedRWPairType.Dict.Set(val.InternString("closed"), val.NewPropertyVal(
+		val.NewBuiltinFuncVal("closed", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) > 0 {
+				if wVal, ok := args[0].AsInstance().GetAttr(val.InternString("writer")); ok {
+					return val.GetAttrCtx(ctx, wVal, val.InternString("closed"))
+				}
+			}
+			return val.BoolVal(false)
+		}),
+		val.NoneVal(),
+		val.NoneVal(),
+	))
+
+	// TextIOWrapper
+	textIOWrapperType := val.MustNewType("TextIOWrapper", []*val.PyType{textIOBaseType}, nil)
+	textIOWrapperType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) == 0 {
+			panic("TypeError: TextIOWrapper() missing required argument 'buffer'")
+		}
+		bufVal := args[0]
+		if bufVal.Type() == FileType {
+			pf := (*pyFile)(val.AsPointer(bufVal))
+			pf.binary = false
+			return bufVal
+		}
+		enc := "utf-8"
+		if len(args) > 1 && !args[1].IsNone() {
+			enc = args[1].AsString()
+		}
+		inst := val.NewInstanceOfType(textIOWrapperType)
+		inst.AsInstance().SetAttr(val.InternString("buffer"), bufVal)
+		inst.AsInstance().SetAttr(val.InternString("encoding"), val.NewStringVal(enc))
+		return inst
+	}
+	textIOWrapperType.Dict.Set(val.InternString("read"), val.NewBuiltinFuncVal("read", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		bufVal, _ := args[0].AsInstance().GetAttr(val.InternString("buffer"))
+		var res val.Value
+		if fn, _, ok := bufVal.Type().LookupMRO(val.InternString("read")); ok {
+			if len(args) > 1 {
+				res = ctx.Invoke2(fn, bufVal, args[1])
+			} else {
+				res = ctx.Invoke1(fn, bufVal)
+			}
+		}
+		if res.IsBytes() {
+			return val.NewStringVal(string(res.AsBytes().Data))
+		}
+		return res
+	}))
+	textIOWrapperType.Dict.Set(val.InternString("readline"), val.NewBuiltinFuncVal("readline", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		bufVal, _ := args[0].AsInstance().GetAttr(val.InternString("buffer"))
+		var res val.Value
+		if fn, _, ok := bufVal.Type().LookupMRO(val.InternString("readline")); ok {
+			if len(args) > 1 {
+				res = ctx.Invoke2(fn, bufVal, args[1])
+			} else {
+				res = ctx.Invoke1(fn, bufVal)
+			}
+		}
+		if res.IsBytes() {
+			return val.NewStringVal(string(res.AsBytes().Data))
+		}
+		return res
+	}))
+	textIOWrapperType.Dict.Set(val.InternString("write"), val.NewBuiltinFuncVal("write", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 2 {
+			panic("TypeError: write() takes 1 argument")
+		}
+		bufVal, _ := args[0].AsInstance().GetAttr(val.InternString("buffer"))
+		strData := args[1].AsString()
+		bytesVal := val.NewBytesVal([]byte(strData))
+		if fn, _, ok := bufVal.Type().LookupMRO(val.InternString("write")); ok {
+			ctx.Invoke2(fn, bufVal, bytesVal)
+		}
+		return val.Int64Val(int64(len(strData)))
+	}))
+	textIOWrapperType.Dict.Set(val.InternString("flush"), val.NewBuiltinFuncVal("flush", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		bufVal, _ := args[0].AsInstance().GetAttr(val.InternString("buffer"))
+		if fn, _, ok := bufVal.Type().LookupMRO(val.InternString("flush")); ok {
+			return ctx.Invoke1(fn, bufVal)
+		}
+		return val.NoneVal()
+	}))
+	textIOWrapperType.Dict.Set(val.InternString("close"), val.NewBuiltinFuncVal("close", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		bufVal, _ := args[0].AsInstance().GetAttr(val.InternString("buffer"))
+		if fn, _, ok := bufVal.Type().LookupMRO(val.InternString("close")); ok {
+			return ctx.Invoke1(fn, bufVal)
+		}
+		return val.NoneVal()
+	}))
+	textIOWrapperType.Dict.Set(val.InternString("fileno"), val.NewBuiltinFuncVal("fileno", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		bufVal, _ := args[0].AsInstance().GetAttr(val.InternString("buffer"))
+		if fn, _, ok := bufVal.Type().LookupMRO(val.InternString("fileno")); ok {
+			return ctx.Invoke1(fn, bufVal)
+		}
+		panic("UnsupportedOperation: fileno")
+	}))
+	textIOWrapperType.Dict.Set(val.InternString("closed"), val.NewPropertyVal(
+		val.NewBuiltinFuncVal("closed", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) > 0 {
+				if bufVal, ok := args[0].AsInstance().GetAttr(val.InternString("buffer")); ok {
+					return val.GetAttrCtx(ctx, bufVal, val.InternString("closed"))
+				}
+			}
+			return val.BoolVal(false)
+		}),
+		val.NoneVal(),
+		val.NoneVal(),
+	))
+
 	ioMod.Dict.Set(val.InternString("IOBase"), val.TypeVal(ioBaseType))
 	ioMod.Dict.Set(val.InternString("RawIOBase"), val.TypeVal(rawIOBaseType))
 	ioMod.Dict.Set(val.InternString("BufferedIOBase"), val.TypeVal(bufferedIOBaseType))
 	ioMod.Dict.Set(val.InternString("TextIOBase"), val.TypeVal(textIOBaseType))
+	ioMod.Dict.Set(val.InternString("BufferedReader"), val.TypeVal(bufferedReaderType))
+	ioMod.Dict.Set(val.InternString("BufferedWriter"), val.TypeVal(bufferedWriterType))
+	ioMod.Dict.Set(val.InternString("BufferedRWPair"), val.TypeVal(bufferedRWPairType))
+	ioMod.Dict.Set(val.InternString("TextIOWrapper"), val.TypeVal(textIOWrapperType))
 	ioMod.Dict.Set(val.InternString("UnsupportedOperation"), val.TypeVal(val.OSErrorType))
 
 	// open
@@ -756,14 +1336,19 @@ func (e *Engine) createIOModule() val.Value {
 				panic("TypeError: open() missing required argument 'file' (pos 1)")
 			}
 		}
-		file := pathArg(ctx, pa[0])
+		var targetVal val.Value
+		if pa[0].IsInt64() {
+			targetVal = pa[0]
+		} else {
+			targetVal = val.NewStringVal(pathArg(ctx, pa[0]))
+		}
 		mode := "r"
 		if len(pa) >= 2 && pa[1].IsAnyString() {
 			mode = pa[1].AsString()
 		} else if v, ok := kwArg(args, kwnames, "mode"); ok && v.IsAnyString() {
 			mode = v.AsString()
 		}
-		return openFileBuiltin(file, mode)
+		return openFileBuiltinVal(targetVal, mode)
 	})
 
 	ioMod.Dict.Set(val.InternString("open"), openFn)

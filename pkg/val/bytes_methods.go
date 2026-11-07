@@ -3,7 +3,10 @@ package val
 import (
 	"bytes"
 	"encoding/hex"
+	"fmt"
 	"strconv"
+	"strings"
+	"unicode/utf8"
 )
 
 func bytesMethodArg(v Value) ([]byte, bool) {
@@ -16,7 +19,40 @@ func bytesMethodArg(v Value) ([]byte, bool) {
 	if v.IsMemoryView() {
 		return v.AsMemoryView().Buf, true
 	}
+	if v.IsInstance() && len(v.AsInstance().Slots) > 0 {
+		return bytesMethodArg(v.AsInstance().Slots[0])
+	}
 	return nil, false
+}
+
+// DecodeBytesToString decodes binary data into a string using the specified encoding.
+func DecodeBytesToString(data []byte, encoding string) (string, error) {
+	norm := strings.ToLower(encoding)
+	norm = strings.ReplaceAll(norm, "-", "_")
+	norm = strings.ReplaceAll(norm, " ", "_")
+
+	switch norm {
+	case "", "utf_8", "utf8", "u8", "utf_8_sig", "utf8_sig":
+		return string(data), nil
+	case "latin_1", "latin1", "iso_8859_1", "iso8859_1", "8859", "cp819", "raw_unicode_escape":
+		runes := make([]rune, len(data))
+		for i, b := range data {
+			runes[i] = rune(b)
+		}
+		return string(runes), nil
+	case "ascii", "us_ascii":
+		runes := make([]rune, len(data))
+		for i, b := range data {
+			if b > 127 {
+				return "", fmt.Errorf("UnicodeDecodeError: 'ascii' codec can't decode byte 0x%02x in position %d: ordinal not in range(128)", b, i)
+			}
+			runes[i] = rune(b)
+		}
+		return string(runes), nil
+	default:
+		_ = utf8.RuneCount(data)
+		return string(data), nil
+	}
 }
 
 func bytesSelf(name string, args []Value) []byte {
@@ -363,6 +399,124 @@ func initBytesMethods() {
 		return NewStringVal(hex.EncodeToString(self))
 	}
 
+	bytesArg := func(v Value) []byte {
+		if v.IsBytes() {
+			return v.AsBytes().Data
+		}
+		if v.IsByteArray() {
+			return v.AsByteArray().Data
+		}
+		if v.IsMemoryView() {
+			return v.AsMemoryView().Buf
+		}
+		if v.IsInt64() {
+			return []byte{byte(v.AsInt64())}
+		}
+		panic("TypeError: a bytes-like object is required, not '" + v.Type().Name + "'")
+	}
+
+	findFn := func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		self := bytesSelf("find", args)
+		if len(args) < 2 {
+			panic("TypeError: find expected at least 1 argument, got 0")
+		}
+		sub := bytesArg(args[1])
+		start := 0
+		end := len(self)
+		if len(args) > 2 && args[2].IsInt64() {
+			start = int(args[2].AsInt64())
+			if start < 0 {
+				start += len(self)
+				if start < 0 {
+					start = 0
+				}
+			}
+			if start > len(self) {
+				start = len(self)
+			}
+		}
+		if len(args) > 3 && args[3].IsInt64() {
+			end = int(args[3].AsInt64())
+			if end < 0 {
+				end += len(self)
+				if end < 0 {
+					end = 0
+				}
+			}
+			if end > len(self) {
+				end = len(self)
+			}
+		}
+		if start > end {
+			return Int64Val(-1)
+		}
+		idx := bytes.Index(self[start:end], sub)
+		if idx == -1 {
+			return Int64Val(-1)
+		}
+		return Int64Val(int64(start + idx))
+	}
+
+	rfindFn := func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		self := bytesSelf("rfind", args)
+		if len(args) < 2 {
+			panic("TypeError: rfind expected at least 1 argument, got 0")
+		}
+		sub := bytesArg(args[1])
+		start := 0
+		end := len(self)
+		if len(args) > 2 && args[2].IsInt64() {
+			start = int(args[2].AsInt64())
+			if start < 0 {
+				start += len(self)
+				if start < 0 {
+					start = 0
+				}
+			}
+			if start > len(self) {
+				start = len(self)
+			}
+		}
+		if len(args) > 3 && args[3].IsInt64() {
+			end = int(args[3].AsInt64())
+			if end < 0 {
+				end += len(self)
+				if end < 0 {
+					end = 0
+				}
+			}
+			if end > len(self) {
+				end = len(self)
+			}
+		}
+		if start > end {
+			return Int64Val(-1)
+		}
+		idx := bytes.LastIndex(self[start:end], sub)
+		if idx == -1 {
+			return Int64Val(-1)
+		}
+		return Int64Val(int64(start + idx))
+	}
+
+	startswithFn := func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		self := bytesSelf("startswith", args)
+		if len(args) < 2 {
+			panic("TypeError: startswith expected at least 1 argument, got 0")
+		}
+		sub := bytesArg(args[1])
+		return BoolVal(bytes.HasPrefix(self, sub))
+	}
+
+	endswithFn := func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		self := bytesSelf("endswith", args)
+		if len(args) < 2 {
+			panic("TypeError: endswith expected at least 1 argument, got 0")
+		}
+		sub := bytesArg(args[1])
+		return BoolVal(bytes.HasSuffix(self, sub))
+	}
+
 	for _, t := range []*PyType{BytesType, ByteArrayType} {
 		t.Dict.Set(InternString("maketrans"), NewBuiltinFuncVal("maketrans", maketransFn))
 		t.Dict.Set(InternString("translate"), NewBuiltinFuncVal("translate", translateFn))
@@ -378,5 +532,9 @@ func initBytesMethods() {
 		t.Dict.Set(InternString("upper"), NewBuiltinFuncVal("upper", upperFn))
 		t.Dict.Set(InternString("fromhex"), NewBuiltinFuncVal("fromhex", fromhexFn))
 		t.Dict.Set(InternString("hex"), NewBuiltinFuncVal("hex", hexFn))
+		t.Dict.Set(InternString("find"), NewBuiltinFuncVal("find", findFn))
+		t.Dict.Set(InternString("rfind"), NewBuiltinFuncVal("rfind", rfindFn))
+		t.Dict.Set(InternString("startswith"), NewBuiltinFuncVal("startswith", startswithFn))
+		t.Dict.Set(InternString("endswith"), NewBuiltinFuncVal("endswith", endswithFn))
 	}
 }

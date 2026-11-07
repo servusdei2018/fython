@@ -697,6 +697,13 @@ func NewTypeWithMeta(name string, bases []*PyType, dict *PyDict, meta *PyType) (
 		}
 	}
 
+	// Python data model: __new__ defined as a function is implicitly wrapped in staticmethod.
+	if DunderNew.ptr != nil {
+		if newFn, hasNew := dict.Get(DunderNew); hasNew && newFn.IsFunction() {
+			dict.Set(DunderNew, NewStaticMethodVal(newFn))
+		}
+	}
+
 	// Collect inherited fixed slots from base RootShapes (including primitive backing slots and parent __slots__)
 	var inheritedAttrs []ShapeAttr
 	seenAttr := func(n Value) bool {
@@ -1306,7 +1313,11 @@ func (t *PyType) syncDunderSlots() {
 		t.dunderMissing = Value{}
 	}
 	if fn, _, ok := t.LookupMRO(DunderNew); ok {
-		t.dunderNew = fn
+		if fn.IsStaticMethod() {
+			t.dunderNew = fn.AsStaticMethod().Callable
+		} else {
+			t.dunderNew = fn
+		}
 	} else {
 		t.dunderNew = Value{}
 	}

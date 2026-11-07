@@ -338,6 +338,12 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 				}
 				panic(val.NewException(val.StopIterationType, "StopIteration"))
 			}
+			if status == val.IterError {
+				if ctx != nil && ctx.HasException() {
+					panic(ctx.ActiveException)
+				}
+			}
+			return nextVal
 		}
 
 		if nextMeth, _, ok := it.Type().LookupMRO(val.InternString("__next__")); ok {
@@ -926,13 +932,20 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		if len(args) < 2 {
 			panic("TypeError: pow expected at least 2 arguments")
 		}
-		base := args[0]
-		exp := args[1]
-		res := val.Pow(base, exp)
-		if len(args) > 2 {
-			res = val.Mod(res, args[2])
+		if len(args) > 2 && !args[2].IsNone() {
+			base := val.ToBigInt(args[0])
+			exp := val.ToBigInt(args[1])
+			mod := val.ToBigInt(args[2])
+			if mod.Sign() == 0 {
+				panic("ValueError: pow() 3rd argument cannot be 0")
+			}
+			res := new(big.Int).Exp(base, exp, mod)
+			if res.IsInt64() {
+				return val.Int64Val(res.Int64())
+			}
+			return val.NewBigIntVal(res)
 		}
-		return res
+		return val.Pow(args[0], args[1])
 	}))
 
 	d.Set(val.InternString("round"), val.NewBuiltinFuncVal("round", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {

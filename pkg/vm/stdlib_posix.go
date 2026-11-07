@@ -658,8 +658,227 @@ func installPosix(osMod *val.PyModule) {
 		if args[0].IsAnyString() {
 			return args[0]
 		}
+		if args[0].IsBytes() {
+			return val.NewStringVal(string(args[0].AsBytes().Data))
+		}
 		return val.NewStringVal(pathArg(ctx, args[0]))
 	})
+
+	set("get_exec_path", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		pathStr := os.Getenv("PATH")
+		if len(args) > 0 && !args[0].IsNone() && args[0].IsDict() {
+			if v, ok := args[0].AsDict().Get(val.InternString("PATH")); ok && v.IsAnyString() {
+				pathStr = v.AsString()
+			}
+		}
+		if pathStr == "" {
+			pathStr = ":/bin:/usr/bin"
+		}
+		parts := strings.Split(pathStr, string(filepath.ListSeparator))
+		var items []val.Value
+		for _, p := range parts {
+			items = append(items, val.NewStringVal(p))
+		}
+		return val.NewListVal(items...)
+	})
+
+	set("_get_exports_list", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: _get_exports_list() takes 1 argument")
+		}
+		var names []val.Value
+		if args[0].IsModule() {
+			dict := args[0].AsModule().Dict
+			for _, entry := range dict.Entries {
+				if entry.Active && entry.Key.IsAnyString() {
+					k := entry.Key.AsString()
+					if !strings.HasPrefix(k, "_") {
+						names = append(names, entry.Key)
+					}
+				}
+			}
+		}
+		return val.NewListVal(names...)
+	})
+
+	set("pipe", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		r, w, err := os.Pipe()
+		if err != nil {
+			raiseOSError(err, "")
+		}
+		rFd := int(r.Fd())
+		wFd := int(w.Fd())
+		fdMutex.Lock()
+		fdMap[rFd] = r
+		fdMap[wFd] = w
+		fdMutex.Unlock()
+		return val.NewTupleVal(val.Int64Val(int64(rFd)), val.Int64Val(int64(wFd)))
+	})
+
+	set("close", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: close() takes 1 argument")
+		}
+		fd := int(args[0].AsInt64())
+		fdMutex.Lock()
+		f, ok := fdMap[fd]
+		delete(fdMap, fd)
+		fdMutex.Unlock()
+		if ok {
+			_ = f.Close()
+		} else {
+			_ = syscall.Close(fd)
+		}
+		return val.NoneVal()
+	})
+
+	set("read", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 2 {
+			panic("TypeError: read() takes 2 arguments")
+		}
+		fd := int(args[0].AsInt64())
+		n := int(args[1].AsInt64())
+		buf := make([]byte, n)
+		fdMutex.Lock()
+		f, ok := fdMap[fd]
+		fdMutex.Unlock()
+		var readN int
+		var err error
+		if ok {
+			readN, err = f.Read(buf)
+		} else {
+			readN, err = syscall.Read(fd, buf)
+		}
+		if err != nil && readN == 0 {
+			return val.NewBytesVal(nil)
+		}
+		return val.NewBytesVal(buf[:readN])
+	})
+
+	set("write", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 2 {
+			panic("TypeError: write() takes 2 arguments")
+		}
+		fd := int(args[0].AsInt64())
+		var data []byte
+		if args[1].IsBytes() {
+			data = args[1].AsBytes().Data
+		} else if args[1].IsByteArray() {
+			data = args[1].AsByteArray().Data
+		} else if args[1].IsMemoryView() {
+			data = args[1].AsMemoryView().Buf
+		} else if args[1].IsAnyString() {
+			data = []byte(args[1].AsString())
+		} else {
+			panic("TypeError: a bytes-like object is required")
+		}
+		fdMutex.Lock()
+		f, ok := fdMap[fd]
+		fdMutex.Unlock()
+		var writtenN int
+		var err error
+		if ok {
+			writtenN, err = f.Write(data)
+		} else {
+			writtenN, err = syscall.Write(fd, data)
+		}
+		if err != nil {
+			raiseOSError(err, "")
+		}
+		return val.Int64Val(int64(writtenN))
+	})
+
+	set("dup", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: dup() takes 1 argument")
+		}
+		oldfd := int(args[0].AsInt64())
+		newfd, err := syscall.Dup(oldfd)
+		if err != nil {
+			raiseOSError(err, "")
+		}
+		return val.Int64Val(int64(newfd))
+	})
+
+	set("dup2", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 2 {
+			panic("TypeError: dup2() takes at least 2 arguments")
+		}
+		oldfd := int(args[0].AsInt64())
+		newfd := int(args[1].AsInt64())
+		if err := syscall.Dup2(oldfd, newfd); err != nil {
+			raiseOSError(err, "")
+		}
+		return val.Int64Val(int64(newfd))
+	})
+
+	set("waitpid", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 2 {
+			panic("TypeError: waitpid() takes 2 arguments")
+		}
+		pid := int(args[0].AsInt64())
+		options := int(args[1].AsInt64())
+		var wstatus syscall.WaitStatus
+		wpid, err := syscall.Wait4(pid, &wstatus, options, nil)
+		if err != nil {
+			raiseOSError(err, "")
+		}
+		return val.NewTupleVal(val.Int64Val(int64(wpid)), val.Int64Val(int64(wstatus)))
+	})
+
+	set("waitstatus_to_exitcode", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: waitstatus_to_exitcode() takes exactly 1 argument")
+		}
+		st := int(args[0].AsInt64())
+		ws := syscall.WaitStatus(st)
+		if ws.Exited() {
+			return val.Int64Val(int64(ws.ExitStatus()))
+		}
+		if ws.Signaled() {
+			return val.Int64Val(-int64(ws.Signal()))
+		}
+		return val.Int64Val(int64(st))
+	})
+
+	set("WIFEXITED", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: WIFEXITED() takes 1 argument")
+		}
+		return val.BoolVal(syscall.WaitStatus(int(args[0].AsInt64())).Exited())
+	})
+	set("WEXITSTATUS", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: WEXITSTATUS() takes 1 argument")
+		}
+		return val.Int64Val(int64(syscall.WaitStatus(int(args[0].AsInt64())).ExitStatus()))
+	})
+	set("WIFSIGNALED", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: WIFSIGNALED() takes 1 argument")
+		}
+		return val.BoolVal(syscall.WaitStatus(int(args[0].AsInt64())).Signaled())
+	})
+	set("WTERMSIG", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: WTERMSIG() takes 1 argument")
+		}
+		return val.Int64Val(int64(syscall.WaitStatus(int(args[0].AsInt64())).Signal()))
+	})
+	set("WIFSTOPPED", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: WIFSTOPPED() takes 1 argument")
+		}
+		return val.BoolVal(syscall.WaitStatus(int(args[0].AsInt64())).Stopped())
+	})
+	set("WSTOPSIG", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: WSTOPSIG() takes 1 argument")
+		}
+		return val.Int64Val(int64(syscall.WaitStatus(int(args[0].AsInt64())).StopSignal()))
+	})
+	osMod.Dict.Set(val.InternString("WNOHANG"), val.Int64Val(int64(syscall.WNOHANG)))
+
 	set("strerror", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 || !args[0].IsInt64() {
 			panic("TypeError: strerror() argument must be int")
@@ -981,6 +1200,15 @@ var errnoTable = []struct {
 	{"ECONNRESET", syscall.ECONNRESET}, {"ETIMEDOUT", syscall.ETIMEDOUT},
 	{"ENOTSUP", syscall.ENOTSUP}, {"EOPNOTSUPP", syscall.EOPNOTSUPP},
 	{"EINPROGRESS", syscall.EINPROGRESS}, {"EALREADY", syscall.EALREADY},
+	{"ENOTCONN", syscall.ENOTCONN}, {"EISCONN", syscall.EISCONN},
+	{"EDESTADDRREQ", syscall.EDESTADDRREQ}, {"EMSGSIZE", syscall.EMSGSIZE},
+	{"EPROTOTYPE", syscall.EPROTOTYPE}, {"ENOPROTOOPT", syscall.ENOPROTOOPT},
+	{"EPROTONOSUPPORT", syscall.EPROTONOSUPPORT}, {"ESOCKTNOSUPPORT", syscall.ESOCKTNOSUPPORT},
+	{"EPFNOSUPPORT", syscall.EPFNOSUPPORT}, {"EAFNOSUPPORT", syscall.EAFNOSUPPORT},
+	{"EADDRNOTAVAIL", syscall.EADDRNOTAVAIL}, {"ENETDOWN", syscall.ENETDOWN},
+	{"ENETUNREACH", syscall.ENETUNREACH}, {"ENETRESET", syscall.ENETRESET},
+	{"ENOBUFS", syscall.ENOBUFS}, {"EHOSTDOWN", syscall.EHOSTDOWN},
+	{"EHOSTUNREACH", syscall.EHOSTUNREACH},
 }
 
 func (e *Engine) createErrnoModule() val.Value {

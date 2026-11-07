@@ -3035,11 +3035,13 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 						continue
 					}
 					if entry.Kind == ICKindInstanceSlot {
-						stack[sp-1] = val.UnboundVal()
-						stack[sp] = instObj.Slots[entry.SlotIndex]
-						sp++
-						ip++
-						continue
+						if v, ok := instObj.GetSlot(entry.SlotIndex); ok {
+							stack[sp-1] = val.UnboundVal()
+							stack[sp] = v
+							sp++
+							ip++
+							continue
+						}
 					}
 				}
 			} else if obj.IsModule() {
@@ -3673,33 +3675,29 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				} else {
 					instShape := instObj.Shape
 					pic := &curAttrPIC[ip]
-					if pic[0].Shape == instShape && pic[0].SlotIndex < len(instObj.Slots) {
-						v := instObj.Slots[pic[0].SlotIndex]
-						if !v.IsUnbound() {
+					if pic[0].Shape == instShape {
+						if v, ok := instObj.GetSlot(pic[0].SlotIndex); ok && !v.IsUnbound() {
 							stack[sp-1] = v
 							ip++
 							continue
 						}
 					}
-					if pic[1].Shape == instShape && pic[1].SlotIndex < len(instObj.Slots) {
-						v := instObj.Slots[pic[1].SlotIndex]
-						if !v.IsUnbound() {
+					if pic[1].Shape == instShape {
+						if v, ok := instObj.GetSlot(pic[1].SlotIndex); ok && !v.IsUnbound() {
 							stack[sp-1] = v
 							ip++
 							continue
 						}
 					}
-					if pic[2].Shape == instShape && pic[2].SlotIndex < len(instObj.Slots) {
-						v := instObj.Slots[pic[2].SlotIndex]
-						if !v.IsUnbound() {
+					if pic[2].Shape == instShape {
+						if v, ok := instObj.GetSlot(pic[2].SlotIndex); ok && !v.IsUnbound() {
 							stack[sp-1] = v
 							ip++
 							continue
 						}
 					}
-					if pic[3].Shape == instShape && pic[3].SlotIndex < len(instObj.Slots) {
-						v := instObj.Slots[pic[3].SlotIndex]
-						if !v.IsUnbound() {
+					if pic[3].Shape == instShape {
+						if v, ok := instObj.GetSlot(pic[3].SlotIndex); ok && !v.IsUnbound() {
 							stack[sp-1] = v
 							ip++
 							continue
@@ -3708,13 +3706,10 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					entry := curIC[ip]
 					if instObj.Shape.ID == entry.ExpectedShapeID && instType.VersionTag == entry.ExpectedTypeVer {
 						if entry.Kind == ICKindInstanceSlot {
-							if entry.SlotIndex >= 0 && entry.SlotIndex < len(instObj.Slots) {
-								v := instObj.Slots[entry.SlotIndex]
-								if !v.IsUnbound() {
-									stack[sp-1] = v
-									ip++
-									continue
-								}
+							if v, ok := instObj.GetSlot(entry.SlotIndex); ok && !v.IsUnbound() {
+								stack[sp-1] = v
+								ip++
+								continue
 							}
 						}
 						if entry.Kind == ICKindDataDescriptor {
@@ -3799,35 +3794,38 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				} else {
 					instShape := instObj.Shape
 					pic := &curAttrPIC[ip]
-					if pic[0].Shape == instShape && pic[0].SlotIndex < len(instObj.Slots) {
-						instObj.Slots[pic[0].SlotIndex] = v
-						sp -= 2
-						ip++
-						continue
+					if pic[0].Shape == instShape {
+						if instObj.SetSlot(pic[0].SlotIndex, v) {
+							sp -= 2
+							ip++
+							continue
+						}
 					}
-					if pic[1].Shape == instShape && pic[1].SlotIndex < len(instObj.Slots) {
-						instObj.Slots[pic[1].SlotIndex] = v
-						sp -= 2
-						ip++
-						continue
+					if pic[1].Shape == instShape {
+						if instObj.SetSlot(pic[1].SlotIndex, v) {
+							sp -= 2
+							ip++
+							continue
+						}
 					}
-					if pic[2].Shape == instShape && pic[2].SlotIndex < len(instObj.Slots) {
-						instObj.Slots[pic[2].SlotIndex] = v
-						sp -= 2
-						ip++
-						continue
+					if pic[2].Shape == instShape {
+						if instObj.SetSlot(pic[2].SlotIndex, v) {
+							sp -= 2
+							ip++
+							continue
+						}
 					}
-					if pic[3].Shape == instShape && pic[3].SlotIndex < len(instObj.Slots) {
-						instObj.Slots[pic[3].SlotIndex] = v
-						sp -= 2
-						ip++
-						continue
+					if pic[3].Shape == instShape {
+						if instObj.SetSlot(pic[3].SlotIndex, v) {
+							sp -= 2
+							ip++
+							continue
+						}
 					}
 					entry := curIC[ip]
 					if instObj.Shape.ID == entry.ExpectedShapeID && instType.VersionTag == entry.ExpectedTypeVer {
 						if entry.Kind == ICKindInstanceSlot {
-							if entry.SlotIndex >= 0 && entry.SlotIndex < len(instObj.Slots) {
-								instObj.Slots[entry.SlotIndex] = v
+							if instObj.SetSlot(entry.SlotIndex, v) {
 								sp -= 2
 								ip++
 								continue
@@ -6351,8 +6349,8 @@ func (vm *VM) loadMethodSlow(obj, attrName val.Value, ip, sp, frameIdx int, curI
 
 		if instObj.Shape != nil {
 			if slotIdx, ok := instObj.Shape.Lookup(attrName); ok {
-				slotVal := instObj.Slots[slotIdx]
-				if !slotVal.IsUnbound() {
+				slotVal, okSlot := instObj.GetSlot(slotIdx)
+				if okSlot && !slotVal.IsUnbound() {
 					curIC[ip] = ICSlot{
 						ExpectedShapeID: instObj.Shape.ID,
 						Kind:            ICKindInstanceSlot,
@@ -6481,8 +6479,8 @@ func (vm *VM) callMethodPICSlow(receiver, attrName val.Value, ip, newBase, argc,
 		}
 		if instObj.Shape != nil {
 			if slotIdx, ok := instObj.Shape.Lookup(attrName); ok {
-				callable := instObj.Slots[slotIdx]
-				if !callable.IsUnbound() {
+				callable, okSlot := instObj.GetSlot(slotIdx)
+				if okSlot && !callable.IsUnbound() {
 					vm.execCtx.SP = newBase + totalArgs
 					vm.activeFrameIdx = frameIdx
 					return vm.callFromHook(&vm.execCtx, callable, newBase+1, argc, nil)

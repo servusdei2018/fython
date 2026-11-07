@@ -2,9 +2,33 @@ package vm
 
 import (
 	"math"
+	"math/big"
 
 	"github.com/servusdei2018/fython/pkg/val"
 )
+
+func toBigInt(v val.Value) *big.Int {
+	if v.IsInt64() {
+		return big.NewInt(v.AsInt64())
+	}
+	if v.Kind() == val.KindBigInt {
+		return new(big.Int).Set(&v.AsBigInt().Val)
+	}
+	if v.IsBool() {
+		if v.AsBool() {
+			return big.NewInt(1)
+		}
+		return big.NewInt(0)
+	}
+	panic("TypeError: 'float' object cannot be interpreted as an integer")
+}
+
+func bigIntToVal(bi *big.Int) val.Value {
+	if bi.IsInt64() {
+		return val.Int64Val(bi.Int64())
+	}
+	return val.NewBigIntVal(bi)
+}
 
 func toFloat(v val.Value) float64 {
 	if v.IsFloat64() {
@@ -200,23 +224,116 @@ func (e *Engine) createMathModule() val.Value {
 		return val.BoolVal(!math.IsNaN(f) && !math.IsInf(f, 0))
 	}))
 
-	// gcd(a, b)
+	// gcd(*integers)
 	mod.Dict.Set(val.InternString("gcd"), val.NewBuiltinFuncVal("gcd", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) == 0 {
+			return val.Int64Val(0)
+		}
+		g := toBigInt(args[0])
+		g = new(big.Int).Abs(g)
+		for i := 1; i < len(args); i++ {
+			b := toBigInt(args[i])
+			g.GCD(nil, nil, g, b)
+		}
+		return bigIntToVal(g)
+	}))
+
+	// lcm(*integers)
+	mod.Dict.Set(val.InternString("lcm"), val.NewBuiltinFuncVal("lcm", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) == 0 {
+			return val.Int64Val(1)
+		}
+		l := toBigInt(args[0])
+		l = new(big.Int).Abs(l)
+		zero := big.NewInt(0)
+		for i := 1; i < len(args); i++ {
+			b := toBigInt(args[i])
+			b = new(big.Int).Abs(b)
+			if l.Cmp(zero) == 0 || b.Cmp(zero) == 0 {
+				l = big.NewInt(0)
+				continue
+			}
+			g := new(big.Int).GCD(nil, nil, l, b)
+			l.Div(l, g)
+			l.Mul(l, b)
+		}
+		return bigIntToVal(l)
+	}))
+
+	// isqrt(n)
+	mod.Dict.Set(val.InternString("isqrt"), val.NewBuiltinFuncVal("isqrt", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: isqrt() takes exactly one argument")
+		}
+		n := toBigInt(args[0])
+		if n.Sign() < 0 {
+			panic("ValueError: isqrt() argument must be nonnegative")
+		}
+		res := new(big.Int).Sqrt(n)
+		return bigIntToVal(res)
+	}))
+
+	// frexp(x)
+	mod.Dict.Set(val.InternString("frexp"), val.NewBuiltinFuncVal("frexp", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: frexp() takes exactly one argument")
+		}
+		x := toFloat(args[0])
+		m, e := math.Frexp(x)
+		return val.NewTupleVal(val.Float64Val(m), val.Int64Val(int64(e)))
+	}))
+
+	// ldexp(m, e)
+	mod.Dict.Set(val.InternString("ldexp"), val.NewBuiltinFuncVal("ldexp", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: gcd() takes at least 2 arguments")
+			panic("TypeError: ldexp() takes exactly 2 arguments")
 		}
-		a := args[0].AsInt64()
-		b := args[1].AsInt64()
-		if a < 0 {
-			a = -a
+		x := toFloat(args[0])
+		e := args[1].AsInt64()
+		return val.Float64Val(math.Ldexp(x, int(e)))
+	}))
+
+	// modf(x)
+	mod.Dict.Set(val.InternString("modf"), val.NewBuiltinFuncVal("modf", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: modf() takes exactly one argument")
 		}
-		if b < 0 {
-			b = -b
+		x := toFloat(args[0])
+		intPart, fracPart := math.Modf(x)
+		return val.NewTupleVal(val.Float64Val(fracPart), val.Float64Val(intPart))
+	}))
+
+	// nextafter(x, y)
+	mod.Dict.Set(val.InternString("nextafter"), val.NewBuiltinFuncVal("nextafter", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 2 {
+			panic("TypeError: nextafter() takes exactly 2 arguments")
 		}
-		for b != 0 {
-			a, b = b, a%b
+		x := toFloat(args[0])
+		y := toFloat(args[1])
+		return val.Float64Val(math.Nextafter(x, y))
+	}))
+
+	// ulp(x)
+	mod.Dict.Set(val.InternString("ulp"), val.NewBuiltinFuncVal("ulp", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: ulp() takes exactly one argument")
 		}
-		return val.Int64Val(a)
+		x := toFloat(args[0])
+		if math.IsNaN(x) {
+			return val.Float64Val(math.NaN())
+		}
+		if math.IsInf(x, 0) {
+			return val.Float64Val(math.Inf(1))
+		}
+		x = math.Abs(x)
+		if x == 0.0 {
+			return val.Float64Val(math.Nextafter(0.0, 1.0))
+		}
+		x2 := math.Nextafter(x, math.Inf(1))
+		if math.IsInf(x2, 1) {
+			return val.Float64Val(x - math.Nextafter(x, -math.Inf(1)))
+		}
+		return val.Float64Val(x2 - x)
 	}))
 
 	// factorial(n)

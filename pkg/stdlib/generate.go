@@ -102,9 +102,110 @@ var upstream = []string{
 	"unittest/signals.py",
 	"unittest/suite.py",
 	"unittest/util.py",
+	// Network stack
+	"socket.py",
+	"ssl.py",
+	"selectors.py",
+	"socketserver.py",
+	// HTTP & urllib stack
+	"http/__init__.py",
+	"http/client.py",
+	"http/server.py",
+	"http/cookies.py",
+	"http/cookiejar.py",
+	"urllib/error.py",
+	"urllib/request.py",
+	"urllib/response.py",
+	"urllib/robotparser.py",
+	// Email stack
+	"email/__init__.py",
+	"email/_encoded_words.py",
+	"email/_header_value_parser.py",
+	"email/_parseaddr.py",
+	"email/_policybase.py",
+	"email/base64mime.py",
+	"email/charset.py",
+	"email/contentmanager.py",
+	"email/encoders.py",
+	"email/errors.py",
+	"email/feedparser.py",
+	"email/generator.py",
+	"email/header.py",
+	"email/headerregistry.py",
+	"email/iterators.py",
+	"email/message.py",
+	"email/parser.py",
+	"email/policy.py",
+	"email/quoprimime.py",
+	"email/utils.py",
+	"email/mime/__init__.py",
+	"email/mime/application.py",
+	"email/mime/audio.py",
+	"email/mime/base.py",
+	"email/mime/image.py",
+	"email/mime/message.py",
+	"email/mime/multipart.py",
+	"email/mime/nonmultipart.py",
+	"email/mime/text.py",
+	// HTML, mimetypes, quopri, string, codecs, contextvars
+	"html/__init__.py",
+	"html/entities.py",
+	"mimetypes.py",
+	"quopri.py",
+	"string/__init__.py",
+	"string/templatelib.py",
+	"codecs.py",
+	"contextvars.py",
+	// Subprocess stack
+	"subprocess.py",
+	// Exact numerics stack
+	"numbers.py",
+	"fractions.py",
+	"_pydecimal.py",
+	"decimal.py",
+	// SQLite database stack
+	"sqlite3/__init__.py",
+	"sqlite3/dbapi2.py",
+	"sqlite3/dump.py",
 }
 
 func main() {
+	localLib := os.Getenv("CPYTHON_LIB_DIR")
+	if localLib == "" {
+		if fi, err := os.Stat("/usr/lib64/python3.15"); err == nil && fi.IsDir() {
+			localLib = "/usr/lib64/python3.15"
+		}
+	}
+
+	if localLib != "" {
+		for _, rel := range upstream {
+			src := path.Join(localLib, rel)
+			dest := path.Join("lib", rel)
+			data, err := os.ReadFile(src)
+			if err != nil {
+				fatalf("read local %s: %v", src, err)
+			}
+			if err := os.MkdirAll(path.Dir(dest), 0o755); err != nil {
+				fatalf("mkdir %s: %v", path.Dir(dest), err)
+			}
+			if err := os.WriteFile(dest, data, 0o644); err != nil {
+				fatalf("write %s: %v", dest, err)
+			}
+		}
+		license, err := os.ReadFile("lib/LICENSE")
+		if err != nil {
+			fatalf("read license: %v", err)
+		}
+		if !strings.Contains(string(license), "PYTHON SOFTWARE FOUNDATION LICENSE VERSION 2") {
+			fatalf("lib/LICENSE is not the PSF License Version 2")
+		}
+		if err := writeManifest(); err != nil {
+			fatalf("manifest: %v", err)
+		}
+		fmt.Printf("wrote lib/LICENSE and %d modules from local CPython %s\n", len(upstream), cpythonTag)
+		return
+	}
+
 	url := "https://github.com/python/cpython/archive/refs/tags/" + cpythonTag + ".tar.gz"
 	client := &http.Client{Timeout: 5 * time.Minute}
 	resp, err := client.Get(url)
