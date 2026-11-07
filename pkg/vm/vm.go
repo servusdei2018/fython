@@ -36,29 +36,64 @@ func (vm *VM) RunCodeWithGlobals(co *CodeObject, globals *val.PyDict) val.Value 
 	return vm.runNestedCode(co, globals, val.NoneVal(), nil)
 }
 
+func (vm *VM) vmStackTop() int {
+	top := 0
+	limit := vm.activeFrameIdx
+	if limit > len(vm.frames) {
+		limit = len(vm.frames)
+	}
+	for i := 0; i < limit; i++ {
+		f := &vm.frames[i]
+		if f.co != nil && f.stackIsVM {
+			end := f.baseOffset + 256
+			if f.co.NumLocals+f.co.MaxStackSize > 256 {
+				end = f.baseOffset + f.co.NumLocals + f.co.MaxStackSize
+			}
+			if end > top {
+				top = end
+			}
+			if f.retSP > top {
+				top = f.retSP
+			}
+		}
+	}
+	if vm.activeCO != nil && len(vm.execCtx.Stack) > 0 && len(vm.stack) > 0 && &vm.execCtx.Stack[0] == &vm.stack[0] {
+		end := vm.activeBaseOffset + 256
+		if vm.activeCO.NumLocals+vm.activeCO.MaxStackSize > 256 {
+			end = vm.activeBaseOffset + vm.activeCO.NumLocals + vm.activeCO.MaxStackSize
+		}
+		if end > top {
+			top = end
+		}
+		if vm.execCtx.SP > top {
+			top = vm.execCtx.SP
+		}
+	}
+	return top
+}
+
 func (vm *VM) nextNestedStackAndFrame(extraSlots int) (int, int) {
 	if vm.activeCO == nil {
 		need := extraSlots + 256
 		if need > len(vm.stack) {
+			wasVM := len(vm.execCtx.Stack) > 0 && len(vm.stack) > 0 && &vm.execCtx.Stack[0] == &vm.stack[0]
 			vm.stack = ensureStack(vm.stack, need)
-			vm.execCtx.Stack = vm.stack
+			if wasVM {
+				vm.execCtx.Stack = vm.stack
+			}
 		}
 		return 0, 0
 	}
-	base := vm.execCtx.SP
-	minActiveEnd := vm.activeBaseOffset + 256
-	if vm.activeCO.MaxStackSize+vm.activeCO.NumLocals > 256 {
-		minActiveEnd = vm.activeBaseOffset + vm.activeCO.MaxStackSize + vm.activeCO.NumLocals
-	}
-	if base < minActiveEnd {
-		base = minActiveEnd
-	}
+	base := vm.vmStackTop()
 	nextFrame := vm.activeFrameIdx + 1
 	vm.ensureFrameCapacity(nextFrame + 4)
 	need := base + extraSlots + 256
 	if need > len(vm.stack) {
+		wasVM := len(vm.execCtx.Stack) > 0 && len(vm.stack) > 0 && &vm.execCtx.Stack[0] == &vm.stack[0]
 		vm.stack = ensureStack(vm.stack, need)
-		vm.execCtx.Stack = vm.stack
+		if wasVM {
+			vm.execCtx.Stack = vm.stack
+		}
 	}
 	return base, nextFrame
 }
@@ -980,6 +1015,14 @@ func (vm *VM) initBuiltins() {
 			}
 		} else if obj.IsModule() {
 			mod := obj.AsModule()
+			if modDirFn, ok := mod.Dict.Get(val.DunderDir); ok && !modDirFn.IsNone() && !modDirFn.IsUnbound() {
+				res := ctx.Invoke0(modDirFn)
+				items := val.ExtractIterableItems(ctx, res)
+				sort.SliceStable(items, func(i, j int) bool {
+					return items[i].IsAnyString() && items[j].IsAnyString() && items[i].AsString() < items[j].AsString()
+				})
+				return val.NewListVal(items...)
+			}
 			if mod.Dict != nil {
 				for _, item := range mod.Dict.Items() {
 					if item.Key.IsAnyString() {
@@ -1567,6 +1610,7 @@ func (vm *VM) syncActiveFrame(frameIdx int, co *CodeObject, code []uint32, const
 		saved.locals = locals
 		saved.cache = cache
 		saved.excStackLen = len(vm.excStack)
+		saved.stackIsVM = len(vm.execCtx.Stack) > 0 && len(vm.stack) > 0 && &vm.execCtx.Stack[0] == &vm.stack[0]
 		vm.activeFrameIdx = frameIdx
 		vm.activeCO = co
 		vm.activeBaseOffset = baseOffset
@@ -1871,7 +1915,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			} else if a.IsAnyString() && b.IsAnyString() {
 				if a.IsString() {
 					psA := a.AsStringObj()
-					bLen := b.StringLen()
+					bLen := b.StringByteLen()
 					if psA.Buf != nil && cap(psA.Buf) >= len(psA.Buf)+bLen {
 						psA.Buf, _ = val.AppendValueBytes(psA.Buf, b)
 						psA.Data = unsafe.String(unsafe.SliceData(psA.Buf), len(psA.Buf))
@@ -2500,6 +2544,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.locals = curLocals
 				saved.cache = curCodeCache
 				saved.excStackLen = len(vm.excStack)
+				saved.stackIsVM = stackIsVM
 				curLocals = val.NoneVal()
 				frameIdx++
 				curCO = callee
@@ -2651,6 +2696,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.locals = curLocals
 				saved.cache = curCodeCache
 				saved.excStackLen = len(vm.excStack)
+				saved.stackIsVM = stackIsVM
 				curLocals = val.NoneVal()
 				frameIdx++
 				curCO = callee
@@ -2849,6 +2895,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.locals = curLocals
 				saved.cache = curCodeCache
 				saved.excStackLen = len(vm.excStack)
+				saved.stackIsVM = stackIsVM
 				curLocals = val.NoneVal()
 				frameIdx++
 				curCO = callee
@@ -2969,6 +3016,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.locals = curLocals
 				saved.cache = curCodeCache
 				saved.excStackLen = len(vm.excStack)
+				saved.stackIsVM = stackIsVM
 				curLocals = val.NoneVal()
 				frameIdx++
 				curCO = callee
@@ -3099,7 +3147,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 						}
 					}
 				}
-			} else if obj.IsModule() {
+			} else if obj.IsModule() && obj.Type() == val.ModuleType {
 				mod := obj.AsModule()
 				entry := &curIC[ip]
 				modVer := atomic.LoadUint64(&mod.Dict.VersionTag)
@@ -3293,6 +3341,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.locals = curLocals
 				saved.cache = curCodeCache
 				saved.excStackLen = len(vm.excStack)
+				saved.stackIsVM = stackIsVM
 				curLocals = val.NoneVal()
 				frameIdx++
 				curCO = callee
@@ -3386,6 +3435,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.locals = curLocals
 				saved.cache = curCodeCache
 				saved.excStackLen = len(vm.excStack)
+				saved.stackIsVM = stackIsVM
 				curLocals = val.NoneVal()
 				frameIdx++
 				curCO = callee
@@ -3579,6 +3629,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 						saved.locals = curLocals
 						saved.cache = curCodeCache
 						saved.excStackLen = len(vm.excStack)
+						saved.stackIsVM = stackIsVM
 						curLocals = val.NoneVal()
 						frameIdx++
 						curCO = callee
@@ -3849,7 +3900,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					vm.execCtx.SP = sp
 					attrRes = vm.loadAttrInstanceSlowSafe(instObj, obj, consts[uint16(inst)], ip, sp, frameIdx, curIC, curAttrPIC)
 				}
-			} else if obj.IsModule() {
+			} else if obj.IsModule() && obj.Type() == val.ModuleType {
 				mod := obj.AsModule()
 				entry := &curIC[ip]
 				modVer := atomic.LoadUint64(&mod.Dict.VersionTag)
@@ -4678,7 +4729,30 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					curCodeCache = vm.getCodeCache(curCO)
 					continue
 				}
-				if nextVal, ok := pyIter.Next(); ok {
+				vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+				vm.execCtx.SP = sp
+				nextVal, ok := pyIter.Next()
+				if stackIsVM && &stack[0] != &vm.stack[0] {
+					stack = vm.stack
+					locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+				}
+				if vm.execCtx.HasException() {
+					exc := vm.execCtx.ActiveException
+					vm.execCtx.ClearException()
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if activeGen != nil {
+							activeGen.State = val.GenClosed
+						}
+						if activeCoro != nil {
+							activeCoro.State = val.CoroClosed
+						}
+						return val.NoneVal()
+					}
+					locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+					curCodeCache = vm.getCodeCache(curCO)
+					continue
+				}
+				if ok {
 					stack[sp] = nextVal
 					sp++
 					ip++
@@ -6526,9 +6600,15 @@ func (vm *VM) loadMethodSlow(obj, attrName val.Value, ip, sp, frameIdx int, curI
 
 	if obj.IsModule() {
 		mod := obj.AsModule()
-		if fnVal, ok := mod.Dict.Get(attrName); ok {
-			return val.UnboundVal(), fnVal
+		if obj.Type() == val.ModuleType {
+			if fnVal, ok := mod.Dict.Get(attrName); ok && !fnVal.IsLazyImport() {
+				return val.UnboundVal(), fnVal
+			}
 		}
+		vm.execCtx.SP = sp
+		vm.activeFrameIdx = frameIdx
+		res := val.GetAttrCtx(&vm.execCtx, obj, attrName)
+		return val.UnboundVal(), res
 	}
 
 	if obj.IsSuper() {

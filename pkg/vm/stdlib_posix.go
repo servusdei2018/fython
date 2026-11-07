@@ -515,6 +515,79 @@ func statResultVal(si statInfo) val.Value {
 	return v
 }
 
+type unameInfo struct {
+	Sysname  string
+	Nodename string
+	Release  string
+	Version  string
+	Machine  string
+}
+
+var (
+	unameResultType *val.PyType
+	unameResultOnce sync.Once
+	unameFieldNames = []string{"sysname", "nodename", "release", "version", "machine"}
+)
+
+func initUnameResultType() {
+	unameResultOnce.Do(func() {
+		t := val.MustNewType("uname_result", []*val.PyType{val.ObjectType}, nil)
+		t.Dict.Set(val.InternString("__module__"), val.InternString("posix"))
+		seq := func(self val.Value) []val.Value {
+			inst := self.AsInstance()
+			out := make([]val.Value, len(unameFieldNames))
+			for i, n := range unameFieldNames {
+				v, _ := inst.GetAttr(val.InternString(n))
+				out[i] = v
+			}
+			return out
+		}
+		t.Dict.Set(val.InternString("__getitem__"), val.NewBuiltinFuncVal("__getitem__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			items := seq(args[0])
+			i := int(args[1].AsInt64())
+			if i < 0 {
+				i += len(items)
+			}
+			if i < 0 || i >= len(items) {
+				panic("IndexError: tuple index out of range")
+			}
+			return items[i]
+		}))
+		t.Dict.Set(val.InternString("__len__"), val.NewBuiltinFuncVal("__len__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			return val.Int64Val(int64(len(unameFieldNames)))
+		}))
+		t.Dict.Set(val.InternString("__iter__"), val.NewBuiltinFuncVal("__iter__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			return val.NewIterVal(val.NewTupleVal(seq(args[0])...))
+		}))
+		t.Dict.Set(val.InternString("__repr__"), val.NewBuiltinFuncVal("__repr__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			var b strings.Builder
+			b.WriteString("posix.uname_result(")
+			for i, v := range seq(args[0]) {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				b.WriteString(unameFieldNames[i] + "=" + val.PyRepr(ctx, v))
+			}
+			b.WriteString(")")
+			return val.NewStringVal(b.String())
+		}))
+		t.InvalidateVersion()
+		unameResultType = t
+	})
+}
+
+func unameResultVal(ui unameInfo) val.Value {
+	initUnameResultType()
+	v := val.NewInstanceOfType(unameResultType)
+	inst := v.AsInstance()
+	inst.SetAttr(val.InternString("sysname"), val.NewStringVal(ui.Sysname))
+	inst.SetAttr(val.InternString("nodename"), val.NewStringVal(ui.Nodename))
+	inst.SetAttr(val.InternString("release"), val.NewStringVal(ui.Release))
+	inst.SetAttr(val.InternString("version"), val.NewStringVal(ui.Version))
+	inst.SetAttr(val.InternString("machine"), val.NewStringVal(ui.Machine))
+	return v
+}
+
 // portableMode converts a Go FileMode into POSIX st_mode bits.
 func portableMode(m fs.FileMode) int64 {
 	mode := int64(m.Perm())
@@ -596,6 +669,11 @@ func installPosix(osMod *val.PyModule) {
 	osMod.Dict.Set(val.InternString("PathLike"), val.TypeVal(pathLikeType))
 	terminalSizeVal(80, 24)
 	osMod.Dict.Set(val.InternString("terminal_size"), val.TypeVal(terminalSizeType))
+	initUnameResultType()
+	osMod.Dict.Set(val.InternString("uname_result"), val.TypeVal(unameResultType))
+	set("uname", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return unameResultVal(getUnameInfo())
+	})
 
 	osMod.Dict.Set(val.InternString("supports_dir_fd"), val.NewSetVal())
 	osMod.Dict.Set(val.InternString("supports_fd"), val.NewSetVal())

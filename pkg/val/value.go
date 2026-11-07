@@ -345,9 +345,24 @@ func (v Value) IsString() bool {
 	return v.ptr != nil && v.ptr.Kind == KindString
 }
 
-// IsAnyString reports whether v is either an inline small string or a heap-allocated string.
+// IsAnyString reports whether v is an inline string, a heap string, or a str subclass instance.
 func (v Value) IsAnyString() bool {
-	return v.ptr == &tagInlineStr || (v.ptr != nil && v.ptr.Kind == KindString)
+	if v.ptr == &tagInlineStr {
+		return true
+	}
+	if v.ptr == nil {
+		return false
+	}
+	if v.ptr.Kind == KindString {
+		return true
+	}
+	if v.ptr.Kind == KindInstance {
+		inst := (*PyInstance)(unsafe.Pointer(v.ptr))
+		if inst.Header.Type != nil && StrType != nil && IsSubclass(inst.Header.Type, StrType) {
+			return len(inst.Slots) > 0 && inst.Slots[0].IsAnyString()
+		}
+	}
+	return false
 }
 
 // IsList reports whether v is a heap-allocated PyList.
@@ -695,10 +710,9 @@ func equalsStructural(a, b Value) bool {
 		return false
 	}
 
-	// String comparison across inline and heap strings.
-	if (a.ptr == &tagInlineStr || a.ptr.Kind == KindString) &&
-		(b.ptr == &tagInlineStr || b.ptr.Kind == KindString) {
-		return StringEquals(a, b)
+	// String comparison across inline, heap strings, and string subclasses.
+	if a.IsAnyString() && b.IsAnyString() {
+		return a.AsString() == b.AsString()
 	}
 
 	// Binary data types comparison (bytes, bytearray, memoryview).
@@ -850,6 +864,9 @@ func HashValue(v Value) uint32 {
 		}
 		return mix64To32(math.Float64bits(f))
 	}
+	if v.ptr == &tagInlineStr {
+		return InlineStrHash(v)
+	}
 	if v.ptr.Kind == KindString {
 		if v.ptr.Hash != 0 {
 			return v.ptr.Hash
@@ -858,8 +875,8 @@ func HashValue(v Value) uint32 {
 		v.ptr.Hash = h
 		return h
 	}
-	if v.ptr == &tagInlineStr {
-		return InlineStrHash(v)
+	if v.IsAnyString() {
+		return HashString(v.AsString())
 	}
 	if v.ptr == &tagFloat64 {
 		f := math.Float64frombits(v.num)

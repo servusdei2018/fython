@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 	"unsafe"
 )
 
@@ -305,6 +306,15 @@ func memberDescrTpDescrGet(ctx *ExecContext, descr, obj Value, owner *PyType) Va
 		}
 		panic("val: AttributeError: '" + md.Owner.Name + "' object has no attribute '" + md.Name.AsString() + "'")
 	}
+	if obj.IsModule() && IsSubclass(obj.Type(), md.Owner) {
+		m := obj.AsModule()
+		if m.Dict != nil {
+			if v, ok := m.Dict.Get(md.Name); ok && !v.IsUnbound() {
+				return v
+			}
+		}
+		panic("val: AttributeError: '" + md.Owner.Name + "' object has no attribute '" + md.Name.AsString() + "'")
+	}
 	if !obj.IsInstance() {
 		panic("TypeError: descriptor '" + md.Name.AsString() + "' for '" + md.Owner.Name + "' objects doesn't apply to a '" + obj.Type().Name + "' object")
 	}
@@ -331,6 +341,18 @@ func memberDescrTpDescrSet(ctx *ExecContext, descr, obj, value Value) {
 			return
 		}
 		t.Attrs.Set(md.Name, value)
+		return
+	}
+	if obj.IsModule() && IsSubclass(obj.Type(), md.Owner) {
+		m := obj.AsModule()
+		if m.Dict == nil {
+			m.Dict = NewDictVal(4).AsDict()
+		}
+		if value.IsUnbound() {
+			m.Dict.Delete(md.Name)
+			return
+		}
+		m.Dict.Set(md.Name, value)
 		return
 	}
 	if !obj.IsInstance() {
@@ -766,6 +788,29 @@ func boundMethodTpCall(ctx *ExecContext, callable Value, args []Value, kwnames [
 	panic("val: bound method target is not callable")
 }
 
+func boundMethodTpGetAttr(ctx *ExecContext, obj, name Value) Value {
+	bm := obj.AsBoundMethod()
+	nameStr := name.AsString()
+	switch nameStr {
+	case "__func__", "__wrapped__":
+		return bm.Func
+	case "__self__":
+		return bm.Self
+	}
+	interned := InternValue(name)
+	if descr, _, found := BoundMethodType.LookupMRO(interned); found {
+		descrType := descr.Type()
+		if descrType.Slots.TpDescrGet != nil {
+			return descrType.Slots.TpDescrGet(ctx, descr, obj, BoundMethodType)
+		}
+		return descr
+	}
+	if bm.Func.HeaderPtr() != nil {
+		return GetAttrCtx(ctx, bm.Func, name)
+	}
+	return objectGetAttr(ctx, obj, name)
+}
+
 func propertyDescrGet(ctx *ExecContext, descr, obj Value, owner *PyType) Value {
 	prop := descr.AsProperty()
 	if obj.IsNone() || obj.IsUnbound() {
@@ -1033,24 +1078,17 @@ func typeTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value)
 		}
 		if cls.HasInit() {
 			initFn := cls.DunderInitVal()
-			if ctx != nil && ctx.SP+1+len(args) <= len(ctx.Stack) {
+			buf := make([]Value, 1+len(args))
+			buf[0] = inst
+			copy(buf[1:], args)
+			if initFn.IsBuiltinFunc() {
+				initFn.AsBuiltinFunc().Fn(ctx, initFn, buf, kwnames)
+			} else if ctx != nil && ctx.CallHook != nil && ctx.SP+len(buf) <= len(ctx.Stack) {
 				base := ctx.SP
-				ctx.Stack[base] = inst
-				copy(ctx.Stack[base+1:base+1+len(args)], args)
-				if initFn.IsBuiltinFunc() {
-					initFn.AsBuiltinFunc().Fn(ctx, initFn, ctx.Stack[base:base+1+len(args)], kwnames)
-				} else if ctx.CallHook != nil {
-					ctx.CallHook(ctx, initFn, base, 1+len(args), kwnames)
-				}
-			} else {
-				buf := make([]Value, 1+len(args))
-				buf[0] = inst
-				copy(buf[1:], args)
-				if initFn.IsBuiltinFunc() {
-					initFn.AsBuiltinFunc().Fn(ctx, initFn, buf, kwnames)
-				} else if tpCall := initFn.Type().Slots.TpCall; tpCall != nil {
-					tpCall(ctx, initFn, buf, kwnames)
-				}
+				copy(ctx.Stack[base:base+len(buf)], buf)
+				ctx.CallHook(ctx, initFn, base, len(buf), kwnames)
+			} else if tpCall := initFn.Type().Slots.TpCall; tpCall != nil {
+				tpCall(ctx, initFn, buf, kwnames)
 			}
 		}
 	}
@@ -1094,24 +1132,59 @@ func strSqItem(ctx *ExecContext, a, idxVal Value) Value {
 	}
 	idx := int(idxVal.AsInt64())
 	s := a.AsString()
-	if idx < 0 {
-		idx += len(s)
+	if isASCII(s) {
+		if idx < 0 {
+			idx += len(s)
+		}
+		if idx < 0 || idx >= len(s) {
+			if ctx != nil {
+				ctx.Raise(NewIndexError("string index out of range"))
+				return NoneVal()
+			}
+			panic("IndexError: string index out of range")
+		}
+		return SmallStringVal(s[idx : idx+1])
 	}
-	if idx < 0 || idx >= len(s) {
+	runes := []rune(s)
+	if idx < 0 {
+		idx += len(runes)
+	}
+	if idx < 0 || idx >= len(runes) {
 		if ctx != nil {
 			ctx.Raise(NewIndexError("string index out of range"))
 			return NoneVal()
 		}
 		panic("IndexError: string index out of range")
 	}
-	return SmallStringVal(s[idx : idx+1])
+	return NewStringVal(string(runes[idx]))
 }
 
 func strMpSubscript(ctx *ExecContext, a, idxVal Value) Value {
 	if idxVal.IsSlice() {
 		sl := idxVal.AsSlice()
 		s := a.AsString()
-		start, stop, step, sliceLen, err := NormalizeSliceIndices(sl.Start, sl.Stop, sl.Step, len(s))
+		if isASCII(s) {
+			start, stop, step, sliceLen, err := NormalizeSliceIndices(sl.Start, sl.Stop, sl.Step, len(s))
+			if err != nil {
+				panic(err.Error())
+			}
+			if sliceLen == 0 {
+				return NewStringVal("")
+			}
+			if step == 1 {
+				return NewStringVal(s[start:stop])
+			}
+			var buf strings.Builder
+			buf.Grow(sliceLen)
+			cur := start
+			for i := 0; i < sliceLen; i++ {
+				buf.WriteByte(s[cur])
+				cur += step
+			}
+			return NewStringVal(buf.String())
+		}
+		runes := []rune(s)
+		start, stop, step, sliceLen, err := NormalizeSliceIndices(sl.Start, sl.Stop, sl.Step, len(runes))
 		if err != nil {
 			panic(err.Error())
 		}
@@ -1119,16 +1192,15 @@ func strMpSubscript(ctx *ExecContext, a, idxVal Value) Value {
 			return NewStringVal("")
 		}
 		if step == 1 {
-			return NewStringVal(s[start:stop])
+			return NewStringVal(string(runes[start:stop]))
 		}
-		var buf strings.Builder
-		buf.Grow(sliceLen)
+		resRunes := make([]rune, sliceLen)
 		cur := start
 		for i := 0; i < sliceLen; i++ {
-			buf.WriteByte(s[cur])
+			resRunes[i] = runes[cur]
 			cur += step
 		}
-		return NewStringVal(buf.String())
+		return NewStringVal(string(resRunes))
 	}
 	return strSqItem(ctx, a, idxVal)
 }
@@ -1547,13 +1619,21 @@ func BuiltinLen(ctx *ExecContext, callable Value, args []Value, kwnames []Value)
 	}
 	x := args[0]
 	if x.ptr == &tagInlineStr {
-		return Int64Val(int64(x.num & 0xFF))
+		s := x.AsString()
+		if isASCII(s) {
+			return Int64Val(int64(len(s)))
+		}
+		return Int64Val(int64(utf8.RuneCountInString(s)))
 	}
 	switch x.ptr.Kind {
 	case KindList:
 		return Int64Val(int64(len(x.AsList().Items)))
 	case KindString:
-		return Int64Val(int64(len(x.AsStringObj().Data)))
+		s := x.AsStringObj().Data
+		if isASCII(s) {
+			return Int64Val(int64(len(s)))
+		}
+		return Int64Val(int64(utf8.RuneCountInString(s)))
 	case KindDict:
 		return Int64Val(int64(x.AsDict().Len()))
 	case KindTuple:
@@ -3729,7 +3809,25 @@ func initTypes() {
 			return IntToStringVal(a.AsInt64())
 		}
 		if a.IsAnyString() {
-			return a
+			if callable.IsType() && callable.AsType() == StrType {
+				if a.Type() == StrType {
+					return a
+				}
+				return NewStringVal(a.AsString())
+			}
+			cls := StrType
+			if callable.IsType() {
+				cls = callable.AsType()
+			}
+			inst := NewInstanceOfType(cls)
+			instInst := inst.AsInstance()
+			s := NewStringVal(a.AsString())
+			if len(instInst.Slots) == 0 {
+				instInst.Slots = []Value{s}
+			} else {
+				instInst.Slots[0] = s
+			}
+			return inst
 		}
 		if ctx != nil && a.Type() != nil && a.Type() != StrType {
 			if strFn, _, ok := a.Type().LookupMRO(InternString("__str__")); ok {
@@ -3983,6 +4081,14 @@ func initTypes() {
 			items[i] = NewStringVal(p)
 		}
 		return NewListVal(items...)
+	}))
+
+	TypeType.Dict.Set(DunderCall, NewBuiltinFuncVal("type.__call__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 || !args[0].IsType() {
+			panic("TypeError: descriptor '__call__' of 'type' object needs an argument")
+		}
+		cls := args[0]
+		return typeTpCall(ctx, cls, args[1:], kwnames)
 	}))
 
 	StrType.Dict.Set(InternString("join"), NewBuiltinFuncVal("join", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
@@ -4360,6 +4466,25 @@ func initTypes() {
 		}
 		return compareSliceRich(ctx, args[0].AsList().Items, args[1].AsList().Items, CmpNEQ)
 	}))
+	listAddBuiltin := NewBuiltinFuncVal("list.__add__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: list.__add__ takes 2 arguments")
+		}
+		return listNbAdd(ctx, args[0], args[1])
+	})
+	ListType.Dict.Set(DunderAdd, listAddBuiltin)
+	ListType.dunderAdd = listAddBuiltin
+	listMulBuiltin := NewBuiltinFuncVal("list.__mul__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: list.__mul__ takes 2 arguments")
+		}
+		return listNbMul(ctx, args[0], args[1])
+	})
+	ListType.Dict.Set(DunderMul, listMulBuiltin)
+	ListType.dunderMul = listMulBuiltin
+	ListType.Dict.Set(DunderRMul, listMulBuiltin)
+	ListType.dunderRMul = listMulBuiltin
+	ListType.syncDunderSlots()
 
 	DictType = MustNewType("dict", []*PyType{ObjectType}, nil)
 	DictType.Slots.SqLen = dictSqLen
@@ -4564,12 +4689,7 @@ func initTypes() {
 				}
 			} else if keysFn, _, ok := other.Type().LookupMRO(InternString("keys")); ok {
 				keysVal := ctx.Invoke1(keysFn, other)
-				it := NewIterVal(keysVal).AsIter()
-				for {
-					k, ok := it.Next()
-					if !ok {
-						break
-					}
+				for _, k := range ExtractIterableItems(ctx, keysVal) {
 					var v Value
 					if getItemFn, _, ok := other.Type().LookupMRO(DunderGetItem); ok {
 						v = ctx.Invoke2(getItemFn, other, k)
@@ -4577,12 +4697,7 @@ func initTypes() {
 					d.Set(k, v)
 				}
 			} else {
-				it := NewIterVal(other).AsIter()
-				for {
-					item, ok := it.Next()
-					if !ok {
-						break
-					}
+				for _, item := range ExtractIterableItems(ctx, other) {
 					if item.IsTuple() && len(item.AsTuple().Items) >= 2 {
 						d.Set(item.AsTuple().Items[0], item.AsTuple().Items[1])
 					}
@@ -4659,7 +4774,8 @@ func initTypes() {
 		if args[0].Kind() == KindTuple && args[0].Type() == TupleType {
 			return args[0]
 		}
-		return NewTupleVal(ExtractIterableItems(ctx, args[0])...)
+		items := ExtractIterableItems(ctx, args[0])
+		return NewTupleVal(items...)
 	}
 	tupleNewBuiltin := NewBuiltinFuncVal("tuple.__new__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		cls := TupleType
@@ -4785,6 +4901,25 @@ func initTypes() {
 		}
 		return Int64Val(n)
 	}))
+	tupleAddBuiltin := NewBuiltinFuncVal("tuple.__add__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: tuple.__add__ takes 2 arguments")
+		}
+		return tupleNbAdd(ctx, args[0], args[1])
+	})
+	TupleType.Dict.Set(DunderAdd, tupleAddBuiltin)
+	TupleType.dunderAdd = tupleAddBuiltin
+	tupleMulBuiltin := NewBuiltinFuncVal("tuple.__mul__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: tuple.__mul__ takes 2 arguments")
+		}
+		return tupleNbMul(ctx, args[0], args[1])
+	})
+	TupleType.Dict.Set(DunderMul, tupleMulBuiltin)
+	TupleType.dunderMul = tupleMulBuiltin
+	TupleType.Dict.Set(DunderRMul, tupleMulBuiltin)
+	TupleType.dunderRMul = tupleMulBuiltin
+	TupleType.syncDunderSlots()
 
 	CodeType = MustNewType("code", []*PyType{ObjectType}, nil)
 	CodeType.Slots.TpCall = functionTpCall
@@ -4860,6 +4995,14 @@ func initTypes() {
 			items[i] = NewTupleVal(e.Key, e.Value)
 		}
 		return NewListVal(items...)
+	}))
+
+	TypeType.Dict.Set(DunderCall, NewBuiltinFuncVal("type.__call__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 || !args[0].IsType() {
+			panic("TypeError: descriptor '__call__' of 'type' object needs an argument")
+		}
+		cls := args[0]
+		return typeTpCall(ctx, cls, args[1:], kwnames)
 	}))
 	LocalsProxyType.Dict.Set(InternString("get"), NewBuiltinFuncVal("get", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
@@ -4963,6 +5106,7 @@ func initTypes() {
 
 	BoundMethodType = MustNewType("method", []*PyType{ObjectType}, nil)
 	BoundMethodType.Slots.TpCall = boundMethodTpCall
+	BoundMethodType.Slots.TpGetAttr = boundMethodTpGetAttr
 
 	funcCall := NewBuiltinFuncVal("function.__call__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
@@ -5746,6 +5890,11 @@ func initTypes() {
 
 	// Initialize built-in exception types
 	BaseExceptionType = MustNewType("BaseException", []*PyType{ObjectType}, nil)
+	BaseExceptionType.Dict.Set(InternString("__traceback__"), NoneVal())
+	BaseExceptionType.Dict.Set(InternString("__cause__"), NoneVal())
+	BaseExceptionType.Dict.Set(InternString("__context__"), NoneVal())
+	BaseExceptionType.Dict.Set(InternString("__suppress_context__"), BoolVal(false))
+	BaseExceptionType.Dict.Set(InternString("args"), NewTupleVal())
 	BaseExceptionType.Dict.Set(DunderInit, NewBuiltinFuncVal("__init__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) > 0 {
 			self := args[0]
@@ -5756,6 +5905,10 @@ func initTypes() {
 					copy(tupleItems, args[1:])
 				}
 				self.AsInstance().SetAttr(InternString("args"), NewTupleVal(tupleItems...))
+				self.AsInstance().SetAttr(InternString("__traceback__"), NoneVal())
+				self.AsInstance().SetAttr(InternString("__cause__"), NoneVal())
+				self.AsInstance().SetAttr(InternString("__context__"), NoneVal())
+				self.AsInstance().SetAttr(InternString("__suppress_context__"), BoolVal(false))
 			}
 		}
 		return NoneVal()
@@ -6462,6 +6615,14 @@ func initTypes() {
 		}
 		return NewListVal(items...)
 	}))
+
+	TypeType.Dict.Set(DunderCall, NewBuiltinFuncVal("type.__call__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 || !args[0].IsType() {
+			panic("TypeError: descriptor '__call__' of 'type' object needs an argument")
+		}
+		cls := args[0]
+		return typeTpCall(ctx, cls, args[1:], kwnames)
+	}))
 	MemoryViewType.Dict.Set(InternString("release"), NewBuiltinFuncVal("release", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
 			panic("TypeError: release() takes no arguments")
@@ -6536,23 +6697,41 @@ func initTypes() {
 	ModuleType = MustNewType("module", []*PyType{ObjectType}, nil)
 	ModuleType.Slots.TpGetAttr = moduleGetAttr
 	ModuleType.Slots.TpSetAttr = moduleSetAttr
-	ModuleType.Slots.TpCall = func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		// types.ModuleType(name, doc=None)
-		if !callable.IsType() || callable.AsType() != ModuleType {
-			panic("TypeError: 'module' object is not callable")
+
+	moduleNewBuiltin := NewBuiltinFuncVal("module.__new__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: module.__new__(): not enough arguments")
 		}
+		cls := args[0]
+		if !cls.IsType() {
+			panic("TypeError: module.__new__(X): X is not a type object")
+		}
+		return NewInstanceOfType(cls.AsType())
+	})
+	ModuleType.Dict.Set(DunderNew, moduleNewBuiltin)
+	ModuleType.dunderNew = moduleNewBuiltin
+
+	moduleInitBuiltin := NewBuiltinFuncVal("module.__init__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: module.__init__() takes at least 1 argument")
+		}
+		self := args[0]
+		if !self.IsModule() {
+			panic("TypeError: module.__init__() target must be a module")
+		}
+		mod := self.AsModule()
 		npos := len(args) - len(kwnames)
 		var nameV, docV Value
 		haveName := false
 		docV = NoneVal()
-		if npos > 2 {
-			panic("TypeError: module() takes at most 2 arguments")
-		}
-		if npos >= 1 {
-			nameV, haveName = args[0], true
+		if npos > 3 {
+			panic("TypeError: module.__init__() takes at most 3 arguments")
 		}
 		if npos >= 2 {
-			docV = args[1]
+			nameV, haveName = args[1], true
+		}
+		if npos >= 3 {
+			docV = args[2]
 		}
 		for i, kn := range kwnames {
 			switch kn.AsString() {
@@ -6561,22 +6740,83 @@ func initTypes() {
 			case "doc":
 				docV = args[npos+i]
 			default:
-				panic("TypeError: module() got an unexpected keyword argument '" + kn.AsString() + "'")
+				panic("TypeError: module.__init__() got an unexpected keyword argument '" + kn.AsString() + "'")
 			}
 		}
-		if !haveName {
-			panic("TypeError: module() missing required argument 'name' (pos 1)")
+		if haveName {
+			if !nameV.IsAnyString() {
+				panic("TypeError: module.__init__() argument 'name' must be str, not " + nameV.Type().Name)
+			}
+			mod.Name = nameV.AsString()
+			mod.Dict.Set(InternString("__name__"), nameV)
 		}
-		if !nameV.IsAnyString() {
-			panic("TypeError: module.__init__() argument 'name' must be str, not " + nameV.Type().Name)
+		mod.Dict.Set(InternString("__doc__"), docV)
+		mod.Dict.Set(InternString("__package__"), NoneVal())
+		mod.Dict.Set(InternString("__loader__"), NoneVal())
+		mod.Dict.Set(InternString("__spec__"), NoneVal())
+		return NoneVal()
+	})
+	ModuleType.Dict.Set(DunderInit, moduleInitBuiltin)
+	ModuleType.dunderInit = moduleInitBuiltin
+
+	moduleGetAttributeBuiltin := NewBuiltinFuncVal("module.__getattribute__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: module.__getattribute__() takes 2 arguments")
 		}
-		m := NewModuleVal(nameV.AsString(), "")
-		m.AsModule().Dict.Delete(InternString("__file__"))
-		m.AsModule().Dict.Set(InternString("__doc__"), docV)
-		m.AsModule().Dict.Set(InternString("__package__"), NoneVal())
-		m.AsModule().Dict.Set(InternString("__loader__"), NoneVal())
-		m.AsModule().Dict.Set(InternString("__spec__"), NoneVal())
-		return m
+		return defaultModuleGetAttr(ctx, args[0], InternValue(args[1]))
+	})
+	ModuleType.Dict.Set(DunderGetAttribute, moduleGetAttributeBuiltin)
+
+	moduleSetAttrBuiltin := NewBuiltinFuncVal("module.__setattr__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 3 {
+			panic("TypeError: module.__setattr__() takes 3 arguments")
+		}
+		return moduleSetAttr(ctx, args[0], args[1], args[2])
+	})
+	ModuleType.Dict.Set(DunderSetAttr, moduleSetAttrBuiltin)
+
+	moduleDelAttrBuiltin := NewBuiltinFuncVal("module.__delattr__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: module.__delattr__() takes 2 arguments")
+		}
+		objectDelAttr(ctx, args[0], args[1])
+		return NoneVal()
+	})
+	ModuleType.Dict.Set(DunderDelAttr, moduleDelAttrBuiltin)
+
+	moduleReprBuiltin := NewBuiltinFuncVal("module.__repr__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			return NewStringVal("<module>")
+		}
+		if !args[0].IsModule() {
+			return NewStringVal(fmt.Sprintf("<%s object at %p>", args[0].Type().Name, args[0].HeaderPtr()))
+		}
+		m := args[0].AsModule()
+		name := m.Name
+		if nameV, ok := m.Dict.Get(InternString("__name__")); ok && nameV.IsAnyString() {
+			name = nameV.AsString()
+		}
+		if fileV, ok := m.Dict.Get(InternString("__file__")); ok && fileV.IsAnyString() {
+			return NewStringVal(fmt.Sprintf("<module '%s' from '%s'>", name, fileV.AsString()))
+		}
+		return NewStringVal(fmt.Sprintf("<module '%s'>", name))
+	})
+	ModuleType.Dict.Set(InternString("__repr__"), moduleReprBuiltin)
+	ModuleType.syncDunderSlots()
+
+	ModuleType.Slots.TpCall = func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		cls := ModuleType
+		if callable.IsType() {
+			cls = callable.AsType()
+		}
+		inst := NewInstanceOfType(cls)
+		if cls.HasInit() {
+			initArgs := make([]Value, 1+len(args))
+			initArgs[0] = inst
+			copy(initArgs[1:], args)
+			ctx.Call(cls.DunderInitVal(), initArgs, kwnames)
+		}
+		return inst
 	}
 
 	// 4. Populate static lookup table and sentinel headers.
@@ -6699,6 +6939,7 @@ func initTypes() {
 		initTypeDescriptorsAndSubclasses(ctx, t, kwArgs, kwnames)
 		return TypeVal(t)
 	})
+	typeNewBuiltin.AsBuiltinFunc().NoBind = true
 	TypeType.Dict.Set(DunderNew, typeNewBuiltin)
 	TypeType.dunderNew = typeNewBuiltin
 	TypeType.Dict.Set(DunderSetAttr, NewBuiltinFuncVal("type.__setattr__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
@@ -6770,6 +7011,14 @@ func initTypes() {
 		return NewListVal(items...)
 	}))
 
+	TypeType.Dict.Set(DunderCall, NewBuiltinFuncVal("type.__call__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 || !args[0].IsType() {
+			panic("TypeError: descriptor '__call__' of 'type' object needs an argument")
+		}
+		cls := args[0]
+		return typeTpCall(ctx, cls, args[1:], kwnames)
+	}))
+
 	objectInitSubclassBuiltin := NewBuiltinFuncVal("object.__init_subclass__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(kwnames) > 0 {
 			panic("TypeError: __init_subclass__() takes no keyword arguments")
@@ -6803,9 +7052,32 @@ func initTypes() {
 		}
 		if obj.IsInstance() {
 			if tp.Flags&FlagForbidDynamicAttrs != 0 {
+				if BaseExceptionType != nil && IsSubclass(tp, BaseExceptionType) {
+					switch interned.AsString() {
+					case "__traceback__", "__cause__", "__context__", "__suppress_context__":
+						goto allowDynamicSet
+					}
+				}
 				panic(NewAttributeError("'" + tp.Name + "' object has no attribute '" + interned.AsString() + "'"))
 			}
+		allowDynamicSet:
 			obj.AsInstance().SetAttr(interned, value)
+			return NoneVal()
+		}
+		if obj.IsFunction() {
+			fn := obj.AsFunction()
+			if fn.Dict == nil {
+				fn.Dict = NewDictVal(4).AsDict()
+			}
+			fn.Dict.Set(interned, value)
+			return NoneVal()
+		}
+		if obj.IsModule() {
+			if interned.AsString() == "__class__" {
+				AssignInstanceClass(obj, value)
+				return NoneVal()
+			}
+			obj.AsModule().Dict.Set(interned, value)
 			return NoneVal()
 		}
 		if obj.IsDict() && tp != DictType {
@@ -6849,6 +7121,19 @@ func initTypes() {
 		if obj.IsInstance() {
 			if !obj.AsInstance().DeleteAttr(interned) {
 				panic(NewAttributeError("'" + tp.Name + "' object has no attribute '" + interned.AsString() + "'"))
+			}
+			return NoneVal()
+		}
+		if obj.IsFunction() {
+			fn := obj.AsFunction()
+			if fn.Dict != nil && fn.Dict.Delete(interned) {
+				return NoneVal()
+			}
+			panic(NewAttributeError("'" + tp.Name + "' object has no attribute '" + interned.AsString() + "'"))
+		}
+		if obj.IsModule() {
+			if !obj.AsModule().Dict.Delete(interned) {
+				panic(NewAttributeError("module '" + obj.AsModule().Name + "' has no attribute '" + interned.AsString() + "'"))
 			}
 			return NoneVal()
 		}
@@ -6991,11 +7276,13 @@ func initTypes() {
 		cls := args[0].AsType()
 		return NewInstanceOfType(cls)
 	})
+	ObjectNewBuiltin.AsBuiltinFunc().NoBind = true
 	ObjectType.Dict.Set(DunderNew, ObjectNewBuiltin)
 	ObjectType.dunderNew = ObjectNewBuiltin
 
 	ObjectType.syncDunderSlots()
 	TypeType.syncDunderSlots()
+	TypeType.Slots.TpCall = typeTpCall
 }
 
 type PyDictKeys struct {

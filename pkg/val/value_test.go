@@ -548,3 +548,64 @@ func TestPyModuleAndDictGetWithSlot(t *testing.T) {
 		t.Fatalf("GetAttrCtx returned %v, want 12345", got)
 	}
 }
+
+func TestModuleTypeSubclassingAndPEP562(t *testing.T) {
+	ctx := &ExecContext{}
+
+	// 1. PEP 562: __getattr__ in regular module dictionary
+	modVal := NewModuleVal("pep562_mod", "pep562_mod.py")
+	mod := modVal.AsModule()
+	getattrCalled := false
+	getattrFn := NewBuiltinFuncVal("__getattr__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		getattrCalled = true
+		if len(args) > 0 && args[0].AsString() == "dynamic_val" {
+			return Int64Val(777)
+		}
+		panic(NewAttributeError("not found: " + args[0].AsString()))
+	})
+	mod.Dict.Set(DunderGetAttr, getattrFn)
+
+	gotDyn := GetAttrCtx(ctx, modVal, InternString("dynamic_val"))
+	if !getattrCalled || !gotDyn.IsInt64() || gotDyn.AsInt64() != 777 {
+		t.Fatalf("PEP 562 __getattr__ failed: got %v, called=%v", gotDyn, getattrCalled)
+	}
+
+	// 2. Custom ModuleType subclass
+	customCls := MustNewType("CustomModule", []*PyType{ModuleType}, nil)
+	customCls.SetAttrStr("class_prop", NewStringVal("from_class"))
+
+	instVal := NewInstanceOfType(customCls)
+	if !instVal.IsModule() {
+		t.Fatalf("expected NewInstanceOfType(CustomModule) to be KindModule, got %v", instVal.Kind())
+	}
+	if instVal.Type() != customCls {
+		t.Fatalf("expected Type to be CustomModule, got %v", instVal.Type().Name)
+	}
+
+	// Read class attribute
+	clsAttr := GetAttrCtx(ctx, instVal, InternString("class_prop"))
+	if clsAttr.AsString() != "from_class" {
+		t.Fatalf("expected class_prop from CustomModule MRO, got %v", clsAttr)
+	}
+
+	// Set instance attribute
+	SetAttrCtx(ctx, instVal, InternString("inst_prop"), Int64Val(42))
+	instAttr := GetAttrCtx(ctx, instVal, InternString("inst_prop"))
+	if !instAttr.IsInt64() || instAttr.AsInt64() != 42 {
+		t.Fatalf("expected inst_prop to be 42, got %v", instAttr)
+	}
+
+	// 3. __class__ assignment on module
+	plainMod := NewModuleVal("reclass_mod", "reclass_mod.py")
+	if plainMod.Type() != ModuleType {
+		t.Fatalf("expected plainMod to have ModuleType, got %v", plainMod.Type().Name)
+	}
+	AssignInstanceClass(plainMod, TypeVal(customCls))
+	if plainMod.Type() != customCls {
+		t.Fatalf("expected plainMod type to become CustomModule, got %v", plainMod.Type().Name)
+	}
+	reclassedAttr := GetAttrCtx(ctx, plainMod, InternString("class_prop"))
+	if reclassedAttr.AsString() != "from_class" {
+		t.Fatalf("expected class_prop on reclassed module, got %v", reclassedAttr)
+	}
+}

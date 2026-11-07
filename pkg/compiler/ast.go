@@ -147,6 +147,7 @@ type ASTComp struct {
 	Iter    ExprID
 	IfConds ExprSlice
 	IsDict  bool
+	IsAsync bool
 	Next    uint32 // 1-based index to next ASTComp in chain; 0 if terminal
 }
 

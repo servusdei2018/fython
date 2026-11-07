@@ -214,6 +214,17 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			ctx.Invoke1(write, val.NewStringVal(sb.String()))
 			return val.NoneVal()
 		}
+		if ctx != nil && ctx.VM != nil {
+			if vmInstance, ok := ctx.VM.(*VM); ok {
+				if sysVal, ok := vmInstance.modules.Get(val.InternString("sys")); ok && sysVal.IsModule() {
+					if stdoutVal, ok := sysVal.AsModule().Dict.Get(val.InternString("stdout")); ok && !stdoutVal.IsNone() {
+						write := val.GetAttrCtx(ctx, stdoutVal, val.InternString("write"))
+						ctx.Invoke1(write, val.NewStringVal(sb.String()))
+						return val.NoneVal()
+					}
+				}
+			}
+		}
 		fmt.Print(sb.String())
 		return val.NoneVal()
 	}))
@@ -1031,11 +1042,42 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 	d.Set(val.InternString("compile"), val.NewBuiltinFuncVal("compile", builtinCompile))
 
 	d.Set(val.InternString("eval"), val.NewBuiltinFuncVal("eval", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		if len(args) < 1 {
+		npos := len(args) - len(kwnames)
+		if npos < 1 && len(args) < 1 {
 			panic("TypeError: eval() takes at least 1 argument")
 		}
+		var expr val.Value
+		globalsVal := val.NoneVal()
+		localsVal := val.NoneVal()
+		closureVal := val.NoneVal()
+
+		if npos >= 1 {
+			expr = args[0]
+		}
+		if npos >= 2 {
+			globalsVal = args[1]
+		}
+		if npos >= 3 {
+			localsVal = args[2]
+		}
+		if npos >= 4 {
+			closureVal = args[3]
+		}
+		for i, kn := range kwnames {
+			argV := args[npos+i]
+			switch kn.AsString() {
+			case "source", "expression":
+				expr = argV
+			case "globals":
+				globalsVal = argV
+			case "locals":
+				localsVal = argV
+			case "closure":
+				closureVal = argV
+			}
+		}
+
 		vmInstance := ctx.VM.(*VM)
-		expr := args[0]
 		var co *CodeObject
 
 		if expr.Kind() == val.KindCode {
@@ -1056,24 +1098,35 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			panic("TypeError: eval() arg 1 must be a string, bytes or code object")
 		}
 
-		globalsDict := vmInstance.currentGlobals()
-		if len(args) > 1 && !args[1].IsNone() {
-			if args[1].IsDict() {
-				globalsDict = args[1].AsDict()
+		var globalsDict *val.PyDict
+		if globalsVal.IsNone() {
+			globalsDict = vmInstance.currentGlobals()
+			if localsVal.IsNone() {
+				localsVal = vmInstance.currentLocalsVal()
 			}
-		}
-		localsVal := val.NoneVal()
-		if len(args) > 2 && !args[2].IsNone() {
-			localsVal = args[2]
-		} else if len(args) == 1 || args[1].IsNone() {
-			localsVal = vmInstance.currentLocalsVal()
+		} else if globalsVal.IsDict() {
+			globalsDict = globalsVal.AsDict()
+			if localsVal.IsNone() {
+				localsVal = globalsVal
+			}
+		} else {
+			panic("TypeError: globals must be a dict")
 		}
 
 		if _, ok := globalsDict.Get(val.InternString("__builtins__")); !ok {
-			globalsDict.Set(val.InternString("__builtins__"), val.DictVal(vmInstance.builtins))
+			if builtinsMod, ok := vmInstance.modules.Get(val.InternString("builtins")); ok {
+				globalsDict.Set(val.InternString("__builtins__"), builtinsMod)
+			} else {
+				globalsDict.Set(val.InternString("__builtins__"), val.DictVal(vmInstance.builtins))
+			}
 		}
 
-		res := vmInstance.runNestedCode(co, globalsDict, localsVal, nil)
+		var cells []val.Value
+		if !closureVal.IsNone() && closureVal.IsTuple() {
+			cells = closureVal.AsTuple().Items
+		}
+
+		res := vmInstance.runNestedCode(co, globalsDict, localsVal, cells)
 		if !vmInstance.unhandledException.IsNone() && vmInstance.unhandledException.HeaderPtr() != nil {
 			exc := vmInstance.unhandledException
 			vmInstance.unhandledException = val.NoneVal()
@@ -1083,11 +1136,42 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 	}))
 
 	d.Set(val.InternString("exec"), val.NewBuiltinFuncVal("exec", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		if len(args) < 1 {
+		npos := len(args) - len(kwnames)
+		if npos < 1 && len(args) < 1 {
 			panic("TypeError: exec() takes at least 1 argument")
 		}
+		var codeObj val.Value
+		globalsVal := val.NoneVal()
+		localsVal := val.NoneVal()
+		closureVal := val.NoneVal()
+
+		if npos >= 1 {
+			codeObj = args[0]
+		}
+		if npos >= 2 {
+			globalsVal = args[1]
+		}
+		if npos >= 3 {
+			localsVal = args[2]
+		}
+		if npos >= 4 {
+			closureVal = args[3]
+		}
+		for i, kn := range kwnames {
+			argV := args[npos+i]
+			switch kn.AsString() {
+			case "source", "code":
+				codeObj = argV
+			case "globals":
+				globalsVal = argV
+			case "locals":
+				localsVal = argV
+			case "closure":
+				closureVal = argV
+			}
+		}
+
 		vmInstance := ctx.VM.(*VM)
-		codeObj := args[0]
 		var co *CodeObject
 
 		if codeObj.Kind() == val.KindCode {
@@ -1108,24 +1192,35 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			panic("TypeError: exec() arg 1 must be a string, bytes or code object")
 		}
 
-		globalsDict := vmInstance.currentGlobals()
-		if len(args) > 1 && !args[1].IsNone() {
-			if args[1].IsDict() {
-				globalsDict = args[1].AsDict()
+		var globalsDict *val.PyDict
+		if globalsVal.IsNone() {
+			globalsDict = vmInstance.currentGlobals()
+			if localsVal.IsNone() {
+				localsVal = vmInstance.currentLocalsVal()
 			}
-		}
-		localsVal := val.NoneVal()
-		if len(args) > 2 && !args[2].IsNone() {
-			localsVal = args[2]
-		} else if len(args) == 1 || args[1].IsNone() {
-			localsVal = vmInstance.currentLocalsVal()
+		} else if globalsVal.IsDict() {
+			globalsDict = globalsVal.AsDict()
+			if localsVal.IsNone() {
+				localsVal = globalsVal
+			}
+		} else {
+			panic("TypeError: globals must be a dict")
 		}
 
 		if _, ok := globalsDict.Get(val.InternString("__builtins__")); !ok {
-			globalsDict.Set(val.InternString("__builtins__"), val.DictVal(vmInstance.builtins))
+			if builtinsMod, ok := vmInstance.modules.Get(val.InternString("builtins")); ok {
+				globalsDict.Set(val.InternString("__builtins__"), builtinsMod)
+			} else {
+				globalsDict.Set(val.InternString("__builtins__"), val.DictVal(vmInstance.builtins))
+			}
 		}
 
-		vmInstance.runNestedCode(co, globalsDict, localsVal, nil)
+		var cells []val.Value
+		if !closureVal.IsNone() && closureVal.IsTuple() {
+			cells = closureVal.AsTuple().Items
+		}
+
+		vmInstance.runNestedCode(co, globalsDict, localsVal, cells)
 		if !vmInstance.unhandledException.IsNone() && vmInstance.unhandledException.HeaderPtr() != nil {
 			exc := vmInstance.unhandledException
 			vmInstance.unhandledException = val.NoneVal()
@@ -1179,7 +1274,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			panic("ModuleNotFoundError: " + err.Error())
 		}
 
-		if len(fromList) > 0 && modVal.IsModule() {
+		if len(fromList) > 0 {
 			for _, sym := range fromList {
 				_, _ = vmInstance.ImportFrom(modVal, sym, callerGlobals)
 				if !vmInstance.unhandledException.IsNone() && vmInstance.unhandledException.HeaderPtr() != nil {

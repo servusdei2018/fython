@@ -2878,6 +2878,78 @@ func (c *Compiler) compileListComp(expr *ASTExpr) error {
 	var compileClause func(currIdx uint32, depth int) error
 	compileClause = func(currIdx uint32, depth int) error {
 		curr := &c.arena.Comps[currIdx]
+		if curr.IsAsync {
+			if err := c.compileExpr(curr.Iter); err != nil {
+				return err
+			}
+			_, aiterIdx := c.constPool.InternName("__aiter__")
+			c.emitOp(vm.OP_LOAD_METHOD, 0, aiterIdx)
+			c.emitOp(vm.OP_CALL_METHOD, 0, 0)
+
+			iterSlot := c.allocTempLocal()
+			c.emitOp(vm.OP_STORE_FAST, 0, uint16(iterSlot))
+
+			loopStart := len(c.code)
+
+			c.emitOp(vm.OP_LOAD_FAST, 0, uint16(iterSlot))
+			_, anextIdx := c.constPool.InternName("__anext__")
+			c.emitOp(vm.OP_LOAD_METHOD, 0, anextIdx)
+			c.emitOp(vm.OP_CALL_METHOD, 0, 0)
+			c.emitOp(vm.OP_GET_AWAITABLE, 0, 0)
+
+			anextDepth := c.stackDepth
+			anextStart := len(c.code)
+			c.emitOp(vm.OP_AWAIT, 0, 0)
+			anextEnd := len(c.code)
+
+			if err := c.compileStoreTarget(curr.Target); err != nil {
+				return err
+			}
+
+			var ifSkips []int
+			for _, ifCond := range c.arena.GetExprSlice(curr.IfConds) {
+				if err := c.compileExpr(ifCond); err != nil {
+					return err
+				}
+				ifSkips = append(ifSkips, c.emitOp(vm.OP_JUMP_IF_FALSE, 0, 0))
+			}
+
+			if curr.Next != 0 {
+				if err := compileClause(curr.Next-1, depth+1); err != nil {
+					return err
+				}
+			} else {
+				if err := c.compileExpr(expr.Left); err != nil {
+					return err
+				}
+				c.emitOp(vm.OP_LIST_APPEND, 0, uint16(depth+1))
+			}
+
+			c.emitOp(vm.OP_JUMP, 0, uint16(loopStart))
+
+			excHandlerIP := len(c.code)
+			c.addExceptionRange(anextStart, anextEnd, excHandlerIP, anextDepth, false)
+
+			c.emitOp(vm.OP_DUP_TOP, 0, 0)
+			if err := c.compileNameLoad("StopAsyncIteration"); err != nil {
+				return err
+			}
+			c.emitOp(vm.OP_CHECK_EXC_MATCH, 0, 0)
+			jumpNotMatch := c.emitOp(vm.OP_JUMP_IF_FALSE, 0, 0)
+
+			c.emitOp(vm.OP_POP_TOP, 0, 0)
+			jumpAfterLoop := c.emitOp(vm.OP_JUMP, 0, 0)
+
+			c.patchJump(jumpNotMatch, len(c.code))
+			c.emitOp(vm.OP_RAISE, 1, 0)
+
+			c.patchJump(jumpAfterLoop, len(c.code))
+			for _, skip := range ifSkips {
+				c.patchJump(skip, loopStart)
+			}
+			return nil
+		}
+
 		if err := c.compileExpr(curr.Iter); err != nil {
 			return err
 		}
@@ -2929,6 +3001,78 @@ func (c *Compiler) compileDictComp(expr *ASTExpr) error {
 	var compileClause func(currIdx uint32, depth int) error
 	compileClause = func(currIdx uint32, depth int) error {
 		curr := &c.arena.Comps[currIdx]
+		if curr.IsAsync {
+			if err := c.compileExpr(curr.Iter); err != nil {
+				return err
+			}
+			_, aiterIdx := c.constPool.InternName("__aiter__")
+			c.emitOp(vm.OP_LOAD_METHOD, 0, aiterIdx)
+			c.emitOp(vm.OP_CALL_METHOD, 0, 0)
+
+			iterSlot := c.allocTempLocal()
+			c.emitOp(vm.OP_STORE_FAST, 0, uint16(iterSlot))
+
+			loopStart := len(c.code)
+
+			c.emitOp(vm.OP_LOAD_FAST, 0, uint16(iterSlot))
+			_, anextIdx := c.constPool.InternName("__anext__")
+			c.emitOp(vm.OP_LOAD_METHOD, 0, anextIdx)
+			c.emitOp(vm.OP_CALL_METHOD, 0, 0)
+			c.emitOp(vm.OP_GET_AWAITABLE, 0, 0)
+
+			anextDepth := c.stackDepth
+			anextStart := len(c.code)
+			c.emitOp(vm.OP_AWAIT, 0, 0)
+			anextEnd := len(c.code)
+
+			if err := c.compileStoreTarget(curr.Target); err != nil {
+				return err
+			}
+
+			var ifSkips []int
+			for _, ifCond := range c.arena.GetExprSlice(curr.IfConds) {
+				if err := c.compileExpr(ifCond); err != nil {
+					return err
+				}
+				ifSkips = append(ifSkips, c.emitOp(vm.OP_JUMP_IF_FALSE, 0, 0))
+			}
+
+			if curr.Next != 0 {
+				if err := compileClause(curr.Next-1, depth+1); err != nil {
+					return err
+				}
+			} else {
+				if err := c.compileExpr(expr.Left); err != nil {
+					return err
+				}
+				c.emitOp(vm.OP_LIST_APPEND, 0, uint16(depth+1))
+			}
+
+			c.emitOp(vm.OP_JUMP, 0, uint16(loopStart))
+
+			excHandlerIP := len(c.code)
+			c.addExceptionRange(anextStart, anextEnd, excHandlerIP, anextDepth, false)
+
+			c.emitOp(vm.OP_DUP_TOP, 0, 0)
+			if err := c.compileNameLoad("StopAsyncIteration"); err != nil {
+				return err
+			}
+			c.emitOp(vm.OP_CHECK_EXC_MATCH, 0, 0)
+			jumpNotMatch := c.emitOp(vm.OP_JUMP_IF_FALSE, 0, 0)
+
+			c.emitOp(vm.OP_POP_TOP, 0, 0)
+			jumpAfterLoop := c.emitOp(vm.OP_JUMP, 0, 0)
+
+			c.patchJump(jumpNotMatch, len(c.code))
+			c.emitOp(vm.OP_RAISE, 1, 0)
+
+			c.patchJump(jumpAfterLoop, len(c.code))
+			for _, skip := range ifSkips {
+				c.patchJump(skip, loopStart)
+			}
+			return nil
+		}
+
 		if err := c.compileExpr(curr.Iter); err != nil {
 			return err
 		}
@@ -3492,6 +3636,78 @@ func (c *Compiler) compileSetComp(expr *ASTExpr) error {
 	var compileClause func(currIdx uint32, depth int) error
 	compileClause = func(currIdx uint32, depth int) error {
 		curr := &c.arena.Comps[currIdx]
+		if curr.IsAsync {
+			if err := c.compileExpr(curr.Iter); err != nil {
+				return err
+			}
+			_, aiterIdx := c.constPool.InternName("__aiter__")
+			c.emitOp(vm.OP_LOAD_METHOD, 0, aiterIdx)
+			c.emitOp(vm.OP_CALL_METHOD, 0, 0)
+
+			iterSlot := c.allocTempLocal()
+			c.emitOp(vm.OP_STORE_FAST, 0, uint16(iterSlot))
+
+			loopStart := len(c.code)
+
+			c.emitOp(vm.OP_LOAD_FAST, 0, uint16(iterSlot))
+			_, anextIdx := c.constPool.InternName("__anext__")
+			c.emitOp(vm.OP_LOAD_METHOD, 0, anextIdx)
+			c.emitOp(vm.OP_CALL_METHOD, 0, 0)
+			c.emitOp(vm.OP_GET_AWAITABLE, 0, 0)
+
+			anextDepth := c.stackDepth
+			anextStart := len(c.code)
+			c.emitOp(vm.OP_AWAIT, 0, 0)
+			anextEnd := len(c.code)
+
+			if err := c.compileStoreTarget(curr.Target); err != nil {
+				return err
+			}
+
+			var ifSkips []int
+			for _, ifCond := range c.arena.GetExprSlice(curr.IfConds) {
+				if err := c.compileExpr(ifCond); err != nil {
+					return err
+				}
+				ifSkips = append(ifSkips, c.emitOp(vm.OP_JUMP_IF_FALSE, 0, 0))
+			}
+
+			if curr.Next != 0 {
+				if err := compileClause(curr.Next-1, depth+1); err != nil {
+					return err
+				}
+			} else {
+				if err := c.compileExpr(expr.Left); err != nil {
+					return err
+				}
+				c.emitOp(vm.OP_LIST_APPEND, 0, uint16(depth+1))
+			}
+
+			c.emitOp(vm.OP_JUMP, 0, uint16(loopStart))
+
+			excHandlerIP := len(c.code)
+			c.addExceptionRange(anextStart, anextEnd, excHandlerIP, anextDepth, false)
+
+			c.emitOp(vm.OP_DUP_TOP, 0, 0)
+			if err := c.compileNameLoad("StopAsyncIteration"); err != nil {
+				return err
+			}
+			c.emitOp(vm.OP_CHECK_EXC_MATCH, 0, 0)
+			jumpNotMatch := c.emitOp(vm.OP_JUMP_IF_FALSE, 0, 0)
+
+			c.emitOp(vm.OP_POP_TOP, 0, 0)
+			jumpAfterLoop := c.emitOp(vm.OP_JUMP, 0, 0)
+
+			c.patchJump(jumpNotMatch, len(c.code))
+			c.emitOp(vm.OP_RAISE, 1, 0)
+
+			c.patchJump(jumpAfterLoop, len(c.code))
+			for _, skip := range ifSkips {
+				c.patchJump(skip, loopStart)
+			}
+			return nil
+		}
+
 		if err := c.compileExpr(curr.Iter); err != nil {
 			return err
 		}

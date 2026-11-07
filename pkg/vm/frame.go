@@ -77,6 +77,7 @@ type CallFrame struct {
 	cache       *VMCodeCache
 	shadowFrame *val.PyFrame
 	excStackLen int
+	stackIsVM   bool
 }
 
 // LineSpanEntry maps an instruction pointer range [StartIP, EndIP) to source line and column.

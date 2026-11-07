@@ -606,5 +606,88 @@ func (e *Engine) createItertoolsModule() val.Value {
 		})
 	}))
 
+	// batched(iterable, n, *, strict=False)
+	mod.Dict.Set(val.InternString("batched"), val.NewBuiltinFuncVal("batched", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 2 {
+			panic("TypeError: batched() missing required arguments")
+		}
+		it := iterFor(ctx, args[0])
+		n := int(args[1].AsInt64())
+		if n < 1 {
+			panic("ValueError: n must be at least one")
+		}
+		strict := false
+		if v, ok := kwArg(args, kwnames, "strict"); ok {
+			strict = v.IsTruthy()
+		}
+		return val.NewIterValWithNext(func() (val.Value, bool) {
+			batch := make([]val.Value, 0, n)
+			for i := 0; i < n; i++ {
+				item, ok := it.Next()
+				if !ok {
+					break
+				}
+				batch = append(batch, item)
+			}
+			if len(batch) == 0 {
+				return val.NoneVal(), false
+			}
+			if strict && len(batch) < n {
+				panic("ValueError: batched(): incomplete batch")
+			}
+			return val.NewTupleVal(batch...), true
+		})
+	}))
+
+	// zip_longest(*iterables, fillvalue=None)
+	mod.Dict.Set(val.InternString("zip_longest"), val.NewBuiltinFuncVal("zip_longest", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		fillvalue := val.NoneVal()
+		if len(kwnames) > 0 {
+			kwStart := len(args) - len(kwnames)
+			for i, kn := range kwnames {
+				if kn.AsString() == "fillvalue" {
+					fillvalue = args[kwStart+i]
+				}
+			}
+			args = args[:kwStart]
+		}
+		if len(args) == 0 {
+			return val.NewIterValWithNext(func() (val.Value, bool) { return val.NoneVal(), false })
+		}
+		iters := make([]*val.PyIter, len(args))
+		for i, a := range args {
+			iters[i] = iterFor(ctx, a)
+		}
+		exhausted := make([]bool, len(args))
+		activeCount := len(args)
+
+		return val.NewIterValWithNext(func() (val.Value, bool) {
+			if activeCount == 0 {
+				return val.NoneVal(), false
+			}
+			res := make([]val.Value, len(iters))
+			produced := false
+			for i, it := range iters {
+				if exhausted[i] {
+					res[i] = fillvalue
+				} else {
+					v, ok := it.Next()
+					if ok {
+						res[i] = v
+						produced = true
+					} else {
+						exhausted[i] = true
+						activeCount--
+						res[i] = fillvalue
+					}
+				}
+			}
+			if !produced {
+				return val.NoneVal(), false
+			}
+			return val.NewTupleVal(res...), true
+		})
+	}))
+
 	return modVal
 }

@@ -8,6 +8,63 @@ import (
 	"github.com/servusdei2018/fython/pkg/val"
 )
 
+var (
+	codecInfoType *val.PyType
+	codecInfoOnce sync.Once
+)
+
+func initCodecInfoType() {
+	codecInfoOnce.Do(func() {
+		t := val.MustNewType("CodecInfo", []*val.PyType{val.ObjectType}, nil)
+		t.Dict.Set(val.InternString("__module__"), val.InternString("codecs"))
+		seq := func(self val.Value) []val.Value {
+			inst := self.AsInstance()
+			encode, _ := inst.GetAttr(val.InternString("encode"))
+			decode, _ := inst.GetAttr(val.InternString("decode"))
+			sr, _ := inst.GetAttr(val.InternString("streamreader"))
+			sw, _ := inst.GetAttr(val.InternString("streamwriter"))
+			return []val.Value{encode, decode, sr, sw}
+		}
+		t.Dict.Set(val.InternString("__getitem__"), val.NewBuiltinFuncVal("__getitem__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			items := seq(args[0])
+			i := int(args[1].AsInt64())
+			if i < 0 {
+				i += len(items)
+			}
+			if i < 0 || i >= len(items) {
+				panic("IndexError: tuple index out of range")
+			}
+			return items[i]
+		}))
+		t.Dict.Set(val.InternString("__len__"), val.NewBuiltinFuncVal("__len__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			return val.Int64Val(4)
+		}))
+		t.Dict.Set(val.InternString("__iter__"), val.NewBuiltinFuncVal("__iter__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			return val.NewIterVal(val.NewTupleVal(seq(args[0])...))
+		}))
+		t.Dict.Set(val.InternString("__repr__"), val.NewBuiltinFuncVal("__repr__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			name, _ := args[0].AsInstance().GetAttr(val.InternString("name"))
+			return val.NewStringVal("<codecs.CodecInfo object for encoding " + name.AsString() + ">")
+		}))
+		t.InvalidateVersion()
+		codecInfoType = t
+	})
+}
+
+func makeCodecInfo(name string, encFn, decFn val.Value) val.Value {
+	initCodecInfoType()
+	v := val.NewInstanceOfType(codecInfoType)
+	inst := v.AsInstance()
+	inst.SetAttr(val.InternString("name"), val.NewStringVal(name))
+	inst.SetAttr(val.InternString("encode"), encFn)
+	inst.SetAttr(val.InternString("decode"), decFn)
+	inst.SetAttr(val.InternString("streamreader"), val.NoneVal())
+	inst.SetAttr(val.InternString("streamwriter"), val.NoneVal())
+	inst.SetAttr(val.InternString("incrementalencoder"), val.NoneVal())
+	inst.SetAttr(val.InternString("incrementaldecoder"), val.NoneVal())
+	return v
+}
+
 func (e *Engine) createCodecsModule() val.Value {
 	modVal := val.NewModuleVal("_codecs", "Native codec registry and encoders/decoders")
 	mod := modVal.AsModule()
@@ -53,6 +110,25 @@ func (e *Engine) createCodecsModule() val.Value {
 			}
 		}
 
+		switch norm {
+		case "utf_8", "utf8", "u8":
+			utf8Enc, _ := mod.Dict.Get(val.InternString("utf_8_encode"))
+			utf8Dec, _ := mod.Dict.Get(val.InternString("utf_8_decode"))
+			return makeCodecInfo("utf-8", utf8Enc, utf8Dec)
+		case "ascii", "us_ascii", "646":
+			asciiEnc, _ := mod.Dict.Get(val.InternString("ascii_encode"))
+			asciiDec, _ := mod.Dict.Get(val.InternString("ascii_decode"))
+			return makeCodecInfo("ascii", asciiEnc, asciiDec)
+		case "latin_1", "latin1", "iso_8859_1", "8859", "cp819":
+			latinEnc, _ := mod.Dict.Get(val.InternString("latin_1_encode"))
+			latinDec, _ := mod.Dict.Get(val.InternString("latin_1_decode"))
+			return makeCodecInfo("latin-1", latinEnc, latinDec)
+		case "raw_unicode_escape":
+			rawEnc, _ := mod.Dict.Get(val.InternString("raw_unicode_escape_encode"))
+			rawDec, _ := mod.Dict.Get(val.InternString("raw_unicode_escape_decode"))
+			return makeCodecInfo("raw-unicode-escape", rawEnc, rawDec)
+		}
+
 		panic("LookupError: unknown encoding: " + enc)
 	}))
 
@@ -85,11 +161,18 @@ func (e *Engine) createCodecsModule() val.Value {
 				return val.NewTupleVal(val.NewStringVal(""), val.Int64Val(1))
 			case "replace":
 				return val.NewTupleVal(val.NewStringVal("\ufffd"), val.Int64Val(1))
+			case "surrogateescape", "backslashreplace", "xmlcharrefreplace":
+				return val.NewTupleVal(val.NewStringVal(""), val.Int64Val(1))
+			case "strict":
+				if len(a) > 0 {
+					panic(a[0])
+				}
+				panic("UnicodeError: 'strict' codec error handler")
 			default:
 				if len(a) > 0 {
 					panic(a[0])
 				}
-				panic("UnicodeError: codec error handler " + name)
+				panic("LookupError: unknown error handler name '" + name + "'")
 			}
 		})
 	}))

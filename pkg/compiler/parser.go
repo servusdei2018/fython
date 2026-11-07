@@ -2437,13 +2437,36 @@ func (p *Parser) parsePower() (ExprID, error) {
 	return left, nil
 }
 
-func (p *Parser) parseCompClauses() (uint32, error) {
+func (p *Parser) matchCompStart() (bool, bool) {
+	if p.match(TOKEN_FOR) {
+		return true, false
+	}
+	if p.cur.Type == TOKEN_ASYNC && p.peek().Type == TOKEN_FOR {
+		p.advance() // async
+		p.advance() // for
+		return true, true
+	}
+	return false, false
+}
+
+func (p *Parser) parseCompClauses(firstIsAsync bool) (uint32, error) {
 	var firstIdx uint32
 	var prevIdx uint32
 	first := true
 
-	for first || p.match(TOKEN_FOR) {
-		first = false
+	for {
+		var isAsync bool
+		if first {
+			first = false
+			isAsync = firstIsAsync
+		} else {
+			var ok bool
+			ok, isAsync = p.matchCompStart()
+			if !ok {
+				break
+			}
+		}
+
 		p.parsingForTarget = true
 		target, err := p.parseExpr()
 		p.parsingForTarget = false
@@ -2470,6 +2493,7 @@ func (p *Parser) parseCompClauses() (uint32, error) {
 			Target:  target,
 			Iter:    iter,
 			IfConds: p.arena.AddExprSlice(ifs),
+			IsAsync: isAsync,
 		})
 		if prevIdx != 0 {
 			p.arena.Comps[prevIdx-1].Next = idx + 1
@@ -2526,8 +2550,8 @@ func (p *Parser) parsePrimary() (ExprID, error) {
 					if err != nil {
 						return ExprNone, err
 					}
-					if p.match(TOKEN_FOR) {
-						compIdx, err := p.parseCompClauses()
+					if ok, isAsync := p.matchCompStart(); ok {
+						compIdx, err := p.parseCompClauses(isAsync)
 						if err != nil {
 							return ExprNone, err
 						}
@@ -2897,8 +2921,8 @@ func (p *Parser) parseAtom() (ExprID, error) {
 		if err != nil {
 			return ExprNone, err
 		}
-		if p.match(TOKEN_FOR) {
-			compIdx, err := p.parseCompClauses()
+		if ok, isAsync := p.matchCompStart(); ok {
+			compIdx, err := p.parseCompClauses(isAsync)
 			if err != nil {
 				return ExprNone, err
 			}
@@ -2957,8 +2981,8 @@ func (p *Parser) parseAtom() (ExprID, error) {
 			return ExprNone, err
 		}
 		// Check for list comprehension: [elt for target in iter if cond]
-		if p.match(TOKEN_FOR) {
-			compIdx, err := p.parseCompClauses()
+		if ok, isAsync := p.matchCompStart(); ok {
+			compIdx, err := p.parseCompClauses(isAsync)
 			if err != nil {
 				return ExprNone, err
 			}
@@ -3049,8 +3073,8 @@ func (p *Parser) parseAtom() (ExprID, error) {
 			}
 
 			// Check for dict comprehension: {k: v for target in iter if cond}
-			if p.match(TOKEN_FOR) {
-				compIdx, err := p.parseCompClauses()
+			if ok, isAsync := p.matchCompStart(); ok {
+				compIdx, err := p.parseCompClauses(isAsync)
 				if err != nil {
 					return ExprNone, err
 				}
@@ -3098,8 +3122,8 @@ func (p *Parser) parseAtom() (ExprID, error) {
 		}
 
 		// Check for set comprehension: {elt for target in iter if cond}
-		if p.match(TOKEN_FOR) {
-			compIdx, err := p.parseCompClauses()
+		if ok, isAsync := p.matchCompStart(); ok {
+			compIdx, err := p.parseCompClauses(isAsync)
 			if err != nil {
 				return ExprNone, err
 			}

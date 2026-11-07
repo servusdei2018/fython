@@ -196,6 +196,13 @@ func NewInstanceOfType(cls *PyType) Value {
 	if cls == nil {
 		cls = ObjectType
 	}
+	if ModuleType != nil && IsSubclass(cls, ModuleType) {
+		mod := &PyModule{
+			Header: ObjectHeader{Kind: KindModule, Type: cls},
+			Dict:   NewDictVal(16).AsDict(),
+		}
+		return Value{num: 0, ptr: &mod.Header}
+	}
 	shape := cls.RootShape
 	if shape == nil {
 		shape = defaultRootShape
@@ -316,8 +323,15 @@ func (inst *PyInstance) SetAttr(name, value Value) int {
 		return idx
 	}
 	if inst.Header.Type != nil && (inst.Header.Type.Flags&uint32(FlagForbidDynamicAttrs)) != 0 {
+		if BaseExceptionType != nil && IsSubclass(inst.Header.Type, BaseExceptionType) {
+			switch name.AsString() {
+			case "__traceback__", "__cause__", "__context__", "__suppress_context__":
+				goto allowDynamic
+			}
+		}
 		panic("val: AttributeError: '" + inst.Header.Type.Name + "' object has no attribute '" + name.AsString() + "'")
 	}
+allowDynamic:
 	newShape := inst.Shape.Transition(name)
 	slotIdx := newShape.SlotIndex
 	if slotIdx < len(inst.Slots) {

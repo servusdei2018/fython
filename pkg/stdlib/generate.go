@@ -220,6 +220,16 @@ var upstream = []string{
 	"json/decoder.py",
 	"json/encoder.py",
 	"json/scanner.py",
+	// Platform and sysconfig
+	"platform.py",
+	"sysconfig/__init__.py",
+	"sysconfig/__main__.py",
+	// Shell and colors
+	"shlex.py",
+	"colorsys.py",
+	// Pickle
+	"_compat_pickle.py",
+	"pickle.py",
 }
 
 func main() {

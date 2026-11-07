@@ -819,6 +819,11 @@ func NewTypeWithMeta(name string, bases []*PyType, dict *PyDict, meta *PyType) (
 		}
 	}
 
+	if len(bases) > 0 && bases[0] != nil {
+		t.Slots = bases[0].Slots
+		t.Slots.TpCall = nil
+	}
+
 	isTypeSubclass := false
 	for _, b := range t.MRO {
 		if b == TypeType {
@@ -835,8 +840,22 @@ func NewTypeWithMeta(name string, bases []*PyType, dict *PyDict, meta *PyType) (
 			t.Slots.TpCall = TypeType.Slots.TpCall
 		}
 	} else {
-		t.Slots.TpGetAttr = objectGetAttr
-		t.Slots.TpSetAttr = objectSetAttr
+		isModuleSubclass := false
+		if ModuleType != nil {
+			for _, b := range t.MRO {
+				if b == ModuleType {
+					isModuleSubclass = true
+					break
+				}
+			}
+		}
+		if isModuleSubclass {
+			t.Slots.TpGetAttr = moduleGetAttr
+			t.Slots.TpSetAttr = moduleSetAttr
+		} else {
+			t.Slots.TpGetAttr = objectGetAttr
+			t.Slots.TpSetAttr = objectSetAttr
+		}
 	}
 	t.syncDunderSlots()
 
@@ -1104,7 +1123,7 @@ func (t *PyType) syncDunderSlots() {
 	} else {
 		t.dunderGetAttr = Value{}
 	}
-	if fn, owner, ok := t.LookupMRO(DunderSetAttr); ok && owner != ObjectType && owner != TypeType {
+	if fn, owner, ok := t.LookupMRO(DunderSetAttr); ok && owner != ObjectType && owner != TypeType && owner != ModuleType {
 		t.dunderSetAttr = fn
 		t.Flags |= FlagCustomSetAttr
 	} else {
@@ -1344,14 +1363,14 @@ func (t *PyType) syncDunderSlots() {
 	}
 
 	// Reflection, attributes & lifecycle
-	if fn, owner, ok := t.LookupMRO(DunderGetAttribute); ok && owner != ObjectType {
+	if fn, owner, ok := t.LookupMRO(DunderGetAttribute); ok && owner != ObjectType && owner != ModuleType {
 		t.dunderGetAttribute = fn
 		t.Flags |= uint32(FlagCustomGetAttribute)
 	} else {
 		t.dunderGetAttribute = Value{}
 		t.Flags &= ^uint32(FlagCustomGetAttribute)
 	}
-	if fn, owner, ok := t.LookupMRO(DunderDelAttr); ok && owner != ObjectType && owner != TypeType {
+	if fn, owner, ok := t.LookupMRO(DunderDelAttr); ok && owner != ObjectType && owner != TypeType && owner != ModuleType {
 		t.dunderDelAttr = fn
 	} else {
 		t.dunderDelAttr = Value{}
@@ -1515,6 +1534,41 @@ func defaultObjectGetAttr(ctx *ExecContext, obj, name Value) Value {
 		}
 	}
 
+	if obj.IsModule() {
+		mod := obj.AsModule()
+		if interned.AsString() == "__dict__" {
+			return DictVal(mod.Dict)
+		}
+		if v, ok := mod.Dict.Get(interned); ok {
+			if v.IsLazyImport() && ResolveLazyImportHook != nil {
+				var vm any
+				if ctx != nil {
+					vm = ctx.VM
+				}
+				resolved, err := ResolveLazyImportHook(vm, mod, interned, v)
+				if err != nil {
+					panic("ImportError: " + err.Error())
+				}
+				return resolved
+			}
+			return v
+		}
+		switch interned.AsString() {
+		case "__name__":
+			return InternString(mod.Name)
+		case "__doc__":
+			return NoneVal()
+		case "__file__":
+			if mod.File != "" {
+				return NewStringVal(mod.File)
+			}
+		case "__annotations__":
+			return ModuleAnnotations(ctx, mod)
+		case "__annotate__":
+			return NoneVal()
+		}
+	}
+
 	if obj.IsDict() && tp != DictType {
 		if d := obj.AsDict(); d.Attrs != nil {
 			if val, ok := d.Attrs.Get(interned); ok {
@@ -1575,6 +1629,16 @@ func defaultObjectGetAttr(ctx *ExecContext, obj, name Value) Value {
 		}
 		if obj.Kind() == KindBoundMethod {
 			return obj.AsBoundMethod().Func
+		}
+	}
+
+	if obj.Kind() == KindBoundMethod {
+		if interned.AsString() == "__self__" {
+			return obj.AsBoundMethod().Self
+		}
+		bm := obj.AsBoundMethod()
+		if bm.Func.HeaderPtr() != nil {
+			return defaultObjectGetAttr(ctx, bm.Func, name)
 		}
 	}
 
@@ -1663,6 +1727,23 @@ func objectSetAttr(ctx *ExecContext, obj, name, value Value) Value {
 			return NoneVal()
 		}
 		obj.AsInstance().SetAttr(interned, value)
+		return NoneVal()
+	}
+
+	if obj.IsModule() {
+		if interned.AsString() == "__class__" {
+			AssignInstanceClass(obj, value)
+			return NoneVal()
+		}
+		mod := obj.AsModule()
+		if interned.AsString() == "__dict__" {
+			if !value.IsDict() {
+				panic("TypeError: __dict__ must be set to a dictionary, not a '" + value.Type().Name + "'")
+			}
+			mod.Dict = value.AsDict()
+			return NoneVal()
+		}
+		mod.Dict.Set(interned, value)
 		return NoneVal()
 	}
 
@@ -1876,6 +1957,14 @@ func objectDelAttr(ctx *ExecContext, obj, name Value) {
 		return
 	}
 
+	if obj.IsFunction() {
+		fn := obj.AsFunction()
+		if fn.Dict != nil && fn.Dict.Delete(interned) {
+			return
+		}
+		panic(NewAttributeError("'" + tp.Name + "' object has no attribute '" + interned.AsString() + "'"))
+	}
+
 	if obj.IsModule() {
 		if !obj.AsModule().Dict.Delete(interned) {
 			panic(NewAttributeError("module '" + obj.AsModule().Name + "' has no attribute '" + interned.AsString() + "'"))
@@ -1901,14 +1990,35 @@ func objectDelAttr(ctx *ExecContext, obj, name Value) {
 // moduleGetAttr implements attribute lookup on a *PyModule object.
 func moduleGetAttr(ctx *ExecContext, obj, name Value) Value {
 	if obj.Kind() != KindModule {
-		// Instances of ModuleType subclasses are plain PyInstances.
 		return objectGetAttr(ctx, obj, name)
 	}
-	mod := obj.AsModule()
+	tp := obj.Type()
 	interned := InternValue(name)
-	if interned.AsString() == "__dict__" {
-		return DictVal(mod.Dict)
+	if tp.dunderGetAttribute.ptr != nil && tp != ModuleType {
+		return ctx.Invoke2(tp.dunderGetAttribute, obj, interned)
 	}
+	return defaultModuleGetAttr(ctx, obj, interned)
+}
+
+func defaultModuleGetAttr(ctx *ExecContext, obj, interned Value) Value {
+	mod := obj.AsModule()
+	tp := obj.Type()
+	if interned.AsString() == "__class__" {
+		return TypeVal(tp)
+	}
+
+	// 1. Data descriptors on class MRO
+	descr, _, foundInClass := tp.LookupMRO(interned)
+	if foundInClass {
+		descrType := descr.Type()
+		if descr.IsDataDescriptor() || (descrType.Slots.TpDescrGet != nil && descrType.Slots.TpDescrSet != nil) {
+			if descrType.Slots.TpDescrGet != nil {
+				return descrType.Slots.TpDescrGet(ctx, descr, obj, tp)
+			}
+		}
+	}
+
+	// 2. Module dict
 	if v, ok := mod.Dict.Get(interned); ok {
 		if v.IsLazyImport() && ResolveLazyImportHook != nil {
 			var vm any
@@ -1923,6 +2033,21 @@ func moduleGetAttr(ctx *ExecContext, obj, name Value) Value {
 		}
 		return v
 	}
+
+	if interned.AsString() == "__dict__" {
+		return DictVal(mod.Dict)
+	}
+
+	// 3. Non-data descriptors on class MRO
+	if foundInClass {
+		descrType := descr.Type()
+		if descrType.Slots.TpDescrGet != nil {
+			return descrType.Slots.TpDescrGet(ctx, descr, obj, tp)
+		}
+		return descr
+	}
+
+	// 4. Built-in module reflection attributes
 	switch interned.AsString() {
 	case "__name__":
 		return InternString(mod.Name)
@@ -1937,14 +2062,19 @@ func moduleGetAttr(ctx *ExecContext, obj, name Value) Value {
 	case "__annotate__":
 		return NoneVal()
 	}
-	if ModuleType != nil {
-		if descr, _, ok := ModuleType.LookupMRO(interned); ok {
-			if descrGet := descr.Type().Slots.TpDescrGet; descrGet != nil {
-				return descrGet(ctx, descr, obj, ModuleType)
-			}
-			return descr
+
+	// 5. Class-level __getattr__
+	if tp.dunderGetAttr.ptr != nil {
+		return ctx.Invoke2(tp.dunderGetAttr, obj, interned)
+	}
+
+	// 6. PEP 562 module-level __getattr__
+	if interned != DunderGetAttr {
+		if getattrFn, ok := mod.Dict.Get(DunderGetAttr); ok && !getattrFn.IsNone() && !getattrFn.IsUnbound() {
+			return ctx.Invoke1(getattrFn, interned)
 		}
 	}
+
 	panic("val: AttributeError: module '" + mod.Name + "' has no attribute '" + interned.AsString() + "'")
 }
 
@@ -1953,9 +2083,31 @@ func moduleSetAttr(ctx *ExecContext, obj, name, value Value) Value {
 	if obj.Kind() != KindModule {
 		return objectSetAttr(ctx, obj, name, value)
 	}
-	mod := obj.AsModule()
 	interned := InternValue(name)
-	mod.Dict.Set(interned, value)
+	tp := obj.Type()
+	if tp.dunderSetAttr.ptr != nil && tp != ModuleType {
+		ctx.Invoke3(tp.dunderSetAttr, obj, interned, value)
+		return NoneVal()
+	}
+	if interned.AsString() == "__class__" {
+		AssignInstanceClass(obj, value)
+		return NoneVal()
+	}
+	if descr, _, foundInClass := tp.LookupMRO(interned); foundInClass {
+		descrType := descr.Type()
+		if descrType.Slots.TpDescrSet != nil {
+			descrType.Slots.TpDescrSet(ctx, descr, obj, value)
+			return NoneVal()
+		}
+	}
+	if interned.AsString() == "__dict__" {
+		if !value.IsDict() {
+			panic("TypeError: __dict__ must be set to a dictionary, not a '" + value.Type().Name + "'")
+		}
+		obj.AsModule().Dict = value.AsDict()
+		return NoneVal()
+	}
+	obj.AsModule().Dict.Set(interned, value)
 	return NoneVal()
 }
 
@@ -1995,6 +2147,13 @@ func AssignInstanceClass(obj, value Value) {
 		panic("TypeError: __class__ must be set to a class, not '" + value.Type().Name + "' object")
 	}
 	newT := value.AsType()
+	if obj.IsModule() {
+		if ModuleType == nil || !IsSubclass(newT, ModuleType) {
+			panic("TypeError: __class__ assignment only supported for ModuleType subclasses")
+		}
+		obj.AsModule().Header.Type = newT
+		return
+	}
 	old := obj.AsInstance()
 	fresh := NewInstanceOfType(newT)
 	if !fresh.IsInstance() {

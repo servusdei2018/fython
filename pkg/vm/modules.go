@@ -348,6 +348,63 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 				filePath = "stdlib:" + vfsPath
 				isPackage = isPkg
 				found = true
+			} else if strings.HasPrefix(currName, "_sysconfigdata_") {
+				modVal := val.NewModuleVal(currName, "")
+				prefix, base := vm.engine.sysPrefix()
+				btv := val.NewDictVal(16).AsDict()
+				btv.Set(val.InternString("prefix"), val.NewStringVal(prefix))
+				btv.Set(val.InternString("base"), val.NewStringVal(base))
+				btv.Set(val.InternString("SOABI"), val.NewStringVal("cpython-315"))
+				btv.Set(val.InternString("EXT_SUFFIX"), val.NewStringVal(".so"))
+				modVal.AsModule().Dict.Set(val.InternString("build_time_vars"), val.DictVal(btv))
+				vm.modules.Set(internedCurr, modVal)
+				if i > 0 {
+					if parentVal.IsModule() {
+						parentVal.AsModule().Dict.Set(val.InternString(parts[i]), modVal)
+					} else {
+						val.SetAttrCtx(&vm.execCtx, parentVal, val.InternString(parts[i]), modVal)
+					}
+				}
+				parentVal = modVal
+				continue
+			} else if sysVal, ok := vm.modules.Get(val.InternString("sys")); ok && sysVal.IsModule() {
+				if mpVal, ok := sysVal.AsModule().Dict.Get(val.InternString("meta_path")); ok && mpVal.IsList() {
+					pathArg := val.NoneVal()
+					if i > 0 && parentVal.IsModule() {
+						if pVal, ok := parentVal.AsModule().Dict.Get(val.InternString("__path__")); ok {
+							pathArg = pVal
+						}
+					}
+					for _, finder := range mpVal.AsList().Items {
+						if findSpecFn, ok := vmGetAttrSafe(&vm.execCtx, finder, "find_spec"); ok && !findSpecFn.IsNone() {
+							spec := vm.execCtx.Call(findSpecFn, []val.Value{val.NewStringVal(currName), pathArg, val.NoneVal()}, nil)
+							if !spec.IsNone() && spec.HeaderPtr() != nil {
+								if loaderVal, ok := vmGetAttrSafe(&vm.execCtx, spec, "loader"); ok && !loaderVal.IsNone() {
+									if execModFn, ok := vmGetAttrSafe(&vm.execCtx, loaderVal, "exec_module"); ok && !execModFn.IsNone() {
+										modVal := val.NewModuleVal(currName, "")
+										modVal.AsModule().Dict.Set(val.InternString("__spec__"), spec)
+										modVal.AsModule().Dict.Set(val.InternString("__loader__"), loaderVal)
+										vm.modules.Set(internedCurr, modVal)
+										if i > 0 {
+											if parentVal.IsModule() {
+												parentVal.AsModule().Dict.Set(val.InternString(parts[i]), modVal)
+											} else {
+												val.SetAttrCtx(&vm.execCtx, parentVal, val.InternString(parts[i]), modVal)
+											}
+										}
+										vm.execCtx.Call(execModFn, []val.Value{modVal}, nil)
+										if replaced, ok := vm.modules.Get(internedCurr); ok && !replaced.IsNone() {
+											modVal = replaced
+										}
+										parentVal = modVal
+										found = true
+										break
+									}
+								}
+							}
+						}
+					}
+				}
 			}
 		}
 
@@ -407,8 +464,12 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 		vm.modules.Set(internedCurr, modVal)
 
 		// Link child module as attribute of parent package
-		if i > 0 && parentVal.IsModule() {
-			parentVal.AsModule().Dict.Set(val.InternString(parts[i]), modVal)
+		if i > 0 {
+			if parentVal.IsModule() {
+				parentVal.AsModule().Dict.Set(val.InternString(parts[i]), modVal)
+			} else {
+				val.SetAttrCtx(&vm.execCtx, parentVal, val.InternString(parts[i]), modVal)
+			}
 		}
 
 		// Execute module bytecode
@@ -416,6 +477,18 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 		if !vm.unhandledException.IsNone() && vm.unhandledException.HeaderPtr() != nil {
 			vm.modules.Delete(internedCurr)
 			return val.NoneVal(), nil
+		}
+
+		// After module execution, check if module replaced sys.modules[__name__]
+		if replaced, ok := vm.modules.Get(internedCurr); ok && !replaced.IsNone() {
+			modVal = replaced
+		}
+		if i > 0 {
+			if parentVal.IsModule() {
+				parentVal.AsModule().Dict.Set(val.InternString(parts[i]), modVal)
+			} else {
+				val.SetAttrCtx(&vm.execCtx, parentVal, val.InternString(parts[i]), modVal)
+			}
 		}
 
 		parentVal = modVal
@@ -481,32 +554,68 @@ func (vm *VM) resolveLazyImport(mod *val.PyModule, name val.Value, lazyVal val.V
 
 // ImportFrom resolves an attribute or submodule from an imported module.
 func (vm *VM) ImportFrom(modVal val.Value, symbolName string, callerGlobals *val.PyDict) (val.Value, error) {
-	if !modVal.IsModule() {
-		return val.NoneVal(), fmt.Errorf("ImportError: '%s' is not a module", modVal.String())
-	}
-	mod := modVal.AsModule()
 	interned := val.InternString(symbolName)
 
-	// 1. Check module dictionary
-	if v, ok := mod.Dict.Get(interned); ok {
-		if v.IsLazyImport() {
-			resolved, err := vm.resolveLazyImport(mod, interned, v)
-			if err != nil {
-				return val.NoneVal(), err
+	// 1. Fast path for standard module dict
+	if modVal.IsModule() && modVal.Type() == val.ModuleType {
+		mod := modVal.AsModule()
+		if v, ok := mod.Dict.Get(interned); ok {
+			if v.IsLazyImport() {
+				resolved, err := vm.resolveLazyImport(mod, interned, v)
+				if err != nil {
+					return val.NoneVal(), err
+				}
+				return resolved, nil
 			}
-			return resolved, nil
+			return v, nil
 		}
-		return v, nil
 	}
 
-	// 2. Fall back to loading submodule mod.Name + "." + symbolName
-	subName := mod.Name + "." + symbolName
-	if subVal, err := vm.ImportModule(subName, 0, true, callerGlobals); err == nil {
-		mod.Dict.Set(interned, subVal)
-		return subVal, nil
+	// 2. Try val.GetAttrCtx (descriptor / custom ModuleType / PEP 562 __getattr__)
+	var attrVal val.Value
+	var attrErr any
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				attrErr = r
+			}
+		}()
+		attrVal = val.GetAttrCtx(&vm.execCtx, modVal, interned)
+	}()
+	if attrErr == nil && !attrVal.IsNone() && !attrVal.IsUnbound() {
+		return attrVal, nil
 	}
 
-	return val.NoneVal(), fmt.Errorf("ImportError: cannot import name '%s' from '%s'", symbolName, mod.Name)
+	// 3. Fall back to loading submodule mod.Name + "." + symbolName
+	modName := ""
+	if modVal.IsModule() {
+		modName = modVal.AsModule().Name
+	} else {
+		func() {
+			defer func() { _ = recover() }()
+			nameVal := val.GetAttrCtx(&vm.execCtx, modVal, val.InternString("__name__"))
+			if nameVal.IsAnyString() {
+				modName = nameVal.AsString()
+			}
+		}()
+	}
+
+	if modName != "" {
+		subName := modName + "." + symbolName
+		if subVal, err := vm.ImportModule(subName, 0, true, callerGlobals); err == nil {
+			if modVal.IsModule() {
+				modVal.AsModule().Dict.Set(interned, subVal)
+			} else {
+				func() {
+					defer func() { _ = recover() }()
+					val.SetAttrCtx(&vm.execCtx, modVal, interned, subVal)
+				}()
+			}
+			return subVal, nil
+		}
+	}
+
+	return val.NoneVal(), fmt.Errorf("ImportError: cannot import name '%s' from '%s'", symbolName, modName)
 }
 
 // ImportStar copies exported symbols from modVal into callerGlobals.

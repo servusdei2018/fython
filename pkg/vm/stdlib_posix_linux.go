@@ -37,3 +37,33 @@ func ttySize() (cols, lines int, ok bool) {
 	}
 	return 0, 0, false
 }
+
+// getUnameInfo queries the kernel via syscall.Uname on Linux.
+func getUnameInfo() unameInfo {
+	var buf syscall.Utsname
+	if err := syscall.Uname(&buf); err != nil {
+		return unameInfo{
+			Sysname:  "Linux",
+			Nodename: "localhost",
+			Release:  "6.0.0",
+			Version:  "#1",
+			Machine:  "x86_64",
+		}
+	}
+	charsToString := func(p unsafe.Pointer, maxLen int) string {
+		b := unsafe.Slice((*byte)(p), maxLen)
+		for i, c := range b {
+			if c == 0 {
+				return string(b[:i])
+			}
+		}
+		return string(b)
+	}
+	return unameInfo{
+		Sysname:  charsToString(unsafe.Pointer(&buf.Sysname[0]), len(buf.Sysname)),
+		Nodename: charsToString(unsafe.Pointer(&buf.Nodename[0]), len(buf.Nodename)),
+		Release:  charsToString(unsafe.Pointer(&buf.Release[0]), len(buf.Release)),
+		Version:  charsToString(unsafe.Pointer(&buf.Version[0]), len(buf.Version)),
+		Machine:  charsToString(unsafe.Pointer(&buf.Machine[0]), len(buf.Machine)),
+	}
+}

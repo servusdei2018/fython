@@ -861,6 +861,8 @@ func (st *SymbolTable) visitExpr(exprID ExprID) error {
 		}
 		genScope := NewScope(ScopeFunction, "<genexpr>", st.cur)
 		genScope.IsGenerator = true
+		genScope.ParamNames = []string{".0"}
+		genScope.Bound[".0"] = true
 		st.Scopes = append(st.Scopes, genScope)
 
 		saved := st.cur
@@ -968,6 +970,23 @@ func (st *SymbolTable) visitExpr(exprID ExprID) error {
 		slice := st.arena.ExprSlices[expr.Extra]
 		for _, elem := range st.arena.ExprIDs[slice.Start : slice.Start+slice.Count] {
 			if err := st.visitExpr(elem); err != nil {
+				return err
+			}
+		}
+
+	case ExprKindSlice:
+		if expr.Left != ExprNone {
+			if err := st.visitExpr(expr.Left); err != nil {
+				return err
+			}
+		}
+		if expr.Right != ExprNone {
+			if err := st.visitExpr(expr.Right); err != nil {
+				return err
+			}
+		}
+		if expr.Extra != 0 {
+			if err := st.visitExpr(ExprID(expr.Extra - 1)); err != nil {
 				return err
 			}
 		}

@@ -201,11 +201,13 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 	sysMod.Dict.Set(val.InternString("base_exec_prefix"), val.NewStringVal(disc.basePrefix))
 	sysMod.Dict.Set(val.InternString("platlibdir"), val.NewStringVal("lib"))
 
-	sysMod.Dict.Set(val.InternString("version"), val.NewStringVal("3.15.0 (main, fython)"))
+	sysMod.Dict.Set(val.InternString("version"), val.NewStringVal("3.15.0 (main, fython) [Go]"))
 	verInfo := newVersionInfoTuple(3, 15, 0, "final", 0)
 	sysMod.Dict.Set(val.InternString("version_info"), verInfo)
 	sysMod.Dict.Set(val.InternString("hexversion"), val.Int64Val(0x030f00f0))
 	sysMod.Dict.Set(val.InternString("platform"), val.InternString(runtime.GOOS))
+	sysMod.Dict.Set(val.InternString("abiflags"), val.InternString(""))
+	sysMod.Dict.Set(val.InternString("winver"), val.NoneVal())
 	sysMod.Dict.Set(val.InternString("byteorder"), val.InternString("little"))
 	sysMod.Dict.Set(val.InternString("maxsize"), val.Int64Val(9223372036854775807))
 	sysMod.Dict.Set(val.InternString("float_info"), newFloatInfo())
@@ -234,6 +236,7 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 	implInst.SetAttr(val.InternString("version"), verInfo)
 	implInst.SetAttr(val.InternString("hexversion"), val.Int64Val(0x030f00f0))
 	implInst.SetAttr(val.InternString("cache_tag"), val.InternString("fython-315"))
+	implInst.SetAttr(val.InternString("_multiarch"), val.InternString(""))
 	sysMod.Dict.Set(val.InternString("implementation"), implNs)
 
 	sysMod.Dict.Set(val.InternString("flags"), newSysFlags(eff))
@@ -277,10 +280,17 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 		val.InternString("_codecs"), val.InternString("_socket"), val.InternString("_ssl"),
 		val.InternString("_sqlite3"), val.InternString("_random"), val.InternString("_ast"),
 		val.InternString("locale"), val.InternString("_locale"), val.InternString("gettext"),
+		val.InternString("pdb"), val.InternString("marshal"),
 	}
 	sysMod.Dict.Set(val.InternString("builtin_module_names"), val.NewTupleVal(builtinNames...))
 
 	// sys.intern(string)
+	sysMod.Dict.Set(val.InternString("getdefaultencoding"), val.NewBuiltinFuncVal("getdefaultencoding", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.NewStringVal("utf-8")
+	}))
+	sysMod.Dict.Set(val.InternString("getfilesystemencoding"), val.NewBuiltinFuncVal("getfilesystemencoding", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.NewStringVal("utf-8")
+	}))
 	sysMod.Dict.Set(val.InternString("audit"), val.NewBuiltinFuncVal("audit", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		return val.NoneVal()
 	}))
@@ -308,9 +318,15 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 
 	// sys.stdout, stderr, stdin
 	ioMod := e.createIOModule()
-	sysMod.Dict.Set(val.InternString("stdout"), e.stdStream(1))
-	sysMod.Dict.Set(val.InternString("stderr"), e.stdStream(2))
-	sysMod.Dict.Set(val.InternString("stdin"), e.stdStream(0))
+	outStream := e.stdStream(1)
+	errStream := e.stdStream(2)
+	inStream := e.stdStream(0)
+	sysMod.Dict.Set(val.InternString("stdout"), outStream)
+	sysMod.Dict.Set(val.InternString("stderr"), errStream)
+	sysMod.Dict.Set(val.InternString("stdin"), inStream)
+	sysMod.Dict.Set(val.InternString("__stdout__"), outStream)
+	sysMod.Dict.Set(val.InternString("__stderr__"), errStream)
+	sysMod.Dict.Set(val.InternString("__stdin__"), inStream)
 
 	// sys._getframe([depth=0])
 	sysMod.Dict.Set(val.InternString("_getframe"), val.NewBuiltinFuncVal("_getframe", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -432,6 +448,7 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 	localeMod := e.createLocaleModule()
 	modules.Set(val.InternString("locale"), localeMod)
 	modules.Set(val.InternString("_locale"), localeMod)
+	modules.Set(val.InternString("pdb"), e.createPdbModule())
 	modules.Set(val.InternString("_heapq"), e.createHeapQModule())
 	modules.Set(val.InternString("_bisect"), e.createBisectModule())
 	modules.Set(val.InternString("_queue"), e.createQueueModule())
@@ -449,6 +466,7 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 	if wh, ok := testSupportMod.AsModule().Dict.Get(val.InternString("warnings_helper")); ok {
 		modules.Set(val.InternString("test.support.warnings_helper"), wh)
 	}
+	modules.Set(val.InternString("marshal"), e.createMarshalModule())
 	modules.Set(val.InternString("_imp"), e.createImpModule())
 	modules.Set(val.InternString("_frozen_importlib"), e.createFrozenImportlibModule())
 	modules.Set(val.InternString("_frozen_importlib_external"), e.createFrozenImportlibExternalModule())
@@ -538,18 +556,65 @@ func newSysFlags(eff RuntimeConfig) val.Value {
 	return flags
 }
 
+func (e *Engine) sysPrefix() (string, string) {
+	disc := discoverVenvAndPaths(e.runtimeConfig, e.searchPaths)
+	return disc.prefix, disc.basePrefix
+}
+
 func (e *Engine) createLocaleModule() val.Value {
 	modVal := val.NewModuleVal("locale", "Locale support")
 	mod := modVal.AsModule()
 	mod.Dict.Set(val.InternString("getencoding"), val.NewBuiltinFuncVal("getencoding", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		return val.NewStringVal("utf-8")
+		return val.NewStringVal("UTF-8")
 	}))
 	mod.Dict.Set(val.InternString("getpreferredencoding"), val.NewBuiltinFuncVal("getpreferredencoding", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		return val.NewStringVal("utf-8")
+		return val.NewStringVal("UTF-8")
+	}))
+	mod.Dict.Set(val.InternString("getlocale"), val.NewBuiltinFuncVal("getlocale", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.NewTupleVal(val.NewStringVal("en_US"), val.NewStringVal("UTF-8"))
+	}))
+	mod.Dict.Set(val.InternString("getdefaultlocale"), val.NewBuiltinFuncVal("getdefaultlocale", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.NewTupleVal(val.NewStringVal("en_US"), val.NewStringVal("UTF-8"))
 	}))
 	mod.Dict.Set(val.InternString("setlocale"), val.NewBuiltinFuncVal("setlocale", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		return val.NewStringVal("C")
 	}))
+	mod.Dict.Set(val.InternString("normalize"), val.NewBuiltinFuncVal("normalize", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) > 0 {
+			return args[0]
+		}
+		return val.NewStringVal("")
+	}))
+	mod.Dict.Set(val.InternString("strcoll"), val.NewBuiltinFuncVal("strcoll", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) >= 2 {
+			s1, s2 := args[0].AsString(), args[1].AsString()
+			if s1 < s2 {
+				return val.Int64Val(-1)
+			} else if s1 > s2 {
+				return val.Int64Val(1)
+			}
+		}
+		return val.Int64Val(0)
+	}))
+	mod.Dict.Set(val.InternString("strxfrm"), val.NewBuiltinFuncVal("strxfrm", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) > 0 {
+			return args[0]
+		}
+		return val.NewStringVal("")
+	}))
+	mod.Dict.Set(val.InternString("localeconv"), val.NewBuiltinFuncVal("localeconv", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		d := val.NewDictVal(16).AsDict()
+		d.Set(val.InternString("decimal_point"), val.NewStringVal("."))
+		d.Set(val.InternString("thousands_sep"), val.NewStringVal(""))
+		return val.DictVal(d)
+	}))
+	mod.Dict.Set(val.InternString("format_string"), val.NewBuiltinFuncVal("format_string", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) > 0 {
+			return args[0]
+		}
+		return val.NewStringVal("")
+	}))
+	mod.Dict.Set(val.InternString("CHAR_MAX"), val.Int64Val(127))
 	mod.Dict.Set(val.InternString("LC_ALL"), val.Int64Val(0))
 	mod.Dict.Set(val.InternString("LC_CTYPE"), val.Int64Val(1))
 	mod.Dict.Set(val.InternString("LC_NUMERIC"), val.Int64Val(2))

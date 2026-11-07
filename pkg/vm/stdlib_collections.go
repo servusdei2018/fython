@@ -276,6 +276,52 @@ func initCollectionsTypes() {
 			return val.ObjectVal(&newDeq.Header)
 		})
 
+		registerDequeMethod("remove", func(ctx *val.ExecContext, deq *pyDeque, args []val.Value) val.Value {
+			if len(args) < 1 {
+				panic("TypeError: remove() takes exactly one argument")
+			}
+			valTarget := args[0]
+			deq.Mu.Lock()
+			defer deq.Mu.Unlock()
+			idx := -1
+			for i, it := range deq.Items {
+				if val.Equals(it, valTarget) {
+					idx = i
+					break
+				}
+			}
+			if idx < 0 {
+				panic("ValueError: deque.remove(x): x not in deque")
+			}
+			deq.Items = append(deq.Items[:idx], deq.Items[idx+1:]...)
+			return val.NoneVal()
+		})
+
+		registerDequeMethod("count", func(ctx *val.ExecContext, deq *pyDeque, args []val.Value) val.Value {
+			if len(args) < 1 {
+				panic("TypeError: count() takes exactly one argument")
+			}
+			valTarget := args[0]
+			deq.Mu.RLock()
+			defer deq.Mu.RUnlock()
+			cnt := int64(0)
+			for _, it := range deq.Items {
+				if val.Equals(it, valTarget) {
+					cnt++
+				}
+			}
+			return val.Int64Val(cnt)
+		})
+
+		registerDequeMethod("reverse", func(ctx *val.ExecContext, deq *pyDeque, args []val.Value) val.Value {
+			deq.Mu.Lock()
+			defer deq.Mu.Unlock()
+			for i, j := 0, len(deq.Items)-1; i < j; i, j = i+1, j-1 {
+				deq.Items[i], deq.Items[j] = deq.Items[j], deq.Items[i]
+			}
+			return val.NoneVal()
+		})
+
 		// 2. TupleGetterType
 		TupleGetterType = val.MustNewType("_tuplegetter", []*val.PyType{val.ObjectType}, nil)
 		TupleGetterType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {

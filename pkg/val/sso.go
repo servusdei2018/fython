@@ -3,6 +3,7 @@ package val
 import (
 	"strconv"
 	"sync"
+	"unicode/utf8"
 	"unsafe"
 )
 
@@ -109,7 +110,34 @@ func AppendValueBytes(dst []byte, v Value) ([]byte, bool) {
 		}
 		return dst, true
 	}
+	if v.ptr != nil && v.ptr.Kind == KindInstance {
+		inst := (*PyInstance)(unsafe.Pointer(v.ptr))
+		if inst.Header.Type != nil && StrType != nil && IsSubclass(inst.Header.Type, StrType) {
+			if len(inst.Slots) > 0 && inst.Slots[0].IsAnyString() {
+				return AppendValueBytes(dst, inst.Slots[0])
+			}
+		}
+	}
 	return dst, false
+}
+
+// StringByteLen returns the byte length of a KindInlineStr or KindString Value (0 allocations).
+func (v Value) StringByteLen() int {
+	if v.ptr == &tagInlineStr {
+		return int(v.num & 0xFF)
+	}
+	if v.ptr != nil && v.ptr.Kind == KindString {
+		return len((*PyString)(unsafe.Pointer(v.ptr)).Data)
+	}
+	if v.ptr != nil && v.ptr.Kind == KindInstance {
+		inst := (*PyInstance)(unsafe.Pointer(v.ptr))
+		if inst.Header.Type != nil && StrType != nil && IsSubclass(inst.Header.Type, StrType) {
+			if len(inst.Slots) > 0 && inst.Slots[0].IsAnyString() {
+				return inst.Slots[0].StringByteLen()
+			}
+		}
+	}
+	return 0
 }
 
 // NewStringVal routes strings of length <= 7 bytes to SmallStringVal (0 allocations)
@@ -175,19 +203,20 @@ func inlineEqualsHeapString(num uint64, s string) bool {
 	return true
 }
 
-// StringLen returns the byte length of a KindInlineStr or KindString Value (0 allocations).
+// StringLen returns the character length of a KindInlineStr or KindString Value (0 allocations for ASCII).
 func (v Value) StringLen() int {
-	if v.ptr == &tagInlineStr {
-		return int(v.num & 0xFF)
+	s := v.AsString()
+	if isASCII(s) {
+		return len(s)
 	}
-	if v.ptr.Kind == KindString {
-		return len((*PyString)(unsafe.Pointer(v.ptr)).Data)
-	}
-	return 0
+	return utf8.RuneCountInString(s)
 }
 
 // AsString returns a Go string for a KindInlineStr or KindString Value.
 func (v Value) AsString() string {
+	if v.ptr == nil {
+		return ""
+	}
 	if v.ptr == &tagInlineStr {
 		n := int(v.num & 0xFF)
 		if n == 0 {
@@ -201,6 +230,14 @@ func (v Value) AsString() string {
 	}
 	if v.ptr.Kind == KindString {
 		return (*PyString)(unsafe.Pointer(v.ptr)).Data
+	}
+	if v.ptr.Kind == KindInstance {
+		inst := (*PyInstance)(unsafe.Pointer(v.ptr))
+		if inst.Header.Type != nil && StrType != nil && IsSubclass(inst.Header.Type, StrType) {
+			if len(inst.Slots) > 0 && inst.Slots[0].IsAnyString() {
+				return inst.Slots[0].AsString()
+			}
+		}
 	}
 	return ""
 }
@@ -481,8 +518,8 @@ func IntToStringVal(n int64) Value {
 // For larger strings, it copies directly into an allocated buffer with extra headroom
 // for chained in-place additions, avoiding redundant Go string copies.
 func ConcatStrings(a, b Value) Value {
-	lenA := a.StringLen()
-	lenB := b.StringLen()
+	lenA := a.StringByteLen()
+	lenB := b.StringByteLen()
 	totalLen := lenA + lenB
 	if totalLen <= 7 {
 		var buf [8]byte
@@ -506,6 +543,10 @@ func ConcatStrings(a, b Value) Value {
 		data := (*PyString)(unsafe.Pointer(a.ptr)).Data
 		copy(buf, data)
 		pos = len(data)
+	} else {
+		s := a.AsString()
+		copy(buf, s)
+		pos = len(s)
 	}
 	if b.ptr == &tagInlineStr {
 		n := int(b.num & 0xFF)
@@ -515,6 +556,9 @@ func ConcatStrings(a, b Value) Value {
 	} else if b.ptr.Kind == KindString {
 		data := (*PyString)(unsafe.Pointer(b.ptr)).Data
 		copy(buf[pos:], data)
+	} else {
+		s := b.AsString()
+		copy(buf[pos:], s)
 	}
 	s := unsafe.String(unsafe.SliceData(buf), totalLen)
 	ps := &PyString{

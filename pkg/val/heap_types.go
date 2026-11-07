@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"unicode/utf8"
 	"unsafe"
 	"weak"
 )
@@ -814,8 +815,12 @@ func (it *PyIter) Next() (Value, bool) {
 		if it.Idx >= len(s) {
 			return NoneVal(), false
 		}
-		res := NewStringVal(string(s[it.Idx]))
-		it.Idx++
+		_, size := utf8.DecodeRuneInString(s[it.Idx:])
+		if size == 0 {
+			return NoneVal(), false
+		}
+		res := NewStringVal(s[it.Idx : it.Idx+size])
+		it.Idx += size
 		return res, true
 	case IterKindBytes:
 		b := it.Obj.AsBytes().Data
@@ -1103,6 +1108,10 @@ func NewException(cls *PyType, msg string) Value {
 		argsTuple = NewTupleVal(strVal)
 	}
 	inst.AsInstance().SetAttr(InternString("args"), argsTuple)
+	inst.AsInstance().SetAttr(InternString("__traceback__"), NoneVal())
+	inst.AsInstance().SetAttr(InternString("__cause__"), NoneVal())
+	inst.AsInstance().SetAttr(InternString("__context__"), NoneVal())
+	inst.AsInstance().SetAttr(InternString("__suppress_context__"), BoolVal(false))
 	return inst
 }
 

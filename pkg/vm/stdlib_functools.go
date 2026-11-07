@@ -48,22 +48,41 @@ func initFunctoolsTypes() {
 				panic("TypeError: partial expected at least 1 argument, got 0")
 			}
 			fn := args[0]
+			kwStart := len(args) - len(kwnames)
 			var boundArgs []val.Value
-			if len(args) > 1 {
-				boundArgs = append([]val.Value(nil), args[1:]...)
+			if kwStart > 1 {
+				boundArgs = append([]val.Value(nil), args[1:kwStart]...)
 			}
 			var kwDict *val.PyDict
 			if len(kwnames) > 0 {
 				kwDict = val.NewDictVal(len(kwnames)).AsDict()
-				kwStart := len(args) - len(kwnames)
 				for i, kn := range kwnames {
 					kwDict.Set(kn, args[kwStart+i])
 				}
-				if kwStart > 1 {
-					boundArgs = append([]val.Value(nil), args[1:kwStart]...)
-				} else {
-					boundArgs = nil
+			}
+			if fn.Type() == PartialType {
+				inner := (*pyPartial)(unsafe.Pointer(fn.HeaderPtr()))
+				fn = inner.Target
+				var allArgs []val.Value
+				allArgs = append(allArgs, inner.Args...)
+				allArgs = append(allArgs, boundArgs...)
+				boundArgs = allArgs
+				allKw := val.NewDictVal(16).AsDict()
+				if inner.Keywords != nil {
+					for _, entry := range inner.Keywords.Entries {
+						if entry.Active {
+							allKw.Set(entry.Key, entry.Value)
+						}
+					}
 				}
+				if kwDict != nil {
+					for _, entry := range kwDict.Entries {
+						if entry.Active {
+							allKw.Set(entry.Key, entry.Value)
+						}
+					}
+				}
+				kwDict = allKw
 			}
 			part := &pyPartial{
 				Header: val.ObjectHeader{
@@ -82,21 +101,39 @@ func initFunctoolsTypes() {
 				panic("TypeError: descriptor '__call__' of 'partial' object needs an argument")
 			}
 			part := (*pyPartial)(unsafe.Pointer(args[0].HeaderPtr()))
+			kwStart := len(args) - len(kwnames)
+			posCall := args[1:kwStart]
+			kwCallVals := args[kwStart:]
+
 			var mergedArgs []val.Value
 			mergedArgs = append(mergedArgs, part.Args...)
-			mergedArgs = append(mergedArgs, args[1:]...)
+			mergedArgs = append(mergedArgs, posCall...)
 
-			var mergedKwNames []val.Value
+			mergedKwMap := make(map[string]val.Value)
+			var kwOrder []string
 			if part.Keywords != nil {
 				for _, entry := range part.Keywords.Entries {
 					if entry.Active {
-						mergedArgs = append(mergedArgs, entry.Value)
-						mergedKwNames = append(mergedKwNames, entry.Key)
+						k := entry.Key.AsString()
+						if _, exists := mergedKwMap[k]; !exists {
+							kwOrder = append(kwOrder, k)
+						}
+						mergedKwMap[k] = entry.Value
 					}
 				}
 			}
-			if len(kwnames) > 0 {
-				mergedKwNames = append(mergedKwNames, kwnames...)
+			for i, kn := range kwnames {
+				k := kn.AsString()
+				if _, exists := mergedKwMap[k]; !exists {
+					kwOrder = append(kwOrder, k)
+				}
+				mergedKwMap[k] = kwCallVals[i]
+			}
+
+			var mergedKwNames []val.Value
+			for _, k := range kwOrder {
+				mergedArgs = append(mergedArgs, mergedKwMap[k])
+				mergedKwNames = append(mergedKwNames, val.InternString(k))
 			}
 
 			return ctx.Call(part.Target, mergedArgs, mergedKwNames)
@@ -158,6 +195,24 @@ func initFunctoolsTypes() {
 			return res
 		}
 		CacheWrapper.Dict.Set(val.DunderCall, val.NewBuiltinFuncVal("__call__", cacheCall))
+		cacheGet := func(ctx *val.ExecContext, descr, obj val.Value, owner *val.PyType) val.Value {
+			if obj.IsNone() || obj.IsUnbound() {
+				return descr
+			}
+			return val.NewBoundMethodVal(obj, descr)
+		}
+		CacheWrapper.Slots.TpDescrGet = cacheGet
+		CacheWrapper.Dict.Set(val.DunderGet, val.NewBuiltinFuncVal("__get__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) < 1 {
+				panic("TypeError: descriptor '__get__' of '_lru_cache_wrapper' object needs an argument")
+			}
+			obj := val.NoneVal()
+			if len(args) > 1 {
+				obj = args[1]
+			}
+			return cacheGet(ctx, args[0], obj, nil)
+		}))
+		CacheWrapper.InvalidateVersion()
 		CacheWrapper.Slots.TpGetAttr = func(ctx *val.ExecContext, obj, name val.Value) val.Value {
 			cache := (*pyLRUCache)(unsafe.Pointer(obj.HeaderPtr()))
 			if name.AsString() == "__dict__" {
