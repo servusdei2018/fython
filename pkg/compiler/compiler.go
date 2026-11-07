@@ -4,10 +4,26 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync/atomic"
 
 	"github.com/servusdei2018/fython/pkg/val"
 	"github.com/servusdei2018/fython/pkg/vm"
 )
+
+var defaultOptimizeLevel atomic.Int32
+
+// SetDefaultOptimizeLevel sets the process-wide compiler optimization level (0, 1 for -O, 2 for -OO).
+func SetDefaultOptimizeLevel(level int) {
+	if level < 0 {
+		level = 0
+	}
+	defaultOptimizeLevel.Store(int32(level))
+}
+
+// DefaultOptimizeLevel returns the active default compiler optimization level.
+func DefaultOptimizeLevel() int {
+	return int(defaultOptimizeLevel.Load())
+}
 
 func init() {
 	vm.SetDefaultCompileHook(CompileSource)
@@ -17,8 +33,13 @@ func init() {
 	hook := func(src []byte, filename string, mode int) (*vm.CodeObject, error) {
 		return CompileSourceMode(src, filename, CompileMode(mode))
 	}
+	optHook := func(src []byte, filename string, mode, optimize int) (*vm.CodeObject, error) {
+		return CompileSourceModeWithOptimize(src, filename, CompileMode(mode), optimize)
+	}
 	vm.SetDynamicCompileHook(hook)
+	vm.SetDynamicCompileOptimizeHook(optHook)
 	vm.DefaultEngine().SetDynamicCompileHook(hook)
+	vm.DefaultEngine().SetDynamicCompileOptimizeHook(optHook)
 }
 
 type CleanupKind int
@@ -67,6 +88,7 @@ type Compiler struct {
 	filename       string
 	qualnamePrefix string
 	isExec         bool
+	optimize       int
 }
 
 func buildLineStarts(src []byte) []int {
@@ -137,6 +159,14 @@ func Compile(src []byte, arena *ASTArena) (*vm.CodeObject, error) {
 
 // CompileWithFilename compiles Python source bytes into an executable *vm.CodeObject with source filename.
 func CompileWithFilename(src []byte, arena *ASTArena, filename string) (*vm.CodeObject, error) {
+	return CompileWithFilenameAndOptimize(src, arena, filename, DefaultOptimizeLevel())
+}
+
+// CompileWithFilenameAndOptimize compiles Python source bytes with source filename and explicit optimization level.
+func CompileWithFilenameAndOptimize(src []byte, arena *ASTArena, filename string, optimize int) (*vm.CodeObject, error) {
+	if optimize < 0 {
+		optimize = DefaultOptimizeLevel()
+	}
 	parser := NewParser(src, arena)
 	topStmts, err := parser.ParseModule()
 	if err != nil {
@@ -162,6 +192,7 @@ func CompileWithFilename(src []byte, arena *ASTArena, filename string) (*vm.Code
 		qualnamePrefix: "",
 		curLine:        1,
 		curCol:         1,
+		optimize:       optimize,
 	}
 
 	if topScope.HasAnnotations {
@@ -243,6 +274,14 @@ const (
 
 // CompileSourceMode compiles Python source bytes with the specified mode.
 func CompileSourceMode(src []byte, filename string, mode CompileMode) (*vm.CodeObject, error) {
+	return CompileSourceModeWithOptimize(src, filename, mode, DefaultOptimizeLevel())
+}
+
+// CompileSourceModeWithOptimize compiles Python source bytes with the specified mode and optimization level.
+func CompileSourceModeWithOptimize(src []byte, filename string, mode CompileMode, optimize int) (*vm.CodeObject, error) {
+	if optimize < 0 {
+		optimize = DefaultOptimizeLevel()
+	}
 	arena := NewASTArena(256)
 	if filename == "" {
 		filename = "<string>"
@@ -268,6 +307,7 @@ func CompileSourceMode(src []byte, filename string, mode CompileMode) (*vm.CodeO
 			isExec:         true,
 			curLine:        1,
 			curCol:         1,
+			optimize:       optimize,
 		}
 		if err := c.compileExpr(exprID); err != nil {
 			return nil, err
@@ -315,9 +355,20 @@ func CompileSourceMode(src []byte, filename string, mode CompileMode) (*vm.CodeO
 		isExec:         true,
 		curLine:        1,
 		curCol:         1,
+		optimize:       optimize,
 	}
 	if topScope.HasAnnotations {
 		if err := c.emitModuleAnnotatePrologue(); err != nil {
+			return nil, err
+		}
+	}
+	modDoc := val.NoneVal()
+	if docStr, hasDoc := c.extractDocstringFromSlice(topStmts); hasDoc {
+		docVal := val.NewStringVal(docStr)
+		modDoc = docVal
+		docIdx := c.constPool.Add(docVal)
+		c.emitOp(vm.OP_LOAD_CONST, 0, docIdx)
+		if err := c.compileNameStore("__doc__"); err != nil {
 			return nil, err
 		}
 	}
@@ -343,7 +394,7 @@ func CompileSourceMode(src []byte, filename string, mode CompileMode) (*vm.CodeO
 		NumLocals:      frameLocalCount(c.scope),
 		NumParams:      0,
 		MaxStackSize:   c.maxStackDepth + 16,
-		Doc:            val.NoneVal(),
+		Doc:            modDoc,
 		ExceptionTable: c.exceptionTable,
 		LineSpans:      c.lineSpans,
 	}
@@ -351,7 +402,7 @@ func CompileSourceMode(src []byte, filename string, mode CompileMode) (*vm.CodeO
 }
 
 func (c *Compiler) extractDocstringFromSlice(stmts []StmtID) (string, bool) {
-	if len(stmts) == 0 {
+	if c.optimize >= 2 || len(stmts) == 0 {
 		return "", false
 	}
 	firstStmt := c.arena.GetStmt(stmts[0])
@@ -424,11 +475,15 @@ func (c *Compiler) runCleanupsTo(target *CleanupBlock) error {
 			c.emitOp(vm.OP_CALL_METHOD_PIC, 3, exitIdx)
 			c.emitOp(vm.OP_POP_TOP, 0, 0)
 		} else if cl.Kind == CleanupFinally {
+			savedCleanup := c.activeCleanup
+			c.activeCleanup = cl.Parent
 			for _, sID := range c.arena.StmtIDs[cl.Finally.Start : cl.Finally.Start+cl.Finally.Count] {
 				if err := c.compileStmt(sID); err != nil {
+					c.activeCleanup = savedCleanup
 					return err
 				}
 			}
+			c.activeCleanup = savedCleanup
 		} else if cl.Kind == CleanupExcept {
 			c.emitOp(vm.OP_POP_EXCEPT, 0, 0)
 		}
@@ -848,6 +903,11 @@ func (c *Compiler) emitLoadClosure(name string) error {
 }
 
 func (c *Compiler) compileNameLoad(name string) error {
+	if name == "__debug__" {
+		idx := c.constPool.Add(val.BoolVal(c.optimize == 0))
+		c.emitOp(vm.OP_LOAD_CONST, 0, idx)
+		return nil
+	}
 	sym := c.scope.Symbols[name]
 	if c.scope.CanSeeClass && name != annClassDictName && name != annCondAnnotations &&
 		(sym == nil || sym.Storage == StorageGlobal || sym.Storage == StorageFree) {
@@ -901,6 +961,9 @@ func (c *Compiler) compileNameLoad(name string) error {
 }
 
 func (c *Compiler) compileNameStore(name string) error {
+	if name == "__debug__" {
+		return fmt.Errorf("SyntaxError: cannot assign to __debug__")
+	}
 	sym := c.scope.Symbols[name]
 	if sym == nil {
 		_, idx := c.constPool.InternName(name)
@@ -1233,11 +1296,24 @@ func (c *Compiler) allocTempLocal() int {
 func (c *Compiler) compileTryStmt(stmt *ASTStmt) error {
 	tryStmt := &c.arena.TryStmts[stmt.Extra]
 
+	var finallyCleanup *CleanupBlock
+	if tryStmt.Finally.Count > 0 {
+		finallyCleanup = &CleanupBlock{
+			Kind:    CleanupFinally,
+			Parent:  c.activeCleanup,
+			Finally: tryStmt.Finally,
+		}
+		c.activeCleanup = finallyCleanup
+	}
+
 	tryStart := len(c.code)
 	depth := c.stackDepth
 
 	for _, sID := range c.arena.StmtIDs[tryStmt.Body.Start : tryStmt.Body.Start+tryStmt.Body.Count] {
 		if err := c.compileStmt(sID); err != nil {
+			if finallyCleanup != nil {
+				c.activeCleanup = finallyCleanup.Parent
+			}
 			return err
 		}
 	}
@@ -1247,6 +1323,9 @@ func (c *Compiler) compileTryStmt(stmt *ASTStmt) error {
 	if tryStmt.Else.Count > 0 {
 		for _, sID := range c.arena.StmtIDs[tryStmt.Else.Start : tryStmt.Else.Start+tryStmt.Else.Count] {
 			if err := c.compileStmt(sID); err != nil {
+				if finallyCleanup != nil {
+					c.activeCleanup = finallyCleanup.Parent
+				}
 				return err
 			}
 		}
@@ -1266,6 +1345,9 @@ func (c *Compiler) compileTryStmt(stmt *ASTStmt) error {
 		if h.IsStar {
 			if h.Type != ExprNone {
 				if err := c.compileExpr(h.Type); err != nil {
+					if finallyCleanup != nil {
+						c.activeCleanup = finallyCleanup.Parent
+					}
 					return err
 				}
 				c.emitOp(vm.OP_CHECK_EXC_MATCH_STAR, 0, 0)
@@ -1274,6 +1356,9 @@ func (c *Compiler) compileTryStmt(stmt *ASTStmt) error {
 			c.emitOp(vm.OP_PUSH_EXC_INFO, 0, 0)
 			if h.Name != "" {
 				if err := c.compileNameStore(h.Name); err != nil {
+					if finallyCleanup != nil {
+						c.activeCleanup = finallyCleanup.Parent
+					}
 					return err
 				}
 			} else {
@@ -1285,6 +1370,10 @@ func (c *Compiler) compileTryStmt(stmt *ASTStmt) error {
 			c.activeCleanup = cleanup
 			for _, sID := range c.arena.StmtIDs[h.Body.Start : h.Body.Start+h.Body.Count] {
 				if err := c.compileStmt(sID); err != nil {
+					c.activeCleanup = cleanup.Parent
+					if finallyCleanup != nil {
+						c.activeCleanup = finallyCleanup.Parent
+					}
 					return err
 				}
 			}
@@ -1300,6 +1389,9 @@ func (c *Compiler) compileTryStmt(stmt *ASTStmt) error {
 			if h.Type != ExprNone {
 				c.emitOp(vm.OP_DUP_TOP, 0, 0)
 				if err := c.compileExpr(h.Type); err != nil {
+					if finallyCleanup != nil {
+						c.activeCleanup = finallyCleanup.Parent
+					}
 					return err
 				}
 				c.emitOp(vm.OP_CHECK_EXC_MATCH, 0, 0)
@@ -1310,6 +1402,9 @@ func (c *Compiler) compileTryStmt(stmt *ASTStmt) error {
 			if h.Name != "" {
 				c.emitOp(vm.OP_DUP_TOP, 0, 0)
 				if err := c.compileNameStore(h.Name); err != nil {
+					if finallyCleanup != nil {
+						c.activeCleanup = finallyCleanup.Parent
+					}
 					return err
 				}
 			}
@@ -1319,6 +1414,10 @@ func (c *Compiler) compileTryStmt(stmt *ASTStmt) error {
 			c.activeCleanup = cleanup
 			for _, sID := range c.arena.StmtIDs[h.Body.Start : h.Body.Start+h.Body.Count] {
 				if err := c.compileStmt(sID); err != nil {
+					c.activeCleanup = cleanup.Parent
+					if finallyCleanup != nil {
+						c.activeCleanup = finallyCleanup.Parent
+					}
 					return err
 				}
 			}
@@ -1331,6 +1430,10 @@ func (c *Compiler) compileTryStmt(stmt *ASTStmt) error {
 				c.patchJump(nextHandlerJump, len(c.code))
 			}
 		}
+	}
+
+	if finallyCleanup != nil {
+		c.activeCleanup = finallyCleanup.Parent
 	}
 
 	if len(handlers) > 0 {
@@ -1642,6 +1745,7 @@ func (c *Compiler) compileFuncDef(stmt *ASTStmt) error {
 		lineStarts:     c.lineStarts,
 		curLine:        firstLine,
 		curCol:         1,
+		optimize:       c.optimize,
 	}
 
 	tpCount := uint16(fnDef.TypeParams.Count)
@@ -1794,6 +1898,7 @@ func (c *Compiler) compileFuncDef(stmt *ASTStmt) error {
 			scope:     annScope,
 			constPool: NewConstPool(),
 			code:      make([]uint32, 0, 32),
+			optimize:  c.optimize,
 		}
 
 		// PEP 749: only VALUE (1) and VALUE_WITH_FAKE_GLOBALS (2) are
@@ -1949,6 +2054,7 @@ func (c *Compiler) compileClassDef(stmt *ASTStmt) error {
 		lineStarts:     c.lineStarts,
 		curLine:        firstLine,
 		curCol:         1,
+		optimize:       c.optimize,
 	}
 
 	clsTPCount := uint16(clsDef.TypeParams.Count)
@@ -3307,6 +3413,9 @@ func (c *Compiler) compileTypeAlias(stmt *ASTStmt) error {
 }
 
 func (c *Compiler) compileAssertStmt(stmt *ASTStmt) error {
+	if c.optimize >= 1 {
+		return nil
+	}
 	if err := c.compileExpr(stmt.Expr1); err != nil {
 		return err
 	}
@@ -3446,6 +3555,7 @@ func (c *Compiler) compileGenExp(expr *ASTExpr) error {
 		scope:     genScope,
 		constPool: NewConstPool(),
 		code:      make([]uint32, 0, 32),
+		optimize:  c.optimize,
 	}
 
 	// Load parameter 0 (.0)
@@ -3582,6 +3692,7 @@ func (c *Compiler) compileLambda(expr *ASTExpr) error {
 		lineStarts:     c.lineStarts,
 		curLine:        firstLine,
 		curCol:         1,
+		optimize:       c.optimize,
 	}
 
 	for _, sID := range c.arena.StmtIDs[fnDef.Body.Start : fnDef.Body.Start+fnDef.Body.Count] {
@@ -3720,6 +3831,7 @@ func (c *Compiler) emitAnnotateFunction() error {
 		lineStarts:     c.lineStarts,
 		curLine:        c.curLine,
 		curCol:         1,
+		optimize:       c.optimize,
 	}
 
 	sub.emitOp(vm.OP_LOAD_FAST, 0, 0)

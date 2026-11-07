@@ -21,6 +21,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 	d.Set(val.InternString("None"), val.NoneVal())
 	d.Set(val.InternString("NotImplemented"), val.NotImplementedVal())
 	d.Set(val.InternString("Ellipsis"), val.EllipsisVal())
+	d.Set(val.InternString("__debug__"), val.BoolVal(true))
 
 	// Standard Types
 	d.Set(val.InternString("int"), val.TypeVal(val.IntType))

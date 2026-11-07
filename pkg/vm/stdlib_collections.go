@@ -359,33 +359,66 @@ func initCollectionsTypes() {
 
 		// 3. DefaultDictType (subclass of dict)
 		DefaultDictType = val.MustNewType("defaultdict", []*val.PyType{val.DictType}, nil)
-		DefaultDictType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-			defaultFactory := val.NoneVal()
-			var dictArgs []val.Value
-			if len(args) > 0 {
-				defaultFactory = args[0]
-				dictArgs = args[1:]
-			}
-			dVal := val.NewDictVal(16)
-			d := dVal.AsDict()
-			d.Header.Type = DefaultDictType
-			d.Set(val.InternString("default_factory"), defaultFactory)
-
-			if len(dictArgs) > 0 {
-				initFn := val.DictType.Slots.TpCall
-				if initFn != nil {
-					_ = initFn(ctx, dVal, dictArgs, kwnames)
+		DefaultDictType.Dict.Set(val.InternString("default_factory"), val.NoneVal())
+		getDefaultFactory := func(d *val.PyDict) (val.Value, bool) {
+			key := val.InternString("default_factory")
+			if d.Attrs != nil {
+				if f, ok := d.Attrs.Get(key); ok {
+					return f, true
 				}
 			}
+			return d.Get(key)
+		}
+		defaultDictInit := func(ctx *val.ExecContext, dVal val.Value, args []val.Value, kwnames []val.Value) {
+			d := dVal.AsDict()
+			defaultFactory := val.NoneVal()
+			posCount := len(args) - len(kwnames)
+			var dictArgs []val.Value
+			if posCount > 0 {
+				defaultFactory = args[0]
+				dictArgs = append(dictArgs, args[1:]...)
+			} else if len(kwnames) > 0 {
+				dictArgs = append(dictArgs, args...)
+			}
+			if d.Attrs == nil {
+				d.Attrs = val.NewDictVal(4).AsDict()
+			}
+			d.Attrs.Set(val.InternString("default_factory"), defaultFactory)
+			if len(dictArgs) > 0 {
+				initFn, _, ok := val.DictType.LookupMRO(val.DunderInit)
+				if ok && initFn.IsBuiltinFunc() {
+					callArgs := make([]val.Value, 1+len(dictArgs))
+					callArgs[0] = dVal
+					copy(callArgs[1:], dictArgs)
+					initFn.AsBuiltinFunc().Fn(ctx, initFn, callArgs, kwnames)
+				}
+			}
+		}
+		DefaultDictType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			dVal := val.NewDictVal(16)
+			d := dVal.AsDict()
+			if callable.IsType() {
+				d.Header.Type = callable.AsType()
+			} else {
+				d.Header.Type = DefaultDictType
+			}
+			defaultDictInit(ctx, dVal, args, kwnames)
 			return dVal
 		}
+		DefaultDictType.Dict.Set(val.DunderInit, val.NewBuiltinFuncVal("__init__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) < 1 {
+				panic("TypeError: descriptor '__init__' of 'defaultdict' object needs an argument")
+			}
+			defaultDictInit(ctx, args[0], args[1:], kwnames)
+			return val.NoneVal()
+		}))
 
 		DefaultDictType.Slots.MpSubscript = func(ctx *val.ExecContext, o, key val.Value) val.Value {
 			d := o.AsDict()
 			if v, ok := d.Get(key); ok {
 				return v
 			}
-			if missingFn, _, ok := DefaultDictType.LookupMRO(val.InternString("__missing__")); ok {
+			if missingFn, _, ok := o.Type().LookupMRO(val.InternString("__missing__")); ok {
 				return ctx.Invoke2(missingFn, o, key)
 			}
 			panic("KeyError: " + key.String())
@@ -393,8 +426,7 @@ func initCollectionsTypes() {
 
 		DefaultDictType.Dict.Set(val.InternString("__repr__"), val.NewBuiltinFuncVal("defaultdict.__repr__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			d := args[0].AsDict()
-			factoryKey := val.InternString("default_factory")
-			factory, _ := d.Get(factoryKey)
+			factory, _ := getDefaultFactory(d)
 			var sb strings.Builder
 			sb.WriteString("defaultdict(" + val.PyRepr(ctx, factory) + ", {")
 			first := true
@@ -411,7 +443,6 @@ func initCollectionsTypes() {
 			sb.WriteString("})")
 			return val.NewStringVal(sb.String())
 		}))
-		DefaultDictType.InvalidateVersion()
 		DefaultDictType.Dict.Set(val.InternString("__missing__"), val.NewBuiltinFuncVal("__missing__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
 				panic("TypeError: __missing__() takes 1 argument")
@@ -419,7 +450,7 @@ func initCollectionsTypes() {
 			self := args[0]
 			key := args[1]
 			d := self.AsDict()
-			factory, ok := d.Get(val.InternString("default_factory"))
+			factory, ok := getDefaultFactory(d)
 			if !ok || factory.IsNone() {
 				panic("KeyError: " + key.String())
 			}
@@ -427,6 +458,7 @@ func initCollectionsTypes() {
 			d.Set(key, newVal)
 			return newVal
 		}))
+		DefaultDictType.InvalidateVersion()
 	})
 }
 

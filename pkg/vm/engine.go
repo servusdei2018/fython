@@ -53,30 +53,33 @@ func (cs *CompilerSingleflight) Do(key string, fn func() (*CodeObject, error)) (
 // It manages the thread-safe string intern table, root shape, builtins,
 // code object cache, module singleflight compiler, and pools lightweight *VM execution contexts.
 type Engine struct {
-	internPool              *val.InternPool
-	rootShape               *val.Shape
-	builtins                *val.PyDict
-	vmPool                  sync.Pool
-	codeCache               sync.Map // maps canonical path or module name -> *CodeObject
-	singleflight            CompilerSingleflight
-	sharedModules           *val.PyDict
-	isSharedModules         bool
-	searchPaths             []string
-	compileHook             func(src []byte) (*CodeObject, error)
-	compileWithFilenameHook func(src []byte, filename string) (*CodeObject, error)
-	dynamicCompileHook      func(src []byte, filename string, mode int) (*CodeObject, error)
-	virtualModules          sync.Map
-	asyncMode               AsyncMode
-	coroPool                sync.Pool
-	osPathMu                sync.Mutex
-	signals                 sigState
-	stdStreams              [3]atomic.Pointer[val.Value]
+	internPool                 *val.InternPool
+	rootShape                  *val.Shape
+	builtins                   *val.PyDict
+	vmPool                     sync.Pool
+	codeCache                  sync.Map // maps canonical path or module name -> *CodeObject
+	singleflight               CompilerSingleflight
+	sharedModules              *val.PyDict
+	isSharedModules            bool
+	searchPaths                []string
+	runtimeConfig              RuntimeConfig
+	compileHook                func(src []byte) (*CodeObject, error)
+	compileWithFilenameHook    func(src []byte, filename string) (*CodeObject, error)
+	dynamicCompileHook         func(src []byte, filename string, mode int) (*CodeObject, error)
+	dynamicCompileOptimizeHook func(src []byte, filename string, mode, optimize int) (*CodeObject, error)
+	virtualModules             sync.Map
+	asyncMode                  AsyncMode
+	coroPool                   sync.Pool
+	osPathMu                   sync.Mutex
+	signals                    sigState
+	stdStreams                 [3]atomic.Pointer[val.Value]
 }
 
 var (
-	defaultCompileHook             func(src []byte) (*CodeObject, error)
-	defaultCompileWithFilenameHook func(src []byte, filename string) (*CodeObject, error)
-	defaultDynamicCompileHook      func(src []byte, filename string, mode int) (*CodeObject, error)
+	defaultCompileHook                func(src []byte) (*CodeObject, error)
+	defaultCompileWithFilenameHook    func(src []byte, filename string) (*CodeObject, error)
+	defaultDynamicCompileHook         func(src []byte, filename string, mode int) (*CodeObject, error)
+	defaultDynamicCompileOptimizeHook func(src []byte, filename string, mode, optimize int) (*CodeObject, error)
 )
 
 // SetDefaultCompileHook sets the global default callback for source compilation.
@@ -92,6 +95,11 @@ func SetDefaultCompileWithFilenameHook(fn func(src []byte, filename string) (*Co
 // SetDynamicCompileHook sets the global default callback for dynamic eval/exec compilation.
 func SetDynamicCompileHook(fn func(src []byte, filename string, mode int) (*CodeObject, error)) {
 	defaultDynamicCompileHook = fn
+}
+
+// SetDynamicCompileOptimizeHook sets the global default callback for dynamic compilation with an optimization level.
+func SetDynamicCompileOptimizeHook(fn func(src []byte, filename string, mode, optimize int) (*CodeObject, error)) {
+	defaultDynamicCompileOptimizeHook = fn
 }
 
 // NewEngine creates and initializes a shared Engine instance.
@@ -141,7 +149,17 @@ func NewEngine() *Engine {
 }
 
 func (e *Engine) newSysModules() *val.PyDict {
-	modules := val.NewDictVal(32).AsDict()
+	modules, _ := e.newSysModulesWithDiscovery()
+	return modules
+}
+
+func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
+	initImportlibTypes()
+	initZipImportTypes()
+
+	modules := val.NewDictVal(64).AsDict()
+	eff := e.runtimeConfig.Effective()
+	disc := discoverVenvAndPaths(e.runtimeConfig, e.searchPaths)
 
 	// 1. Built-in sys module
 	sysModVal := val.NewModuleVal("sys", "")
@@ -149,29 +167,99 @@ func (e *Engine) newSysModules() *val.PyDict {
 	sysMod.Dict.Set(val.InternString("modules"), val.ObjectVal(&modules.Header))
 
 	// Search paths list
-	pathItems := make([]val.Value, len(e.searchPaths))
-	for i, p := range e.searchPaths {
+	pathItems := make([]val.Value, len(disc.paths))
+	for i, p := range disc.paths {
 		pathItems[i] = val.NewStringVal(p)
 	}
 	sysMod.Dict.Set(val.InternString("path"), val.NewListVal(pathItems...))
-	sysMod.Dict.Set(val.InternString("version"), val.NewStringVal("3.14.0 (main, fython)"))
-	sysMod.Dict.Set(val.InternString("version_info"), val.NewTupleVal(val.Int64Val(3), val.Int64Val(14), val.Int64Val(0), val.InternString("final"), val.Int64Val(0)))
-	sysMod.Dict.Set(val.InternString("hexversion"), val.Int64Val(0x030e00f0))
+
+	// sys.argv and sys.orig_argv
+	argv := eff.Argv
+	if len(argv) == 0 {
+		argv = []string{""}
+	}
+	argvItems := make([]val.Value, len(argv))
+	for i, a := range argv {
+		argvItems[i] = val.NewStringVal(a)
+	}
+	sysMod.Dict.Set(val.InternString("argv"), val.NewListVal(argvItems...))
+
+	origArgv := eff.OrigArgv
+	if len(origArgv) == 0 {
+		origArgv = os.Args
+	}
+	origArgvItems := make([]val.Value, len(origArgv))
+	for i, a := range origArgv {
+		origArgvItems[i] = val.NewStringVal(a)
+	}
+	sysMod.Dict.Set(val.InternString("orig_argv"), val.NewListVal(origArgvItems...))
+
+	sysMod.Dict.Set(val.InternString("executable"), val.NewStringVal(eff.Executable))
+	sysMod.Dict.Set(val.InternString("prefix"), val.NewStringVal(disc.prefix))
+	sysMod.Dict.Set(val.InternString("exec_prefix"), val.NewStringVal(disc.prefix))
+	sysMod.Dict.Set(val.InternString("base_prefix"), val.NewStringVal(disc.basePrefix))
+	sysMod.Dict.Set(val.InternString("base_exec_prefix"), val.NewStringVal(disc.basePrefix))
+	sysMod.Dict.Set(val.InternString("platlibdir"), val.NewStringVal("lib"))
+
+	sysMod.Dict.Set(val.InternString("version"), val.NewStringVal("3.15.0 (main, fython)"))
+	verInfo := newVersionInfoTuple(3, 15, 0, "final", 0)
+	sysMod.Dict.Set(val.InternString("version_info"), verInfo)
+	sysMod.Dict.Set(val.InternString("hexversion"), val.Int64Val(0x030f00f0))
 	sysMod.Dict.Set(val.InternString("platform"), val.InternString(runtime.GOOS))
 	sysMod.Dict.Set(val.InternString("byteorder"), val.InternString("little"))
 	sysMod.Dict.Set(val.InternString("maxsize"), val.Int64Val(9223372036854775807))
 	sysMod.Dict.Set(val.InternString("float_info"), newFloatInfo())
 	sysMod.Dict.Set(val.InternString("hash_info"), newHashInfo())
-	sysMod.Dict.Set(val.InternString("warnoptions"), val.NewListVal())
-	flags := val.NewInstanceOfType(val.ObjectType)
-	flags.AsInstance().SetAttr(val.InternString("context_aware_warnings"), val.Int64Val(0))
-	flags.AsInstance().SetAttr(val.InternString("warn_default_encoding"), val.Int64Val(0))
-	flags.AsInstance().SetAttr(val.InternString("utf8_mode"), val.Int64Val(1))
-	sysMod.Dict.Set(val.InternString("flags"), flags)
+	sysMod.Dict.Set(val.InternString("dont_write_bytecode"), val.BoolVal(eff.DontWriteBytecode))
+
+	warnItems := make([]val.Value, len(eff.WarnOptions))
+	for i, w := range eff.WarnOptions {
+		warnItems[i] = val.NewStringVal(w)
+	}
+	sysMod.Dict.Set(val.InternString("warnoptions"), val.NewListVal(warnItems...))
+
+	xoptsDict := val.NewDictVal(len(eff.XOptions)).AsDict()
+	for k, v := range eff.XOptions {
+		if v == "" {
+			xoptsDict.Set(val.NewStringVal(k), val.BoolVal(true))
+		} else {
+			xoptsDict.Set(val.NewStringVal(k), val.NewStringVal(v))
+		}
+	}
+	sysMod.Dict.Set(val.InternString("_xoptions"), val.DictVal(xoptsDict))
+
+	implNs := val.NewInstanceOfType(val.ObjectType)
+	implInst := implNs.AsInstance()
+	implInst.SetAttr(val.InternString("name"), val.InternString("fython"))
+	implInst.SetAttr(val.InternString("version"), verInfo)
+	implInst.SetAttr(val.InternString("hexversion"), val.Int64Val(0x030f00f0))
+	implInst.SetAttr(val.InternString("cache_tag"), val.InternString("fython-315"))
+	sysMod.Dict.Set(val.InternString("implementation"), implNs)
+
+	sysMod.Dict.Set(val.InternString("flags"), newSysFlags(eff))
+
+	// PEP 451 / 302 import hooks
+	sysMod.Dict.Set(val.InternString("meta_path"), val.NewListVal(
+		val.TypeVal(BuiltinImporterType),
+		val.TypeVal(FrozenImporterType),
+		val.TypeVal(PathFinderType),
+	))
+	fileFinderHook, _ := FileFinderType.Dict.Get(val.InternString("path_hook"))
+	var ffHookCallable val.Value = val.TypeVal(FileFinderType)
+	if fileFinderHook.IsBuiltinFunc() {
+		ffHookCallable = fileFinderHook.AsBuiltinFunc().Fn(nil, fileFinderHook, nil, nil)
+	}
+	sysMod.Dict.Set(val.InternString("path_hooks"), val.NewListVal(
+		val.TypeVal(ZipImporterType),
+		ffHookCallable,
+	))
+	sysMod.Dict.Set(val.InternString("path_importer_cache"), val.NewDictVal(8))
 
 	// Builtin module names
 	builtinNames := []val.Value{
-		val.InternString("sys"), val.InternString("builtins"), val.InternString("_abc"),
+		val.InternString("sys"), val.InternString("builtins"), val.InternString("_imp"),
+		val.InternString("_frozen_importlib"), val.InternString("_frozen_importlib_external"),
+		val.InternString("zipimport"), val.InternString("site"), val.InternString("_abc"),
 		val.InternString("_collections"), val.InternString("itertools"), val.InternString("_functools"),
 		val.InternString("_operator"), val.InternString("operator"), val.InternString("_sre"),
 		val.InternString("re"), val.InternString("_types"), val.InternString("types"),
@@ -183,7 +271,12 @@ func (e *Engine) newSysModules() *val.PyDict {
 		val.InternString("_contextvars"), val.InternString("unicodedata"), val.InternString("_datetime"),
 		val.InternString("binascii"), val.InternString("_hashlib"), val.InternString("_struct"),
 		val.InternString("_csv"), val.InternString("_heapq"), val.InternString("_bisect"),
-		val.InternString("_queue"), val.InternString("atexit"),
+		val.InternString("_queue"), val.InternString("atexit"), val.InternString("errno"),
+		val.InternString("zlib"), val.InternString("posix"), val.InternString("nt"),
+		val.InternString("_signal"), val.InternString("select"), val.InternString("_string"),
+		val.InternString("_codecs"), val.InternString("_socket"), val.InternString("_ssl"),
+		val.InternString("_sqlite3"), val.InternString("_random"), val.InternString("_ast"),
+		val.InternString("locale"), val.InternString("_locale"), val.InternString("gettext"),
 	}
 	sysMod.Dict.Set(val.InternString("builtin_module_names"), val.NewTupleVal(builtinNames...))
 
@@ -356,16 +449,93 @@ func (e *Engine) newSysModules() *val.PyDict {
 	if wh, ok := testSupportMod.AsModule().Dict.Get(val.InternString("warnings_helper")); ok {
 		modules.Set(val.InternString("test.support.warnings_helper"), wh)
 	}
-	importlibMod := e.createImportlibModule()
-	modules.Set(val.InternString("importlib"), importlibMod)
-	if utilVal, ok := importlibMod.AsModule().Dict.Get(val.InternString("util")); ok {
-		modules.Set(val.InternString("importlib.util"), utilVal)
-	}
-	if machVal, ok := importlibMod.AsModule().Dict.Get(val.InternString("machinery")); ok {
-		modules.Set(val.InternString("importlib.machinery"), machVal)
+	modules.Set(val.InternString("_imp"), e.createImpModule())
+	modules.Set(val.InternString("_frozen_importlib"), e.createFrozenImportlibModule())
+	modules.Set(val.InternString("_frozen_importlib_external"), e.createFrozenImportlibExternalModule())
+	modules.Set(val.InternString("zipimport"), e.createZipImportModule())
+	modules.Set(val.InternString("site"), e.createSiteModule())
+
+	// Populate __loader__ and __spec__ on all built-in modules
+	for _, entry := range modules.Items() {
+		if entry.Value.IsModule() {
+			m := entry.Value.AsModule()
+			m.Dict.Set(val.InternString("__loader__"), val.TypeVal(BuiltinImporterType))
+			if pathVal, hasPath := m.Dict.Get(val.InternString("__path__")); hasPath && pathVal.IsList() {
+				var locs []string
+				for _, it := range pathVal.AsList().Items {
+					if it.IsAnyString() {
+						locs = append(locs, it.AsString())
+					}
+				}
+				m.Dict.Set(val.InternString("__spec__"), newModuleSpecVal(m.Name, val.TypeVal(BuiltinImporterType), "built-in", true, locs))
+			} else {
+				m.Dict.Set(val.InternString("__spec__"), newBuiltinModuleSpecVal(m.Name))
+			}
+		}
 	}
 
-	return modules
+	return modules, disc.pthImports
+}
+
+var (
+	versionInfoTypeOnce sync.Once
+	versionInfoType     *val.PyType
+)
+
+func newVersionInfoTuple(major, minor, micro int64, releaselevel string, serial int64) val.Value {
+	versionInfoTypeOnce.Do(func() {
+		versionInfoType = val.MustNewType("version_info", []*val.PyType{val.TupleType}, nil)
+		versionInfoType.InvalidateVersion()
+	})
+	tupVal := val.NewTupleVal(
+		val.Int64Val(major),
+		val.Int64Val(minor),
+		val.Int64Val(micro),
+		val.InternString(releaselevel),
+		val.Int64Val(serial),
+	)
+	tup := tupVal.AsTuple()
+	tup.Header.Type = versionInfoType
+	tup.Attrs = val.NewDictVal(5).AsDict()
+	tup.Attrs.Set(val.InternString("major"), val.Int64Val(major))
+	tup.Attrs.Set(val.InternString("minor"), val.Int64Val(minor))
+	tup.Attrs.Set(val.InternString("micro"), val.Int64Val(micro))
+	tup.Attrs.Set(val.InternString("releaselevel"), val.InternString(releaselevel))
+	tup.Attrs.Set(val.InternString("serial"), val.Int64Val(serial))
+	return tupVal
+}
+
+func boolToInt64(b bool) int64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func newSysFlags(eff RuntimeConfig) val.Value {
+	flags := val.NewInstanceOfType(val.ObjectType)
+	inst := flags.AsInstance()
+	set := func(name string, v val.Value) { inst.SetAttr(val.InternString(name), v) }
+	set("debug", val.Int64Val(0))
+	set("inspect", val.Int64Val(boolToInt64(eff.Interactive)))
+	set("interactive", val.Int64Val(boolToInt64(eff.Interactive)))
+	set("optimize", val.Int64Val(int64(eff.Optimize)))
+	set("dont_write_bytecode", val.Int64Val(boolToInt64(eff.DontWriteBytecode)))
+	set("no_user_site", val.Int64Val(boolToInt64(eff.NoUserSite)))
+	set("no_site", val.Int64Val(boolToInt64(eff.NoSite)))
+	set("ignore_environment", val.Int64Val(boolToInt64(eff.IgnoreEnv)))
+	set("verbose", val.Int64Val(0))
+	set("bytes_warning", val.Int64Val(0))
+	set("quiet", val.Int64Val(boolToInt64(eff.Quiet)))
+	set("hash_randomization", val.Int64Val(1))
+	set("isolated", val.Int64Val(boolToInt64(eff.Isolated)))
+	set("dev_mode", val.BoolVal(false))
+	set("utf8_mode", val.Int64Val(1))
+	set("warn_default_encoding", val.Int64Val(0))
+	set("safe_path", val.BoolVal(eff.Isolated))
+	set("context_aware_warnings", val.Int64Val(0))
+	set("unbuffered", val.Int64Val(boolToInt64(eff.Unbuffered)))
+	return flags
 }
 
 func (e *Engine) createLocaleModule() val.Value {
@@ -391,57 +561,14 @@ func (e *Engine) createLocaleModule() val.Value {
 	return modVal
 }
 
-func (e *Engine) createImportlibModule() val.Value {
-	modVal := val.NewModuleVal("importlib", "Core Python import machinery")
-	mod := modVal.AsModule()
-	utilModVal := val.NewModuleVal("importlib.util", "Utilities for importlib")
-	utilMod := utilModVal.AsModule()
-	utilMod.Dict.Set(val.InternString("MAGIC_NUMBER"), val.NewBytesVal([]byte{0xcb, 0x0d, 0x0d, 0x0a}))
-	utilMod.Dict.Set(val.InternString("find_spec"), val.NewBuiltinFuncVal("find_spec", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		return val.NoneVal()
-	}))
-	mod.Dict.Set(val.InternString("util"), utilModVal)
+// SetRuntimeConfig configures CLI flags and runtime options on this Engine.
+func (e *Engine) SetRuntimeConfig(cfg RuntimeConfig) {
+	e.runtimeConfig = cfg
+}
 
-	machModVal := val.NewModuleVal("importlib.machinery", "Import machinery")
-	machMod := machModVal.AsModule()
-	specType := val.MustNewType("ModuleSpec", []*val.PyType{val.ObjectType}, nil)
-	fileFinderType := val.MustNewType("FileFinder", []*val.PyType{val.ObjectType}, nil)
-	machMod.Dict.Set(val.InternString("ModuleSpec"), val.TypeVal(specType))
-	machMod.Dict.Set(val.InternString("FileFinder"), val.TypeVal(fileFinderType))
-	machMod.Dict.Set(val.InternString("BuiltinImporter"), val.NewInstanceOfType(val.ObjectType))
-	mod.Dict.Set(val.InternString("machinery"), machModVal)
-
-	mod.Dict.Set(val.InternString("import_module"), val.NewBuiltinFuncVal("import_module", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		if len(args) < 1 {
-			panic(val.NewException(val.TypeErrorType, "import_module() requires name"))
-		}
-		name := args[0].AsString()
-		if e.sharedModules != nil {
-			if v, ok := e.sharedModules.Get(val.InternString(name)); ok {
-				return v
-			}
-		}
-		vm := e.AcquireVM()
-		defer e.ReleaseVM(vm)
-		modVal, err := vm.ImportModule(name, 0, true, nil)
-		if err != nil {
-			panic(val.NewException(val.ModuleNotFoundErrorType, err.Error()))
-		}
-		return modVal
-	}))
-
-	mod.Dict.Set(val.InternString("invalidate_caches"), val.NewBuiltinFuncVal("invalidate_caches", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		return val.NoneVal()
-	}))
-
-	mod.Dict.Set(val.InternString("reload"), val.NewBuiltinFuncVal("reload", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		if len(args) < 1 {
-			panic(val.NewException(val.TypeErrorType, "reload() requires module"))
-		}
-		return args[0]
-	}))
-
-	return modVal
+// RuntimeConfig returns the configured CLI flags and runtime options on this Engine.
+func (e *Engine) RuntimeConfig() RuntimeConfig {
+	return e.runtimeConfig
 }
 
 // SetAsyncMode sets the coroutine scheduling strategy for this Engine.
@@ -463,8 +590,9 @@ func (e *Engine) newVMInternal(stackCap, frameCap int) *VM {
 		frameCap = DefaultFrameSlabSize
 	}
 	modules := e.sharedModules
+	var pthImports []string
 	if !e.isSharedModules || modules == nil {
-		modules = e.newSysModules()
+		modules, pthImports = e.newSysModulesWithDiscovery()
 	}
 	v := &VM{
 		engine:     e,
@@ -490,7 +618,19 @@ func (e *Engine) newVMInternal(stackCap, frameCap int) *VM {
 	if !e.isSharedModules {
 		mainModVal := val.NewModuleVal("__main__", "")
 		mainModVal.AsModule().Dict = v.globals
+		v.globals.Set(val.InternString("__name__"), val.InternString("__main__"))
+		v.globals.Set(val.InternString("__doc__"), val.NoneVal())
+		v.globals.Set(val.InternString("__package__"), val.NoneVal())
+		v.globals.Set(val.InternString("__loader__"), val.NoneVal())
+		v.globals.Set(val.InternString("__spec__"), val.NoneVal())
 		modules.Set(val.InternString("__main__"), mainModVal)
+	}
+	for _, impLine := range pthImports {
+		co, err := e.CompileDynamic([]byte(impLine+"\n"), "<pth>", 0)
+		if err == nil && co != nil {
+			v.RunCode(co)
+			v.unhandledException = val.NoneVal()
+		}
 	}
 	return v
 }
@@ -546,6 +686,16 @@ func (e *Engine) SetSharedModules(enabled bool) {
 // SetSearchPaths sets the directory search paths for module resolution.
 func (e *Engine) SetSearchPaths(paths []string) {
 	e.searchPaths = append([]string(nil), paths...)
+	if e.sharedModules != nil {
+		if sysVal, ok := e.sharedModules.Get(val.InternString("sys")); ok && sysVal.IsModule() {
+			disc := discoverVenvAndPaths(e.runtimeConfig, e.searchPaths)
+			pathItems := make([]val.Value, len(disc.paths))
+			for i, p := range disc.paths {
+				pathItems[i] = val.NewStringVal(p)
+			}
+			sysVal.AsModule().Dict.Set(val.InternString("path"), val.NewListVal(pathItems...))
+		}
+	}
 }
 
 // SearchPaths returns the active directory search paths.
@@ -553,15 +703,35 @@ func (e *Engine) SearchPaths() []string {
 	return e.searchPaths
 }
 
+func setCodeFilenameRecursive(co *CodeObject, filename string) {
+	if co == nil || filename == "" {
+		return
+	}
+	if co.FileName == "" || co.FileName == "<string>" {
+		co.FileName = filename
+	}
+	for _, c := range co.Consts {
+		if c.IsCode() {
+			if child := AsCodeObject(c); child != nil {
+				setCodeFilenameRecursive(child, filename)
+			}
+		}
+	}
+}
+
 // SetCompileHook sets the source compilation callback.
 func (e *Engine) SetCompileHook(fn func(src []byte) (*CodeObject, error)) {
 	e.compileHook = fn
-	if fn != nil {
-		e.compileWithFilenameHook = func(src []byte, _ string) (*CodeObject, error) {
-			return fn(src)
-		}
-	} else {
+	if fn == nil {
 		e.compileWithFilenameHook = nil
+	} else {
+		e.compileWithFilenameHook = func(src []byte, filename string) (*CodeObject, error) {
+			co, err := fn(src)
+			if err == nil && co != nil {
+				setCodeFilenameRecursive(co, filename)
+			}
+			return co, err
+		}
 	}
 }
 
@@ -575,6 +745,11 @@ func (e *Engine) SetDynamicCompileHook(fn func(src []byte, filename string, mode
 	e.dynamicCompileHook = fn
 }
 
+// SetDynamicCompileOptimizeHook sets the source compilation callback for eval/exec/compile with optimize.
+func (e *Engine) SetDynamicCompileOptimizeHook(fn func(src []byte, filename string, mode, optimize int) (*CodeObject, error)) {
+	e.dynamicCompileOptimizeHook = fn
+}
+
 // CompileDynamic compiles Python source bytes dynamically using the configured hook.
 func (e *Engine) CompileDynamic(src []byte, filename string, mode int) (*CodeObject, error) {
 	if e.dynamicCompileHook != nil {
@@ -584,6 +759,17 @@ func (e *Engine) CompileDynamic(src []byte, filename string, mode int) (*CodeObj
 		return defaultDynamicCompileHook(src, filename, mode)
 	}
 	return nil, fmt.Errorf("Engine: dynamic compilation hook not set")
+}
+
+// CompileDynamicWithOptimize compiles Python source bytes dynamically with an explicit optimize level.
+func (e *Engine) CompileDynamicWithOptimize(src []byte, filename string, mode, optimize int) (*CodeObject, error) {
+	if e.dynamicCompileOptimizeHook != nil {
+		return e.dynamicCompileOptimizeHook(src, filename, mode, optimize)
+	}
+	if defaultDynamicCompileOptimizeHook != nil {
+		return defaultDynamicCompileOptimizeHook(src, filename, mode, optimize)
+	}
+	return e.CompileDynamic(src, filename, mode)
 }
 
 // RegisterVirtualModule registers in-memory source code under the given module name.

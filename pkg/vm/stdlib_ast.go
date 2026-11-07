@@ -733,6 +733,10 @@ func builtinCompile(ctx *val.ExecContext, callable val.Value, args []val.Value, 
 	}
 	srcVal, fnVal, modeVal := a[0], a[1], a[2]
 	flags := int(intArg(ctx, a[3], 0))
+	optimize := int(intArg(ctx, a[5], -1))
+	if optimize < -1 || optimize > 2 {
+		panic("ValueError: compile(): invalid optimize value")
+	}
 	if !modeVal.IsAnyString() {
 		panic("TypeError: compile() argument 'mode' must be str, not " + typeNameOf(modeVal))
 	}
@@ -771,7 +775,7 @@ func builtinCompile(ctx *val.ExecContext, callable val.Value, args []val.Value, 
 		if mode == "single" {
 			text += "\n"
 		}
-		return compileSource(ctx, []byte(text), filename, mode)
+		return compileSourceWithOptimize(ctx, []byte(text), filename, mode, optimize)
 	}
 	if srcVal.Kind() == val.KindCode {
 		return srcVal
@@ -794,10 +798,14 @@ func builtinCompile(ctx *val.ExecContext, callable val.Value, args []val.Value, 
 	if mode == "func_type" {
 		panic("ValueError: compile() mode 'func_type' requires flag PyCF_ONLY_AST")
 	}
-	return compileSource(ctx, src, filename, mode)
+	return compileSourceWithOptimize(ctx, src, filename, mode, optimize)
 }
 
 func compileSource(ctx *val.ExecContext, src []byte, filename, mode string) val.Value {
+	return compileSourceWithOptimize(ctx, src, filename, mode, -1)
+}
+
+func compileSourceWithOptimize(ctx *val.ExecContext, src []byte, filename, mode string, optimize int) val.Value {
 	m := 0
 	switch mode {
 	case "eval":
@@ -806,7 +814,7 @@ func compileSource(ctx *val.ExecContext, src []byte, filename, mode string) val.
 		m = 2
 	}
 	vmInstance := ctx.VM.(*VM)
-	co, err := vmInstance.engine.CompileDynamic(src, filename, m)
+	co, err := vmInstance.engine.CompileDynamicWithOptimize(src, filename, m, optimize)
 	if err != nil {
 		panic("SyntaxError: " + err.Error())
 	}

@@ -732,6 +732,15 @@ func builtinFuncTpCall(ctx *ExecContext, callable Value, args []Value, kwnames [
 }
 
 func boundMethodTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+	if callable.IsType() {
+		if len(args) != 2 || len(kwnames) != 0 {
+			panic("TypeError: method expected 2 arguments, got " + strconv.Itoa(len(args)))
+		}
+		if args[1].IsNone() {
+			panic("TypeError: method() arg 2 must not be None")
+		}
+		return NewBoundMethodVal(args[1], args[0])
+	}
 	bm := callable.AsBoundMethod()
 	fn := bm.Func
 	if ctx != nil && ctx.SP+1+len(args) <= len(ctx.Stack) {
@@ -5861,6 +5870,40 @@ func initTypes() {
 	SystemExitType.InvalidateVersion()
 	KeyboardInterruptType = MustNewType("KeyboardInterrupt", []*PyType{BaseExceptionType}, nil)
 	ImportErrorType = MustNewType("ImportError", []*PyType{ExceptionType}, nil)
+	ImportErrorType.Dict.Set(InternString("name"), NoneVal())
+	ImportErrorType.Dict.Set(InternString("path"), NoneVal())
+	ImportErrorType.Dict.Set(InternString("msg"), NoneVal())
+	ImportErrorType.Dict.Set(DunderInit, NewBuiltinFuncVal("__init__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) > 0 && args[0].IsInstance() {
+			inst := args[0].AsInstance()
+			posEnd := len(args) - len(kwnames)
+			if posEnd < 1 {
+				posEnd = 1
+			}
+			rest := append([]Value(nil), args[1:posEnd]...)
+			inst.SetAttr(InternString("args"), NewTupleVal(rest...))
+			if len(rest) == 1 {
+				inst.SetAttr(InternString("msg"), rest[0])
+			} else {
+				inst.SetAttr(InternString("msg"), NoneVal())
+			}
+			nameVal := NoneVal()
+			pathVal := NoneVal()
+			for i, kw := range kwnames {
+				v := args[posEnd+i]
+				switch kw.AsString() {
+				case "name":
+					nameVal = v
+				case "path":
+					pathVal = v
+				}
+			}
+			inst.SetAttr(InternString("name"), nameVal)
+			inst.SetAttr(InternString("path"), pathVal)
+		}
+		return NoneVal()
+	}))
+	ImportErrorType.InvalidateVersion()
 	ModuleNotFoundErrorType = MustNewType("ModuleNotFoundError", []*PyType{ImportErrorType}, nil)
 	BufferErrorType = MustNewType("BufferError", []*PyType{ExceptionType}, nil)
 	ReferenceErrorType = MustNewType("ReferenceError", []*PyType{ExceptionType}, nil)

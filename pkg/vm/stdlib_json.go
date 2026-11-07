@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode/utf16"
@@ -462,7 +463,8 @@ func writeJSONValue(sb *strings.Builder, v val.Value, indent int, level int) err
 		d := v.AsDict()
 		first := true
 		sb.WriteString("{")
-		for _, e := range d.ActiveEntries() {
+		entries := d.ActiveEntries()
+		for _, e := range entries {
 			if !e.Active {
 				continue
 			}
@@ -501,6 +503,180 @@ func writeJSONValue(sb *strings.Builder, v val.Value, indent int, level int) err
 	}
 
 	return fmt.Errorf("TypeError: Object of type %s is not JSON serializable", v.Type().Name)
+}
+
+type jsonDumpOpts struct {
+	indentStr string
+	hasIndent bool
+	sortKeys  bool
+	itemSep   string
+	keySep    string
+}
+
+func extractJSONDumpOpts(posArgs []val.Value, allArgs []val.Value, kwnames []val.Value, indentPosIdx int) jsonDumpOpts {
+	opts := jsonDumpOpts{
+		itemSep: ", ",
+		keySep:  ": ",
+	}
+	var indentVal val.Value = val.NoneVal()
+	if len(posArgs) > indentPosIdx {
+		indentVal = posArgs[indentPosIdx]
+	}
+	if v, ok := kwArg(allArgs, kwnames, "indent"); ok {
+		indentVal = v
+	}
+	if !indentVal.IsNone() {
+		if indentVal.IsInt64() {
+			n := int(indentVal.AsInt64())
+			if n >= 0 {
+				opts.hasIndent = true
+				opts.indentStr = strings.Repeat(" ", n)
+				opts.itemSep = ","
+			}
+		} else if indentVal.IsAnyString() {
+			opts.hasIndent = true
+			opts.indentStr = indentVal.AsString()
+			opts.itemSep = ","
+		}
+	}
+	if v, ok := kwArg(allArgs, kwnames, "sort_keys"); ok && v.IsTruthy() {
+		opts.sortKeys = true
+	}
+	if v, ok := kwArg(allArgs, kwnames, "separators"); ok {
+		if v.IsTuple() && len(v.AsTuple().Items) == 2 {
+			opts.itemSep = v.AsTuple().Items[0].AsString()
+			opts.keySep = v.AsTuple().Items[1].AsString()
+		} else if v.IsList() && len(v.AsList().Items) == 2 {
+			opts.itemSep = v.AsList().Items[0].AsString()
+			opts.keySep = v.AsList().Items[1].AsString()
+		}
+	}
+	return opts
+}
+
+func jsonDumpsWithOpts(v val.Value, opts jsonDumpOpts) (string, error) {
+	if !opts.hasIndent && !opts.sortKeys && opts.itemSep == ", " && opts.keySep == ": " {
+		return jsonDumps(v, 0)
+	}
+	var sb strings.Builder
+	sb.Grow(64)
+	if err := writeJSONValueWithOpts(&sb, v, opts, 0); err != nil {
+		return "", err
+	}
+	return sb.String(), nil
+}
+
+func writeJSONValueWithOpts(sb *strings.Builder, v val.Value, opts jsonDumpOpts, level int) error {
+	if v.IsNone() || v.IsBool() || v.IsInt64() || v.IsFloat64() || v.IsAnyString() || v.IsBytes() || v.IsByteArray() || v.IsMemoryView() {
+		return writeJSONValue(sb, v, 0, level)
+	}
+	writeLvlIndent := func(lvl int) {
+		for i := 0; i < lvl; i++ {
+			sb.WriteString(opts.indentStr)
+		}
+	}
+	if v.IsList() || v.IsTuple() {
+		var items []val.Value
+		if v.IsList() {
+			items = v.AsList().Items
+		} else {
+			items = v.AsTuple().Items
+		}
+		if len(items) == 0 {
+			sb.WriteString("[]")
+			return nil
+		}
+		sb.WriteString("[")
+		if opts.hasIndent {
+			sb.WriteString("\n")
+		}
+		for i, item := range items {
+			if opts.hasIndent {
+				writeLvlIndent(level + 1)
+			}
+			if err := writeJSONValueWithOpts(sb, item, opts, level+1); err != nil {
+				return err
+			}
+			if i+1 < len(items) {
+				sb.WriteString(opts.itemSep)
+			}
+			if opts.hasIndent {
+				sb.WriteString("\n")
+			}
+		}
+		if opts.hasIndent {
+			writeLvlIndent(level)
+		}
+		sb.WriteString("]")
+		return nil
+	}
+	if v.IsDict() {
+		d := v.AsDict()
+		var active []val.DictEntry
+		for _, e := range d.ActiveEntries() {
+			if e.Active {
+				active = append(active, e)
+			}
+		}
+		if opts.sortKeys {
+			sort.Slice(active, func(i, j int) bool {
+				return active[i].Key.AsString() < active[j].Key.AsString()
+			})
+		}
+		if len(active) == 0 {
+			sb.WriteString("{}")
+			return nil
+		}
+		sb.WriteString("{")
+		if opts.hasIndent {
+			sb.WriteString("\n")
+		}
+		for i, e := range active {
+			if opts.hasIndent {
+				writeLvlIndent(level + 1)
+			}
+			writeJSONString(sb, e.Key.AsString())
+			sb.WriteString(opts.keySep)
+			if err := writeJSONValueWithOpts(sb, e.Value, opts, level+1); err != nil {
+				return err
+			}
+			if i+1 < len(active) {
+				sb.WriteString(opts.itemSep)
+			}
+			if opts.hasIndent {
+				sb.WriteString("\n")
+			}
+		}
+		if opts.hasIndent {
+			writeLvlIndent(level)
+		}
+		sb.WriteString("}")
+		return nil
+	}
+	return fmt.Errorf("TypeError: Object of type %s is not JSON serializable", v.Type().Name)
+}
+
+func applyJSONObjectHook(ctx *val.ExecContext, v val.Value, hook val.Value) val.Value {
+	if hook.IsNone() || hook.IsUnbound() {
+		return v
+	}
+	if v.IsList() {
+		lst := v.AsList()
+		for i, item := range lst.Items {
+			lst.Items[i] = applyJSONObjectHook(ctx, item, hook)
+		}
+		return v
+	}
+	if v.IsDict() {
+		d := v.AsDict()
+		for i := range d.Entries {
+			if d.Entries[i].Active {
+				d.Entries[i].Value = applyJSONObjectHook(ctx, d.Entries[i].Value, hook)
+			}
+		}
+		return ctx.Invoke1(hook, v)
+	}
+	return v
 }
 
 func writeIndent(sb *strings.Builder, indent, level int) {
@@ -542,15 +718,24 @@ func writeJSONString(sb *strings.Builder, s string) {
 
 // createJSONModule builds the native json PyModule Value.
 func (e *Engine) createJSONModule() val.Value {
-	modVal := val.NewModuleVal("json", "")
+	modVal := val.NewModuleVal("json", "stdlib:lib/json/__init__.py")
 	mod := modVal.AsModule()
+	mod.Dict.Set(val.InternString("__package__"), val.NewStringVal("json"))
+	mod.Dict.Set(val.InternString("__path__"), val.NewListVal(val.NewStringVal("stdlib:lib/json")))
+	jsonDecErrType := val.MustNewType("JSONDecodeError", []*val.PyType{val.ValueErrorType}, nil)
+	mod.Dict.Set(val.InternString("JSONDecodeError"), val.TypeVal(jsonDecErrType))
 
 	mod.Dict.Set(val.InternString("loads"), val.NewBuiltinFuncVal("loads", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		if len(args) < 1 {
-			panic("TypeError: loads() takes at least 1 argument")
+		pa := posArgs(args, kwnames)
+		if len(pa) < 1 {
+			if v, ok := kwArg(args, kwnames, "s"); ok {
+				pa = []val.Value{v}
+			} else {
+				panic("TypeError: loads() takes at least 1 argument")
+			}
 		}
 		var rawBytes []byte
-		a := args[0]
+		a := pa[0]
 		if a.IsAnyString() {
 			rawBytes = []byte(a.AsString())
 		} else if a.IsBytes() {
@@ -568,18 +753,23 @@ func (e *Engine) createJSONModule() val.Value {
 		if err != nil {
 			panic("ValueError: " + err.Error())
 		}
+		if hook, ok := kwArg(args, kwnames, "object_hook"); ok && !hook.IsNone() {
+			res = applyJSONObjectHook(ctx, res, hook)
+		}
 		return res
 	}))
 
 	mod.Dict.Set(val.InternString("dumps"), val.NewBuiltinFuncVal("dumps", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		if len(args) < 1 {
-			panic("TypeError: dumps() takes at least 1 argument")
+		pa := posArgs(args, kwnames)
+		if len(pa) < 1 {
+			if v, ok := kwArg(args, kwnames, "obj"); ok {
+				pa = []val.Value{v}
+			} else {
+				panic("TypeError: dumps() takes at least 1 argument")
+			}
 		}
-		indent := 0
-		if len(args) >= 2 && args[1].IsInt64() {
-			indent = int(args[1].AsInt64())
-		}
-		res, err := jsonDumps(args[0], indent)
+		opts := extractJSONDumpOpts(pa, args, kwnames, 1)
+		res, err := jsonDumpsWithOpts(pa[0], opts)
 		if err != nil {
 			panic(err.Error())
 		}
@@ -587,10 +777,15 @@ func (e *Engine) createJSONModule() val.Value {
 	}))
 
 	mod.Dict.Set(val.InternString("load"), val.NewBuiltinFuncVal("load", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		if len(args) < 1 {
-			panic("TypeError: load() takes at least 1 argument")
+		pa := posArgs(args, kwnames)
+		if len(pa) < 1 {
+			if v, ok := kwArg(args, kwnames, "fp"); ok {
+				pa = []val.Value{v}
+			} else {
+				panic("TypeError: load() takes at least 1 argument")
+			}
 		}
-		fp := args[0]
+		fp := pa[0]
 		readMethod := val.GetAttrCtx(ctx, fp, val.InternString("read"))
 		content := ctx.Invoke0(readMethod)
 		var rawBytes []byte
@@ -606,22 +801,23 @@ func (e *Engine) createJSONModule() val.Value {
 		if err != nil {
 			panic("ValueError: " + err.Error())
 		}
+		if hook, ok := kwArg(args, kwnames, "object_hook"); ok && !hook.IsNone() {
+			res = applyJSONObjectHook(ctx, res, hook)
+		}
 		return res
 	}))
 
 	mod.Dict.Set(val.InternString("dump"), val.NewBuiltinFuncVal("dump", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		if len(args) < 2 {
+		pa := posArgs(args, kwnames)
+		if len(pa) < 2 {
 			panic("TypeError: dump() takes at least 2 arguments")
 		}
-		indent := 0
-		if len(args) >= 3 && args[2].IsInt64() {
-			indent = int(args[2].AsInt64())
-		}
-		resStr, err := jsonDumps(args[0], indent)
+		opts := extractJSONDumpOpts(pa, args, kwnames, 2)
+		resStr, err := jsonDumpsWithOpts(pa[0], opts)
 		if err != nil {
 			panic(err.Error())
 		}
-		fp := args[1]
+		fp := pa[1]
 		writeMethod := val.GetAttrCtx(ctx, fp, val.InternString("write"))
 		ctx.Invoke1(writeMethod, val.NewStringVal(resStr))
 		return val.NoneVal()

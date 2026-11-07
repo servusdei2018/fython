@@ -3,6 +3,7 @@ package vm
 import (
 	"fmt"
 	"math"
+	"path/filepath"
 	"strings"
 	"sync"
 	"unicode"
@@ -14,8 +15,11 @@ var (
 	inspectInitOnce sync.Once
 	ParameterType   *val.PyType
 	SignatureType   *val.PyType
+	FrameInfoType   *val.PyType
 	EmptyObject     val.Value
 )
+
+var frameInfoFields = []string{"frame", "filename", "lineno", "function", "code_context", "index"}
 
 func initInspectTypes() {
 	inspectInitOnce.Do(func() {
@@ -150,6 +154,39 @@ func initInspectTypes() {
 
 		ParameterType.InvalidateVersion()
 		SignatureType.InvalidateVersion()
+
+		FrameInfoType = val.MustNewType("FrameInfo", []*val.PyType{val.ObjectType}, nil)
+		FrameInfoType.Dict.Set(val.InternString("__module__"), val.InternString("inspect"))
+		frameSeq := func(self val.Value) []val.Value {
+			inst := self.AsInstance()
+			out := make([]val.Value, len(frameInfoFields))
+			for i, name := range frameInfoFields {
+				v, _ := inst.GetAttr(val.InternString(name))
+				out[i] = v
+			}
+			return out
+		}
+		FrameInfoType.Dict.Set(val.InternString("__getitem__"), val.NewBuiltinFuncVal("__getitem__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			items := frameSeq(args[0])
+			if args[1].IsSlice() {
+				return val.TupleType.Slots.MpSubscript(ctx, val.NewTupleVal(items...), args[1])
+			}
+			i := int(args[1].AsInt64())
+			if i < 0 {
+				i += len(items)
+			}
+			if i < 0 || i >= len(items) {
+				panic("IndexError: tuple index out of range")
+			}
+			return items[i]
+		}))
+		FrameInfoType.Dict.Set(val.InternString("__len__"), val.NewBuiltinFuncVal("__len__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			return val.Int64Val(int64(len(frameInfoFields)))
+		}))
+		FrameInfoType.Dict.Set(val.InternString("__iter__"), val.NewBuiltinFuncVal("__iter__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			return val.NewIterVal(val.NewTupleVal(frameSeq(args[0])...))
+		}))
+		FrameInfoType.InvalidateVersion()
 	})
 }
 
@@ -186,7 +223,22 @@ func (e *Engine) createInspectModule() val.Value {
 
 	mod.Dict.Set(val.InternString("Parameter"), val.TypeVal(ParameterType))
 	mod.Dict.Set(val.InternString("Signature"), val.TypeVal(SignatureType))
+	mod.Dict.Set(val.InternString("FrameInfo"), val.TypeVal(FrameInfoType))
 	mod.Dict.Set(val.InternString("_empty"), EmptyObject)
+
+	mod.Dict.Set(val.InternString("getmodulename"), val.NewBuiltinFuncVal("getmodulename", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: getmodulename() missing required argument 'path'")
+		}
+		p := pathArg(ctx, args[0])
+		fname := filepath.Base(p)
+		for _, suffix := range []string{".pyc", ".fyc", ".pyw", ".py", ".so", ".pyd"} {
+			if strings.HasSuffix(fname, suffix) {
+				return val.NewStringVal(fname[:len(fname)-len(suffix)])
+			}
+		}
+		return val.NoneVal()
+	}))
 
 	mod.Dict.Set(val.InternString("cleandoc"), val.NewBuiltinFuncVal("cleandoc", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) != 1 || !args[0].IsAnyString() {
@@ -222,18 +274,51 @@ func (e *Engine) createInspectModule() val.Value {
 					fnName = val.CodeInspectorHook.QualName(f.CO)
 					line = val.CodeInspectorHook.LineAt(f.CO, f.IP)
 				}
-				info := val.NewTupleVal(
-					fVal,
-					val.NewStringVal(fileName),
-					val.Int64Val(int64(line)),
-					val.NewStringVal(fnName),
-					val.NewListVal(),
-					val.Int64Val(0),
-				)
+				info := val.NewInstanceOfType(FrameInfoType)
+				inst := info.AsInstance()
+				inst.SetAttr(val.InternString("frame"), fVal)
+				inst.SetAttr(val.InternString("filename"), val.NewStringVal(fileName))
+				inst.SetAttr(val.InternString("lineno"), val.Int64Val(int64(line)))
+				inst.SetAttr(val.InternString("function"), val.NewStringVal(fnName))
+				inst.SetAttr(val.InternString("code_context"), val.NewListVal())
+				inst.SetAttr(val.InternString("index"), val.Int64Val(0))
 				listItems = append(listItems, info)
 			}
 		}
 		return val.NewListVal(listItems...)
+	}))
+
+	// ismodule(obj)
+	mod.Dict.Set(val.InternString("ismodule"), val.NewBuiltinFuncVal("ismodule", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			return val.BoolVal(false)
+		}
+		return val.BoolVal(args[0].IsModule())
+	}))
+
+	// ismethod(obj)
+	mod.Dict.Set(val.InternString("ismethod"), val.NewBuiltinFuncVal("ismethod", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			return val.BoolVal(false)
+		}
+		return val.BoolVal(args[0].IsBoundMethod())
+	}))
+
+	// isbuiltin(obj)
+	mod.Dict.Set(val.InternString("isbuiltin"), val.NewBuiltinFuncVal("isbuiltin", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			return val.BoolVal(false)
+		}
+		return val.BoolVal(args[0].IsBuiltinFunc())
+	}))
+
+	// isroutine(obj)
+	mod.Dict.Set(val.InternString("isroutine"), val.NewBuiltinFuncVal("isroutine", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			return val.BoolVal(false)
+		}
+		v := args[0]
+		return val.BoolVal(v.IsFunction() || v.IsBuiltinFunc() || v.IsBoundMethod())
 	}))
 
 	// isfunction(obj)

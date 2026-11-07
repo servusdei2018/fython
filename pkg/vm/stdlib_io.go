@@ -503,8 +503,10 @@ func initIOTypes() {
 			pf.mu.Lock()
 			if !pf.isClosed && pf.f != nil {
 				pf.flushLocked()
-				_ = pf.f.Close()
-				pf.isClosed = true
+				if pf.f != os.Stdin && pf.f != os.Stdout && pf.f != os.Stderr {
+					_ = pf.f.Close()
+					pf.isClosed = true
+				}
 			}
 			pf.mu.Unlock()
 			return val.NoneVal()
@@ -523,28 +525,36 @@ func initIOTypes() {
 			}
 			if n < 0 {
 				pf.flushLocked()
-				stat, err := pf.f.Stat()
-				if err == nil && stat.Size() > 0 {
-					size := stat.Size()
-					buf := make([]byte, size)
-					readN, _ := io.ReadFull(pf.f, buf)
-					if readN > 0 {
-						buf = buf[:readN]
-						if pf.binary {
-							pf.mu.Unlock()
-							return val.NewBytesVal(buf)
+				if pf.reader == nil || pf.reader.Buffered() == 0 {
+					stat, err := pf.f.Stat()
+					if err == nil && stat.Size() > 0 {
+						curPos, seekErr := pf.f.Seek(0, io.SeekCurrent)
+						remSize := stat.Size()
+						if seekErr == nil && curPos >= 0 && curPos <= remSize {
+							remSize -= curPos
 						}
-						s := unsafe.String(unsafe.SliceData(buf), readN)
-						ps := &val.PyString{
-							Header: val.ObjectHeader{
-								Kind: val.KindString,
-								Hash: val.HashString(s),
-								Type: val.StrType,
-							},
-							Data: s,
+						if remSize > 0 {
+							buf := make([]byte, remSize)
+							readN, _ := io.ReadFull(pf.f, buf)
+							if readN > 0 {
+								buf = buf[:readN]
+								if pf.binary {
+									pf.mu.Unlock()
+									return val.NewBytesVal(buf)
+								}
+								s := unsafe.String(unsafe.SliceData(buf), readN)
+								ps := &val.PyString{
+									Header: val.ObjectHeader{
+										Kind: val.KindString,
+										Hash: val.HashString(s),
+										Type: val.StrType,
+									},
+									Data: s,
+								}
+								pf.mu.Unlock()
+								return val.ObjectVal(&ps.Header)
+							}
 						}
-						pf.mu.Unlock()
-						return val.ObjectVal(&ps.Header)
 					}
 				}
 				content, err := io.ReadAll(pf.reader)
@@ -612,6 +622,87 @@ func initIOTypes() {
 				return val.NewBytesVal(line)
 			}
 			return val.NewStringVal(string(line))
+		}))
+
+		FileType.Dict.Set(val.InternString("readlines"), val.NewBuiltinFuncVal("readlines", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			pf := (*pyFile)(val.AsPointer(args[0]))
+			pf.mu.Lock()
+			defer pf.mu.Unlock()
+			if pf.isClosed {
+				panic("ValueError: I/O operation on closed file.")
+			}
+			var lines []val.Value
+			for {
+				line, err := pf.reader.ReadBytes('\n')
+				if len(line) > 0 {
+					if pf.binary {
+						lines = append(lines, val.NewBytesVal(line))
+					} else {
+						lines = append(lines, val.NewStringVal(string(line)))
+					}
+				}
+				if err != nil {
+					break
+				}
+			}
+			return val.NewListVal(lines...)
+		}))
+
+		FileType.Dict.Set(val.InternString("seek"), val.NewBuiltinFuncVal("seek", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) < 2 {
+				panic("TypeError: seek() takes at least 1 argument")
+			}
+			pf := (*pyFile)(val.AsPointer(args[0]))
+			pf.mu.Lock()
+			defer pf.mu.Unlock()
+			if pf.isClosed {
+				panic("ValueError: I/O operation on closed file.")
+			}
+			pf.flushLocked()
+			offset := args[1].AsInt64()
+			whence := io.SeekStart
+			if len(args) >= 3 && args[2].IsInt64() {
+				whence = int(args[2].AsInt64())
+			}
+			if whence == io.SeekCurrent && pf.reader != nil && pf.reader.Buffered() > 0 {
+				offset -= int64(pf.reader.Buffered())
+			}
+			pos, err := pf.f.Seek(offset, whence)
+			if err != nil {
+				panic("OSError: " + err.Error())
+			}
+			if pf.reader != nil {
+				pf.reader.Reset(pf.f)
+			}
+			return val.Int64Val(pos)
+		}))
+
+		FileType.Dict.Set(val.InternString("tell"), val.NewBuiltinFuncVal("tell", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			pf := (*pyFile)(val.AsPointer(args[0]))
+			pf.mu.Lock()
+			defer pf.mu.Unlock()
+			if pf.isClosed {
+				panic("ValueError: I/O operation on closed file.")
+			}
+			pf.flushLocked()
+			pos, err := pf.f.Seek(0, io.SeekCurrent)
+			if err != nil {
+				panic("OSError: " + err.Error())
+			}
+			if pf.reader != nil && pf.reader.Buffered() > 0 {
+				pos -= int64(pf.reader.Buffered())
+			}
+			return val.Int64Val(pos)
+		}))
+
+		FileType.Dict.Set(val.InternString("seekable"), val.NewBuiltinFuncVal("seekable", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			return val.BoolVal(true)
+		}))
+		FileType.Dict.Set(val.InternString("readable"), val.NewBuiltinFuncVal("readable", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			return val.BoolVal(true)
+		}))
+		FileType.Dict.Set(val.InternString("writable"), val.NewBuiltinFuncVal("writable", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			return val.BoolVal(true)
 		}))
 
 		FileType.Dict.Set(val.InternString("write"), val.NewBuiltinFuncVal("write", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -717,8 +808,10 @@ func initIOTypes() {
 			defer pf.mu.Unlock()
 			if !pf.isClosed && pf.f != nil {
 				pf.flushLocked()
-				_ = pf.f.Close()
-				pf.isClosed = true
+				if pf.f != os.Stdin && pf.f != os.Stdout && pf.f != os.Stderr {
+					_ = pf.f.Close()
+					pf.isClosed = true
+				}
 			}
 			return val.NoneVal()
 		}))
@@ -1434,6 +1527,12 @@ func (e *Engine) createIOModule() val.Value {
 	})
 
 	ioMod.Dict.Set(val.InternString("open"), openFn)
+	ioMod.Dict.Set(val.InternString("open_code"), val.NewBuiltinFuncVal("open_code", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: open_code() missing required argument 'path'")
+		}
+		return openFileBuiltinVal(val.NewStringVal(pathArg(ctx, args[0])), "rb")
+	}))
 	ioMod.Dict.Set(val.InternString("DEFAULT_BUFFER_SIZE"), val.Int64Val(8192))
 	ioMod.Dict.Set(val.InternString("SEEK_SET"), val.Int64Val(0))
 	ioMod.Dict.Set(val.InternString("SEEK_CUR"), val.Int64Val(1))

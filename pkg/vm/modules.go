@@ -23,7 +23,12 @@ func resolveRelativeImport(name string, level int, callerGlobals *val.PyDict) (s
 		if pkgVal, ok := callerGlobals.Get(val.InternString("__package__")); ok && pkgVal.IsAnyString() && pkgVal.AsString() != "" {
 			basePkg = pkgVal.AsString()
 		} else if nameVal, ok := callerGlobals.Get(val.InternString("__name__")); ok && nameVal.IsAnyString() {
-			basePkg = nameVal.AsString()
+			nameStr := nameVal.AsString()
+			if _, hasPath := callerGlobals.Get(val.InternString("__path__")); hasPath {
+				basePkg = nameStr
+			} else if idx := strings.LastIndex(nameStr, "."); idx >= 0 {
+				basePkg = nameStr[:idx]
+			}
 		}
 	}
 
@@ -33,7 +38,7 @@ func resolveRelativeImport(name string, level int, callerGlobals *val.PyDict) (s
 
 	parts := strings.Split(basePkg, ".")
 	steps := level - 1
-	if steps > len(parts) {
+	if steps >= len(parts) {
 		return "", fmt.Errorf("ImportError: attempted relative import beyond top-level package")
 	}
 
@@ -47,21 +52,78 @@ func resolveRelativeImport(name string, level int, callerGlobals *val.PyDict) (s
 	return strings.Join(remaining, "."), nil
 }
 
+// GetModule looks up a module by name in the VM's sys.modules dictionary.
+func (vm *VM) GetModule(name string) (val.Value, bool) {
+	if vm == nil || vm.modules == nil {
+		return val.NoneVal(), false
+	}
+	return vm.modules.Get(val.InternString(name))
+}
+
+// liveSysPath returns the current string entries of sys.path on the VM,
+// falling back to vm.engine.searchPaths if sys.path is unavailable.
+func (vm *VM) liveSysPath() []string {
+	if vm != nil && vm.modules != nil {
+		if sysVal, ok := vm.modules.Get(val.InternString("sys")); ok && sysVal.IsModule() {
+			if pathVal, ok := sysVal.AsModule().Dict.Get(val.InternString("path")); ok && pathVal.IsList() {
+				items := pathVal.AsList().Items
+				out := make([]string, 0, len(items))
+				for _, item := range items {
+					if item.IsAnyString() {
+						out = append(out, item.AsString())
+					}
+				}
+				return out
+			}
+		}
+	}
+	if vm != nil && vm.engine != nil {
+		return vm.engine.searchPaths
+	}
+	return []string{"."}
+}
+
+func (vm *VM) dontWriteBytecode() bool {
+	if vm != nil && vm.modules != nil {
+		if sysVal, ok := vm.modules.Get(val.InternString("sys")); ok && sysVal.IsModule() {
+			if dwb, ok := sysVal.AsModule().Dict.Get(val.InternString("dont_write_bytecode")); ok {
+				return dwb.IsTruthy()
+			}
+		}
+	}
+	if vm != nil && vm.engine != nil {
+		return vm.engine.runtimeConfig.Effective().DontWriteBytecode
+	}
+	return false
+}
+
 // findModuleFile searches the provided search paths for a module or package file.
 func (e *Engine) findModuleFile(moduleName string, searchDirs []string) (string, bool, bool) {
 	parts := strings.Split(moduleName, ".")
 	relPath := filepath.Join(parts...)
+	relSlash := path.Join(parts...)
 
 	for _, dir := range searchDirs {
+		if dir == "" {
+			dir = "."
+		}
 		if strings.HasPrefix(dir, "stdlib:") {
 			vfsDir := strings.TrimPrefix(dir, "stdlib:")
-			initPath := path.Join(vfsDir, path.Join(parts...), "__init__.py")
+			initPath := path.Join(vfsDir, relSlash, "__init__.py")
 			if _, err := stdlib.StdlibFS.ReadFile(initPath); err == nil {
 				return "stdlib:" + initPath, true, true
 			}
-			modPath := path.Join(vfsDir, path.Join(parts...)+".py")
+			modPath := path.Join(vfsDir, relSlash+".py")
 			if _, err := stdlib.StdlibFS.ReadFile(modPath); err == nil {
 				return "stdlib:" + modPath, false, true
+			}
+			continue
+		}
+
+		// Check zip or wheel archive entry
+		if archPath, prefix, arch, ok := splitZipArchivePath(dir); ok && arch != nil {
+			if entryPath, isPkg, found := arch.findModule(prefix, relSlash); found {
+				return archPath + "/" + entryPath, isPkg, true
 			}
 			continue
 		}
@@ -146,6 +208,28 @@ func (e *Engine) LoadOrCompileModule(filePath, moduleName string) (*CodeObject, 
 			return nil, fmt.Errorf("ModuleNotFoundError: No module named '%s'", moduleName)
 		}
 
+		// Check if filePath points inside a .zip or .whl archive
+		if _, innerPath, arch, ok := splitZipArchivePath(filePath); ok && arch != nil && innerPath != "" {
+			src, found := arch.readEntry(innerPath)
+			if !found {
+				return nil, fmt.Errorf("ModuleNotFoundError: No module named '%s'", moduleName)
+			}
+			var co *CodeObject
+			var err error
+			if e.compileWithFilenameHook != nil {
+				co, err = e.compileWithFilenameHook(src, filePath)
+			} else if e.compileHook != nil {
+				co, err = e.compileHook(src)
+			} else {
+				return nil, fmt.Errorf("Engine: no compileHook set to compile zip module '%s'", filePath)
+			}
+			if err != nil {
+				return nil, err
+			}
+			e.codeCache.Store(cacheKey, co)
+			return co, nil
+		}
+
 		// Stat source file
 		info, err := os.Stat(filePath)
 		if err != nil {
@@ -184,9 +268,11 @@ func (e *Engine) LoadOrCompileModule(filePath, moduleName string) (*CodeObject, 
 			return nil, err
 		}
 
-		// Save updated .fyc cache asynchronously/silently
-		srcHash := ComputeSourceHash(src)
-		_ = SaveFyc(fycPath, co, uint64(info.Size()), info.ModTime().UnixNano(), srcHash)
+		// Save updated .fyc cache unless sys.dont_write_bytecode / -B / PYTHONDONTWRITEBYTECODE is active
+		if !e.runtimeConfig.Effective().DontWriteBytecode {
+			srcHash := ComputeSourceHash(src)
+			_ = SaveFyc(fycPath, co, uint64(info.Size()), info.ModTime().UnixNano(), srcHash)
+		}
 
 		e.codeCache.Store(cacheKey, co)
 		return co, nil
@@ -236,7 +322,7 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 		// Determine search directories
 		var searchDirs []string
 		if i == 0 {
-			searchDirs = vm.engine.searchPaths
+			searchDirs = vm.liveSysPath()
 		} else {
 			// Search in parent package's __path__
 			parentMod := parentVal.AsModule()
@@ -282,11 +368,13 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 		if i > 0 {
 			mod.Package = strings.Join(parts[:i], ".")
 		}
+		var subSearchLocs []string
 		if isPackage {
 			pkgPath := filepath.Dir(filePath)
 			if strings.HasPrefix(filePath, "stdlib:") {
 				pkgPath = "stdlib:" + path.Dir(strings.TrimPrefix(filePath, "stdlib:"))
 			}
+			subSearchLocs = []string{pkgPath}
 			mod.Dict.Set(val.InternString("__package__"), val.NewStringVal(currName))
 			mod.Dict.Set(val.InternString("__path__"), val.NewListVal(val.NewStringVal(pkgPath)))
 		} else {
@@ -296,6 +384,24 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 				mod.Dict.Set(val.InternString("__package__"), val.NewStringVal(""))
 			}
 		}
+
+		// Attach PEP 451 __loader__ and __spec__
+		var loaderVal val.Value
+		if archPath, innerPath, arch, ok := splitZipArchivePath(filePath); ok && arch != nil && innerPath != "" {
+			loaderDir := path.Dir(innerPath)
+			if isPackage {
+				loaderDir = path.Dir(loaderDir)
+			}
+			if loaderDir == "." || loaderDir == "/" {
+				loaderDir = ""
+			}
+			loaderVal = newZipImporterInstance(vm, archPath, loaderDir)
+		} else {
+			loaderVal = newSourceFileLoaderVal(currName, filePath)
+		}
+		specVal := newModuleSpecVal(currName, loaderVal, filePath, isPackage, subSearchLocs)
+		mod.Dict.Set(val.InternString("__loader__"), loaderVal)
+		mod.Dict.Set(val.InternString("__spec__"), specVal)
 
 		// CRITICAL: Register into sys.modules BEFORE executing bytecode to resolve circular imports
 		vm.modules.Set(internedCurr, modVal)

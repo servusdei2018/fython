@@ -50,10 +50,15 @@ func initOperatorTypes() {
 				}
 				return val.ObjectVal(&ig.inst.Header)
 			}
+			self := callable
+			if self.IsBuiltinFunc() && len(args) > 0 {
+				self = args[0]
+				args = args[1:]
+			}
 			if len(args) < 1 {
 				panic("TypeError: expected 1 argument")
 			}
-			ig := (*pyItemGetter)(val.AsPointer(callable))
+			ig := (*pyItemGetter)(val.AsPointer(self))
 			if len(ig.items) == 1 {
 				return val.GetItemCtx(ctx, args[0], ig.items[0])
 			}
@@ -64,7 +69,6 @@ func initOperatorTypes() {
 			return val.NewTupleVal(res...)
 		}
 		itemgetterType.Dict.Set(val.InternString("__call__"), val.NewBuiltinFuncVal("__call__", itemgetterType.Slots.TpCall))
-		itemgetterType.InvalidateVersion()
 
 		attrgetterType = val.MustNewType("attrgetter", []*val.PyType{val.ObjectType}, nil)
 		attrgetterType.Dict.Set(val.InternString("__module__"), val.InternString("operator"))
@@ -86,10 +90,15 @@ func initOperatorTypes() {
 				}
 				return val.ObjectVal(&ag.inst.Header)
 			}
+			self := callable
+			if self.IsBuiltinFunc() && len(args) > 0 {
+				self = args[0]
+				args = args[1:]
+			}
 			if len(args) < 1 {
 				panic("TypeError: expected 1 argument")
 			}
-			ag := (*pyAttrGetter)(val.AsPointer(callable))
+			ag := (*pyAttrGetter)(val.AsPointer(self))
 			resolveAttr := func(subCtx *val.ExecContext, obj val.Value, attr string) val.Value {
 				parts := strings.Split(attr, ".")
 				curr := obj
@@ -112,7 +121,6 @@ func initOperatorTypes() {
 			return val.NewTupleVal(res...)
 		}
 		attrgetterType.Dict.Set(val.InternString("__call__"), val.NewBuiltinFuncVal("__call__", attrgetterType.Slots.TpCall))
-		attrgetterType.InvalidateVersion()
 
 		methodcallerType = val.MustNewType("methodcaller", []*val.PyType{val.ObjectType}, nil)
 		methodcallerType.Dict.Set(val.InternString("__module__"), val.InternString("operator"))
@@ -132,10 +140,15 @@ func initOperatorTypes() {
 				}
 				return val.ObjectVal(&mc.inst.Header)
 			}
+			self := callable
+			if self.IsBuiltinFunc() && len(args) > 0 {
+				self = args[0]
+				args = args[1:]
+			}
 			if len(args) < 1 {
 				panic("TypeError: expected 1 argument")
 			}
-			mc := (*pyMethodCaller)(val.AsPointer(callable))
+			mc := (*pyMethodCaller)(val.AsPointer(self))
 			method, ok := vmGetAttrSafe(ctx, args[0], mc.name)
 			if !ok {
 				panic("AttributeError: '" + args[0].Type().Name + "' object has no attribute '" + mc.name + "'")
@@ -143,7 +156,6 @@ func initOperatorTypes() {
 			return ctx.Call(method, mc.args, mc.kwnames)
 		}
 		methodcallerType.Dict.Set(val.InternString("__call__"), val.NewBuiltinFuncVal("__call__", methodcallerType.Slots.TpCall))
-		methodcallerType.InvalidateVersion()
 	})
 }
 

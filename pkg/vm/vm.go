@@ -571,7 +571,7 @@ func (vm *VM) bindFunctionArgs(co *CodeObject, defaults []val.Value, kwDefaults 
 				}
 			}
 		}
-		if numLocals < nargs {
+		if varArgsIdx < 0 && numLocals < nargs {
 			numLocals = nargs
 		}
 		return argBase + numLocals
@@ -1281,7 +1281,7 @@ func (vm *VM) bindFunctionArgsToSlice(co *CodeObject, defaults []val.Value, kwDe
 				}
 			}
 		}
-		if numLocals < nargs {
+		if varArgsIdx < 0 && numLocals < nargs {
 			numLocals = nargs
 		}
 		return numLocals
@@ -1492,6 +1492,8 @@ func (vm *VM) resumeGenerator(ctx *val.ExecContext, gen *val.PyGenerator, sentVa
 		vm.unhandledException = val.NoneVal()
 		if ctx != nil {
 			ctx.Raise(exc)
+		} else {
+			panic(exc)
 		}
 		return val.NoneVal(), val.IterError
 	}
@@ -1544,6 +1546,8 @@ func (vm *VM) resumeCoroutine(ctx *val.ExecContext, coro *val.PyCoroutine, sentV
 		vm.unhandledException = val.NoneVal()
 		if ctx != nil {
 			ctx.Raise(exc)
+		} else {
+			panic(exc)
 		}
 		return val.NoneVal(), val.IterError
 	}
@@ -1720,8 +1724,10 @@ func ensureStack(stack []val.Value, minCap int) []val.Value {
 
 func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, startFrameIdx int, startCells []val.Value, startGlobals *val.PyDict, startLocals val.Value, stack []val.Value, activeGen *val.PyGenerator, activeCoro *val.PyCoroutine) val.Value {
 	savedCtxStack := vm.execCtx.Stack
+	savedCtxSP := vm.execCtx.SP
 	wasVMStack := len(savedCtxStack) > 0 && len(vm.stack) > 0 && &savedCtxStack[0] == &vm.stack[0]
 	vm.execCtx.Stack = stack
+	vm.execCtx.SP = startSP
 	savedActiveCO := vm.activeCO
 	savedActiveBaseOffset := vm.activeBaseOffset
 	savedActiveCells := vm.activeCells
@@ -1732,6 +1738,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		} else {
 			vm.execCtx.Stack = savedCtxStack
 		}
+		vm.execCtx.SP = savedCtxSP
 		vm.activeCO = savedActiveCO
 		vm.activeBaseOffset = savedActiveBaseOffset
 		vm.activeCells = savedActiveCells

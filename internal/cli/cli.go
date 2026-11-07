@@ -1,7 +1,13 @@
 package cli
 
 import (
+	"archive/zip"
+	"bufio"
+	"bytes"
+	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/alecthomas/kong"
@@ -11,7 +17,7 @@ import (
 )
 
 // Version is the reported Fython compatibility version string.
-const Version = "Fython 3.14.0"
+const Version = "Fython 3.15.0"
 
 // Mode represents the resolved CPython invocation mode.
 type Mode int
@@ -44,31 +50,70 @@ func (m Mode) String() string {
 
 // CLI defines the Kong command-line grammar for fython.
 type CLI struct {
-	Command     *string          `short:"c" name:"cmd" xor:"target" placeholder:"cmd" help:"Program passed in as string (terminates option list)."`
-	Module      *string          `short:"m" name:"mod" xor:"target" placeholder:"mod" help:"Run library module as a script (terminates option list)."`
-	Interactive bool             `short:"i" name:"interactive" help:"Inspect interactively after running script."`
-	Quiet       bool             `short:"q" name:"quiet" help:"Don't display version and copyright messages on interactive startup."`
-	Version     kong.VersionFlag `short:"V" name:"version" help:"Print the Python version number and exit."`
+	Command           *string          `short:"c" name:"cmd" xor:"target" placeholder:"cmd" help:"Program passed in as string (terminates option list)."`
+	Module            *string          `short:"m" name:"mod" xor:"target" placeholder:"mod" help:"Run library module as a script (terminates option list)."`
+	Interactive       bool             `short:"i" name:"interactive" help:"Inspect interactively after running script."`
+	Quiet             bool             `short:"q" name:"quiet" help:"Don't display version and copyright messages on interactive startup."`
+	DontWriteBytecode bool             `short:"B" name:"dont-write-bytecode" help:"Don't write .pyc/.fyc files on import."`
+	Unbuffered        bool             `short:"u" name:"unbuffered" help:"Force the stdout and stderr streams to be unbuffered."`
+	IgnoreEnv         bool             `short:"E" name:"ignore-environment" help:"Ignore PYTHON* environment variables (such as PYTHONPATH)."`
+	NoUserSite        bool             `short:"s" name:"no-user-site" help:"Don't add user site directory to sys.path."`
+	NoSite            bool             `short:"S" name:"no-site" help:"Don't imply 'import site' on initialization."`
+	Isolated          bool             `short:"I" name:"isolated" help:"Isolate Python from the user's environment (implies -E and -s)."`
+	Optimize          int              `short:"O" name:"optimize" type:"counter" help:"Remove assert and __debug__-dependent statements; -OO also strips docstrings."`
+	WarnOptions       []string         `short:"W" name:"warn" placeholder:"arg" help:"Warning control (arg is action:message:category:module:lineno)."`
+	XOptions          []string         `short:"X" name:"xopt" placeholder:"opt" help:"Set implementation-specific option."`
+	Version           kong.VersionFlag `short:"V" name:"version" help:"Print the Python version number and exit."`
 
 	Args []string `arg:"" optional:"" name:"arg" help:"Program file and arguments (or arguments to -c/-m)."`
 }
 
 // Invocation holds the resolved execution target and sys.argv slice.
 type Invocation struct {
-	Mode        Mode
-	Command     string
-	Module      string
-	Script      string
-	Argv        []string
-	Interactive bool
-	Quiet       bool
+	Mode              Mode
+	Command           string
+	Module            string
+	Script            string
+	Argv              []string
+	Interactive       bool
+	Quiet             bool
+	DontWriteBytecode bool
+	Unbuffered        bool
+	IgnoreEnv         bool
+	NoUserSite        bool
+	NoSite            bool
+	Isolated          bool
+	Optimize          int
+	WarnOptions       []string
+	XOptions          map[string]string
 }
 
 // Resolve computes the effective CPython invocation mode and sys.argv slice from parsed CLI flags.
 func (c *CLI) Resolve() Invocation {
+	var xopts map[string]string
+	if len(c.XOptions) > 0 {
+		xopts = make(map[string]string, len(c.XOptions))
+		for _, raw := range c.XOptions {
+			if k, v, ok := strings.Cut(raw, "="); ok {
+				xopts[k] = v
+			} else {
+				xopts[raw] = ""
+			}
+		}
+	}
+
 	inv := Invocation{
-		Interactive: c.Interactive,
-		Quiet:       c.Quiet,
+		Interactive:       c.Interactive,
+		Quiet:             c.Quiet,
+		DontWriteBytecode: c.DontWriteBytecode,
+		Unbuffered:        c.Unbuffered,
+		IgnoreEnv:         c.IgnoreEnv || c.Isolated,
+		NoUserSite:        c.NoUserSite || c.Isolated,
+		NoSite:            c.NoSite,
+		Isolated:          c.Isolated,
+		Optimize:          c.Optimize,
+		WarnOptions:       append([]string(nil), c.WarnOptions...),
+		XOptions:          xopts,
 	}
 
 	switch {
@@ -95,54 +140,233 @@ func (c *CLI) Resolve() Invocation {
 	return inv
 }
 
+func (inv Invocation) toRuntimeConfig() vm.RuntimeConfig {
+	return vm.RuntimeConfig{
+		Argv:              inv.Argv,
+		OrigArgv:          append([]string(nil), os.Args...),
+		Optimize:          inv.Optimize,
+		DontWriteBytecode: inv.DontWriteBytecode,
+		Unbuffered:        inv.Unbuffered,
+		IgnoreEnv:         inv.IgnoreEnv,
+		NoUserSite:        inv.NoUserSite,
+		NoSite:            inv.NoSite,
+		Isolated:          inv.Isolated,
+		Interactive:       inv.Interactive,
+		Quiet:             inv.Quiet,
+		WarnOptions:       inv.WarnOptions,
+		XOptions:          inv.XOptions,
+	}
+}
+
+func isZipArchiveFile(path string) bool {
+	raw, err := os.ReadFile(path)
+	if err != nil || len(raw) < 4 {
+		return false
+	}
+	_, err = zip.NewReader(bytes.NewReader(raw), int64(len(raw)))
+	return err == nil
+}
+
 // Run executes the resolved CLI invocation.
 func (c *CLI) Run() error {
 	inv := c.Resolve()
+	rtCfg := inv.toRuntimeConfig()
+	eff := rtCfg.Effective()
+
+	prevOpt := compiler.DefaultOptimizeLevel()
+	compiler.SetDefaultOptimizeLevel(eff.Optimize)
+	defer compiler.SetDefaultOptimizeLevel(prevOpt)
+
+	eng := vm.DefaultEngine()
+	prevCfg := eng.RuntimeConfig()
+	eng.SetRuntimeConfig(rtCfg)
+	defer eng.SetRuntimeConfig(prevCfg)
+
+	var v *vm.VM
+	var execErr error
+
 	switch inv.Mode {
 	case ModeCommand:
 		if inv.Command != "" {
-			co, err := compiler.CompileString(inv.Command)
+			co, err := compiler.CompileSourceModeWithOptimize([]byte(inv.Command), "<string>", compiler.ModeExec, eff.Optimize)
 			if err != nil {
 				return err
 			}
-			v := vm.NewVM()
+			v = eng.NewVM()
 			v.SetGlobal("__name__", val.NewStringVal("__main__"))
 			v.RunCode(co)
-			return unhandledError(v)
+			execErr = unhandledError(v)
 		}
-		return nil
 	case ModeModule:
 		if inv.Module != "" {
-			v := vm.NewVM()
-			if _, err := v.ImportModule(inv.Module, 0, true, nil); err != nil {
-				if !strings.HasPrefix(err.Error(), "ModuleNotFoundError:") {
-					return err
+			v = eng.NewVM()
+			if !eff.Isolated {
+				if cwd, err := os.Getwd(); err == nil {
+					prependSysPath0(v, cwd)
 				}
 			}
+			stmt := fmt.Sprintf("import runpy\nrunpy._run_module_as_main(%q, True)\n", inv.Module)
+			co, err := compiler.CompileSourceModeWithOptimize([]byte(stmt), "<runpy>", compiler.ModeExec, eff.Optimize)
+			if err != nil {
+				return err
+			}
+			v.RunCode(co)
+			execErr = unhandledError(v)
 		}
-		return nil
+	case ModeStdin:
+		src, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return err
+		}
+		if len(src) > 0 {
+			co, err := compiler.CompileSourceModeWithOptimize(src, "<stdin>", compiler.ModeExec, eff.Optimize)
+			if err != nil {
+				return err
+			}
+			v = eng.NewVM()
+			v.SetGlobal("__name__", val.NewStringVal("__main__"))
+			v.SetGlobal("__file__", val.NewStringVal("<stdin>"))
+			v.RunCode(co)
+			execErr = unhandledError(v)
+		}
 	case ModeScript:
 		if inv.Script != "" {
-			if _, err := os.Stat(inv.Script); err == nil {
+			info, err := os.Stat(inv.Script)
+			if err != nil {
+				return fmt.Errorf("fython: can't open file %q: %v", inv.Script, err)
+			}
+			if info.IsDir() || isZipArchiveFile(inv.Script) {
+				v = eng.NewVM()
+				prependSysPath0(v, inv.Script)
+				stmt := "import runpy\nrunpy._run_module_as_main('__main__', False)\n"
+				co, err := compiler.CompileSourceModeWithOptimize([]byte(stmt), "<runpy>", compiler.ModeExec, eff.Optimize)
+				if err != nil {
+					return err
+				}
+				v.RunCode(co)
+				execErr = unhandledError(v)
+			} else {
 				src, err := os.ReadFile(inv.Script)
 				if err != nil {
 					return err
 				}
-				co, err := compiler.CompileSourceWithFilename(src, inv.Script)
+				co, err := compiler.CompileSourceModeWithOptimize(src, inv.Script, compiler.ModeExec, eff.Optimize)
 				if err != nil {
 					return err
 				}
-				v := vm.NewVM()
+				v = eng.NewVM()
+				if !eff.Isolated {
+					scriptDir := filepath.Dir(inv.Script)
+					if absDir, err := filepath.Abs(scriptDir); err == nil {
+						scriptDir = absDir
+					}
+					prependSysPath0(v, scriptDir)
+				}
 				v.SetGlobal("__name__", val.NewStringVal("__main__"))
 				v.SetGlobal("__file__", val.NewStringVal(inv.Script))
 				v.RunCode(co)
-				return unhandledError(v)
+				execErr = unhandledError(v)
+			}
+		}
+	case ModeREPL:
+		if fi, err := os.Stdin.Stat(); err == nil && (fi.Mode()&os.ModeCharDevice) == 0 {
+			data, _ := io.ReadAll(os.Stdin)
+			if len(strings.TrimSpace(string(data))) > 0 {
+				v = eng.NewVM()
+				return runInteractiveREPL(v, bytes.NewReader(data), os.Stderr, eff.Optimize)
 			}
 		}
 		return nil
-	default:
-		return nil
 	}
+
+	if eff.Interactive && v != nil {
+		if uncaught, ok := execErr.(*ErrUncaughtException); ok {
+			_, _ = fmt.Fprintln(os.Stderr, uncaught.Error())
+			v.ClearUnhandledException()
+			execErr = nil
+		}
+		if execErr == nil {
+			return runInteractiveREPL(v, os.Stdin, os.Stderr, eff.Optimize)
+		}
+	}
+
+	return execErr
+}
+
+func prependSysPath0(v *vm.VM, dir string) {
+	sysModVal, ok := v.GetModule("sys")
+	if !ok || !sysModVal.IsModule() {
+		return
+	}
+	pathVal, ok := sysModVal.AsModule().Dict.Get(val.InternString("path"))
+	if !ok || !pathVal.IsList() {
+		return
+	}
+	list := pathVal.AsList()
+	if len(list.Items) > 0 && list.Items[0].IsAnyString() && list.Items[0].AsString() == "." {
+		list.Items[0] = val.NewStringVal(dir)
+		return
+	}
+	list.Items = append([]val.Value{val.NewStringVal(dir)}, list.Items...)
+}
+
+func runInteractiveREPL(v *vm.VM, in io.Reader, errOut io.Writer, optimize int) error {
+	sc := bufio.NewScanner(in)
+	var buf strings.Builder
+	for sc.Scan() {
+		line := sc.Text()
+		if buf.Len() > 0 {
+			if strings.TrimSpace(line) == "" {
+				stmt := buf.String()
+				buf.Reset()
+				if err := evalREPLLine(v, stmt, errOut, optimize); err != nil {
+					return err
+				}
+				continue
+			}
+			buf.WriteString(line)
+			buf.WriteByte('\n')
+			continue
+		}
+		trimmed := strings.TrimRight(line, " \t")
+		if strings.HasSuffix(trimmed, ":") || strings.HasSuffix(trimmed, "\\") {
+			buf.WriteString(line)
+			buf.WriteByte('\n')
+			continue
+		}
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		if err := evalREPLLine(v, line+"\n", errOut, optimize); err != nil {
+			return err
+		}
+	}
+	if buf.Len() > 0 {
+		if err := evalREPLLine(v, buf.String(), errOut, optimize); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func evalREPLLine(v *vm.VM, src string, errOut io.Writer, optimize int) error {
+	co, err := compiler.CompileSourceModeWithOptimize([]byte(src), "<stdin>", compiler.ModeSingle, optimize)
+	if err != nil {
+		co, err = compiler.CompileSourceModeWithOptimize([]byte(src), "<stdin>", compiler.ModeExec, optimize)
+		if err != nil {
+			_, _ = fmt.Fprintln(errOut, err.Error())
+			return nil
+		}
+	}
+	v.RunCode(co)
+	if uerr := unhandledError(v); uerr != nil {
+		if exitErr, ok := uerr.(*ErrExit); ok {
+			return exitErr
+		}
+		_, _ = fmt.Fprintln(errOut, uerr.Error())
+		v.ClearUnhandledException()
+	}
+	return nil
 }
 
 // ErrUncaughtException signals that the program terminated with an uncaught Python exception.
@@ -235,11 +459,15 @@ func normalizeArgs(args []string) []string {
 		if strings.HasPrefix(arg, "--cmd=") || strings.HasPrefix(arg, "--mod=") {
 			return terminateAt(args, i+1)
 		}
+		if arg == "--warn" || arg == "--xopt" {
+			i++
+			continue
+		}
 		if strings.HasPrefix(arg, "--") {
 			continue
 		}
 
-		// Short flag cluster (e.g. -c, -m, -ic, -c"print(1)")
+		// Short flag cluster (e.g. -c, -m, -ic, -c"print(1)", -Wignore, -W ignore, -Xdev)
 		shorts := arg[1:]
 		for j := 0; j < len(shorts); j++ {
 			ch := shorts[j]
@@ -252,6 +480,15 @@ func normalizeArgs(args []string) []string {
 					return terminateAt(args, i+2)
 				}
 				return args
+			}
+			if ch == 'W' || ch == 'X' {
+				if j+1 < len(shorts) {
+					// Attached value e.g. -Wignore or -Xutf8
+					break
+				}
+				// Separate argument e.g. -W ignore or -X utf8
+				i++
+				break
 			}
 		}
 	}

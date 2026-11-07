@@ -90,6 +90,35 @@ func TestParseAndResolve(t *testing.T) {
 			},
 		},
 		{
+			name: "runtime flags -OO -B -u -E -s -S -W -X with command",
+			args: []string{"-OO", "-B", "-u", "-E", "-s", "-S", "-W", "ignore", "-X", "dev=1", "-X", "utf8", "-c", "x = 1"},
+			want: Invocation{
+				Mode:              ModeCommand,
+				Command:           "x = 1",
+				Argv:              []string{"-c"},
+				DontWriteBytecode: true,
+				Unbuffered:        true,
+				IgnoreEnv:         true,
+				NoUserSite:        true,
+				NoSite:            true,
+				Optimize:          2,
+				WarnOptions:       []string{"ignore"},
+				XOptions:          map[string]string{"dev": "1", "utf8": ""},
+			},
+		},
+		{
+			name: "isolated flag -I implies -E and -s",
+			args: []string{"-I", "-c", "x = 2"},
+			want: Invocation{
+				Mode:       ModeCommand,
+				Command:    "x = 2",
+				Argv:       []string{"-c"},
+				Isolated:   true,
+				IgnoreEnv:  true,
+				NoUserSite: true,
+			},
+		},
+		{
 			name:    "mutual exclusion error combining -c and -m",
 			args:    []string{"-c", "print(1)", "-m", "mod"},
 			wantErr: true,
@@ -119,8 +148,10 @@ func TestParseAndResolve(t *testing.T) {
 				t.Errorf("Resolve() = %+v, want %+v", got, tt.want)
 			}
 
-			if err := ctx.Run(); err != nil {
-				t.Errorf("ctx.Run() unexpected error: %v", err)
+			if got.Mode == ModeCommand && !got.Interactive {
+				if err := ctx.Run(); err != nil {
+					t.Errorf("ctx.Run() unexpected error: %v", err)
+				}
 			}
 		})
 	}
