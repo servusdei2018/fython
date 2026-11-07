@@ -166,6 +166,8 @@ const (
 	IterKindFunc
 	IterKindGenerator
 	IterKindString
+	IterKindBytes
+	IterKindByteArray
 )
 
 // PyIter represents a zero-allocation iterator over lists, tuples, dicts, or ranges.
@@ -713,6 +715,12 @@ func NewIterVal(obj Value) Value {
 		it.Obj = NewListVal(obj.AsSet().Items()...)
 	} else if obj.IsAnyString() {
 		it.Kind = IterKindString
+	} else if obj.IsBytes() {
+		it.Kind = IterKindBytes
+	} else if obj.IsByteArray() {
+		it.Kind = IterKindByteArray
+	} else if obj.Type() != nil && obj.Type().Slots.TpIter != nil {
+		return obj.Type().Slots.TpIter(nil, obj)
 	} else {
 		it.Kind = IterKindInvalid
 	}
@@ -807,6 +815,22 @@ func (it *PyIter) Next() (Value, bool) {
 			return NoneVal(), false
 		}
 		res := NewStringVal(string(s[it.Idx]))
+		it.Idx++
+		return res, true
+	case IterKindBytes:
+		b := it.Obj.AsBytes().Data
+		if it.Idx >= len(b) {
+			return NoneVal(), false
+		}
+		res := Int64Val(int64(b[it.Idx]))
+		it.Idx++
+		return res, true
+	case IterKindByteArray:
+		b := it.Obj.AsByteArray().Data
+		if it.Idx >= len(b) {
+			return NoneVal(), false
+		}
+		res := Int64Val(int64(b[it.Idx]))
 		it.Idx++
 		return res, true
 	default:
@@ -1107,6 +1131,11 @@ func NewIndexError(msg string) Value {
 // NewZeroDivisionError constructs a ZeroDivisionError instance.
 func NewZeroDivisionError(msg string) Value {
 	return NewException(ZeroDivisionErrorType, msg)
+}
+
+// NewOverflowError constructs an OverflowError instance.
+func NewOverflowError(msg string) Value {
+	return NewException(OverflowErrorType, msg)
 }
 
 // NewNameError constructs a NameError instance.

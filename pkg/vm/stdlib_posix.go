@@ -1,12 +1,16 @@
 package vm
 
 import (
+	crand "crypto/rand"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/servusdei2018/fython/pkg/val"
 )
@@ -221,6 +225,222 @@ type statInfo struct {
 	AtimeNs, MtimeNs, CtimeNs             int64
 }
 
+var (
+	dirEntryType    *val.PyType
+	dirEntryOnce    sync.Once
+	scandirIterType *val.PyType
+	scandirOnce     sync.Once
+	pathLikeType    *val.PyType
+	pathLikeOnce    sync.Once
+)
+
+func initPathLikeType() {
+	pathLikeOnce.Do(func() {
+		t := val.MustNewType("PathLike", []*val.PyType{val.ObjectType}, nil)
+		t.Dict.Set(val.InternString("__module__"), val.InternString("os"))
+		t.Dict.Set(val.InternString("register"), val.NewBuiltinFuncVal("register", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) > 1 {
+				return args[1]
+			}
+			return val.NoneVal()
+		}))
+		t.Dict.Set(val.InternString("__subclasshook__"), val.NewBuiltinFuncVal("__subclasshook__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) < 2 {
+				return val.NotImplementedVal()
+			}
+			subclass := args[1]
+			if subclass.IsType() {
+				tp := subclass.AsType()
+				if _, _, ok := tp.LookupMRO(val.InternString("__fspath__")); ok {
+					return val.BoolVal(true)
+				}
+			}
+			return val.NotImplementedVal()
+		}))
+		t.InvalidateVersion()
+		pathLikeType = t
+	})
+}
+
+func initDirEntryType() {
+	dirEntryOnce.Do(func() {
+		t := val.MustNewType("DirEntry", []*val.PyType{val.ObjectType}, nil)
+		t.Dict.Set(val.InternString("__module__"), val.InternString("os"))
+		t.Dict.Set(val.InternString("is_dir"), val.NewBuiltinFuncVal("is_dir", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			inst := args[0].AsInstance()
+			follow := true
+			if v, ok := kwArg(args, kwnames, "follow_symlinks"); ok {
+				follow = v.IsTruthy()
+			} else if len(args) > 1 {
+				follow = args[1].IsTruthy()
+			}
+			isSymlinkVal, _ := inst.GetAttr(val.InternString("_is_symlink"))
+			isSymlink := isSymlinkVal.IsTruthy()
+			isDirVal, _ := inst.GetAttr(val.InternString("_is_dir"))
+			if !isSymlink || !follow {
+				return isDirVal
+			}
+			pVal, _ := inst.GetAttr(val.InternString("path"))
+			info, err := os.Stat(pVal.AsString())
+			if err != nil {
+				return val.BoolVal(false)
+			}
+			return val.BoolVal(info.IsDir())
+		}))
+		t.Dict.Set(val.InternString("is_file"), val.NewBuiltinFuncVal("is_file", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			inst := args[0].AsInstance()
+			follow := true
+			if v, ok := kwArg(args, kwnames, "follow_symlinks"); ok {
+				follow = v.IsTruthy()
+			} else if len(args) > 1 {
+				follow = args[1].IsTruthy()
+			}
+			isSymlinkVal, _ := inst.GetAttr(val.InternString("_is_symlink"))
+			isSymlink := isSymlinkVal.IsTruthy()
+			isDirVal, _ := inst.GetAttr(val.InternString("_is_dir"))
+			if !isSymlink || !follow {
+				return val.BoolVal(!isDirVal.IsTruthy() && !isSymlink)
+			}
+			pVal, _ := inst.GetAttr(val.InternString("path"))
+			info, err := os.Stat(pVal.AsString())
+			if err != nil {
+				return val.BoolVal(false)
+			}
+			return val.BoolVal(!info.IsDir())
+		}))
+		t.Dict.Set(val.InternString("is_symlink"), val.NewBuiltinFuncVal("is_symlink", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			inst := args[0].AsInstance()
+			v, _ := inst.GetAttr(val.InternString("_is_symlink"))
+			return v
+		}))
+		t.Dict.Set(val.InternString("stat"), val.NewBuiltinFuncVal("stat", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			inst := args[0].AsInstance()
+			follow := true
+			if v, ok := kwArg(args, kwnames, "follow_symlinks"); ok {
+				follow = v.IsTruthy()
+			} else if len(args) > 1 {
+				follow = args[1].IsTruthy()
+			}
+			pVal, _ := inst.GetAttr(val.InternString("path"))
+			p := pVal.AsString()
+			var (
+				info fs.FileInfo
+				err  error
+			)
+			if follow {
+				info, err = os.Stat(p)
+			} else {
+				info, err = os.Lstat(p)
+			}
+			if err != nil {
+				raiseOSError(err, p)
+			}
+			return fileInfoToStat(info)
+		}))
+		t.Dict.Set(val.InternString("inode"), val.NewBuiltinFuncVal("inode", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			inst := args[0].AsInstance()
+			pVal, _ := inst.GetAttr(val.InternString("path"))
+			info, err := os.Lstat(pVal.AsString())
+			if err != nil {
+				raiseOSError(err, pVal.AsString())
+			}
+			st := fileInfoToStat(info).AsInstance()
+			ino, _ := st.GetAttr(val.InternString("st_ino"))
+			return ino
+		}))
+		t.Dict.Set(val.InternString("__fspath__"), val.NewBuiltinFuncVal("__fspath__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			inst := args[0].AsInstance()
+			pVal, _ := inst.GetAttr(val.InternString("path"))
+			return pVal
+		}))
+		t.Dict.Set(val.InternString("__repr__"), val.NewBuiltinFuncVal("__repr__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			inst := args[0].AsInstance()
+			nVal, _ := inst.GetAttr(val.InternString("name"))
+			return val.NewStringVal(fmt.Sprintf("<DirEntry %q>", nVal.AsString()))
+		}))
+		t.InvalidateVersion()
+		dirEntryType = t
+	})
+}
+
+func newDirEntryVal(dir string, ent os.DirEntry) val.Value {
+	initDirEntryType()
+	v := val.NewInstanceOfType(dirEntryType)
+	inst := v.AsInstance()
+	name := ent.Name()
+	fullPath := filepath.Join(dir, name)
+	isDir := ent.IsDir()
+	isSymlink := ent.Type()&fs.ModeSymlink != 0
+	inst.SetAttr(val.InternString("name"), val.NewStringVal(name))
+	inst.SetAttr(val.InternString("path"), val.NewStringVal(fullPath))
+	inst.SetAttr(val.InternString("_is_dir"), val.BoolVal(isDir))
+	inst.SetAttr(val.InternString("_is_symlink"), val.BoolVal(isSymlink))
+	return v
+}
+
+func initScandirIterType() {
+	scandirOnce.Do(func() {
+		t := val.MustNewType("ScandirIterator", []*val.PyType{val.ObjectType}, nil)
+		t.Dict.Set(val.InternString("__module__"), val.InternString("os"))
+		t.Dict.Set(val.InternString("__iter__"), val.NewBuiltinFuncVal("__iter__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			return args[0]
+		}))
+		t.Dict.Set(val.InternString("__next__"), val.NewBuiltinFuncVal("__next__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			inst := args[0].AsInstance()
+			closedVal, _ := inst.GetAttr(val.InternString("_closed"))
+			if closedVal.IsTruthy() {
+				if ctx != nil {
+					ctx.Raise(val.NewStopIteration(val.NoneVal()))
+					return val.NoneVal()
+				}
+				panic(val.NewStopIteration(val.NoneVal()))
+			}
+			idxVal, _ := inst.GetAttr(val.InternString("_idx"))
+			entriesVal, _ := inst.GetAttr(val.InternString("_entries"))
+			entries := entriesVal.AsList().Items
+			idx := int(idxVal.AsInt64())
+			if idx >= len(entries) {
+				if ctx != nil {
+					ctx.Raise(val.NewStopIteration(val.NoneVal()))
+					return val.NoneVal()
+				}
+				panic(val.NewStopIteration(val.NoneVal()))
+			}
+			inst.SetAttr(val.InternString("_idx"), val.Int64Val(int64(idx+1)))
+			return entries[idx]
+		}))
+		t.Dict.Set(val.InternString("close"), val.NewBuiltinFuncVal("close", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			inst := args[0].AsInstance()
+			inst.SetAttr(val.InternString("_closed"), val.BoolVal(true))
+			return val.NoneVal()
+		}))
+		t.Dict.Set(val.InternString("__enter__"), val.NewBuiltinFuncVal("__enter__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			return args[0]
+		}))
+		t.Dict.Set(val.InternString("__exit__"), val.NewBuiltinFuncVal("__exit__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			inst := args[0].AsInstance()
+			inst.SetAttr(val.InternString("_closed"), val.BoolVal(true))
+			return val.NoneVal()
+		}))
+		t.InvalidateVersion()
+		scandirIterType = t
+	})
+}
+
+func newScandirIterVal(dir string, entries []os.DirEntry) val.Value {
+	initScandirIterType()
+	v := val.NewInstanceOfType(scandirIterType)
+	inst := v.AsInstance()
+	items := make([]val.Value, len(entries))
+	for i, ent := range entries {
+		items[i] = newDirEntryVal(dir, ent)
+	}
+	inst.SetAttr(val.InternString("_entries"), val.NewListVal(items...))
+	inst.SetAttr(val.InternString("_idx"), val.Int64Val(0))
+	inst.SetAttr(val.InternString("_closed"), val.BoolVal(false))
+	return v
+}
+
 func initStatResultType() {
 	statResultOnce.Do(func() {
 		t := val.MustNewType("stat_result", []*val.PyType{val.ObjectType}, nil)
@@ -370,6 +590,34 @@ func installPosix(osMod *val.PyModule) {
 
 	initStatResultType()
 	osMod.Dict.Set(val.InternString("stat_result"), val.TypeVal(statResultType))
+	initDirEntryType()
+	osMod.Dict.Set(val.InternString("DirEntry"), val.TypeVal(dirEntryType))
+	initPathLikeType()
+	osMod.Dict.Set(val.InternString("PathLike"), val.TypeVal(pathLikeType))
+	terminalSizeVal(80, 24)
+	osMod.Dict.Set(val.InternString("terminal_size"), val.TypeVal(terminalSizeType))
+
+	osMod.Dict.Set(val.InternString("supports_dir_fd"), val.NewSetVal())
+	osMod.Dict.Set(val.InternString("supports_fd"), val.NewSetVal())
+	osMod.Dict.Set(val.InternString("supports_follow_symlinks"), val.NewSetVal())
+	osMod.Dict.Set(val.InternString("_walk_symlinks_as_files"), val.NewInstanceOfType(val.ObjectType))
+
+	osMod.Dict.Set(val.InternString("O_RDONLY"), val.Int64Val(int64(syscall.O_RDONLY)))
+	osMod.Dict.Set(val.InternString("O_WRONLY"), val.Int64Val(int64(syscall.O_WRONLY)))
+	osMod.Dict.Set(val.InternString("O_RDWR"), val.Int64Val(int64(syscall.O_RDWR)))
+	osMod.Dict.Set(val.InternString("O_APPEND"), val.Int64Val(int64(syscall.O_APPEND)))
+	osMod.Dict.Set(val.InternString("O_CREAT"), val.Int64Val(int64(syscall.O_CREAT)))
+	osMod.Dict.Set(val.InternString("O_EXCL"), val.Int64Val(int64(syscall.O_EXCL)))
+	osMod.Dict.Set(val.InternString("O_TRUNC"), val.Int64Val(int64(syscall.O_TRUNC)))
+	osMod.Dict.Set(val.InternString("O_BINARY"), val.Int64Val(0))
+	osMod.Dict.Set(val.InternString("O_TEXT"), val.Int64Val(0))
+	osMod.Dict.Set(val.InternString("F_OK"), val.Int64Val(0))
+	osMod.Dict.Set(val.InternString("R_OK"), val.Int64Val(4))
+	osMod.Dict.Set(val.InternString("W_OK"), val.Int64Val(2))
+	osMod.Dict.Set(val.InternString("X_OK"), val.Int64Val(1))
+	osMod.Dict.Set(val.InternString("SEEK_SET"), val.Int64Val(0))
+	osMod.Dict.Set(val.InternString("SEEK_CUR"), val.Int64Val(1))
+	osMod.Dict.Set(val.InternString("SEEK_END"), val.Int64Val(2))
 
 	set("fspath", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		pa := posArgs(args, kwnames)
@@ -507,6 +755,192 @@ func installPosix(osMod *val.PyModule) {
 			return val.NewBytesVal([]byte(dst))
 		}
 		return val.NewStringVal(dst)
+	})
+
+	set("walk", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		top := "."
+		pa := posArgs(args, kwnames)
+		if len(pa) >= 1 && !pa[0].IsNone() {
+			top = pathArg(ctx, pa[0])
+		} else if v, ok := kwArg(args, kwnames, "top"); ok {
+			top = pathArg(ctx, v)
+		}
+		topdown := true
+		if len(pa) >= 2 {
+			topdown = pa[1].IsTruthy()
+		} else if v, ok := kwArg(args, kwnames, "topdown"); ok {
+			topdown = v.IsTruthy()
+		}
+		followlinks := false
+		if v, ok := kwArg(args, kwnames, "followlinks"); ok {
+			followlinks = v.IsTruthy()
+		}
+		var walkTuples []val.Value
+		var walkDir func(current string)
+		walkDir = func(current string) {
+			entries, err := os.ReadDir(current)
+			if err != nil {
+				return
+			}
+			var dirnames []val.Value
+			var filenames []val.Value
+			for _, ent := range entries {
+				name := ent.Name()
+				isDir := ent.IsDir()
+				if !isDir && followlinks && ent.Type()&fs.ModeSymlink != 0 {
+					if info, err := os.Stat(filepath.Join(current, name)); err == nil {
+						isDir = info.IsDir()
+					}
+				}
+				if isDir {
+					dirnames = append(dirnames, val.NewStringVal(name))
+				} else {
+					filenames = append(filenames, val.NewStringVal(name))
+				}
+			}
+			tuple := val.NewTupleVal(val.NewStringVal(current), val.NewListVal(dirnames...), val.NewListVal(filenames...))
+			if topdown {
+				walkTuples = append(walkTuples, tuple)
+				for _, d := range dirnames {
+					walkDir(filepath.Join(current, d.AsString()))
+				}
+			} else {
+				for _, d := range dirnames {
+					walkDir(filepath.Join(current, d.AsString()))
+				}
+				walkTuples = append(walkTuples, tuple)
+			}
+		}
+		walkDir(top)
+		return val.NewIterVal(val.NewTupleVal(walkTuples...))
+	})
+
+	set("scandir", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		dir := "."
+		pa := posArgs(args, kwnames)
+		if len(pa) >= 1 && !pa[0].IsNone() {
+			dir = pathArg(ctx, pa[0])
+		} else if v, ok := kwArg(args, kwnames, "path"); ok && !v.IsNone() {
+			dir = pathArg(ctx, v)
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			raiseOSError(err, dir)
+		}
+		return newScandirIterVal(dir, entries)
+	})
+
+	set("replace", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 2 {
+			panic("TypeError: replace() takes 2 arguments")
+		}
+		src := pathArg(ctx, args[0])
+		dst := pathArg(ctx, args[1])
+		if err := os.Rename(src, dst); err != nil {
+			raiseOSError(err, src)
+		}
+		return val.NoneVal()
+	})
+
+	set("symlink", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		pa := posArgs(args, kwnames)
+		if len(pa) < 2 {
+			panic("TypeError: symlink() takes at least 2 arguments")
+		}
+		src := pathArg(ctx, pa[0])
+		dst := pathArg(ctx, pa[1])
+		if err := os.Symlink(src, dst); err != nil {
+			raiseOSError(err, src)
+		}
+		return val.NoneVal()
+	})
+
+	set("chmod", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		pa := posArgs(args, kwnames)
+		if len(pa) < 2 {
+			panic("TypeError: chmod() takes 2 arguments")
+		}
+		p := pathArg(ctx, pa[0])
+		mode, ok := intOf(ctx, pa[1])
+		if !ok {
+			panic("TypeError: chmod() mode must be int")
+		}
+		if err := os.Chmod(p, os.FileMode(mode)); err != nil {
+			raiseOSError(err, p)
+		}
+		return val.NoneVal()
+	})
+
+	set("utime", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		pa := posArgs(args, kwnames)
+		if len(pa) < 1 {
+			panic("TypeError: utime() takes at least 1 argument")
+		}
+		p := pathArg(ctx, pa[0])
+		now := time.Now()
+		atime := now
+		mtime := now
+		if len(pa) >= 2 && !pa[1].IsNone() {
+			if pa[1].IsTuple() && len(pa[1].AsTuple().Items) == 2 {
+				items := pa[1].AsTuple().Items
+				var aSec, mSec float64
+				if items[0].IsInt64() {
+					aSec = float64(items[0].AsInt64())
+				} else if items[0].IsFloat64() {
+					aSec = items[0].AsFloat64()
+				}
+				if items[1].IsInt64() {
+					mSec = float64(items[1].AsInt64())
+				} else if items[1].IsFloat64() {
+					mSec = items[1].AsFloat64()
+				}
+				atime = time.Unix(int64(aSec), int64((aSec-float64(int64(aSec)))*1e9))
+				mtime = time.Unix(int64(mSec), int64((mSec-float64(int64(mSec)))*1e9))
+			}
+		} else if nsVal, ok := kwArg(args, kwnames, "ns"); ok && nsVal.IsTuple() && len(nsVal.AsTuple().Items) == 2 {
+			items := nsVal.AsTuple().Items
+			if items[0].IsInt64() && items[1].IsInt64() {
+				atime = time.Unix(0, items[0].AsInt64())
+				mtime = time.Unix(0, items[1].AsInt64())
+			}
+		}
+		if err := os.Chtimes(p, atime, mtime); err != nil {
+			raiseOSError(err, p)
+		}
+		return val.NoneVal()
+	})
+
+	set("urandom", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: urandom() takes 1 argument")
+		}
+		n, ok := intOf(ctx, args[0])
+		if !ok || n < 0 {
+			panic("ValueError: negative size")
+		}
+		buf := make([]byte, n)
+		if _, err := crand.Read(buf); err != nil {
+			panic("OSError: urandom failed: " + err.Error())
+		}
+		return val.NewBytesVal(buf)
+	})
+
+	set("get_terminal_size", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		fc, fl := 80, 24
+		fb := val.NoneVal()
+		if pa := posArgs(args, kwnames); len(pa) >= 1 {
+			fb = pa[0]
+		} else if v, ok := kwArg(args, kwnames, "fallback"); ok {
+			fb = v
+		}
+		if fb.IsTuple() && len(fb.AsTuple().Items) == 2 {
+			it := fb.AsTuple().Items
+			if it[0].IsInt64() && it[1].IsInt64() {
+				fc, fl = int(it[0].AsInt64()), int(it[1].AsInt64())
+			}
+		}
+		c, l := terminalSize(fc, fl)
+		return terminalSizeVal(c, l)
 	})
 }
 
@@ -646,6 +1080,20 @@ func terminalSizeVal(cols, lines int) val.Value {
 	terminalSizeOnce.Do(func() {
 		t := val.MustNewType("terminal_size", []*val.PyType{val.ObjectType}, nil)
 		t.Dict.Set(val.InternString("__module__"), val.InternString("os"))
+		t.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			var fc, fl int64 = 80, 24
+			if len(args) > 0 {
+				seq := args[0]
+				if seq.IsTuple() && len(seq.AsTuple().Items) >= 2 {
+					fc = seq.AsTuple().Items[0].AsInt64()
+					fl = seq.AsTuple().Items[1].AsInt64()
+				} else if seq.IsList() && len(seq.AsList().Items) >= 2 {
+					fc = seq.AsList().Items[0].AsInt64()
+					fl = seq.AsList().Items[1].AsInt64()
+				}
+			}
+			return terminalSizeVal(int(fc), int(fl))
+		}
 		pair := func(self val.Value) val.Value {
 			c, _ := self.AsInstance().GetAttr(val.InternString("columns"))
 			l, _ := self.AsInstance().GetAttr(val.InternString("lines"))
@@ -723,6 +1171,13 @@ func envInt(name string) int {
 		}
 	}
 	return n
+}
+
+func (e *Engine) createPosixModule() val.Value {
+	modVal := val.NewModuleVal("posix", "")
+	mod := modVal.AsModule()
+	installPosix(mod)
+	return modVal
 }
 
 func (e *Engine) createShutilModule() val.Value {

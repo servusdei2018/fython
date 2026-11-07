@@ -301,6 +301,60 @@ func initIOTypes() {
 			t.Dict.Set(val.InternString("seekable"), yes)
 			t.InvalidateVersion()
 		}
+		StringIOType.Dict.Set(val.InternString("readline"), val.NewBuiltinFuncVal("readline", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			sio := (*pyStringIO)(val.AsPointer(args[0]))
+			sio.mu.Lock()
+			defer sio.mu.Unlock()
+			if sio.pos >= len(sio.buf) {
+				return val.NewStringVal("")
+			}
+			start := sio.pos
+			nl := -1
+			for i := start; i < len(sio.buf); i++ {
+				if sio.buf[i] == '\n' {
+					nl = i
+					break
+				}
+			}
+			if nl >= 0 {
+				sio.pos = nl + 1
+				return val.NewStringVal(string(sio.buf[start : nl+1]))
+			}
+			sio.pos = len(sio.buf)
+			return val.NewStringVal(string(sio.buf[start:]))
+		}))
+
+		StringIOType.Slots.TpIter = func(ctx *val.ExecContext, o val.Value) val.Value {
+			return val.NewIterValWithNext(func() (val.Value, bool) {
+				sio := (*pyStringIO)(val.AsPointer(o))
+				sio.mu.Lock()
+				defer sio.mu.Unlock()
+				if sio.pos >= len(sio.buf) {
+					return val.NoneVal(), false
+				}
+				start := sio.pos
+				nl := -1
+				for i := start; i < len(sio.buf); i++ {
+					if sio.buf[i] == '\n' {
+						nl = i
+						break
+					}
+				}
+				if nl >= 0 {
+					sio.pos = nl + 1
+					return val.NewStringVal(string(sio.buf[start : nl+1])), true
+				}
+				sio.pos = len(sio.buf)
+				return val.NewStringVal(string(sio.buf[start:])), true
+			})
+		}
+		StringIOType.Dict.Set(val.InternString("__iter__"), val.NewBuiltinFuncVal("__iter__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) < 1 {
+				panic("TypeError: __iter__() missing self")
+			}
+			return StringIOType.Slots.TpIter(ctx, args[0])
+		}))
+
 		StringIOType.Dict.Set(val.InternString("close"), val.NewBuiltinFuncVal("close", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			sio := (*pyStringIO)(val.AsPointer(args[0]))
 			sio.mu.Lock()
@@ -507,6 +561,30 @@ func initIOTypes() {
 			}
 			return val.Int64Val(int64(pf.f.Fd()))
 		}))
+		FileType.Slots.TpIter = func(ctx *val.ExecContext, o val.Value) val.Value {
+			return val.NewIterValWithNext(func() (val.Value, bool) {
+				pf := (*pyFile)(val.AsPointer(o))
+				pf.mu.Lock()
+				defer pf.mu.Unlock()
+				if pf.isClosed {
+					return val.NoneVal(), false
+				}
+				line, err := pf.reader.ReadBytes('\n')
+				if err != nil && len(line) == 0 {
+					return val.NoneVal(), false
+				}
+				if pf.binary {
+					return val.NewBytesVal(line), true
+				}
+				return val.NewStringVal(string(line)), true
+			})
+		}
+		FileType.Dict.Set(val.InternString("__iter__"), val.NewBuiltinFuncVal("__iter__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) < 1 {
+				panic("TypeError: __iter__() missing self")
+			}
+			return FileType.Slots.TpIter(ctx, args[0])
+		}))
 		FileType.Dict.Set(val.InternString("close"), val.NewBuiltinFuncVal("close", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			pf := (*pyFile)(val.AsPointer(args[0]))
 			pf.mu.Lock()
@@ -617,20 +695,88 @@ func (e *Engine) createIOModule() val.Value {
 		return val.ObjectVal(&sio.inst.Header)
 	}))
 
+	initIOTypes()
+	ioMod.Dict.Set(val.InternString("TextIOWrapper"), val.TypeVal(FileType))
+	ioMod.Dict.Set(val.InternString("BufferedReader"), val.TypeVal(FileType))
+	ioMod.Dict.Set(val.InternString("BufferedWriter"), val.TypeVal(FileType))
+	ioMod.Dict.Set(val.InternString("BufferedRandom"), val.TypeVal(FileType))
+	ioMod.Dict.Set(val.InternString("FileIO"), val.TypeVal(FileType))
+	ioBaseType := val.MustNewType("IOBase", []*val.PyType{val.ObjectType}, nil)
+	ioBaseType.Dict.Set(val.InternString("closed"), val.BoolVal(false))
+	ioBaseType.Dict.Set(val.InternString("__enter__"), val.NewBuiltinFuncVal("__enter__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) > 0 {
+			return args[0]
+		}
+		return val.NoneVal()
+	}))
+	ioBaseType.Dict.Set(val.InternString("__exit__"), val.NewBuiltinFuncVal("__exit__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) > 0 {
+			if closeFn, _, ok := args[0].Type().LookupMRO(val.InternString("close")); ok {
+				return ctx.Invoke1(closeFn, args[0])
+			}
+		}
+		return val.NoneVal()
+	}))
+	ioBaseType.Dict.Set(val.InternString("close"), val.NewBuiltinFuncVal("close", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) > 0 && args[0].IsInstance() {
+			args[0].AsInstance().SetAttr(val.InternString("closed"), val.BoolVal(true))
+		}
+		return val.NoneVal()
+	}))
+	ioBaseType.Dict.Set(val.InternString("flush"), val.NewBuiltinFuncVal("flush", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.NoneVal()
+	}))
+	ioBaseType.Dict.Set(val.InternString("seekable"), val.NewBuiltinFuncVal("seekable", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.BoolVal(false)
+	}))
+	ioBaseType.Dict.Set(val.InternString("readable"), val.NewBuiltinFuncVal("readable", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.BoolVal(false)
+	}))
+	ioBaseType.Dict.Set(val.InternString("writable"), val.NewBuiltinFuncVal("writable", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.BoolVal(false)
+	}))
+
+	rawIOBaseType := val.MustNewType("RawIOBase", []*val.PyType{ioBaseType}, nil)
+	bufferedIOBaseType := val.MustNewType("BufferedIOBase", []*val.PyType{ioBaseType}, nil)
+	textIOBaseType := val.MustNewType("TextIOBase", []*val.PyType{ioBaseType}, nil)
+
+	ioMod.Dict.Set(val.InternString("IOBase"), val.TypeVal(ioBaseType))
+	ioMod.Dict.Set(val.InternString("RawIOBase"), val.TypeVal(rawIOBaseType))
+	ioMod.Dict.Set(val.InternString("BufferedIOBase"), val.TypeVal(bufferedIOBaseType))
+	ioMod.Dict.Set(val.InternString("TextIOBase"), val.TypeVal(textIOBaseType))
+	ioMod.Dict.Set(val.InternString("UnsupportedOperation"), val.TypeVal(val.OSErrorType))
+
 	// open
 	openFn := val.NewBuiltinFuncVal("open", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		if len(args) < 1 {
-			panic("TypeError: open() takes at least 1 argument")
+		pa := posArgs(args, kwnames)
+		if len(pa) < 1 {
+			if v, ok := kwArg(args, kwnames, "file"); ok {
+				pa = []val.Value{v}
+			} else {
+				panic("TypeError: open() missing required argument 'file' (pos 1)")
+			}
 		}
-		file := args[0].AsString()
+		file := pathArg(ctx, pa[0])
 		mode := "r"
-		if len(args) >= 2 && args[1].IsAnyString() {
-			mode = args[1].AsString()
+		if len(pa) >= 2 && pa[1].IsAnyString() {
+			mode = pa[1].AsString()
+		} else if v, ok := kwArg(args, kwnames, "mode"); ok && v.IsAnyString() {
+			mode = v.AsString()
 		}
 		return openFileBuiltin(file, mode)
 	})
 
 	ioMod.Dict.Set(val.InternString("open"), openFn)
+	ioMod.Dict.Set(val.InternString("DEFAULT_BUFFER_SIZE"), val.Int64Val(8192))
+	ioMod.Dict.Set(val.InternString("SEEK_SET"), val.Int64Val(0))
+	ioMod.Dict.Set(val.InternString("SEEK_CUR"), val.Int64Val(1))
+	ioMod.Dict.Set(val.InternString("SEEK_END"), val.Int64Val(2))
+	ioMod.Dict.Set(val.InternString("text_encoding"), val.NewBuiltinFuncVal("text_encoding", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) >= 1 && !args[0].IsNone() {
+			return args[0]
+		}
+		return val.NewStringVal("locale")
+	}))
 
 	return ioModVal
 }

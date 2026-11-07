@@ -54,10 +54,48 @@ func (e *Engine) createMathModule() val.Value {
 	registerUnary("exp", math.Exp)
 	registerUnary("log2", math.Log2)
 	registerUnary("log10", math.Log10)
-	registerUnary("ceil", math.Ceil)
-	registerUnary("floor", math.Floor)
-	registerUnary("trunc", math.Trunc)
 	registerUnary("fabs", math.Abs)
+
+	mod.Dict.Set(val.InternString("floor"), val.NewBuiltinFuncVal("floor", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: floor() takes exactly one argument")
+		}
+		x := toFloat(args[0])
+		return val.Int64Val(int64(math.Floor(x)))
+	}))
+	mod.Dict.Set(val.InternString("ceil"), val.NewBuiltinFuncVal("ceil", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: ceil() takes exactly one argument")
+		}
+		x := toFloat(args[0])
+		return val.Int64Val(int64(math.Ceil(x)))
+	}))
+	mod.Dict.Set(val.InternString("trunc"), val.NewBuiltinFuncVal("trunc", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: trunc() takes exactly one argument")
+		}
+		x := toFloat(args[0])
+		return val.Int64Val(int64(math.Trunc(x)))
+	}))
+	registerUnary("lgamma", func(x float64) float64 {
+		lg, _ := math.Lgamma(x)
+		return lg
+	})
+	registerUnary("gamma", math.Gamma)
+	registerUnary("degrees", func(x float64) float64 { return x * 180 / math.Pi })
+	registerUnary("radians", func(x float64) float64 { return x * math.Pi / 180 })
+
+	registerBinary := func(name string, fn func(float64, float64) float64) {
+		mod.Dict.Set(val.InternString(name), val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) < 2 {
+				panic("TypeError: " + name + "() takes exactly 2 arguments")
+			}
+			return val.Float64Val(fn(toFloat(args[0]), toFloat(args[1])))
+		}))
+	}
+	registerBinary("hypot", math.Hypot)
+	registerBinary("fmod", math.Mod)
+	registerBinary("remainder", math.Remainder)
 
 	// log(x[, base])
 	mod.Dict.Set(val.InternString("log"), val.NewBuiltinFuncVal("log", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {

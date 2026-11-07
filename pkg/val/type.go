@@ -352,6 +352,7 @@ var (
 	BigIntType            *PyType
 	ListType              *PyType
 	DictType              *PyType
+	DictKeysType          *PyType
 	TupleType             *PyType
 	CodeType              *PyType
 	FunctionType          *PyType
@@ -1055,9 +1056,33 @@ func (t *PyType) syncDunderSlots() {
 	if fn, _, ok := t.LookupMRO(DunderNext); ok {
 		t.dunderNext = fn
 		t.Slots.TpIterNext = func(ctx *ExecContext, o Value) (Value, IterStatus) {
-			res := ctx.Invoke1(t.dunderNext, o)
-			if ctx.HasException() {
-				exc := ctx.ActiveException
+			var res Value
+			var exc Value
+			hasExc := false
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						if v, ok := r.(Value); ok {
+							exc = v
+							hasExc = true
+							return
+						}
+						panic(r)
+					}
+				}()
+				res = ctx.Invoke1(t.dunderNext, o)
+			}()
+			if hasExc {
+				if IsInstance(exc, StopIterationType) {
+					return NoneVal(), IterExhausted
+				}
+				if ctx != nil {
+					ctx.Raise(exc)
+				}
+				return NoneVal(), IterError
+			}
+			if ctx != nil && ctx.HasException() {
+				exc = ctx.ActiveException
 				ctx.ClearException()
 				if IsInstance(exc, StopIterationType) {
 					return NoneVal(), IterExhausted
@@ -1431,6 +1456,14 @@ func defaultObjectGetAttr(ctx *ExecContext, obj, name Value) Value {
 		}
 	}
 
+	if obj.IsTuple() && tp != TupleType {
+		if t := obj.AsTuple(); t.Attrs != nil {
+			if val, ok := t.Attrs.Get(interned); ok {
+				return val
+			}
+		}
+	}
+
 	if k := obj.Kind(); k == KindFuture || k == KindTask {
 		if d := AsyncAttrs(obj, false); d != nil {
 			if val, ok := d.Get(interned); ok {
@@ -1471,9 +1504,6 @@ func defaultObjectGetAttr(ctx *ExecContext, obj, name Value) Value {
 	}
 
 	if interned.AsString() == "__dict__" {
-		if k := obj.Kind(); k == KindFuture || k == KindTask {
-			return Value{num: uint64(KindDict), ptr: &AsyncAttrs(obj, true).Header}
-		}
 		if obj.IsDict() && tp != DictType {
 			d := obj.AsDict()
 			if d.Attrs == nil {
@@ -1487,6 +1517,13 @@ func defaultObjectGetAttr(ctx *ExecContext, obj, name Value) Value {
 				l.Attrs = NewDictVal(8).AsDict()
 			}
 			return Value{num: uint64(KindDict), ptr: &l.Attrs.Header}
+		}
+		if obj.IsTuple() && tp != TupleType {
+			t := obj.AsTuple()
+			if t.Attrs == nil {
+				t.Attrs = NewDictVal(8).AsDict()
+			}
+			return Value{num: uint64(KindDict), ptr: &t.Attrs.Header}
 		}
 	}
 
@@ -1569,6 +1606,15 @@ func objectSetAttr(ctx *ExecContext, obj, name, value Value) Value {
 			l.Attrs = NewDictVal(8).AsDict()
 		}
 		l.Attrs.Set(interned, value)
+		return NoneVal()
+	}
+
+	if obj.IsTuple() && tp != TupleType {
+		t := obj.AsTuple()
+		if t.Attrs == nil {
+			t.Attrs = NewDictVal(8).AsDict()
+		}
+		t.Attrs.Set(interned, value)
 		return NoneVal()
 	}
 

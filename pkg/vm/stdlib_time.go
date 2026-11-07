@@ -58,5 +58,42 @@ func (e *Engine) createTimeModule() val.Value {
 		return val.Int64Val(elapsed.Nanoseconds())
 	}))
 
+	parseTimeArg := func(args []val.Value) time.Time {
+		if len(args) == 0 || args[0].IsNone() {
+			return time.Now()
+		}
+		secs := toFloat(args[0])
+		secInt := int64(secs)
+		nsec := int64((secs - float64(secInt)) * 1e9)
+		return time.Unix(secInt, nsec)
+	}
+
+	timeToStructTime := func(t time.Time) val.Value {
+		yday := t.YearDay()
+		wday := int(t.Weekday()-1+7) % 7 // Monday = 0
+		isdst := 0
+		return val.NewTupleVal(
+			val.Int64Val(int64(t.Year())),
+			val.Int64Val(int64(t.Month())),
+			val.Int64Val(int64(t.Day())),
+			val.Int64Val(int64(t.Hour())),
+			val.Int64Val(int64(t.Minute())),
+			val.Int64Val(int64(t.Second())),
+			val.Int64Val(int64(wday)),
+			val.Int64Val(int64(yday)),
+			val.Int64Val(int64(isdst)),
+		)
+	}
+
+	mod.Dict.Set(val.InternString("localtime"), val.NewBuiltinFuncVal("localtime", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		t := parseTimeArg(args).Local()
+		return timeToStructTime(t)
+	}))
+
+	mod.Dict.Set(val.InternString("gmtime"), val.NewBuiltinFuncVal("gmtime", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		t := parseTimeArg(args).UTC()
+		return timeToStructTime(t)
+	}))
+
 	return modVal
 }

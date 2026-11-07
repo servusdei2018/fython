@@ -3,42 +3,186 @@ package vm
 import (
 	"crypto/subtle"
 	"strings"
+	"sync"
 
 	"github.com/servusdei2018/fython/pkg/val"
 )
+
+type pyItemGetter struct {
+	inst  val.PyInstance
+	items []val.Value
+}
+
+type pyAttrGetter struct {
+	inst  val.PyInstance
+	attrs []string
+}
+
+type pyMethodCaller struct {
+	inst    val.PyInstance
+	name    string
+	args    []val.Value
+	kwnames []val.Value
+}
+
+var (
+	itemgetterType    *val.PyType
+	attrgetterType    *val.PyType
+	methodcallerType  *val.PyType
+	operatorTypesOnce sync.Once
+)
+
+func initOperatorTypes() {
+	operatorTypesOnce.Do(func() {
+		itemgetterType = val.MustNewType("itemgetter", []*val.PyType{val.ObjectType}, nil)
+		itemgetterType.Dict.Set(val.InternString("__module__"), val.InternString("operator"))
+		itemgetterType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if callable.IsType() {
+				if len(args) == 0 {
+					panic("TypeError: itemgetter needs at least 1 item")
+				}
+				ig := &pyItemGetter{
+					inst: val.PyInstance{
+						Header: val.ObjectHeader{Kind: val.KindInstance, Type: itemgetterType},
+						Shape:  itemgetterType.RootShape,
+					},
+					items: append([]val.Value(nil), args...),
+				}
+				return val.ObjectVal(&ig.inst.Header)
+			}
+			if len(args) < 1 {
+				panic("TypeError: expected 1 argument")
+			}
+			ig := (*pyItemGetter)(val.AsPointer(callable))
+			if len(ig.items) == 1 {
+				return val.GetItemCtx(ctx, args[0], ig.items[0])
+			}
+			res := make([]val.Value, len(ig.items))
+			for i, it := range ig.items {
+				res[i] = val.GetItemCtx(ctx, args[0], it)
+			}
+			return val.NewTupleVal(res...)
+		}
+		itemgetterType.Dict.Set(val.InternString("__call__"), val.NewBuiltinFuncVal("__call__", itemgetterType.Slots.TpCall))
+		itemgetterType.InvalidateVersion()
+
+		attrgetterType = val.MustNewType("attrgetter", []*val.PyType{val.ObjectType}, nil)
+		attrgetterType.Dict.Set(val.InternString("__module__"), val.InternString("operator"))
+		attrgetterType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if callable.IsType() {
+				if len(args) == 0 {
+					panic("TypeError: attrgetter needs at least 1 attribute")
+				}
+				attrs := make([]string, len(args))
+				for i, a := range args {
+					attrs[i] = a.AsString()
+				}
+				ag := &pyAttrGetter{
+					inst: val.PyInstance{
+						Header: val.ObjectHeader{Kind: val.KindInstance, Type: attrgetterType},
+						Shape:  attrgetterType.RootShape,
+					},
+					attrs: attrs,
+				}
+				return val.ObjectVal(&ag.inst.Header)
+			}
+			if len(args) < 1 {
+				panic("TypeError: expected 1 argument")
+			}
+			ag := (*pyAttrGetter)(val.AsPointer(callable))
+			resolveAttr := func(subCtx *val.ExecContext, obj val.Value, attr string) val.Value {
+				parts := strings.Split(attr, ".")
+				curr := obj
+				for _, p := range parts {
+					v, ok := vmGetAttrSafe(subCtx, curr, p)
+					if !ok {
+						panic("AttributeError: '" + curr.Type().Name + "' object has no attribute '" + p + "'")
+					}
+					curr = v
+				}
+				return curr
+			}
+			if len(ag.attrs) == 1 {
+				return resolveAttr(ctx, args[0], ag.attrs[0])
+			}
+			res := make([]val.Value, len(ag.attrs))
+			for i, at := range ag.attrs {
+				res[i] = resolveAttr(ctx, args[0], at)
+			}
+			return val.NewTupleVal(res...)
+		}
+		attrgetterType.Dict.Set(val.InternString("__call__"), val.NewBuiltinFuncVal("__call__", attrgetterType.Slots.TpCall))
+		attrgetterType.InvalidateVersion()
+
+		methodcallerType = val.MustNewType("methodcaller", []*val.PyType{val.ObjectType}, nil)
+		methodcallerType.Dict.Set(val.InternString("__module__"), val.InternString("operator"))
+		methodcallerType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if callable.IsType() {
+				if len(args) == 0 {
+					panic("TypeError: methodcaller needs a method name")
+				}
+				mc := &pyMethodCaller{
+					inst: val.PyInstance{
+						Header: val.ObjectHeader{Kind: val.KindInstance, Type: methodcallerType},
+						Shape:  methodcallerType.RootShape,
+					},
+					name:    args[0].AsString(),
+					args:    append([]val.Value(nil), args[1:]...),
+					kwnames: append([]val.Value(nil), kwnames...),
+				}
+				return val.ObjectVal(&mc.inst.Header)
+			}
+			if len(args) < 1 {
+				panic("TypeError: expected 1 argument")
+			}
+			mc := (*pyMethodCaller)(val.AsPointer(callable))
+			method, ok := vmGetAttrSafe(ctx, args[0], mc.name)
+			if !ok {
+				panic("AttributeError: '" + args[0].Type().Name + "' object has no attribute '" + mc.name + "'")
+			}
+			return ctx.Call(method, mc.args, mc.kwnames)
+		}
+		methodcallerType.Dict.Set(val.InternString("__call__"), val.NewBuiltinFuncVal("__call__", methodcallerType.Slots.TpCall))
+		methodcallerType.InvalidateVersion()
+	})
+}
 
 func (e *Engine) createOperatorModule() val.Value {
 	modVal := val.NewModuleVal("_operator", "")
 	mod := modVal.AsModule()
 
+	set := func(name string, fn val.VectorcallFunc) {
+		mod.Dict.Set(val.InternString(name), val.NewModuleFuncVal(name, fn))
+	}
+
 	// Arithmetic
-	mod.Dict.Set(val.InternString("add"), val.NewBuiltinFuncVal("add", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+	set("add", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		return val.AddCtx(ctx, args[0], args[1])
-	}))
-	mod.Dict.Set(val.InternString("sub"), val.NewBuiltinFuncVal("sub", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+	})
+	set("sub", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		return val.SubCtx(ctx, args[0], args[1])
-	}))
-	mod.Dict.Set(val.InternString("mul"), val.NewBuiltinFuncVal("mul", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+	})
+	set("mul", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		return val.MulCtx(ctx, args[0], args[1])
-	}))
-	mod.Dict.Set(val.InternString("truediv"), val.NewBuiltinFuncVal("truediv", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+	})
+	set("truediv", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		return val.TrueDiv(args[0], args[1])
-	}))
-	mod.Dict.Set(val.InternString("floordiv"), val.NewBuiltinFuncVal("floordiv", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+	})
+	set("floordiv", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		return val.FloorDiv(args[0], args[1])
-	}))
-	mod.Dict.Set(val.InternString("mod"), val.NewBuiltinFuncVal("mod", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+	})
+	set("mod", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		return val.Mod(args[0], args[1])
-	}))
-	mod.Dict.Set(val.InternString("pow"), val.NewBuiltinFuncVal("pow", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+	})
+	set("pow", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		return val.Pow(args[0], args[1])
-	}))
-	mod.Dict.Set(val.InternString("neg"), val.NewBuiltinFuncVal("neg", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+	})
+	set("neg", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		return val.SubCtx(ctx, val.Int64Val(0), args[0])
-	}))
-	mod.Dict.Set(val.InternString("pos"), val.NewBuiltinFuncVal("pos", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+	})
+	set("pos", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		return args[0]
-	}))
+	})
 	mod.Dict.Set(val.InternString("abs"), val.BuiltinAbsVal)
 
 	// Bitwise
@@ -210,79 +354,11 @@ func (e *Engine) createOperatorModule() val.Value {
 		return val.BoolVal(subtle.ConstantTimeCompare(b1, b2) == 1)
 	}))
 
-	// itemgetter(*items)
-	mod.Dict.Set(val.InternString("itemgetter"), val.NewBuiltinFuncVal("itemgetter", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		if len(args) == 0 {
-			panic("TypeError: itemgetter needs at least 1 item")
-		}
-		items := append([]val.Value(nil), args...)
-		if len(items) == 1 {
-			it := items[0]
-			return val.NewBuiltinFuncVal("itemgetter", func(subCtx *val.ExecContext, subCallable val.Value, subArgs []val.Value, subKwnames []val.Value) val.Value {
-				return val.GetItemCtx(subCtx, subArgs[0], it)
-			})
-		}
-		return val.NewBuiltinFuncVal("itemgetter", func(subCtx *val.ExecContext, subCallable val.Value, subArgs []val.Value, subKwnames []val.Value) val.Value {
-			res := make([]val.Value, len(items))
-			for i, it := range items {
-				res[i] = val.GetItemCtx(subCtx, subArgs[0], it)
-			}
-			return val.NewTupleVal(res...)
-		})
-	}))
-
-	// attrgetter(*attrs)
-	mod.Dict.Set(val.InternString("attrgetter"), val.NewBuiltinFuncVal("attrgetter", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		if len(args) == 0 {
-			panic("TypeError: attrgetter needs at least 1 attribute")
-		}
-		attrs := make([]string, len(args))
-		for i, a := range args {
-			attrs[i] = a.AsString()
-		}
-		resolveAttr := func(subCtx *val.ExecContext, obj val.Value, attr string) val.Value {
-			parts := strings.Split(attr, ".")
-			curr := obj
-			for _, p := range parts {
-				v, ok := vmGetAttrSafe(subCtx, curr, p)
-				if !ok {
-					panic("AttributeError: '" + curr.Type().Name + "' object has no attribute '" + p + "'")
-				}
-				curr = v
-			}
-			return curr
-		}
-		if len(attrs) == 1 {
-			at := attrs[0]
-			return val.NewBuiltinFuncVal("attrgetter", func(subCtx *val.ExecContext, subCallable val.Value, subArgs []val.Value, subKwnames []val.Value) val.Value {
-				return resolveAttr(subCtx, subArgs[0], at)
-			})
-		}
-		return val.NewBuiltinFuncVal("attrgetter", func(subCtx *val.ExecContext, subCallable val.Value, subArgs []val.Value, subKwnames []val.Value) val.Value {
-			res := make([]val.Value, len(attrs))
-			for i, at := range attrs {
-				res[i] = resolveAttr(subCtx, subArgs[0], at)
-			}
-			return val.NewTupleVal(res...)
-		})
-	}))
-
-	// methodcaller(name, *args, **kwargs)
-	mod.Dict.Set(val.InternString("methodcaller"), val.NewBuiltinFuncVal("methodcaller", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		if len(args) == 0 {
-			panic("TypeError: methodcaller needs a method name")
-		}
-		methodName := args[0].AsString()
-		mArgs := append([]val.Value(nil), args[1:]...)
-		mKwNames := append([]val.Value(nil), kwnames...)
-		return val.NewBuiltinFuncVal("methodcaller", func(subCtx *val.ExecContext, subCallable val.Value, subArgs []val.Value, subKwnames []val.Value) val.Value {
-			method, ok := vmGetAttrSafe(subCtx, subArgs[0], methodName)
-			if !ok {
-				panic("AttributeError: '" + subArgs[0].Type().Name + "' object has no attribute '" + methodName + "'")
-			}
-			return subCtx.Call(method, mArgs, mKwNames)
-		})
-	}))
+	// itemgetter, attrgetter, methodcaller
+	initOperatorTypes()
+	mod.Dict.Set(val.InternString("itemgetter"), val.TypeVal(itemgetterType))
+	mod.Dict.Set(val.InternString("attrgetter"), val.TypeVal(attrgetterType))
+	mod.Dict.Set(val.InternString("methodcaller"), val.TypeVal(methodcallerType))
 
 	// call(obj, *args, **kwargs)
 	mod.Dict.Set(val.InternString("call"), val.NewBuiltinFuncVal("call", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {

@@ -10,6 +10,38 @@ import (
 	"strings"
 )
 
+func raiseTypeError(ctx *ExecContext, msg string) Value {
+	if ctx != nil {
+		ctx.Raise(NewTypeError(msg))
+		return NoneVal()
+	}
+	panic("TypeError: " + msg)
+}
+
+func raiseZeroDivisionError(ctx *ExecContext, msg string) Value {
+	if ctx != nil {
+		ctx.Raise(NewZeroDivisionError(msg))
+		return NoneVal()
+	}
+	panic("ZeroDivisionError: " + msg)
+}
+
+func raiseOverflowError(ctx *ExecContext, msg string) Value {
+	if ctx != nil {
+		ctx.Raise(NewOverflowError(msg))
+		return NoneVal()
+	}
+	panic("OverflowError: " + msg)
+}
+
+func raiseValueError(ctx *ExecContext, msg string) Value {
+	if ctx != nil {
+		ctx.Raise(NewValueError(msg))
+		return NoneVal()
+	}
+	panic("ValueError: " + msg)
+}
+
 // Add performs overflow-safe Python addition (a + b) without an explicit VM context.
 func Add(a, b Value) Value {
 	return AddCtx(nil, a, b)
@@ -91,7 +123,14 @@ func addSlow(ctx *ExecContext, a, b Value) Value {
 		}
 	}
 
-	panic("val: TypeError: unsupported operand type(s) for +: '" + aType.Name + "' and '" + bType.Name + "'")
+	if a.IsAnyString() {
+		return raiseTypeError(ctx, "can only concatenate str (not \""+bType.Name+"\") to str")
+	}
+	if a.IsList() {
+		return raiseTypeError(ctx, "can only concatenate list (not \""+bType.Name+"\") to list")
+	}
+
+	return raiseTypeError(ctx, "unsupported operand type(s) for +: '"+aType.Name+"' and '"+bType.Name+"'")
 }
 
 func numericNbAdd(ctx *ExecContext, a, b Value) Value {
@@ -128,7 +167,7 @@ func strNbAdd(ctx *ExecContext, a, b Value) Value {
 		(b.ptr == &tagInlineStr || b.ptr.Kind == KindString) {
 		return ConcatStrings(a, b)
 	}
-	panic("val.Add: can only concatenate str to str")
+	return NotImplementedVal()
 }
 
 func listNbAdd(ctx *ExecContext, a, b Value) Value {
@@ -140,7 +179,7 @@ func listNbAdd(ctx *ExecContext, a, b Value) Value {
 		copy(merged[len(la):], lb)
 		return NewListVal(merged...)
 	}
-	panic("val.Add: can only concatenate list to list")
+	return NotImplementedVal()
 }
 
 // Sub performs overflow-safe Python subtraction (a - b) without an explicit VM context.
@@ -223,7 +262,7 @@ func subSlow(ctx *ExecContext, a, b Value) Value {
 		}
 	}
 
-	panic("val: TypeError: unsupported operand type(s) for -: '" + aType.Name + "' and '" + bType.Name + "'")
+	return raiseTypeError(ctx, "unsupported operand type(s) for -: '"+aType.Name+"' and '"+bType.Name+"'")
 }
 
 func numericNbSub(ctx *ExecContext, a, b Value) Value {
@@ -346,7 +385,7 @@ func mulSlow(ctx *ExecContext, a, b Value) Value {
 		}
 	}
 
-	panic("val: TypeError: unsupported operand type(s) for *: '" + aType.Name + "' and '" + bType.Name + "'")
+	return raiseTypeError(ctx, "unsupported operand type(s) for *: '"+aType.Name+"' and '"+bType.Name+"'")
 }
 
 func numericNbMul(ctx *ExecContext, a, b Value) Value {
@@ -416,6 +455,24 @@ func RichCompare(ctx *ExecContext, a, b Value, op uint8) Value {
 			return BoolVal(ai == bi)
 		case CmpISNOT:
 			return BoolVal(ai != bi)
+		}
+	}
+
+	if isAnyInt(a) && isAnyInt(b) {
+		cmp := toBigInt(a).Cmp(toBigInt(b))
+		switch op {
+		case CmpLT:
+			return BoolVal(cmp < 0)
+		case CmpLTE:
+			return BoolVal(cmp <= 0)
+		case CmpEQ:
+			return BoolVal(cmp == 0)
+		case CmpNEQ:
+			return BoolVal(cmp != 0)
+		case CmpGT:
+			return BoolVal(cmp > 0)
+		case CmpGTE:
+			return BoolVal(cmp >= 0)
 		}
 	}
 
@@ -614,7 +671,7 @@ func RichCompare(ctx *ExecContext, a, b Value, op uint8) Value {
 	if int(op) < len(opSymbols) {
 		symbol = opSymbols[op]
 	}
-	panic("val: TypeError: '" + symbol + "' not supported between instances of '" + aType.Name + "' and '" + bType.Name + "'")
+	return raiseTypeError(ctx, "'"+symbol+"' not supported between instances of '"+aType.Name+"' and '"+bType.Name+"'")
 }
 
 func compareSliceRich(ctx *ExecContext, ia, ib []Value, op uint8) Value {
@@ -688,7 +745,7 @@ func GetItemCtx(ctx *ExecContext, obj, key Value) Value {
 	if tp.Slots.SqItem != nil {
 		return tp.Slots.SqItem(ctx, obj, key)
 	}
-	panic("val.GetItem: '" + tp.Name + "' object is not subscriptable")
+	return raiseTypeError(ctx, "'"+tp.Name+"' object is not subscriptable")
 }
 
 // SetItemCtx evaluates obj[key] = value via MpAssSubscript or SqAssItem type slots.
@@ -702,7 +759,7 @@ func SetItemCtx(ctx *ExecContext, obj, key, value Value) {
 		tp.Slots.SqAssItem(ctx, obj, key, value)
 		return
 	}
-	panic("val.SetItem: '" + tp.Name + "' object does not support item assignment")
+	raiseTypeError(ctx, "'"+tp.Name+"' object does not support item assignment")
 }
 
 // GetAttrCtx evaluates obj.name via TpGetAttr type slot.
@@ -735,21 +792,28 @@ func DelAttrCtx(ctx *ExecContext, obj, name Value) {
 	objectDelAttr(ctx, obj, name)
 }
 
+func isAnyInt(v Value) bool {
+	return v.ptr == &tagInt64 || v.ptr == &tagBool || (v.ptr != nil && v.ptr.Kind == KindBigInt)
+}
+
+// IsAnyInt reports whether v is an integer (int64, bool, or BigInt).
+func IsAnyInt(v Value) bool {
+	return isAnyInt(v)
+}
+
 func toBigInt(v Value) *big.Int {
-	if v.ptr.Kind == KindBigInt {
+	if v.ptr != nil && v.ptr.Kind == KindBigInt {
 		return &v.AsBigInt().Val
 	}
-	if v.ptr == &tagInt64 {
-		var b big.Int
-		b.SetInt64(int64(v.num))
-		return &b
-	}
-	if v.ptr == &tagBool {
-		var b big.Int
-		b.SetInt64(int64(v.num))
-		return &b
+	if v.ptr == &tagInt64 || v.ptr == &tagBool {
+		return big.NewInt(int64(v.num))
 	}
 	panic("val: cannot convert value to big.Int")
+}
+
+// ToBigInt converts an integer-like value to *big.Int.
+func ToBigInt(v Value) *big.Int {
+	return toBigInt(v)
 }
 
 func toFloat64(v Value) float64 {
@@ -768,11 +832,30 @@ func toFloat64(v Value) float64 {
 
 // FloorDiv performs Python floor division (a // b).
 func FloorDiv(a, b Value) Value {
+	return FloorDivCtx(nil, a, b)
+}
+
+// FloorDivCtx performs Python floor division (a // b) with VM execution context.
+func FloorDivCtx(ctx *ExecContext, a, b Value) Value {
+	if a.Kind() == KindComplex || b.Kind() == KindComplex {
+		return raiseTypeError(ctx, "can't take floor of complex number")
+	}
+	aType := a.Type()
+	bType := b.Type()
+	isStrictSub := aType != bType && IsSubclass(bType, aType)
+	if isStrictSub {
+		if fn, _, ok := bType.LookupMRO(InternString("__rfloordiv__")); ok {
+			res := ctx.Invoke2(fn, b, a)
+			if !res.IsNotImplemented() {
+				return res
+			}
+		}
+	}
 	if (a.ptr == &tagInt64 || a.ptr == &tagBool) && (b.ptr == &tagInt64 || b.ptr == &tagBool) {
 		ai := int64(a.num)
 		bi := int64(b.num)
 		if bi == 0 {
-			panic("vm: ZeroDivisionError: integer division or modulo by zero")
+			return raiseZeroDivisionError(ctx, "integer division or modulo by zero")
 		}
 		res := ai / bi
 		rem := ai % bi
@@ -785,40 +868,119 @@ func FloorDiv(a, b Value) Value {
 		af := toFloat64(a)
 		bf := toFloat64(b)
 		if bf == 0 {
-			panic("vm: ZeroDivisionError: float floor division by zero")
+			return raiseZeroDivisionError(ctx, "float floor division by zero")
 		}
 		return Float64Val(math.Floor(af / bf))
 	}
 	if isIntKind(a) && isIntKind(b) {
-		q, _ := bigFloorDivMod(toBigInt(a), toBigInt(b))
+		ba := toBigInt(a)
+		bb := toBigInt(b)
+		if bb.Sign() == 0 {
+			return raiseZeroDivisionError(ctx, "integer division or modulo by zero")
+		}
+		q, _ := bigFloorDivMod(ba, bb)
 		return normBig(q)
 	}
-	panic("val: TypeError: unsupported operand type(s) for //: '" + a.Type().Name + "' and '" + b.Type().Name + "'")
+	if fn, _, ok := aType.LookupMRO(InternString("__floordiv__")); ok {
+		res := ctx.Invoke2(fn, a, b)
+		if !res.IsNotImplemented() {
+			return res
+		}
+	}
+	if !isStrictSub {
+		if fn, _, ok := bType.LookupMRO(InternString("__rfloordiv__")); ok {
+			res := ctx.Invoke2(fn, b, a)
+			if !res.IsNotImplemented() {
+				return res
+			}
+		}
+	}
+	return raiseTypeError(ctx, "unsupported operand type(s) for //: '"+aType.Name+"' and '"+bType.Name+"'")
 }
 
 // TrueDiv performs Python true division (a / b).
 func TrueDiv(a, b Value) Value {
-	if r, ok := complexBinaryAny('/', a, b); ok {
-		return r
+	return TrueDivCtx(nil, a, b)
+}
+
+// TrueDivCtx performs Python true division (a / b) with VM execution context.
+func TrueDivCtx(ctx *ExecContext, a, b Value) Value {
+	aType := a.Type()
+	bType := b.Type()
+	isStrictSub := aType != bType && IsSubclass(bType, aType)
+	if isStrictSub {
+		if fn, _, ok := bType.LookupMRO(InternString("__rtruediv__")); ok {
+			res := ctx.Invoke2(fn, b, a)
+			if !res.IsNotImplemented() {
+				return res
+			}
+		}
 	}
-	bf := toFloat64(b)
-	if bf == 0 {
-		panic("vm: ZeroDivisionError: division by zero")
+	if a.Kind() == KindComplex || b.Kind() == KindComplex {
+		ar, ai, ok1 := toComplexParts(a)
+		br, bi, ok2 := toComplexParts(b)
+		if ok1 && ok2 {
+			if br == 0 && bi == 0 {
+				return raiseZeroDivisionError(ctx, "division by zero")
+			}
+			r, i := complexDiv(ar, ai, br, bi)
+			return NewComplexVal(r, i)
+		}
 	}
-	af := toFloat64(a)
-	return Float64Val(af / bf)
+	if (isNumberKind(a) || isIntKind(a)) && (isNumberKind(b) || isIntKind(b)) {
+		bf := toFloat64(b)
+		if bf == 0 {
+			return raiseZeroDivisionError(ctx, "division by zero")
+		}
+		af := toFloat64(a)
+		return Float64Val(af / bf)
+	}
+	if fn, _, ok := aType.LookupMRO(InternString("__truediv__")); ok {
+		res := ctx.Invoke2(fn, a, b)
+		if !res.IsNotImplemented() {
+			return res
+		}
+	}
+	if !isStrictSub {
+		if fn, _, ok := bType.LookupMRO(InternString("__rtruediv__")); ok {
+			res := ctx.Invoke2(fn, b, a)
+			if !res.IsNotImplemented() {
+				return res
+			}
+		}
+	}
+	return raiseTypeError(ctx, "unsupported operand type(s) for /: '"+aType.Name+"' and '"+bType.Name+"'")
 }
 
 // Mod performs Python modulo operation (a % b).
 func Mod(a, b Value) Value {
+	return ModCtx(nil, a, b)
+}
+
+// ModCtx performs Python modulo operation (a % b) with VM execution context.
+func ModCtx(ctx *ExecContext, a, b Value) Value {
 	if a.IsAnyString() {
-		return formatStringMod(a.AsString(), b)
+		return formatStringModCtx(ctx, a.AsString(), b)
+	}
+	if a.Kind() == KindComplex || b.Kind() == KindComplex {
+		return raiseTypeError(ctx, "can't take modulo of complex number")
+	}
+	aType := a.Type()
+	bType := b.Type()
+	isStrictSub := aType != bType && IsSubclass(bType, aType)
+	if isStrictSub {
+		if fn, _, ok := bType.LookupMRO(InternString("__rmod__")); ok {
+			res := ctx.Invoke2(fn, b, a)
+			if !res.IsNotImplemented() {
+				return res
+			}
+		}
 	}
 	if (a.ptr == &tagInt64 || a.ptr == &tagBool) && (b.ptr == &tagInt64 || b.ptr == &tagBool) {
 		ai := int64(a.num)
 		bi := int64(b.num)
 		if bi == 0 {
-			panic("vm: ZeroDivisionError: integer modulo by zero")
+			return raiseZeroDivisionError(ctx, "integer modulo by zero")
 		}
 		rem := ai % bi
 		if (rem != 0) && ((rem < 0) != (bi < 0)) {
@@ -830,7 +992,7 @@ func Mod(a, b Value) Value {
 		af := toFloat64(a)
 		bf := toFloat64(b)
 		if bf == 0 {
-			panic("vm: ZeroDivisionError: float modulo by zero")
+			return raiseZeroDivisionError(ctx, "float modulo by zero")
 		}
 		rem := math.Mod(af, bf)
 		if (rem != 0) && ((rem < 0) != (bf < 0)) {
@@ -839,14 +1001,49 @@ func Mod(a, b Value) Value {
 		return Float64Val(rem)
 	}
 	if isIntKind(a) && isIntKind(b) {
-		_, r := bigFloorDivMod(toBigInt(a), toBigInt(b))
+		ba := toBigInt(a)
+		bb := toBigInt(b)
+		if bb.Sign() == 0 {
+			return raiseZeroDivisionError(ctx, "integer modulo by zero")
+		}
+		_, r := bigFloorDivMod(ba, bb)
 		return normBig(r)
 	}
-	panic("val: TypeError: unsupported operand type(s) for %: '" + a.Type().Name + "' and '" + b.Type().Name + "'")
+	if fn, _, ok := aType.LookupMRO(InternString("__mod__")); ok {
+		res := ctx.Invoke2(fn, a, b)
+		if !res.IsNotImplemented() {
+			return res
+		}
+	}
+	if !isStrictSub {
+		if fn, _, ok := bType.LookupMRO(InternString("__rmod__")); ok {
+			res := ctx.Invoke2(fn, b, a)
+			if !res.IsNotImplemented() {
+				return res
+			}
+		}
+	}
+	return raiseTypeError(ctx, "unsupported operand type(s) for %: '"+aType.Name+"' and '"+bType.Name+"'")
 }
 
 // Pow performs Python exponentiation (a ** b).
 func Pow(a, b Value) Value {
+	return PowCtx(nil, a, b)
+}
+
+// PowCtx performs Python exponentiation (a ** b) with VM execution context.
+func PowCtx(ctx *ExecContext, a, b Value) Value {
+	aType := a.Type()
+	bType := b.Type()
+	isStrictSub := aType != bType && IsSubclass(bType, aType)
+	if isStrictSub {
+		if fn, _, ok := bType.LookupMRO(InternString("__rpow__")); ok {
+			res := ctx.Invoke2(fn, b, a)
+			if !res.IsNotImplemented() {
+				return res
+			}
+		}
+	}
 	if (a.ptr == &tagInt64 || a.ptr == &tagBool) && (b.ptr == &tagInt64 || b.ptr == &tagBool) {
 		ai := int64(a.num)
 		bi := int64(b.num)
@@ -894,27 +1091,55 @@ func Pow(a, b Value) Value {
 					}
 					return Int64Val(-1)
 				}
-				panic("OverflowError: exponent too large")
+				return raiseOverflowError(ctx, "exponent too large")
 			}
 			if int64(ba.BitLen())*bb.Int64() > 1<<26 {
-				panic("MemoryError: result of exponentiation is too large")
+				return raiseOverflowError(ctx, "result of exponentiation is too large")
 			}
 			return normBig(new(big.Int).Exp(ba, bb, nil))
 		}
 		if toBigInt(a).Sign() == 0 {
-			panic("vm: ZeroDivisionError: zero to a negative power")
+			return raiseZeroDivisionError(ctx, "zero to a negative power")
 		}
 	}
 	if a.Kind() == KindComplex || b.Kind() == KindComplex {
-		return complexPow(a, b)
+		ar, ai, ok1 := toComplexParts(a)
+		br, bi, ok2 := toComplexParts(b)
+		if !ok1 || !ok2 {
+			return raiseTypeError(ctx, "unsupported operand type(s) for ** or pow(): '"+a.Type().Name+"' and '"+b.Type().Name+"'")
+		}
+		if ar == 0 && ai == 0 && (bi != 0 || br < 0) {
+			return raiseZeroDivisionError(ctx, "zero to a negative or complex power")
+		}
+		r, i := complexPowParts(ar, ai, br, bi)
+		if math.IsInf(r, 0) || math.IsInf(i, 0) {
+			if !math.IsInf(ar, 0) && !math.IsInf(ai, 0) && !math.IsInf(br, 0) && !math.IsInf(bi, 0) {
+				return raiseOverflowError(ctx, "complex exponentiation")
+			}
+		}
+		return NewComplexVal(r, i)
 	}
 	if !isNumberKind(a) || !isNumberKind(b) {
-		panic("val: TypeError: unsupported operand type(s) for ** or pow(): '" + a.Type().Name + "' and '" + b.Type().Name + "'")
+		if fn, _, ok := aType.LookupMRO(InternString("__pow__")); ok {
+			res := ctx.Invoke2(fn, a, b)
+			if !res.IsNotImplemented() {
+				return res
+			}
+		}
+		if !isStrictSub {
+			if fn, _, ok := bType.LookupMRO(InternString("__rpow__")); ok {
+				res := ctx.Invoke2(fn, b, a)
+				if !res.IsNotImplemented() {
+					return res
+				}
+			}
+		}
+		return raiseTypeError(ctx, "unsupported operand type(s) for ** or pow(): '"+a.Type().Name+"' and '"+b.Type().Name+"'")
 	}
 	af := toFloat64(a)
 	bf := toFloat64(b)
 	if af == 0 && bf < 0 {
-		panic("vm: ZeroDivisionError: zero to a negative power")
+		return raiseZeroDivisionError(ctx, "zero to a negative power")
 	}
 	if af < 0 && !math.IsInf(bf, 0) && bf != math.Floor(bf) {
 		return complexPow(Float64Val(af), Float64Val(bf))
@@ -977,21 +1202,21 @@ func InCtx(ctx *ExecContext, item, container Value) Value {
 	}
 	if container.IsAnyString() && cType == StrType {
 		if !item.IsAnyString() {
-			panic("TypeError: 'in <string>' requires string as left operand, not " + item.Type().Name)
+			return raiseTypeError(ctx, "'in <string>' requires string as left operand, not "+item.Type().Name)
 		}
 		return BoolVal(strings.Contains(container.AsString(), item.AsString()))
 	}
 	if cType != nil {
 		if cType.dunderContains.ptr != nil {
 			if cType.dunderContains.IsNone() {
-				panic("TypeError: argument of type '" + cType.Name + "' is not iterable")
+				return raiseTypeError(ctx, "argument of type '"+cType.Name+"' is not iterable")
 			}
 			res := ctx.Invoke2(cType.dunderContains, container, item)
 			return BoolVal(res.IsTruthy())
 		}
 		if fn, _, ok := cType.LookupMRO(DunderContains); ok {
 			if fn.IsNone() {
-				panic("TypeError: argument of type '" + cType.Name + "' is not iterable")
+				return raiseTypeError(ctx, "argument of type '"+cType.Name+"' is not iterable")
 			}
 			res := ctx.Invoke2(fn, container, item)
 			return BoolVal(res.IsTruthy())
@@ -1009,7 +1234,7 @@ func InCtx(ctx *ExecContext, item, container Value) Value {
 		if item.IsInt64() {
 			v := item.AsInt64()
 			if v < 0 || v > 255 {
-				panic("ValueError: byte must be in range(0, 256)")
+				return raiseValueError(ctx, "byte must be in range(0, 256)")
 			}
 			return BoolVal(bytes.IndexByte(buf, byte(v)) >= 0)
 		}
@@ -1019,7 +1244,7 @@ func InCtx(ctx *ExecContext, item, container Value) Value {
 		if item.IsByteArray() {
 			return BoolVal(bytes.Contains(buf, item.AsByteArray().Data))
 		}
-		panic("TypeError: a bytes-like object is required, not '" + item.Type().Name + "'")
+		return raiseTypeError(ctx, "a bytes-like object is required, not '"+item.Type().Name+"'")
 	}
 	if ctx == nil && AcquireExecContextHook != nil {
 		var release func()
@@ -1041,7 +1266,7 @@ func InCtx(ctx *ExecContext, item, container Value) Value {
 		if cType != nil {
 			typeName = cType.Name
 		}
-		panic("TypeError: argument of type '" + typeName + "' is not iterable")
+		return raiseTypeError(ctx, "argument of type '"+typeName+"' is not iterable")
 	}
 	for {
 		elem, status := itNext(ctx, it)
@@ -1175,15 +1400,29 @@ func BitAnd(ctx *ExecContext, a, b Value) Value {
 	if (a.ptr == &tagInt64 || a.ptr == &tagBool) && (b.ptr == &tagInt64 || b.ptr == &tagBool) {
 		return Int64Val(int64(a.num) & int64(b.num))
 	}
+	if isAnyInt(a) && isAnyInt(b) {
+		return normBig(new(big.Int).And(toBigInt(a), toBigInt(b)))
+	}
 	if a.IsSet() && b.IsSet() {
 		return a.AsSet().Intersection(b.AsSet())
 	}
 	if m, _, ok := a.Type().LookupMRO(InternString("__and__")); ok {
 		if ctx != nil {
-			return ctx.Invoke2(m, a, b)
+			res := ctx.Invoke2(m, a, b)
+			if !res.IsNotImplemented() {
+				return res
+			}
 		}
 	}
-	panic("TypeError: unsupported operand type(s) for &: '" + a.Type().Name + "' and '" + b.Type().Name + "'")
+	if m, _, ok := b.Type().LookupMRO(InternString("__rand__")); ok {
+		if ctx != nil {
+			res := ctx.Invoke2(m, b, a)
+			if !res.IsNotImplemented() {
+				return res
+			}
+		}
+	}
+	return raiseTypeError(ctx, "unsupported operand type(s) for &: '"+a.Type().Name+"' and '"+b.Type().Name+"'")
 }
 
 // UnionOrHook builds a PEP 604 union when both operands are unionable.
@@ -1196,6 +1435,9 @@ var UnionOrHook func(ctx *ExecContext, a, b Value) (Value, bool)
 func BitOr(ctx *ExecContext, a, b Value) Value {
 	if (a.ptr == &tagInt64 || a.ptr == &tagBool) && (b.ptr == &tagInt64 || b.ptr == &tagBool) {
 		return Int64Val(int64(a.num) | int64(b.num))
+	}
+	if isAnyInt(a) && isAnyInt(b) {
+		return normBig(new(big.Int).Or(toBigInt(a), toBigInt(b)))
 	}
 	if a.IsSet() && b.IsSet() {
 		return a.AsSet().Union(b.AsSet())
@@ -1218,7 +1460,10 @@ func BitOr(ctx *ExecContext, a, b Value) Value {
 	}
 	if m, _, ok := a.Type().LookupMRO(InternString("__or__")); ok {
 		if ctx != nil {
-			return ctx.Invoke2(m, a, b)
+			res := ctx.Invoke2(m, a, b)
+			if !res.IsNotImplemented() {
+				return res
+			}
 		}
 	}
 	if a.IsDict() && b.IsDict() {
@@ -1232,7 +1477,15 @@ func BitOr(ctx *ExecContext, a, b Value) Value {
 		}
 		return merged
 	}
-	panic("TypeError: unsupported operand type(s) for |: '" + a.Type().Name + "' and '" + b.Type().Name + "'")
+	if m, _, ok := b.Type().LookupMRO(InternString("__ror__")); ok {
+		if ctx != nil {
+			res := ctx.Invoke2(m, b, a)
+			if !res.IsNotImplemented() {
+				return res
+			}
+		}
+	}
+	return raiseTypeError(ctx, "unsupported operand type(s) for |: '"+a.Type().Name+"' and '"+b.Type().Name+"'")
 }
 
 // BitXor performs Python bitwise xor (a ^ b).
@@ -1240,41 +1493,127 @@ func BitXor(ctx *ExecContext, a, b Value) Value {
 	if (a.ptr == &tagInt64 || a.ptr == &tagBool) && (b.ptr == &tagInt64 || b.ptr == &tagBool) {
 		return Int64Val(int64(a.num) ^ int64(b.num))
 	}
+	if isAnyInt(a) && isAnyInt(b) {
+		return normBig(new(big.Int).Xor(toBigInt(a), toBigInt(b)))
+	}
 	if a.IsSet() && b.IsSet() {
 		return a.AsSet().SymmetricDifference(b.AsSet())
 	}
 	if m, _, ok := a.Type().LookupMRO(InternString("__xor__")); ok {
 		if ctx != nil {
-			return ctx.Invoke2(m, a, b)
+			res := ctx.Invoke2(m, a, b)
+			if !res.IsNotImplemented() {
+				return res
+			}
 		}
 	}
-	panic("TypeError: unsupported operand type(s) for ^: '" + a.Type().Name + "' and '" + b.Type().Name + "'")
+	if m, _, ok := b.Type().LookupMRO(InternString("__rxor__")); ok {
+		if ctx != nil {
+			res := ctx.Invoke2(m, b, a)
+			if !res.IsNotImplemented() {
+				return res
+			}
+		}
+	}
+	return raiseTypeError(ctx, "unsupported operand type(s) for ^: '"+a.Type().Name+"' and '"+b.Type().Name+"'")
 }
 
 // LShift performs Python left shift (a << b).
 func LShift(ctx *ExecContext, a, b Value) Value {
 	if (a.ptr == &tagInt64 || a.ptr == &tagBool) && (b.ptr == &tagInt64 || b.ptr == &tagBool) {
-		return Int64Val(int64(a.num) << uint64(b.num))
+		shift := int64(b.num)
+		if shift < 0 {
+			return raiseValueError(ctx, "negative shift count")
+		}
+		val := int64(a.num)
+		if shift < 62 && val != 0 {
+			res := val << uint(shift)
+			if (res >> uint(shift)) == val {
+				return Int64Val(res)
+			}
+		} else if shift == 0 || val == 0 {
+			return a
+		}
+		res := new(big.Int).Lsh(big.NewInt(val), uint(shift))
+		return normBig(res)
+	}
+	if isAnyInt(a) && isAnyInt(b) {
+		biB := toBigInt(b)
+		if biB.Sign() < 0 {
+			return raiseValueError(ctx, "negative shift count")
+		}
+		if !biB.IsUint64() {
+			return raiseValueError(ctx, "shift count too large")
+		}
+		res := new(big.Int).Lsh(toBigInt(a), uint(biB.Uint64()))
+		return normBig(res)
 	}
 	if m, _, ok := a.Type().LookupMRO(InternString("__lshift__")); ok {
 		if ctx != nil {
-			return ctx.Invoke2(m, a, b)
+			res := ctx.Invoke2(m, a, b)
+			if !res.IsNotImplemented() {
+				return res
+			}
 		}
 	}
-	panic("TypeError: unsupported operand type(s) for <<: '" + a.Type().Name + "' and '" + b.Type().Name + "'")
+	if m, _, ok := b.Type().LookupMRO(InternString("__rlshift__")); ok {
+		if ctx != nil {
+			res := ctx.Invoke2(m, b, a)
+			if !res.IsNotImplemented() {
+				return res
+			}
+		}
+	}
+	return raiseTypeError(ctx, "unsupported operand type(s) for <<: '"+a.Type().Name+"' and '"+b.Type().Name+"'")
 }
 
 // RShift performs Python right shift (a >> b).
 func RShift(ctx *ExecContext, a, b Value) Value {
 	if (a.ptr == &tagInt64 || a.ptr == &tagBool) && (b.ptr == &tagInt64 || b.ptr == &tagBool) {
-		return Int64Val(int64(a.num) >> uint64(b.num))
+		shift := int64(b.num)
+		if shift < 0 {
+			return raiseValueError(ctx, "negative shift count")
+		}
+		val := int64(a.num)
+		if shift < 64 {
+			return Int64Val(val >> uint(shift))
+		}
+		if val < 0 {
+			return Int64Val(-1)
+		}
+		return Int64Val(0)
+	}
+	if isAnyInt(a) && isAnyInt(b) {
+		biB := toBigInt(b)
+		if biB.Sign() < 0 {
+			return raiseValueError(ctx, "negative shift count")
+		}
+		if !biB.IsUint64() {
+			if toBigInt(a).Sign() < 0 {
+				return Int64Val(-1)
+			}
+			return Int64Val(0)
+		}
+		res := new(big.Int).Rsh(toBigInt(a), uint(biB.Uint64()))
+		return normBig(res)
 	}
 	if m, _, ok := a.Type().LookupMRO(InternString("__rshift__")); ok {
 		if ctx != nil {
-			return ctx.Invoke2(m, a, b)
+			res := ctx.Invoke2(m, a, b)
+			if !res.IsNotImplemented() {
+				return res
+			}
 		}
 	}
-	panic("TypeError: unsupported operand type(s) for >>: '" + a.Type().Name + "' and '" + b.Type().Name + "'")
+	if m, _, ok := b.Type().LookupMRO(InternString("__rrshift__")); ok {
+		if ctx != nil {
+			res := ctx.Invoke2(m, b, a)
+			if !res.IsNotImplemented() {
+				return res
+			}
+		}
+	}
+	return raiseTypeError(ctx, "unsupported operand type(s) for >>: '"+a.Type().Name+"' and '"+b.Type().Name+"'")
 }
 
 // Invert performs Python bitwise invert (~a).
@@ -1282,25 +1621,105 @@ func Invert(ctx *ExecContext, a Value) Value {
 	if a.ptr == &tagInt64 || a.ptr == &tagBool {
 		return Int64Val(^int64(a.num))
 	}
+	if isAnyInt(a) {
+		bi := toBigInt(a)
+		one := big.NewInt(1)
+		res := new(big.Int).Add(bi, one)
+		res.Neg(res)
+		return normBig(res)
+	}
 	if m, _, ok := a.Type().LookupMRO(InternString("__invert__")); ok {
 		if ctx != nil {
-			return ctx.Invoke1(m, a)
+			res := ctx.Invoke1(m, a)
+			if !res.IsNotImplemented() {
+				return res
+			}
 		}
 	}
-	panic("TypeError: bad operand type for unary ~: '" + a.Type().Name + "'")
+	return raiseTypeError(ctx, "bad operand type for unary ~: '"+a.Type().Name+"'")
+}
+
+// Positive performs Python unary positive (+a).
+func Positive(ctx *ExecContext, a Value) Value {
+	if a.ptr == &tagInt64 || a.ptr == &tagBool {
+		return Int64Val(int64(a.num))
+	}
+	if a.ptr == &tagFloat64 {
+		return a
+	}
+	if a.IsComplex() {
+		return a
+	}
+	if isAnyInt(a) {
+		return a
+	}
+	if m, _, ok := a.Type().LookupMRO(InternString("__pos__")); ok {
+		if ctx != nil {
+			res := ctx.Invoke1(m, a)
+			if !res.IsNotImplemented() {
+				return res
+			}
+		}
+	}
+	return raiseTypeError(ctx, "bad operand type for unary +: '"+a.Type().Name+"'")
+}
+
+// Negative performs Python unary negative (-a).
+func Negative(ctx *ExecContext, a Value) Value {
+	if a.ptr == &tagInt64 {
+		return Int64Val(-int64(a.num))
+	}
+	if a.ptr == &tagBool {
+		return Int64Val(-int64(a.num))
+	}
+	if a.ptr == &tagFloat64 {
+		return Float64Val(-math.Float64frombits(a.num))
+	}
+	if a.IsComplex() {
+		c := a.AsComplex()
+		return NewComplexVal(-c.Real, -c.Imag)
+	}
+	if isAnyInt(a) {
+		bi := toBigInt(a)
+		return normBig(new(big.Int).Neg(bi))
+	}
+	if m, _, ok := a.Type().LookupMRO(InternString("__neg__")); ok {
+		if ctx != nil {
+			res := ctx.Invoke1(m, a)
+			if !res.IsNotImplemented() {
+				return res
+			}
+		}
+	}
+	return raiseTypeError(ctx, "bad operand type for unary -: '"+a.Type().Name+"'")
 }
 
 // MatMul performs Python matrix multiplication (a @ b).
 func MatMul(ctx *ExecContext, a, b Value) Value {
 	if m, _, ok := a.Type().LookupMRO(InternString("__matmul__")); ok {
 		if ctx != nil {
-			return ctx.Invoke2(m, a, b)
+			res := ctx.Invoke2(m, a, b)
+			if !res.IsNotImplemented() {
+				return res
+			}
 		}
 	}
-	panic("TypeError: unsupported operand type(s) for @: '" + a.Type().Name + "' and '" + b.Type().Name + "'")
+	if m, _, ok := b.Type().LookupMRO(InternString("__rmatmul__")); ok {
+		if ctx != nil {
+			res := ctx.Invoke2(m, b, a)
+			if !res.IsNotImplemented() {
+				return res
+			}
+		}
+	}
+	return raiseTypeError(ctx, "unsupported operand type(s) for @: '"+a.Type().Name+"' and '"+b.Type().Name+"'")
 }
 
 func formatStringMod(fmtStr string, arg Value) Value {
+	return formatStringModCtx(nil, fmtStr, arg)
+}
+
+func formatStringModCtx(ctx *ExecContext, fmtStr string, arg Value) Value {
 	var items []Value
 	var argDict *PyDict
 	if arg.IsTuple() {
@@ -1351,7 +1770,7 @@ func formatStringMod(fmtStr string, arg Value) Value {
 			i++
 		}
 		if i >= n {
-			panic("ValueError: incomplete format")
+			return raiseValueError(ctx, "incomplete format")
 		}
 		specifier := fmtStr[startSpec:i]
 		convType := fmtStr[i]
@@ -1360,16 +1779,20 @@ func formatStringMod(fmtStr string, arg Value) Value {
 		var val Value
 		if hasMapKey {
 			if argDict == nil {
-				panic("TypeError: format requires a mapping")
+				return raiseTypeError(ctx, "format requires a mapping")
 			}
 			var ok bool
 			val, ok = argDict.Get(InternString(mapKey))
 			if !ok {
+				if ctx != nil {
+					ctx.Raise(NewException(KeyErrorType, fmt.Sprintf("KeyError: %s", mapKey)))
+					return NoneVal()
+				}
 				panic(NewException(KeyErrorType, fmt.Sprintf("KeyError: %s", mapKey)))
 			}
 		} else {
 			if itemIdx >= len(items) {
-				panic("TypeError: not enough arguments for format string")
+				return raiseTypeError(ctx, "not enough arguments for format string")
 			}
 			val = items[itemIdx]
 			itemIdx++
@@ -1389,13 +1812,29 @@ func formatStringMod(fmtStr string, arg Value) Value {
 		case 'a':
 			rendered = asciiEscape(modConvert(val, PyRepr))
 		case 'd', 'i', 'u':
-			rendered = fmt.Sprintf("%"+specifier+"d", val.AsInt64())
+			if isAnyInt(val) {
+				rendered = fmt.Sprintf("%"+specifier+"d", toBigInt(val))
+			} else {
+				rendered = fmt.Sprintf("%"+specifier+"d", val.AsInt64())
+			}
 		case 'x':
-			rendered = fmt.Sprintf("%"+specifier+"x", val.AsInt64())
+			if isAnyInt(val) {
+				rendered = fmt.Sprintf("%"+specifier+"x", toBigInt(val))
+			} else {
+				rendered = fmt.Sprintf("%"+specifier+"x", val.AsInt64())
+			}
 		case 'X':
-			rendered = fmt.Sprintf("%"+specifier+"X", val.AsInt64())
+			if isAnyInt(val) {
+				rendered = fmt.Sprintf("%"+specifier+"X", toBigInt(val))
+			} else {
+				rendered = fmt.Sprintf("%"+specifier+"X", val.AsInt64())
+			}
 		case 'o':
-			rendered = fmt.Sprintf("%"+specifier+"o", val.AsInt64())
+			if isAnyInt(val) {
+				rendered = fmt.Sprintf("%"+specifier+"o", toBigInt(val))
+			} else {
+				rendered = fmt.Sprintf("%"+specifier+"o", val.AsInt64())
+			}
 		case 'f', 'F':
 			fVal := toFloat64(val)
 			rendered = fmt.Sprintf("%"+specifier+"f", fVal)
@@ -1411,7 +1850,7 @@ func formatStringMod(fmtStr string, arg Value) Value {
 			} else if val.IsInt64() {
 				rendered = string(rune(val.AsInt64()))
 			} else {
-				panic("TypeError: %c requires int or char")
+				return raiseTypeError(ctx, "%c requires int or char")
 			}
 		default:
 			rendered = val.String()
@@ -1425,7 +1864,7 @@ func formatStringMod(fmtStr string, arg Value) Value {
 	}
 
 	if !hasAnyMapKey && itemIdx < len(items) {
-		panic("TypeError: not all arguments converted during string formatting")
+		return raiseTypeError(ctx, "not all arguments converted during string formatting")
 	}
 
 	return NewStringVal(sb.String())

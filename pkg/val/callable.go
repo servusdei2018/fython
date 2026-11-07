@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math"
+	"math/big"
 	"math/bits"
 	"sort"
 	"strconv"
@@ -17,6 +18,7 @@ import (
 type PyTuple struct {
 	Header ObjectHeader
 	Items  []Value
+	Attrs  *PyDict
 }
 
 // PyBuiltinFunc represents a zero-allocation native Go built-in callable using the Vectorcall convention.
@@ -25,6 +27,7 @@ type PyBuiltinFunc struct {
 	Header ObjectHeader
 	Name   string
 	Fn     VectorcallFunc
+	NoBind bool
 }
 
 // PyFunction represents a Python function object wrapping a KindCode bytecode object,
@@ -113,6 +116,21 @@ func NewBuiltinFuncVal(name string, fn VectorcallFunc) Value {
 		},
 		Name: name,
 		Fn:   fn,
+	}
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+// NewModuleFuncVal constructs a heap-allocated KindBuiltinFunc Value representing a standalone
+// module-level function that never binds as an instance method.
+func NewModuleFuncVal(name string, fn VectorcallFunc) Value {
+	obj := &PyBuiltinFunc{
+		Header: ObjectHeader{
+			Kind: KindBuiltinFunc,
+			Type: BuiltinFuncType,
+		},
+		Name:   name,
+		Fn:     fn,
+		NoBind: true,
 	}
 	return Value{num: 0, ptr: &obj.Header}
 }
@@ -278,6 +296,15 @@ func memberDescrTpDescrGet(ctx *ExecContext, descr, obj Value, owner *PyType) Va
 		return descr
 	}
 	md := descr.AsMemberDescr()
+	if obj.IsTuple() && IsSubclass(obj.Type(), md.Owner) {
+		t := obj.AsTuple()
+		if t.Attrs != nil {
+			if v, ok := t.Attrs.Get(md.Name); ok && !v.IsUnbound() {
+				return v
+			}
+		}
+		panic("val: AttributeError: '" + md.Owner.Name + "' object has no attribute '" + md.Name.AsString() + "'")
+	}
 	if !obj.IsInstance() {
 		panic("TypeError: descriptor '" + md.Name.AsString() + "' for '" + md.Owner.Name + "' objects doesn't apply to a '" + obj.Type().Name + "' object")
 	}
@@ -294,6 +321,18 @@ func memberDescrTpDescrGet(ctx *ExecContext, descr, obj Value, owner *PyType) Va
 
 func memberDescrTpDescrSet(ctx *ExecContext, descr, obj, value Value) {
 	md := descr.AsMemberDescr()
+	if obj.IsTuple() && IsSubclass(obj.Type(), md.Owner) {
+		t := obj.AsTuple()
+		if t.Attrs == nil {
+			t.Attrs = NewDictVal(4).AsDict()
+		}
+		if value.IsUnbound() {
+			t.Attrs.Delete(md.Name)
+			return
+		}
+		t.Attrs.Set(md.Name, value)
+		return
+	}
 	if !obj.IsInstance() {
 		panic("TypeError: descriptor '" + md.Name.AsString() + "' for '" + md.Owner.Name + "' objects doesn't apply to a '" + obj.Type().Name + "' object")
 	}
@@ -393,6 +432,17 @@ func staticMethodTpCall(ctx *ExecContext, callable Value, args []Value, kwnames 
 
 func functionDescrGet(ctx *ExecContext, descr, obj Value, owner *PyType) Value {
 	if obj.IsNone() || obj.IsUnbound() {
+		return descr
+	}
+	return NewBoundMethodVal(obj, descr)
+}
+
+func builtinFuncDescrGet(ctx *ExecContext, descr, obj Value, owner *PyType) Value {
+	if obj.IsNone() || obj.IsUnbound() {
+		return descr
+	}
+	bf := descr.AsBuiltinFunc()
+	if bf.NoBind {
 		return descr
 	}
 	return NewBoundMethodVal(obj, descr)
@@ -1011,13 +1061,24 @@ func strSqLen(ctx *ExecContext, a Value) int64 {
 }
 
 func strSqItem(ctx *ExecContext, a, idxVal Value) Value {
+	if !idxVal.IsInt64() {
+		if ctx != nil {
+			ctx.Raise(NewTypeError("string indices must be integers, not '" + idxVal.Type().Name + "'"))
+			return NoneVal()
+		}
+		panic("TypeError: string indices must be integers, not '" + idxVal.Type().Name + "'")
+	}
 	idx := int(idxVal.AsInt64())
 	s := a.AsString()
 	if idx < 0 {
 		idx += len(s)
 	}
 	if idx < 0 || idx >= len(s) {
-		panic("val: IndexError: string index out of range")
+		if ctx != nil {
+			ctx.Raise(NewIndexError("string index out of range"))
+			return NoneVal()
+		}
+		panic("IndexError: string index out of range")
 	}
 	return SmallStringVal(s[idx : idx+1])
 }
@@ -1587,6 +1648,19 @@ func bytesTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value
 		}
 		return NewBytesVal(res)
 	}
+	// Fall back to general iterable extraction (generators, ranges, etc.)
+	if ctx != nil {
+		items := ExtractIterableItems(ctx, arg)
+		res := make([]byte, len(items))
+		for i, it := range items {
+			b := it.AsInt64()
+			if b < 0 || b > 255 {
+				panic("ValueError: bytes must be in range(0, 256)")
+			}
+			res[i] = byte(b)
+		}
+		return NewBytesVal(res)
+	}
 	panic("TypeError: cannot convert '" + arg.Type().Name + "' object to bytes")
 }
 
@@ -1636,6 +1710,19 @@ func byteArrayTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []V
 	}
 	if arg.IsTuple() {
 		items := arg.AsTuple().Items
+		res := make([]byte, len(items))
+		for i, it := range items {
+			b := it.AsInt64()
+			if b < 0 || b > 255 {
+				panic("ValueError: byte must be in range(0, 256)")
+			}
+			res[i] = byte(b)
+		}
+		return NewByteArrayVal(res)
+	}
+	// Fall back to general iterable extraction (generators, ranges, etc.)
+	if ctx != nil {
+		items := ExtractIterableItems(ctx, arg)
 		res := make([]byte, len(items))
 		for i, it := range items {
 			b := it.AsInt64()
@@ -2251,11 +2338,31 @@ func ExtractIterableItems(ctx *ExecContext, arg Value) []Value {
 	if arg.IsDict() {
 		return arg.AsDict().Keys()
 	}
+	if arg.Type() == DictKeysType {
+		pk := (*PyDictKeys)(AsPointer(arg))
+		return pk.Dict.Keys()
+	}
 	if arg.IsAnyString() {
 		s := arg.AsString()
 		var res []Value
 		for _, r := range s {
 			res = append(res, NewStringVal(string(r)))
+		}
+		return res
+	}
+	if arg.IsBytes() {
+		data := arg.AsBytes().Data
+		res := make([]Value, len(data))
+		for i, b := range data {
+			res[i] = Int64Val(int64(b))
+		}
+		return res
+	}
+	if arg.IsByteArray() {
+		data := arg.AsByteArray().Data
+		res := make([]Value, len(data))
+		for i, b := range data {
+			res[i] = Int64Val(int64(b))
 		}
 		return res
 	}
@@ -2307,7 +2414,24 @@ func ExtractIterableItems(ctx *ExecContext, arg Value) []Value {
 			if itType != nil && itType.Slots.TpIterNext != nil {
 				var res []Value
 				for {
-					v, status := itType.Slots.TpIterNext(ctx, it)
+					var v Value
+					var status IterStatus
+					var done bool
+					func() {
+						defer func() {
+							if r := recover(); r != nil {
+								if exc, ok := r.(Value); ok && IsInstance(exc, StopIterationType) {
+									done = true
+									return
+								}
+								panic(r)
+							}
+						}()
+						v, status = itType.Slots.TpIterNext(ctx, it)
+					}()
+					if done {
+						break
+					}
 					if status == IterError {
 						if ctx != nil && ctx.HasException() && IsInstance(ctx.ActiveException, StopIterationType) {
 							ctx.ClearException()
@@ -2325,11 +2449,28 @@ func ExtractIterableItems(ctx *ExecContext, arg Value) []Value {
 				if nextFn, _, okNext := itType.LookupMRO(InternString("__next__")); okNext {
 					var res []Value
 					for {
-						v := ctx.Invoke1(nextFn, it)
-						if ctx != nil && ctx.HasException() {
-							if IsInstance(ctx.ActiveException, StopIterationType) {
-								ctx.ClearException()
+						var v Value
+						var done bool
+						func() {
+							defer func() {
+								if r := recover(); r != nil {
+									if exc, ok := r.(Value); ok && IsInstance(exc, StopIterationType) {
+										done = true
+										return
+									}
+									panic(r)
+								}
+							}()
+							v = ctx.Invoke1(nextFn, it)
+							if ctx != nil && ctx.HasException() {
+								if IsInstance(ctx.ActiveException, StopIterationType) {
+									ctx.ClearException()
+									done = true
+									return
+								}
 							}
+						}()
+						if done {
 							break
 						}
 						res = append(res, v)
@@ -2812,27 +2953,55 @@ func initTypes() {
 	}))
 
 	IntType.Slots.TpCall = func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		if len(args) == 0 {
+		pa, kw := splitStrKw(args, kwnames)
+		if len(pa) == 0 {
 			return Int64Val(0)
 		}
-		a := args[0]
-		if a.IsInt64() {
+		base := 10
+		if len(pa) > 1 && pa[1].IsInt64() {
+			base = int(pa[1].AsInt64())
+		} else if bVal, ok := kw["base"]; ok && bVal.IsInt64() {
+			base = int(bVal.AsInt64())
+		}
+		a := pa[0]
+		if a.IsInt64() && base == 10 {
 			return a
 		}
-		if a.IsFloat64() {
+		if a.Kind() == KindBigInt && base == 10 {
+			return a
+		}
+		if a.IsFloat64() && base == 10 {
 			return Int64Val(int64(a.AsFloat64()))
 		}
-		if a.IsBool() {
+		if a.IsBool() && base == 10 {
 			if a.AsBool() {
 				return Int64Val(1)
 			}
 			return Int64Val(0)
 		}
-		if a.IsAnyString() {
-			n, err := strconv.ParseInt(strings.TrimSpace(a.AsString()), 10, 64)
-			if err == nil {
-				return Int64Val(n)
+		if a.IsAnyString() || a.IsBytes() || a.IsByteArray() {
+			var s string
+			if a.IsAnyString() {
+				s = strings.TrimSpace(a.AsString())
+			} else if a.IsBytes() {
+				s = strings.TrimSpace(string(a.AsBytes().Data))
+			} else {
+				s = strings.TrimSpace(string(a.AsByteArray().Data))
 			}
+			if base == 16 {
+				if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
+					s = s[2:]
+				} else if strings.HasPrefix(s, "+0x") || strings.HasPrefix(s, "+0X") {
+					s = s[3:]
+				} else if strings.HasPrefix(s, "-0x") || strings.HasPrefix(s, "-0X") {
+					s = "-" + s[3:]
+				}
+			}
+			bi := new(big.Int)
+			if _, ok := bi.SetString(s, base); ok {
+				return normBig(bi)
+			}
+			panic("ValueError: invalid literal for int() with base " + strconv.Itoa(base) + ": '" + s + "'")
 		}
 		if a.IsInstance() {
 			inst := a.AsInstance()
@@ -2848,6 +3017,107 @@ func initTypes() {
 		}
 		panic("TypeError: int() argument must be a string or number")
 	}
+
+	IntType.Dict.Set(InternString("from_bytes"), NewBuiltinFuncVal("int.from_bytes", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		pa, kw := splitStrKw(args, kwnames)
+		if len(pa) > 0 && pa[0].IsType() {
+			pa = pa[1:]
+		}
+		if len(pa) < 1 {
+			panic("TypeError: from_bytes() takes at least 1 argument")
+		}
+		var rawBytes []byte
+		if b, ok := bytesMethodArg(pa[0]); ok {
+			rawBytes = b
+		} else {
+			items := ExtractIterableItems(ctx, pa[0])
+			rawBytes = make([]byte, len(items))
+			for i, it := range items {
+				if it.IsInt64() {
+					bVal := it.AsInt64()
+					if bVal < 0 || bVal > 255 {
+						panic("ValueError: byte must be in range(0, 256)")
+					}
+					rawBytes[i] = byte(bVal)
+				} else {
+					panic("TypeError: an integer is required")
+				}
+			}
+		}
+		byteorder := "big"
+		if len(pa) > 1 && pa[1].IsAnyString() {
+			byteorder = pa[1].AsString()
+		} else if bo, ok := kw["byteorder"]; ok && bo.IsAnyString() {
+			byteorder = bo.AsString()
+		}
+		signed := false
+		if sVal, ok := kw["signed"]; ok {
+			signed = sVal.IsTruthy()
+		} else if len(pa) > 2 {
+			signed = pa[2].IsTruthy()
+		}
+		if len(rawBytes) == 0 {
+			return Int64Val(0)
+		}
+		bCopy := make([]byte, len(rawBytes))
+		copy(bCopy, rawBytes)
+		if byteorder == "little" {
+			for i, j := 0, len(bCopy)-1; i < j; i, j = i+1, j-1 {
+				bCopy[i], bCopy[j] = bCopy[j], bCopy[i]
+			}
+		} else if byteorder != "big" {
+			panic("ValueError: byteorder must be either 'little' or 'big'")
+		}
+		bi := new(big.Int).SetBytes(bCopy)
+		if signed && (bCopy[0]&0x80) != 0 {
+			shift := uint(len(bCopy) * 8)
+			twoPow := new(big.Int).Lsh(big.NewInt(1), shift)
+			bi.Sub(bi, twoPow)
+		}
+		return normBig(bi)
+	}))
+
+	IntType.Dict.Set(InternString("to_bytes"), NewBuiltinFuncVal("int.to_bytes", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		pa, kw := splitStrKw(args, kwnames)
+		if len(pa) < 2 {
+			panic("TypeError: to_bytes() takes at least 1 argument")
+		}
+		self := pa[0]
+		length := int(pa[1].AsInt64())
+		byteorder := "big"
+		if len(pa) > 2 && pa[2].IsAnyString() {
+			byteorder = pa[2].AsString()
+		} else if bo, ok := kw["byteorder"]; ok && bo.IsAnyString() {
+			byteorder = bo.AsString()
+		}
+		signed := false
+		if sVal, ok := kw["signed"]; ok {
+			signed = sVal.IsTruthy()
+		}
+		bi := toBigInt(self)
+		if !signed && bi.Sign() < 0 {
+			panic("OverflowError: can't convert negative int to unsigned")
+		}
+		if signed && bi.Sign() < 0 {
+			shift := uint(length * 8)
+			twoPow := new(big.Int).Lsh(big.NewInt(1), shift)
+			bi = new(big.Int).Add(bi, twoPow)
+		}
+		b := bi.Bytes()
+		if len(b) > length {
+			panic("OverflowError: int too big to convert")
+		}
+		res := make([]byte, length)
+		copy(res[length-len(b):], b)
+		if byteorder == "little" {
+			for i, j := 0, len(res)-1; i < j; i, j = i+1, j-1 {
+				res[i], res[j] = res[j], res[i]
+			}
+		} else if byteorder != "big" {
+			panic("ValueError: byteorder must be either 'little' or 'big'")
+		}
+		return NewBytesVal(res)
+	}))
 
 	BoolType = MustNewType("bool", []*PyType{IntType}, nil)
 	BoolType.Slots.NbAdd = numericNbAdd
@@ -3801,12 +4071,53 @@ func initTypes() {
 		return NoneVal()
 	}))
 
+	DictKeysType = MustNewType("dict_keys", []*PyType{ObjectType}, nil)
+	DictKeysType.Slots.SqLen = func(ctx *ExecContext, self Value) int64 {
+		pk := (*PyDictKeys)(AsPointer(self))
+		return int64(pk.Dict.Len())
+	}
+	DictKeysType.Slots.TpIter = func(ctx *ExecContext, self Value) Value {
+		pk := (*PyDictKeys)(AsPointer(self))
+		return NewIterVal(Value{num: uint64(KindDict), ptr: &pk.Dict.Header})
+	}
+	DictKeysType.Slots.NbSub = func(ctx *ExecContext, a, b Value) Value {
+		s1 := NewSetVal(ExtractIterableItems(ctx, a)...).AsSet()
+		s2 := NewSetVal(ExtractIterableItems(ctx, b)...).AsSet()
+		return s1.Difference(s2)
+	}
+	DictKeysType.Dict.Set(DunderSub, NewBuiltinFuncVal("__sub__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: __sub__() takes 1 argument")
+		}
+		return DictKeysType.Slots.NbSub(ctx, args[0], args[1])
+	}))
+	DictKeysType.Dict.Set(DunderIter, NewBuiltinFuncVal("__iter__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: __iter__() missing self")
+		}
+		return DictKeysType.Slots.TpIter(ctx, args[0])
+	}))
+	DictKeysType.Dict.Set(DunderLen, NewBuiltinFuncVal("__len__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: __len__() missing self")
+		}
+		return Int64Val(DictKeysType.Slots.SqLen(ctx, args[0]))
+	}))
+	DictKeysType.Dict.Set(InternString("__contains__"), NewBuiltinFuncVal("__contains__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: __contains__() takes 1 argument")
+		}
+		pk := (*PyDictKeys)(AsPointer(args[0]))
+		_, found := pk.Dict.Get(args[1])
+		return BoolVal(found)
+	}))
+
 	DictType.Dict.Set(InternString("keys"), NewBuiltinFuncVal("keys", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
 			panic("TypeError: descriptor 'keys' of 'dict' object needs an argument")
 		}
 		d := args[0].AsDict()
-		return NewListVal(d.Keys()...)
+		return NewDictKeysVal(d)
 	}))
 
 	DictType.Dict.Set(InternString("values"), NewBuiltinFuncVal("values", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
@@ -4269,7 +4580,7 @@ func initTypes() {
 	FunctionType.dunderGet = funcGetBuiltin
 
 	BuiltinFuncType = MustNewType("builtin_function_or_method", []*PyType{ObjectType}, nil)
-	BuiltinFuncType.Slots.TpDescrGet = functionDescrGet
+	BuiltinFuncType.Slots.TpDescrGet = builtinFuncDescrGet
 	BuiltinFuncType.Slots.TpCall = builtinFuncTpCall
 
 	builtinFuncGetBuiltin := NewBuiltinFuncVal("builtin_function_or_method.__get__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
@@ -4285,7 +4596,7 @@ func initTypes() {
 		if len(args) > 2 && args[2].IsType() {
 			owner = args[2].AsType()
 		}
-		return functionDescrGet(ctx, fn, obj, owner)
+		return builtinFuncDescrGet(ctx, fn, obj, owner)
 	})
 	BuiltinFuncType.Dict.Set(DunderGet, builtinFuncGetBuiltin)
 	BuiltinFuncType.dunderGet = builtinFuncGetBuiltin
@@ -5458,6 +5769,13 @@ func initTypes() {
 	BytesType.Slots.TpAsBuffer = bytesTpAsBuffer
 	BytesType.Slots.NbAdd = bytesNbAdd
 	BytesType.Slots.TpCall = bytesTpCall
+	BytesType.Slots.TpIter = func(ctx *ExecContext, o Value) Value { return NewIterVal(o) }
+	BytesType.Dict.Set(DunderIter, NewBuiltinFuncVal("__iter__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: descriptor '__iter__' of 'bytes' object needs an argument")
+		}
+		return NewIterVal(args[0])
+	}))
 
 	bytesNewBuiltin := NewBuiltinFuncVal("bytes.__new__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		var callArgs []Value
@@ -5547,6 +5865,13 @@ func initTypes() {
 	ByteArrayType.Slots.MpAssSubscript = byteArrayMpAssSubscript
 	ByteArrayType.Slots.TpAsBuffer = byteArrayTpAsBuffer
 	ByteArrayType.Slots.TpCall = byteArrayTpCall
+	ByteArrayType.Slots.TpIter = func(ctx *ExecContext, o Value) Value { return NewIterVal(o) }
+	ByteArrayType.Dict.Set(DunderIter, NewBuiltinFuncVal("__iter__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: descriptor '__iter__' of 'bytearray' object needs an argument")
+		}
+		return NewIterVal(args[0])
+	}))
 	ByteArrayType.Dict.Set(InternString("append"), NewBuiltinFuncVal("append", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
 			panic("TypeError: append() takes exactly one argument")
@@ -5612,6 +5937,8 @@ func initTypes() {
 		ba.mu.RUnlock()
 		return NewStringVal(s)
 	}))
+
+	initBytesMethods()
 
 	MemoryViewType = MustNewType("memoryview", []*PyType{ObjectType}, nil)
 	MemoryViewType.Slots.SqLen = memoryViewSqLen
@@ -6058,4 +6385,20 @@ func initTypes() {
 
 	ObjectType.syncDunderSlots()
 	TypeType.syncDunderSlots()
+}
+
+type PyDictKeys struct {
+	inst PyInstance
+	Dict *PyDict
+}
+
+func NewDictKeysVal(d *PyDict) Value {
+	pk := &PyDictKeys{
+		inst: PyInstance{
+			Header: ObjectHeader{Kind: KindInstance, Type: DictKeysType},
+			Shape:  DictKeysType.RootShape,
+		},
+		Dict: d,
+	}
+	return ObjectVal(&pk.inst.Header)
 }

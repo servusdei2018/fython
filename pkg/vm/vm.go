@@ -997,13 +997,20 @@ func (vm *VM) initBuiltins() {
 	}))
 
 	vm.builtins.Set(val.InternString("open"), val.NewBuiltinFuncVal("open", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		if len(args) < 1 {
-			panic("TypeError: open() takes at least 1 argument")
+		pa := posArgs(args, kwnames)
+		if len(pa) < 1 {
+			if v, ok := kwArg(args, kwnames, "file"); ok {
+				pa = []val.Value{v}
+			} else {
+				panic("TypeError: open() missing required argument 'file' (pos 1)")
+			}
 		}
-		file := args[0].AsString()
+		file := pathArg(ctx, pa[0])
 		mode := "r"
-		if len(args) >= 2 && args[1].IsAnyString() {
-			mode = args[1].AsString()
+		if len(pa) >= 2 && pa[1].IsAnyString() {
+			mode = pa[1].AsString()
+		} else if v, ok := kwArg(args, kwnames, "mode"); ok && v.IsAnyString() {
+			mode = v.AsString()
 		}
 		return openFileBuiltin(file, mode)
 	}))
@@ -1836,6 +1843,25 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				vm.execCtx.SP = sp
 				vm.activeFrameIdx = frameIdx
 				stack[sp-2] = val.AddCtx(&vm.execCtx, a, b)
+				if vm.execCtx.HasException() {
+					exc := vm.execCtx.ActiveException
+					vm.execCtx.ClearException()
+					if stackIsVM && &stack[0] != &vm.stack[0] {
+						stack = vm.stack
+					}
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if activeGen != nil {
+							activeGen.State = val.GenClosed
+						}
+						if activeCoro != nil {
+							activeCoro.State = val.CoroClosed
+						}
+						return val.NoneVal()
+					}
+					locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+					curCodeCache = vm.getCodeCache(curCO)
+					continue
+				}
 			}
 			sp--
 			ip++
@@ -1858,6 +1884,25 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				vm.execCtx.SP = sp
 				vm.activeFrameIdx = frameIdx
 				stack[sp-2] = val.AddCtx(&vm.execCtx, a, b)
+				if vm.execCtx.HasException() {
+					exc := vm.execCtx.ActiveException
+					vm.execCtx.ClearException()
+					if stackIsVM && &stack[0] != &vm.stack[0] {
+						stack = vm.stack
+					}
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if activeGen != nil {
+							activeGen.State = val.GenClosed
+						}
+						if activeCoro != nil {
+							activeCoro.State = val.CoroClosed
+						}
+						return val.NoneVal()
+					}
+					locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+					curCodeCache = vm.getCodeCache(curCO)
+					continue
+				}
 			}
 			sp--
 			ip++
@@ -1873,6 +1918,25 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				vm.execCtx.SP = sp
 				vm.activeFrameIdx = frameIdx
 				stack[sp-2] = val.AddCtx(&vm.execCtx, a, b)
+				if vm.execCtx.HasException() {
+					exc := vm.execCtx.ActiveException
+					vm.execCtx.ClearException()
+					if stackIsVM && &stack[0] != &vm.stack[0] {
+						stack = vm.stack
+					}
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if activeGen != nil {
+							activeGen.State = val.GenClosed
+						}
+						if activeCoro != nil {
+							activeCoro.State = val.CoroClosed
+						}
+						return val.NoneVal()
+					}
+					locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+					curCodeCache = vm.getCodeCache(curCO)
+					continue
+				}
 			}
 			sp--
 			ip++
@@ -1895,6 +1959,25 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				vm.execCtx.SP = sp
 				vm.activeFrameIdx = frameIdx
 				stack[sp-2] = val.SubCtx(&vm.execCtx, a, b)
+				if vm.execCtx.HasException() {
+					exc := vm.execCtx.ActiveException
+					vm.execCtx.ClearException()
+					if stackIsVM && &stack[0] != &vm.stack[0] {
+						stack = vm.stack
+					}
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if activeGen != nil {
+							activeGen.State = val.GenClosed
+						}
+						if activeCoro != nil {
+							activeCoro.State = val.CoroClosed
+						}
+						return val.NoneVal()
+					}
+					locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+					curCodeCache = vm.getCodeCache(curCO)
+					continue
+				}
 			}
 			sp--
 			ip++
@@ -1917,6 +2000,25 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				vm.execCtx.SP = sp
 				vm.activeFrameIdx = frameIdx
 				stack[sp-2] = val.SubCtx(&vm.execCtx, a, b)
+				if vm.execCtx.HasException() {
+					exc := vm.execCtx.ActiveException
+					vm.execCtx.ClearException()
+					if stackIsVM && &stack[0] != &vm.stack[0] {
+						stack = vm.stack
+					}
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if activeGen != nil {
+							activeGen.State = val.GenClosed
+						}
+						if activeCoro != nil {
+							activeCoro.State = val.CoroClosed
+						}
+						return val.NoneVal()
+					}
+					locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+					curCodeCache = vm.getCodeCache(curCO)
+					continue
+				}
 			}
 			sp--
 			ip++
@@ -1927,6 +2029,25 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			vm.execCtx.SP = sp
 			vm.activeFrameIdx = frameIdx
 			stack[sp-2] = val.MulCtx(&vm.execCtx, a, b)
+			if vm.execCtx.HasException() {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				if stackIsVM && &stack[0] != &vm.stack[0] {
+					stack = vm.stack
+				}
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if activeGen != nil {
+						activeGen.State = val.GenClosed
+					}
+					if activeCoro != nil {
+						activeCoro.State = val.CoroClosed
+					}
+					return val.NoneVal()
+				}
+				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+				curCodeCache = vm.getCodeCache(curCO)
+				continue
+			}
 			sp--
 			ip++
 
@@ -2121,7 +2242,30 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				atomic.StoreUint32(&code[ip], (inst&0x00FFFFFF)|(uint32(OP_COMPARE_LT_INT)<<24))
 				stack[sp-2] = val.BoolVal(a.AsInt64() < b.AsInt64())
 			} else {
-				stack[sp-2] = val.LessThan(a, b)
+				vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+				vm.execCtx.SP = sp
+				res := vm.compareOpSafe(a, b, CMP_LT)
+				if stackIsVM && &stack[0] != &vm.stack[0] {
+					stack = vm.stack
+					locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+				}
+				if vm.execCtx.HasException() {
+					exc := vm.execCtx.ActiveException
+					vm.execCtx.ClearException()
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if activeGen != nil {
+							activeGen.State = val.GenClosed
+						}
+						if activeCoro != nil {
+							activeCoro.State = val.CoroClosed
+						}
+						return val.NoneVal()
+					}
+					locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+					curCodeCache = vm.getCodeCache(curCO)
+					continue
+				}
+				stack[sp-2] = res
 			}
 			sp--
 			ip++
@@ -2134,7 +2278,30 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			} else {
 				// Type stability broken: deoptimize in-place back to OP_COMPARE_LT
 				atomic.StoreUint32(&code[ip], (inst&0x00FFFFFF)|(uint32(OP_COMPARE_LT)<<24))
-				stack[sp-2] = val.LessThan(a, b)
+				vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+				vm.execCtx.SP = sp
+				res := vm.compareOpSafe(a, b, CMP_LT)
+				if stackIsVM && &stack[0] != &vm.stack[0] {
+					stack = vm.stack
+					locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+				}
+				if vm.execCtx.HasException() {
+					exc := vm.execCtx.ActiveException
+					vm.execCtx.ClearException()
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if activeGen != nil {
+							activeGen.State = val.GenClosed
+						}
+						if activeCoro != nil {
+							activeCoro.State = val.CoroClosed
+						}
+						return val.NoneVal()
+					}
+					locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+					curCodeCache = vm.getCodeCache(curCO)
+					continue
+				}
+				stack[sp-2] = res
 			}
 			sp--
 			ip++
@@ -4666,8 +4833,15 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		case OP_BINARY_TRUE_DIV:
 			b := stack[sp-1]
 			a := stack[sp-2]
-			if (b.IsInt64() && b.AsInt64() == 0) || (b.IsFloat64() && b.AsFloat64() == 0.0) {
-				exc := val.NewZeroDivisionError("division by zero")
+			vm.execCtx.SP = sp
+			vm.activeFrameIdx = frameIdx
+			stack[sp-2] = val.TrueDivCtx(&vm.execCtx, a, b)
+			if vm.execCtx.HasException() {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				if stackIsVM && &stack[0] != &vm.stack[0] {
+					stack = vm.stack
+				}
 				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
@@ -4681,15 +4855,21 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				curCodeCache = vm.getCodeCache(curCO)
 				continue
 			}
-			stack[sp-2] = val.TrueDiv(a, b)
 			sp--
 			ip++
 
 		case OP_BINARY_FLOOR_DIV:
 			b := stack[sp-1]
 			a := stack[sp-2]
-			if (b.IsInt64() && b.AsInt64() == 0) || (b.IsFloat64() && b.AsFloat64() == 0.0) {
-				exc := val.NewZeroDivisionError("integer division or modulo by zero")
+			vm.execCtx.SP = sp
+			vm.activeFrameIdx = frameIdx
+			stack[sp-2] = val.FloorDivCtx(&vm.execCtx, a, b)
+			if vm.execCtx.HasException() {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				if stackIsVM && &stack[0] != &vm.stack[0] {
+					stack = vm.stack
+				}
 				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
@@ -4703,15 +4883,21 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				curCodeCache = vm.getCodeCache(curCO)
 				continue
 			}
-			stack[sp-2] = val.FloorDiv(a, b)
 			sp--
 			ip++
 
 		case OP_BINARY_MOD:
 			b := stack[sp-1]
 			a := stack[sp-2]
-			if ((b.IsInt64() && b.AsInt64() == 0) || (b.IsFloat64() && b.AsFloat64() == 0.0)) && !a.IsAnyString() && !a.IsBytes() && !a.IsInstance() {
-				exc := val.NewZeroDivisionError("integer modulo by zero")
+			vm.execCtx.SP = sp
+			vm.activeFrameIdx = frameIdx
+			stack[sp-2] = val.ModCtx(&vm.execCtx, a, b)
+			if vm.execCtx.HasException() {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				if stackIsVM && &stack[0] != &vm.stack[0] {
+					stack = vm.stack
+				}
 				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
@@ -4725,12 +4911,32 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				curCodeCache = vm.getCodeCache(curCO)
 				continue
 			}
-			stack[sp-2] = val.Mod(a, b)
 			sp--
 			ip++
 
 		case OP_BINARY_POW:
-			stack[sp-2] = val.Pow(stack[sp-2], stack[sp-1])
+			vm.execCtx.SP = sp
+			vm.activeFrameIdx = frameIdx
+			stack[sp-2] = val.PowCtx(&vm.execCtx, stack[sp-2], stack[sp-1])
+			if vm.execCtx.HasException() {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				if stackIsVM && &stack[0] != &vm.stack[0] {
+					stack = vm.stack
+				}
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if activeGen != nil {
+						activeGen.State = val.GenClosed
+					}
+					if activeCoro != nil {
+						activeCoro.State = val.CoroClosed
+					}
+					return val.NoneVal()
+				}
+				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+				curCodeCache = vm.getCodeCache(curCO)
+				continue
+			}
 			sp--
 			ip++
 
@@ -4743,7 +4949,60 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			} else if v.IsComplex() {
 				stack[sp-1] = val.NewComplexVal(-v.AsComplex().Real, -v.AsComplex().Imag)
 			} else {
-				stack[sp-1] = val.Sub(val.Int64Val(0), v)
+				vm.execCtx.SP = sp
+				vm.activeFrameIdx = frameIdx
+				res := val.Negative(&vm.execCtx, v)
+				if vm.execCtx.HasException() {
+					exc := vm.execCtx.ActiveException
+					vm.execCtx.ClearException()
+					if stackIsVM && &stack[0] != &vm.stack[0] {
+						stack = vm.stack
+					}
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if activeGen != nil {
+							activeGen.State = val.GenClosed
+						}
+						if activeCoro != nil {
+							activeCoro.State = val.CoroClosed
+						}
+						return val.NoneVal()
+					}
+					locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+					curCodeCache = vm.getCodeCache(curCO)
+					continue
+				}
+				stack[sp-1] = res
+			}
+			ip++
+
+		case OP_UNARY_POSITIVE:
+			v := stack[sp-1]
+			if v.IsInt64() || v.IsFloat64() || v.IsComplex() {
+				// No-op for standard numbers
+			} else {
+				vm.execCtx.SP = sp
+				vm.activeFrameIdx = frameIdx
+				res := val.Positive(&vm.execCtx, v)
+				if vm.execCtx.HasException() {
+					exc := vm.execCtx.ActiveException
+					vm.execCtx.ClearException()
+					if stackIsVM && &stack[0] != &vm.stack[0] {
+						stack = vm.stack
+					}
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if activeGen != nil {
+							activeGen.State = val.GenClosed
+						}
+						if activeCoro != nil {
+							activeCoro.State = val.CoroClosed
+						}
+						return val.NoneVal()
+					}
+					locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+					curCodeCache = vm.getCodeCache(curCO)
+					continue
+				}
+				stack[sp-1] = res
 			}
 			ip++
 
@@ -5519,48 +5778,202 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		case OP_BINARY_AND:
 			b := stack[sp-1]
 			a := stack[sp-2]
+			vm.execCtx.SP = sp
+			vm.activeFrameIdx = frameIdx
+			res := val.BitAnd(&vm.execCtx, a, b)
+			if vm.execCtx.HasException() {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				if stackIsVM && &stack[0] != &vm.stack[0] {
+					stack = vm.stack
+				}
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if activeGen != nil {
+						activeGen.State = val.GenClosed
+					}
+					if activeCoro != nil {
+						activeCoro.State = val.CoroClosed
+					}
+					return val.NoneVal()
+				}
+				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+				curCodeCache = vm.getCodeCache(curCO)
+				continue
+			}
+			stack[sp-2] = res
 			sp--
-			stack[sp-1] = val.BitAnd(&vm.execCtx, a, b)
 			ip++
 
 		case OP_BINARY_OR:
 			b := stack[sp-1]
 			a := stack[sp-2]
+			vm.execCtx.SP = sp
+			vm.activeFrameIdx = frameIdx
+			res := val.BitOr(&vm.execCtx, a, b)
+			if vm.execCtx.HasException() {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				if stackIsVM && &stack[0] != &vm.stack[0] {
+					stack = vm.stack
+				}
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if activeGen != nil {
+						activeGen.State = val.GenClosed
+					}
+					if activeCoro != nil {
+						activeCoro.State = val.CoroClosed
+					}
+					return val.NoneVal()
+				}
+				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+				curCodeCache = vm.getCodeCache(curCO)
+				continue
+			}
+			stack[sp-2] = res
 			sp--
-			stack[sp-1] = val.BitOr(&vm.execCtx, a, b)
 			ip++
 
 		case OP_BINARY_XOR:
 			b := stack[sp-1]
 			a := stack[sp-2]
+			vm.execCtx.SP = sp
+			vm.activeFrameIdx = frameIdx
+			res := val.BitXor(&vm.execCtx, a, b)
+			if vm.execCtx.HasException() {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				if stackIsVM && &stack[0] != &vm.stack[0] {
+					stack = vm.stack
+				}
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if activeGen != nil {
+						activeGen.State = val.GenClosed
+					}
+					if activeCoro != nil {
+						activeCoro.State = val.CoroClosed
+					}
+					return val.NoneVal()
+				}
+				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+				curCodeCache = vm.getCodeCache(curCO)
+				continue
+			}
+			stack[sp-2] = res
 			sp--
-			stack[sp-1] = val.BitXor(&vm.execCtx, a, b)
 			ip++
 
 		case OP_BINARY_LSHIFT:
 			b := stack[sp-1]
 			a := stack[sp-2]
+			vm.execCtx.SP = sp
+			vm.activeFrameIdx = frameIdx
+			res := val.LShift(&vm.execCtx, a, b)
+			if vm.execCtx.HasException() {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				if stackIsVM && &stack[0] != &vm.stack[0] {
+					stack = vm.stack
+				}
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if activeGen != nil {
+						activeGen.State = val.GenClosed
+					}
+					if activeCoro != nil {
+						activeCoro.State = val.CoroClosed
+					}
+					return val.NoneVal()
+				}
+				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+				curCodeCache = vm.getCodeCache(curCO)
+				continue
+			}
+			stack[sp-2] = res
 			sp--
-			stack[sp-1] = val.LShift(&vm.execCtx, a, b)
 			ip++
 
 		case OP_BINARY_RSHIFT:
 			b := stack[sp-1]
 			a := stack[sp-2]
+			vm.execCtx.SP = sp
+			vm.activeFrameIdx = frameIdx
+			res := val.RShift(&vm.execCtx, a, b)
+			if vm.execCtx.HasException() {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				if stackIsVM && &stack[0] != &vm.stack[0] {
+					stack = vm.stack
+				}
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if activeGen != nil {
+						activeGen.State = val.GenClosed
+					}
+					if activeCoro != nil {
+						activeCoro.State = val.CoroClosed
+					}
+					return val.NoneVal()
+				}
+				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+				curCodeCache = vm.getCodeCache(curCO)
+				continue
+			}
+			stack[sp-2] = res
 			sp--
-			stack[sp-1] = val.RShift(&vm.execCtx, a, b)
 			ip++
 
 		case OP_BINARY_MATMUL:
 			b := stack[sp-1]
 			a := stack[sp-2]
+			vm.execCtx.SP = sp
+			vm.activeFrameIdx = frameIdx
+			res := val.MatMul(&vm.execCtx, a, b)
+			if vm.execCtx.HasException() {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				if stackIsVM && &stack[0] != &vm.stack[0] {
+					stack = vm.stack
+				}
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if activeGen != nil {
+						activeGen.State = val.GenClosed
+					}
+					if activeCoro != nil {
+						activeCoro.State = val.CoroClosed
+					}
+					return val.NoneVal()
+				}
+				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+				curCodeCache = vm.getCodeCache(curCO)
+				continue
+			}
+			stack[sp-2] = res
 			sp--
-			stack[sp-1] = val.MatMul(&vm.execCtx, a, b)
 			ip++
 
 		case OP_UNARY_INVERT:
 			a := stack[sp-1]
-			stack[sp-1] = val.Invert(&vm.execCtx, a)
+			vm.execCtx.SP = sp
+			vm.activeFrameIdx = frameIdx
+			res := val.Invert(&vm.execCtx, a)
+			if vm.execCtx.HasException() {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				if stackIsVM && &stack[0] != &vm.stack[0] {
+					stack = vm.stack
+				}
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if activeGen != nil {
+						activeGen.State = val.GenClosed
+					}
+					if activeCoro != nil {
+						activeCoro.State = val.CoroClosed
+					}
+					return val.NoneVal()
+				}
+				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+				curCodeCache = vm.getCodeCache(curCO)
+				continue
+			}
+			stack[sp-1] = res
 			ip++
 
 		case OP_BUILD_SET:
@@ -5952,6 +6365,9 @@ func (vm *VM) loadMethodSlow(obj, attrName val.Value, ip, sp, frameIdx int, curI
 		}
 
 		if foundInClass {
+			if descr.IsBuiltinFunc() && descr.AsBuiltinFunc().NoBind {
+				return val.UnboundVal(), descr
+			}
 			if descr.IsFunction() || descr.IsBuiltinFunc() || descr.Kind() == val.KindCode {
 				pic := &curMethodPIC[ip]
 				var targetFn *val.PyFunction
@@ -6015,6 +6431,9 @@ func (vm *VM) loadMethodSlow(obj, attrName val.Value, ip, sp, frameIdx int, curI
 	// Primitive or built-in heap type method lookup.
 	tp := obj.Type()
 	if descr, _, ok := tp.LookupMRO(attrName); ok {
+		if descr.IsBuiltinFunc() && descr.AsBuiltinFunc().NoBind {
+			return val.UnboundVal(), descr
+		}
 		if descr.IsFunction() || descr.IsBuiltinFunc() || descr.Kind() == val.KindCode {
 			return obj, descr
 		}
@@ -6075,7 +6494,7 @@ func (vm *VM) callMethodPICSlow(receiver, attrName val.Value, ip, newBase, argc,
 	if recType != nil {
 		descr, _, foundInClass := recType.LookupMRO(attrName)
 		if foundInClass {
-			if descr.IsFunction() || descr.IsBuiltinFunc() {
+			if descr.IsFunction() || (descr.IsBuiltinFunc() && !descr.AsBuiltinFunc().NoBind) {
 				if receiver.IsInstance() {
 					instObj := receiver.AsInstance()
 					pic := &curMethodPIC[ip]

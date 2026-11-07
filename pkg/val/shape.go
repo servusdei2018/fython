@@ -73,7 +73,7 @@ func (s *Shape) Lookup(name Value) (int, bool) {
 		}
 	}
 	// Fallback if caller passed an un-interned heap string.
-	if name.ptr.Kind == KindString && (name.ptr.Flags&FlagInterned) == 0 {
+	if name.ptr != nil && name.ptr.Kind == KindString && (name.ptr.Flags&FlagInterned) == 0 {
 		for i := range attrs {
 			if StringEquals(attrs[i].Name, name) {
 				return attrs[i].Index, true

@@ -1810,52 +1810,11 @@ func (p *Parser) parseInterpolated(template bool) (ExprID, error) {
 				End:   midTok.End,
 			}))
 		} else if p.match(TOKEN_LBRACE) {
-			exprStart := p.cur.Start
-			valExpr, err := p.parseTernary()
+			fv, err := p.parseFormattedValue(template)
 			if err != nil {
 				return ExprNone, err
 			}
-			expression := strings.TrimRight(string(p.src[exprStart:p.cur.Start]), " \t")
-			debugText := ""
-			if p.match(TOKEN_ASSIGN) {
-				debugText = string(p.src[exprStart:p.cur.Start])
-			}
-			conversion := uint8(0)
-			if p.match(TOKEN_EXCLAIM) {
-				if p.cur.Type == TOKEN_IDENT {
-					identTok := p.advance()
-					identStr := string(p.src[identTok.Start:identTok.End])
-					if len(identStr) > 0 {
-						conversion = identStr[0]
-					}
-				}
-			}
-			if template && debugText != "" && conversion == 0 {
-				conversion = 'r'
-			}
-			var formatSpec ExprID = ExprNone
-			if p.match(TOKEN_COLON) {
-				formatSpec, err = p.parseFormatSpec()
-				if err != nil {
-					return ExprNone, err
-				}
-			}
-			if _, err := p.expect(TOKEN_RBRACE); err != nil {
-				return ExprNone, err
-			}
-			fvIdx := p.arena.AllocFormattedValue(ASTFormattedValue{
-				Value:      valExpr,
-				Conversion: conversion,
-				FormatSpec: formatSpec,
-				DebugText:  debugText,
-				Expression: expression,
-			})
-			pieces = append(pieces, p.arena.AllocExpr(ASTExpr{
-				Kind:  ExprKindFormattedValue,
-				Left:  valExpr,
-				Right: formatSpec,
-				Extra: fvIdx,
-			}))
+			pieces = append(pieces, fv)
 		} else {
 			break
 		}
@@ -1885,21 +1844,113 @@ func (p *Parser) partOp() uint8 {
 	return 1
 }
 
-func (p *Parser) parseFormatSpec() (ExprID, error) {
+func (p *Parser) parseFormattedValue(template bool) (ExprID, error) {
+	exprStart := p.cur.Start
+	valExpr, err := p.parseTernary()
+	if err != nil {
+		return ExprNone, err
+	}
+	expression := strings.TrimRight(string(p.src[exprStart:p.cur.Start]), " \t")
+	debugText := ""
+	if p.match(TOKEN_ASSIGN) {
+		debugText = string(p.src[exprStart:p.cur.Start])
+	}
+	conversion := uint8(0)
+	if p.match(TOKEN_EXCLAIM) {
+		if p.cur.Type == TOKEN_IDENT {
+			identTok := p.advance()
+			identStr := string(p.src[identTok.Start:identTok.End])
+			if len(identStr) > 0 {
+				conversion = identStr[0]
+			}
+		}
+	}
+	if template && debugText != "" && conversion == 0 {
+		conversion = 'r'
+	}
+	var formatSpec ExprID = ExprNone
+	if p.match(TOKEN_COLON) {
+		formatSpec, err = p.parseFormatSpec(template)
+		if err != nil {
+			return ExprNone, err
+		}
+	}
+	if _, err := p.expect(TOKEN_RBRACE); err != nil {
+		return ExprNone, err
+	}
+	fvIdx := p.arena.AllocFormattedValue(ASTFormattedValue{
+		Value:      valExpr,
+		Conversion: conversion,
+		FormatSpec: formatSpec,
+		DebugText:  debugText,
+		Expression: expression,
+	})
+	return p.arena.AllocExpr(ASTExpr{
+		Kind:  ExprKindFormattedValue,
+		Left:  valExpr,
+		Right: formatSpec,
+		Extra: fvIdx,
+	}), nil
+}
+
+func (p *Parser) parseFormatSpec(template bool) (ExprID, error) {
 	if p.cur.Type == TOKEN_RBRACE || p.cur.Type == TOKEN_EOF || p.cur.Type == TOKEN_FSTRING_END {
 		return ExprNone, nil
 	}
-	start := p.cur.Start
-	end := p.cur.End
+	origStart := p.cur.Start
+	var pieces []ExprID
+	literalStart := p.cur.Start
+	lastEnd := p.cur.End
 	for p.cur.Type != TOKEN_RBRACE && p.cur.Type != TOKEN_EOF && p.cur.Type != TOKEN_FSTRING_END {
-		end = p.cur.End
+		if p.cur.Type == TOKEN_LBRACE {
+			if p.cur.Start > literalStart {
+				pieces = append(pieces, p.arena.AllocExpr(ASTExpr{
+					Kind:  ExprKindString,
+					Op:    p.partOp(),
+					Start: literalStart,
+					End:   p.cur.Start,
+				}))
+			}
+			p.advance()
+			fv, err := p.parseFormattedValue(template)
+			if err != nil {
+				return ExprNone, err
+			}
+			pieces = append(pieces, fv)
+			literalStart = p.cur.Start
+			lastEnd = p.cur.End
+			continue
+		}
+		lastEnd = p.cur.End
 		p.advance()
 	}
+
+	if len(pieces) == 0 {
+		return p.arena.AllocExpr(ASTExpr{
+			Kind:  ExprKindString,
+			Op:    p.partOp(),
+			Start: origStart,
+			End:   lastEnd,
+		}), nil
+	}
+
+	if p.cur.Start > literalStart {
+		pieces = append(pieces, p.arena.AllocExpr(ASTExpr{
+			Kind:  ExprKindString,
+			Op:    p.partOp(),
+			Start: literalStart,
+			End:   p.cur.Start,
+		}))
+	}
+
+	fsIdx := p.arena.AllocFString(ASTFString{
+		Pieces: p.arena.AddExprSlice(pieces),
+		Raw:    p.interpRaw,
+	})
 	return p.arena.AllocExpr(ASTExpr{
-		Kind:  ExprKindString,
-		Op:    p.partOp(),
-		Start: start,
-		End:   end,
+		Kind:  ExprKindJoinedStr,
+		Start: origStart,
+		Extra: fsIdx,
 	}), nil
 }
 

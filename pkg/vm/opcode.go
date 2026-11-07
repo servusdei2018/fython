@@ -149,6 +149,9 @@ const (
 	// OP_LOAD_FROM_DICT_OR_DEREF pops a mapping and looks up consts[ArgBx] in
 	// it; on a miss it loads closure cell ArgA.
 	OP_LOAD_FROM_DICT_OR_DEREF
+
+	// OP_UNARY_POSITIVE performs Python unary positive (+a).
+	OP_UNARY_POSITIVE
 )
 
 // Comparison operation codes for OP_COMPARE_OP (passed in ArgA field).
@@ -373,6 +376,8 @@ func (op Opcode) String() string {
 		return "OP_LOAD_FROM_DICT_OR_GLOBALS"
 	case OP_LOAD_FROM_DICT_OR_DEREF:
 		return "OP_LOAD_FROM_DICT_OR_DEREF"
+	case OP_UNARY_POSITIVE:
+		return "OP_UNARY_POSITIVE"
 	case OP_BINARY_MATMUL:
 		return "OP_BINARY_MATMUL"
 	case OP_CALL_FUNCTION_EX:

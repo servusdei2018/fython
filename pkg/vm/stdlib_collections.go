@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 	"unsafe"
@@ -314,6 +315,23 @@ func initCollectionsTypes() {
 				return sqItem(ctx, obj, val.Int64Val(int64(getter.Index)))
 			}
 			panic("TypeError: tuplegetter applied to non-tuple")
+		}
+
+		TupleGetterType.Slots.TpGetAttr = func(ctx *val.ExecContext, obj, name val.Value) val.Value {
+			getter := (*pyTupleGetter)(unsafe.Pointer(obj.HeaderPtr()))
+			if name.AsString() == "__doc__" {
+				return getter.Doc
+			}
+			return val.ObjectGetAttr(ctx, obj, name)
+		}
+
+		TupleGetterType.Slots.TpSetAttr = func(ctx *val.ExecContext, obj, name, value val.Value) val.Value {
+			getter := (*pyTupleGetter)(unsafe.Pointer(obj.HeaderPtr()))
+			if name.AsString() == "__doc__" {
+				getter.Doc = value
+				return val.NoneVal()
+			}
+			panic(fmt.Sprintf("AttributeError: '_tuplegetter' object has no attribute '%s'", name.AsString()))
 		}
 
 		DequeType.Dict.Set(val.InternString("__repr__"), val.NewBuiltinFuncVal("deque.__repr__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {

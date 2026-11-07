@@ -399,6 +399,10 @@ func (e *Engine) createAsyncioModule() val.Value {
 	// asyncio.create_task(coro)
 	mod.Dict.Set(val.InternString("create_task"), val.NewBuiltinFuncVal("create_task", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
+			if ctx != nil {
+				ctx.Raise(val.NewTypeError("create_task() takes at least 1 argument"))
+				return val.NoneVal()
+			}
 			panic("TypeError: create_task() takes at least 1 argument")
 		}
 		loop := GetCurrentEventLoop()
@@ -412,6 +416,66 @@ func (e *Engine) createAsyncioModule() val.Value {
 		}
 		task := loop.CreateTaskIn(args[0], parent)
 		return val.ObjectVal(&task.Header)
+	}))
+
+	// asyncio.ensure_future(coro_or_future, *, loop=None)
+	mod.Dict.Set(val.InternString("ensure_future"), val.NewBuiltinFuncVal("ensure_future", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			if ctx != nil {
+				ctx.Raise(val.NewTypeError("ensure_future() takes at least 1 argument"))
+				return val.NoneVal()
+			}
+			panic("TypeError: ensure_future() takes at least 1 argument")
+		}
+		target := args[0]
+		if target.IsFuture() || target.IsTask() {
+			return target
+		}
+		if target.IsCoroutine() {
+			loop := GetCurrentEventLoop()
+			if loop == nil {
+				loop = NewEventLoop(e, e.asyncMode)
+				SetCurrentEventLoop(loop)
+			}
+			var parent *val.PyContext
+			if ctx != nil && ctx.VM != nil {
+				parent = ctx.VM.(*VM).ActiveContext()
+			}
+			task := loop.CreateTaskIn(target, parent)
+			return val.ObjectVal(&task.Header)
+		}
+		awaitMethod := val.GetAttrCtx(ctx, target, val.InternString("__await__"))
+		if ctx != nil && ctx.HasException() {
+			ctx.ClearException()
+		} else if !awaitMethod.IsUnbound() && !awaitMethod.IsNone() {
+			var coro val.Value
+			if ctx != nil && ctx.VM != nil {
+				vm := ctx.VM.(*VM)
+				coro = vm.Vectorcall(awaitMethod, nil, nil)
+			}
+			if ctx != nil && ctx.HasException() {
+				return val.NoneVal()
+			}
+			if coro.IsFuture() || coro.IsTask() {
+				return coro
+			}
+			loop := GetCurrentEventLoop()
+			if loop == nil {
+				loop = NewEventLoop(e, e.asyncMode)
+				SetCurrentEventLoop(loop)
+			}
+			var parent *val.PyContext
+			if ctx != nil && ctx.VM != nil {
+				parent = ctx.VM.(*VM).ActiveContext()
+			}
+			task := loop.CreateTaskIn(coro, parent)
+			return val.ObjectVal(&task.Header)
+		}
+		if ctx != nil {
+			ctx.Raise(val.NewTypeError("An asyncio.Future, a coroutine, or an awaitable is required"))
+			return val.NoneVal()
+		}
+		panic("TypeError: An asyncio.Future, a coroutine, or an awaitable is required")
 	}))
 
 	// asyncio.gather(*aws, return_exceptions=False)

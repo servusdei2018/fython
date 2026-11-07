@@ -162,11 +162,16 @@ func (e *Engine) newSysModules() *val.PyDict {
 		val.InternString("gc"), val.InternString("_weakref"), val.InternString("weakref"),
 		val.InternString("traceback"), val.InternString("inspect"), val.InternString("asyncio"),
 		val.InternString("_thread"), val.InternString("_typing"), val.InternString("_colorize"),
-		val.InternString("_contextvars"), val.InternString("unicodedata"),
+		val.InternString("_contextvars"), val.InternString("unicodedata"), val.InternString("_datetime"),
+		val.InternString("binascii"), val.InternString("_hashlib"), val.InternString("_struct"),
+		val.InternString("_csv"),
 	}
 	sysMod.Dict.Set(val.InternString("builtin_module_names"), val.NewTupleVal(builtinNames...))
 
 	// sys.intern(string)
+	sysMod.Dict.Set(val.InternString("audit"), val.NewBuiltinFuncVal("audit", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.NoneVal()
+	}))
 	sysMod.Dict.Set(val.InternString("intern"), val.NewBuiltinFuncVal("intern", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
 			panic("TypeError: intern() requires 1 argument")
@@ -264,15 +269,69 @@ func (e *Engine) newSysModules() *val.PyDict {
 	modules.Set(val.InternString("re"), e.createReModule())
 	modules.Set(val.InternString("_ast"), e.createASTModule())
 	modules.Set(val.InternString("_thread"), e.createThreadModule())
+	modules.Set(val.InternString("threading"), e.createThreadingModule())
 	modules.Set(val.InternString("_typing"), e.createTypingModule())
 	modules.Set(val.InternString("_colorize"), e.createColorizeModule())
 	modules.Set(val.InternString("_contextvars"), e.createContextVarsModule())
 	modules.Set(val.InternString("_signal"), e.createSignalModule())
+	posixMod := e.createPosixModule()
+	modules.Set(val.InternString("posix"), posixMod)
+	modules.Set(val.InternString("nt"), posixMod)
+	modules.Set(val.InternString("_random"), e.createRandomModule())
+	modules.Set(val.InternString("_datetime"), e.createDateTimeModule())
+	modules.Set(val.InternString("binascii"), e.createBinasciiModule())
+	modules.Set(val.InternString("_hashlib"), e.createHashlibModule())
+	modules.Set(val.InternString("_struct"), e.createStructModule())
+	modules.Set(val.InternString("_csv"), e.createCsvModule())
+	modules.Set(val.InternString("zlib"), e.createZlibModule())
 	modules.Set(val.InternString("errno"), e.createErrnoModule())
 	modules.Set(val.InternString("gettext"), e.createGettextModule())
-	modules.Set(val.InternString("shutil"), e.createShutilModule())
+	importlibMod := e.createImportlibModule()
+	modules.Set(val.InternString("importlib"), importlibMod)
+	if utilVal, ok := importlibMod.AsModule().Dict.Get(val.InternString("util")); ok {
+		modules.Set(val.InternString("importlib.util"), utilVal)
+	}
 
 	return modules
+}
+
+func (e *Engine) createImportlibModule() val.Value {
+	modVal := val.NewModuleVal("importlib", "Core Python import machinery")
+	mod := modVal.AsModule()
+	utilModVal := val.NewModuleVal("importlib.util", "Utilities for importlib")
+	mod.Dict.Set(val.InternString("util"), utilModVal)
+
+	mod.Dict.Set(val.InternString("import_module"), val.NewBuiltinFuncVal("import_module", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic(val.NewException(val.TypeErrorType, "import_module() requires name"))
+		}
+		name := args[0].AsString()
+		if e.sharedModules != nil {
+			if v, ok := e.sharedModules.Get(val.InternString(name)); ok {
+				return v
+			}
+		}
+		vm := e.AcquireVM()
+		defer e.ReleaseVM(vm)
+		modVal, err := vm.ImportModule(name, 0, true, nil)
+		if err != nil {
+			panic(val.NewException(val.ModuleNotFoundErrorType, err.Error()))
+		}
+		return modVal
+	}))
+
+	mod.Dict.Set(val.InternString("invalidate_caches"), val.NewBuiltinFuncVal("invalidate_caches", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.NoneVal()
+	}))
+
+	mod.Dict.Set(val.InternString("reload"), val.NewBuiltinFuncVal("reload", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic(val.NewException(val.TypeErrorType, "reload() requires module"))
+		}
+		return args[0]
+	}))
+
+	return modVal
 }
 
 // SetAsyncMode sets the coroutine scheduling strategy for this Engine.

@@ -65,3 +65,35 @@ func (e *Engine) createThreadModule() val.Value {
 
 	return modVal
 }
+
+func (e *Engine) createThreadingModule() val.Value {
+	initThreadModule()
+	modVal := val.NewModuleVal("threading", "")
+	mod := modVal.AsModule()
+
+	mod.Dict.Set(val.InternString("Lock"), val.TypeVal(threadLockType))
+	mod.Dict.Set(val.InternString("RLock"), val.TypeVal(threadRLockType))
+	mod.Dict.Set(val.InternString("get_ident"), val.NewBuiltinFuncVal("get_ident", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		id := atomic.LoadInt64(&threadCounter)
+		return val.Int64Val(id)
+	}))
+	mod.Dict.Set(val.InternString("TIMEOUT_MAX"), val.Int64Val(9223372036))
+
+	dummyThreadType := val.MustNewType("Thread", []*val.PyType{val.ObjectType}, nil)
+	mod.Dict.Set(val.InternString("Thread"), val.TypeVal(dummyThreadType))
+	mod.Dict.Set(val.InternString("current_thread"), val.NewBuiltinFuncVal("current_thread", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		inst := val.NewInstanceOfType(dummyThreadType)
+		inst.AsInstance().SetAttr(val.InternString("name"), val.NewStringVal("MainThread"))
+		inst.AsInstance().SetAttr(val.InternString("ident"), val.Int64Val(atomic.LoadInt64(&threadCounter)))
+		return inst
+	}))
+	mod.Dict.Set(val.InternString("main_thread"), val.NewBuiltinFuncVal("main_thread", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		inst := val.NewInstanceOfType(dummyThreadType)
+		inst.AsInstance().SetAttr(val.InternString("name"), val.NewStringVal("MainThread"))
+		inst.AsInstance().SetAttr(val.InternString("ident"), val.Int64Val(1))
+		return inst
+	}))
+	mod.Dict.Set(val.InternString("local"), val.TypeVal(val.ObjectType))
+
+	return modVal
+}

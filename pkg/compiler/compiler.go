@@ -18,12 +18,27 @@ func init() {
 	vm.DefaultEngine().SetDynamicCompileHook(hook)
 }
 
+type CleanupKind int
+
+const (
+	CleanupWith CleanupKind = iota
+	CleanupFinally
+)
+
+type CleanupBlock struct {
+	Kind     CleanupKind
+	Parent   *CleanupBlock
+	TempSlot int
+	Finally  StmtSlice
+}
+
 // LoopContext tracks jump patch locations for break and continue statements.
 type LoopContext struct {
 	LoopStart int
 	Breaks    []int
 	Continues []int
 	Parent    *LoopContext
+	Cleanup   *CleanupBlock
 	IsFor     bool
 }
 
@@ -38,6 +53,7 @@ type Compiler struct {
 	stackDepth     int
 	maxStackDepth  int
 	activeLoop     *LoopContext
+	activeCleanup  *CleanupBlock
 	err            error
 	nextChildIdx   int
 	lineStarts     []int
@@ -392,6 +408,28 @@ func (c *Compiler) emitReturnNone() {
 	c.emitOp(vm.OP_RETURN, 0, 0)
 }
 
+func (c *Compiler) runCleanupsTo(target *CleanupBlock) error {
+	for cl := c.activeCleanup; cl != target && cl != nil; cl = cl.Parent {
+		if cl.Kind == CleanupWith {
+			_, exitIdx := c.constPool.InternName("__exit__")
+			noneIdx := c.constPool.Add(val.NoneVal())
+			c.emitOp(vm.OP_LOAD_FAST, 0, uint16(cl.TempSlot))
+			c.emitOp(vm.OP_LOAD_CONST, 0, noneIdx)
+			c.emitOp(vm.OP_LOAD_CONST, 0, noneIdx)
+			c.emitOp(vm.OP_LOAD_CONST, 0, noneIdx)
+			c.emitOp(vm.OP_CALL_METHOD_PIC, 3, exitIdx)
+			c.emitOp(vm.OP_POP_TOP, 0, 0)
+		} else if cl.Kind == CleanupFinally {
+			for _, sID := range c.arena.StmtIDs[cl.Finally.Start : cl.Finally.Start+cl.Finally.Count] {
+				if err := c.compileStmt(sID); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
 func (c *Compiler) compileStmt(stmtID StmtID) error {
 	stmt := c.arena.GetStmt(stmtID)
 	if stmt == nil {
@@ -407,11 +445,31 @@ func (c *Compiler) compileStmt(stmtID StmtID) error {
 		c.emitOp(vm.OP_POP_TOP, 0, 0)
 
 	case StmtKindReturn:
+		var retSlot int = -1
 		if stmt.Expr1 != ExprNone {
 			if err := c.compileExpr(stmt.Expr1); err != nil {
 				return err
 			}
+			if c.activeCleanup != nil {
+				retSlot = c.allocTempLocal()
+				c.emitOp(vm.OP_STORE_FAST, 0, uint16(retSlot))
+			}
 		} else {
+			if c.activeCleanup != nil {
+				noneIdx := c.constPool.Add(val.NoneVal())
+				c.emitOp(vm.OP_LOAD_CONST, 0, noneIdx)
+				retSlot = c.allocTempLocal()
+				c.emitOp(vm.OP_STORE_FAST, 0, uint16(retSlot))
+			}
+		}
+
+		if err := c.runCleanupsTo(nil); err != nil {
+			return err
+		}
+
+		if retSlot >= 0 {
+			c.emitOp(vm.OP_LOAD_FAST, 0, uint16(retSlot))
+		} else if stmt.Expr1 == ExprNone {
 			noneIdx := c.constPool.Add(val.NoneVal())
 			c.emitOp(vm.OP_LOAD_CONST, 0, noneIdx)
 		}
@@ -510,6 +568,9 @@ func (c *Compiler) compileStmt(stmtID StmtID) error {
 		if c.activeLoop == nil {
 			return fmt.Errorf("SyntaxError: 'break' outside loop")
 		}
+		if err := c.runCleanupsTo(c.activeLoop.Cleanup); err != nil {
+			return err
+		}
 		if c.activeLoop.IsFor {
 			c.emitOp(vm.OP_POP_TOP, 0, 0)
 		}
@@ -519,6 +580,9 @@ func (c *Compiler) compileStmt(stmtID StmtID) error {
 	case StmtKindContinue:
 		if c.activeLoop == nil {
 			return fmt.Errorf("SyntaxError: 'continue' outside loop")
+		}
+		if err := c.runCleanupsTo(c.activeLoop.Cleanup); err != nil {
+			return err
 		}
 		jumpIdx := c.emitOp(vm.OP_JUMP, 0, 0)
 		c.activeLoop.Continues = append(c.activeLoop.Continues, jumpIdx)
@@ -886,6 +950,7 @@ func (c *Compiler) compileWhileStmt(stmt *ASTStmt) error {
 	loopCtx := &LoopContext{
 		LoopStart: loopStart,
 		Parent:    c.activeLoop,
+		Cleanup:   c.activeCleanup,
 	}
 	c.activeLoop = loopCtx
 
@@ -937,6 +1002,7 @@ func (c *Compiler) compileForStmt(stmt *ASTStmt) error {
 	loopCtx := &LoopContext{
 		LoopStart: loopStart,
 		Parent:    c.activeLoop,
+		Cleanup:   c.activeCleanup,
 		IsFor:     true,
 	}
 	c.activeLoop = loopCtx
@@ -1004,6 +1070,7 @@ func (c *Compiler) compileAsyncForStmt(stmt *ASTStmt) error {
 	loopCtx := &LoopContext{
 		LoopStart: loopStart,
 		Parent:    c.activeLoop,
+		Cleanup:   c.activeCleanup,
 	}
 	c.activeLoop = loopCtx
 
@@ -1314,9 +1381,17 @@ func (c *Compiler) compileWithItemRecursive(items []ASTWithItem, body uint32) er
 
 	depth := c.stackDepth
 	withStart := len(c.code)
+	cleanup := &CleanupBlock{
+		Kind:     CleanupWith,
+		Parent:   c.activeCleanup,
+		TempSlot: tempSlot,
+	}
+	c.activeCleanup = cleanup
 	if err := c.compileWithItemRecursive(items[1:], body); err != nil {
+		c.activeCleanup = cleanup.Parent
 		return err
 	}
+	c.activeCleanup = cleanup.Parent
 	withEnd := len(c.code)
 
 	// Normal exit: call __exit__(None, None, None)
@@ -2059,6 +2134,8 @@ func (c *Compiler) compileExpr(exprID ExprID) error {
 		}
 		if expr.Op == uint8(TOKEN_MINUS) {
 			c.emitOp(vm.OP_UNARY_NEGATIVE, 0, 0)
+		} else if expr.Op == uint8(TOKEN_PLUS) {
+			c.emitOp(vm.OP_UNARY_POSITIVE, 0, 0)
 		} else if expr.Op == uint8(TOKEN_NOT) {
 			c.emitOp(vm.OP_UNARY_NOT, 0, 0)
 		} else if expr.Op == uint8(TOKEN_TILDE) {
@@ -2804,14 +2881,14 @@ func (c *Compiler) compileTemplate(fs *ASTFString) error {
 			convIdx := c.constPool.Add(val.NewStringVal(string([]byte{fv.Conversion})))
 			c.emitOp(vm.OP_LOAD_CONST, 0, convIdx)
 		}
-		spec := ""
 		if fv.FormatSpec != ExprNone {
-			if se := c.arena.GetExpr(fv.FormatSpec); se != nil {
-				spec = decodeTemplateLiteral(string(c.src[se.Start:se.End]), fs.Raw)
+			if err := c.compileExpr(fv.FormatSpec); err != nil {
+				return err
 			}
+		} else {
+			specIdx := c.constPool.Add(val.NewStringVal(""))
+			c.emitOp(vm.OP_LOAD_CONST, 0, specIdx)
 		}
-		specIdx := c.constPool.Add(val.NewStringVal(spec))
-		c.emitOp(vm.OP_LOAD_CONST, 0, specIdx)
 		emitRun()
 	}
 	c.emitOp(vm.OP_BUILD_TEMPLATE, 0, uint16(n))

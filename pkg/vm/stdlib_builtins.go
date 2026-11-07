@@ -3,6 +3,7 @@ package vm
 import (
 	"fmt"
 	"math"
+	"math/big"
 	"sort"
 	"strconv"
 	"strings"
@@ -339,10 +340,38 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			}
 		}
 
+		if nextMeth, _, ok := it.Type().LookupMRO(val.InternString("__next__")); ok {
+			var nextVal val.Value
+			var exhausted bool
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						if exc, ok := r.(val.Value); ok && val.IsInstance(exc, val.StopIterationType) {
+							exhausted = true
+							return
+						}
+						panic(r)
+					}
+				}()
+				nextVal = ctx.Invoke1(nextMeth, it)
+				if ctx != nil && ctx.HasException() && val.IsInstance(ctx.ActiveException, val.StopIterationType) {
+					ctx.ClearException()
+					exhausted = true
+				}
+			}()
+			if exhausted {
+				if hasDefault {
+					return defVal
+				}
+				panic(val.NewException(val.StopIterationType, "StopIteration"))
+			}
+			return nextVal
+		}
+
 		if hasDefault {
 			return defVal
 		}
-		panic(val.NewException(val.StopIterationType, "StopIteration"))
+		panic(val.NewException(val.TypeErrorType, "'"+it.Type().Name+"' object is not an iterator"))
 	}))
 
 	// hasattr, getattr, setattr, delattr
@@ -732,15 +761,42 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			}
 			items = append(items, v)
 		}
+		var keyFunc val.Value
 		reverse := false
 		if len(kwnames) > 0 {
 			kwStart := len(args) - len(kwnames)
 			for i, kn := range kwnames {
 				if kn.AsString() == "reverse" {
 					reverse = args[kwStart+i].IsTruthy()
+				} else if kn.AsString() == "key" {
+					keyFunc = args[kwStart+i]
 				}
 			}
 		}
+
+		if keyFunc.HeaderPtr() != nil && !keyFunc.IsNone() {
+			type sortedItem struct {
+				val val.Value
+				key val.Value
+			}
+			pairs := make([]sortedItem, len(items))
+			for i, itm := range items {
+				pairs[i] = sortedItem{val: itm, key: ctx.Invoke1(keyFunc, itm)}
+			}
+			sort.SliceStable(pairs, func(i, j int) bool {
+				lt := val.RichCompare(ctx, pairs[i].key, pairs[j].key, val.CmpLT).IsTruthy()
+				if reverse {
+					return !lt && !val.RichCompare(ctx, pairs[i].key, pairs[j].key, val.CmpEQ).IsTruthy()
+				}
+				return lt
+			})
+			res := make([]val.Value, len(items))
+			for i, p := range pairs {
+				res[i] = p.val
+			}
+			return val.NewListVal(res...)
+		}
+
 		sort.SliceStable(items, func(i, j int) bool {
 			lt := val.RichCompare(ctx, items[i], items[j], val.CmpLT).IsTruthy()
 			if reverse {
@@ -799,6 +855,13 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		if len(args) < 1 {
 			panic("TypeError: bin() takes exactly one argument")
 		}
+		if val.IsAnyInt(args[0]) {
+			bi := val.ToBigInt(args[0])
+			if bi.Sign() < 0 {
+				return val.NewStringVal("-0b" + new(big.Int).Abs(bi).Text(2))
+			}
+			return val.NewStringVal("0b" + bi.Text(2))
+		}
 		return val.NewStringVal(fmt.Sprintf("%#b", args[0].AsInt64()))
 	}))
 
@@ -806,12 +869,26 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		if len(args) < 1 {
 			panic("TypeError: hex() takes exactly one argument")
 		}
+		if val.IsAnyInt(args[0]) {
+			bi := val.ToBigInt(args[0])
+			if bi.Sign() < 0 {
+				return val.NewStringVal("-0x" + new(big.Int).Abs(bi).Text(16))
+			}
+			return val.NewStringVal("0x" + bi.Text(16))
+		}
 		return val.NewStringVal(fmt.Sprintf("%#x", args[0].AsInt64()))
 	}))
 
 	d.Set(val.InternString("oct"), val.NewBuiltinFuncVal("oct", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
 			panic("TypeError: oct() takes exactly one argument")
+		}
+		if val.IsAnyInt(args[0]) {
+			bi := val.ToBigInt(args[0])
+			if bi.Sign() < 0 {
+				return val.NewStringVal("-0o" + new(big.Int).Abs(bi).Text(8))
+			}
+			return val.NewStringVal("0o" + bi.Text(8))
 		}
 		return val.NewStringVal(fmt.Sprintf("%#o", args[0].AsInt64()))
 	}))
@@ -911,18 +988,27 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			return val.NewMappingProxyVal(val.DictVal(obj.AsType().Dict))
 		}
 		if obj.IsInstance() {
-			if obj.AsInstance().Shape == nil {
+			inst := obj.AsInstance()
+			if inst.Shape != nil && inst.Shape.Type != nil && (inst.Shape.Type.Flags&uint32(val.FlagForbidDynamicAttrs)) != 0 {
+				if ctx != nil {
+					ctx.Raise(val.NewTypeError("vars() argument must have __dict__ attribute"))
+					return val.NoneVal()
+				}
+				panic("TypeError: vars() argument must have __dict__ attribute")
+			}
+			if inst.Shape == nil {
 				return val.NewDictVal(0)
 			}
-			return val.NewInstanceDictProxy(obj.AsInstance())
-		}
-		if k := obj.Kind(); k == val.KindFuture || k == val.KindTask {
-			return val.DictVal(val.AsyncAttrs(obj, true))
+			return val.NewInstanceDictProxy(inst)
 		}
 		if obj.IsDict() || obj.IsList() {
 			if d := val.GetAttrCtx(ctx, obj, val.InternString("__dict__")); d.IsDict() {
 				return d
 			}
+		}
+		if ctx != nil {
+			ctx.Raise(val.NewTypeError("vars() argument must have __dict__ attribute"))
+			return val.NoneVal()
 		}
 		panic("TypeError: vars() argument must have __dict__ attribute")
 	}))
@@ -1238,11 +1324,25 @@ func iterFor(ctx *val.ExecContext, o val.Value) *val.PyIter {
 	}
 	if nextFn, _, ok := tp.LookupMRO(val.InternString("__next__")); ok {
 		return val.NewIterValWithNext(func() (val.Value, bool) {
-			v := ctx.Invoke1(nextFn, o)
-			if ctx.HasException() {
-				if val.IsInstance(ctx.ActiveException, val.StopIterationType) {
+			var v val.Value
+			var done bool
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						if exc, ok := r.(val.Value); ok && val.IsInstance(exc, val.StopIterationType) {
+							done = true
+							return
+						}
+						panic(r)
+					}
+				}()
+				v = ctx.Invoke1(nextFn, o)
+				if ctx.HasException() && val.IsInstance(ctx.ActiveException, val.StopIterationType) {
 					ctx.ClearException()
+					done = true
 				}
+			}()
+			if done {
 				return val.NoneVal(), false
 			}
 			return v, true

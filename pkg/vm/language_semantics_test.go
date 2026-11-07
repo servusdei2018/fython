@@ -447,3 +447,184 @@ assert list(zip(itertools.count(), 'abc')) == [(0, 'a'), (1, 'b'), (2, 'c')]
 assert {1, 2, 3} - {1} == {2, 3}
 `)
 }
+
+func TestOperatorExceptionIntegrity(t *testing.T) {
+	runSnippet(t, `
+# Binary operators on incompatible operands raise catchable TypeError
+ops = [
+    lambda: [] - 1,
+    lambda: (1+2j) // 2,
+    lambda: (1+2j) % 2,
+    lambda: "str" + 5,
+    lambda: None * 3,
+    lambda: [1, 2] @ [3, 4],
+    lambda: {} << 1,
+    lambda: {1} >> 2,
+    lambda: "a" & "b",
+    lambda: 1.5 ^ 2.5,
+    lambda: 1.0 | 2,
+]
+for op in ops:
+    caught = False
+    try:
+        op()
+    except TypeError:
+        caught = True
+    assert caught, f"Expected TypeError for operator"
+
+# Unary operators
+unary_ops = [
+    lambda: - "hello",
+    lambda: + [],
+    lambda: ~ 3.14,
+]
+for op in unary_ops:
+    caught = False
+    try:
+        op()
+    except TypeError:
+        caught = True
+    assert caught, f"Expected TypeError for unary operator"
+
+# Comparison operators
+cmp_ops = [
+    lambda: 1 < "a",
+    lambda: "a" <= 1,
+    lambda: [1] > (1,),
+    lambda: {1} >= [1],
+]
+for op in cmp_ops:
+    caught = False
+    try:
+        op()
+    except TypeError:
+        caught = True
+    assert caught, f"Expected TypeError for comparison"
+
+# Custom object returning NotImplemented
+class Dummy:
+    def __add__(self, other):
+        return NotImplemented
+    def __radd__(self, other):
+        return NotImplemented
+    def __lt__(self, other):
+        return NotImplemented
+
+caught = False
+try:
+    Dummy() + 42
+except TypeError:
+    caught = True
+assert caught
+
+caught = False
+try:
+    42 + Dummy()
+except TypeError:
+    caught = True
+assert caught
+
+caught = False
+try:
+    Dummy() < 42
+except TypeError:
+    caught = True
+assert caught
+
+# Division / modulo by zero raises catchable ZeroDivisionError
+div_ops = [
+    lambda: 1 / 0,
+    lambda: 1 // 0,
+    lambda: 1 % 0,
+    lambda: divmod(1, 0),
+    lambda: 1.5 / 0.0,
+]
+for op in div_ops:
+    caught = False
+    try:
+        op()
+    except ZeroDivisionError:
+        caught = True
+    assert caught, f"Expected ZeroDivisionError"
+`)
+}
+
+func TestNestedFormatSpecifiers(t *testing.T) {
+	runSnippet(t, `
+w, p, x = 10, 3, 3.14159
+res = f"{x:{w}.{p}f}"
+assert res == "     3.142", f"Got: {res!r}"
+
+align = ">"
+width = 8
+val = "test"
+assert f"{val:{align}{width}}" == "    test"
+`)
+}
+
+func TestAsyncioEnsureFuture(t *testing.T) {
+	runSnippet(t, `
+import asyncio
+
+async def sample():
+    return 42
+
+async def main():
+    coro = sample()
+    task = asyncio.ensure_future(coro)
+    assert isinstance(task, asyncio.Task)
+    task2 = asyncio.ensure_future(task)
+    assert task2 is task
+    res = await task
+    assert res == 42
+
+asyncio.run(main())
+`)
+}
+
+func TestStrictVars(t *testing.T) {
+	runSnippet(t, `
+import re
+import asyncio
+
+class Slotted:
+    __slots__ = ('x', 'y')
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+s = Slotted(1, 2)
+caught = False
+try:
+    vars(s)
+except TypeError as e:
+    caught = True
+    assert "vars() argument must have __dict__ attribute" in str(e)
+assert caught
+
+pattern = re.compile("abc")
+caught = False
+try:
+    vars(pattern)
+except TypeError as e:
+    caught = True
+    assert "vars() argument must have __dict__ attribute" in str(e)
+assert caught
+
+async def dummy():
+    pass
+
+async def check_task():
+    t = asyncio.create_task(dummy())
+    caught = False
+    try:
+        vars(t)
+    except TypeError as e:
+        caught = True
+        assert "vars() argument must have __dict__ attribute" in str(e)
+    assert caught
+    await t
+
+asyncio.run(check_task())
+`)
+}
