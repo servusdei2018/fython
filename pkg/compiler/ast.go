@@ -342,6 +342,7 @@ type AliasSlice struct {
 // ASTImport stores metadata for an `import ...` statement.
 type ASTImport struct {
 	Aliases AliasSlice
+	IsLazy  bool
 }
 
 // ASTImportFrom stores metadata for a `from ... import ...` statement.
@@ -350,6 +351,7 @@ type ASTImportFrom struct {
 	Level   int
 	Aliases AliasSlice
 	IsStar  bool
+	IsLazy  bool
 }
 
 // ASTArena provides flat, contiguous, typed storage for all AST nodes and auxiliary metadata.

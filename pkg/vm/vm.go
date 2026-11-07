@@ -804,10 +804,14 @@ func (vm *VM) initBuiltins() {
 			base := vmInstance.activeBaseOffset
 			activeCells := vmInstance.activeCells
 
-			if base >= len(vmInstance.stack) {
+			stack := ctx.Stack
+			if len(stack) == 0 {
+				stack = vmInstance.stack
+			}
+			if base >= len(stack) {
 				panic("RuntimeError: super(): no arguments")
 			}
-			self := vmInstance.stack[base]
+			self := stack[base]
 			if self.IsNone() && self.HeaderPtr() == nil {
 				panic("RuntimeError: super(): no arguments")
 			}
@@ -874,6 +878,34 @@ func (vm *VM) initBuiltins() {
 		}
 		vmInstance := ctx.VM.(*VM)
 		return vmInstance.buildClass(classBody, nameVal, bases, val.DictVal(kwdsDict), vmInstance.globals)
+	}))
+
+	vm.builtins.Set(val.InternString("__build_lazy_import__"), val.NewBuiltinFuncVal("__build_lazy_import__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 3 {
+			panic("TypeError: __build_lazy_import__ requires 3 arguments")
+		}
+		modName := args[0].AsString()
+		symName := args[1].AsString()
+		level := int(args[2].AsInt64())
+		pkgName := ""
+		if ctx != nil && ctx.VM != nil {
+			vmInstance := ctx.VM.(*VM)
+			var activeGlobals *val.PyDict
+			if vmInstance.activeFrameIdx >= 0 && vmInstance.activeFrameIdx < len(vmInstance.frames) {
+				activeGlobals = vmInstance.frames[vmInstance.activeFrameIdx].globals
+			}
+			if activeGlobals == nil {
+				activeGlobals = vmInstance.globals
+			}
+			if activeGlobals != nil {
+				if v, ok := activeGlobals.Get(val.InternString("__package__")); ok && v.IsAnyString() {
+					pkgName = v.AsString()
+				} else if v, ok := activeGlobals.Get(val.InternString("__name__")); ok && v.IsAnyString() {
+					pkgName = v.AsString()
+				}
+			}
+		}
+		return val.NewLazyImportVal(modName, symName, level, pkgName)
 	}))
 
 	vm.builtins.Set(val.InternString("dir"), val.NewBuiltinFuncVal("dir", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -1068,6 +1100,7 @@ func (vm *VM) initBuiltins() {
 		if builtins == nil {
 			builtins = eng.builtins
 		}
+		val.SetMultiThreaded(true)
 
 		go func() {
 			workerVM := eng.AcquireVM()
@@ -1529,6 +1562,7 @@ func (vm *VM) syncActiveFrame(frameIdx int, co *CodeObject, code []uint32, const
 		saved.globals = globals
 		saved.locals = locals
 		saved.cache = cache
+		saved.excStackLen = len(vm.excStack)
 		vm.activeFrameIdx = frameIdx
 		vm.activeCO = co
 		vm.activeBaseOffset = baseOffset
@@ -1537,8 +1571,6 @@ func (vm *VM) syncActiveFrame(frameIdx int, co *CodeObject, code []uint32, const
 }
 
 func (vm *VM) unwindException(exc val.Value, curCO **CodeObject, ip *int, frameIdx *int, startFrameIdx int, baseOffset *int, sp *int, code *[]uint32, consts *[]val.Value, cells *[]val.Value, globals **val.PyDict, curLocals *val.Value, stack []val.Value, curIC *[]ICSlot, curMethodPIC *[][4]val.MethodPICEntry, curAttrPIC *[][4]AttrPICEntry) bool {
-	vm.lastException = exc
-
 	var curTB val.Value = val.NoneVal()
 	if exc.IsInstance() {
 		curTB, _ = exc.AsInstance().GetAttr(val.InternString("__traceback__"))
@@ -1627,6 +1659,9 @@ func (vm *VM) unwindException(exc val.Value, curCO **CodeObject, ip *int, frameI
 
 			(*frameIdx)--
 			caller := &vm.frames[*frameIdx]
+			if len(vm.excStack) > caller.excStackLen {
+				vm.excStack = vm.excStack[:caller.excStackLen]
+			}
 			*curCO = caller.co
 			*code = caller.code
 			*consts = caller.consts
@@ -1656,6 +1691,7 @@ func (vm *VM) unwindException(exc val.Value, curCO **CodeObject, ip *int, frameI
 		}
 
 		vm.unhandledException = exc
+		vm.lastException = exc
 		return false
 	}
 }
@@ -2456,6 +2492,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.globals = globals
 				saved.locals = curLocals
 				saved.cache = curCodeCache
+				saved.excStackLen = len(vm.excStack)
 				curLocals = val.NoneVal()
 				frameIdx++
 				curCO = callee
@@ -2500,8 +2537,12 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			case val.KindFunction:
 				fn := target.AsFunction()
 				callee := AsCodeObject(fn.Code)
+				fnGlobals := fn.Globals
+				if fnGlobals == nil {
+					fnGlobals = globals
+				}
 				if callee.IsGenerator {
-					genVal, ok := vm.instantiateGeneratorSafe(callee, target, fn.Defaults, fn.KwDefaults, stack, newBase, argc, nil, globals)
+					genVal, ok := vm.instantiateGeneratorSafe(callee, target, fn.Defaults, fn.KwDefaults, stack, newBase, argc, nil, fnGlobals)
 					if !ok {
 						exc := vm.execCtx.ActiveException
 						vm.execCtx.ClearException()
@@ -2524,7 +2565,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					continue
 				}
 				if callee.IsCoroutine {
-					coroVal, ok := vm.instantiateCoroutineSafe(callee, target, fn.Defaults, fn.KwDefaults, stack, newBase, argc, nil, globals)
+					coroVal, ok := vm.instantiateCoroutineSafe(callee, target, fn.Defaults, fn.KwDefaults, stack, newBase, argc, nil, fnGlobals)
 					if !ok {
 						exc := vm.execCtx.ActiveException
 						vm.execCtx.ClearException()
@@ -2602,6 +2643,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.globals = globals
 				saved.locals = curLocals
 				saved.cache = curCodeCache
+				saved.excStackLen = len(vm.excStack)
 				curLocals = val.NoneVal()
 				frameIdx++
 				curCO = callee
@@ -2703,8 +2745,12 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			case val.KindFunction:
 				fn := target.AsFunction()
 				callee := AsCodeObject(fn.Code)
+				fnGlobals := fn.Globals
+				if fnGlobals == nil {
+					fnGlobals = globals
+				}
 				if callee.IsGenerator {
-					genVal, ok := vm.instantiateGeneratorSafe(callee, target, fn.Defaults, fn.KwDefaults, stack, newBase, totalArgs, kwnames, globals)
+					genVal, ok := vm.instantiateGeneratorSafe(callee, target, fn.Defaults, fn.KwDefaults, stack, newBase, totalArgs, kwnames, fnGlobals)
 					if !ok {
 						exc := vm.execCtx.ActiveException
 						vm.execCtx.ClearException()
@@ -2727,7 +2773,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					continue
 				}
 				if callee.IsCoroutine {
-					coroVal, ok := vm.instantiateCoroutineSafe(callee, target, fn.Defaults, fn.KwDefaults, stack, newBase, totalArgs, kwnames, globals)
+					coroVal, ok := vm.instantiateCoroutineSafe(callee, target, fn.Defaults, fn.KwDefaults, stack, newBase, totalArgs, kwnames, fnGlobals)
 					if !ok {
 						exc := vm.execCtx.ActiveException
 						vm.execCtx.ClearException()
@@ -2795,6 +2841,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.globals = globals
 				saved.locals = curLocals
 				saved.cache = curCodeCache
+				saved.excStackLen = len(vm.excStack)
 				curLocals = val.NoneVal()
 				frameIdx++
 				curCO = callee
@@ -2914,6 +2961,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.globals = globals
 				saved.locals = curLocals
 				saved.cache = curCodeCache
+				saved.excStackLen = len(vm.excStack)
 				curLocals = val.NoneVal()
 				frameIdx++
 				curCO = callee
@@ -3131,8 +3179,12 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			case val.KindFunction:
 				fn := callable.AsFunction()
 				callee := AsCodeObject(fn.Code)
+				fnGlobals := fn.Globals
+				if fnGlobals == nil {
+					fnGlobals = globals
+				}
 				if callee.IsGenerator {
-					genVal, ok := vm.instantiateGeneratorSafe(callee, callable, fn.Defaults, fn.KwDefaults, stack, newBase, totalArgs, nil, globals)
+					genVal, ok := vm.instantiateGeneratorSafe(callee, callable, fn.Defaults, fn.KwDefaults, stack, newBase, totalArgs, nil, fnGlobals)
 					if !ok {
 						exc := vm.execCtx.ActiveException
 						vm.execCtx.ClearException()
@@ -3155,7 +3207,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					continue
 				}
 				if callee.IsCoroutine {
-					coroVal, ok := vm.instantiateCoroutineSafe(callee, callable, fn.Defaults, fn.KwDefaults, stack, newBase, totalArgs, nil, globals)
+					coroVal, ok := vm.instantiateCoroutineSafe(callee, callable, fn.Defaults, fn.KwDefaults, stack, newBase, totalArgs, nil, fnGlobals)
 					if !ok {
 						exc := vm.execCtx.ActiveException
 						vm.execCtx.ClearException()
@@ -3233,6 +3285,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.globals = globals
 				saved.locals = curLocals
 				saved.cache = curCodeCache
+				saved.excStackLen = len(vm.excStack)
 				curLocals = val.NoneVal()
 				frameIdx++
 				curCO = callee
@@ -3325,6 +3378,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.globals = globals
 				saved.locals = curLocals
 				saved.cache = curCodeCache
+				saved.excStackLen = len(vm.excStack)
 				curLocals = val.NoneVal()
 				frameIdx++
 				curCO = callee
@@ -3517,6 +3571,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 						saved.globals = globals
 						saved.locals = curLocals
 						saved.cache = curCodeCache
+						saved.excStackLen = len(vm.excStack)
 						curLocals = val.NoneVal()
 						frameIdx++
 						curCO = callee
@@ -3636,6 +3691,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			}
 			frameIdx--
 			caller := &vm.frames[frameIdx]
+			if len(vm.excStack) > caller.excStackLen {
+				vm.excStack = vm.excStack[:caller.excStackLen]
+			}
 			curCO = caller.co
 			code = caller.code
 			consts = caller.consts
@@ -3675,41 +3733,102 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				} else {
 					instShape := instObj.Shape
 					pic := &curAttrPIC[ip]
+					isMT := val.IsMultiThreaded()
 					if pic[0].Shape == instShape {
-						if v, ok := instObj.GetSlot(pic[0].SlotIndex); ok && !v.IsUnbound() {
-							stack[sp-1] = v
-							ip++
-							continue
+						slotIdx := pic[0].SlotIndex
+						if !isMT {
+							if uint(slotIdx) < uint(len(instObj.Slots)) {
+								v := instObj.Slots[slotIdx]
+								if !v.IsUnbound() {
+									stack[sp-1] = v
+									ip++
+									continue
+								}
+							}
+						} else {
+							if v, ok := instObj.GetSlot(slotIdx); ok && !v.IsUnbound() {
+								stack[sp-1] = v
+								ip++
+								continue
+							}
 						}
 					}
 					if pic[1].Shape == instShape {
-						if v, ok := instObj.GetSlot(pic[1].SlotIndex); ok && !v.IsUnbound() {
-							stack[sp-1] = v
-							ip++
-							continue
+						slotIdx := pic[1].SlotIndex
+						if !isMT {
+							if uint(slotIdx) < uint(len(instObj.Slots)) {
+								v := instObj.Slots[slotIdx]
+								if !v.IsUnbound() {
+									stack[sp-1] = v
+									ip++
+									continue
+								}
+							}
+						} else {
+							if v, ok := instObj.GetSlot(slotIdx); ok && !v.IsUnbound() {
+								stack[sp-1] = v
+								ip++
+								continue
+							}
 						}
 					}
 					if pic[2].Shape == instShape {
-						if v, ok := instObj.GetSlot(pic[2].SlotIndex); ok && !v.IsUnbound() {
-							stack[sp-1] = v
-							ip++
-							continue
+						slotIdx := pic[2].SlotIndex
+						if !isMT {
+							if uint(slotIdx) < uint(len(instObj.Slots)) {
+								v := instObj.Slots[slotIdx]
+								if !v.IsUnbound() {
+									stack[sp-1] = v
+									ip++
+									continue
+								}
+							}
+						} else {
+							if v, ok := instObj.GetSlot(slotIdx); ok && !v.IsUnbound() {
+								stack[sp-1] = v
+								ip++
+								continue
+							}
 						}
 					}
 					if pic[3].Shape == instShape {
-						if v, ok := instObj.GetSlot(pic[3].SlotIndex); ok && !v.IsUnbound() {
-							stack[sp-1] = v
-							ip++
-							continue
+						slotIdx := pic[3].SlotIndex
+						if !isMT {
+							if uint(slotIdx) < uint(len(instObj.Slots)) {
+								v := instObj.Slots[slotIdx]
+								if !v.IsUnbound() {
+									stack[sp-1] = v
+									ip++
+									continue
+								}
+							}
+						} else {
+							if v, ok := instObj.GetSlot(slotIdx); ok && !v.IsUnbound() {
+								stack[sp-1] = v
+								ip++
+								continue
+							}
 						}
 					}
 					entry := curIC[ip]
 					if instObj.Shape.ID == entry.ExpectedShapeID && instType.VersionTag == entry.ExpectedTypeVer {
 						if entry.Kind == ICKindInstanceSlot {
-							if v, ok := instObj.GetSlot(entry.SlotIndex); ok && !v.IsUnbound() {
-								stack[sp-1] = v
-								ip++
-								continue
+							slotIdx := entry.SlotIndex
+							if !isMT {
+								if uint(slotIdx) < uint(len(instObj.Slots)) {
+									v := instObj.Slots[slotIdx]
+									if !v.IsUnbound() {
+										stack[sp-1] = v
+										ip++
+										continue
+									}
+								}
+							} else {
+								if v, ok := instObj.GetSlot(slotIdx); ok && !v.IsUnbound() {
+									stack[sp-1] = v
+									ip++
+									continue
+								}
 							}
 						}
 						if entry.Kind == ICKindDataDescriptor {
@@ -3794,41 +3913,92 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				} else {
 					instShape := instObj.Shape
 					pic := &curAttrPIC[ip]
+					isMT := val.IsMultiThreaded()
 					if pic[0].Shape == instShape {
-						if instObj.SetSlot(pic[0].SlotIndex, v) {
-							sp -= 2
-							ip++
-							continue
+						slotIdx := pic[0].SlotIndex
+						if !isMT {
+							if uint(slotIdx) < uint(len(instObj.Slots)) {
+								instObj.Slots[slotIdx] = v
+								sp -= 2
+								ip++
+								continue
+							}
+						} else {
+							if instObj.SetSlot(slotIdx, v) {
+								sp -= 2
+								ip++
+								continue
+							}
 						}
 					}
 					if pic[1].Shape == instShape {
-						if instObj.SetSlot(pic[1].SlotIndex, v) {
-							sp -= 2
-							ip++
-							continue
+						slotIdx := pic[1].SlotIndex
+						if !isMT {
+							if uint(slotIdx) < uint(len(instObj.Slots)) {
+								instObj.Slots[slotIdx] = v
+								sp -= 2
+								ip++
+								continue
+							}
+						} else {
+							if instObj.SetSlot(slotIdx, v) {
+								sp -= 2
+								ip++
+								continue
+							}
 						}
 					}
 					if pic[2].Shape == instShape {
-						if instObj.SetSlot(pic[2].SlotIndex, v) {
-							sp -= 2
-							ip++
-							continue
+						slotIdx := pic[2].SlotIndex
+						if !isMT {
+							if uint(slotIdx) < uint(len(instObj.Slots)) {
+								instObj.Slots[slotIdx] = v
+								sp -= 2
+								ip++
+								continue
+							}
+						} else {
+							if instObj.SetSlot(slotIdx, v) {
+								sp -= 2
+								ip++
+								continue
+							}
 						}
 					}
 					if pic[3].Shape == instShape {
-						if instObj.SetSlot(pic[3].SlotIndex, v) {
-							sp -= 2
-							ip++
-							continue
+						slotIdx := pic[3].SlotIndex
+						if !isMT {
+							if uint(slotIdx) < uint(len(instObj.Slots)) {
+								instObj.Slots[slotIdx] = v
+								sp -= 2
+								ip++
+								continue
+							}
+						} else {
+							if instObj.SetSlot(slotIdx, v) {
+								sp -= 2
+								ip++
+								continue
+							}
 						}
 					}
 					entry := curIC[ip]
 					if instObj.Shape.ID == entry.ExpectedShapeID && instType.VersionTag == entry.ExpectedTypeVer {
 						if entry.Kind == ICKindInstanceSlot {
-							if instObj.SetSlot(entry.SlotIndex, v) {
-								sp -= 2
-								ip++
-								continue
+							slotIdx := entry.SlotIndex
+							if !isMT {
+								if uint(slotIdx) < uint(len(instObj.Slots)) {
+									instObj.Slots[slotIdx] = v
+									sp -= 2
+									ip++
+									continue
+								}
+							} else {
+								if instObj.SetSlot(slotIdx, v) {
+									sp -= 2
+									ip++
+									continue
+								}
 							}
 						}
 						if entry.Kind == ICKindDataDescriptor {
@@ -3965,6 +4135,14 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				}
 			}
 			if v, slot, ok := globals.GetWithSlotHint(nameVal, entry.SlotIndex); ok {
+				if v.IsLazyImport() {
+					resolved, err := vm.resolveLazyImport(nil, nameVal, v)
+					if err != nil {
+						panic("ImportError: " + err.Error())
+					}
+					globals.Set(nameVal, resolved)
+					v = resolved
+				}
 				entry.Kind = ICKindGlobal
 				entry.ExpectedGlobalsVer = globVer
 				entry.CachedVal = v
@@ -4121,6 +4299,19 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
 				curCodeCache = vm.getCodeCache(curCO)
 				continue
+			}
+
+			if res.IsLazyImport() {
+				resolved, err := vm.resolveLazyImport(nil, nameVal, res)
+				if err != nil {
+					panic("ImportError: " + err.Error())
+				}
+				if !curLocals.IsNone() && curLocals.Type() == val.DictType {
+					curLocals.AsDict().Set(nameVal, resolved)
+				} else if globals != nil {
+					globals.Set(nameVal, resolved)
+				}
+				res = resolved
 			}
 
 			stack[sp] = res
@@ -5329,6 +5520,21 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 
 		case OP_CLEANUP_EXC:
 			sp--
+			ip++
+
+		case OP_PUSH_EXC_INFO:
+			vm.excStack = append(vm.excStack, vm.lastException)
+			vm.lastException = stack[sp-1]
+			ip++
+
+		case OP_POP_EXCEPT:
+			n := len(vm.excStack)
+			if n > 0 {
+				vm.lastException = vm.excStack[n-1]
+				vm.excStack = vm.excStack[:n-1]
+			} else {
+				vm.lastException = val.NoneVal()
+			}
 			ip++
 
 		case OP_NOP:

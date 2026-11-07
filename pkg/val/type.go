@@ -21,11 +21,15 @@ type ExecContext struct {
 	CallHook        func(ctx *ExecContext, callable Value, argBase int, nargs int, kwnames []Value) Value
 	ActiveException Value
 	VM              any
+	ThreadID        int64
 }
 
 // AcquireExecContextHook allows standalone comparison/hashing helpers in pkg/val
 // to obtain a temporary VM ExecContext when invoked without an explicit ctx.
 var AcquireExecContextHook func() (*ExecContext, func())
+
+// ResolveLazyImportHook allows resolving a PyLazyImport placeholder through the VM.
+var ResolveLazyImportHook func(vm any, mod *PyModule, name Value, lazyVal Value) (Value, error)
 
 func (ctx *ExecContext) Raise(exc Value) {
 	if ctx != nil {
@@ -745,6 +749,18 @@ func NewTypeWithMeta(name string, bases []*PyType, dict *PyDict, meta *PyType) (
 						slotNames = append(slotNames, item.AsString())
 					}
 				}
+			} else if slotsVal.IsDict() {
+				for _, item := range slotsVal.AsDict().Keys() {
+					if item.IsAnyString() {
+						slotNames = append(slotNames, item.AsString())
+					}
+				}
+			} else if slotsVal.IsSet() {
+				for _, item := range slotsVal.AsSet().Items() {
+					if item.IsAnyString() {
+						slotNames = append(slotNames, item.AsString())
+					}
+				}
 			} else if slotsVal.IsIter() {
 				it := slotsVal.AsIter()
 				for {
@@ -909,32 +925,80 @@ var subclassesMu sync.RWMutex
 // without runtime string or dictionary lookups.
 
 func dunderNbAddSlot(ctx *ExecContext, a, b Value) Value {
-	return ctx.Invoke2(a.Type().dunderAdd, a, b)
+	fn := a.Type().dunderAdd
+	if !fn.IsFunction() && !fn.IsBuiltinFunc() {
+		if descrGet := fn.Type().Slots.TpDescrGet; descrGet != nil {
+			fn = descrGet(ctx, fn, a, a.Type())
+		}
+		return ctx.Invoke1(fn, b)
+	}
+	return ctx.Invoke2(fn, a, b)
 }
 
 func dunderNbSubSlot(ctx *ExecContext, a, b Value) Value {
-	return ctx.Invoke2(a.Type().dunderSub, a, b)
+	fn := a.Type().dunderSub
+	if !fn.IsFunction() && !fn.IsBuiltinFunc() {
+		if descrGet := fn.Type().Slots.TpDescrGet; descrGet != nil {
+			fn = descrGet(ctx, fn, a, a.Type())
+		}
+		return ctx.Invoke1(fn, b)
+	}
+	return ctx.Invoke2(fn, a, b)
 }
 
 func dunderNbMulSlot(ctx *ExecContext, a, b Value) Value {
-	return ctx.Invoke2(a.Type().dunderMul, a, b)
+	fn := a.Type().dunderMul
+	if !fn.IsFunction() && !fn.IsBuiltinFunc() {
+		if descrGet := fn.Type().Slots.TpDescrGet; descrGet != nil {
+			fn = descrGet(ctx, fn, a, a.Type())
+		}
+		return ctx.Invoke1(fn, b)
+	}
+	return ctx.Invoke2(fn, a, b)
 }
 
 func dunderNbAbsSlot(ctx *ExecContext, a Value) Value {
-	return ctx.Invoke1(a.Type().dunderAbs, a)
+	fn := a.Type().dunderAbs
+	if !fn.IsFunction() && !fn.IsBuiltinFunc() {
+		if descrGet := fn.Type().Slots.TpDescrGet; descrGet != nil {
+			fn = descrGet(ctx, fn, a, a.Type())
+		}
+		return ctx.Invoke0(fn)
+	}
+	return ctx.Invoke1(fn, a)
 }
 
 func dunderSqLenSlot(ctx *ExecContext, a Value) int64 {
-	res := ctx.Invoke1(a.Type().dunderLen, a)
-	return res.AsInt64()
+	fn := a.Type().dunderLen
+	if !fn.IsFunction() && !fn.IsBuiltinFunc() {
+		if descrGet := fn.Type().Slots.TpDescrGet; descrGet != nil {
+			fn = descrGet(ctx, fn, a, a.Type())
+		}
+		return ctx.Invoke0(fn).AsInt64()
+	}
+	return ctx.Invoke1(fn, a).AsInt64()
 }
 
 func dunderGetItemSlot(ctx *ExecContext, a, b Value) Value {
-	return ctx.Invoke2(a.Type().dunderGetItem, a, b)
+	fn := a.Type().dunderGetItem
+	if !fn.IsFunction() && !fn.IsBuiltinFunc() {
+		if descrGet := fn.Type().Slots.TpDescrGet; descrGet != nil {
+			fn = descrGet(ctx, fn, a, a.Type())
+		}
+		return ctx.Invoke1(fn, b)
+	}
+	return ctx.Invoke2(fn, a, b)
 }
 
 func dunderSetItemSlot(ctx *ExecContext, a, b, c Value) Value {
-	return ctx.Invoke3(a.Type().dunderSetItem, a, b, c)
+	fn := a.Type().dunderSetItem
+	if !fn.IsFunction() && !fn.IsBuiltinFunc() {
+		if descrGet := fn.Type().Slots.TpDescrGet; descrGet != nil {
+			fn = descrGet(ctx, fn, a, a.Type())
+		}
+		return ctx.Invoke2(fn, b, c)
+	}
+	return ctx.Invoke3(fn, a, b, c)
 }
 
 func dunderTpCallSlot(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
@@ -1846,6 +1910,17 @@ func moduleGetAttr(ctx *ExecContext, obj, name Value) Value {
 		return DictVal(mod.Dict)
 	}
 	if v, ok := mod.Dict.Get(interned); ok {
+		if v.IsLazyImport() && ResolveLazyImportHook != nil {
+			var vm any
+			if ctx != nil {
+				vm = ctx.VM
+			}
+			resolved, err := ResolveLazyImportHook(vm, mod, interned, v)
+			if err != nil {
+				panic("ImportError: " + err.Error())
+			}
+			return resolved
+		}
 		return v
 	}
 	switch interned.AsString() {

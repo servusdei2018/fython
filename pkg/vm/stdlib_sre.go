@@ -140,6 +140,15 @@ func (p *pyPattern) subject(v val.Value) []rune {
 			panic("TypeError: cannot use a bytes pattern on a string-like object")
 		}
 		return []rune(v.AsString())
+	case v.IsInstance() && val.IsSubclass(v.Type(), val.StrType):
+		if p.IsBytes {
+			panic("TypeError: cannot use a bytes pattern on a string-like object")
+		}
+		inst := v.AsInstance()
+		if len(inst.Slots) > 0 && inst.Slots[0].IsAnyString() {
+			return []rune(inst.Slots[0].AsString())
+		}
+		return []rune(v.String())
 	case v.IsBytes() || v.IsByteArray() || v.IsMemoryView():
 		if !p.IsBytes {
 			panic("TypeError: cannot use a string pattern on a bytes-like object")
@@ -152,6 +161,20 @@ func (p *pyPattern) subject(v val.Value) []rune {
 			data = v.AsByteArray().Data
 		default:
 			data = v.AsMemoryView().Buf
+		}
+		rs := make([]rune, len(data))
+		for i, b := range data {
+			rs[i] = rune(b)
+		}
+		return rs
+	case v.IsInstance() && val.IsSubclass(v.Type(), val.BytesType):
+		if !p.IsBytes {
+			panic("TypeError: cannot use a string pattern on a bytes-like object")
+		}
+		inst := v.AsInstance()
+		var data []byte
+		if len(inst.Slots) > 0 && inst.Slots[0].IsBytes() {
+			data = inst.Slots[0].AsBytes().Data
 		}
 		rs := make([]rune, len(data))
 		for i, b := range data {
@@ -894,12 +917,40 @@ func reEscape(v val.Value) val.Value {
 			sb.WriteRune(r)
 		}
 		return val.NewStringVal(sb.String())
+	case v.IsInstance() && val.IsSubclass(v.Type(), val.StrType):
+		s := v.String()
+		inst := v.AsInstance()
+		if len(inst.Slots) > 0 && inst.Slots[0].IsAnyString() {
+			s = inst.Slots[0].AsString()
+		}
+		var sb strings.Builder
+		for _, r := range s {
+			if r < 128 && strings.ContainsRune(special, r) {
+				sb.WriteByte('\\')
+			}
+			sb.WriteRune(r)
+		}
+		return val.NewStringVal(sb.String())
 	case v.IsBytes() || v.IsByteArray():
 		var data []byte
 		if v.IsBytes() {
 			data = v.AsBytes().Data
 		} else {
 			data = v.AsByteArray().Data
+		}
+		out := make([]byte, 0, len(data))
+		for _, b := range data {
+			if b < 128 && strings.IndexByte(special, b) >= 0 {
+				out = append(out, '\\')
+			}
+			out = append(out, b)
+		}
+		return val.NewBytesVal(out)
+	case v.IsInstance() && val.IsSubclass(v.Type(), val.BytesType):
+		var data []byte
+		inst := v.AsInstance()
+		if len(inst.Slots) > 0 && inst.Slots[0].IsBytes() {
+			data = inst.Slots[0].AsBytes().Data
 		}
 		out := make([]byte, 0, len(data))
 		for _, b := range data {

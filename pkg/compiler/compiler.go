@@ -10,7 +10,10 @@ import (
 )
 
 func init() {
+	vm.SetDefaultCompileHook(CompileSource)
+	vm.SetDefaultCompileWithFilenameHook(CompileSourceWithFilename)
 	vm.DefaultEngine().SetCompileHook(CompileSource)
+	vm.DefaultEngine().SetCompileWithFilenameHook(CompileSourceWithFilename)
 	hook := func(src []byte, filename string, mode int) (*vm.CodeObject, error) {
 		return CompileSourceMode(src, filename, CompileMode(mode))
 	}
@@ -23,6 +26,7 @@ type CleanupKind int
 const (
 	CleanupWith CleanupKind = iota
 	CleanupFinally
+	CleanupExcept
 )
 
 type CleanupBlock struct {
@@ -208,7 +212,7 @@ func CompileWithFilename(src []byte, arena *ASTArena, filename string) (*vm.Code
 		ExceptionTable: c.exceptionTable,
 		LineSpans:      c.lineSpans,
 	}
-	return co, nil
+	return co.Init(), nil
 }
 
 // CompileSource compiles Python source bytes using a fresh ASTArena.
@@ -288,7 +292,7 @@ func CompileSourceMode(src []byte, filename string, mode CompileMode) (*vm.CodeO
 			ExceptionTable: c.exceptionTable,
 			LineSpans:      c.lineSpans,
 		}
-		return co, nil
+		return co.Init(), nil
 	}
 
 	parser := NewParser(src, arena)
@@ -343,7 +347,7 @@ func CompileSourceMode(src []byte, filename string, mode CompileMode) (*vm.CodeO
 		ExceptionTable: c.exceptionTable,
 		LineSpans:      c.lineSpans,
 	}
-	return co, nil
+	return co.Init(), nil
 }
 
 func (c *Compiler) extractDocstringFromSlice(stmts []StmtID) (string, bool) {
@@ -425,6 +429,8 @@ func (c *Compiler) runCleanupsTo(target *CleanupBlock) error {
 					return err
 				}
 			}
+		} else if cl.Kind == CleanupExcept {
+			c.emitOp(vm.OP_POP_EXCEPT, 0, 0)
 		}
 	}
 	return nil
@@ -608,6 +614,25 @@ func (c *Compiler) compileStmt(stmtID StmtID) error {
 	case StmtKindImport:
 		imp := c.arena.GetImport(stmt.Extra)
 		if imp != nil {
+			if imp.IsLazy {
+				for _, alias := range c.arena.GetAliasSlice(imp.Aliases) {
+					if err := c.compileNameLoad("__build_lazy_import__"); err != nil {
+						return err
+					}
+					c.emitOp(vm.OP_LOAD_CONST, 0, c.constPool.Add(val.NewStringVal(alias.Name)))
+					c.emitOp(vm.OP_LOAD_CONST, 0, c.constPool.Add(val.NewStringVal("")))
+					c.emitOp(vm.OP_LOAD_CONST, 0, c.constPool.Add(val.Int64Val(0)))
+					c.emitOp(vm.OP_CALL, 3, 0)
+					targetName := alias.AsName
+					if targetName == "" {
+						targetName = strings.Split(alias.Name, ".")[0]
+					}
+					if err := c.compileNameStore(targetName); err != nil {
+						return err
+					}
+				}
+				break
+			}
 			for _, alias := range c.arena.GetAliasSlice(imp.Aliases) {
 				_, constIdx := c.constPool.InternName(alias.Name)
 				flagLeaf := uint8(0)
@@ -628,6 +653,25 @@ func (c *Compiler) compileStmt(stmtID StmtID) error {
 	case StmtKindImportFrom:
 		impFrom := c.arena.GetImportFrom(stmt.Extra)
 		if impFrom != nil {
+			if impFrom.IsLazy {
+				for _, alias := range c.arena.GetAliasSlice(impFrom.Aliases) {
+					if err := c.compileNameLoad("__build_lazy_import__"); err != nil {
+						return err
+					}
+					c.emitOp(vm.OP_LOAD_CONST, 0, c.constPool.Add(val.NewStringVal(impFrom.Module)))
+					c.emitOp(vm.OP_LOAD_CONST, 0, c.constPool.Add(val.NewStringVal(alias.Name)))
+					c.emitOp(vm.OP_LOAD_CONST, 0, c.constPool.Add(val.Int64Val(int64(impFrom.Level))))
+					c.emitOp(vm.OP_CALL, 3, 0)
+					targetName := alias.Name
+					if alias.AsName != "" {
+						targetName = alias.AsName
+					}
+					if err := c.compileNameStore(targetName); err != nil {
+						return err
+					}
+				}
+				break
+			}
 			_, constIdx := c.constPool.InternName(impFrom.Module)
 			c.emitOp(vm.OP_IMPORT_NAME, 0x80|uint8(impFrom.Level&0x7F), constIdx)
 			if impFrom.IsStar {
@@ -1227,6 +1271,7 @@ func (c *Compiler) compileTryStmt(stmt *ASTStmt) error {
 				c.emitOp(vm.OP_CHECK_EXC_MATCH_STAR, 0, 0)
 				nextHandlerJump = c.emitOp(vm.OP_JUMP_IF_FALSE, 0, 0)
 			}
+			c.emitOp(vm.OP_PUSH_EXC_INFO, 0, 0)
 			if h.Name != "" {
 				if err := c.compileNameStore(h.Name); err != nil {
 					return err
@@ -1236,11 +1281,15 @@ func (c *Compiler) compileTryStmt(stmt *ASTStmt) error {
 			}
 			c.emitOp(vm.OP_POP_TOP, 0, 0) // pop rest
 
+			cleanup := &CleanupBlock{Kind: CleanupExcept, Parent: c.activeCleanup}
+			c.activeCleanup = cleanup
 			for _, sID := range c.arena.StmtIDs[h.Body.Start : h.Body.Start+h.Body.Count] {
 				if err := c.compileStmt(sID); err != nil {
 					return err
 				}
 			}
+			c.activeCleanup = cleanup.Parent
+			c.emitOp(vm.OP_POP_EXCEPT, 0, 0)
 			hEndJump := c.emitOp(vm.OP_JUMP, 0, 0)
 			handlerEndJumps = append(handlerEndJumps, hEndJump)
 
@@ -1257,6 +1306,7 @@ func (c *Compiler) compileTryStmt(stmt *ASTStmt) error {
 				nextHandlerJump = c.emitOp(vm.OP_JUMP_IF_FALSE, 0, 0)
 			}
 
+			c.emitOp(vm.OP_PUSH_EXC_INFO, 0, 0)
 			if h.Name != "" {
 				c.emitOp(vm.OP_DUP_TOP, 0, 0)
 				if err := c.compileNameStore(h.Name); err != nil {
@@ -1265,11 +1315,15 @@ func (c *Compiler) compileTryStmt(stmt *ASTStmt) error {
 			}
 			c.emitOp(vm.OP_POP_TOP, 0, 0)
 
+			cleanup := &CleanupBlock{Kind: CleanupExcept, Parent: c.activeCleanup}
+			c.activeCleanup = cleanup
 			for _, sID := range c.arena.StmtIDs[h.Body.Start : h.Body.Start+h.Body.Count] {
 				if err := c.compileStmt(sID); err != nil {
 					return err
 				}
 			}
+			c.activeCleanup = cleanup.Parent
+			c.emitOp(vm.OP_POP_EXCEPT, 0, 0)
 			hEndJump := c.emitOp(vm.OP_JUMP, 0, 0)
 			handlerEndJumps = append(handlerEndJumps, hEndJump)
 
@@ -1405,7 +1459,7 @@ func (c *Compiler) compileWithItemRecursive(items []ASTWithItem, body uint32) er
 	c.emitOp(vm.OP_POP_TOP, 0, 0)
 	jumpAfterWith := c.emitOp(vm.OP_JUMP, 0, 0)
 
-	// Exception handler: call __exit__(exc, exc, None) and check suppression
+	// Exception handler: call __exit__(type(exc), exc, None) and check suppression
 	excTarget := len(c.code)
 	c.addExceptionRange(withStart, withEnd, excTarget, depth, false)
 
@@ -1413,8 +1467,10 @@ func (c *Compiler) compileWithItemRecursive(items []ASTWithItem, body uint32) er
 	tempSlot2 := c.allocTempLocal()
 	c.emitOp(vm.OP_STORE_FAST, 0, uint16(tempSlot2))
 
+	_, classIdx := c.constPool.InternName("__class__")
 	c.emitOp(vm.OP_LOAD_FAST, 0, uint16(tempSlot))
 	c.emitOp(vm.OP_LOAD_FAST, 0, uint16(tempSlot2))
+	c.emitOp(vm.OP_LOAD_ATTR, 0, classIdx)
 	c.emitOp(vm.OP_LOAD_FAST, 0, uint16(tempSlot2))
 	c.emitOp(vm.OP_LOAD_CONST, 0, noneIdx)
 	c.emitOp(vm.OP_CALL_METHOD_PIC, 3, exitIdx)
@@ -1491,7 +1547,7 @@ func (c *Compiler) compileAsyncWithItemRecursive(items []ASTWithItem, body uint3
 	c.emitOp(vm.OP_POP_TOP, 0, 0)
 	jumpAfterWith := c.emitOp(vm.OP_JUMP, 0, 0)
 
-	// Exception handler: call __aexit__(exc, exc, None) and check suppression
+	// Exception handler: call __aexit__(type(exc), exc, None) and check suppression
 	excTarget := len(c.code)
 	c.addExceptionRange(withStart, withEnd, excTarget, depth, false)
 
@@ -1499,9 +1555,11 @@ func (c *Compiler) compileAsyncWithItemRecursive(items []ASTWithItem, body uint3
 	tempSlot2 := c.allocTempLocal()
 	c.emitOp(vm.OP_STORE_FAST, 0, uint16(tempSlot2))
 
+	_, classIdx := c.constPool.InternName("__class__")
 	c.emitOp(vm.OP_LOAD_FAST, 0, uint16(tempSlot))
 	c.emitOp(vm.OP_LOAD_METHOD, 0, exitIdx)
 	c.emitOp(vm.OP_LOAD_FAST, 0, uint16(tempSlot2))
+	c.emitOp(vm.OP_LOAD_ATTR, 0, classIdx)
 	c.emitOp(vm.OP_LOAD_FAST, 0, uint16(tempSlot2))
 	c.emitOp(vm.OP_LOAD_CONST, 0, noneIdx)
 	c.emitOp(vm.OP_CALL_METHOD, 3, 0)

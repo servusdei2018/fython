@@ -36,6 +36,8 @@ type pyZlibDecompress struct {
 	outPending        []byte
 	unusedData        []byte
 	unconsumedTail    []byte
+	savedUnusedData   []byte
+	streamFinished    bool
 	totalDecodedSoFar int
 	eof               bool
 	needsInput        bool
@@ -178,6 +180,8 @@ func initZlibTypes() {
 				unusedData:        append([]byte(nil), d.unusedData...),
 				unconsumedTail:    append([]byte(nil), d.unconsumedTail...),
 				totalDecodedSoFar: d.totalDecodedSoFar,
+				savedUnusedData:   append([]byte(nil), d.savedUnusedData...),
+				streamFinished:    d.streamFinished,
 				eof:               d.eof,
 				needsInput:        d.needsInput,
 			}
@@ -264,7 +268,7 @@ func (d *pyZlibDecompress) decompress(data []byte, maxLen int) []byte {
 	if len(data) > 0 {
 		d.inBuf = append(d.inBuf, data...)
 	}
-	if !d.eof && len(d.inBuf) > 0 {
+	if !d.streamFinished && len(d.inBuf) > 0 {
 		br := bytes.NewReader(d.inBuf)
 		var r io.Reader = br
 		var closeReader io.Closer
@@ -310,19 +314,16 @@ func (d *pyZlibDecompress) decompress(data []byte, maxLen int) []byte {
 		}
 
 		if err == nil || err == io.EOF {
-			d.eof = true
-			d.needsInput = false
+			d.streamFinished = true
 			unread := br.Len()
-			d.unusedData = append([]byte(nil), d.inBuf[len(d.inBuf)-unread:]...)
+			d.savedUnusedData = append([]byte(nil), d.inBuf[len(d.inBuf)-unread:]...)
 			d.inBuf = nil
-			d.unconsumedTail = nil
 			if len(decoded) > d.totalDecodedSoFar {
 				d.outPending = append(d.outPending, decoded[d.totalDecodedSoFar:]...)
 				d.totalDecodedSoFar = len(decoded)
 			}
 		} else if err == io.ErrUnexpectedEOF {
-			d.needsInput = true
-			d.eof = false
+			d.streamFinished = false
 			if len(decoded) > d.totalDecodedSoFar {
 				d.outPending = append(d.outPending, decoded[d.totalDecodedSoFar:]...)
 				d.totalDecodedSoFar = len(decoded)
@@ -337,10 +338,22 @@ func (d *pyZlibDecompress) decompress(data []byte, maxLen int) []byte {
 		res = append([]byte(nil), d.outPending[:maxLen]...)
 		d.outPending = d.outPending[maxLen:]
 		d.unconsumedTail = append([]byte(nil), d.inBuf...)
+		d.eof = false
+		d.needsInput = false
+		d.unusedData = []byte{}
 	} else {
 		res = d.outPending
 		d.outPending = nil
 		d.unconsumedTail = nil
+		if d.streamFinished {
+			d.eof = true
+			d.needsInput = false
+			d.unusedData = d.savedUnusedData
+		} else {
+			d.eof = false
+			d.needsInput = true
+			d.unusedData = []byte{}
+		}
 	}
 	if res == nil {
 		res = []byte{}
@@ -353,9 +366,16 @@ func (d *pyZlibDecompress) flush(length int) []byte {
 	if length > 0 && length < len(d.outPending) {
 		res = append([]byte(nil), d.outPending[:length]...)
 		d.outPending = d.outPending[length:]
+		d.eof = false
+		d.needsInput = false
 	} else {
 		res = d.outPending
 		d.outPending = nil
+		if d.streamFinished {
+			d.eof = true
+			d.needsInput = false
+			d.unusedData = d.savedUnusedData
+		}
 	}
 	if res == nil {
 		res = []byte{}

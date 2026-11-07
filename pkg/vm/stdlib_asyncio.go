@@ -348,6 +348,32 @@ func (e *Engine) createAsyncioModule() val.Value {
 	mod.Dict.Set(val.InternString("InvalidStateError"), val.TypeVal(InvalidStateErrorType))
 	mod.Dict.Set(val.InternString("TimeoutError"), val.TypeVal(TimeoutErrorType))
 
+	// coroutines submodule
+	coroSubmodVal := val.NewModuleVal("asyncio.coroutines", "")
+	isCoroSentinel := val.NewInstanceOfType(val.ObjectType)
+	coroSubmodVal.AsModule().Dict.Set(val.InternString("_is_coroutine"), isCoroSentinel)
+	mod.Dict.Set(val.InternString("coroutines"), coroSubmodVal)
+	if e != nil && e.sharedModules != nil {
+		e.sharedModules.Set(val.InternString("asyncio.coroutines"), coroSubmodVal)
+	}
+
+	mod.Dict.Set(val.InternString("iscoroutinefunction"), val.NewBuiltinFuncVal("iscoroutinefunction", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			return val.BoolVal(false)
+		}
+		target := args[0]
+		if target.IsInstance() {
+			if v, ok := target.AsInstance().GetAttr(val.InternString("_is_coroutine")); ok && !v.IsNone() {
+				return val.BoolVal(true)
+			}
+			if v, ok := target.AsInstance().GetAttr(val.InternString("_is_coroutine_marker")); ok && !v.IsNone() {
+				return val.BoolVal(true)
+			}
+		}
+		co := callableCode(args)
+		return val.BoolVal(co != nil && co.IsCoroutine && !co.IsGenerator)
+	}))
+
 	// asyncio.run(coro)
 	mod.Dict.Set(val.InternString("run"), val.NewBuiltinFuncVal("run", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {

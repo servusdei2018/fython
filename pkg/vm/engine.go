@@ -53,28 +53,41 @@ func (cs *CompilerSingleflight) Do(key string, fn func() (*CodeObject, error)) (
 // It manages the thread-safe string intern table, root shape, builtins,
 // code object cache, module singleflight compiler, and pools lightweight *VM execution contexts.
 type Engine struct {
-	internPool         *val.InternPool
-	rootShape          *val.Shape
-	builtins           *val.PyDict
-	vmPool             sync.Pool
-	codeCache          sync.Map // maps canonical path or module name -> *CodeObject
-	singleflight       CompilerSingleflight
-	sharedModules      *val.PyDict
-	isSharedModules    bool
-	searchPaths        []string
-	compileHook        func(src []byte) (*CodeObject, error)
-	dynamicCompileHook func(src []byte, filename string, mode int) (*CodeObject, error)
-	virtualModules     sync.Map
-	asyncMode          AsyncMode
-	coroPool           sync.Pool
-	osPathMu           sync.Mutex
-	signals            sigState
-	stdStreams         [3]atomic.Pointer[val.Value]
+	internPool              *val.InternPool
+	rootShape               *val.Shape
+	builtins                *val.PyDict
+	vmPool                  sync.Pool
+	codeCache               sync.Map // maps canonical path or module name -> *CodeObject
+	singleflight            CompilerSingleflight
+	sharedModules           *val.PyDict
+	isSharedModules         bool
+	searchPaths             []string
+	compileHook             func(src []byte) (*CodeObject, error)
+	compileWithFilenameHook func(src []byte, filename string) (*CodeObject, error)
+	dynamicCompileHook      func(src []byte, filename string, mode int) (*CodeObject, error)
+	virtualModules          sync.Map
+	asyncMode               AsyncMode
+	coroPool                sync.Pool
+	osPathMu                sync.Mutex
+	signals                 sigState
+	stdStreams              [3]atomic.Pointer[val.Value]
 }
 
 var (
-	defaultDynamicCompileHook func(src []byte, filename string, mode int) (*CodeObject, error)
+	defaultCompileHook             func(src []byte) (*CodeObject, error)
+	defaultCompileWithFilenameHook func(src []byte, filename string) (*CodeObject, error)
+	defaultDynamicCompileHook      func(src []byte, filename string, mode int) (*CodeObject, error)
 )
+
+// SetDefaultCompileHook sets the global default callback for source compilation.
+func SetDefaultCompileHook(fn func(src []byte) (*CodeObject, error)) {
+	defaultCompileHook = fn
+}
+
+// SetDefaultCompileWithFilenameHook sets the global default callback for source compilation with filename.
+func SetDefaultCompileWithFilenameHook(fn func(src []byte, filename string) (*CodeObject, error)) {
+	defaultCompileWithFilenameHook = fn
+}
 
 // SetDynamicCompileHook sets the global default callback for dynamic eval/exec compilation.
 func SetDynamicCompileHook(fn func(src []byte, filename string, mode int) (*CodeObject, error)) {
@@ -99,12 +112,14 @@ func NewEngine() *Engine {
 	}
 
 	e := &Engine{
-		internPool:         val.NewInternPool(256),
-		rootShape:          val.NewRootShape(),
-		builtins:           val.NewDictVal(64).AsDict(),
-		searchPaths:        searchPaths,
-		asyncMode:          AsyncModeSingleThread,
-		dynamicCompileHook: defaultDynamicCompileHook,
+		internPool:              val.NewInternPool(256),
+		rootShape:               val.NewRootShape(),
+		builtins:                val.NewDictVal(64).AsDict(),
+		searchPaths:             searchPaths,
+		asyncMode:               AsyncModeSingleThread,
+		compileHook:             defaultCompileHook,
+		compileWithFilenameHook: defaultCompileWithFilenameHook,
+		dynamicCompileHook:      defaultDynamicCompileHook,
 	}
 	// Temporary bootstrap VM to populate e.builtins
 	bootVM := &VM{
@@ -167,7 +182,8 @@ func (e *Engine) newSysModules() *val.PyDict {
 		val.InternString("_thread"), val.InternString("_typing"), val.InternString("_colorize"),
 		val.InternString("_contextvars"), val.InternString("unicodedata"), val.InternString("_datetime"),
 		val.InternString("binascii"), val.InternString("_hashlib"), val.InternString("_struct"),
-		val.InternString("_csv"),
+		val.InternString("_csv"), val.InternString("_heapq"), val.InternString("_bisect"),
+		val.InternString("_queue"), val.InternString("atexit"),
 	}
 	sysMod.Dict.Set(val.InternString("builtin_module_names"), val.NewTupleVal(builtinNames...))
 
@@ -248,6 +264,16 @@ func (e *Engine) newSysModules() *val.PyDict {
 		return lastExc
 	}))
 
+	sysMod.Dict.Set(val.InternString("getrecursionlimit"), val.NewBuiltinFuncVal("getrecursionlimit", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.Int64Val(1000)
+	}))
+	sysMod.Dict.Set(val.InternString("getfilesystemencoding"), val.NewBuiltinFuncVal("getfilesystemencoding", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.NewStringVal("utf-8")
+	}))
+	sysMod.Dict.Set(val.InternString("getfilesystemencodeerrors"), val.NewBuiltinFuncVal("getfilesystemencodeerrors", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.NewStringVal("surrogateescape")
+	}))
+
 	modules.Set(val.InternString("sys"), sysModVal)
 
 	// 2. Built-in builtins module
@@ -263,7 +289,11 @@ func (e *Engine) newSysModules() *val.PyDict {
 	modules.Set(val.InternString("os"), e.createOSModule())
 	modules.Set(val.InternString("io"), ioMod)
 	modules.Set(val.InternString("_io"), ioMod)
-	modules.Set(val.InternString("asyncio"), e.createAsyncioModule())
+	asyncioMod := e.createAsyncioModule()
+	modules.Set(val.InternString("asyncio"), asyncioMod)
+	if coroMod, ok := asyncioMod.AsModule().Dict.Get(val.InternString("coroutines")); ok {
+		modules.Set(val.InternString("asyncio.coroutines"), coroMod)
+	}
 	modules.Set(val.InternString("_weakref"), e.createWeakrefCModule())
 	modules.Set(val.InternString("weakref"), e.createWeakrefModule())
 	modules.Set(val.InternString("traceback"), e.createTracebackModule())
@@ -309,10 +339,30 @@ func (e *Engine) newSysModules() *val.PyDict {
 	localeMod := e.createLocaleModule()
 	modules.Set(val.InternString("locale"), localeMod)
 	modules.Set(val.InternString("_locale"), localeMod)
+	modules.Set(val.InternString("_heapq"), e.createHeapQModule())
+	modules.Set(val.InternString("_bisect"), e.createBisectModule())
+	modules.Set(val.InternString("_queue"), e.createQueueModule())
+	modules.Set(val.InternString("atexit"), e.createAtexitModule())
+	modules.Set(val.InternString("_testcapi"), e.createTestCapiModule())
+	testMod, testSupportMod := e.createTestPackage()
+	modules.Set(val.InternString("test"), testMod)
+	modules.Set(val.InternString("test.support"), testSupportMod)
+	if ih, ok := testSupportMod.AsModule().Dict.Get(val.InternString("import_helper")); ok {
+		modules.Set(val.InternString("test.support.import_helper"), ih)
+	}
+	if oh, ok := testSupportMod.AsModule().Dict.Get(val.InternString("os_helper")); ok {
+		modules.Set(val.InternString("test.support.os_helper"), oh)
+	}
+	if wh, ok := testSupportMod.AsModule().Dict.Get(val.InternString("warnings_helper")); ok {
+		modules.Set(val.InternString("test.support.warnings_helper"), wh)
+	}
 	importlibMod := e.createImportlibModule()
 	modules.Set(val.InternString("importlib"), importlibMod)
 	if utilVal, ok := importlibMod.AsModule().Dict.Get(val.InternString("util")); ok {
 		modules.Set(val.InternString("importlib.util"), utilVal)
+	}
+	if machVal, ok := importlibMod.AsModule().Dict.Get(val.InternString("machinery")); ok {
+		modules.Set(val.InternString("importlib.machinery"), machVal)
 	}
 
 	return modules
@@ -345,7 +395,21 @@ func (e *Engine) createImportlibModule() val.Value {
 	modVal := val.NewModuleVal("importlib", "Core Python import machinery")
 	mod := modVal.AsModule()
 	utilModVal := val.NewModuleVal("importlib.util", "Utilities for importlib")
+	utilMod := utilModVal.AsModule()
+	utilMod.Dict.Set(val.InternString("MAGIC_NUMBER"), val.NewBytesVal([]byte{0xcb, 0x0d, 0x0d, 0x0a}))
+	utilMod.Dict.Set(val.InternString("find_spec"), val.NewBuiltinFuncVal("find_spec", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.NoneVal()
+	}))
 	mod.Dict.Set(val.InternString("util"), utilModVal)
+
+	machModVal := val.NewModuleVal("importlib.machinery", "Import machinery")
+	machMod := machModVal.AsModule()
+	specType := val.MustNewType("ModuleSpec", []*val.PyType{val.ObjectType}, nil)
+	fileFinderType := val.MustNewType("FileFinder", []*val.PyType{val.ObjectType}, nil)
+	machMod.Dict.Set(val.InternString("ModuleSpec"), val.TypeVal(specType))
+	machMod.Dict.Set(val.InternString("FileFinder"), val.TypeVal(fileFinderType))
+	machMod.Dict.Set(val.InternString("BuiltinImporter"), val.NewInstanceOfType(val.ObjectType))
+	mod.Dict.Set(val.InternString("machinery"), machModVal)
 
 	mod.Dict.Set(val.InternString("import_module"), val.NewBuiltinFuncVal("import_module", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
@@ -492,6 +556,18 @@ func (e *Engine) SearchPaths() []string {
 // SetCompileHook sets the source compilation callback.
 func (e *Engine) SetCompileHook(fn func(src []byte) (*CodeObject, error)) {
 	e.compileHook = fn
+	if fn != nil {
+		e.compileWithFilenameHook = func(src []byte, _ string) (*CodeObject, error) {
+			return fn(src)
+		}
+	} else {
+		e.compileWithFilenameHook = nil
+	}
+}
+
+// SetCompileWithFilenameHook sets the source compilation callback with filename.
+func (e *Engine) SetCompileWithFilenameHook(fn func(src []byte, filename string) (*CodeObject, error)) {
+	e.compileWithFilenameHook = fn
 }
 
 // SetDynamicCompileHook sets the source compilation callback for eval/exec.

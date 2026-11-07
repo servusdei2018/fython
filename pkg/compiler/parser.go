@@ -204,9 +204,9 @@ func (p *Parser) parseStmt() (StmtID, error) {
 		if p.tokenText(p.cur) == "lazy" && (p.peek().Type == TOKEN_IMPORT || p.peek().Type == TOKEN_FROM) {
 			p.advance()
 			if p.cur.Type == TOKEN_IMPORT {
-				return p.parseImportStmt()
+				return p.parseImportStmt(true)
 			}
-			return p.parseFromImportStmt()
+			return p.parseFromImportStmt(true)
 		}
 		return p.parseSimpleStmt()
 	default:
@@ -1072,7 +1072,8 @@ func (p *Parser) parseDottedName() (string, uint32, uint32, error) {
 	return name, start, end, nil
 }
 
-func (p *Parser) parseImportStmt() (StmtID, error) {
+func (p *Parser) parseImportStmt(isLazyOpt ...bool) (StmtID, error) {
+	isLazy := len(isLazyOpt) > 0 && isLazyOpt[0]
 	startTok, _ := p.expect(TOKEN_IMPORT)
 	var aliases []ASTAlias
 	for {
@@ -1097,7 +1098,7 @@ func (p *Parser) parseImportStmt() (StmtID, error) {
 	p.match(TOKEN_NEWLINE)
 
 	aliasSlice := p.arena.AddAliasSlice(aliases)
-	impIdx := p.arena.AllocImport(ASTImport{Aliases: aliasSlice})
+	impIdx := p.arena.AllocImport(ASTImport{Aliases: aliasSlice, IsLazy: isLazy})
 	return p.arena.AllocStmt(ASTStmt{
 		Kind:  StmtKindImport,
 		Start: startTok.Start,
@@ -1105,7 +1106,8 @@ func (p *Parser) parseImportStmt() (StmtID, error) {
 	}), nil
 }
 
-func (p *Parser) parseFromImportStmt() (StmtID, error) {
+func (p *Parser) parseFromImportStmt(isLazyOpt ...bool) (StmtID, error) {
+	isLazy := len(isLazyOpt) > 0 && isLazyOpt[0]
 	startTok, _ := p.expect(TOKEN_FROM)
 	level := 0
 	for p.match(TOKEN_DOT) {
@@ -1132,6 +1134,7 @@ func (p *Parser) parseFromImportStmt() (StmtID, error) {
 			Module: module,
 			Level:  level,
 			IsStar: true,
+			IsLazy: isLazy,
 		})
 		return p.arena.AllocStmt(ASTStmt{
 			Kind:  StmtKindImportFrom,
@@ -1201,6 +1204,7 @@ func (p *Parser) parseFromImportStmt() (StmtID, error) {
 		Level:   level,
 		Aliases: aliasSlice,
 		IsStar:  false,
+		IsLazy:  isLazy,
 	})
 	return p.arena.AllocStmt(ASTStmt{
 		Kind:  StmtKindImportFrom,

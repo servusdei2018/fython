@@ -6,7 +6,20 @@ import (
 	"unsafe"
 )
 
-var nextShapeID uint32
+var (
+	nextShapeID     uint32
+	isMultiThreaded atomic.Bool
+)
+
+// SetMultiThreaded enables or disables multi-threaded mode for instance slots.
+func SetMultiThreaded(v bool) {
+	isMultiThreaded.Store(v)
+}
+
+// IsMultiThreaded reports whether concurrent execution is active.
+func IsMultiThreaded() bool {
+	return isMultiThreaded.Load()
+}
 
 func allocShapeID() uint32 {
 	return atomic.AddUint32(&nextShapeID, 1)
@@ -205,8 +218,14 @@ func (v Value) AsInstance() *PyInstance {
 	return (*PyInstance)(unsafe.Pointer(v.ptr))
 }
 
-// GetSlot returns the Value at slot index idx in a thread-safe manner.
+// GetSlot returns the Value at slot index idx.
 func (inst *PyInstance) GetSlot(idx int) (Value, bool) {
+	if !isMultiThreaded.Load() {
+		if uint(idx) < uint(len(inst.Slots)) {
+			return inst.Slots[idx], true
+		}
+		return NoneVal(), false
+	}
 	inst.mu.RLock()
 	if idx < 0 || idx >= len(inst.Slots) {
 		inst.mu.RUnlock()
@@ -217,8 +236,15 @@ func (inst *PyInstance) GetSlot(idx int) (Value, bool) {
 	return val, true
 }
 
-// SetSlot sets the Value at slot index idx in a thread-safe manner.
+// SetSlot sets the Value at slot index idx.
 func (inst *PyInstance) SetSlot(idx int, val Value) bool {
+	if !isMultiThreaded.Load() {
+		if uint(idx) < uint(len(inst.Slots)) {
+			inst.Slots[idx] = val
+			return true
+		}
+		return false
+	}
 	inst.mu.Lock()
 	if idx < 0 || idx >= len(inst.Slots) {
 		inst.mu.Unlock()
@@ -229,8 +255,19 @@ func (inst *PyInstance) SetSlot(idx int, val Value) bool {
 	return true
 }
 
-// GetAttr looks up an attribute by name on the instance using its Shape in a thread-safe manner.
+// GetAttr looks up an attribute by name on the instance using its Shape.
 func (inst *PyInstance) GetAttr(name Value) (Value, bool) {
+	if !isMultiThreaded.Load() {
+		idx, ok := inst.Shape.Lookup(name)
+		if !ok || uint(idx) >= uint(len(inst.Slots)) {
+			return NoneVal(), false
+		}
+		val := inst.Slots[idx]
+		if val.IsUnbound() {
+			return NoneVal(), false
+		}
+		return val, true
+	}
 	inst.mu.RLock()
 	idx, ok := inst.Shape.Lookup(name)
 	if !ok || idx >= len(inst.Slots) {
@@ -247,6 +284,14 @@ func (inst *PyInstance) GetAttr(name Value) (Value, bool) {
 
 // DeleteAttr removes an attribute from the instance by marking its slot unbound.
 func (inst *PyInstance) DeleteAttr(name Value) bool {
+	if !isMultiThreaded.Load() {
+		idx, ok := inst.Shape.Lookup(name)
+		if !ok || uint(idx) >= uint(len(inst.Slots)) || inst.Slots[idx].IsUnbound() {
+			return false
+		}
+		inst.Slots[idx] = UnboundVal()
+		return true
+	}
 	inst.mu.Lock()
 	defer inst.mu.Unlock()
 	idx, ok := inst.Shape.Lookup(name)

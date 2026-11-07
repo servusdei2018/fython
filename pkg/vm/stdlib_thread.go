@@ -21,44 +21,476 @@ type threadState struct {
 	mu      sync.Mutex
 }
 
+type lockState struct {
+	sem chan struct{}
+}
+
+type rlockState struct {
+	mu    sync.Mutex
+	cond  *sync.Cond
+	owner int64
+	count int
+}
+
+type condState struct {
+	lock val.Value
+	mu   sync.Mutex
+	cond *sync.Cond
+}
+
 var (
 	threadLockType  *val.PyType
 	threadRLockType *val.PyType
+	threadCondType  *val.PyType
 	threadType      *val.PyType
 	threadStateMap  sync.Map // map[*val.PyInstance]*threadState
+	lockStateMap    sync.Map // map[*val.PyInstance]*lockState
+	rlockStateMap   sync.Map // map[*val.PyInstance]*rlockState
+	condStateMap    sync.Map // map[*val.PyInstance]*condState
 	threadOnce      sync.Once
 	threadCounter   int64 = 1
 )
 
+func getCurrentThreadIdent(ctx *val.ExecContext) int64 {
+	if ctx != nil && ctx.ThreadID != 0 {
+		return ctx.ThreadID
+	}
+	return 1
+}
+
 func initThreadModule() {
 	threadOnce.Do(func() {
-		threadLockType = val.MustNewType("LockType", []*val.PyType{val.ObjectType}, nil)
-		threadLockType.Dict.Set(val.InternString("acquire"), val.NewBuiltinFuncVal("acquire", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-			return val.BoolVal(true)
-		}))
-		threadLockType.Dict.Set(val.InternString("release"), val.NewBuiltinFuncVal("release", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-			return val.NoneVal()
-		}))
-		threadLockType.Dict.Set(val.InternString("locked"), val.NewBuiltinFuncVal("locked", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-			return val.BoolVal(false)
-		}))
-		threadLockType.Dict.Set(val.InternString("__enter__"), val.NewBuiltinFuncVal("__enter__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-			if len(args) > 0 {
-				return args[0]
+		getLockState := func(self val.Value) *lockState {
+			if !self.IsInstance() {
+				panic("TypeError: descriptor requires a 'Lock' object")
 			}
-			return val.NoneVal()
+			inst := self.AsInstance()
+			if v, ok := lockStateMap.Load(inst); ok {
+				return v.(*lockState)
+			}
+			st := &lockState{sem: make(chan struct{}, 1)}
+			st.sem <- struct{}{}
+			lockStateMap.Store(inst, st)
+			return st
+		}
+
+		threadLockType = val.MustNewType("LockType", []*val.PyType{val.ObjectType}, nil)
+		threadLockType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			inst := val.NewInstanceOfType(threadLockType)
+			st := &lockState{sem: make(chan struct{}, 1)}
+			st.sem <- struct{}{}
+			lockStateMap.Store(inst.AsInstance(), st)
+			return inst
+		}
+
+		threadLockType.Dict.Set(val.InternString("acquire"), val.NewBuiltinFuncVal("acquire", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) < 1 {
+				panic("TypeError: acquire() requires at least 0 arguments")
+			}
+			st := getLockState(args[0])
+			blocking := true
+			var timeout time.Duration = -1
+			if len(args) > 1 {
+				blocking = args[1].IsTruthy()
+			}
+			if len(args) > 2 && !args[2].IsNone() {
+				if args[2].IsFloat64() {
+					timeout = time.Duration(args[2].AsFloat64() * float64(time.Second))
+				} else if args[2].IsInt64() {
+					timeout = time.Duration(args[2].AsInt64()) * time.Second
+				}
+			}
+			for i, kw := range kwnames {
+				kwStr := kw.AsString()
+				valIdx := len(args) - len(kwnames) + i
+				v := args[valIdx]
+				switch kwStr {
+				case "blocking":
+					blocking = v.IsTruthy()
+				case "timeout":
+					if !v.IsNone() {
+						if v.IsFloat64() {
+							timeout = time.Duration(v.AsFloat64() * float64(time.Second))
+						} else if v.IsInt64() {
+							timeout = time.Duration(v.AsInt64()) * time.Second
+						}
+					}
+				}
+			}
+
+			if !blocking {
+				select {
+				case <-st.sem:
+					return val.BoolVal(true)
+				default:
+					return val.BoolVal(false)
+				}
+			}
+			if timeout < 0 {
+				<-st.sem
+				return val.BoolVal(true)
+			}
+			select {
+			case <-st.sem:
+				return val.BoolVal(true)
+			case <-time.After(timeout):
+				return val.BoolVal(false)
+			}
 		}))
+
+		threadLockType.Dict.Set(val.InternString("release"), val.NewBuiltinFuncVal("release", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) < 1 {
+				panic("TypeError: release() requires at least 0 arguments")
+			}
+			st := getLockState(args[0])
+			select {
+			case st.sem <- struct{}{}:
+				return val.NoneVal()
+			default:
+				panic("RuntimeError: release unlocked lock")
+			}
+		}))
+
+		threadLockType.Dict.Set(val.InternString("locked"), val.NewBuiltinFuncVal("locked", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) < 1 {
+				panic("TypeError: locked() requires at least 0 arguments")
+			}
+			st := getLockState(args[0])
+			return val.BoolVal(len(st.sem) == 0)
+		}))
+
+		threadLockType.Dict.Set(val.InternString("__enter__"), val.NewBuiltinFuncVal("__enter__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) < 1 {
+				panic("TypeError: descriptor '__enter__' requires 1 argument")
+			}
+			self := args[0]
+			st := getLockState(self)
+			<-st.sem
+			return self
+		}))
+
 		threadLockType.Dict.Set(val.InternString("__exit__"), val.NewBuiltinFuncVal("__exit__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-			return val.NoneVal()
+			if len(args) < 1 {
+				panic("TypeError: descriptor '__exit__' requires at least 1 argument")
+			}
+			st := getLockState(args[0])
+			select {
+			case st.sem <- struct{}{}:
+				return val.NoneVal()
+			default:
+				panic("RuntimeError: release unlocked lock")
+			}
 		}))
+
+		// RLock
+		getRLockState := func(self val.Value) *rlockState {
+			if !self.IsInstance() {
+				panic("TypeError: descriptor requires an 'RLock' object")
+			}
+			inst := self.AsInstance()
+			if v, ok := rlockStateMap.Load(inst); ok {
+				return v.(*rlockState)
+			}
+			st := &rlockState{}
+			st.cond = sync.NewCond(&st.mu)
+			rlockStateMap.Store(inst, st)
+			return st
+		}
 
 		threadRLockType = val.MustNewType("RLock", []*val.PyType{val.ObjectType}, nil)
 		threadRLockType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-			return val.NewInstanceOfType(threadRLockType)
+			inst := val.NewInstanceOfType(threadRLockType)
+			st := &rlockState{}
+			st.cond = sync.NewCond(&st.mu)
+			rlockStateMap.Store(inst.AsInstance(), st)
+			return inst
 		}
-		for _, it := range threadLockType.Dict.Items() {
-			threadRLockType.Dict.Set(it.Key, it.Value)
+
+		threadRLockType.Dict.Set(val.InternString("acquire"), val.NewBuiltinFuncVal("RLock.acquire", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) < 1 {
+				panic("TypeError: acquire() requires at least 0 arguments")
+			}
+			st := getRLockState(args[0])
+			ident := getCurrentThreadIdent(ctx)
+			blocking := true
+			var timeout time.Duration = -1
+
+			if len(args) > 1 {
+				blocking = args[1].IsTruthy()
+			}
+			if len(args) > 2 && !args[2].IsNone() {
+				if args[2].IsFloat64() {
+					timeout = time.Duration(args[2].AsFloat64() * float64(time.Second))
+				} else if args[2].IsInt64() {
+					timeout = time.Duration(args[2].AsInt64()) * time.Second
+				}
+			}
+
+			st.mu.Lock()
+			defer st.mu.Unlock()
+
+			if st.owner == ident {
+				st.count++
+				return val.BoolVal(true)
+			}
+			if st.owner == 0 {
+				st.owner = ident
+				st.count = 1
+				return val.BoolVal(true)
+			}
+			if !blocking {
+				return val.BoolVal(false)
+			}
+
+			if timeout < 0 {
+				for st.owner != 0 {
+					st.cond.Wait()
+				}
+				st.owner = ident
+				st.count = 1
+				return val.BoolVal(true)
+			}
+
+			deadline := time.Now().Add(timeout)
+			for st.owner != 0 {
+				rem := time.Until(deadline)
+				if rem <= 0 {
+					return val.BoolVal(false)
+				}
+				done := make(chan struct{})
+				go func() {
+					st.mu.Lock()
+					defer st.mu.Unlock()
+					for st.owner != 0 && time.Now().Before(deadline) {
+						st.cond.Wait()
+					}
+					close(done)
+				}()
+				st.mu.Unlock()
+				select {
+				case <-done:
+					st.mu.Lock()
+				case <-time.After(rem):
+					st.mu.Lock()
+					if st.owner != 0 {
+						return val.BoolVal(false)
+					}
+				}
+			}
+			st.owner = ident
+			st.count = 1
+			return val.BoolVal(true)
+		}))
+
+		threadRLockType.Dict.Set(val.InternString("release"), val.NewBuiltinFuncVal("RLock.release", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) < 1 {
+				panic("TypeError: release() requires at least 0 arguments")
+			}
+			st := getRLockState(args[0])
+			ident := getCurrentThreadIdent(ctx)
+
+			st.mu.Lock()
+			defer st.mu.Unlock()
+
+			if st.owner != ident {
+				panic("RuntimeError: cannot release un-acquired lock")
+			}
+			st.count--
+			if st.count == 0 {
+				st.owner = 0
+				st.cond.Signal()
+			}
+			return val.NoneVal()
+		}))
+
+		threadRLockType.Dict.Set(val.InternString("__enter__"), val.NewBuiltinFuncVal("__enter__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) < 1 {
+				panic("TypeError: descriptor '__enter__' requires 1 argument")
+			}
+			self := args[0]
+			st := getRLockState(self)
+			ident := getCurrentThreadIdent(ctx)
+			st.mu.Lock()
+			if st.owner == ident {
+				st.count++
+				st.mu.Unlock()
+				return self
+			}
+			for st.owner != 0 {
+				st.cond.Wait()
+			}
+			st.owner = ident
+			st.count = 1
+			st.mu.Unlock()
+			return self
+		}))
+
+		threadRLockType.Dict.Set(val.InternString("__exit__"), val.NewBuiltinFuncVal("__exit__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) < 1 {
+				panic("TypeError: descriptor '__exit__' requires at least 1 argument")
+			}
+			st := getRLockState(args[0])
+			ident := getCurrentThreadIdent(ctx)
+			st.mu.Lock()
+			if st.owner != ident {
+				st.mu.Unlock()
+				panic("RuntimeError: cannot release un-acquired lock")
+			}
+			st.count--
+			if st.count == 0 {
+				st.owner = 0
+				st.cond.Signal()
+			}
+			st.mu.Unlock()
+			return val.NoneVal()
+		}))
+
+		// Condition
+		getCondState := func(self val.Value) *condState {
+			if !self.IsInstance() {
+				panic("TypeError: descriptor requires a 'Condition' object")
+			}
+			inst := self.AsInstance()
+			if v, ok := condStateMap.Load(inst); ok {
+				return v.(*condState)
+			}
+			st := &condState{}
+			st.cond = sync.NewCond(&st.mu)
+			condStateMap.Store(inst, st)
+			return st
 		}
+
+		threadCondDict := val.NewDictVal(16).AsDict()
+		threadCondType = val.MustNewType("Condition", []*val.PyType{val.ObjectType}, threadCondDict)
+
+		threadCondType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			inst := val.NewInstanceOfType(threadCondType)
+			st := &condState{}
+			st.cond = sync.NewCond(&st.mu)
+			var lockVal val.Value
+			if len(args) > 0 && !args[0].IsNone() {
+				lockVal = args[0]
+			} else {
+				lockVal = val.NewInstanceOfType(threadRLockType)
+				rst := &rlockState{}
+				rst.cond = sync.NewCond(&rst.mu)
+				rlockStateMap.Store(lockVal.AsInstance(), rst)
+			}
+			st.lock = lockVal
+			condStateMap.Store(inst.AsInstance(), st)
+			return inst
+		}
+
+		threadCondDict.Set(val.InternString("acquire"), val.NewBuiltinFuncVal("Condition.acquire", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) < 1 {
+				panic("TypeError: acquire() requires self")
+			}
+			st := getCondState(args[0])
+			if fn, _, ok := st.lock.Type().LookupMRO(val.InternString("acquire")); ok {
+				passArgs := append([]val.Value{st.lock}, args[1:]...)
+				if tpCall := fn.Type().Slots.TpCall; tpCall != nil {
+					return tpCall(ctx, fn, passArgs, nil)
+				}
+			}
+			return val.BoolVal(true)
+		}))
+
+		threadCondDict.Set(val.InternString("release"), val.NewBuiltinFuncVal("Condition.release", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) < 1 {
+				panic("TypeError: release() requires self")
+			}
+			st := getCondState(args[0])
+			if fn, _, ok := st.lock.Type().LookupMRO(val.InternString("release")); ok {
+				return ctx.Invoke1(fn, st.lock)
+			}
+			return val.NoneVal()
+		}))
+
+		threadCondDict.Set(val.InternString("wait"), val.NewBuiltinFuncVal("Condition.wait", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) < 1 {
+				panic("TypeError: wait() requires self")
+			}
+			st := getCondState(args[0])
+			var timeout time.Duration = -1
+			if len(args) > 1 && !args[1].IsNone() {
+				if args[1].IsFloat64() {
+					timeout = time.Duration(args[1].AsFloat64() * float64(time.Second))
+				} else if args[1].IsInt64() {
+					timeout = time.Duration(args[1].AsInt64()) * time.Second
+				}
+			}
+
+			// Release lock
+			if relFn, _, ok := st.lock.Type().LookupMRO(val.InternString("release")); ok {
+				ctx.Invoke1(relFn, st.lock)
+			}
+			defer func() {
+				// Re-acquire lock
+				if acqFn, _, ok := st.lock.Type().LookupMRO(val.InternString("acquire")); ok {
+					ctx.Invoke1(acqFn, st.lock)
+				}
+			}()
+
+			st.mu.Lock()
+			if timeout < 0 {
+				st.cond.Wait()
+				st.mu.Unlock()
+				return val.BoolVal(true)
+			}
+
+			done := make(chan struct{})
+			go func() {
+				st.mu.Lock()
+				st.cond.Wait()
+				st.mu.Unlock()
+				close(done)
+			}()
+			st.mu.Unlock()
+
+			select {
+			case <-done:
+				return val.BoolVal(true)
+			case <-time.After(timeout):
+				return val.BoolVal(false)
+			}
+		}))
+
+		threadCondDict.Set(val.InternString("notify"), val.NewBuiltinFuncVal("Condition.notify", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) < 1 {
+				panic("TypeError: notify() requires self")
+			}
+			st := getCondState(args[0])
+			st.mu.Lock()
+			st.cond.Broadcast()
+			st.mu.Unlock()
+			return val.NoneVal()
+		}))
+
+		threadCondDict.Set(val.InternString("notify_all"), threadCondDict.Items()[len(threadCondDict.Items())-1].Value)
+		threadCondDict.Set(val.InternString("notifyAll"), threadCondDict.Items()[len(threadCondDict.Items())-1].Value)
+
+		threadCondDict.Set(val.InternString("__enter__"), val.NewBuiltinFuncVal("Condition.__enter__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) < 1 {
+				panic("TypeError: descriptor '__enter__' requires 1 argument")
+			}
+			self := args[0]
+			st := getCondState(self)
+			if fn, _, ok := st.lock.Type().LookupMRO(val.InternString("acquire")); ok {
+				ctx.Invoke1(fn, st.lock)
+			}
+			return self
+		}))
+
+		threadCondDict.Set(val.InternString("__exit__"), val.NewBuiltinFuncVal("Condition.__exit__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) < 1 {
+				panic("TypeError: descriptor '__exit__' requires at least 1 argument")
+			}
+			st := getCondState(args[0])
+			if fn, _, ok := st.lock.Type().LookupMRO(val.InternString("release")); ok {
+				ctx.Invoke1(fn, st.lock)
+			}
+			return val.NoneVal()
+		}))
 
 		threadTypeDict := val.NewDictVal(16).AsDict()
 		threadType = val.MustNewType("Thread", []*val.PyType{val.ObjectType}, threadTypeDict)
@@ -140,6 +572,7 @@ func initThreadModule() {
 		}))
 
 		threadTypeDict.Set(val.InternString("start"), val.NewBuiltinFuncVal("start", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			val.SetMultiThreaded(true)
 			st := getThreadState(args[0])
 			st.mu.Lock()
 			if st.started {
@@ -155,6 +588,7 @@ func initThreadModule() {
 			callArgs := st.args
 			kwNames := st.kwnames
 			doneCh := st.done
+			ident := st.ident
 
 			go func() {
 				defer close(doneCh)
@@ -170,6 +604,7 @@ func initThreadModule() {
 				if !target.IsNone() {
 					threadCtx, release := val.AcquireExecContextHook()
 					defer release()
+					threadCtx.ThreadID = ident
 					if tpCall := target.Type().Slots.TpCall; tpCall != nil {
 						tpCall(threadCtx, target, callArgs, kwNames)
 					}
@@ -286,11 +721,13 @@ func (e *Engine) createThreadModule() val.Value {
 			}
 		}
 
+		val.SetMultiThreaded(true)
 		thID := atomic.AddInt64(&threadCounter, 1)
 
 		go func() {
 			threadCtx, release := val.AcquireExecContextHook()
 			defer release()
+			threadCtx.ThreadID = thID
 			defer func() {
 				_ = recover()
 			}()
@@ -407,12 +844,164 @@ func (e *Engine) createThreadingModule() val.Value {
 		}
 	}))
 
+	// Semaphore & BoundedSemaphore
+	type semaphoreState struct {
+		value     int64
+		maxValue  int64
+		isBounded bool
+		mu        sync.Mutex
+		cond      *sync.Cond
+	}
+	var semStateMap sync.Map
+
+	semTypeDict := val.NewDictVal(8).AsDict()
+	semType := val.MustNewType("Semaphore", []*val.PyType{val.ObjectType}, semTypeDict)
+	semType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		inst := val.NewInstanceOfType(semType)
+		var v int64 = 1
+		if len(args) > 0 && args[0].IsInt64() {
+			v = args[0].AsInt64()
+		}
+		if v < 0 {
+			panic("ValueError: semaphore initial value must be >= 0")
+		}
+		st := &semaphoreState{value: v}
+		st.cond = sync.NewCond(&st.mu)
+		semStateMap.Store(inst.AsInstance(), st)
+		return inst
+	}
+
+	getSemState := func(self val.Value) *semaphoreState {
+		if !self.IsInstance() {
+			panic("TypeError: descriptor requires a 'Semaphore' object")
+		}
+		if v, ok := semStateMap.Load(self.AsInstance()); ok {
+			return v.(*semaphoreState)
+		}
+		st := &semaphoreState{value: 1}
+		st.cond = sync.NewCond(&st.mu)
+		semStateMap.Store(self.AsInstance(), st)
+		return st
+	}
+
+	semTypeDict.Set(val.InternString("acquire"), val.NewBuiltinFuncVal("acquire", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		st := getSemState(args[0])
+		blocking := true
+		var timeout time.Duration = -1
+		if len(args) > 1 {
+			blocking = args[1].IsTruthy()
+		}
+		if len(args) > 2 && !args[2].IsNone() {
+			if args[2].IsFloat64() {
+				timeout = time.Duration(args[2].AsFloat64() * float64(time.Second))
+			} else if args[2].IsInt64() {
+				timeout = time.Duration(args[2].AsInt64()) * time.Second
+			}
+		}
+
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		if !blocking {
+			if st.value > 0 {
+				st.value--
+				return val.BoolVal(true)
+			}
+			return val.BoolVal(false)
+		}
+		if timeout < 0 {
+			for st.value <= 0 {
+				st.cond.Wait()
+			}
+			st.value--
+			return val.BoolVal(true)
+		}
+
+		done := make(chan struct{})
+		go func() {
+			st.mu.Lock()
+			for st.value <= 0 {
+				st.cond.Wait()
+			}
+			st.mu.Unlock()
+			close(done)
+		}()
+		select {
+		case <-done:
+			st.value--
+			return val.BoolVal(true)
+		case <-time.After(timeout):
+			return val.BoolVal(false)
+		}
+	}))
+
+	semTypeDict.Set(val.InternString("release"), val.NewBuiltinFuncVal("release", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		st := getSemState(args[0])
+		var n int64 = 1
+		if len(args) > 1 && args[1].IsInt64() {
+			n = args[1].AsInt64()
+		}
+		st.mu.Lock()
+		if st.isBounded && st.value+n > st.maxValue {
+			st.mu.Unlock()
+			panic("ValueError: Semaphore released too many times")
+		}
+		st.value += n
+		for i := int64(0); i < n; i++ {
+			st.cond.Signal()
+		}
+		st.mu.Unlock()
+		return val.NoneVal()
+	}))
+
+	semTypeDict.Set(val.InternString("__enter__"), val.NewBuiltinFuncVal("__enter__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		st := getSemState(args[0])
+		st.mu.Lock()
+		for st.value <= 0 {
+			st.cond.Wait()
+		}
+		st.value--
+		st.mu.Unlock()
+		return args[0]
+	}))
+
+	semTypeDict.Set(val.InternString("__exit__"), val.NewBuiltinFuncVal("__exit__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		st := getSemState(args[0])
+		st.mu.Lock()
+		st.value++
+		st.cond.Signal()
+		st.mu.Unlock()
+		return val.NoneVal()
+	}))
+
+	bsemTypeDict := val.NewDictVal(8).AsDict()
+	bsemType := val.MustNewType("BoundedSemaphore", []*val.PyType{semType}, bsemTypeDict)
+	bsemType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		inst := val.NewInstanceOfType(bsemType)
+		var v int64 = 1
+		if len(args) > 0 && args[0].IsInt64() {
+			v = args[0].AsInt64()
+		}
+		if v < 0 {
+			panic("ValueError: semaphore initial value must be >= 0")
+		}
+		st := &semaphoreState{value: v, maxValue: v, isBounded: true}
+		st.cond = sync.NewCond(&st.mu)
+		semStateMap.Store(inst.AsInstance(), st)
+		return inst
+	}
+
 	mod.Dict.Set(val.InternString("Lock"), val.TypeVal(threadLockType))
 	mod.Dict.Set(val.InternString("RLock"), val.TypeVal(threadRLockType))
+	mod.Dict.Set(val.InternString("Condition"), val.TypeVal(threadCondType))
 	mod.Dict.Set(val.InternString("Thread"), val.TypeVal(threadType))
 	mod.Dict.Set(val.InternString("Event"), val.TypeVal(eventType))
+	mod.Dict.Set(val.InternString("Semaphore"), val.TypeVal(semType))
+	mod.Dict.Set(val.InternString("BoundedSemaphore"), val.TypeVal(bsemType))
+	mod.Dict.Set(val.InternString("_register_atexit"), val.NewBuiltinFuncVal("_register_atexit", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.NoneVal()
+	}))
 	mod.Dict.Set(val.InternString("get_ident"), val.NewBuiltinFuncVal("get_ident", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		id := atomic.LoadInt64(&threadCounter)
+		id := getCurrentThreadIdent(ctx)
 		return val.Int64Val(id)
 	}))
 	mod.Dict.Set(val.InternString("TIMEOUT_MAX"), val.Int64Val(9223372036))

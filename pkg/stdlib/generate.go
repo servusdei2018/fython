@@ -28,6 +28,7 @@ const cpythonTag = "v3.15.0"
 
 // upstream is the set of Lib/ paths copied from the pinned tag.
 var upstream = []string{
+	"__future__.py",
 	"_ast_unparse.py",
 	"_collections_abc.py",
 	"_py_abc.py",
@@ -167,6 +168,23 @@ var upstream = []string{
 	"sqlite3/__init__.py",
 	"sqlite3/dbapi2.py",
 	"sqlite3/dump.py",
+	// Ecosystem battery
+	"logging/__init__.py",
+	"logging/handlers.py",
+	"logging/config.py",
+	"tomllib/__init__.py",
+	"tomllib/_parser.py",
+	"tomllib/_re.py",
+	"tomllib/_types.py",
+	"configparser.py",
+	"tarfile.py",
+	"queue.py",
+	"concurrent/__init__.py",
+	"concurrent/futures/__init__.py",
+	"concurrent/futures/_base.py",
+	"concurrent/futures/thread.py",
+	"concurrent/futures/process.py",
+	"pkgutil.py",
 }
 
 func main() {

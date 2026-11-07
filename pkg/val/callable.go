@@ -1641,6 +1641,48 @@ func byteArrayNbAdd(ctx *ExecContext, a, b Value) Value {
 	return NewByteArrayVal(res)
 }
 
+func bytesNbMul(ctx *ExecContext, a, b Value) Value {
+	var data []byte
+	var n int64
+	if a.IsBytes() && (b.IsInt64() || b.IsBool()) {
+		data = a.AsBytes().Data
+		n = b.AsInt64()
+	} else if (a.IsInt64() || a.IsBool()) && b.IsBytes() {
+		data = b.AsBytes().Data
+		n = a.AsInt64()
+	} else {
+		return NotImplementedVal()
+	}
+	if n <= 0 {
+		return NewBytesVal([]byte{})
+	}
+	return NewBytesVal(bytes.Repeat(data, int(n)))
+}
+
+func byteArrayNbMul(ctx *ExecContext, a, b Value) Value {
+	var data []byte
+	var n int64
+	if a.IsByteArray() && (b.IsInt64() || b.IsBool()) {
+		ba := a.AsByteArray()
+		ba.mu.RLock()
+		data = ba.Data
+		ba.mu.RUnlock()
+		n = b.AsInt64()
+	} else if (a.IsInt64() || a.IsBool()) && b.IsByteArray() {
+		ba := b.AsByteArray()
+		ba.mu.RLock()
+		data = ba.Data
+		ba.mu.RUnlock()
+		n = a.AsInt64()
+	} else {
+		return NotImplementedVal()
+	}
+	if n <= 0 {
+		return NewByteArrayVal([]byte{})
+	}
+	return NewByteArrayVal(bytes.Repeat(data, int(n)))
+}
+
 func bytesTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 	if len(args) == 0 {
 		return NewBytesVal(nil)
@@ -2187,12 +2229,12 @@ func localsProxyRepr(o Value) string {
 
 func weakRefTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 	ref := callable.AsWeakRef()
-	if ref.IsDead {
+	if ref.IsDead.Load() {
 		return NoneVal()
 	}
 	hdr := ref.WP.Value()
 	if hdr == nil {
-		ref.IsDead = true
+		ref.IsDead.Store(true)
 		return NoneVal()
 	}
 	return ObjectVal(hdr)
@@ -3798,6 +3840,39 @@ func initTypes() {
 			panic("TypeError: startswith() takes at least 1 argument")
 		}
 		s := args[0].AsString()
+		sLen := len(s)
+		start := 0
+		end := sLen
+		if len(args) > 2 && !args[2].IsNone() {
+			if args[2].IsInt64() {
+				start = int(args[2].AsInt64())
+			}
+			if start < 0 {
+				start += sLen
+				if start < 0 {
+					start = 0
+				}
+			} else if start > sLen {
+				start = sLen
+			}
+		}
+		if len(args) > 3 && !args[3].IsNone() {
+			if args[3].IsInt64() {
+				end = int(args[3].AsInt64())
+			}
+			if end < 0 {
+				end += sLen
+				if end < 0 {
+					end = 0
+				}
+			} else if end > sLen {
+				end = sLen
+			}
+		}
+		if start > end {
+			start = end
+		}
+		s = s[start:end]
 		prefix := args[1]
 		if prefix.IsTuple() {
 			for _, item := range prefix.AsTuple().Items {
@@ -3815,6 +3890,39 @@ func initTypes() {
 			panic("TypeError: endswith() takes at least 1 argument")
 		}
 		s := args[0].AsString()
+		sLen := len(s)
+		start := 0
+		end := sLen
+		if len(args) > 2 && !args[2].IsNone() {
+			if args[2].IsInt64() {
+				start = int(args[2].AsInt64())
+			}
+			if start < 0 {
+				start += sLen
+				if start < 0 {
+					start = 0
+				}
+			} else if start > sLen {
+				start = sLen
+			}
+		}
+		if len(args) > 3 && !args[3].IsNone() {
+			if args[3].IsInt64() {
+				end = int(args[3].AsInt64())
+			}
+			if end < 0 {
+				end += sLen
+				if end < 0 {
+					end = 0
+				}
+			} else if end > sLen {
+				end = sLen
+			}
+		}
+		if start > end {
+			start = end
+		}
+		s = s[start:end]
 		suffix := args[1]
 		if suffix.IsTuple() {
 			for _, item := range suffix.AsTuple().Items {
@@ -4847,6 +4955,17 @@ func initTypes() {
 	BoundMethodType = MustNewType("method", []*PyType{ObjectType}, nil)
 	BoundMethodType.Slots.TpCall = boundMethodTpCall
 
+	funcCall := NewBuiltinFuncVal("function.__call__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: descriptor '__call__' requires at least 1 argument")
+		}
+		target := args[0]
+		return ctx.Call(target, args[1:], kwnames)
+	})
+	FunctionType.Dict.Set(InternString("__call__"), funcCall)
+	BuiltinFuncType.Dict.Set(InternString("__call__"), funcCall)
+	BoundMethodType.Dict.Set(InternString("__call__"), funcCall)
+
 	PropertyType = MustNewType("property", []*PyType{ObjectType}, nil)
 	PropertyType.Slots.TpDescrGet = propertyDescrGet
 	PropertyType.Slots.TpDescrSet = propertyDescrSet
@@ -5010,6 +5129,23 @@ func initTypes() {
 		panic("TypeError: cannot delete __annotate__ attribute")
 	})
 	TypeType.Dict.Set(InternString("__annotate__"), NewPropertyVal(typeAnnotateGetter, typeAnnotateSetter, typeAnnotateDeleter))
+
+	codeAttrs := []string{
+		"co_argcount", "co_posonlyargcount", "co_kwonlyargcount", "co_nlocals",
+		"co_stacksize", "co_flags", "co_code", "co_consts", "co_names",
+		"co_varnames", "co_filename", "co_name", "co_qualname", "co_firstlineno",
+		"co_linetable", "co_lnotab", "co_freevars", "co_cellvars", "co_lines", "co_positions",
+	}
+	for _, attr := range codeAttrs {
+		attrName := attr
+		fget := NewBuiltinFuncVal(attrName, func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+			if len(args) < 1 {
+				panic("TypeError: descriptor '" + attrName + "' of 'code' object needs an argument")
+			}
+			return codeTpGetAttr(ctx, args[0], InternString(attrName))
+		})
+		CodeType.Dict.Set(InternString(attrName), NewPropertyVal(fget, Value{}, Value{}))
+	}
 
 	MappingProxyType = MustNewType("mappingproxy", []*PyType{ObjectType}, nil)
 	MappingProxyType.Slots.TpCall = func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
@@ -5301,6 +5437,22 @@ func initTypes() {
 		}
 		return NoneVal(), IterExhausted
 	}
+	IterType.Dict.Set(InternString("__next__"), NewBuiltinFuncVal("iterator.__next__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: descriptor '__next__' of 'iterator' object needs an argument")
+		}
+		v, status := IterType.Slots.TpIterNext(ctx, args[0])
+		if status == IterExhausted {
+			panic(NewException(StopIterationType, ""))
+		}
+		return v
+	}))
+	IterType.Dict.Set(InternString("__iter__"), NewBuiltinFuncVal("iterator.__iter__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: descriptor '__iter__' of 'iterator' object needs an argument")
+		}
+		return args[0]
+	}))
 
 	RangeType = MustNewType("range", []*PyType{ObjectType}, nil)
 	RangeType.Slots.TpCall = func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
@@ -6019,6 +6171,7 @@ func initTypes() {
 	BytesType.Slots.MpSubscript = bytesMpSubscript
 	BytesType.Slots.TpAsBuffer = bytesTpAsBuffer
 	BytesType.Slots.NbAdd = bytesNbAdd
+	BytesType.Slots.NbMul = bytesNbMul
 	BytesType.Slots.TpCall = bytesTpCall
 	BytesType.Slots.TpIter = func(ctx *ExecContext, o Value) Value { return NewIterVal(o) }
 	BytesType.Dict.Set(DunderIter, NewBuiltinFuncVal("__iter__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
@@ -6135,6 +6288,7 @@ func initTypes() {
 	ByteArrayType.Slots.MpAssSubscript = byteArrayMpAssSubscript
 	ByteArrayType.Slots.TpAsBuffer = byteArrayTpAsBuffer
 	ByteArrayType.Slots.NbAdd = byteArrayNbAdd
+	ByteArrayType.Slots.NbMul = byteArrayNbMul
 	ByteArrayType.Slots.TpCall = byteArrayTpCall
 	ByteArrayType.Slots.TpIter = func(ctx *ExecContext, o Value) Value { return NewIterVal(o) }
 	ByteArrayType.Dict.Set(DunderIter, NewBuiltinFuncVal("__iter__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
@@ -6428,6 +6582,7 @@ func initTypes() {
 	builtinTypes[KindSet] = SetType
 	builtinTypes[KindNative] = ObjectType
 	builtinTypes[KindComplex] = ComplexType
+	builtinTypes[KindLazyImport] = ObjectType
 
 	tagNone.Type = NoneType
 	tagBool.Type = BoolType
@@ -6711,17 +6866,68 @@ func initTypes() {
 		if len(args) < 1 {
 			return NoneVal()
 		}
+		self := args[0]
 		// Honour an overridden __reduce__, like CPython's object.__reduce_ex__.
-		if fn, owner, ok := args[0].Type().LookupMRO(InternString("__reduce__")); ok && owner != ObjectType {
-			return ctx.Invoke1(fn, args[0])
+		if fn, owner, ok := self.Type().LookupMRO(InternString("__reduce__")); ok && owner != ObjectType {
+			return ctx.Invoke1(fn, self)
 		}
-		return NewTupleVal(TypeVal(args[0].Type()), NewTupleVal())
+
+		cls := self.Type()
+		clsVal := TypeVal(cls)
+
+		if self.IsInstance() {
+			inst := self.AsInstance()
+			var dictState Value = NoneVal()
+			var slotState Value = NoneVal()
+
+			if (cls.Flags & FlagForbidDynamicAttrs) != 0 {
+				if inst.Shape != nil && len(inst.Shape.Attrs) > 0 {
+					slotDict := NewDictVal(len(inst.Shape.Attrs)).AsDict()
+					for _, a := range inst.Shape.Attrs {
+						if v, ok := inst.GetSlot(a.Index); ok && !v.IsUnbound() {
+							slotDict.Set(a.Name, v)
+						}
+					}
+					if slotDict.Len() > 0 {
+						slotState = Value{num: uint64(KindDict), ptr: &slotDict.Header}
+					}
+				}
+			} else {
+				if inst.Shape != nil && len(inst.Shape.Attrs) > 0 {
+					dynDict := NewDictVal(len(inst.Shape.Attrs)).AsDict()
+					for _, a := range inst.Shape.Attrs {
+						if v, ok := inst.GetSlot(a.Index); ok && !v.IsUnbound() {
+							dynDict.Set(a.Name, v)
+						}
+					}
+					if dynDict.Len() > 0 {
+						dictState = Value{num: uint64(KindDict), ptr: &dynDict.Header}
+					}
+				}
+			}
+
+			var state Value = NoneVal()
+			if slotState.HeaderPtr() != nil {
+				state = NewTupleVal(NoneVal(), slotState)
+			} else if dictState.HeaderPtr() != nil && !dictState.IsNone() {
+				state = dictState
+			}
+
+			if !state.IsNone() {
+				return NewTupleVal(ObjectNewBuiltin, NewTupleVal(clsVal), state)
+			}
+		}
+
+		return NewTupleVal(ObjectNewBuiltin, NewTupleVal(clsVal))
 	}))
 	ObjectType.Dict.Set(InternString("__reduce__"), NewBuiltinFuncVal("object.__reduce__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
 			return NoneVal()
 		}
-		return NewTupleVal(TypeVal(args[0].Type()), NewTupleVal())
+		if redEx, _, ok := args[0].Type().LookupMRO(InternString("__reduce_ex__")); ok && redEx != callable {
+			return ctx.Invoke2(redEx, args[0], Int64Val(0))
+		}
+		return NewTupleVal(ObjectNewBuiltin, NewTupleVal(TypeVal(args[0].Type())))
 	}))
 	ObjectType.Dict.Set(InternString("__dir__"), NewBuiltinFuncVal("object.__dir__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		return NewListVal()

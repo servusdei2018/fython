@@ -883,6 +883,18 @@ func (e *Engine) createIOModule() val.Value {
 	ioBaseType.Dict.Set(val.InternString("flush"), val.NewBuiltinFuncVal("flush", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		return val.NoneVal()
 	}))
+	ioBaseType.Dict.Set(val.InternString("seek"), val.NewBuiltinFuncVal("seek", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		panic("io.UnsupportedOperation: seek")
+	}))
+	ioBaseType.Dict.Set(val.InternString("tell"), val.NewBuiltinFuncVal("tell", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: descriptor 'tell' of 'IOBase' object needs an argument")
+		}
+		if seekFn, _, ok := args[0].Type().LookupMRO(val.InternString("seek")); ok {
+			return ctx.Invoke3(seekFn, args[0], val.Int64Val(0), val.Int64Val(1))
+		}
+		panic("io.UnsupportedOperation: seek")
+	}))
 	ioBaseType.Dict.Set(val.InternString("seekable"), val.NewBuiltinFuncVal("seekable", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		return val.BoolVal(false)
 	}))
@@ -934,6 +946,48 @@ func (e *Engine) createIOModule() val.Value {
 		}
 		return val.NoneVal()
 	}))
+
+	invokeIOSeek := func(ctx *val.ExecContext, rawVal val.Value, args []val.Value) val.Value {
+		seekFn, _, ok := rawVal.Type().LookupMRO(val.InternString("seek"))
+		if !ok {
+			panic("io.UnsupportedOperation: seek")
+		}
+		var callArgs []val.Value
+		if len(args) > 1 {
+			callArgs = args[1:]
+		}
+		if descrGet := seekFn.Type().Slots.TpDescrGet; descrGet != nil {
+			bound := descrGet(ctx, seekFn, rawVal, rawVal.Type())
+			switch len(callArgs) {
+			case 0:
+				return ctx.Invoke0(bound)
+			case 1:
+				return ctx.Invoke1(bound, callArgs[0])
+			default:
+				return ctx.Invoke2(bound, callArgs[0], callArgs[1])
+			}
+		}
+		switch len(callArgs) {
+		case 0:
+			return ctx.Invoke1(seekFn, rawVal)
+		case 1:
+			return ctx.Invoke2(seekFn, rawVal, callArgs[0])
+		default:
+			return ctx.Invoke3(seekFn, rawVal, callArgs[0], callArgs[1])
+		}
+	}
+
+	invokeIOTell := func(ctx *val.ExecContext, rawVal val.Value) val.Value {
+		tellFn, _, ok := rawVal.Type().LookupMRO(val.InternString("tell"))
+		if !ok {
+			panic("io.UnsupportedOperation: tell")
+		}
+		if descrGet := tellFn.Type().Slots.TpDescrGet; descrGet != nil {
+			bound := descrGet(ctx, tellFn, rawVal, rawVal.Type())
+			return ctx.Invoke0(bound)
+		}
+		return ctx.Invoke1(tellFn, rawVal)
+	}
 
 	rawIOBaseType := val.MustNewType("RawIOBase", []*val.PyType{ioBaseType}, nil)
 	bufferedIOBaseType := val.MustNewType("BufferedIOBase", []*val.PyType{ioBaseType}, nil)
@@ -1067,6 +1121,20 @@ func (e *Engine) createIOModule() val.Value {
 		val.NoneVal(),
 		val.NoneVal(),
 	))
+	bufferedReaderType.Dict.Set(val.InternString("seek"), val.NewBuiltinFuncVal("seek", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) == 0 {
+			panic("TypeError: seek() missing self")
+		}
+		rawVal, _ := args[0].AsInstance().GetAttr(val.InternString("raw"))
+		return invokeIOSeek(ctx, rawVal, args)
+	}))
+	bufferedReaderType.Dict.Set(val.InternString("tell"), val.NewBuiltinFuncVal("tell", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) == 0 {
+			panic("TypeError: tell() missing self")
+		}
+		rawVal, _ := args[0].AsInstance().GetAttr(val.InternString("raw"))
+		return invokeIOTell(ctx, rawVal)
+	}))
 
 	// BufferedWriter
 	bufferedWriterType := val.MustNewType("BufferedWriter", []*val.PyType{bufferedIOBaseType}, nil)
@@ -1136,6 +1204,20 @@ func (e *Engine) createIOModule() val.Value {
 		val.NoneVal(),
 		val.NoneVal(),
 	))
+	bufferedWriterType.Dict.Set(val.InternString("seek"), val.NewBuiltinFuncVal("seek", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) == 0 {
+			panic("TypeError: seek() missing self")
+		}
+		rawVal, _ := args[0].AsInstance().GetAttr(val.InternString("raw"))
+		return invokeIOSeek(ctx, rawVal, args)
+	}))
+	bufferedWriterType.Dict.Set(val.InternString("tell"), val.NewBuiltinFuncVal("tell", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) == 0 {
+			panic("TypeError: tell() missing self")
+		}
+		rawVal, _ := args[0].AsInstance().GetAttr(val.InternString("raw"))
+		return invokeIOTell(ctx, rawVal)
+	}))
 
 	// BufferedRWPair
 	bufferedRWPairType := val.MustNewType("BufferedRWPair", []*val.PyType{bufferedIOBaseType}, nil)

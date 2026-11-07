@@ -102,7 +102,13 @@ func PyStrRepr(s string) string {
 func PyRepr(ctx *ExecContext, v Value) string {
 	if ctx != nil && !isPrimitiveReprKind(v) {
 		if fn, owner, ok := v.Type().LookupMRO(InternString("__repr__")); ok && owner != ObjectType {
-			res := ctx.Invoke1(fn, v)
+			var res Value
+			if descrGet := fn.Type().Slots.TpDescrGet; descrGet != nil {
+				bound := descrGet(ctx, fn, v, v.Type())
+				res = ctx.Invoke0(bound)
+			} else {
+				res = ctx.Invoke1(fn, v)
+			}
 			if s, ok := strMethodArg(res); ok {
 				return s
 			}
@@ -196,7 +202,13 @@ func PyStr(ctx *ExecContext, v Value) string {
 	}
 	if ctx != nil {
 		if fn, owner, ok := v.Type().LookupMRO(InternString("__str__")); ok && owner != ObjectType {
-			res := ctx.Invoke1(fn, v)
+			var res Value
+			if descrGet := fn.Type().Slots.TpDescrGet; descrGet != nil {
+				bound := descrGet(ctx, fn, v, v.Type())
+				res = ctx.Invoke0(bound)
+			} else {
+				res = ctx.Invoke1(fn, v)
+			}
 			if s, ok := strMethodArg(res); ok {
 				return s
 			}

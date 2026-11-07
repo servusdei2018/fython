@@ -504,6 +504,48 @@ func initBytesMethods() {
 		if len(args) < 2 {
 			panic("TypeError: startswith expected at least 1 argument, got 0")
 		}
+		sLen := len(self)
+		start := 0
+		end := sLen
+		if len(args) > 2 && !args[2].IsNone() {
+			if args[2].IsInt64() {
+				start = int(args[2].AsInt64())
+			}
+			if start < 0 {
+				start += sLen
+				if start < 0 {
+					start = 0
+				}
+			} else if start > sLen {
+				start = sLen
+			}
+		}
+		if len(args) > 3 && !args[3].IsNone() {
+			if args[3].IsInt64() {
+				end = int(args[3].AsInt64())
+			}
+			if end < 0 {
+				end += sLen
+				if end < 0 {
+					end = 0
+				}
+			} else if end > sLen {
+				end = sLen
+			}
+		}
+		if start > end {
+			start = end
+		}
+		self = self[start:end]
+		if args[1].IsTuple() {
+			for _, item := range args[1].AsTuple().Items {
+				sub := bytesArg(item)
+				if bytes.HasPrefix(self, sub) {
+					return BoolVal(true)
+				}
+			}
+			return BoolVal(false)
+		}
 		sub := bytesArg(args[1])
 		return BoolVal(bytes.HasPrefix(self, sub))
 	}
@@ -513,11 +555,101 @@ func initBytesMethods() {
 		if len(args) < 2 {
 			panic("TypeError: endswith expected at least 1 argument, got 0")
 		}
+		sLen := len(self)
+		start := 0
+		end := sLen
+		if len(args) > 2 && !args[2].IsNone() {
+			if args[2].IsInt64() {
+				start = int(args[2].AsInt64())
+			}
+			if start < 0 {
+				start += sLen
+				if start < 0 {
+					start = 0
+				}
+			} else if start > sLen {
+				start = sLen
+			}
+		}
+		if len(args) > 3 && !args[3].IsNone() {
+			if args[3].IsInt64() {
+				end = int(args[3].AsInt64())
+			}
+			if end < 0 {
+				end += sLen
+				if end < 0 {
+					end = 0
+				}
+			} else if end > sLen {
+				end = sLen
+			}
+		}
+		if start > end {
+			start = end
+		}
+		self = self[start:end]
+		if args[1].IsTuple() {
+			for _, item := range args[1].AsTuple().Items {
+				sub := bytesArg(item)
+				if bytes.HasSuffix(self, sub) {
+					return BoolVal(true)
+				}
+			}
+			return BoolVal(false)
+		}
 		sub := bytesArg(args[1])
 		return BoolVal(bytes.HasSuffix(self, sub))
 	}
 
+	countFn := func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		self := bytesSelf("count", args)
+		if len(args) < 2 {
+			panic("TypeError: count expected at least 1 argument, got 0")
+		}
+		sLen := len(self)
+		start := 0
+		end := sLen
+		if len(args) > 2 && !args[2].IsNone() {
+			if args[2].IsInt64() {
+				start = int(args[2].AsInt64())
+			}
+			if start < 0 {
+				start += sLen
+				if start < 0 {
+					start = 0
+				}
+			} else if start > sLen {
+				start = sLen
+			}
+		}
+		if len(args) > 3 && !args[3].IsNone() {
+			if args[3].IsInt64() {
+				end = int(args[3].AsInt64())
+			}
+			if end < 0 {
+				end += sLen
+				if end < 0 {
+					end = 0
+				}
+			} else if end > sLen {
+				end = sLen
+			}
+		}
+		if start > end {
+			start = end
+		}
+		self = self[start:end]
+		var sub []byte
+		if args[1].IsInt64() {
+			sub = []byte{byte(args[1].AsInt64())}
+		} else {
+			sub = bytesArg(args[1])
+		}
+		return Int64Val(int64(bytes.Count(self, sub)))
+	}
+
 	for _, t := range []*PyType{BytesType, ByteArrayType} {
+		t.Dict.Set(InternString("count"), NewBuiltinFuncVal("count", countFn))
 		t.Dict.Set(InternString("maketrans"), NewBuiltinFuncVal("maketrans", maketransFn))
 		t.Dict.Set(InternString("translate"), NewBuiltinFuncVal("translate", translateFn))
 		t.Dict.Set(InternString("ljust"), NewBuiltinFuncVal("ljust", ljustFn))

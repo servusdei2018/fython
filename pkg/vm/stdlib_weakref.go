@@ -30,8 +30,7 @@ type finalizeCleanupArg struct {
 }
 
 func onWeakRefCleanup(d *weakCleanupData) {
-	d.ref.IsDead = true
-	d.ref.WP = weak.Pointer[val.ObjectHeader]{}
+	d.ref.IsDead.Store(true)
 	unregisterWeakRef(d.addr, d.ref)
 	if !d.callback.IsNone() {
 		go func() {
@@ -95,7 +94,7 @@ func unregisterWeakRef(addr uintptr, ref *val.PyWeakRef) {
 	refs := weakrefRegistry[addr]
 	n := 0
 	for _, r := range refs {
-		if r != ref && !r.IsDead && r.WP.Value() != nil {
+		if r != ref && !r.IsDead.Load() && r.WP.Value() != nil {
 			refs[n] = r
 			n++
 		}
@@ -117,7 +116,7 @@ func getActiveWeakRefs(hdr *val.ObjectHeader) []*val.PyWeakRef {
 	refs := weakrefRegistry[addr]
 	var active []*val.PyWeakRef
 	for _, r := range refs {
-		if !r.IsDead && r.WP.Value() != nil {
+		if !r.IsDead.Load() && r.WP.Value() != nil {
 			active = append(active, r)
 		}
 	}
@@ -383,6 +382,16 @@ func initWeakrefTypes(e *Engine) {
 			}
 			return v
 		}))
+		WeakKeyDictionaryType.Dict.Set(val.InternString("clear"), val.NewBuiltinFuncVal("clear", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) < 1 {
+				return val.NoneVal()
+			}
+			data := val.GetAttrCtx(ctx, args[0], dataKey)
+			if data.IsDict() {
+				data.AsDict().Clear()
+			}
+			return val.NoneVal()
+		}))
 		WeakKeyDictionaryType.InvalidateVersion()
 
 		// WeakValueDictionary
@@ -425,6 +434,17 @@ func initWeakrefTypes(e *Engine) {
 				panic("KeyError: " + key.String())
 			}
 			return val.ObjectVal(res)
+		}))
+
+		WeakValueDictionaryType.Dict.Set(val.InternString("clear"), val.NewBuiltinFuncVal("clear", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) < 1 {
+				return val.NoneVal()
+			}
+			data := val.GetAttrCtx(ctx, args[0], dataKey)
+			if data.IsDict() {
+				data.AsDict().Clear()
+			}
+			return val.NoneVal()
 		}))
 
 		WeakValueDictionaryType.Dict.Set(val.InternString("__setitem__"), val.NewBuiltinFuncVal("__setitem__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -512,6 +532,17 @@ func initWeakrefTypes(e *Engine) {
 				return dflt
 			}
 			return val.ObjectVal(res)
+		}))
+
+		WeakValueDictionaryType.Dict.Set(val.InternString("clear"), val.NewBuiltinFuncVal("clear", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) < 1 {
+				return val.NoneVal()
+			}
+			data := val.GetAttrCtx(ctx, args[0], dataKey)
+			if data.IsDict() {
+				data.AsDict().Clear()
+			}
+			return val.NoneVal()
 		}))
 		WeakValueDictionaryType.InvalidateVersion()
 

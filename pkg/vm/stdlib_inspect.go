@@ -298,12 +298,205 @@ func (e *Engine) createInspectModule() val.Value {
 		return val.BoolVal(co != nil && co.IsGenerator && !co.IsCoroutine)
 	}))
 	mod.Dict.Set(val.InternString("iscoroutinefunction"), val.NewBuiltinFuncVal("iscoroutinefunction", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) > 0 {
+			if v, ok := vmGetAttrSafe(ctx, args[0], "_is_coroutine"); ok && v.IsTruthy() {
+				return val.BoolVal(true)
+			}
+			if v, ok := vmGetAttrSafe(ctx, args[0], "_is_coroutine_marker"); ok && v.IsTruthy() {
+				return val.BoolVal(true)
+			}
+		}
 		co := callableCode(args)
 		return val.BoolVal(co != nil && co.IsCoroutine && !co.IsGenerator)
 	}))
 	mod.Dict.Set(val.InternString("isasyncgenfunction"), val.NewBuiltinFuncVal("isasyncgenfunction", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		co := callableCode(args)
 		return val.BoolVal(co != nil && co.IsGenerator && co.IsCoroutine)
+	}))
+
+	// getattr_static(obj, attr, default=_sentinel)
+	sentinelVal := val.NewInstanceOfType(val.ObjectType)
+	mod.Dict.Set(val.InternString("_sentinel"), sentinelVal)
+	mod.Dict.Set(val.InternString("getattr_static"), val.NewBuiltinFuncVal("getattr_static", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 2 {
+			panic("TypeError: getattr_static() takes at least 2 arguments")
+		}
+		obj := args[0]
+		attrName := val.InternValue(args[1])
+		hasDefault := len(args) > 2
+		defVal := val.NoneVal()
+		if hasDefault {
+			defVal = args[2]
+		}
+
+		findInType := func(tp *val.PyType) (val.Value, bool) {
+			if tp == nil {
+				return val.NoneVal(), false
+			}
+			for _, base := range tp.MRO {
+				if base == nil || base.Dict == nil {
+					continue
+				}
+				if v, ok := base.Dict.Get(attrName); ok {
+					return v, true
+				}
+			}
+			return val.NoneVal(), false
+		}
+
+		if obj.IsType() {
+			tp := obj.AsType()
+			if meta := tp.Header.Type; meta != nil {
+				if v, ok := findInType(meta); ok {
+					vType := v.Type()
+					if v.IsDataDescriptor() || (vType.Slots.TpDescrGet != nil && vType.Slots.TpDescrSet != nil) {
+						return v
+					}
+				}
+			}
+			if v, ok := findInType(tp); ok {
+				return v
+			}
+			if meta := tp.Header.Type; meta != nil {
+				if v, ok := findInType(meta); ok {
+					return v
+				}
+			}
+		} else {
+			objType := obj.Type()
+			if objType != nil {
+				if v, ok := findInType(objType); ok {
+					vType := v.Type()
+					if v.IsDataDescriptor() || (vType.Slots.TpDescrGet != nil && vType.Slots.TpDescrSet != nil) {
+						return v
+					}
+				}
+			}
+			if obj.IsInstance() {
+				inst := obj.AsInstance()
+				if inst.Shape != nil {
+					if v, ok := inst.GetAttr(attrName); ok {
+						return v
+					}
+				}
+			} else if obj.IsDict() && objType != val.DictType {
+				if d := obj.AsDict(); d.Attrs != nil {
+					if v, ok := d.Attrs.Get(attrName); ok {
+						return v
+					}
+				}
+			} else if obj.IsModule() {
+				mod := obj.AsModule()
+				if mod.Dict != nil {
+					if v, ok := mod.Dict.Get(attrName); ok {
+						return v
+					}
+				}
+			}
+			if objType != nil {
+				if v, ok := findInType(objType); ok {
+					return v
+				}
+			}
+		}
+
+		if hasDefault {
+			return defVal
+		}
+		panic("AttributeError: " + attrName.AsString())
+	}))
+
+	// _descriptor_get(descriptor, obj, obj_type=None)
+	mod.Dict.Set(val.InternString("_descriptor_get"), val.NewBuiltinFuncVal("_descriptor_get", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 2 {
+			panic("TypeError: _descriptor_get() takes at least 2 arguments")
+		}
+		descr := args[0]
+		obj := args[1]
+		var objType = val.NoneVal()
+		if len(args) > 2 {
+			objType = args[2]
+		} else {
+			objType = val.TypeVal(obj.Type())
+		}
+		descrType := descr.Type()
+		if descrType.Slots.TpDescrGet != nil {
+			var ownerType *val.PyType
+			if objType.IsType() {
+				ownerType = objType.AsType()
+			}
+			return descrType.Slots.TpDescrGet(ctx, descr, obj, ownerType)
+		}
+		return descr
+	}))
+
+	// CO_* constants
+	mod.Dict.Set(val.InternString("CO_OPTIMIZED"), val.Int64Val(0x0001))
+	mod.Dict.Set(val.InternString("CO_NEWLOCALS"), val.Int64Val(0x0002))
+	mod.Dict.Set(val.InternString("CO_VARARGS"), val.Int64Val(0x0004))
+	mod.Dict.Set(val.InternString("CO_VARKEYWORDS"), val.Int64Val(0x0008))
+	mod.Dict.Set(val.InternString("CO_NESTED"), val.Int64Val(0x0010))
+	mod.Dict.Set(val.InternString("CO_GENERATOR"), val.Int64Val(0x0020))
+	mod.Dict.Set(val.InternString("CO_COROUTINE"), val.Int64Val(0x0080))
+	mod.Dict.Set(val.InternString("CO_ITERABLE_COROUTINE"), val.Int64Val(0x0100))
+	mod.Dict.Set(val.InternString("CO_ASYNC_GENERATOR"), val.Int64Val(0x0200))
+
+	// isawaitable(obj)
+	mod.Dict.Set(val.InternString("isawaitable"), val.NewBuiltinFuncVal("isawaitable", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			return val.BoolVal(false)
+		}
+		obj := args[0]
+		if obj.IsCoroutine() || obj.IsTask() || obj.IsFuture() {
+			return val.BoolVal(true)
+		}
+		if v, ok := vmGetAttrSafe(ctx, obj, "__await__"); ok && !v.IsNone() {
+			return val.BoolVal(true)
+		}
+		return val.BoolVal(false)
+	}))
+
+	// isdatadescriptor(obj)
+	mod.Dict.Set(val.InternString("isdatadescriptor"), val.NewBuiltinFuncVal("isdatadescriptor", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			return val.BoolVal(false)
+		}
+		obj := args[0]
+		if !obj.IsType() && !obj.IsInstance() {
+			return val.BoolVal(false)
+		}
+		objType := obj.Type()
+		if obj.IsDataDescriptor() || (objType != nil && objType.Slots.TpDescrSet != nil) {
+			return val.BoolVal(true)
+		}
+		_, hasSet := vmGetAttrSafe(ctx, obj, "__set__")
+		_, hasDel := vmGetAttrSafe(ctx, obj, "__delete__")
+		return val.BoolVal(hasSet || hasDel)
+	}))
+
+	// unwrap(func, stop=None)
+	mod.Dict.Set(val.InternString("unwrap"), val.NewBuiltinFuncVal("unwrap", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: unwrap() takes at least 1 argument")
+		}
+		curr := args[0]
+		stop := val.NoneVal()
+		if len(args) > 1 {
+			stop = args[1]
+		}
+		for {
+			if !stop.IsNone() && !stop.IsUnbound() {
+				stopRes := ctx.Invoke1(stop, curr)
+				if stopRes.IsTruthy() {
+					return curr
+				}
+			}
+			wrapped, ok := vmGetAttrSafe(ctx, curr, "__wrapped__")
+			if !ok || wrapped.IsNone() || wrapped.IsUnbound() {
+				return curr
+			}
+			curr = wrapped
+		}
 	}))
 
 	// iscode(obj)
@@ -396,6 +589,18 @@ func (e *Engine) createInspectModule() val.Value {
 				return sigInst
 			}
 		} else {
+			tp := target.Type()
+			isCallable := false
+			if tp != nil {
+				if tp.Slots.TpCall != nil {
+					isCallable = true
+				} else if _, _, ok := tp.LookupMRO(val.DunderCall); ok {
+					isCallable = true
+				}
+			}
+			if isCallable {
+				panic("ValueError: no signature found for " + target.String())
+			}
 			panic("TypeError: " + target.String() + " is not a callable object")
 		}
 

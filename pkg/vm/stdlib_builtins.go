@@ -1239,7 +1239,16 @@ func checkIsInstance(ctx *val.ExecContext, obj, target val.Value) bool {
 		return res.IsTruthy()
 	}
 	if target.IsType() {
-		return val.IsSubclass(obj.Type(), target.AsType())
+		if val.IsSubclass(obj.Type(), target.AsType()) {
+			return true
+		}
+		// Support __class__ spoofing (e.g. unittest.mock.Mock)
+		if obj.IsInstance() {
+			if spoofedCls, ok := obj.AsInstance().GetAttr(val.InternString("__class__")); ok && spoofedCls.IsType() {
+				return val.IsSubclass(spoofedCls.AsType(), target.AsType())
+			}
+		}
+		return false
 	}
 	return false
 }

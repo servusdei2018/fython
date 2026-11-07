@@ -162,6 +162,49 @@ func (e *Engine) createTracebackModule() val.Value {
 		return val.NoneVal()
 	}))
 
+	// print_exception(exc, [value, tb], limit=None, file=None, chain=True)
+	mod.Dict.Set(val.InternString("print_exception"), val.NewBuiltinFuncVal("print_exception", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		nkw := len(kwnames)
+		npos := len(args) - nkw
+		var posArgs []val.Value
+		if npos > 0 {
+			posArgs = args[:npos]
+		}
+		var fileVal val.Value = val.NoneVal()
+		for i, kn := range kwnames {
+			if kn.AsString() == "file" {
+				fileVal = args[npos+i]
+			}
+		}
+		if fileVal.IsNone() && npos >= 5 {
+			fileVal = posArgs[4]
+		}
+
+		fmtExcFn, _ := mod.Dict.Get(val.InternString("format_exception"))
+		linesVal := ctx.Call(fmtExcFn, posArgs, nil)
+		var text string
+		if linesVal.IsList() {
+			items := linesVal.AsList().Items
+			var sb strings.Builder
+			for _, item := range items {
+				sb.WriteString(item.AsString())
+			}
+			text = sb.String()
+		}
+
+		if !fileVal.IsNone() {
+			writeFn := val.GetAttrCtx(ctx, fileVal, val.InternString("write"))
+			if !writeFn.IsUnbound() && !writeFn.IsNone() {
+				ctx.ClearException()
+				ctx.Invoke1(writeFn, val.NewStringVal(text))
+				return val.NoneVal()
+			}
+			ctx.ClearException()
+		}
+		os.Stderr.WriteString(text)
+		return val.NoneVal()
+	}))
+
 	// format_stack(f=None, limit=None)
 	mod.Dict.Set(val.InternString("format_stack"), val.NewBuiltinFuncVal("format_stack", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		vmInstance := ctx.VM.(*VM)

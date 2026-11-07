@@ -1627,11 +1627,10 @@ func (d *PyDict) Items() []DictItem {
 	return items
 }
 
-// PySet represents a heap-allocated Python set.
+// PySet represents a heap-allocated Python set backed by an open-addressing PyDict table.
 type PySet struct {
-	Header  ObjectHeader
-	mu      sync.RWMutex
-	Entries map[Value]struct{}
+	Header ObjectHeader
+	dict   PyDict
 }
 
 // NewSetVal constructs a new PySet Value.
@@ -1641,10 +1640,13 @@ func NewSetVal(items ...Value) Value {
 			Kind: KindSet,
 			Type: SetType,
 		},
-		Entries: make(map[Value]struct{}, len(items)),
 	}
-	for _, item := range items {
-		s.Entries[item] = struct{}{}
+	s.dict.Header = ObjectHeader{Kind: KindDict, Type: DictType}
+	if len(items) > 0 {
+		s.dict.initTable(len(items))
+		for _, item := range items {
+			s.dict.Set(item, NoneVal())
+		}
 	}
 	return Value{ptr: &s.Header}
 }
@@ -1659,41 +1661,23 @@ func SetVal(s *PySet) Value {
 
 // Add adds an element to the set.
 func (s *PySet) Add(v Value) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.Entries == nil {
-		s.Entries = make(map[Value]struct{})
-	}
-	s.Entries[v] = struct{}{}
+	s.dict.Set(v, NoneVal())
 }
 
 // Contains reports whether v is an element of the set.
 func (s *PySet) Contains(v Value) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.Entries == nil {
-		return false
-	}
-	_, ok := s.Entries[v]
+	_, ok := s.dict.Get(v)
 	return ok
 }
 
 // Len returns the count of elements in the set.
 func (s *PySet) Len() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return len(s.Entries)
+	return s.dict.Len()
 }
 
 // Items returns a slice of all elements in the set.
 func (s *PySet) Items() []Value {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	res := make([]Value, 0, len(s.Entries))
-	for k := range s.Entries {
-		res = append(res, k)
-	}
-	return res
+	return s.dict.Keys()
 }
 
 // Union returns a new set containing all elements from both s and other.
@@ -1743,43 +1727,28 @@ func (s *PySet) SymmetricDifference(other *PySet) Value {
 
 // Remove removes v from the set. Returns true if present.
 func (s *PySet) Remove(v Value) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.Entries == nil {
-		return false
-	}
-	if _, ok := s.Entries[v]; ok {
-		delete(s.Entries, v)
-		return true
-	}
-	return false
+	return s.dict.Delete(v)
 }
 
 // Discard removes v from the set if present.
 func (s *PySet) Discard(v Value) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.Entries != nil {
-		delete(s.Entries, v)
-	}
+	s.dict.Delete(v)
 }
 
 // Clear removes all elements from the set.
 func (s *PySet) Clear() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.Entries = make(map[Value]struct{})
+	s.dict.Clear()
 }
 
 // Pop removes and returns an arbitrary element from the set.
 func (s *PySet) Pop() (Value, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for k := range s.Entries {
-		delete(s.Entries, k)
-		return k, true
+	keys := s.dict.Keys()
+	if len(keys) == 0 {
+		return NoneVal(), false
 	}
-	return NoneVal(), false
+	k := keys[0]
+	s.dict.Delete(k)
+	return k, true
 }
 
 // Difference returns a new set with elements in s that are not in other.
@@ -1798,9 +1767,7 @@ func (s *PySet) IsSubset(other *PySet) bool {
 	if other == nil {
 		return s.Len() == 0
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for k := range s.Entries {
+	for _, k := range s.Items() {
 		if !other.Contains(k) {
 			return false
 		}
@@ -2087,7 +2054,7 @@ type PyWeakRef struct {
 	Callback Value
 	Hash     int64
 	HasHash  bool
-	IsDead   bool
+	IsDead   atomic.Bool
 }
 
 // PyWeakProxy represents a transparent proxy forwarding to a weakly-referenced object.
@@ -2376,4 +2343,32 @@ func (d *PyDict) Clear() {
 	d.filled = 0
 	atomic.AddUint64(&d.VersionTag, 1)
 	d.mu.Unlock()
+}
+
+// PyLazyImport represents a PEP 690 lazy import placeholder.
+type PyLazyImport struct {
+	Header  ObjectHeader
+	Module  string
+	Symbol  string
+	Level   int
+	Package string
+}
+
+func NewLazyImportVal(module, symbol string, level int, pkg string) Value {
+	li := &PyLazyImport{
+		Header:  ObjectHeader{Kind: KindLazyImport, Type: ObjectType},
+		Module:  module,
+		Symbol:  symbol,
+		Level:   level,
+		Package: pkg,
+	}
+	return Value{num: 0, ptr: &li.Header}
+}
+
+func (v Value) AsLazyImport() *PyLazyImport {
+	return (*PyLazyImport)(unsafe.Pointer(v.ptr))
+}
+
+func (v Value) IsLazyImport() bool {
+	return v.Kind() == KindLazyImport
 }

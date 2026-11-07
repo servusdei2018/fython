@@ -152,6 +152,10 @@ const (
 
 	// OP_UNARY_POSITIVE performs Python unary positive (+a).
 	OP_UNARY_POSITIVE
+
+	// Exception Handler Scopes
+	OP_PUSH_EXC_INFO
+	OP_POP_EXCEPT
 )
 
 // Comparison operation codes for OP_COMPARE_OP (passed in ArgA field).
@@ -378,6 +382,10 @@ func (op Opcode) String() string {
 		return "OP_LOAD_FROM_DICT_OR_DEREF"
 	case OP_UNARY_POSITIVE:
 		return "OP_UNARY_POSITIVE"
+	case OP_PUSH_EXC_INFO:
+		return "OP_PUSH_EXC_INFO"
+	case OP_POP_EXCEPT:
+		return "OP_POP_EXCEPT"
 	case OP_BINARY_MATMUL:
 		return "OP_BINARY_MATMUL"
 	case OP_CALL_FUNCTION_EX:

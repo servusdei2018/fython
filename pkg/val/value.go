@@ -59,6 +59,7 @@ const (
 	KindMappingProxy   // Heap-allocated mappingproxy wrapper (*PyMappingProxy)
 	KindNative         // Heap-allocated native Go object with custom struct
 	KindComplex        // Heap-allocated complex number (*PyComplex)
+	KindLazyImport     // Heap-allocated lazy import placeholder (*PyLazyImport)
 )
 
 // ObjectHeader Flags bitmask constants.
@@ -177,6 +178,8 @@ func (k Kind) String() string {
 		return "object"
 	case KindComplex:
 		return "complex"
+	case KindLazyImport:
+		return "lazy_import"
 	default:
 		return "unknown"
 	}
@@ -1013,7 +1016,7 @@ func (v Value) String() string {
 		var sb strings.Builder
 		sb.WriteString("{")
 		first := true
-		for item := range s.Entries {
+		for _, item := range s.Items() {
 			if !first {
 				sb.WriteString(", ")
 			}

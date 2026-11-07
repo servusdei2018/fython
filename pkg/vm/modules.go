@@ -127,10 +127,14 @@ func (e *Engine) LoadOrCompileModule(filePath, moduleName string) (*CodeObject, 
 			if err != nil {
 				return nil, fmt.Errorf("ModuleNotFoundError: No module named '%s' (%v)", moduleName, err)
 			}
-			if e.compileHook == nil {
+			var co *CodeObject
+			if e.compileWithFilenameHook != nil {
+				co, err = e.compileWithFilenameHook(src, filePath)
+			} else if e.compileHook != nil {
+				co, err = e.compileHook(src)
+			} else {
 				return nil, fmt.Errorf("Engine: no compileHook set to compile stdlib file '%s'", filePath)
 			}
-			co, err := e.compileHook(src)
 			if err != nil {
 				return nil, err
 			}
@@ -168,11 +172,14 @@ func (e *Engine) LoadOrCompileModule(filePath, moduleName string) (*CodeObject, 
 			return nil, err
 		}
 
-		if e.compileHook == nil {
+		var co *CodeObject
+		if e.compileWithFilenameHook != nil {
+			co, err = e.compileWithFilenameHook(src, filePath)
+		} else if e.compileHook != nil {
+			co, err = e.compileHook(src)
+		} else {
 			return nil, fmt.Errorf("Engine: no compileHook set to compile source file '%s'", filePath)
 		}
-
-		co, err := e.compileHook(src)
 		if err != nil {
 			return nil, err
 		}
@@ -316,6 +323,56 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 	return topVal, nil
 }
 
+func init() {
+	val.ResolveLazyImportHook = func(v any, mod *val.PyModule, name val.Value, lazyVal val.Value) (val.Value, error) {
+		vm, ok := v.(*VM)
+		if !ok || vm == nil {
+			return val.NoneVal(), fmt.Errorf("no active VM to resolve lazy import")
+		}
+		return vm.resolveLazyImport(mod, name, lazyVal)
+	}
+}
+
+func (vm *VM) resolveLazyImport(mod *val.PyModule, name val.Value, lazyVal val.Value) (val.Value, error) {
+	li := lazyVal.AsLazyImport()
+	targetModName := li.Module
+	if li.Level > 0 {
+		basePkg := li.Package
+		if basePkg == "" && mod != nil {
+			basePkg = mod.Name
+		}
+		parts := strings.Split(basePkg, ".")
+		if li.Level <= len(parts) {
+			prefix := strings.Join(parts[:len(parts)-li.Level+1], ".")
+			if li.Module != "" {
+				targetModName = prefix + "." + li.Module
+			} else {
+				targetModName = prefix
+			}
+		}
+	}
+
+	targetMod, err := vm.ImportModule(targetModName, 0, true, nil)
+	if err != nil {
+		return val.NoneVal(), err
+	}
+
+	var res val.Value
+	if li.Symbol == "" {
+		res = targetMod
+	} else {
+		res, err = vm.ImportFrom(targetMod, li.Symbol, nil)
+		if err != nil {
+			return val.NoneVal(), err
+		}
+	}
+
+	if mod != nil {
+		mod.Dict.Set(name, res)
+	}
+	return res, nil
+}
+
 // ImportFrom resolves an attribute or submodule from an imported module.
 func (vm *VM) ImportFrom(modVal val.Value, symbolName string, callerGlobals *val.PyDict) (val.Value, error) {
 	if !modVal.IsModule() {
@@ -326,6 +383,13 @@ func (vm *VM) ImportFrom(modVal val.Value, symbolName string, callerGlobals *val
 
 	// 1. Check module dictionary
 	if v, ok := mod.Dict.Get(interned); ok {
+		if v.IsLazyImport() {
+			resolved, err := vm.resolveLazyImport(mod, interned, v)
+			if err != nil {
+				return val.NoneVal(), err
+			}
+			return resolved, nil
+		}
 		return v, nil
 	}
 

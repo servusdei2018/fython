@@ -7,6 +7,7 @@ import (
 	"math"
 	"math/big"
 	"math/bits"
+	"strconv"
 	"strings"
 )
 
@@ -378,10 +379,18 @@ func mulSlow(ctx *ExecContext, a, b Value) Value {
 	}
 
 	// 3. Reflected __rmul__
-	if !isStrictSub && bType.dunderRMul.ptr != nil {
-		res := ctx.Invoke2(bType.dunderRMul, b, a)
-		if !res.IsNotImplemented() {
-			return res
+	if !isStrictSub {
+		if nbMul := bType.Slots.NbMul; nbMul != nil {
+			res := nbMul(ctx, a, b)
+			if !res.IsNotImplemented() {
+				return res
+			}
+		}
+		if bType.dunderRMul.ptr != nil {
+			res := ctx.Invoke2(bType.dunderRMul, b, a)
+			if !res.IsNotImplemented() {
+				return res
+			}
 		}
 	}
 
@@ -547,12 +556,20 @@ func RichCompare(ctx *ExecContext, a, b Value, op uint8) Value {
 		return Value{}
 	}
 
+	invokeDunder := func(fn, self, other Value, tp *PyType) Value {
+		if descrGet := fn.Type().Slots.TpDescrGet; descrGet != nil {
+			bound := descrGet(ctx, fn, self, tp)
+			return ctx.Invoke1(bound, other)
+		}
+		return ctx.Invoke2(fn, self, other)
+	}
+
 	isStrictSub := aType != bType && IsSubclass(bType, aType)
 
 	// 1. If b is a strict subclass of a and defines the reflected comparison, try b first!
 	if isStrictSub {
 		if rFn := getOpDunder(bType, reflectedOp); rFn.ptr != nil {
-			res := ctx.Invoke2(rFn, b, a)
+			res := invokeDunder(rFn, b, a, bType)
 			if !res.IsNotImplemented() {
 				return res
 			}
@@ -561,7 +578,7 @@ func RichCompare(ctx *ExecContext, a, b Value, op uint8) Value {
 
 	// 2. Try a's comparison operator
 	if fn := getOpDunder(aType, op); fn.ptr != nil {
-		res := ctx.Invoke2(fn, a, b)
+		res := invokeDunder(fn, a, b, aType)
 		if !res.IsNotImplemented() {
 			return res
 		}
@@ -570,7 +587,7 @@ func RichCompare(ctx *ExecContext, a, b Value, op uint8) Value {
 	// 3. Try b's reflected comparison operator (if not tried already)
 	if !isStrictSub {
 		if rFn := getOpDunder(bType, reflectedOp); rFn.ptr != nil {
-			res := ctx.Invoke2(rFn, b, a)
+			res := invokeDunder(rFn, b, a, bType)
 			if !res.IsNotImplemented() {
 				return res
 			}
@@ -1207,18 +1224,25 @@ func InCtx(ctx *ExecContext, item, container Value) Value {
 		return BoolVal(strings.Contains(container.AsString(), item.AsString()))
 	}
 	if cType != nil {
+		invokeContains := func(fn Value) Value {
+			if descrGet := fn.Type().Slots.TpDescrGet; descrGet != nil {
+				bound := descrGet(ctx, fn, container, cType)
+				return ctx.Invoke1(bound, item)
+			}
+			return ctx.Invoke2(fn, container, item)
+		}
 		if cType.dunderContains.ptr != nil {
 			if cType.dunderContains.IsNone() {
 				return raiseTypeError(ctx, "argument of type '"+cType.Name+"' is not iterable")
 			}
-			res := ctx.Invoke2(cType.dunderContains, container, item)
+			res := invokeContains(cType.dunderContains)
 			return BoolVal(res.IsTruthy())
 		}
 		if fn, _, ok := cType.LookupMRO(DunderContains); ok {
 			if fn.IsNone() {
 				return raiseTypeError(ctx, "argument of type '"+cType.Name+"' is not iterable")
 			}
-			res := ctx.Invoke2(fn, container, item)
+			res := invokeContains(fn)
 			return BoolVal(res.IsTruthy())
 		}
 	}
@@ -1616,10 +1640,29 @@ func RShift(ctx *ExecContext, a, b Value) Value {
 	return raiseTypeError(ctx, "unsupported operand type(s) for >>: '"+a.Type().Name+"' and '"+b.Type().Name+"'")
 }
 
+func unwrapInstanceInt(a Value) (int64, bool) {
+	if a.IsInstance() && a.Type() != nil && IsSubclass(a.Type(), IntType) {
+		inst := a.AsInstance()
+		if len(inst.Slots) > 0 && inst.Slots[0].IsInt64() {
+			return inst.Slots[0].AsInt64(), true
+		}
+		if v, ok := inst.GetAttr(InternString("value")); ok && v.IsInt64() {
+			return v.AsInt64(), true
+		}
+		if v, ok := inst.GetAttr(InternString("\x00prim")); ok && v.IsInt64() {
+			return v.AsInt64(), true
+		}
+	}
+	return 0, false
+}
+
 // Invert performs Python bitwise invert (~a).
 func Invert(ctx *ExecContext, a Value) Value {
 	if a.ptr == &tagInt64 || a.ptr == &tagBool {
 		return Int64Val(^int64(a.num))
+	}
+	if n, ok := unwrapInstanceInt(a); ok {
+		return Int64Val(^n)
 	}
 	if isAnyInt(a) {
 		bi := toBigInt(a)
@@ -1643,6 +1686,9 @@ func Invert(ctx *ExecContext, a Value) Value {
 func Positive(ctx *ExecContext, a Value) Value {
 	if a.ptr == &tagInt64 || a.ptr == &tagBool {
 		return Int64Val(int64(a.num))
+	}
+	if n, ok := unwrapInstanceInt(a); ok {
+		return Int64Val(n)
 	}
 	if a.ptr == &tagFloat64 {
 		return a
@@ -1671,6 +1717,9 @@ func Negative(ctx *ExecContext, a Value) Value {
 	}
 	if a.ptr == &tagBool {
 		return Int64Val(-int64(a.num))
+	}
+	if n, ok := unwrapInstanceInt(a); ok {
+		return Int64Val(-n)
 	}
 	if a.ptr == &tagFloat64 {
 		return Float64Val(-math.Float64frombits(a.num))
@@ -1764,9 +1813,9 @@ func formatStringModCtx(ctx *ExecContext, fmtStr string, arg Value) Value {
 			}
 		}
 
-		// Flags / width / precision: e.g. -0+ #, width, .prec
+		// Flags / width / precision: e.g. -0+ #, width, .prec, *
 		startSpec := i
-		for i < n && (fmtStr[i] == '-' || fmtStr[i] == '+' || fmtStr[i] == '0' || fmtStr[i] == ' ' || fmtStr[i] == '#' || (fmtStr[i] >= '0' && fmtStr[i] <= '9') || fmtStr[i] == '.') {
+		for i < n && (fmtStr[i] == '-' || fmtStr[i] == '+' || fmtStr[i] == '0' || fmtStr[i] == ' ' || fmtStr[i] == '#' || (fmtStr[i] >= '0' && fmtStr[i] <= '9') || fmtStr[i] == '.' || fmtStr[i] == '*') {
 			i++
 		}
 		if i >= n {
@@ -1775,6 +1824,19 @@ func formatStringModCtx(ctx *ExecContext, fmtStr string, arg Value) Value {
 		specifier := fmtStr[startSpec:i]
 		convType := fmtStr[i]
 		i++
+
+		for strings.Contains(specifier, "*") {
+			if itemIdx >= len(items) {
+				return raiseTypeError(ctx, "not enough arguments for format string")
+			}
+			starVal := items[itemIdx]
+			itemIdx++
+			if !starVal.IsInt64() && !starVal.IsBool() {
+				return raiseTypeError(ctx, "* wants int")
+			}
+			starInt := starVal.AsInt64()
+			specifier = strings.Replace(specifier, "*", strconv.FormatInt(starInt, 10), 1)
+		}
 
 		var val Value
 		if hasMapKey {

@@ -76,6 +76,7 @@ type CallFrame struct {
 	locals      val.Value
 	cache       *VMCodeCache
 	shadowFrame *val.PyFrame
+	excStackLen int
 }
 
 // LineSpanEntry maps an instruction pointer range [StartIP, EndIP) to source line and column.
@@ -189,11 +190,27 @@ type VMCodeCache struct {
 // Compile-time check that CodeObject.Header is at byte offset 0.
 var _ [0 - unsafe.Offsetof(CodeObject{}.Header)]byte
 
-// NewCodeVal wraps a *CodeObject as a val.Value with KindCode.
-func NewCodeVal(co *CodeObject) val.Value {
-	co.initID()
+// Init initializes the CodeObject header and assigns its unique ID safely before execution.
+func (co *CodeObject) Init() *CodeObject {
+	if co == nil {
+		return nil
+	}
 	co.Header.Kind = val.KindCode
 	co.Header.Type = val.CodeType
+	co.initID()
+	return co
+}
+
+// NewCodeVal wraps a *CodeObject as a val.Value with KindCode.
+func NewCodeVal(co *CodeObject) val.Value {
+	if co == nil {
+		return val.NoneVal()
+	}
+	co.initID()
+	if co.Header.Kind != val.KindCode {
+		co.Header.Kind = val.KindCode
+		co.Header.Type = val.CodeType
+	}
 	return val.ObjectVal(&co.Header)
 }
 
@@ -226,6 +243,7 @@ type VM struct {
 	modules            *val.PyDict
 	lastException      val.Value
 	unhandledException val.Value
+	excStack           []val.Value
 	context            *val.PyContext
 	bindingOSPath      bool
 	coroFreeList       []*val.PyCoroutine

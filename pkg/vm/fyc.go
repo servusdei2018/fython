@@ -716,9 +716,7 @@ func decodeCodeObject(r *binaryReader, stringTable []val.Value) (*CodeObject, er
 		ExceptionTable:  excTable,
 		LineSpans:       lineSpans,
 	}
-	co.Header.Kind = val.KindCode
-	co.Header.Type = val.CodeType
-	return co, nil
+	return co.Init(), nil
 }
 
 func decodeValue(r *binaryReader, stringTable []val.Value) (val.Value, error) {
