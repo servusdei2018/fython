@@ -275,15 +275,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		if len(args) < 1 {
 			panic("TypeError: callable() takes exactly one argument")
 		}
-		obj := args[0]
-		tp := obj.Type()
-		if tp.Slots.TpCall != nil {
-			return val.BoolVal(true)
-		}
-		if _, _, ok := tp.LookupMRO(val.DunderCall); ok {
-			return val.BoolVal(true)
-		}
-		return val.BoolVal(false)
+		return val.BoolVal(val.IsCallable(args[0]))
 	}))
 
 	// iter(object[, sentinel])
@@ -831,14 +823,40 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			panic("TypeError: map() must have at least two arguments")
 		}
 		fn := args[0]
-		it := iterFor(ctx, args[1])
+		if len(args) == 2 {
+			it := iterFor(ctx, args[1])
+			var results []val.Value
+			for {
+				item, ok := it.Next()
+				if !ok {
+					break
+				}
+				results = append(results, ctx.Invoke1(fn, item))
+			}
+			return val.NewIterVal(val.NewListVal(results...))
+		}
+
+		// Multiple iterables
+		iters := make([]*val.PyIter, len(args)-1)
+		for i := 1; i < len(args); i++ {
+			iters[i-1] = iterFor(ctx, args[i])
+		}
 		var results []val.Value
+		callArgs := make([]val.Value, len(iters))
 		for {
-			item, ok := it.Next()
-			if !ok {
+			exhausted := false
+			for i := range iters {
+				item, ok := iters[i].Next()
+				if !ok {
+					exhausted = true
+					break
+				}
+				callArgs[i] = item
+			}
+			if exhausted {
 				break
 			}
-			results = append(results, ctx.Invoke1(fn, item))
+			results = append(results, ctx.Call(fn, callArgs, nil))
 		}
 		return val.NewIterVal(val.NewListVal(results...))
 	}))

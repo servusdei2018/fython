@@ -542,7 +542,9 @@ func extractFinderFullname(args []val.Value) string {
 
 func extractPathFinderArgs(args []val.Value) (string, val.Value) {
 	idx := 0
-	if len(args) > 0 && (args[0].IsType() || (args[0].IsInstance() && args[0].Type() == PathFinderType)) {
+	if len(args) > 1 && !args[0].IsAnyString() && args[1].IsAnyString() {
+		idx = 1
+	} else if len(args) > 0 && (args[0].IsType() || (args[0].IsInstance() && args[0].Type() == PathFinderType)) {
 		idx = 1
 	}
 	if len(args) <= idx || !args[idx].IsAnyString() {

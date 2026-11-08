@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // Operator precedences (mirrors CPython's _ast_unparse._Precedence).
@@ -36,6 +37,23 @@ type UnparseOptions struct {
 	// PadLines inserts blank lines so each statement starts at (or after) its
 	// recorded lineno, keeping tracebacks aligned with the original positions.
 	PadLines bool
+}
+
+const SynthAtPrefix = "__fy_synth_at_"
+
+func encodeSynthIdent(name string) string {
+	if strings.HasPrefix(name, "@") {
+		return SynthAtPrefix + name[1:]
+	}
+	return name
+}
+
+// DecodeSynthIdent restores synthesized @ identifiers.
+func DecodeSynthIdent(name string) string {
+	if strings.HasPrefix(name, SynthAtPrefix) {
+		return "@" + name[len(SynthAtPrefix):]
+	}
+	return name
 }
 
 type unparser struct {
@@ -219,7 +237,11 @@ func (u *unparser) stmt(n *Node) {
 			kw = "nonlocal "
 		}
 		names, _ := n.Get("names").([]string)
-		u.fill(kw + strings.Join(names, ", "))
+		encoded := make([]string, len(names))
+		for i, name := range names {
+			encoded[i] = encodeSynthIdent(name)
+		}
+		u.fill(kw + strings.Join(encoded, ", "))
 	case "Raise":
 		u.fill("raise")
 		if e := n.Node("exc"); e != nil {
@@ -405,9 +427,9 @@ func (u *unparser) aliases(as []*Node) {
 		if i > 0 {
 			u.write(", ")
 		}
-		u.write(a.Str("name"))
+		u.write(encodeSynthIdent(a.Str("name")))
 		if as, ok := a.Get("asname").(string); ok && as != "" {
-			u.write(" as " + as)
+			u.write(" as " + encodeSynthIdent(as))
 		}
 	}
 }
@@ -442,7 +464,7 @@ func (u *unparser) typeParams(tps []*Node) {
 }
 
 func (u *unparser) arg(a *Node) {
-	u.write(a.Str("arg"))
+	u.write(encodeSynthIdent(a.Str("arg")))
 	if ann := a.Node("annotation"); ann != nil {
 		u.write(": ")
 		u.expr(ann, pTest)
@@ -482,7 +504,7 @@ func (u *unparser) arguments(a *Node) {
 		comma()
 		u.write("*")
 		if va != nil {
-			u.write(va.Str("arg"))
+			u.write(encodeSynthIdent(va.Str("arg")))
 			if ann := va.Node("annotation"); ann != nil {
 				u.write(": ")
 				u.expr(ann, pTest)
@@ -507,7 +529,7 @@ func (u *unparser) arguments(a *Node) {
 
 func (u *unparser) keyword(k *Node) {
 	if arg, ok := k.Get("arg").(string); ok && arg != "" {
-		u.write(arg + "=")
+		u.write(encodeSynthIdent(arg) + "=")
 	} else {
 		u.write("**")
 	}
@@ -658,7 +680,7 @@ func (u *unparser) expr(n *Node, need int) {
 	}
 	switch n.Spec.Name {
 	case "Name":
-		u.write(n.Str("id"))
+		u.write(encodeSynthIdent(n.Str("id")))
 	case "Constant":
 		u.constant(n, need)
 	case "Attribute":
@@ -669,7 +691,7 @@ func (u *unparser) expr(n *Node, need int) {
 				u.write(" ")
 			}
 		}
-		u.write("." + n.Str("attr"))
+		u.write("." + encodeSynthIdent(n.Str("attr")))
 	case "Call":
 		u.expr(n.Node("func"), pAtom)
 		u.write("(")
@@ -1042,6 +1064,25 @@ func isPrintable(r rune) bool {
 	return unicode.IsPrint(r)
 }
 
+func decodeRuneWTF8(s string, i int) (rune, int) {
+	if i >= len(s) {
+		return 0, 0
+	}
+	b0 := s[i]
+	if b0 < 0x80 {
+		return rune(b0), 1
+	}
+	if b0 == 0xED && i+2 < len(s) {
+		b1 := s[i+1]
+		b2 := s[i+2]
+		if b1 >= 0xA0 && b1 <= 0xBF && b2 >= 0x80 && b2 <= 0xBF {
+			r := rune(b0&0x0F)<<12 | rune(b1&0x3F)<<6 | rune(b2&0x3F)
+			return r, 3
+		}
+	}
+	return utf8.DecodeRuneInString(s[i:])
+}
+
 // escapeBody escapes s for inclusion between quote characters.
 func escapeBody(s string, quote byte, bytesMode bool) string {
 	var sb strings.Builder
@@ -1068,7 +1109,9 @@ func escapeBody(s string, quote byte, bytesMode bool) string {
 		}
 		return sb.String()
 	}
-	for _, r := range s {
+	for i := 0; i < len(s); {
+		r, size := decodeRuneWTF8(s, i)
+		i += size
 		switch {
 		case r == '\\':
 			sb.WriteString(`\\`)

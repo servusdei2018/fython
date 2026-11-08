@@ -1030,5 +1030,38 @@ func (e *Engine) createThreadingModule() val.Value {
 
 	mod.Dict.Set(val.InternString("local"), val.TypeVal(val.ObjectType))
 
+	defaultExcepthook := val.NewBuiltinFuncVal("excepthook", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.NoneVal()
+	})
+	mod.Dict.Set(val.InternString("excepthook"), defaultExcepthook)
+
+	exceptHookArgsType := val.MustNewType("ExceptHookArgs", []*val.PyType{val.ObjectType}, nil)
+	exceptHookArgsType.Dict.Set(val.InternString("__init__"), val.NewBuiltinFuncVal("__init__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) == 0 {
+			return val.NoneVal()
+		}
+		self := args[0]
+		if self.IsInstance() {
+			inst := self.AsInstance()
+			fieldNames := []string{"exc_type", "exc_value", "exc_traceback", "thread"}
+			posArgs := args[1:]
+			if len(kwnames) > 0 {
+				posArgs = args[1 : len(args)-len(kwnames)]
+				kwStart := len(args) - len(kwnames)
+				for i, kn := range kwnames {
+					inst.SetAttr(kn, args[kwStart+i])
+				}
+			}
+			for i, arg := range posArgs {
+				if i < len(fieldNames) {
+					inst.SetAttr(val.InternString(fieldNames[i]), arg)
+				}
+			}
+		}
+		return val.NoneVal()
+	}))
+	exceptHookArgsType.SyncDunderSlots()
+	mod.Dict.Set(val.InternString("ExceptHookArgs"), val.TypeVal(exceptHookArgsType))
+
 	return modVal
 }

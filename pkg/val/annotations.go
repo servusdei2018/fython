@@ -148,10 +148,5 @@ func ModuleAnnotations(ctx *ExecContext, mod *PyModule) Value {
 }
 
 func isCallableValue(v Value) bool {
-	tp := v.Type()
-	if tp.Slots.TpCall != nil {
-		return true
-	}
-	_, _, ok := tp.LookupMRO(DunderCall)
-	return ok
+	return IsCallable(v)
 }

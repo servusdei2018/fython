@@ -120,6 +120,18 @@ func diff(path string, a, b any) string {
 		}
 		return ""
 	}
+	if sa, okA := a.(string); okA {
+		if sb, okB := b.(string); okB {
+			if sa == sb {
+				return ""
+			}
+			// When strings contain lone surrogates, Go's json.Marshal encodes each of the 3 WTF-8 bytes
+			// as utf8.RuneError (\uFFFD\uFFFD\uFFFD) while json.Unmarshal on \uXXXX escapes decodes to a single \uFFFD.
+			if strings.ReplaceAll(sa, "\ufffd\ufffd\ufffd", "\ufffd") == sb {
+				return ""
+			}
+		}
+	}
 	if !reflect.DeepEqual(a, b) {
 		return fmt.Sprintf("%s: got %#v want %#v", path, a, b)
 	}

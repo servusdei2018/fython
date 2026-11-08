@@ -25,6 +25,9 @@ var expectedWheelChecksums = map[string]string{
 	"markdown_it_py-4.2.0-py3-none-any.whl": "9f7ebbcd14fe59494226453aed97c1070d83f8d24b6fc3a3bcf9a38092641c4a",
 	"pygments-2.21.0-py3-none-any.whl":      "2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9",
 	"rich-15.0.0-py3-none-any.whl":          "33bd4ef74232fb73fe9279a257718407f169c09b78a87ad3d296f548e27de0bb",
+	"iniconfig-2.3.1-py3-none-any.whl":      "9121e2c1fdb355232495be3194c8dfe87ccc2d5dee45947b78e68f499790d7a7",
+	"pluggy-1.7.0-py3-none-any.whl":         "7dd7b0d8832ba3cb632c306926ded123429211b83641b35dc5c41ad2d34f9bec",
+	"pytest-9.1.1-py3-none-any.whl":         "37a86b45efb9a47a61a36449063e8e18d0cab3161329fc099eb21783169c4f0c",
 }
 
 func setupPyPIEngine(t *testing.T) (*vm.Engine, []string) {
@@ -300,6 +303,82 @@ assert "packaging" in output
 assert "Summary" in output
 assert "hello" in output
 `
+		runPyPIScript(t, engine, wheelPaths, script)
+	})
+
+	t.Run("pytest_suite", func(t *testing.T) {
+		tempDir := t.TempDir()
+		script := fmt.Sprintf(`
+import os
+import sys
+import tempfile
+import pytest
+
+temp_dir = %q
+test_file = os.path.join(temp_dir, "test_suite_sample.py")
+
+test_code = """
+import os
+import pytest
+
+teardown_tracker = []
+
+@pytest.fixture
+def custom_fixture():
+    teardown_tracker.append("setup")
+    yield 100
+    teardown_tracker.append("teardown")
+
+def test_assertion_pass():
+    a = [10, 20, 30]
+    b = [10, 20, 30]
+    assert a == b
+
+def test_assertion_failure_introspection():
+    try:
+        x = [1, 2, "apple"]
+        y = [1, 2, "banana"]
+        assert x == y
+    except AssertionError as exc:
+        msg = str(exc)
+        # Verify AST assertion rewriting generated detailed diff explanation
+        assert "apple" in msg and "banana" in msg, f"Expected rewritten diff, got: {msg}"
+
+def test_fixtures_and_tmp(custom_fixture, tmp_path, monkeypatch):
+    assert custom_fixture == 100
+    file_path = tmp_path / "greeting.txt"
+    file_path.write_text("pytest_tmp_ok", encoding="utf-8")
+    assert file_path.read_text(encoding="utf-8") == "pytest_tmp_ok"
+    monkeypatch.setenv("FYTHON_PYTEST_ENV", "env_active_42")
+    assert os.environ.get("FYTHON_PYTEST_ENV") == "env_active_42"
+
+@pytest.mark.parametrize("a,b,expected", [
+    (1, 2, 3),
+    (10, 20, 30),
+    (-5, 5, 0),
+])
+def test_parametrize(a, b, expected):
+    assert a + b == expected
+
+def test_raises_match():
+    with pytest.raises(ValueError, match="invalid input payload"):
+        raise ValueError("an invalid input payload occurred")
+"""
+
+with open(test_file, "w", encoding="utf-8") as f:
+    f.write(test_code)
+
+ret = pytest.main([test_file, "-q", "-s", "--import-mode=importlib"])
+assert ret == 0, f"pytest.main returned non-zero exit code {ret}"
+
+sample_mod = None
+for name, mod in list(sys.modules.items()):
+    if "test_suite_sample" in name:
+        sample_mod = mod
+        break
+assert sample_mod is not None, "test_suite_sample not found in sys.modules"
+assert sample_mod.teardown_tracker == ["setup", "teardown"], f"Teardown failed, got: {sample_mod.teardown_tracker}"
+`, tempDir)
 		runPyPIScript(t, engine, wheelPaths, script)
 	})
 }

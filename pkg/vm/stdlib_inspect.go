@@ -641,6 +641,47 @@ func (e *Engine) createInspectModule() val.Value {
 		panic("TypeError: could not determine file for " + ob.String())
 	}))
 
+	getFileFn, _ := mod.Dict.Get(val.InternString("getfile"))
+	mod.Dict.Set(val.InternString("getsourcefile"), getFileFn)
+
+	// getargs(co) -> (args, varargs, varkw)
+	mod.Dict.Set(val.InternString("getargs"), val.NewBuiltinFuncVal("getargs", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: getargs() requires 1 argument")
+		}
+		co := args[0]
+		if co.IsFunction() {
+			co = co.AsFunction().Code
+		}
+		if !co.IsCode() || val.CodeInspectorHook == nil {
+			panic("TypeError: expected code object")
+		}
+		hook := val.CodeInspectorHook
+		vnames := hook.VarNames(co)
+		nargs := hook.ArgCount(co)
+		nkwargs := hook.KWOnlyArgCount(co)
+		var posAndKw []val.Value
+		if nargs <= len(vnames) {
+			posAndKw = append(posAndKw, vnames[:nargs]...)
+		}
+		if nargs+nkwargs <= len(vnames) {
+			posAndKw = append(posAndKw, vnames[nargs:nargs+nkwargs]...)
+		}
+		idx := nargs + nkwargs
+		flags := hook.Flags(co)
+		var varargs val.Value = val.NoneVal()
+		if flags&0x04 != 0 && idx < len(vnames) {
+			varargs = vnames[idx]
+			idx++
+		}
+		var varkw val.Value = val.NoneVal()
+		if flags&0x08 != 0 && idx < len(vnames) {
+			varkw = vnames[idx]
+		}
+		argsList := val.NewListVal(posAndKw...)
+		return val.NewTupleVal(argsList, varargs, varkw)
+	}))
+
 	// signature(fn) -> Signature
 	mod.Dict.Set(val.InternString("signature"), val.NewBuiltinFuncVal("signature", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {

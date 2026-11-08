@@ -505,7 +505,7 @@ func (st *astState) toNode(ctx *val.ExecContext, v val.Value, expect string) *py
 	n := pyast.NewEmpty(sp)
 	for i, f := range sp.Fields {
 		fv, ok := st.getField(v, f.Name)
-		if !ok || (fv.IsNone() && !f.Opt && !f.List) {
+		if !ok || (fv.IsNone() && !f.Opt && !f.List && f.Type != "object") {
 			if f.Opt || f.List {
 				continue
 			}
@@ -775,7 +775,11 @@ func builtinCompile(ctx *val.ExecContext, callable val.Value, args []val.Value, 
 		if mode == "single" {
 			text += "\n"
 		}
-		return compileSourceWithOptimize(ctx, []byte(text), filename, mode, optimize)
+		resVal := compileSourceWithOptimize(ctx, []byte(text), filename, mode, optimize)
+		if co := AsCodeObject(resVal); co != nil {
+			unmangleCodeObject(co)
+		}
+		return resVal
 	}
 	if srcVal.Kind() == val.KindCode {
 		return srcVal
@@ -819,4 +823,46 @@ func compileSourceWithOptimize(ctx *val.ExecContext, src []byte, filename, mode 
 		panic("SyntaxError: " + err.Error())
 	}
 	return NewCodeVal(co)
+}
+
+func unmangleCodeObject(co *CodeObject) {
+	if co == nil {
+		return
+	}
+	for i, v := range co.VarNames {
+		s := v.AsString()
+		if strings.HasPrefix(s, pyast.SynthAtPrefix) {
+			co.VarNames[i] = val.InternString(pyast.DecodeSynthIdent(s))
+		}
+	}
+	for i, v := range co.ParamNames {
+		s := v.AsString()
+		if strings.HasPrefix(s, pyast.SynthAtPrefix) {
+			co.ParamNames[i] = val.InternString(pyast.DecodeSynthIdent(s))
+		}
+	}
+	for i, v := range co.FreeVars {
+		s := v.AsString()
+		if strings.HasPrefix(s, pyast.SynthAtPrefix) {
+			co.FreeVars[i] = val.InternString(pyast.DecodeSynthIdent(s))
+		}
+	}
+	for i, v := range co.CellVars {
+		s := v.AsString()
+		if strings.HasPrefix(s, pyast.SynthAtPrefix) {
+			co.CellVars[i] = val.InternString(pyast.DecodeSynthIdent(s))
+		}
+	}
+	for i, c := range co.Consts {
+		if c.IsAnyString() {
+			s := c.AsString()
+			if strings.HasPrefix(s, pyast.SynthAtPrefix) {
+				co.Consts[i] = val.InternString(pyast.DecodeSynthIdent(s))
+			}
+		} else if c.Kind() == val.KindCode {
+			if childCO := AsCodeObject(c); childCO != nil {
+				unmangleCodeObject(childCO)
+			}
+		}
+	}
 }

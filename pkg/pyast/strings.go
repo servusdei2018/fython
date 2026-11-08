@@ -105,7 +105,8 @@ func decodeEscapes(s []byte, isBytes bool) []byte {
 			return
 		}
 		if r >= 0xD800 && r <= 0xDFFF {
-			r = utf8.RuneError
+			out = append(out, byte(0xE0|(r>>12)), byte(0x80|((r>>6)&0x3F)), byte(0x80|(r&0x3F)))
+			return
 		}
 		out = utf8.AppendRune(out, rune(r))
 	}

@@ -674,6 +674,14 @@ func installPosix(osMod *val.PyModule) {
 	set("uname", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		return unameResultVal(getUnameInfo())
 	})
+	set("umask", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: umask() takes exactly one argument (0 given)")
+		}
+		mask := int(args[0].AsInt64())
+		oldMask := syscall.Umask(mask)
+		return val.Int64Val(int64(oldMask))
+	})
 
 	osMod.Dict.Set(val.InternString("supports_dir_fd"), val.NewSetVal())
 	osMod.Dict.Set(val.InternString("supports_fd"), val.NewSetVal())

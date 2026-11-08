@@ -43,6 +43,64 @@ func getABCMeta(cls *val.PyType) *abcMeta {
 	return meta
 }
 
+func abcSubclassCheck(ctx *val.ExecContext, cls, sub *val.PyType) bool {
+	if sub == cls || val.IsSubclass(sub, cls) {
+		return true
+	}
+	meta := getABCMeta(cls)
+	subVal := val.TypeVal(sub)
+	if meta.cache.Contains(subVal) {
+		return true
+	}
+
+	// 1. Check __subclasshook__ on cls
+	if hook, _, ok := cls.LookupMRO(val.InternString("__subclasshook__")); ok {
+		if ctx != nil {
+			fn := hook
+			if fn.Kind() == val.KindClassMethod {
+				fn = fn.AsClassMethod().Callable
+			}
+			res := ctx.Invoke2(fn, val.TypeVal(cls), subVal)
+			if !res.IsNotImplemented() {
+				if res.IsTruthy() {
+					meta.cache.Add(subVal)
+					return true
+				}
+				return false
+			}
+		}
+	} else if cls.Name == "Sequence" && sub.Name == "list" {
+		fmt.Printf("DEBUG Sequence has NO __subclasshook__\n")
+	}
+
+	// 2. Check direct registry against sub MRO
+	for _, base := range sub.MRO {
+		bVal := val.TypeVal(base)
+		if meta.registry.Contains(bVal) {
+			meta.cache.Add(subVal)
+			return true
+		}
+	}
+
+	// 3. Check registered classes in registry (recursive)
+	for _, regVal := range meta.registry.Items() {
+		if regVal.IsType() && (val.IsSubclass(sub, regVal.AsType()) || (ctx != nil && abcSubclassCheck(ctx, regVal.AsType(), sub))) {
+			meta.cache.Add(subVal)
+			return true
+		}
+	}
+
+	// 4. Check cls.Subclasses recursively
+	for _, scls := range cls.Subclasses {
+		if scls != cls && abcSubclassCheck(ctx, scls, sub) {
+			meta.cache.Add(subVal)
+			return true
+		}
+	}
+
+	return false
+}
+
 func (e *Engine) createABCModule() val.Value {
 	modVal := val.NewModuleVal("_abc", "")
 	mod := modVal.AsModule()
@@ -97,27 +155,12 @@ func (e *Engine) createABCModule() val.Value {
 		cls := args[0].AsType()
 		inst := args[1]
 		instType := inst.Type()
-
-		if val.IsSubclass(instType, cls) {
-			return val.BoolVal(true)
-		}
-
-		meta := getABCMeta(cls)
-		typeVal := val.TypeVal(instType)
-		if meta.cache.Contains(typeVal) {
-			return val.BoolVal(true)
-		}
-
-		// Check registry against instance MRO
-		for _, base := range instType.MRO {
-			bVal := val.TypeVal(base)
-			if meta.registry.Contains(bVal) {
-				meta.cache.Add(typeVal)
-				return val.BoolVal(true)
+		if inst.IsInstance() {
+			if clsVal, ok := inst.AsInstance().GetAttr(val.InternString("__class__")); ok && clsVal.IsType() {
+				instType = clsVal.AsType()
 			}
 		}
-
-		return val.BoolVal(false)
+		return val.BoolVal(abcSubclassCheck(ctx, cls, instType))
 	}))
 
 	// _abc_subclasscheck(cls, subclass) -> bool
@@ -127,26 +170,7 @@ func (e *Engine) createABCModule() val.Value {
 		}
 		cls := args[0].AsType()
 		sub := args[1].AsType()
-
-		if val.IsSubclass(sub, cls) {
-			return val.BoolVal(true)
-		}
-
-		meta := getABCMeta(cls)
-		subVal := val.TypeVal(sub)
-		if meta.cache.Contains(subVal) {
-			return val.BoolVal(true)
-		}
-
-		for _, base := range sub.MRO {
-			bVal := val.TypeVal(base)
-			if meta.registry.Contains(bVal) {
-				meta.cache.Add(subVal)
-				return val.BoolVal(true)
-			}
-		}
-
-		return val.BoolVal(false)
+		return val.BoolVal(abcSubclassCheck(ctx, cls, sub))
 	}))
 
 	// _get_dump(cls) -> (registry, cache, negative_cache, negative_cache_version)

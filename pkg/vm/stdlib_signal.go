@@ -287,17 +287,5 @@ func (e *Engine) createSignalModule() val.Value {
 }
 
 func isCallableValue(v val.Value) bool {
-	switch v.Kind() {
-	case val.KindFunction, val.KindBuiltinFunc, val.KindBoundMethod, val.KindClassMethod, val.KindStaticMethod:
-		return true
-	}
-	t := v.Type()
-	if t == nil {
-		return false
-	}
-	if v.IsType() || t.Slots.TpCall != nil {
-		return true
-	}
-	_, _, ok := t.LookupMRO(val.DunderCall)
-	return ok
+	return val.IsCallable(v)
 }

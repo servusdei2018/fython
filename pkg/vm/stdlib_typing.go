@@ -595,8 +595,18 @@ func isUnionable(v val.Value) bool {
 	if v.IsNone() || v.IsType() {
 		return true
 	}
-	switch v.Type() {
-	case UnionType, GenericAliasType, val.TypeVarType, val.ParamSpecType, val.TypeVarTupleType, val.TypeAliasTypeType:
+	t := v.Type()
+	if t == nil {
+		return false
+	}
+	if t == UnionType || t == GenericAliasType || t == val.TypeVarType || t == val.ParamSpecType || t == val.TypeVarTupleType || t == val.TypeAliasTypeType {
+		return true
+	}
+	if val.IsSubclass(t, GenericAliasType) || val.IsSubclass(t, UnionType) {
+		return true
+	}
+	switch t.Name {
+	case "_CallableGenericAlias", "_GenericAlias", "GenericAlias", "UnionType", "_SpecialGenericAlias", "_UnionGenericAlias":
 		return true
 	default:
 		return false
@@ -758,6 +768,24 @@ func installUnionMethods() {
 	UnionType.Dict.Set(val.InternString("__mro_entries__"), val.NewBuiltinFuncVal("UnionType.__mro_entries__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		panic("TypeError: Cannot subclass a union")
 	}))
+	UnionType.Dict.Set(val.InternString("__or__"), val.NewBuiltinFuncVal("UnionType.__or__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 2 {
+			panic("TypeError: descriptor '__or__' requires 2 arguments")
+		}
+		if !isUnionable(args[0]) || !isUnionable(args[1]) {
+			return val.NotImplementedVal()
+		}
+		return makeUnion([]val.Value{args[0], args[1]})
+	}))
+	UnionType.Dict.Set(val.InternString("__ror__"), val.NewBuiltinFuncVal("UnionType.__ror__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 2 {
+			panic("TypeError: descriptor '__ror__' requires 2 arguments")
+		}
+		if !isUnionable(args[0]) || !isUnionable(args[1]) {
+			return val.NotImplementedVal()
+		}
+		return makeUnion([]val.Value{args[1], args[0]})
+	}))
 	UnionType.InvalidateVersion()
 }
 
@@ -833,13 +861,20 @@ func collectTypeParams(ctx *val.ExecContext, args []val.Value) []val.Value {
 	return out
 }
 
-func newGenericAlias(origin val.Value, args []val.Value) val.Value {
+func newGenericAliasWithCls(cls *val.PyType, origin val.Value, args []val.Value) val.Value {
+	if cls == nil {
+		cls = GenericAliasType
+	}
 	ga := &pyGenericAlias{
-		Header: val.ObjectHeader{Kind: val.KindNative, Type: GenericAliasType},
+		Header: val.ObjectHeader{Kind: val.KindNative, Type: cls},
 		Origin: origin,
 		Args:   append([]val.Value(nil), args...),
 	}
 	return val.ObjectVal(&ga.Header)
+}
+
+func newGenericAlias(origin val.Value, args []val.Value) val.Value {
+	return newGenericAliasWithCls(GenericAliasType, origin, args)
 }
 
 func genericAliasRepr(ctx *val.ExecContext, ga *pyGenericAlias) string {
@@ -855,6 +890,87 @@ func genericAliasRepr(ctx *val.ExecContext, ga *pyGenericAlias) string {
 }
 
 func installGenericAliasMethods() {
+	GenericAliasType.Dict.Set(val.InternString("__new__"), val.NewBuiltinFuncVal("GenericAlias.__new__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		pos, _ := splitKeywords(args, kwnames)
+		if len(pos) < 3 {
+			panic("TypeError: GenericAlias.__new__() takes at least 2 arguments (cls, origin, args)")
+		}
+		cls := pos[0]
+		origin := pos[1]
+		var items []val.Value
+		if pos[2].IsTuple() {
+			items = pos[2].AsTuple().Items
+		} else if pos[2].IsList() {
+			items = pos[2].AsList().Items
+		} else {
+			items = []val.Value{pos[2]}
+		}
+		targetType := GenericAliasType
+		if cls.IsType() {
+			targetType = cls.AsType()
+		}
+		return newGenericAliasWithCls(targetType, origin, items)
+	}))
+
+	originGetter := val.NewBuiltinFuncVal("GenericAlias.__origin__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: descriptor '__origin__' requires an argument")
+		}
+		self := args[0]
+		if self.HeaderPtr() != nil {
+			if self.Kind() == val.KindNative {
+				return asGenericAlias(self).Origin
+			}
+			if self.IsInstance() {
+				if v, ok := self.AsInstance().GetAttr(val.InternString("__origin__")); ok {
+					return v
+				}
+			}
+		}
+		return val.NoneVal()
+	})
+	argsGetter := val.NewBuiltinFuncVal("GenericAlias.__args__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: descriptor '__args__' requires an argument")
+		}
+		self := args[0]
+		if self.HeaderPtr() != nil {
+			if self.Kind() == val.KindNative {
+				return val.NewTupleVal(asGenericAlias(self).Args...)
+			}
+			if self.IsInstance() {
+				if v, ok := self.AsInstance().GetAttr(val.InternString("__args__")); ok {
+					return v
+				}
+			}
+		}
+		return val.NewTupleVal()
+	})
+	paramsGetter := val.NewBuiltinFuncVal("GenericAlias.__parameters__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: descriptor '__parameters__' requires an argument")
+		}
+		self := args[0]
+		if self.HeaderPtr() != nil {
+			if self.Kind() == val.KindNative {
+				return val.NewTupleVal(collectTypeParams(ctx, asGenericAlias(self).Args)...)
+			}
+			if self.IsInstance() {
+				if v, ok := self.AsInstance().GetAttr(val.InternString("__parameters__")); ok {
+					return v
+				}
+			}
+		}
+		return val.NewTupleVal()
+	})
+	unpackedGetter := val.NewBuiltinFuncVal("GenericAlias.__unpacked__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.BoolVal(false)
+	})
+	GenericAliasType.Dict.Set(val.InternString("__origin__"), val.NewPropertyVal(originGetter, val.NoneVal(), val.NoneVal()))
+	GenericAliasType.Dict.Set(val.InternString("__args__"), val.NewPropertyVal(argsGetter, val.NoneVal(), val.NoneVal()))
+	GenericAliasType.Dict.Set(val.InternString("__parameters__"), val.NewPropertyVal(paramsGetter, val.NoneVal(), val.NoneVal()))
+	GenericAliasType.Dict.Set(val.InternString("__unpacked__"), val.NewPropertyVal(unpackedGetter, val.NoneVal(), val.NoneVal()))
+
 	GenericAliasType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		pos, _ := splitKeywords(args, kwnames)
 		if len(pos) < 2 {
@@ -925,6 +1041,24 @@ func installGenericAliasMethods() {
 			acc = acc*1000003 ^ uint64(val.HashValue(a))
 		}
 		return val.Int64Val(int64(acc))
+	}))
+	GenericAliasType.Dict.Set(val.InternString("__or__"), val.NewBuiltinFuncVal("GenericAlias.__or__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 2 {
+			panic("TypeError: descriptor '__or__' requires 2 arguments")
+		}
+		if !isUnionable(args[0]) || !isUnionable(args[1]) {
+			return val.NotImplementedVal()
+		}
+		return makeUnion([]val.Value{args[0], args[1]})
+	}))
+	GenericAliasType.Dict.Set(val.InternString("__ror__"), val.NewBuiltinFuncVal("GenericAlias.__ror__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 2 {
+			panic("TypeError: descriptor '__ror__' requires 2 arguments")
+		}
+		if !isUnionable(args[0]) || !isUnionable(args[1]) {
+			return val.NotImplementedVal()
+		}
+		return makeUnion([]val.Value{args[1], args[0]})
 	}))
 	GenericAliasType.InvalidateVersion()
 }

@@ -1771,9 +1771,25 @@ func formatStringMod(fmtStr string, arg Value) Value {
 func formatStringModCtx(ctx *ExecContext, fmtStr string, arg Value) Value {
 	var items []Value
 	var argDict *PyDict
+
+	hasPositional := false
+	for j := 0; j < len(fmtStr); j++ {
+		if fmtStr[j] == '%' {
+			if j+1 < len(fmtStr) && fmtStr[j+1] == '%' {
+				j++
+				continue
+			}
+			if j+1 < len(fmtStr) && fmtStr[j+1] == '(' {
+				// mapping key
+			} else {
+				hasPositional = true
+			}
+		}
+	}
+
 	if arg.IsTuple() {
 		items = arg.AsTuple().Items
-	} else if arg.IsDict() && strings.Contains(fmtStr, "%(") {
+	} else if arg.IsDict() && !hasPositional {
 		argDict = arg.AsDict()
 	} else {
 		items = []Value{arg}

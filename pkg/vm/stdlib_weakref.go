@@ -180,7 +180,7 @@ func (e *Engine) createWeakrefCModule() val.Value {
 			callback = args[1]
 		}
 
-		isCallable := (ob.Type().Slots.TpCall != nil || ob.IsFunction() || ob.IsBuiltinFunc())
+		isCallable := val.IsCallable(ob)
 		pyProxy := &val.PyWeakProxy{
 			WP:         weak.Make(hdr),
 			Callback:   callback,

@@ -319,6 +319,117 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 			continue
 		}
 
+		// Check custom finders in sys.meta_path before fallback disk lookup
+		if sysVal, ok := vm.modules.Get(val.InternString("sys")); ok && sysVal.IsModule() {
+			if mpVal, ok := sysVal.AsModule().Dict.Get(val.InternString("meta_path")); ok && mpVal.IsList() {
+				pathArg := val.NoneVal()
+				if i > 0 && parentVal.IsModule() {
+					if pVal, ok := parentVal.AsModule().Dict.Get(val.InternString("__path__")); ok {
+						pathArg = pVal
+					}
+				}
+				customHandled := false
+				for _, finder := range mpVal.AsList().Items {
+					// Builtin finders (BuiltinImporterType, FrozenImporterType, PathFinderType)
+					// are handled in the fast-path below.
+					if finder == val.TypeVal(BuiltinImporterType) ||
+						finder == val.TypeVal(FrozenImporterType) ||
+						finder == val.TypeVal(PathFinderType) {
+						continue
+					}
+					if findSpecFn, ok := vmGetAttrSafe(&vm.execCtx, finder, "find_spec"); ok && !findSpecFn.IsNone() {
+						spec := vm.execCtx.Call(findSpecFn, []val.Value{val.NewStringVal(currName), pathArg, val.NoneVal()}, nil)
+						if vmHasException(vm) {
+							return val.NoneVal(), nil
+						}
+						if !spec.IsNone() && spec.HeaderPtr() != nil {
+							var loaderVal val.Value = val.NoneVal()
+							if l, ok := vmGetAttrSafe(&vm.execCtx, spec, "loader"); ok {
+								loaderVal = l
+							}
+							var modVal val.Value = val.NoneVal()
+							if !loaderVal.IsNone() {
+								if createFn, ok := vmGetAttrSafe(&vm.execCtx, loaderVal, "create_module"); ok && !createFn.IsNone() {
+									modVal = vm.execCtx.Call(createFn, []val.Value{spec}, nil)
+									if vmHasException(vm) {
+										return val.NoneVal(), nil
+									}
+								}
+							}
+							originStr := ""
+							if originVal, ok := vmGetAttrSafe(&vm.execCtx, spec, "origin"); ok && originVal.IsAnyString() {
+								originStr = originVal.AsString()
+							}
+							if modVal.IsNone() || !modVal.IsModule() {
+								modVal = val.NewModuleVal(currName, originStr)
+							}
+							mod := modVal.AsModule()
+							if i > 0 {
+								mod.Package = strings.Join(parts[:i], ".")
+							}
+							mod.Dict.Set(val.InternString("__name__"), val.NewStringVal(currName))
+							mod.Dict.Set(val.InternString("__loader__"), loaderVal)
+							mod.Dict.Set(val.InternString("__spec__"), spec)
+							if originStr != "" {
+								mod.Dict.Set(val.InternString("__file__"), val.NewStringVal(originStr))
+							}
+							if pVal, ok := vmGetAttrSafe(&vm.execCtx, spec, "parent"); ok && !pVal.IsNone() {
+								mod.Dict.Set(val.InternString("__package__"), pVal)
+							} else if mod.Package != "" {
+								mod.Dict.Set(val.InternString("__package__"), val.NewStringVal(mod.Package))
+							} else {
+								mod.Dict.Set(val.InternString("__package__"), val.NewStringVal(""))
+							}
+							if subLocs, ok := vmGetAttrSafe(&vm.execCtx, spec, "submodule_search_locations"); ok && !subLocs.IsNone() {
+								mod.Dict.Set(val.InternString("__path__"), subLocs)
+							}
+
+							// Register into sys.modules BEFORE executing bytecode (circular import resolution)
+							vm.modules.Set(internedCurr, modVal)
+
+							// Link child module as attribute of parent package
+							if i > 0 {
+								if parentVal.IsModule() {
+									parentVal.AsModule().Dict.Set(val.InternString(parts[i]), modVal)
+								} else {
+									val.SetAttrCtx(&vm.execCtx, parentVal, val.InternString(parts[i]), modVal)
+								}
+							}
+
+							if !loaderVal.IsNone() {
+								if execFn, ok := vmGetAttrSafe(&vm.execCtx, loaderVal, "exec_module"); ok && !execFn.IsNone() {
+									vm.execCtx.Call(execFn, []val.Value{modVal}, nil)
+									if vmHasException(vm) {
+										vm.modules.Delete(internedCurr)
+										return val.NoneVal(), nil
+									}
+								}
+							}
+
+							// After module execution, check if module replaced sys.modules[__name__]
+							if replaced, ok := vm.modules.Get(internedCurr); ok && !replaced.IsNone() {
+								modVal = replaced
+							}
+							if i > 0 {
+								if parentVal.IsModule() {
+									parentVal.AsModule().Dict.Set(val.InternString(parts[i]), modVal)
+								} else {
+									val.SetAttrCtx(&vm.execCtx, parentVal, val.InternString(parts[i]), modVal)
+								}
+							}
+
+							parentVal = modVal
+							customHandled = true
+							break
+						}
+					}
+				}
+				if customHandled {
+					continue
+				}
+			}
+		}
+
 		// Determine search directories
 		var searchDirs []string
 		if i == 0 {
@@ -367,44 +478,6 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 				}
 				parentVal = modVal
 				continue
-			} else if sysVal, ok := vm.modules.Get(val.InternString("sys")); ok && sysVal.IsModule() {
-				if mpVal, ok := sysVal.AsModule().Dict.Get(val.InternString("meta_path")); ok && mpVal.IsList() {
-					pathArg := val.NoneVal()
-					if i > 0 && parentVal.IsModule() {
-						if pVal, ok := parentVal.AsModule().Dict.Get(val.InternString("__path__")); ok {
-							pathArg = pVal
-						}
-					}
-					for _, finder := range mpVal.AsList().Items {
-						if findSpecFn, ok := vmGetAttrSafe(&vm.execCtx, finder, "find_spec"); ok && !findSpecFn.IsNone() {
-							spec := vm.execCtx.Call(findSpecFn, []val.Value{val.NewStringVal(currName), pathArg, val.NoneVal()}, nil)
-							if !spec.IsNone() && spec.HeaderPtr() != nil {
-								if loaderVal, ok := vmGetAttrSafe(&vm.execCtx, spec, "loader"); ok && !loaderVal.IsNone() {
-									if execModFn, ok := vmGetAttrSafe(&vm.execCtx, loaderVal, "exec_module"); ok && !execModFn.IsNone() {
-										modVal := val.NewModuleVal(currName, "")
-										modVal.AsModule().Dict.Set(val.InternString("__spec__"), spec)
-										modVal.AsModule().Dict.Set(val.InternString("__loader__"), loaderVal)
-										vm.modules.Set(internedCurr, modVal)
-										if i > 0 {
-											if parentVal.IsModule() {
-												parentVal.AsModule().Dict.Set(val.InternString(parts[i]), modVal)
-											} else {
-												val.SetAttrCtx(&vm.execCtx, parentVal, val.InternString(parts[i]), modVal)
-											}
-										}
-										vm.execCtx.Call(execModFn, []val.Value{modVal}, nil)
-										if replaced, ok := vm.modules.Get(internedCurr); ok && !replaced.IsNone() {
-											modVal = replaced
-										}
-										parentVal = modVal
-										found = true
-										break
-									}
-								}
-							}
-						}
-					}
-				}
 			}
 		}
 
@@ -602,7 +675,8 @@ func (vm *VM) ImportFrom(modVal val.Value, symbolName string, callerGlobals *val
 
 	if modName != "" {
 		subName := modName + "." + symbolName
-		if subVal, err := vm.ImportModule(subName, 0, true, callerGlobals); err == nil {
+		subVal, err := vm.ImportModule(subName, 0, true, callerGlobals)
+		if err == nil {
 			if modVal.IsModule() {
 				modVal.AsModule().Dict.Set(interned, subVal)
 			} else {
@@ -612,6 +686,9 @@ func (vm *VM) ImportFrom(modVal val.Value, symbolName string, callerGlobals *val
 				}()
 			}
 			return subVal, nil
+		}
+		if symbolName == "rewrite" {
+			fmt.Printf("DEBUG ImportModule(%s) failed: %v\n", subName, err)
 		}
 	}
 

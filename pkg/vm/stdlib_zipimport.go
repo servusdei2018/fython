@@ -29,18 +29,70 @@ var (
 	ZipImporterType    *val.PyType
 )
 
+// RegisterVirtualZipArchive registers an in-memory zip/wheel archive under virtualPath.
+func RegisterVirtualZipArchive(virtualPath string, raw []byte) (*cachedZipArchive, error) {
+	zr, err := zip.NewReader(bytes.NewReader(raw), int64(len(raw)))
+	if err != nil {
+		return nil, err
+	}
+	files := make(map[string][]byte, len(zr.File))
+	dirs := make(map[string]bool)
+	for _, f := range zr.File {
+		name := strings.TrimPrefix(filepath.ToSlash(f.Name), "/")
+		if strings.HasSuffix(name, "/") || f.FileInfo().IsDir() {
+			trimmed := strings.TrimSuffix(name, "/")
+			if trimmed != "" {
+				dirs[trimmed] = true
+			}
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			continue
+		}
+		data, err := io.ReadAll(rc)
+		_ = rc.Close()
+		if err != nil {
+			continue
+		}
+		files[name] = data
+		dir := path.Dir(name)
+		for dir != "." && dir != "/" && dir != "" {
+			dirs[dir] = true
+			dir = path.Dir(dir)
+		}
+	}
+	cleanPath := filepath.Clean(virtualPath)
+	cached := &cachedZipArchive{
+		archivePath: cleanPath,
+		size:        int64(len(raw)),
+		files:       files,
+		dirs:        dirs,
+	}
+	zipArchiveCacheMap.Store(cleanPath, cached)
+	return cached, nil
+}
+
 // loadZipArchive opens and caches a zip/wheel archive in memory without extracting to disk.
 func loadZipArchive(archivePath string) (*cachedZipArchive, error) {
 	cleanPath := filepath.Clean(archivePath)
+	if v, ok := zipArchiveCacheMap.Load(cleanPath); ok {
+		cached := v.(*cachedZipArchive)
+		if cached.modTimeNano == 0 {
+			return cached, nil
+		}
+		if info, err := os.Stat(cleanPath); err == nil {
+			if cached.modTimeNano == info.ModTime().UnixNano() && cached.size == info.Size() {
+				return cached, nil
+			}
+		} else {
+			return cached, nil
+		}
+	}
+
 	info, err := os.Stat(cleanPath)
 	if err != nil || info.IsDir() {
 		return nil, fmt.Errorf("not a zip file: %s", archivePath)
-	}
-	if v, ok := zipArchiveCacheMap.Load(cleanPath); ok {
-		cached := v.(*cachedZipArchive)
-		if cached.modTimeNano == info.ModTime().UnixNano() && cached.size == info.Size() {
-			return cached, nil
-		}
 	}
 
 	raw, err := os.ReadFile(cleanPath)
@@ -98,6 +150,9 @@ func splitZipArchivePath(target string) (string, string, *cachedZipArchive, bool
 		return "", "", nil, false
 	}
 	cleanTarget := filepath.Clean(target)
+	if v, ok := zipArchiveCacheMap.Load(cleanTarget); ok {
+		return cleanTarget, "", v.(*cachedZipArchive), true
+	}
 	slashTarget := filepath.ToSlash(cleanTarget)
 
 	// Fast check: must contain .zip, .whl, .egg, or .pyz somewhere in the path, or be a file directly.
@@ -106,9 +161,25 @@ func splitZipArchivePath(target string) (string, string, *cachedZipArchive, bool
 		strings.Contains(lower, ".egg") || strings.Contains(lower, ".pyz")
 
 	if !hasZipExt {
-		if info, err := os.Stat(cleanTarget); err == nil && !info.IsDir() {
-			if arch, err := loadZipArchive(cleanTarget); err == nil {
-				return cleanTarget, "", arch, true
+		if arch, err := loadZipArchive(cleanTarget); err == nil {
+			return cleanTarget, "", arch, true
+		}
+		curr := cleanTarget
+		var suffixParts []string
+		for {
+			parent := filepath.Dir(curr)
+			if parent == curr || parent == "." || parent == string(filepath.Separator) {
+				break
+			}
+			suffixParts = append(suffixParts, filepath.Base(curr))
+			curr = parent
+			if v, ok := zipArchiveCacheMap.Load(curr); ok {
+				prefix := ""
+				for i, j := 0, len(suffixParts)-1; i < j; i, j = i+1, j-1 {
+					suffixParts[i], suffixParts[j] = suffixParts[j], suffixParts[i]
+				}
+				prefix = strings.Join(suffixParts, "/")
+				return curr, prefix, v.(*cachedZipArchive), true
 			}
 		}
 		return "", "", nil, false

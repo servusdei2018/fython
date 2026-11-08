@@ -795,7 +795,6 @@ func (c *Compiler) compileTargetLoad(targetID ExprID) error {
 		if err := c.compileExpr(expr.Left); err != nil {
 			return err
 		}
-		c.emitOp(vm.OP_DUP_TOP, 0, 0)
 		attrName := string(c.src[expr.Start:expr.End])
 		_, constIdx := c.constPool.InternName(attrName)
 		c.emitOp(vm.OP_LOAD_ATTR, 0, constIdx)

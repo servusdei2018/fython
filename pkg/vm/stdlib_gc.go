@@ -21,11 +21,11 @@ func (e *Engine) createGCModule() val.Value {
 			}
 			if vmInstance, ok := ctx.VM.(*VM); ok {
 				for i := range vmInstance.ic {
-					vmInstance.ic[i].CachedVal = val.Value{}
+					vmInstance.ic[i] = ICSlot{}
 				}
 				for _, cache := range vmInstance.codeCaches {
 					for i := range cache.ic {
-						cache.ic[i].CachedVal = val.Value{}
+						cache.ic[i] = ICSlot{}
 					}
 				}
 			}

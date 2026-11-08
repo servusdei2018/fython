@@ -186,11 +186,10 @@ func (p *Parser) parseStmt() (StmtID, error) {
 	case TOKEN_AT:
 		return p.parseDecoratedStmt()
 	case TOKEN_MATCH:
-		// match is a soft keyword. "match, rest = ..." is an assignment.
-		if p.peek().Type == TOKEN_ASSIGN || p.peek().Type == TOKEN_DOT || p.peek().Type == TOKEN_COMMA {
-			return p.parseSimpleStmt()
+		if p.isMatchStatement() {
+			return p.parseMatchStmt()
 		}
-		return p.parseMatchStmt()
+		return p.parseSimpleStmt()
 	case TOKEN_TYPE:
 		if isIdentToken(p.peek().Type) {
 			return p.parseTypeStmt()
@@ -1321,6 +1320,64 @@ func (s StmtID) endInArena(arena *ASTArena) uint32 {
 	return stmt.End
 }
 
+func (p *Parser) isMatchStatement() bool {
+	next := p.peek()
+	switch next.Type {
+	case TOKEN_ASSIGN, TOKEN_DOT, TOKEN_COMMA, TOKEN_COLON,
+		TOKEN_PLUSEQ, TOKEN_MINUSEQ, TOKEN_STAREQ, TOKEN_SLASHEQ, TOKEN_PERCENTEQ,
+		TOKEN_AMPEQ, TOKEN_PIPEEQ, TOKEN_CARETEQ, TOKEN_LSHIFTEQ, TOKEN_RSHIFTEQ,
+		TOKEN_STARSTAREQ, TOKEN_SLASHSLASHEQ, TOKEN_ATEQ, TOKEN_SEMI, TOKEN_NEWLINE:
+		return false
+	}
+	depth := 0
+	inQuote := byte(0)
+	for i := int(p.cur.Start); i < len(p.src); i++ {
+		b := p.src[i]
+		if inQuote != 0 {
+			if b == '\\' {
+				i++
+				continue
+			}
+			if b == inQuote {
+				inQuote = 0
+			}
+			continue
+		}
+		if b == '\'' || b == '"' {
+			inQuote = b
+			continue
+		}
+		if b == '#' {
+			for i < len(p.src) && p.src[i] != '\n' && p.src[i] != '\r' {
+				i++
+			}
+			continue
+		}
+		if b == '(' || b == '[' || b == '{' {
+			depth++
+			continue
+		}
+		if b == ')' || b == ']' || b == '}' {
+			if depth > 0 {
+				depth--
+			}
+			continue
+		}
+		if depth == 0 {
+			if b == ':' {
+				return true
+			}
+			if b == '=' {
+				return false
+			}
+			if b == '\n' || b == '\r' || b == ';' {
+				return false
+			}
+		}
+	}
+	return false
+}
+
 func (p *Parser) parseMatchStmt() (StmtID, error) {
 	startTok, _ := p.expect(TOKEN_MATCH)
 	subject, err := p.parseTernary()
@@ -1440,6 +1497,9 @@ func (p *Parser) parsePatternAtom() (PatternID, error) {
 			expr, err := p.parseDottedNameExpr(name, tok.Start)
 			if err != nil {
 				return PatternNone, err
+			}
+			if p.match(TOKEN_LPAREN) {
+				return p.parseClassPattern(expr)
 			}
 			return p.arena.AllocPattern(ASTPattern{
 				Kind:  PatternKindValue,
@@ -1603,7 +1663,7 @@ func (p *Parser) parseClassPattern(clsExpr ExprID) (PatternID, error) {
 	var kwPats []PatternID
 	parsingKW := false
 	for p.cur.Type != TOKEN_RPAREN && p.cur.Type != TOKEN_EOF {
-		if p.cur.Type == TOKEN_IDENT && p.peek().Type == TOKEN_ASSIGN {
+		if isIdentToken(p.cur.Type) && p.peek().Type == TOKEN_ASSIGN {
 			parsingKW = true
 			nameTok := p.advance()
 			p.advance() // '='

@@ -378,10 +378,22 @@ func (defaultCodeInspector) VarNames(code val.Value) []val.Value {
 	if co == nil {
 		return nil
 	}
-	if len(co.VarNames) > 0 {
+	if co.VarNames != nil {
 		return co.VarNames
 	}
-	return co.ParamNames
+	clean := make([]val.Value, 0, len(co.ParamNames))
+	for _, p := range co.ParamNames {
+		s := p.AsString()
+		if strings.HasPrefix(s, "**") {
+			s = s[2:]
+		} else if strings.HasPrefix(s, "*") {
+			s = s[1:]
+		}
+		if s != "" {
+			clean = append(clean, val.InternString(s))
+		}
+	}
+	return clean
 }
 
 func (defaultCodeInspector) CellVars(code val.Value) []val.Value {
@@ -444,12 +456,17 @@ func (defaultCodeInspector) ArgCount(code val.Value) int {
 		return 0
 	}
 	argCount := 0
+	hasStar := false
 	for _, p := range co.ParamNames {
 		s := p.AsString()
 		if strings.HasPrefix(s, "*") {
+			hasStar = true
 			break
 		}
 		argCount++
+	}
+	if !hasStar && co.KWOnlyArgCount > 0 && argCount >= co.KWOnlyArgCount {
+		argCount -= co.KWOnlyArgCount
 	}
 	return argCount
 }

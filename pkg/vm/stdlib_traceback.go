@@ -4,9 +4,92 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/servusdei2018/fython/pkg/val"
 )
+
+var (
+	frameSummaryTypeOnce sync.Once
+	FrameSummaryType     *val.PyType
+)
+
+func initFrameSummaryType() {
+	frameSummaryTypeOnce.Do(func() {
+		d := val.NewDictVal(8).AsDict()
+		d.Set(val.InternString("__init__"), val.NewBuiltinFuncVal("__init__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) < 4 {
+				panic("TypeError: FrameSummary.__init__() missing required arguments")
+			}
+			self := args[0]
+			fn := args[1]
+			lineno := args[2]
+			name := args[3]
+			var line val.Value = val.NewStringVal("")
+			npos := len(args) - len(kwnames)
+			for i, kn := range kwnames {
+				if kn.AsString() == "line" {
+					line = args[npos+i]
+				}
+			}
+			if line.IsNone() || line.IsUnbound() {
+				line = val.NewStringVal("")
+			}
+			val.SetAttrCtx(ctx, self, val.InternString("filename"), fn)
+			val.SetAttrCtx(ctx, self, val.InternString("lineno"), lineno)
+			val.SetAttrCtx(ctx, self, val.InternString("name"), name)
+			val.SetAttrCtx(ctx, self, val.InternString("line"), line)
+			val.SetAttrCtx(ctx, self, val.InternString("locals"), val.NoneVal())
+			return val.NoneVal()
+		}))
+		d.Set(val.InternString("__getitem__"), val.NewBuiltinFuncVal("__getitem__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) < 2 {
+				panic("TypeError: __getitem__ requires 1 argument")
+			}
+			self := args[0]
+			fn := val.GetAttrCtx(ctx, self, val.InternString("filename"))
+			lineno := val.GetAttrCtx(ctx, self, val.InternString("lineno"))
+			name := val.GetAttrCtx(ctx, self, val.InternString("name"))
+			line := val.GetAttrCtx(ctx, self, val.InternString("line"))
+			tup := val.NewTupleVal(fn, lineno, name, line)
+			return ctx.Invoke1(val.GetAttrCtx(ctx, tup, val.InternString("__getitem__")), args[1])
+		}))
+		d.Set(val.InternString("__iter__"), val.NewBuiltinFuncVal("__iter__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) < 1 {
+				panic("TypeError: __iter__ requires self")
+			}
+			self := args[0]
+			fn := val.GetAttrCtx(ctx, self, val.InternString("filename"))
+			lineno := val.GetAttrCtx(ctx, self, val.InternString("lineno"))
+			name := val.GetAttrCtx(ctx, self, val.InternString("name"))
+			line := val.GetAttrCtx(ctx, self, val.InternString("line"))
+			return val.NewIterVal(val.NewTupleVal(fn, lineno, name, line))
+		}))
+		d.Set(val.InternString("__len__"), val.NewBuiltinFuncVal("__len__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			return val.Int64Val(4)
+		}))
+		d.Set(val.InternString("__repr__"), val.NewBuiltinFuncVal("__repr__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			self := args[0]
+			fn := val.GetAttrCtx(ctx, self, val.InternString("filename"))
+			lineno := val.GetAttrCtx(ctx, self, val.InternString("lineno"))
+			name := val.GetAttrCtx(ctx, self, val.InternString("name"))
+			line := val.GetAttrCtx(ctx, self, val.InternString("line"))
+			return val.NewStringVal(fmt.Sprintf("<FrameSummary file %s, line %s, name %s, line %s>", fn.String(), lineno.String(), name.String(), line.String()))
+		}))
+		FrameSummaryType = val.MustNewType("FrameSummary", []*val.PyType{val.ObjectType}, d)
+	})
+}
+
+func newFrameSummaryVal(ctx *val.ExecContext, fileName string, lineno int, fnName string, line string) val.Value {
+	initFrameSummaryType()
+	inst := val.NewInstanceOfType(FrameSummaryType)
+	val.SetAttrCtx(ctx, inst, val.InternString("filename"), val.NewStringVal(fileName))
+	val.SetAttrCtx(ctx, inst, val.InternString("lineno"), val.Int64Val(int64(lineno)))
+	val.SetAttrCtx(ctx, inst, val.InternString("name"), val.NewStringVal(fnName))
+	val.SetAttrCtx(ctx, inst, val.InternString("line"), val.NewStringVal(line))
+	val.SetAttrCtx(ctx, inst, val.InternString("locals"), val.NoneVal())
+	return inst
+}
 
 // FormatException formats a Python exception Value and its __traceback__ chain into a human-readable traceback string.
 func (vm *VM) FormatException(exc val.Value) string {
@@ -48,8 +131,10 @@ func formatTracebackChain(tbVal val.Value) []string {
 }
 
 func (e *Engine) createTracebackModule() val.Value {
+	initFrameSummaryType()
 	modVal := val.NewModuleVal("traceback", "")
 	mod := modVal.AsModule()
+	mod.Dict.Set(val.InternString("FrameSummary"), val.TypeVal(FrameSummaryType))
 
 	// format_tb(tb, limit=None)
 	mod.Dict.Set(val.InternString("format_tb"), val.NewBuiltinFuncVal("format_tb", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -83,13 +168,8 @@ func (e *Engine) createTracebackModule() val.Value {
 					fileName = val.CodeInspectorHook.FileName(f.CO)
 				}
 			}
-			tup := val.NewTupleVal(
-				val.NewStringVal(fileName),
-				val.Int64Val(int64(tb.LineNo)),
-				val.NewStringVal(fnName),
-				val.NewStringVal(""),
-			)
-			listItems = append(listItems, tup)
+			summary := newFrameSummaryVal(ctx, fileName, tb.LineNo, fnName, "")
+			listItems = append(listItems, summary)
 			curr = tb.Next
 		}
 		return val.NewListVal(listItems...)
@@ -122,6 +202,19 @@ func (e *Engine) createTracebackModule() val.Value {
 		}
 		lines = append(lines, val.NewStringVal(formatExceptionMessage(ctx, exc)))
 		return val.NewListVal(lines...)
+	}))
+
+	// format_exception_only(exc, [value])
+	mod.Dict.Set(val.InternString("format_exception_only"), val.NewBuiltinFuncVal("format_exception_only", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) == 0 {
+			return val.NewListVal()
+		}
+		exc := args[0]
+		if len(args) > 1 && !args[1].IsNone() && !args[1].IsUnbound() {
+			exc = args[1]
+		}
+		msg := formatExceptionMessage(ctx, exc)
+		return val.NewListVal(val.NewStringVal(msg))
 	}))
 
 	// format_exc()

@@ -1059,6 +1059,11 @@ func dunderTpDescrSetSlot(ctx *ExecContext, descr, obj, value Value) {
 	ctx.Invoke3(descr.Type().dunderSet, descr, obj, value)
 }
 
+// SyncDunderSlots populates t.Slots function pointers at class creation/mutation time.
+func (t *PyType) SyncDunderSlots() {
+	t.syncDunderSlots()
+}
+
 // syncDunderSlots populates t.Slots function pointers at class creation/mutation time
 // by inspecting t.MRO for canonical dunder methods.
 func (t *PyType) syncDunderSlots() {

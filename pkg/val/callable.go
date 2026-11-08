@@ -206,6 +206,28 @@ func (v Value) AsFunction() *PyFunction {
 	return (*PyFunction)(unsafe.Pointer(v.ptr))
 }
 
+// IsCallable returns true if the value is callable in Python.
+func IsCallable(v Value) bool {
+	if v.IsType() {
+		return true
+	}
+	if v.IsFunction() || v.IsBuiltinFunc() {
+		return true
+	}
+	switch v.Kind() {
+	case KindBoundMethod, KindClassMethod, KindStaticMethod:
+		return true
+	}
+	tp := v.Type()
+	if tp == nil {
+		return false
+	}
+	if fn, _, ok := tp.LookupMRO(DunderCall); ok && fn.HeaderPtr() != nil && !fn.IsUnbound() {
+		return true
+	}
+	return false
+}
+
 // NewBoundMethodVal constructs a heap-allocated KindBoundMethod Value binding self to fn.
 func NewBoundMethodVal(self, fn Value) Value {
 	obj := &PyBoundMethod{
@@ -306,6 +328,24 @@ func memberDescrTpDescrGet(ctx *ExecContext, descr, obj Value, owner *PyType) Va
 		}
 		panic("val: AttributeError: '" + md.Owner.Name + "' object has no attribute '" + md.Name.AsString() + "'")
 	}
+	if obj.IsDict() && IsSubclass(obj.Type(), md.Owner) {
+		d := obj.AsDict()
+		if d.Attrs != nil {
+			if v, ok := d.Attrs.Get(md.Name); ok && !v.IsUnbound() {
+				return v
+			}
+		}
+		panic("val: AttributeError: '" + md.Owner.Name + "' object has no attribute '" + md.Name.AsString() + "'")
+	}
+	if obj.IsList() && IsSubclass(obj.Type(), md.Owner) {
+		l := obj.AsList()
+		if l.Attrs != nil {
+			if v, ok := l.Attrs.Get(md.Name); ok && !v.IsUnbound() {
+				return v
+			}
+		}
+		panic("val: AttributeError: '" + md.Owner.Name + "' object has no attribute '" + md.Name.AsString() + "'")
+	}
 	if obj.IsModule() && IsSubclass(obj.Type(), md.Owner) {
 		m := obj.AsModule()
 		if m.Dict != nil {
@@ -341,6 +381,30 @@ func memberDescrTpDescrSet(ctx *ExecContext, descr, obj, value Value) {
 			return
 		}
 		t.Attrs.Set(md.Name, value)
+		return
+	}
+	if obj.IsDict() && IsSubclass(obj.Type(), md.Owner) {
+		d := obj.AsDict()
+		if d.Attrs == nil {
+			d.Attrs = NewDictVal(4).AsDict()
+		}
+		if value.IsUnbound() {
+			d.Attrs.Delete(md.Name)
+			return
+		}
+		d.Attrs.Set(md.Name, value)
+		return
+	}
+	if obj.IsList() && IsSubclass(obj.Type(), md.Owner) {
+		l := obj.AsList()
+		if l.Attrs == nil {
+			l.Attrs = NewDictVal(4).AsDict()
+		}
+		if value.IsUnbound() {
+			l.Attrs.Delete(md.Name)
+			return
+		}
+		l.Attrs.Set(md.Name, value)
 		return
 	}
 	if obj.IsModule() && IsSubclass(obj.Type(), md.Owner) {
@@ -1265,7 +1329,14 @@ func listMpAssSubscript(ctx *ExecContext, a, idxVal, val Value) Value {
 		} else if val.IsTuple() {
 			rhsItems = val.AsTuple().Items
 		} else {
-			panic("TypeError: can only assign an iterable to a slice")
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						panic("TypeError: can only assign an iterable to a slice")
+					}
+				}()
+				rhsItems = ExtractIterableItems(ctx, val)
+			}()
 		}
 		if step == 1 {
 			newItems := make([]Value, 0, len(l.Items)-sliceLen+len(rhsItems))
@@ -4551,16 +4622,74 @@ func initTypes() {
 		pk := (*PyDictKeys)(AsPointer(self))
 		return NewIterVal(Value{num: uint64(KindDict), ptr: &pk.Dict.Header})
 	}
-	DictKeysType.Slots.NbSub = func(ctx *ExecContext, a, b Value) Value {
+	dictKeysSub := func(ctx *ExecContext, a, b Value) Value {
 		s1 := NewSetVal(ExtractIterableItems(ctx, a)...).AsSet()
 		s2 := NewSetVal(ExtractIterableItems(ctx, b)...).AsSet()
 		return s1.Difference(s2)
+	}
+	DictKeysType.Slots.NbSub = dictKeysSub
+	dictKeysOr := func(ctx *ExecContext, a, b Value) Value {
+		s1 := NewSetVal(ExtractIterableItems(ctx, a)...).AsSet()
+		s2 := NewSetVal(ExtractIterableItems(ctx, b)...).AsSet()
+		return s1.Union(s2)
+	}
+	dictKeysAnd := func(ctx *ExecContext, a, b Value) Value {
+		s1 := NewSetVal(ExtractIterableItems(ctx, a)...).AsSet()
+		s2 := NewSetVal(ExtractIterableItems(ctx, b)...).AsSet()
+		return s1.Intersection(s2)
+	}
+	dictKeysXor := func(ctx *ExecContext, a, b Value) Value {
+		s1 := NewSetVal(ExtractIterableItems(ctx, a)...).AsSet()
+		s2 := NewSetVal(ExtractIterableItems(ctx, b)...).AsSet()
+		return s1.SymmetricDifference(s2)
 	}
 	DictKeysType.Dict.Set(DunderSub, NewBuiltinFuncVal("__sub__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
 			panic("TypeError: __sub__() takes 1 argument")
 		}
-		return DictKeysType.Slots.NbSub(ctx, args[0], args[1])
+		return dictKeysSub(ctx, args[0], args[1])
+	}))
+	DictKeysType.Dict.Set(InternString("__rsub__"), NewBuiltinFuncVal("__rsub__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: __rsub__() takes 1 argument")
+		}
+		return dictKeysSub(ctx, args[1], args[0])
+	}))
+	DictKeysType.Dict.Set(InternString("__or__"), NewBuiltinFuncVal("__or__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: __or__() takes 1 argument")
+		}
+		return dictKeysOr(ctx, args[0], args[1])
+	}))
+	DictKeysType.Dict.Set(InternString("__ror__"), NewBuiltinFuncVal("__ror__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: __ror__() takes 1 argument")
+		}
+		return dictKeysOr(ctx, args[1], args[0])
+	}))
+	DictKeysType.Dict.Set(InternString("__and__"), NewBuiltinFuncVal("__and__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: __and__() takes 1 argument")
+		}
+		return dictKeysAnd(ctx, args[0], args[1])
+	}))
+	DictKeysType.Dict.Set(InternString("__rand__"), NewBuiltinFuncVal("__rand__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: __rand__() takes 1 argument")
+		}
+		return dictKeysAnd(ctx, args[1], args[0])
+	}))
+	DictKeysType.Dict.Set(InternString("__xor__"), NewBuiltinFuncVal("__xor__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: __xor__() takes 1 argument")
+		}
+		return dictKeysXor(ctx, args[0], args[1])
+	}))
+	DictKeysType.Dict.Set(InternString("__rxor__"), NewBuiltinFuncVal("__rxor__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: __rxor__() takes 1 argument")
+		}
+		return dictKeysXor(ctx, args[1], args[0])
 	}))
 	DictKeysType.Dict.Set(DunderIter, NewBuiltinFuncVal("__iter__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
@@ -4646,6 +4775,18 @@ func initTypes() {
 			return args[2]
 		}
 		panic(NewException(KeyErrorType, "KeyError: "+args[1].String()))
+	}))
+
+	DictType.Dict.Set(InternString("popitem"), NewBuiltinFuncVal("popitem", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: descriptor 'popitem' of 'dict' object needs an argument")
+		}
+		d := args[0].AsDict()
+		k, v, ok := d.PopItem()
+		if !ok {
+			panic(NewException(KeyErrorType, "popitem(): dictionary is empty"))
+		}
+		return NewTupleVal(k, v)
 	}))
 
 	DictType.Dict.Set(InternString("setdefault"), NewBuiltinFuncVal("setdefault", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
@@ -5022,6 +5163,12 @@ func initTypes() {
 	WeakRefType = MustNewType("ReferenceType", []*PyType{ObjectType}, nil)
 	WeakRefType.Slots.TpCall = weakRefTpCall
 	WeakRefType.Slots.TpGetAttr = weakRefTpGetAttr
+	WeakRefType.Dict.Set(DunderCall, NewBuiltinFuncVal("ReferenceType.__call__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: descriptor '__call__' of 'ReferenceType' object needs an argument")
+		}
+		return weakRefTpCall(ctx, args[0], args[1:], kwnames)
+	}))
 	WeakRefType.Dict.Set(DunderEq, NewBuiltinFuncVal("__eq__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
 			return BoolVal(false)
@@ -5034,6 +5181,7 @@ func initTypes() {
 		}
 		return Int64Val(weakRefTpHash(args[0]))
 	}))
+	WeakRefType.SyncDunderSlots()
 
 	WeakProxyType = MustNewType("ProxyType", []*PyType{ObjectType}, nil)
 	WeakProxyType.Slots.TpGetAttr = weakProxyTpGetAttr
@@ -5043,6 +5191,13 @@ func initTypes() {
 	CallableWeakProxyType.Slots.TpGetAttr = weakProxyTpGetAttr
 	CallableWeakProxyType.Slots.TpSetAttr = weakProxyTpSetAttr
 	CallableWeakProxyType.Slots.TpCall = weakProxyTpCall
+	CallableWeakProxyType.Dict.Set(DunderCall, NewBuiltinFuncVal("CallableProxyType.__call__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: descriptor '__call__' of 'CallableProxyType' object needs an argument")
+		}
+		return weakProxyTpCall(ctx, args[0], args[1:], kwnames)
+	}))
+	CallableWeakProxyType.SyncDunderSlots()
 
 	FunctionType = MustNewType("function", []*PyType{ObjectType}, nil)
 	FunctionType.Slots.TpDescrGet = functionDescrGet
@@ -5931,6 +6086,17 @@ func initTypes() {
 			}
 		}
 		return NewStringVal("")
+	}))
+	BaseExceptionType.Dict.Set(InternString("with_traceback"), NewBuiltinFuncVal("with_traceback", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: with_traceback() takes exactly one argument")
+		}
+		self := args[0]
+		tb := args[1]
+		if self.IsInstance() {
+			self.AsInstance().SetAttr(InternString("__traceback__"), tb)
+		}
+		return self
 	}))
 	BaseExceptionType.InvalidateVersion()
 	ExceptionType = MustNewType("Exception", []*PyType{BaseExceptionType}, nil)

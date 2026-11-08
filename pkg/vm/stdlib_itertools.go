@@ -1,6 +1,8 @@
 package vm
 
 import (
+	"sync"
+
 	"github.com/servusdei2018/fython/pkg/val"
 )
 
@@ -687,6 +689,53 @@ func (e *Engine) createItertoolsModule() val.Value {
 			}
 			return val.NewTupleVal(res...), true
 		})
+	}))
+
+	// tee(iterable, n=2)
+	mod.Dict.Set(val.InternString("tee"), val.NewBuiltinFuncVal("tee", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: tee() takes at least 1 argument")
+		}
+		n := int64(2)
+		if len(args) > 1 && args[1].IsInt64() {
+			n = args[1].AsInt64()
+			if n < 0 {
+				panic("ValueError: n must be >= 0")
+			}
+		}
+		if n == 0 {
+			return val.NewTupleVal()
+		}
+		it := iterFor(ctx, args[0])
+		var mu sync.Mutex
+		var buffer []val.Value
+		exhausted := false
+
+		branches := make([]val.Value, n)
+		for b := int64(0); b < n; b++ {
+			myIdx := 0
+			branches[b] = val.NewIterValWithNext(func() (val.Value, bool) {
+				mu.Lock()
+				defer mu.Unlock()
+				if myIdx < len(buffer) {
+					v := buffer[myIdx]
+					myIdx++
+					return v, true
+				}
+				if exhausted {
+					return val.NoneVal(), false
+				}
+				v, ok := it.Next()
+				if !ok {
+					exhausted = true
+					return val.NoneVal(), false
+				}
+				buffer = append(buffer, v)
+				myIdx++
+				return v, true
+			})
+		}
+		return val.NewTupleVal(branches...)
 	}))
 
 	return modVal

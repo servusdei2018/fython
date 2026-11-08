@@ -229,10 +229,25 @@ func (e *Engine) createOSModule() val.Value {
 		delete(fdMap, fd)
 		fdMutex.Unlock()
 		if !ok {
-			panic("OSError: [Errno 9] Bad file descriptor")
+			if err := syscall.Close(fd); err != nil {
+				panic("OSError: [Errno 9] Bad file descriptor")
+			}
+			return val.NoneVal()
 		}
 		_ = f.Close()
 		return val.NoneVal()
+	}))
+
+	osMod.Dict.Set(val.InternString("dup"), val.NewBuiltinFuncVal("dup", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: dup() takes 1 argument")
+		}
+		fd := int(args[0].AsInt64())
+		newFd, err := syscall.Dup(fd)
+		if err != nil {
+			panic("OSError: " + err.Error())
+		}
+		return val.Int64Val(int64(newFd))
 	}))
 
 	osMod.Dict.Set(val.InternString("read"), val.NewBuiltinFuncVal("read", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {

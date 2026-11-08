@@ -213,6 +213,7 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 	sysMod.Dict.Set(val.InternString("float_info"), newFloatInfo())
 	sysMod.Dict.Set(val.InternString("hash_info"), newHashInfo())
 	sysMod.Dict.Set(val.InternString("dont_write_bytecode"), val.BoolVal(eff.DontWriteBytecode))
+	sysMod.Dict.Set(val.InternString("pycache_prefix"), val.NoneVal())
 
 	warnItems := make([]val.Value, len(eff.WarnOptions))
 	for i, w := range eff.WarnOptions {
@@ -383,6 +384,96 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 		return val.NewStringVal("surrogateescape")
 	}))
 
+	sysMod.Dict.Set(val.InternString("excepthook"), val.NewBuiltinFuncVal("excepthook", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.NoneVal()
+	}))
+	sysMod.Dict.Set(val.InternString("unraisablehook"), val.NewBuiltinFuncVal("unraisablehook", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.NoneVal()
+	}))
+
+	unraisableHookArgsType := val.MustNewType("UnraisableHookArgs", []*val.PyType{val.ObjectType}, nil)
+	unraisableHookArgsType.Dict.Set(val.InternString("__init__"), val.NewBuiltinFuncVal("__init__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) == 0 {
+			return val.NoneVal()
+		}
+		self := args[0]
+		if self.IsInstance() {
+			inst := self.AsInstance()
+			fieldNames := []string{"exc_type", "exc_value", "exc_traceback", "err_msg", "object"}
+			posArgs := args[1:]
+			if len(kwnames) > 0 {
+				posArgs = args[1 : len(args)-len(kwnames)]
+				kwStart := len(args) - len(kwnames)
+				for i, kn := range kwnames {
+					inst.SetAttr(kn, args[kwStart+i])
+				}
+			}
+			for i, arg := range posArgs {
+				if i < len(fieldNames) {
+					inst.SetAttr(val.InternString(fieldNames[i]), arg)
+				}
+			}
+		}
+		return val.NoneVal()
+	}))
+	unraisableHookArgsType.SyncDunderSlots()
+	sysMod.Dict.Set(val.InternString("UnraisableHookArgs"), val.TypeVal(unraisableHookArgsType))
+
+	// sys.monitoring
+	monitoringModVal := val.NewModuleVal("monitoring", "")
+	monDict := monitoringModVal.AsModule().Dict
+
+	eventsModVal := val.NewModuleVal("events", "")
+	evDict := eventsModVal.AsModule().Dict
+	evDict.Set(val.InternString("NO_EVENTS"), val.Int64Val(0))
+	evDict.Set(val.InternString("PY_START"), val.Int64Val(1))
+	evDict.Set(val.InternString("PY_RESUME"), val.Int64Val(2))
+	evDict.Set(val.InternString("PY_RETURN"), val.Int64Val(4))
+	evDict.Set(val.InternString("PY_YIELD"), val.Int64Val(8))
+	evDict.Set(val.InternString("CALL"), val.Int64Val(16))
+	evDict.Set(val.InternString("LINE"), val.Int64Val(32))
+	evDict.Set(val.InternString("INSTRUCTION"), val.Int64Val(64))
+	evDict.Set(val.InternString("JUMP"), val.Int64Val(128))
+	evDict.Set(val.InternString("BRANCH_LEFT"), val.Int64Val(256))
+	evDict.Set(val.InternString("BRANCH_RIGHT"), val.Int64Val(512))
+	evDict.Set(val.InternString("STOP_ITERATION"), val.Int64Val(1024))
+	evDict.Set(val.InternString("RAISE"), val.Int64Val(2048))
+	evDict.Set(val.InternString("EXCEPTION_HANDLED"), val.Int64Val(4096))
+	evDict.Set(val.InternString("PY_UNWIND"), val.Int64Val(8192))
+	evDict.Set(val.InternString("PY_THROW"), val.Int64Val(16384))
+	evDict.Set(val.InternString("RERAISE"), val.Int64Val(32768))
+	evDict.Set(val.InternString("C_RETURN"), val.Int64Val(65536))
+	evDict.Set(val.InternString("C_RAISE"), val.Int64Val(131072))
+	evDict.Set(val.InternString("BRANCH"), val.Int64Val(262144))
+
+	monDict.Set(val.InternString("events"), eventsModVal)
+	monDict.Set(val.InternString("DEBUGGER_ID"), val.Int64Val(0))
+	monDict.Set(val.InternString("COVERAGE_ID"), val.Int64Val(1))
+	monDict.Set(val.InternString("PROFILER_ID"), val.Int64Val(2))
+	monDict.Set(val.InternString("OPTIMIZER_ID"), val.Int64Val(3))
+	monDict.Set(val.InternString("use_tool_id"), val.NewBuiltinFuncVal("use_tool_id", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.NoneVal()
+	}))
+	monDict.Set(val.InternString("free_tool_id"), val.NewBuiltinFuncVal("free_tool_id", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.NoneVal()
+	}))
+	monDict.Set(val.InternString("register_callback"), val.NewBuiltinFuncVal("register_callback", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.NoneVal()
+	}))
+	monDict.Set(val.InternString("set_events"), val.NewBuiltinFuncVal("set_events", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.NoneVal()
+	}))
+	monDict.Set(val.InternString("get_events"), val.NewBuiltinFuncVal("get_events", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.Int64Val(0)
+	}))
+	monDict.Set(val.InternString("set_local_events"), val.NewBuiltinFuncVal("set_local_events", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.NoneVal()
+	}))
+	monDict.Set(val.InternString("get_local_events"), val.NewBuiltinFuncVal("get_local_events", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		return val.Int64Val(0)
+	}))
+	sysMod.Dict.Set(val.InternString("monitoring"), monitoringModVal)
+
 	modules.Set(val.InternString("sys"), sysModVal)
 
 	// 2. Built-in builtins module
@@ -423,6 +514,8 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 	modules.Set(val.InternString("_thread"), e.createThreadModule())
 	modules.Set(val.InternString("threading"), e.createThreadingModule())
 	modules.Set(val.InternString("_typing"), e.createTypingModule())
+	modules.Set(val.InternString("_tokenize"), e.createTokenizeModule())
+	modules.Set(val.InternString("faulthandler"), e.createFaulthandlerModule())
 	modules.Set(val.InternString("_colorize"), e.createColorizeModule())
 	modules.Set(val.InternString("_contextvars"), e.createContextVarsModule())
 	modules.Set(val.InternString("_signal"), e.createSignalModule())

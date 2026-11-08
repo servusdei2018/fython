@@ -508,11 +508,23 @@ func (vm *VM) callFromHook(ctx *val.ExecContext, callable val.Value, argBase int
 		ctx.Stack[argBase] = bm.Self
 		return vm.callFromHook(ctx, bm.Func, argBase, nargs+1, kwnames)
 
+	case val.KindStaticMethod:
+		sm := callable.AsStaticMethod()
+		return vm.callFromHook(ctx, sm.Callable, argBase, nargs, kwnames)
+
 	default:
 		// Instance __call__ is distinct from the type's constructor slot.
 		// Builtin types such as partial set Slots.TpCall to build instances
 		// and put the instance call in the type dict.
-		if !callable.IsType() {
+		if callable.IsType() {
+			if tpCall := callable.Type().Slots.TpCall; tpCall != nil {
+				savedSP := ctx.SP
+				ctx.SP = argBase + nargs
+				res := tpCall(ctx, callable, ctx.Stack[argBase:argBase+nargs], kwnames)
+				ctx.SP = savedSP
+				return res
+			}
+		} else {
 			if fn, _, ok := callable.Type().LookupMRO(val.DunderCall); ok && fn.HeaderPtr() != nil && !fn.IsUnbound() {
 				if argBase+1+nargs >= len(ctx.Stack) {
 					if len(ctx.Stack) > 0 && len(vm.stack) > 0 && &ctx.Stack[0] == &vm.stack[0] {
@@ -526,13 +538,6 @@ func (vm *VM) callFromHook(ctx *val.ExecContext, callable val.Value, argBase int
 				ctx.Stack[argBase] = callable
 				return vm.callFromHook(ctx, fn, argBase, nargs+1, kwnames)
 			}
-		}
-		if tpCall := callable.Type().Slots.TpCall; tpCall != nil {
-			savedSP := ctx.SP
-			ctx.SP = argBase + nargs
-			res := tpCall(ctx, callable, ctx.Stack[argBase:argBase+nargs], kwnames)
-			ctx.SP = savedSP
-			return res
 		}
 		name := ""
 		file := ""
@@ -6861,7 +6866,10 @@ func (vm *VM) loadAttrInstanceSlow(instObj *val.PyInstance, obj, attrName val.Va
 			}
 			vm.execCtx.SP = sp
 			vm.activeFrameIdx = frameIdx
-			return descrType.Slots.TpDescrGet(&vm.execCtx, descr, obj, instType)
+			if descrType.Slots.TpDescrGet != nil {
+				return descrType.Slots.TpDescrGet(&vm.execCtx, descr, obj, instType)
+			}
+			return descr
 		}
 	}
 
@@ -7236,6 +7244,9 @@ func (vm *VM) descrGetSafe(descr, obj val.Value, owner *val.PyType) (res val.Val
 			}
 		}
 	}()
+	if descr.Type() == nil || descr.Type().Slots.TpDescrGet == nil {
+		return descr
+	}
 	return descr.Type().Slots.TpDescrGet(&vm.execCtx, descr, obj, owner)
 }
 
@@ -7272,7 +7283,9 @@ func (vm *VM) descrSetSafe(descr, obj, v val.Value) {
 			}
 		}
 	}()
-	descr.Type().Slots.TpDescrSet(&vm.execCtx, descr, obj, v)
+	if descr.Type() != nil && descr.Type().Slots.TpDescrSet != nil {
+		descr.Type().Slots.TpDescrSet(&vm.execCtx, descr, obj, v)
+	}
 }
 
 //go:noinline

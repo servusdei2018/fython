@@ -11,6 +11,7 @@ import (
 var (
 	SimpleNamespaceType       *val.PyType
 	DynamicClassAttributeType *val.PyType
+	LazyImportType            *val.PyType
 	typesOnce                 sync.Once
 )
 
@@ -27,17 +28,21 @@ func initTypesModule() {
 	typesOnce.Do(func() {
 		// 1. SimpleNamespace
 		SimpleNamespaceType = val.MustNewType("SimpleNamespace", []*val.PyType{val.ObjectType}, nil)
-		SimpleNamespaceType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-			instVal := val.NewInstanceOfType(SimpleNamespaceType)
-			inst := instVal.AsInstance()
-			if len(kwnames) > 0 {
+		SimpleNamespaceType.Dict.Set(val.InternString("__init__"), val.NewBuiltinFuncVal("__init__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) == 0 {
+				return val.NoneVal()
+			}
+			self := args[0]
+			if self.IsInstance() && len(kwnames) > 0 {
+				inst := self.AsInstance()
 				kwStart := len(args) - len(kwnames)
 				for i, kn := range kwnames {
 					inst.SetAttr(kn, args[kwStart+i])
 				}
 			}
-			return instVal
-		}
+			return val.NoneVal()
+		}))
+		SimpleNamespaceType.SyncDunderSlots()
 
 		SimpleNamespaceType.Dict.Set(val.InternString("__repr__"), val.NewBuiltinFuncVal("__repr__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) == 0 {
@@ -252,6 +257,9 @@ func initTypesModule() {
 			}
 			return val.ObjectVal((*val.ObjectHeader)(unsafe.Pointer(&newAttr.Header)))
 		}))
+
+		LazyImportType = val.MustNewType("lazy_import", []*val.PyType{val.ObjectType}, nil)
+		LazyImportType.InvalidateVersion()
 	})
 }
 
@@ -285,6 +293,7 @@ func (e *Engine) createTypesModule() val.Value {
 	mod.Dict.Set(val.InternString("MemberDescriptorType"), val.TypeVal(val.MemberDescrType))
 	mod.Dict.Set(val.InternString("GenericAlias"), val.TypeVal(GenericAliasType))
 	mod.Dict.Set(val.InternString("UnionType"), val.TypeVal(UnionType))
+	mod.Dict.Set(val.InternString("LazyImportType"), val.TypeVal(LazyImportType))
 
 	// new_class(name, bases=(), kwds=None, exec_body=None)
 	mod.Dict.Set(val.InternString("new_class"), val.NewBuiltinFuncVal("new_class", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {

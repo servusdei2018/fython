@@ -2354,6 +2354,35 @@ func (d *PyDict) Clear() {
 	d.mu.Unlock()
 }
 
+// PopItem removes and returns the last (key, value) pair in LIFO order.
+// Returns (key, value, true) if popped, or (None, None, false) if empty.
+func (d *PyDict) PopItem() (Value, Value, bool) {
+	if d == nil {
+		return NoneVal(), NoneVal(), false
+	}
+	if d.Live != nil {
+		items := d.liveItems()
+		if len(items) == 0 {
+			return NoneVal(), NoneVal(), false
+		}
+		last := items[len(items)-1]
+		d.Live.DeleteAttr(last.Key)
+		return last.Key, last.Value, true
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for i := len(d.Entries) - 1; i >= 0; i-- {
+		e := &d.Entries[i]
+		if e.Active {
+			k := e.Key
+			v := e.Value
+			d.deleteLocked(k)
+			return k, v, true
+		}
+	}
+	return NoneVal(), NoneVal(), false
+}
+
 // PyLazyImport represents a PEP 690 lazy import placeholder.
 type PyLazyImport struct {
 	Header  ObjectHeader
