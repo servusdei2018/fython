@@ -203,3 +203,32 @@ func TestVersionAndHelpFlags(t *testing.T) {
 		}
 	})
 }
+
+func TestServeCLIParsing(t *testing.T) {
+	var s ServeCLI
+	parser, err := kong.New(&s)
+	if err != nil {
+		t.Fatalf("kong.New failed: %v", err)
+	}
+
+	_, err = parser.Parse([]string{"app:main", "--host", "0.0.0.0", "--port", "9000", "--workers", "8", "--interface", "asgi"})
+	if err != nil {
+		t.Fatalf("parser.Parse failed: %v", err)
+	}
+
+	if s.Target != "app:main" {
+		t.Errorf("expected Target app:main, got %s", s.Target)
+	}
+	if s.Host != "0.0.0.0" {
+		t.Errorf("expected Host 0.0.0.0, got %s", s.Host)
+	}
+	if s.Port != 9000 {
+		t.Errorf("expected Port 9000, got %d", s.Port)
+	}
+	if s.Workers != 8 {
+		t.Errorf("expected Workers 8, got %d", s.Workers)
+	}
+	if s.Interface != "asgi" {
+		t.Errorf("expected Interface asgi, got %s", s.Interface)
+	}
+}

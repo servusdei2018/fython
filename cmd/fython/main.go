@@ -33,6 +33,15 @@ func main() {
 		os.Exit(0)
 	}
 
+	if len(os.Args) > 1 && os.Args[1] == "serve" {
+		err := cli.RunServe(os.Args[2:])
+		if err != nil {
+			os.Stderr.WriteString(err.Error() + "\n")
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
 	var c cli.CLI
 	parser, err := cli.NewParser(&c)
 	if err != nil {

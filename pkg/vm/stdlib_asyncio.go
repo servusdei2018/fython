@@ -431,7 +431,7 @@ func (e *Engine) createAsyncioModule() val.Value {
 			}
 			panic("TypeError: create_task() takes at least 1 argument")
 		}
-		loop := GetCurrentEventLoop()
+		loop := GetCurrentEventLoopCtx(ctx)
 		if loop == nil {
 			loop = NewEventLoop(e, e.asyncMode)
 			SetCurrentEventLoop(loop)
@@ -458,7 +458,7 @@ func (e *Engine) createAsyncioModule() val.Value {
 			return target
 		}
 		if target.IsCoroutine() {
-			loop := GetCurrentEventLoop()
+			loop := GetCurrentEventLoopCtx(ctx)
 			if loop == nil {
 				loop = NewEventLoop(e, e.asyncMode)
 				SetCurrentEventLoop(loop)
@@ -485,7 +485,7 @@ func (e *Engine) createAsyncioModule() val.Value {
 			if coro.IsFuture() || coro.IsTask() {
 				return coro
 			}
-			loop := GetCurrentEventLoop()
+			loop := GetCurrentEventLoopCtx(ctx)
 			if loop == nil {
 				loop = NewEventLoop(e, e.asyncMode)
 				SetCurrentEventLoop(loop)
@@ -526,7 +526,7 @@ func (e *Engine) createAsyncioModule() val.Value {
 			return futVal
 		}
 
-		loop := GetCurrentEventLoop()
+		loop := GetCurrentEventLoopCtx(ctx)
 		if loop == nil {
 			loop = NewEventLoop(e, e.asyncMode)
 			SetCurrentEventLoop(loop)
@@ -631,7 +631,7 @@ func (e *Engine) createAsyncioModule() val.Value {
 		futVal := val.NewFutureVal()
 		fut := futVal.AsFuture()
 
-		loop := GetCurrentEventLoop()
+		loop := GetCurrentEventLoopCtx(ctx)
 		if loop == nil {
 			loop = NewEventLoop(e, e.asyncMode)
 			SetCurrentEventLoop(loop)
@@ -683,7 +683,7 @@ func (e *Engine) createAsyncioModule() val.Value {
 
 	// Event loop management
 	mod.Dict.Set(val.InternString("get_event_loop"), val.NewBuiltinFuncVal("get_event_loop", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		loop := GetCurrentEventLoop()
+		loop := GetCurrentEventLoopCtx(ctx)
 		if loop == nil {
 			loop = NewEventLoop(e, e.asyncMode)
 			SetCurrentEventLoop(loop)

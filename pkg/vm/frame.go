@@ -286,6 +286,7 @@ type VM struct {
 	rootCache          VMCodeCache
 	limits             RuntimeLimits
 	stepCount          uint64
+	eventLoop          *EventLoop
 }
 
 func (vm *VM) getCodeCache(co *CodeObject) *VMCodeCache {

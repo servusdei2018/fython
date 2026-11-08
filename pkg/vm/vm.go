@@ -1282,6 +1282,21 @@ func (vm *VM) releaseCoroutine(coro *val.PyCoroutine) {
 	}
 }
 
+// ReleaseCoroutine returns a closed coroutine to the VM's free list.
+func (vm *VM) ReleaseCoroutine(coro *val.PyCoroutine) {
+	vm.releaseCoroutine(coro)
+}
+
+// StepCoroutine advances a coroutine on this VM's execution context.
+func (vm *VM) StepCoroutine(coro *val.PyCoroutine, sent val.Value) (val.Value, val.IterStatus) {
+	return vm.resumeCoroutine(&vm.execCtx, coro, sent)
+}
+
+// ExecContext returns the execution context for this VM.
+func (vm *VM) ExecContext() *val.ExecContext {
+	return &vm.execCtx
+}
+
 func (vm *VM) instantiateCoroutine(co *CodeObject, callable val.Value, defaults []val.Value, kwDefaults *val.PyDict, callerStack []val.Value, argBase int, nargs int, kwnames []val.Value, globals *val.PyDict) val.Value {
 	maxStack := co.MaxStackSize
 	if maxStack < co.NumLocals+16 {

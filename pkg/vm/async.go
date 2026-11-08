@@ -115,6 +115,26 @@ func GetCurrentEventLoop() *EventLoop {
 	return currentEventLoop.Load()
 }
 
+// GetCurrentEventLoopCtx returns the active event loop for ctx/VM, falling back to process-wide loop.
+func GetCurrentEventLoopCtx(ctx *val.ExecContext) *EventLoop {
+	if ctx != nil && ctx.VM != nil {
+		if v, ok := ctx.VM.(*VM); ok && v.eventLoop != nil {
+			return v.eventLoop
+		}
+	}
+	return currentEventLoop.Load()
+}
+
+// EventLoop returns the active event loop associated with this VM.
+func (vm *VM) EventLoop() *EventLoop {
+	return vm.eventLoop
+}
+
+// SetEventLoop sets the active event loop associated with this VM.
+func (vm *VM) SetEventLoop(loop *EventLoop) {
+	vm.eventLoop = loop
+}
+
 // SetCurrentEventLoop sets the active event loop.
 func SetCurrentEventLoop(loop *EventLoop) {
 	currentEventLoop.Store(loop)
@@ -131,6 +151,9 @@ func NewEventLoop(e *Engine, mode AsyncMode) *EventLoop {
 		queue:    NewLockFreeTaskQueue(),
 		mode:     mode,
 		stopChan: make(chan struct{}),
+	}
+	if loop.vm != nil {
+		loop.vm.eventLoop = loop
 	}
 	return loop
 }
@@ -178,9 +201,13 @@ func (l *EventLoop) RunUntilComplete(target val.Value) (val.Value, error) {
 func (l *EventLoop) RunUntilCompleteIn(target val.Value, parent *val.PyContext) (val.Value, error) {
 	prevLoop := GetCurrentEventLoop()
 	SetCurrentEventLoop(l)
+	if l.vm != nil {
+		l.vm.eventLoop = l
+	}
 	defer func() {
 		SetCurrentEventLoop(prevLoop)
 		if l.vm != nil {
+			l.vm.eventLoop = nil
 			l.engine.ReleaseVM(l.vm)
 			l.vm = nil
 		}
