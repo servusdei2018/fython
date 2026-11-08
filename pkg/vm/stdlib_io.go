@@ -570,7 +570,7 @@ func initIOTypes() {
 					Header: val.ObjectHeader{Kind: val.KindInstance, Type: cls},
 					Shape:  cls.RootShape,
 				},
-				buf: make([]byte, 0, 8192),
+				buf: make([]byte, 0, 131072),
 			}
 			return val.ObjectVal(&sio.inst.Header)
 		}))
@@ -590,9 +590,13 @@ func initIOTypes() {
 			}
 			var initBytes []byte
 			if !src.IsNone() && src.IsAnyString() {
-				initBytes, _ = val.AppendValueBytes(nil, src)
+				initBytes, _ = val.AppendValueBytes(sio.buf[:0], src)
 			} else {
-				initBytes = make([]byte, 0, 8192)
+				if sio.buf == nil {
+					initBytes = make([]byte, 0, 131072)
+				} else {
+					initBytes = sio.buf[:0]
+				}
 			}
 			sio.buf = initBytes
 			sio.pos = 0
@@ -654,9 +658,12 @@ func initIOTypes() {
 				if pf.reader == nil || pf.reader.Buffered() == 0 {
 					stat, err := pf.f.Stat()
 					if err == nil && stat.Mode().IsRegular() && stat.Size() >= 0 {
-						curPos, seekErr := pf.f.Seek(0, io.SeekCurrent)
+						var curPos int64
+						if pf.reader != nil {
+							curPos, _ = pf.f.Seek(0, io.SeekCurrent)
+						}
 						remSize := stat.Size()
-						if seekErr == nil && curPos >= 0 && curPos <= remSize {
+						if curPos >= 0 && curPos <= remSize {
 							remSize -= curPos
 						}
 						if remSize == 0 {
@@ -1069,10 +1076,15 @@ func openFileBuiltinVal(fileVal val.Value, mode string) val.Value {
 		writeBuf = (*pooledBuf)[:0]
 	}
 
+	var reader *bufio.Reader
+	if strings.Contains(mode, "r") || strings.Contains(mode, "+") {
+		reader = bufio.NewReader(f)
+	}
+
 	pf := &pyFile{
 		inst:      val.PyInstance{Header: val.ObjectHeader{Kind: val.KindInstance, Type: FileType}, Shape: FileType.RootShape},
 		f:         f,
-		reader:    bufio.NewReader(f),
+		reader:    reader,
 		writeBuf:  writeBuf,
 		binary:    binary,
 		pooledBuf: pooledBuf,

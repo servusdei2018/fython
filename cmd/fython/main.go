@@ -3,11 +3,15 @@ package main
 import (
 	"errors"
 	"os"
+	"runtime/debug"
 
 	"github.com/servusdei2018/fython/internal/cli"
 )
 
 func main() {
+	if os.Getenv("GOGC") == "" {
+		debug.SetGCPercent(500)
+	}
 	if cli.IsBundledExecutable() {
 		err := cli.RunBundledExecutable()
 		if err != nil {

@@ -381,10 +381,12 @@ func (e *Engine) createAsyncioModule() val.Value {
 		}
 		target := args[0]
 		var parent *val.PyContext
+		var currentVM *VM
 		if ctx != nil && ctx.VM != nil {
-			parent = ctx.VM.(*VM).ActiveContext()
+			currentVM = ctx.VM.(*VM)
+			parent = currentVM.ActiveContext()
 		}
-		loop := NewEventLoop(e, e.asyncMode)
+		loop := NewEventLoopWithVM(e, e.asyncMode, currentVM)
 		res, err := loop.RunUntilCompleteIn(target, parent)
 		if err != nil {
 			panic(err.Error())

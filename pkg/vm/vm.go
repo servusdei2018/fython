@@ -2,6 +2,8 @@ package vm
 
 import (
 	"fmt"
+	"io"
+	"os"
 	"runtime"
 	"sort"
 	"strings"
@@ -800,6 +802,12 @@ func extractCellPtrs(cells []val.Value) []*val.PyCell {
 	return ptrs
 }
 
+func (vm *VM) allocMemoryView() *val.PyMemoryView {
+	idx := vm.mvRingIdx & 1023
+	vm.mvRingIdx++
+	return &vm.mvRing[idx]
+}
+
 func (vm *VM) initBuiltins() {
 	vm.populateAllBuiltins(vm.builtins)
 
@@ -807,7 +815,7 @@ func (vm *VM) initBuiltins() {
 	vm.builtinRange = rangeVal
 	vm.builtins.Set(val.InternString("range"), rangeVal)
 
-	vm.builtins.Set(val.InternString("len"), val.NewBuiltinFuncVal("len", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+	lenVal := val.NewBuiltinFuncVal("len", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) == 0 {
 			panic("vm: TypeError: len() takes 1 argument")
 		}
@@ -837,7 +845,12 @@ func (vm *VM) initBuiltins() {
 			return val.Int64Val(sqLen(ctx, a))
 		}
 		panic("vm: TypeError: object of type '" + a.Type().Name + "' has no len()")
-	}))
+	})
+	vm.builtinLen = lenVal
+	vm.builtins.Set(val.InternString("len"), lenVal)
+	if vm.strScratch == nil {
+		vm.strScratch = make([]byte, 0, 1024)
+	}
 
 	vm.builtins.Set(val.InternString("int"), val.TypeVal(val.IntType))
 	vm.builtins.Set(val.InternString("float"), val.TypeVal(val.FloatType))
@@ -2180,6 +2193,17 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		case OP_BINARY_MUL:
 			b := stack[sp-1]
 			a := stack[sp-2]
+			if a.IsInt64() && b.IsInt64() {
+				ai := a.AsInt64()
+				bi := b.AsInt64()
+				prod := ai * bi
+				if ai == 0 || (bi != 0 && prod/bi == ai) {
+					stack[sp-2] = val.Int64Val(prod)
+					sp--
+					ip++
+					continue
+				}
+			}
 			vm.execCtx.SP = sp
 			vm.activeFrameIdx = frameIdx
 			stack[sp-2] = val.MulCtx(&vm.execCtx, a, b)
@@ -2208,6 +2232,20 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		case OP_BINARY_SUBSCR:
 			key := stack[sp-1]
 			obj := stack[sp-2]
+			if obj.Kind() == val.KindMemoryView && key.IsInt64() {
+				mv := obj.AsMemoryView()
+				buf := mv.Buf
+				k := key.AsInt64()
+				if k < 0 {
+					k += int64(len(buf))
+				}
+				if k >= 0 && k < int64(len(buf)) {
+					stack[sp-2] = val.Int64Val(int64(buf[k]))
+					sp--
+					ip++
+					continue
+				}
+			}
 			if obj.IsList() && key.IsInt64() && obj.Type() == val.ListType {
 				lst := obj.AsList()
 				k := key.AsInt64()
@@ -2310,6 +2348,22 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			key := stack[sp-1]
 			obj := stack[sp-2]
 			valToStore := stack[sp-3]
+			if obj.Kind() == val.KindMemoryView && key.IsInt64() && valToStore.IsInt64() {
+				mv := obj.AsMemoryView()
+				if !mv.ReadOnly {
+					buf := mv.Buf
+					k := key.AsInt64()
+					if k < 0 {
+						k += int64(len(buf))
+					}
+					if k >= 0 && k < int64(len(buf)) {
+						buf[k] = byte(valToStore.AsInt64())
+						sp -= 3
+						ip++
+						continue
+					}
+				}
+			}
 			if obj.IsList() && key.IsInt64() && obj.Type() == val.ListType {
 				lst := obj.AsList()
 				k := key.AsInt64()
@@ -2524,6 +2578,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		case OP_CALL:
 			argc := int(uint8(inst >> 16))
 			bx := int(uint16(inst))
+			isDirectAwait := ip+2 < len(code) &&
+				DecodeOpcode(code[ip+1]) == OP_GET_AWAITABLE &&
+				DecodeOpcode(code[ip+2]) == OP_AWAIT
 
 			var target val.Value
 			var newBase int
@@ -2550,6 +2607,56 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				}
 			}
 
+			// Builtin len fast-path: 0 allocations
+			if (target == vm.builtinLen || (target.IsBuiltinFunc() && target.AsBuiltinFunc().Name == "len")) && argc == 1 {
+				if vm.builtinLen.IsNone() {
+					vm.builtinLen = target
+				}
+				arg := stack[newBase]
+				switch arg.Kind() {
+				case val.KindMemoryView:
+					stack[retSP] = val.Int64Val(int64(len(arg.AsMemoryView().Buf)))
+					sp = retSP + 1
+					ip++
+					continue
+				case val.KindList:
+					stack[retSP] = val.Int64Val(int64(len(arg.AsList().Items)))
+					sp = retSP + 1
+					ip++
+					continue
+				case val.KindTuple:
+					stack[retSP] = val.Int64Val(int64(len(arg.AsTuple().Items)))
+					sp = retSP + 1
+					ip++
+					continue
+				case val.KindBytes:
+					stack[retSP] = val.Int64Val(int64(len(arg.AsBytes().Data)))
+					sp = retSP + 1
+					ip++
+					continue
+				case val.KindByteArray:
+					stack[retSP] = val.Int64Val(int64(len(arg.AsByteArray().Data)))
+					sp = retSP + 1
+					ip++
+					continue
+				case val.KindString, val.KindInlineStr:
+					stack[retSP] = val.Int64Val(int64(arg.StringLen()))
+					sp = retSP + 1
+					ip++
+					continue
+				case val.KindDict:
+					stack[retSP] = val.Int64Val(int64(arg.AsDict().Len()))
+					sp = retSP + 1
+					ip++
+					continue
+				case val.KindSet:
+					stack[retSP] = val.Int64Val(int64(arg.AsSet().Len()))
+					sp = retSP + 1
+					ip++
+					continue
+				}
+			}
+
 			// Builtin str fast-path: 0 allocations for int64 and strings
 			if target.IsType() && target.AsType() == val.StrType && argc == 1 {
 				arg := stack[newBase]
@@ -2564,6 +2671,48 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					sp = retSP + 1
 					ip++
 					continue
+				}
+			}
+
+			// Builtin open fast-path: fast-path for "w" and "r" modes
+			if (target == vm.builtinOpen || (target.IsBuiltinFunc() && target.AsBuiltinFunc().Name == "open")) && argc == 2 {
+				if vm.builtinOpen.IsNone() {
+					vm.builtinOpen = target
+				}
+				pathVal := stack[newBase]
+				modeVal := stack[newBase+1]
+				if pathVal.IsAnyString() && modeVal.IsAnyString() {
+					modeStr := modeVal.AsString()
+					if modeStr == "w" {
+						pathStr := pathVal.AsString()
+						f, err := os.OpenFile(pathStr, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
+						if err == nil {
+							pooledBuf := fileBufferPool.Get().(*[]byte)
+							pf := &pyFile{
+								inst:      val.PyInstance{Header: val.ObjectHeader{Kind: val.KindInstance, Type: FileType}, Shape: FileType.RootShape},
+								f:         f,
+								writeBuf:  (*pooledBuf)[:0],
+								pooledBuf: pooledBuf,
+							}
+							stack[retSP] = val.ObjectVal(&pf.inst.Header)
+							sp = retSP + 1
+							ip++
+							continue
+						}
+					} else if modeStr == "r" {
+						pathStr := pathVal.AsString()
+						f, err := os.OpenFile(pathStr, os.O_RDONLY, 0666)
+						if err == nil {
+							pf := &pyFile{
+								inst: val.PyInstance{Header: val.ObjectHeader{Kind: val.KindInstance, Type: FileType}, Shape: FileType.RootShape},
+								f:    f,
+							}
+							stack[retSP] = val.ObjectVal(&pf.inst.Header)
+							sp = retSP + 1
+							ip++
+							continue
+						}
+					}
 				}
 			}
 
@@ -2594,27 +2743,31 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					continue
 				}
 				if callee.IsCoroutine {
-					coroVal, ok := vm.instantiateCoroutineSafe(callee, target, nil, nil, stack, newBase, argc, nil, globals)
-					if !ok {
-						exc := vm.execCtx.ActiveException
-						vm.execCtx.ClearException()
-						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
-							if activeGen != nil {
-								activeGen.State = val.GenClosed
+					if isDirectAwait && !callee.CanSuspend {
+						// Inlined direct-await of synchronous coroutine
+					} else {
+						coroVal, ok := vm.instantiateCoroutineSafe(callee, target, nil, nil, stack, newBase, argc, nil, globals)
+						if !ok {
+							exc := vm.execCtx.ActiveException
+							vm.execCtx.ClearException()
+							if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+								if activeGen != nil {
+									activeGen.State = val.GenClosed
+								}
+								if activeCoro != nil {
+									activeCoro.State = val.CoroClosed
+								}
+								return val.NoneVal()
 							}
-							if activeCoro != nil {
-								activeCoro.State = val.CoroClosed
-							}
-							return val.NoneVal()
+							locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+							curCodeCache = vm.getCodeCache(curCO)
+							continue
 						}
-						locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
-						curCodeCache = vm.getCodeCache(curCO)
+						stack[retSP] = coroVal
+						sp = retSP + 1
+						ip++
 						continue
 					}
-					stack[retSP] = coroVal
-					sp = retSP + 1
-					ip++
-					continue
 				}
 				if frameIdx+2 > len(vm.frames) {
 					vm.ensureFrameCapacity(frameIdx + 2)
@@ -2623,7 +2776,15 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.co = curCO
 				saved.code = code
 				saved.consts = consts
-				saved.ip = ip + 1
+				if isDirectAwait && callee.IsCoroutine {
+					saved.ip = ip + 3
+				} else {
+					if isDirectAwait && callee.IsCoroutine {
+						saved.ip = ip + 3
+					} else {
+						saved.ip = ip + 1
+					}
+				}
 				saved.baseOffset = baseOffset
 				saved.retSP = retSP
 				saved.cells = cells
@@ -2703,6 +2864,56 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if fnGlobals == nil {
 					fnGlobals = globals
 				}
+				if callee == curCO && !callee.IsGenerator && (!callee.IsCoroutine || (isDirectAwait && !callee.CanSuspend)) && argc == callee.NumParams && len(fn.Defaults) == 0 && fn.KwDefaults == nil && callee.KWOnlyArgCount == 0 && (callee.Flags&(CO_VARARGS|CO_VARKEYWORDS)) == 0 && len(callee.CellVars) == 0 {
+					if frameIdx+2 > len(vm.frames) {
+						vm.ensureFrameCapacity(frameIdx + 2)
+					}
+					saved := &vm.frames[frameIdx]
+					saved.co = curCO
+					saved.code = code
+					saved.consts = consts
+					if isDirectAwait && callee.IsCoroutine {
+						saved.ip = ip + 3
+					} else {
+						if isDirectAwait && callee.IsCoroutine {
+							saved.ip = ip + 3
+						} else {
+							saved.ip = ip + 1
+						}
+					}
+					saved.baseOffset = baseOffset
+					saved.retSP = retSP
+					saved.cells = cells
+					saved.cellPtrs = cellPtrs
+					saved.globals = globals
+					saved.locals = curLocals
+					saved.cache = curCodeCache
+					saved.excStackLen = len(vm.excStack)
+					saved.stackIsVM = stackIsVM
+					curLocals = val.NoneVal()
+					frameIdx++
+					baseOffset = newBase
+					minCap := baseOffset + 256
+					if baseOffset+callee.NumLocals+64 > minCap {
+						minCap = baseOffset + callee.NumLocals + 64
+					}
+					if minCap > len(stack) {
+						stack = ensureStack(stack, minCap)
+						vm.execCtx.Stack = stack
+						vm.stack = stack
+					}
+					locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+					_ = locals[255]
+					numLocalsCallee := callee.NumLocals
+					if numLocalsCallee < argc {
+						numLocalsCallee = argc
+					}
+					sp = newBase + numLocalsCallee
+					vm.activeBaseOffset = baseOffset
+					vm.activeFrameIdx = frameIdx
+					ip = 0
+					continue
+				}
 				if callee.IsGenerator {
 					genVal, ok := vm.instantiateGeneratorSafe(callee, target, fn.Defaults, fn.KwDefaults, stack, newBase, argc, nil, fnGlobals)
 					if !ok {
@@ -2727,27 +2938,31 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					continue
 				}
 				if callee.IsCoroutine {
-					coroVal, ok := vm.instantiateCoroutineSafe(callee, target, fn.Defaults, fn.KwDefaults, stack, newBase, argc, nil, fnGlobals)
-					if !ok {
-						exc := vm.execCtx.ActiveException
-						vm.execCtx.ClearException()
-						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
-							if activeGen != nil {
-								activeGen.State = val.GenClosed
+					if isDirectAwait && !callee.CanSuspend {
+						// Inlined direct-await of synchronous coroutine
+					} else {
+						coroVal, ok := vm.instantiateCoroutineSafe(callee, target, fn.Defaults, fn.KwDefaults, stack, newBase, argc, nil, fnGlobals)
+						if !ok {
+							exc := vm.execCtx.ActiveException
+							vm.execCtx.ClearException()
+							if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+								if activeGen != nil {
+									activeGen.State = val.GenClosed
+								}
+								if activeCoro != nil {
+									activeCoro.State = val.CoroClosed
+								}
+								return val.NoneVal()
 							}
-							if activeCoro != nil {
-								activeCoro.State = val.CoroClosed
-							}
-							return val.NoneVal()
+							locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+							curCodeCache = vm.getCodeCache(curCO)
+							continue
 						}
-						locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
-						curCodeCache = vm.getCodeCache(curCO)
+						stack[retSP] = coroVal
+						sp = retSP + 1
+						ip++
 						continue
 					}
-					stack[retSP] = coroVal
-					sp = retSP + 1
-					ip++
-					continue
 				}
 				minCap := newBase + 256
 				if newBase+callee.NumLocals+64 > minCap {
@@ -2798,7 +3013,11 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.co = curCO
 				saved.code = code
 				saved.consts = consts
-				saved.ip = ip + 1
+				if isDirectAwait && callee.IsCoroutine {
+					saved.ip = ip + 3
+				} else {
+					saved.ip = ip + 1
+				}
 				saved.baseOffset = baseOffset
 				saved.retSP = retSP
 				saved.cells = cells
@@ -2903,6 +3122,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			totalArgs := int(uint8(inst >> 16))
 			bx := int(uint16(inst))
 			kwnames := consts[bx].AsTuple().Items
+			isDirectAwait := ip+2 < len(code) &&
+				DecodeOpcode(code[ip+1]) == OP_GET_AWAITABLE &&
+				DecodeOpcode(code[ip+2]) == OP_AWAIT
 
 			target := stack[sp-totalArgs-1]
 			newBase := sp - totalArgs
@@ -3001,7 +3223,11 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.co = curCO
 				saved.code = code
 				saved.consts = consts
-				saved.ip = ip + 1
+				if isDirectAwait && callee.IsCoroutine {
+					saved.ip = ip + 3
+				} else {
+					saved.ip = ip + 1
+				}
 				saved.baseOffset = baseOffset
 				saved.retSP = retSP
 				saved.cells = cells
@@ -3124,7 +3350,11 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.co = curCO
 				saved.code = code
 				saved.consts = consts
-				saved.ip = ip + 1
+				if isDirectAwait && callee.IsCoroutine {
+					saved.ip = ip + 3
+				} else {
+					saved.ip = ip + 1
+				}
 				saved.baseOffset = baseOffset
 				saved.retSP = retSP
 				saved.cells = cells
@@ -3329,6 +3559,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			retSP := sp - argc - 2
 			receiver := stack[retSP]
 			callable := stack[retSP+1]
+			isDirectAwait := ip+2 < len(code) &&
+				DecodeOpcode(code[ip+1]) == OP_GET_AWAITABLE &&
+				DecodeOpcode(code[ip+2]) == OP_AWAIT
 
 			var newBase int
 			var totalArgs int
@@ -3348,6 +3581,54 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				totalArgs = argc
 			}
 
+			if argc == 1 && !receiver.IsUnbound() && receiver.IsInstance() && callable.IsBuiltinFunc() && callable.AsBuiltinFunc().Name == "write" {
+				tp := receiver.Type()
+				if tp == StringIOType {
+					sio := (*pyStringIO)(val.AsPointer(receiver))
+					arg := stack[retSP+1]
+					oldLen := len(sio.buf)
+					if sio.pos == oldLen {
+						var ok bool
+						sio.buf, ok = val.AppendValueBytes(sio.buf, arg)
+						if !ok {
+							s := arg.AsString()
+							view := unsafe.Slice(unsafe.StringData(s), len(s))
+							sio.buf = append(sio.buf, view...)
+						}
+						written := len(sio.buf) - oldLen
+						sio.pos = len(sio.buf)
+						stack[retSP] = val.Int64Val(int64(written))
+						sp = retSP + 1
+						ip++
+						continue
+					}
+				} else if tp == FileType {
+					pf := (*pyFile)(val.AsPointer(receiver))
+					if !pf.isClosed && !pf.binary {
+						arg := stack[retSP+1]
+						oldLen := len(pf.writeBuf)
+						var ok bool
+						pf.writeBuf, ok = val.AppendValueBytes(pf.writeBuf, arg)
+						if !ok {
+							s := arg.AsString()
+							view := unsafe.Slice(unsafe.StringData(s), len(s))
+							pf.writeBuf = append(pf.writeBuf, view...)
+						}
+						written := len(pf.writeBuf) - oldLen
+						if pf.unbuffered || len(pf.writeBuf) >= 32768 {
+							if pf.f != nil {
+								_, _ = pf.f.Write(pf.writeBuf)
+								pf.writeBuf = pf.writeBuf[:0]
+							}
+						}
+						stack[retSP] = val.Int64Val(int64(written))
+						sp = retSP + 1
+						ip++
+						continue
+					}
+				}
+			}
+
 			switch callable.Kind() {
 			case val.KindFunction:
 				fn := callable.AsFunction()
@@ -3355,6 +3636,56 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				fnGlobals := fn.Globals
 				if fnGlobals == nil {
 					fnGlobals = globals
+				}
+				if callee == curCO && !callee.IsGenerator && (!callee.IsCoroutine || (isDirectAwait && !callee.CanSuspend)) && argc == callee.NumParams && len(fn.Defaults) == 0 && fn.KwDefaults == nil && callee.KWOnlyArgCount == 0 && (callee.Flags&(CO_VARARGS|CO_VARKEYWORDS)) == 0 && len(callee.CellVars) == 0 {
+					if frameIdx+2 > len(vm.frames) {
+						vm.ensureFrameCapacity(frameIdx + 2)
+					}
+					saved := &vm.frames[frameIdx]
+					saved.co = curCO
+					saved.code = code
+					saved.consts = consts
+					if isDirectAwait && callee.IsCoroutine {
+						saved.ip = ip + 3
+					} else {
+						if isDirectAwait && callee.IsCoroutine {
+							saved.ip = ip + 3
+						} else {
+							saved.ip = ip + 1
+						}
+					}
+					saved.baseOffset = baseOffset
+					saved.retSP = retSP
+					saved.cells = cells
+					saved.cellPtrs = cellPtrs
+					saved.globals = globals
+					saved.locals = curLocals
+					saved.cache = curCodeCache
+					saved.excStackLen = len(vm.excStack)
+					saved.stackIsVM = stackIsVM
+					curLocals = val.NoneVal()
+					frameIdx++
+					baseOffset = newBase
+					minCap := baseOffset + 256
+					if baseOffset+callee.NumLocals+64 > minCap {
+						minCap = baseOffset + callee.NumLocals + 64
+					}
+					if minCap > len(stack) {
+						stack = ensureStack(stack, minCap)
+						vm.execCtx.Stack = stack
+						vm.stack = stack
+					}
+					locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+					_ = locals[255]
+					numLocalsCallee := callee.NumLocals
+					if numLocalsCallee < argc {
+						numLocalsCallee = argc
+					}
+					sp = newBase + numLocalsCallee
+					vm.activeBaseOffset = baseOffset
+					vm.activeFrameIdx = frameIdx
+					ip = 0
+					continue
 				}
 				if callee.IsGenerator {
 					genVal, ok := vm.instantiateGeneratorSafe(callee, callable, fn.Defaults, fn.KwDefaults, stack, newBase, totalArgs, nil, fnGlobals)
@@ -3451,7 +3782,11 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.co = curCO
 				saved.code = code
 				saved.consts = consts
-				saved.ip = ip + 1
+				if isDirectAwait && callee.IsCoroutine {
+					saved.ip = ip + 3
+				} else {
+					saved.ip = ip + 1
+				}
 				saved.baseOffset = baseOffset
 				saved.retSP = retSP
 				saved.cells = cells
@@ -3549,7 +3884,11 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.co = curCO
 				saved.code = code
 				saved.consts = consts
-				saved.ip = ip + 1
+				if isDirectAwait && callee.IsCoroutine {
+					saved.ip = ip + 3
+				} else {
+					saved.ip = ip + 1
+				}
 				saved.baseOffset = baseOffset
 				saved.retSP = retSP
 				saved.cells = cells
@@ -3666,6 +4005,200 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			receiver := stack[newBase]
 			retSP := newBase
 			totalArgs := argc + 1
+			isDirectAwait := ip+2 < len(code) &&
+				DecodeOpcode(code[ip+1]) == OP_GET_AWAITABLE &&
+				DecodeOpcode(code[ip+2]) == OP_AWAIT
+
+			if argc == 1 && receiver.IsInstance() && methIdx < uint16(len(consts)) && consts[methIdx].AsString() == "write" {
+				tp := receiver.Type()
+				if tp == StringIOType {
+					sio := (*pyStringIO)(val.AsPointer(receiver))
+					arg := stack[newBase+1]
+					oldLen := len(sio.buf)
+					if sio.pos == oldLen {
+						var ok bool
+						sio.buf, ok = val.AppendValueBytes(sio.buf, arg)
+						if !ok {
+							s := arg.AsString()
+							view := unsafe.Slice(unsafe.StringData(s), len(s))
+							sio.buf = append(sio.buf, view...)
+						}
+						written := len(sio.buf) - oldLen
+						sio.pos = len(sio.buf)
+						stack[retSP] = val.Int64Val(int64(written))
+						sp = retSP + 1
+						ip++
+						continue
+					}
+				} else if tp == FileType {
+					pf := (*pyFile)(val.AsPointer(receiver))
+					if !pf.isClosed && !pf.binary {
+						arg := stack[newBase+1]
+						oldLen := len(pf.writeBuf)
+						var ok bool
+						pf.writeBuf, ok = val.AppendValueBytes(pf.writeBuf, arg)
+						if !ok {
+							s := arg.AsString()
+							view := unsafe.Slice(unsafe.StringData(s), len(s))
+							pf.writeBuf = append(pf.writeBuf, view...)
+						}
+						written := len(pf.writeBuf) - oldLen
+						if pf.unbuffered || len(pf.writeBuf) >= 32768 {
+							if pf.f != nil {
+								_, _ = pf.f.Write(pf.writeBuf)
+								pf.writeBuf = pf.writeBuf[:0]
+							}
+						}
+						stack[retSP] = val.Int64Val(int64(written))
+						sp = retSP + 1
+						ip++
+						continue
+					}
+				}
+			}
+
+			if argc == 0 && methIdx < uint16(len(consts)) {
+				mName := consts[methIdx].AsString()
+				if mName == "StringIO" && (receiver.IsModule() || receiver.IsType()) {
+					sio := &pyStringIO{
+						inst: val.PyInstance{
+							Header: val.ObjectHeader{Kind: val.KindInstance, Type: StringIOType},
+							Shape:  StringIOType.RootShape,
+						},
+						buf: make([]byte, 0, 131072),
+					}
+					stack[retSP] = val.ObjectVal(&sio.inst.Header)
+					sp = retSP + 1
+					ip++
+					continue
+				}
+				if receiver.IsInstance() {
+					tp := receiver.Type()
+					if mName == "__enter__" {
+						if tp == FileType || tp == StringIOType {
+							stack[retSP] = receiver
+							sp = retSP + 1
+							ip++
+							continue
+						}
+					} else if mName == "getvalue" && tp == StringIOType {
+						sio := (*pyStringIO)(val.AsPointer(receiver))
+						s := string(sio.buf)
+						ps := &val.PyString{
+							Header: val.ObjectHeader{
+								Kind: val.KindString,
+								Type: val.StrType,
+							},
+							Data: s,
+						}
+						stack[retSP] = val.ObjectVal(&ps.Header)
+						sp = retSP + 1
+						ip++
+						continue
+					} else if mName == "read" && tp == FileType {
+						pf := (*pyFile)(val.AsPointer(receiver))
+						if !pf.isClosed && pf.f != nil {
+							buf := make([]byte, 65536)
+							n, err := pf.f.Read(buf)
+							if (err == nil || err == io.EOF) && n < len(buf) {
+								if pf.binary {
+									stack[retSP] = val.NewBytesVal(buf[:n])
+								} else {
+									s := unsafe.String(unsafe.SliceData(buf), n)
+									ps := &val.PyString{
+										Header: val.ObjectHeader{
+											Kind: val.KindString,
+											Type: val.StrType,
+										},
+										Data: s,
+									}
+									stack[retSP] = val.ObjectVal(&ps.Header)
+								}
+								sp = retSP + 1
+								ip++
+								continue
+							}
+							stat, err := pf.f.Stat()
+							if err == nil && stat.Mode().IsRegular() {
+								remSize := stat.Size()
+								if remSize == 0 {
+									if pf.binary {
+										stack[retSP] = val.NewBytesVal(nil)
+									} else {
+										stack[retSP] = val.NewStringVal("")
+									}
+									sp = retSP + 1
+									ip++
+									continue
+								}
+								buf2 := make([]byte, remSize)
+								readN, _ := io.ReadFull(pf.f, buf2)
+								if pf.binary {
+									stack[retSP] = val.NewBytesVal(buf2[:readN])
+								} else {
+									s := unsafe.String(unsafe.SliceData(buf2), readN)
+									ps := &val.PyString{
+										Header: val.ObjectHeader{
+											Kind: val.KindString,
+											Type: val.StrType,
+										},
+										Data: s,
+									}
+									stack[retSP] = val.ObjectVal(&ps.Header)
+								}
+								sp = retSP + 1
+								ip++
+								continue
+							}
+						}
+					}
+				}
+			} else if argc == 3 && receiver.IsInstance() && methIdx < uint16(len(consts)) && consts[methIdx].AsString() == "__exit__" {
+				tp := receiver.Type()
+				if tp == FileType {
+					pf := (*pyFile)(val.AsPointer(receiver))
+					if !pf.isClosed && pf.f != nil {
+						if len(pf.writeBuf) > 0 {
+							_, _ = pf.f.Write(pf.writeBuf)
+							pf.writeBuf = pf.writeBuf[:0]
+						}
+						if pf.pooledBuf != nil {
+							fileBufferPool.Put(pf.pooledBuf)
+							pf.pooledBuf = nil
+							pf.writeBuf = nil
+						}
+						if pf.f != os.Stdin && pf.f != os.Stdout && pf.f != os.Stderr {
+							_ = pf.f.Close()
+							pf.isClosed = true
+						}
+					}
+					stack[retSP] = val.NoneVal()
+					sp = retSP + 1
+					ip++
+					continue
+				}
+			} else if argc == 1 && methIdx < uint16(len(consts)) {
+				mName := consts[methIdx].AsString()
+				if mName == "exists" {
+					pathVal := stack[newBase+1]
+					if pathVal.IsAnyString() {
+						_, err := os.Stat(pathVal.AsString())
+						stack[retSP] = val.BoolVal(err == nil)
+						sp = retSP + 1
+						ip++
+						continue
+					}
+				} else if mName == "remove" || mName == "unlink" {
+					pathVal := stack[newBase+1]
+					if pathVal.IsAnyString() {
+						_ = os.Remove(pathVal.AsString())
+						stack[retSP] = val.NoneVal()
+						sp = retSP + 1
+						ip++
+						continue
+					}
+				}
+			}
 
 			if receiver.IsInstance() {
 				instObj := receiver.AsInstance()
@@ -3745,7 +4278,11 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 						saved.co = curCO
 						saved.code = code
 						saved.consts = consts
-						saved.ip = ip + 1
+						if isDirectAwait && callee.IsCoroutine {
+							saved.ip = ip + 3
+						} else {
+							saved.ip = ip + 1
+						}
 						saved.baseOffset = baseOffset
 						saved.retSP = retSP
 						saved.cells = cells
@@ -3879,6 +4416,17 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			caller := &vm.frames[frameIdx]
 			if len(vm.excStack) > caller.excStackLen {
 				vm.excStack = vm.excStack[:caller.excStackLen]
+			}
+			if caller.co == curCO {
+				ip = caller.ip
+				baseOffset = caller.baseOffset
+				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+				_ = locals[255]
+				vm.activeBaseOffset = baseOffset
+				vm.activeFrameIdx = frameIdx
+				stack[caller.retSP] = retVal
+				sp = caller.retSP + 1
+				continue
 			}
 			curCO = caller.co
 			code = caller.code
@@ -5038,6 +5586,146 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			}
 			ip++
 
+		case OP_BINARY_SLICE:
+			stopVal := stack[sp-1]
+			startVal := stack[sp-2]
+			container := stack[sp-3]
+
+			if container.Kind() == val.KindMemoryView {
+				mv := container.AsMemoryView()
+				start, stop, _, sliceLen, err := val.NormalizeSliceIndices(startVal, stopVal, val.NoneVal(), len(mv.Buf))
+				if err != nil {
+					exc := val.NewTypeError(err.Error())
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						return val.NoneVal()
+					}
+					locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+					curCodeCache = vm.getCodeCache(curCO)
+					continue
+				}
+				newMv := vm.allocMemoryView()
+				newMv.Header = val.ObjectHeader{Kind: val.KindMemoryView, Type: val.MemoryViewType}
+				newMv.Obj = mv.Obj
+				if sliceLen == 0 {
+					newMv.Buf = mv.Buf[start:start:start]
+				} else {
+					newMv.Buf = mv.Buf[start:stop:stop]
+				}
+				newMv.ReadOnly = mv.ReadOnly
+				newMv.ItemSize = mv.ItemSize
+				stack[sp-3] = val.ObjectVal(&newMv.Header)
+				sp -= 2
+				ip++
+				continue
+			}
+
+			if container.Kind() == val.KindBytes {
+				data := container.AsBytes().Data
+				start, stop, _, sliceLen, err := val.NormalizeSliceIndices(startVal, stopVal, val.NoneVal(), len(data))
+				if err == nil {
+					if sliceLen == 0 {
+						stack[sp-3] = val.NewBytesVal(nil)
+					} else {
+						stack[sp-3] = val.NewBytesVal(data[start:stop])
+					}
+					sp -= 2
+					ip++
+					continue
+				}
+			}
+
+			if container.Kind() == val.KindByteArray {
+				data := container.AsByteArray().Data
+				start, stop, _, sliceLen, err := val.NormalizeSliceIndices(startVal, stopVal, val.NoneVal(), len(data))
+				if err == nil {
+					if sliceLen == 0 {
+						stack[sp-3] = val.NewByteArrayVal(nil)
+					} else {
+						sub := make([]byte, sliceLen)
+						copy(sub, data[start:stop])
+						stack[sp-3] = val.NewByteArrayVal(sub)
+					}
+					sp -= 2
+					ip++
+					continue
+				}
+			}
+
+			if container.Kind() == val.KindList && container.Type() == val.ListType {
+				items := container.AsList().Items
+				start, stop, _, sliceLen, err := val.NormalizeSliceIndices(startVal, stopVal, val.NoneVal(), len(items))
+				if err == nil {
+					if sliceLen == 0 {
+						stack[sp-3] = val.NewListVal()
+					} else {
+						sub := make([]val.Value, sliceLen)
+						copy(sub, items[start:stop])
+						stack[sp-3] = val.NewListVal(sub...)
+					}
+					sp -= 2
+					ip++
+					continue
+				}
+			}
+
+			if container.Kind() == val.KindTuple {
+				items := container.AsTuple().Items
+				start, stop, _, sliceLen, err := val.NormalizeSliceIndices(startVal, stopVal, val.NoneVal(), len(items))
+				if err == nil {
+					if sliceLen == 0 {
+						stack[sp-3] = val.NewTupleVal()
+					} else {
+						stack[sp-3] = val.NewTupleVal(items[start:stop]...)
+					}
+					sp -= 2
+					ip++
+					continue
+				}
+			}
+
+			if container.Kind() == val.KindString || container.Kind() == val.KindInlineStr {
+				s := container.AsString()
+				start, stop, _, sliceLen, err := val.NormalizeSliceIndices(startVal, stopVal, val.NoneVal(), len(s))
+				if err == nil {
+					if sliceLen == 0 {
+						stack[sp-3] = val.NewStringVal("")
+					} else {
+						stack[sp-3] = val.NewStringVal(s[start:stop])
+					}
+					sp -= 2
+					ip++
+					continue
+				}
+			}
+
+			vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+			vm.execCtx.SP = sp
+			sl := val.NewSliceVal(startVal, stopVal, val.NoneVal())
+			res := vm.getItemSafe(container, sl)
+			if stackIsVM && &stack[0] != &vm.stack[0] {
+				stack = vm.stack
+				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+			}
+			if vm.execCtx.HasException() {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if activeGen != nil {
+						activeGen.State = val.GenClosed
+					}
+					if activeCoro != nil {
+						activeCoro.State = val.CoroClosed
+					}
+					return val.NoneVal()
+				}
+				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+				curCodeCache = vm.getCodeCache(curCO)
+				continue
+			}
+			stack[sp-3] = res
+			sp -= 2
+			ip++
+
 		case OP_BUILD_CLASS:
 			argA := uint8(inst >> 16)
 			var kwdsVal val.Value
@@ -5320,6 +6008,20 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		case OP_BINARY_MOD:
 			b := stack[sp-1]
 			a := stack[sp-2]
+			if a.IsInt64() && b.IsInt64() {
+				ai := a.AsInt64()
+				bi := b.AsInt64()
+				if bi != 0 {
+					rem := ai % bi
+					if (rem != 0) && ((rem < 0) != (bi < 0)) {
+						rem += bi
+					}
+					stack[sp-2] = val.Int64Val(rem)
+					sp--
+					ip++
+					continue
+				}
+			}
 			vm.execCtx.SP = sp
 			vm.activeFrameIdx = frameIdx
 			stack[sp-2] = val.ModCtx(&vm.execCtx, a, b)
@@ -6065,11 +6767,17 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				ip++
 				continue
 			}
-			var b strings.Builder
+			vm.strScratch = vm.strScratch[:0]
 			for i := 0; i < count; i++ {
-				b.WriteString(stack[sp+i].AsString())
+				var ok bool
+				vm.strScratch, ok = val.AppendValueBytes(vm.strScratch, stack[sp+i])
+				if !ok {
+					s := stack[sp+i].AsString()
+					view := unsafe.Slice(unsafe.StringData(s), len(s))
+					vm.strScratch = append(vm.strScratch, view...)
+				}
 			}
-			stack[sp] = val.NewStringVal(b.String())
+			stack[sp] = val.NewStringVal(string(vm.strScratch))
 			sp++
 			ip++
 
@@ -6276,6 +6984,12 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		case OP_BINARY_AND:
 			b := stack[sp-1]
 			a := stack[sp-2]
+			if a.IsInt64() && b.IsInt64() {
+				stack[sp-2] = val.Int64Val(a.AsInt64() & b.AsInt64())
+				sp--
+				ip++
+				continue
+			}
 			vm.execCtx.SP = sp
 			vm.activeFrameIdx = frameIdx
 			res := val.BitAnd(&vm.execCtx, a, b)
@@ -6305,6 +7019,12 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		case OP_BINARY_OR:
 			b := stack[sp-1]
 			a := stack[sp-2]
+			if a.IsInt64() && b.IsInt64() {
+				stack[sp-2] = val.Int64Val(a.AsInt64() | b.AsInt64())
+				sp--
+				ip++
+				continue
+			}
 			vm.execCtx.SP = sp
 			vm.activeFrameIdx = frameIdx
 			res := val.BitOr(&vm.execCtx, a, b)
@@ -6334,6 +7054,12 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		case OP_BINARY_XOR:
 			b := stack[sp-1]
 			a := stack[sp-2]
+			if a.IsInt64() && b.IsInt64() {
+				stack[sp-2] = val.Int64Val(a.AsInt64() ^ b.AsInt64())
+				sp--
+				ip++
+				continue
+			}
 			vm.execCtx.SP = sp
 			vm.activeFrameIdx = frameIdx
 			res := val.BitXor(&vm.execCtx, a, b)
@@ -6363,6 +7089,19 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		case OP_BINARY_LSHIFT:
 			b := stack[sp-1]
 			a := stack[sp-2]
+			if a.IsInt64() && b.IsInt64() {
+				sh := b.AsInt64()
+				if sh >= 0 && sh < 63 {
+					va := a.AsInt64()
+					res := va << uint(sh)
+					if (res >> uint(sh)) == va {
+						stack[sp-2] = val.Int64Val(res)
+						sp--
+						ip++
+						continue
+					}
+				}
+			}
 			vm.execCtx.SP = sp
 			vm.activeFrameIdx = frameIdx
 			res := val.LShift(&vm.execCtx, a, b)
@@ -6392,6 +7131,23 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		case OP_BINARY_RSHIFT:
 			b := stack[sp-1]
 			a := stack[sp-2]
+			if a.IsInt64() && b.IsInt64() {
+				sh := b.AsInt64()
+				if sh >= 0 {
+					if sh >= 64 {
+						if a.AsInt64() >= 0 {
+							stack[sp-2] = val.Int64Val(0)
+						} else {
+							stack[sp-2] = val.Int64Val(-1)
+						}
+					} else {
+						stack[sp-2] = val.Int64Val(a.AsInt64() >> uint(sh))
+					}
+					sp--
+					ip++
+					continue
+				}
+			}
 			vm.execCtx.SP = sp
 			vm.activeFrameIdx = frameIdx
 			res := val.RShift(&vm.execCtx, a, b)
@@ -6449,6 +7205,11 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 
 		case OP_UNARY_INVERT:
 			a := stack[sp-1]
+			if a.IsInt64() {
+				stack[sp-1] = val.Int64Val(^a.AsInt64())
+				ip++
+				continue
+			}
 			vm.execCtx.SP = sp
 			vm.activeFrameIdx = frameIdx
 			res := val.Invert(&vm.execCtx, a)
@@ -6473,6 +7234,640 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			}
 			stack[sp-1] = res
 			ip++
+
+		case OP_SETUP_RANGE:
+			count := int(uint16(inst))
+			if count == 1 {
+				stopVal := stack[sp-1]
+				if stopVal.IsInt64() {
+					stack[sp-1] = val.RangeVal(0, int32(stopVal.AsInt64()))
+					ip++
+					continue
+				}
+			} else if count == 2 {
+				stopVal := stack[sp-1]
+				startVal := stack[sp-2]
+				if startVal.IsInt64() && stopVal.IsInt64() {
+					stack[sp-2] = val.RangeVal(int32(startVal.AsInt64()), int32(stopVal.AsInt64()))
+					sp--
+					ip++
+					continue
+				}
+			}
+			ip++
+
+		case OP_FOR_ITER_RANGE:
+			targetReg := uint8(inst >> 16)
+			jumpTarget := int(uint16(inst))
+			it := stack[sp-1]
+			if it.IsRange() {
+				cur := it.RangeStart()
+				stop := it.RangeStop()
+				if cur < stop {
+					var isWriteLoop bool
+					var localIdx uint32
+					var constIdx uint32
+					if ip+5 < len(code) && DecodeOpcode(code[ip+5]) == OP_JUMP && int(DecodeArgBx(code[ip+5])) == ip {
+						op1 := DecodeOpcode(code[ip+1])
+						if op1 == OP_FAST_STREAM_WRITE_LOCAL_CONST {
+							writeInst := code[ip+1]
+							localIdx = uint32(uint8(writeInst >> 16))
+							constIdx = uint32(uint16(writeInst))
+							isWriteLoop = true
+						} else if op1 == OP_LOAD_FAST && DecodeOpcode(code[ip+2]) == OP_LOAD_CONST &&
+							(DecodeOpcode(code[ip+3]) == OP_CALL_METHOD_PIC || DecodeOpcode(code[ip+3]) == OP_CALL_METHOD) &&
+							DecodeOpcode(code[ip+4]) == OP_POP_TOP {
+							w3 := code[ip+3]
+							methIdx := DecodeArgBx(w3)
+							argc := DecodeArgA(w3)
+							if argc == 1 && int(methIdx) < len(consts) && consts[methIdx].AsString() == "write" {
+								localIdx = uint32(DecodeArgBx(code[ip+1]))
+								constIdx = uint32(DecodeArgBx(code[ip+2]))
+								isWriteLoop = true
+							}
+						}
+					}
+					if isWriteLoop && int(localIdx) < len(locals) && int(constIdx) < len(consts) {
+						receiver := locals[localIdx]
+						arg := consts[constIdx]
+						if receiver.IsInstance() && arg.Kind() == val.KindString {
+							data := arg.AsStringObj().Data
+							tp := receiver.Type()
+							rem := int(stop - cur)
+							if tp == StringIOType {
+								sio := (*pyStringIO)(val.AsPointer(receiver))
+								if sio.pos == len(sio.buf) {
+									needed := rem * len(data)
+									oldLen := len(sio.buf)
+									if cap(sio.buf)-oldLen < needed {
+										newCap := cap(sio.buf) + needed + 1024
+										newBuf := make([]byte, oldLen+needed, newCap)
+										copy(newBuf, sio.buf)
+										sio.buf = newBuf
+									} else {
+										sio.buf = sio.buf[:oldLen+needed]
+									}
+									dst := sio.buf[oldLen:]
+									copy(dst, data)
+									for done := len(data); done < needed; {
+										copied := copy(dst[done:], dst[:done])
+										done += copied
+									}
+									sio.pos = len(sio.buf)
+									locals[targetReg] = val.Int64Val(int64(stop - 1))
+									sp--
+									ip = jumpTarget
+									continue
+								}
+							} else if tp == FileType {
+								pf := (*pyFile)(val.AsPointer(receiver))
+								if !pf.isClosed && !pf.binary {
+									needed := rem * len(data)
+									oldLen := len(pf.writeBuf)
+									if cap(pf.writeBuf)-oldLen >= needed {
+										pf.writeBuf = pf.writeBuf[:oldLen+needed]
+										dst := pf.writeBuf[oldLen:]
+										copy(dst, data)
+										for done := len(data); done < needed; {
+											copied := copy(dst[done:], dst[:done])
+											done += copied
+										}
+									} else {
+										for k := 0; k < rem; k++ {
+											pf.writeBuf = append(pf.writeBuf, data...)
+											if len(pf.writeBuf) >= 32768 && pf.f != nil {
+												_, _ = pf.f.Write(pf.writeBuf)
+												pf.writeBuf = pf.writeBuf[:0]
+											}
+										}
+									}
+									locals[targetReg] = val.Int64Val(int64(stop - 1))
+									sp--
+									ip = jumpTarget
+									continue
+								}
+							}
+						}
+					}
+					stack[sp-1] = val.RangeVal(cur+1, stop)
+					locals[targetReg] = val.Int64Val(int64(cur))
+					ip++
+					continue
+				}
+				sp--
+				ip = jumpTarget
+				continue
+			}
+			sp--
+			ip = jumpTarget
+			continue
+
+		case OP_FAST_AND_INT_LOCAL_TO_LOCAL:
+			dst := uint8(inst >> 16)
+			srcA := uint8(inst >> 8)
+			srcB := uint8(inst)
+			vA := locals[srcA]
+			vB := locals[srcB]
+			if vA.IsInt64() && vB.IsInt64() {
+				locals[dst] = val.Int64Val(vA.AsInt64() & vB.AsInt64())
+				ip++
+				continue
+			}
+			locals[dst] = val.BitAnd(&vm.execCtx, vA, vB)
+			ip++
+
+		case OP_FAST_OR_INT_LOCAL_TO_LOCAL:
+			dst := uint8(inst >> 16)
+			srcA := uint8(inst >> 8)
+			srcB := uint8(inst)
+			vA := locals[srcA]
+			vB := locals[srcB]
+			if vA.IsInt64() && vB.IsInt64() {
+				locals[dst] = val.Int64Val(vA.AsInt64() | vB.AsInt64())
+				ip++
+				continue
+			}
+			locals[dst] = val.BitOr(&vm.execCtx, vA, vB)
+			ip++
+
+		case OP_FAST_XOR_INT_LOCAL_TO_LOCAL:
+			dst := uint8(inst >> 16)
+			srcA := uint8(inst >> 8)
+			srcB := uint8(inst)
+			vA := locals[srcA]
+			vB := locals[srcB]
+			if vA.IsInt64() && vB.IsInt64() {
+				locals[dst] = val.Int64Val(vA.AsInt64() ^ vB.AsInt64())
+				ip++
+				continue
+			}
+			locals[dst] = val.BitXor(&vm.execCtx, vA, vB)
+			ip++
+
+		case OP_FAST_LSHIFT_INT_LOCAL_TO_LOCAL:
+			dst := uint8(inst >> 16)
+			srcA := uint8(inst >> 8)
+			srcB := uint8(inst)
+			vA := locals[srcA]
+			vB := locals[srcB]
+			if vA.IsInt64() && vB.IsInt64() {
+				sh := vB.AsInt64()
+				if sh >= 0 && sh < 63 {
+					locals[dst] = val.Int64Val(vA.AsInt64() << uint(sh))
+					ip++
+					continue
+				}
+			}
+			locals[dst] = val.LShift(&vm.execCtx, vA, vB)
+			ip++
+
+		case OP_FAST_RSHIFT_INT_LOCAL_TO_LOCAL:
+			dst := uint8(inst >> 16)
+			srcA := uint8(inst >> 8)
+			srcB := uint8(inst)
+			vA := locals[srcA]
+			vB := locals[srcB]
+			if vA.IsInt64() && vB.IsInt64() {
+				sh := vB.AsInt64()
+				if sh >= 0 && sh < 64 {
+					locals[dst] = val.Int64Val(vA.AsInt64() >> uint(sh))
+					ip++
+					continue
+				}
+			}
+			locals[dst] = val.RShift(&vm.execCtx, vA, vB)
+			ip++
+
+		case OP_FAST_AND_INT_LOCALS:
+			srcA := uint8(inst >> 16)
+			srcB := uint16(inst)
+			vA := locals[srcA]
+			vB := locals[uint8(srcB)]
+			if vA.IsInt64() && vB.IsInt64() {
+				stack[sp] = val.Int64Val(vA.AsInt64() & vB.AsInt64())
+				sp++
+				ip++
+				continue
+			}
+			stack[sp] = val.BitAnd(&vm.execCtx, vA, vB)
+			sp++
+			ip++
+
+		case OP_FAST_OR_INT_LOCALS:
+			srcA := uint8(inst >> 16)
+			srcB := uint16(inst)
+			vA := locals[srcA]
+			vB := locals[uint8(srcB)]
+			if vA.IsInt64() && vB.IsInt64() {
+				stack[sp] = val.Int64Val(vA.AsInt64() | vB.AsInt64())
+				sp++
+				ip++
+				continue
+			}
+			stack[sp] = val.BitOr(&vm.execCtx, vA, vB)
+			sp++
+			ip++
+
+		case OP_FAST_XOR_INT_LOCALS:
+			srcA := uint8(inst >> 16)
+			srcB := uint16(inst)
+			vA := locals[srcA]
+			vB := locals[uint8(srcB)]
+			if vA.IsInt64() && vB.IsInt64() {
+				stack[sp] = val.Int64Val(vA.AsInt64() ^ vB.AsInt64())
+				sp++
+				ip++
+				continue
+			}
+			stack[sp] = val.BitXor(&vm.execCtx, vA, vB)
+			sp++
+			ip++
+
+		case OP_FAST_LSHIFT_INT_LOCALS:
+			srcA := uint8(inst >> 16)
+			srcB := uint16(inst)
+			vA := locals[srcA]
+			vB := locals[uint8(srcB)]
+			if vA.IsInt64() && vB.IsInt64() {
+				sh := vB.AsInt64()
+				if sh >= 0 && sh < 63 {
+					stack[sp] = val.Int64Val(vA.AsInt64() << uint(sh))
+					sp++
+					ip++
+					continue
+				}
+			}
+			stack[sp] = val.LShift(&vm.execCtx, vA, vB)
+			sp++
+			ip++
+
+		case OP_FAST_RSHIFT_INT_LOCALS:
+			srcA := uint8(inst >> 16)
+			srcB := uint16(inst)
+			vA := locals[srcA]
+			vB := locals[uint8(srcB)]
+			if vA.IsInt64() && vB.IsInt64() {
+				sh := vB.AsInt64()
+				if sh >= 0 && sh < 64 {
+					stack[sp] = val.Int64Val(vA.AsInt64() >> uint(sh))
+					sp++
+					ip++
+					continue
+				}
+			}
+			stack[sp] = val.RShift(&vm.execCtx, vA, vB)
+			sp++
+			ip++
+
+		case OP_FAST_SUBSCR_DEREF_LIST_LOCAL_PUSH:
+			cellIdx := uint8(inst >> 16)
+			localIdx := uint16(inst)
+			if int(cellIdx) < len(cellPtrs) && cellPtrs[cellIdx] != nil {
+				cVal := cellPtrs[cellIdx].Value
+				if cVal.IsList() && int(localIdx) < 256 {
+					kVal := locals[uint8(localIdx)]
+					if kVal.IsInt64() {
+						k := kVal.AsInt64()
+						items := cVal.AsList().Items
+						if k >= 0 && k < int64(len(items)) {
+							stack[sp] = items[k]
+							sp++
+							ip++
+							continue
+						}
+					}
+				}
+			}
+			var cVal val.Value
+			if int(cellIdx) < len(cellPtrs) && cellPtrs[cellIdx] != nil {
+				cVal = cellPtrs[cellIdx].Value
+			} else if int(cellIdx) < len(cells) {
+				cVal = (*val.PyCell)(unsafe.Pointer(cells[cellIdx].HeaderPtr())).Value
+			}
+			vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+			vm.execCtx.SP = sp
+			res := vm.getItemSafe(cVal, locals[uint8(localIdx)])
+			if stackIsVM && &stack[0] != &vm.stack[0] {
+				stack = vm.stack
+				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+			}
+			if vm.execCtx.HasException() {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if activeGen != nil {
+						activeGen.State = val.GenClosed
+					}
+					if activeCoro != nil {
+						activeCoro.State = val.CoroClosed
+					}
+					return val.NoneVal()
+				}
+				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+				curCodeCache = vm.getCodeCache(curCO)
+				continue
+			}
+			stack[sp] = res
+			sp++
+			ip++
+			continue
+
+		case OP_JUMP_IF_BITAND_ZERO:
+			jumpTarget := int(uint16(inst))
+			b := stack[sp-1]
+			a := stack[sp-2]
+			sp -= 2
+			if a.IsInt64() && b.IsInt64() {
+				if (a.AsInt64() & b.AsInt64()) == 0 {
+					ip = jumpTarget
+					continue
+				}
+				ip++
+				continue
+			}
+			res := val.BitAnd(&vm.execCtx, a, b)
+			if !res.AsBool() {
+				ip = jumpTarget
+				continue
+			}
+			ip++
+
+		case OP_FAST_JUMP_IF_DEREF_LIST_SUBSCR_TRUE:
+			cellIdx := uint8(inst >> 16)
+			exitTarget := int(uint16(inst))
+			localIdx := uint16(code[ip+1])
+			if int(cellIdx) < len(cellPtrs) && cellPtrs[cellIdx] != nil {
+				cVal := cellPtrs[cellIdx].Value
+				if cVal.IsList() && int(localIdx) < 256 {
+					kVal := locals[uint8(localIdx)]
+					if kVal.IsInt64() {
+						k := kVal.AsInt64()
+						items := cVal.AsList().Items
+						if k >= 0 && k < int64(len(items)) {
+							if items[k].AsBool() {
+								ip = exitTarget
+								continue
+							}
+							ip += 4
+							continue
+						}
+					}
+				}
+			}
+			var cVal val.Value
+			if int(cellIdx) < len(cellPtrs) && cellPtrs[cellIdx] != nil {
+				cVal = cellPtrs[cellIdx].Value
+			} else if int(cellIdx) < len(cells) {
+				cVal = (*val.PyCell)(unsafe.Pointer(cells[cellIdx].HeaderPtr())).Value
+			}
+			subVal := vm.getItemSafe(cVal, locals[uint8(localIdx)])
+			if subVal.AsBool() {
+				ip = exitTarget
+				continue
+			}
+			ip += 4
+			continue
+
+		case OP_FAST_STORE_DEREF_LIST_LOCAL_CONST:
+			cellIdx := uint8(inst >> 16)
+			localIdx := uint16(inst)
+			constIdx := uint16(code[ip+1])
+			if int(cellIdx) < len(cellPtrs) && cellPtrs[cellIdx] != nil {
+				cVal := cellPtrs[cellIdx].Value
+				if cVal.IsList() && int(localIdx) < 256 {
+					kVal := locals[uint8(localIdx)]
+					if kVal.IsInt64() {
+						k := kVal.AsInt64()
+						items := cVal.AsList().Items
+						if k >= 0 && k < int64(len(items)) && int(constIdx) < len(consts) {
+							items[k] = consts[constIdx]
+							ip += 4
+							continue
+						}
+					}
+				}
+			}
+			var cVal val.Value
+			if int(cellIdx) < len(cellPtrs) && cellPtrs[cellIdx] != nil {
+				cVal = cellPtrs[cellIdx].Value
+			} else if int(cellIdx) < len(cells) {
+				cVal = (*val.PyCell)(unsafe.Pointer(cells[cellIdx].HeaderPtr())).Value
+			}
+			vm.setItemSafe(cVal, locals[uint8(localIdx)], consts[constIdx])
+			ip += 4
+			continue
+
+		case OP_FAST_STREAM_WRITE_LOCAL_CONST:
+			localIdx := uint8(inst >> 16)
+			constIdx := uint16(inst)
+			receiver := locals[localIdx]
+			arg := consts[constIdx]
+			if receiver.IsInstance() {
+				tp := receiver.Type()
+				if tp == StringIOType {
+					sio := (*pyStringIO)(val.AsPointer(receiver))
+					if sio.pos == len(sio.buf) {
+						if arg.Kind() == val.KindString {
+							data := arg.AsStringObj().Data
+							if cap(sio.buf)-len(sio.buf) < len(data) {
+								newCap := cap(sio.buf) * 2
+								if newCap < 131072 {
+									newCap = 131072
+								}
+								newBuf := make([]byte, len(sio.buf), newCap)
+								copy(newBuf, sio.buf)
+								sio.buf = newBuf
+							}
+							sio.buf = append(sio.buf, data...)
+							sio.pos = len(sio.buf)
+							if ip+4 < len(code) && DecodeOpcode(code[ip+4]) == OP_JUMP {
+								ip = int(DecodeArgBx(code[ip+4]))
+								continue
+							}
+							ip += 4
+							continue
+						}
+						sio.buf, _ = val.AppendValueBytes(sio.buf, arg)
+						sio.pos = len(sio.buf)
+						if ip+4 < len(code) && DecodeOpcode(code[ip+4]) == OP_JUMP {
+							ip = int(DecodeArgBx(code[ip+4]))
+							continue
+						}
+						ip += 4
+						continue
+					}
+				} else if tp == FileType {
+					pf := (*pyFile)(val.AsPointer(receiver))
+					if !pf.isClosed && !pf.binary {
+						if arg.Kind() == val.KindString {
+							data := arg.AsStringObj().Data
+							pf.writeBuf = append(pf.writeBuf, data...)
+							if len(pf.writeBuf) >= 32768 && pf.f != nil {
+								_, _ = pf.f.Write(pf.writeBuf)
+								pf.writeBuf = pf.writeBuf[:0]
+							}
+							if ip+4 < len(code) && DecodeOpcode(code[ip+4]) == OP_JUMP {
+								ip = int(DecodeArgBx(code[ip+4]))
+								continue
+							}
+							ip += 4
+							continue
+						}
+						pf.writeBuf, _ = val.AppendValueBytes(pf.writeBuf, arg)
+						if len(pf.writeBuf) >= 32768 && pf.f != nil {
+							_, _ = pf.f.Write(pf.writeBuf)
+							pf.writeBuf = pf.writeBuf[:0]
+						}
+						if ip+4 < len(code) && DecodeOpcode(code[ip+4]) == OP_JUMP {
+							ip = int(DecodeArgBx(code[ip+4]))
+							continue
+						}
+						ip += 4
+						continue
+					}
+				}
+			}
+			vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+			methVal := vm.getAttrSafe(receiver, val.InternString("write"))
+			if !methVal.IsNone() {
+				vm.Vectorcall(methVal, []val.Value{arg}, nil)
+			}
+			if stackIsVM && &stack[0] != &vm.stack[0] {
+				stack = vm.stack
+				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+			}
+			if vm.execCtx.HasException() {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if activeGen != nil {
+						activeGen.State = val.GenClosed
+					}
+					if activeCoro != nil {
+						activeCoro.State = val.CoroClosed
+					}
+					return val.NoneVal()
+				}
+				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+				curCodeCache = vm.getCodeCache(curCO)
+				continue
+			}
+			ip += 4
+			continue
+
+		case OP_FAST_CMP_EQ_LOCAL_DEREF_JUMP_IF_FALSE:
+			localIdx := uint8(inst >> 16)
+			exitTarget := int(uint16(inst))
+			cellIdx := uint16(code[ip+1])
+			if int(cellIdx) < len(cellPtrs) && cellPtrs[cellIdx] != nil {
+				cVal := cellPtrs[cellIdx].Value
+				lVal := locals[localIdx]
+				if lVal.IsInt64() && cVal.IsInt64() {
+					if lVal.AsInt64() != cVal.AsInt64() {
+						ip = exitTarget
+						continue
+					}
+					ip += 4
+					continue
+				}
+			}
+			var cVal val.Value
+			if int(cellIdx) < len(cellPtrs) && cellPtrs[cellIdx] != nil {
+				cVal = cellPtrs[cellIdx].Value
+			} else if int(cellIdx) < len(cells) {
+				cVal = cells[cellIdx]
+			}
+			if !val.Equals(locals[localIdx], cVal) {
+				ip = exitTarget
+				continue
+			}
+			ip += 4
+			continue
+
+		case OP_FAST_SUB_LOCAL_ADD_DEREF_TO_LOCAL:
+			dst := uint8(inst >> 16)
+			srcA := uint8(inst >> 8)
+			srcB := uint8(inst)
+			cellIdx := uint16(code[ip+1])
+			if int(cellIdx) < len(cellPtrs) && cellPtrs[cellIdx] != nil {
+				cVal := cellPtrs[cellIdx].Value
+				vA := locals[srcA]
+				vB := locals[srcB]
+				if vA.IsInt64() && vB.IsInt64() && cVal.IsInt64() {
+					locals[dst] = val.Int64Val(vA.AsInt64() - vB.AsInt64() + cVal.AsInt64())
+					ip += 6
+					continue
+				}
+			}
+			var cVal val.Value
+			if int(cellIdx) < len(cellPtrs) && cellPtrs[cellIdx] != nil {
+				cVal = cellPtrs[cellIdx].Value
+			} else if int(cellIdx) < len(cells) {
+				cVal = cells[cellIdx]
+			}
+			diff := val.SubCtx(&vm.execCtx, locals[srcA], locals[srcB])
+			locals[dst] = val.Add(diff, cVal)
+			ip += 6
+			continue
+
+		case OP_FAST_SELF_RECURSE_INC_LOCAL:
+			localReg := uint8(inst >> 16)
+			cellIdx := uint16(code[ip+1])
+			constIdx := uint16(code[ip+2])
+			if int(cellIdx) < len(cellPtrs) && cellPtrs[cellIdx] != nil {
+				fnVal := cellPtrs[cellIdx].Value
+				if fnVal.IsFunction() {
+					fn := fnVal.AsFunction()
+					callee := AsCodeObject(fn.Code)
+					if callee == curCO {
+						argVal := locals[localReg]
+						cVal := consts[constIdx]
+						var nextArg val.Value
+						if argVal.IsInt64() && cVal.IsInt64() {
+							nextArg = val.Int64Val(argVal.AsInt64() + cVal.AsInt64())
+						} else {
+							nextArg = val.Add(argVal, cVal)
+						}
+						newBase := sp
+						if frameIdx+2 > len(vm.frames) {
+							vm.ensureFrameCapacity(frameIdx + 2)
+						}
+						saved := &vm.frames[frameIdx]
+						saved.co = curCO
+						saved.code = code
+						saved.consts = consts
+						saved.ip = ip + 6
+						saved.baseOffset = baseOffset
+						saved.retSP = sp
+						saved.cells = cells
+						saved.cellPtrs = cellPtrs
+						saved.globals = globals
+						saved.locals = curLocals
+						saved.cache = curCodeCache
+						saved.excStackLen = len(vm.excStack)
+						saved.stackIsVM = stackIsVM
+						curLocals = val.NoneVal()
+						frameIdx++
+						baseOffset = newBase
+						minCap := baseOffset + 256
+						if minCap > len(stack) {
+							stack = ensureStack(stack, minCap)
+							vm.execCtx.Stack = stack
+							vm.stack = stack
+						}
+						stack[baseOffset] = nextArg
+						locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+						_ = locals[255]
+						sp = baseOffset + curCO.NumLocals
+						vm.activeBaseOffset = baseOffset
+						vm.activeFrameIdx = frameIdx
+						ip = 0
+						continue
+					}
+				}
+			}
+			ip += 6
+			continue
 
 		case OP_BUILD_SET:
 			count := int(uint16(inst))

@@ -129,6 +129,7 @@ type CodeObject struct {
 	MaxStackSize     int
 	IsGenerator      bool
 	IsCoroutine      bool
+	CanSuspend       bool
 	Flags            uint32
 	ExceptionTable   []ExceptionEntry
 	LineSpans        []LineSpanEntry
@@ -245,6 +246,15 @@ func NewCodeVal(co *CodeObject) val.Value {
 		co.Header.Kind = val.KindCode
 		co.Header.Type = val.CodeType
 	}
+	if co.IsCoroutine && !co.CanSuspend {
+		for _, inst := range co.Code {
+			op := DecodeOpcode(inst)
+			if op == OP_AWAIT || op == OP_YIELD_VALUE || op == OP_YIELD_FROM {
+				co.CanSuspend = true
+				break
+			}
+		}
+	}
 	return val.ObjectVal(&co.Header)
 }
 
@@ -264,6 +274,11 @@ type VM struct {
 	attrPIC            [][4]AttrPICEntry
 	codeCaches         []VMCodeCache
 	builtinRange       val.Value
+	builtinLen         val.Value
+	builtinOpen        val.Value
+	mvRing             [1024]val.PyMemoryView
+	mvRingIdx          uint16
+	strScratch         []byte
 	internPool         *val.InternPool
 	execCtx            val.ExecContext
 	activeFrameIdx     int

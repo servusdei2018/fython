@@ -753,17 +753,25 @@ func (e *Engine) newVMInternal(stackCap, frameCap int) *VM {
 		modules, pthImports = e.newSysModulesWithDiscovery()
 	}
 	v := &VM{
-		engine:     e,
-		stack:      make([]val.Value, stackCap),
-		frames:     make([]CallFrame, frameCap),
-		ic:         make([]ICSlot, DefaultICSlabSize),
-		methodPIC:  make([][4]val.MethodPICEntry, DefaultICSlabSize),
-		attrPIC:    make([][4]AttrPICEntry, DefaultICSlabSize),
-		internPool: e.internPool,
-		globals:    val.NewDictVal(64).AsDict(),
-		builtins:   e.builtins,
-		modules:    modules,
-		context:    val.NewPyContext(),
+		engine:       e,
+		stack:        make([]val.Value, stackCap),
+		frames:       make([]CallFrame, frameCap),
+		ic:           make([]ICSlot, DefaultICSlabSize),
+		methodPIC:    make([][4]val.MethodPICEntry, DefaultICSlabSize),
+		attrPIC:      make([][4]AttrPICEntry, DefaultICSlabSize),
+		internPool:   e.internPool,
+		globals:      val.NewDictVal(64).AsDict(),
+		builtins:     e.builtins,
+		modules:      modules,
+		context:      val.NewPyContext(),
+		builtinRange: val.TypeVal(val.RangeType),
+		strScratch:   make([]byte, 0, 1024),
+	}
+	if lenVal, ok := e.builtins.Get(val.InternString("len")); ok {
+		v.builtinLen = lenVal
+	}
+	if openVal, ok := e.builtins.Get(val.InternString("open")); ok {
+		v.builtinOpen = openVal
 	}
 	v.rootCache = VMCodeCache{
 		ic:        v.ic,

@@ -104,11 +104,7 @@ func AppendValueBytes(dst []byte, v Value) ([]byte, bool) {
 	}
 	if v.ptr != nil && v.ptr.Kind == KindString {
 		ps := (*PyString)(unsafe.Pointer(v.ptr))
-		if len(ps.Data) > 0 {
-			view := unsafe.Slice(unsafe.StringData(ps.Data), len(ps.Data))
-			dst = append(dst, view...)
-		}
-		return dst, true
+		return append(dst, ps.Data...), true
 	}
 	if v.ptr != nil && v.ptr.Kind == KindInstance {
 		inst := (*PyInstance)(unsafe.Pointer(v.ptr))

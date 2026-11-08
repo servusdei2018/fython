@@ -799,6 +799,31 @@ func (c *Compiler) compileTargetLoad(targetID ExprID) error {
 		_, constIdx := c.constPool.InternName(attrName)
 		c.emitOp(vm.OP_LOAD_ATTR, 0, constIdx)
 	case ExprKindSubscript:
+		rightExpr := c.arena.GetExpr(expr.Right)
+		if rightExpr != nil && rightExpr.Kind == ExprKindSlice && rightExpr.Extra == 0 {
+			// Zero-allocation binary slice: container[start:stop]
+			if err := c.compileExpr(expr.Left); err != nil {
+				return err
+			}
+			if rightExpr.Left != ExprNone {
+				if err := c.compileExpr(rightExpr.Left); err != nil {
+					return err
+				}
+			} else {
+				idx := c.constPool.Add(val.NoneVal())
+				c.emitOp(vm.OP_LOAD_CONST, 0, idx)
+			}
+			if rightExpr.Right != ExprNone {
+				if err := c.compileExpr(rightExpr.Right); err != nil {
+					return err
+				}
+			} else {
+				idx := c.constPool.Add(val.NoneVal())
+				c.emitOp(vm.OP_LOAD_CONST, 0, idx)
+			}
+			c.emitOp(vm.OP_BINARY_SLICE, 0, 0)
+			return nil
+		}
 		if err := c.compileExpr(expr.Left); err != nil {
 			return err
 		}
@@ -996,11 +1021,36 @@ func (c *Compiler) compileNameStore(name string) error {
 	return nil
 }
 
-func (c *Compiler) compileIfStmt(stmt *ASTStmt) error {
-	if err := c.compileExpr(stmt.Expr1); err != nil {
+func (c *Compiler) compileCond(exprID ExprID, falseJumps *[]int) error {
+	expr := c.arena.GetExpr(exprID)
+	if expr == nil {
+		return nil
+	}
+	if expr.Kind == ExprKindBinary && expr.Op == uint8(TOKEN_AND) {
+		if err := c.compileCond(expr.Left, falseJumps); err != nil {
+			return err
+		}
+		return c.compileCond(expr.Right, falseJumps)
+	}
+	if expr.Kind == ExprKindUnary && expr.Op == uint8(TOKEN_NOT) {
+		if err := c.compileExpr(expr.Left); err != nil {
+			return err
+		}
+		*falseJumps = append(*falseJumps, c.emitOp(vm.OP_JUMP_IF_TRUE, 0, 0))
+		return nil
+	}
+	if err := c.compileExpr(exprID); err != nil {
 		return err
 	}
-	jumpFalse := c.emitOp(vm.OP_JUMP_IF_FALSE, 0, 0)
+	*falseJumps = append(*falseJumps, c.emitOp(vm.OP_JUMP_IF_FALSE, 0, 0))
+	return nil
+}
+
+func (c *Compiler) compileIfStmt(stmt *ASTStmt) error {
+	var falseJumps []int
+	if err := c.compileCond(stmt.Expr1, &falseJumps); err != nil {
+		return err
+	}
 
 	// Then body
 	for _, sID := range c.arena.GetStmtSlice(stmt.Body) {
@@ -1013,24 +1063,28 @@ func (c *Compiler) compileIfStmt(stmt *ASTStmt) error {
 	var exitJumps []int
 	exitJumps = append(exitJumps, jumpEnd)
 
-	c.patchJump(jumpFalse, len(c.code))
+	for _, j := range falseJumps {
+		c.patchJump(j, len(c.code))
+	}
 
 	// Elifs
 	elifsStart := stmt.Extra >> 16
 	elifsCount := stmt.Extra & 0xFFFF
 	for i := uint32(0); i < elifsCount; i++ {
 		elif := &c.arena.Elifs[elifsStart+i]
-		if err := c.compileExpr(elif.Cond); err != nil {
+		var elifFalseJumps []int
+		if err := c.compileCond(elif.Cond, &elifFalseJumps); err != nil {
 			return err
 		}
-		elifFalse := c.emitOp(vm.OP_JUMP_IF_FALSE, 0, 0)
 		for _, sID := range c.arena.StmtIDs[elif.Body.Start : elif.Body.Start+elif.Body.Count] {
 			if err := c.compileStmt(sID); err != nil {
 				return err
 			}
 		}
 		exitJumps = append(exitJumps, c.emitOp(vm.OP_JUMP, 0, 0))
-		c.patchJump(elifFalse, len(c.code))
+		for _, j := range elifFalseJumps {
+			c.patchJump(j, len(c.code))
+		}
 	}
 
 	// Else
@@ -1099,6 +1153,98 @@ func (c *Compiler) compileWhileStmt(stmt *ASTStmt) error {
 }
 
 func (c *Compiler) compileForStmt(stmt *ASTStmt) error {
+	iterExpr := c.arena.GetExpr(stmt.Expr2)
+	targetExpr := c.arena.GetExpr(stmt.Expr1)
+
+	var isFusedRange bool
+	var rangeSlot uint8
+	var rangeArgCount int
+
+	if iterExpr != nil && iterExpr.Kind == ExprKindCall && targetExpr != nil && targetExpr.Kind == ExprKindName {
+		call := &c.arena.Calls[iterExpr.Extra]
+		calleeExpr := c.arena.GetExpr(call.Func)
+		if calleeExpr != nil && calleeExpr.Kind == ExprKindName {
+			calleeName := string(c.src[calleeExpr.Start:calleeExpr.End])
+			if calleeName == "range" {
+				rangeSym := c.scope.Symbols["range"]
+				if rangeSym == nil || rangeSym.Storage == StorageGlobal {
+					targetName := string(c.src[targetExpr.Start:targetExpr.End])
+					targetSym := c.scope.Symbols[targetName]
+					if targetSym != nil && targetSym.Storage == StorageFastLocal && targetSym.Offset < 256 {
+						posArgs := c.arena.GetExprSlice(call.PosArgs)
+						kwNames := c.arena.GetIdentSlice(call.KWNames)
+						if len(kwNames) == 0 && (len(posArgs) == 1 || len(posArgs) == 2) {
+							isFusedRange = true
+							rangeSlot = uint8(targetSym.Offset)
+							rangeArgCount = len(posArgs)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if isFusedRange {
+		posArgs := c.arena.GetExprSlice(c.arena.Calls[iterExpr.Extra].PosArgs)
+		if rangeArgCount == 1 {
+			if err := c.compileExpr(posArgs[0]); err != nil {
+				return err
+			}
+			c.emitOp(vm.OP_SETUP_RANGE, 0, 1)
+		} else {
+			if err := c.compileExpr(posArgs[0]); err != nil {
+				return err
+			}
+			if err := c.compileExpr(posArgs[1]); err != nil {
+				return err
+			}
+			c.emitOp(vm.OP_SETUP_RANGE, 0, 2)
+		}
+
+		loopStart := len(c.code)
+		loopCtx := &LoopContext{
+			LoopStart: loopStart,
+			Parent:    c.activeLoop,
+			Cleanup:   c.activeCleanup,
+			IsFor:     true,
+		}
+		c.activeLoop = loopCtx
+
+		forIterJump := c.emitOp(vm.OP_FOR_ITER_RANGE, rangeSlot, 0)
+
+		for _, sID := range c.arena.GetStmtSlice(stmt.Body) {
+			if err := c.compileStmt(sID); err != nil {
+				return err
+			}
+		}
+
+		c.emitOp(vm.OP_JUMP, 0, uint16(loopStart))
+
+		endTarget := len(c.code)
+		c.patchJump(forIterJump, endTarget)
+
+		for _, cont := range loopCtx.Continues {
+			c.patchJump(cont, loopStart)
+		}
+
+		c.activeLoop = loopCtx.Parent
+
+		if stmt.Else != 0 {
+			for _, sID := range c.arena.GetStmtSlice(stmt.Else) {
+				if err := c.compileStmt(sID); err != nil {
+					return err
+				}
+			}
+		}
+
+		afterElseTarget := len(c.code)
+		for _, b := range loopCtx.Breaks {
+			c.patchJump(b, afterElseTarget)
+		}
+
+		return nil
+	}
+
 	if err := c.compileExpr(stmt.Expr2); err != nil {
 		return err
 	}
@@ -1848,6 +1994,17 @@ func (c *Compiler) compileFuncDef(stmt *ASTStmt) error {
 		}
 	}
 
+	var canSuspend bool
+	if fnScope.IsCoroutine {
+		for _, inst := range subCompiler.code {
+			op := vm.DecodeOpcode(inst)
+			if op == vm.OP_AWAIT || op == vm.OP_YIELD_VALUE || op == vm.OP_YIELD_FROM {
+				canSuspend = true
+				break
+			}
+		}
+	}
+
 	fnCodeObj := &vm.CodeObject{
 		Name:            fnDef.Name,
 		QualName:        qualName,
@@ -1866,6 +2023,7 @@ func (c *Compiler) compileFuncDef(stmt *ASTStmt) error {
 		MaxStackSize:    maxStack,
 		IsGenerator:     fnScope.IsGenerator,
 		IsCoroutine:     fnScope.IsCoroutine,
+		CanSuspend:      canSuspend,
 		Flags:           coFlags,
 		Doc:             fnDoc,
 		ExceptionTable:  subCompiler.exceptionTable,
@@ -2406,6 +2564,31 @@ func (c *Compiler) compileExpr(exprID ExprID) error {
 		c.emitOp(vm.OP_LOAD_ATTR, 0, idx)
 
 	case ExprKindSubscript:
+		rightExpr := c.arena.GetExpr(expr.Right)
+		if rightExpr != nil && rightExpr.Kind == ExprKindSlice && rightExpr.Extra == 0 {
+			// Zero-allocation binary slice: container[start:stop]
+			if err := c.compileExpr(expr.Left); err != nil {
+				return err
+			}
+			if rightExpr.Left != ExprNone {
+				if err := c.compileExpr(rightExpr.Left); err != nil {
+					return err
+				}
+			} else {
+				idx := c.constPool.Add(val.NoneVal())
+				c.emitOp(vm.OP_LOAD_CONST, 0, idx)
+			}
+			if rightExpr.Right != ExprNone {
+				if err := c.compileExpr(rightExpr.Right); err != nil {
+					return err
+				}
+			} else {
+				idx := c.constPool.Add(val.NoneVal())
+				c.emitOp(vm.OP_LOAD_CONST, 0, idx)
+			}
+			c.emitOp(vm.OP_BINARY_SLICE, 0, 0)
+			return nil
+		}
 		if err := c.compileExpr(expr.Left); err != nil {
 			return err
 		}

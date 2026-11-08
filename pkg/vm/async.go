@@ -99,6 +99,7 @@ func (q *LockFreeTaskQueue) Pop() *val.PyTask {
 type EventLoop struct {
 	engine     *Engine
 	vm         *VM
+	ownsVM     bool
 	queue      *LockFreeTaskQueue
 	mode       AsyncMode
 	stopChan   chan struct{}
@@ -142,15 +143,25 @@ func SetCurrentEventLoop(loop *EventLoop) {
 
 // NewEventLoop creates an EventLoop attached to the provided Engine.
 func NewEventLoop(e *Engine, mode AsyncMode) *EventLoop {
+	return NewEventLoopWithVM(e, mode, nil)
+}
+
+// NewEventLoopWithVM creates an EventLoop, optionally reusing an existing VM instance.
+func NewEventLoopWithVM(e *Engine, mode AsyncMode, currentVM *VM) *EventLoop {
 	if e == nil {
 		e = DefaultEngine()
 	}
 	loop := &EventLoop{
 		engine:   e,
-		vm:       e.AcquireVM(),
+		vm:       currentVM,
+		ownsVM:   currentVM == nil,
 		queue:    NewLockFreeTaskQueue(),
 		mode:     mode,
 		stopChan: make(chan struct{}),
+	}
+	if loop.vm == nil {
+		loop.vm = e.AcquireVM()
+		loop.ownsVM = true
 	}
 	if loop.vm != nil {
 		loop.vm.eventLoop = loop
@@ -208,7 +219,9 @@ func (l *EventLoop) RunUntilCompleteIn(target val.Value, parent *val.PyContext) 
 		SetCurrentEventLoop(prevLoop)
 		if l.vm != nil {
 			l.vm.eventLoop = nil
-			l.engine.ReleaseVM(l.vm)
+			if l.ownsVM {
+				l.engine.ReleaseVM(l.vm)
+			}
 			l.vm = nil
 		}
 	}()
