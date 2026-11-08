@@ -156,6 +156,10 @@ const (
 	// Exception Handler Scopes
 	OP_PUSH_EXC_INFO
 	OP_POP_EXCEPT
+
+	// Fused Local Arithmetic Superinstructions
+	OP_FAST_ADD_INT_LOCALS
+	OP_FAST_SUB_INT_LOCALS
 )
 
 // Comparison operation codes for OP_COMPARE_OP (passed in ArgA field).
@@ -390,6 +394,10 @@ func (op Opcode) String() string {
 		return "OP_BINARY_MATMUL"
 	case OP_CALL_FUNCTION_EX:
 		return "OP_CALL_FUNCTION_EX"
+	case OP_FAST_ADD_INT_LOCALS:
+		return "OP_FAST_ADD_INT_LOCALS"
+	case OP_FAST_SUB_INT_LOCALS:
+		return "OP_FAST_SUB_INT_LOCALS"
 	default:
 		return "OP_UNKNOWN"
 	}

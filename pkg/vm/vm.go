@@ -414,6 +414,11 @@ func (vm *VM) Vectorcall(callable val.Value, args []val.Value, kwnames []val.Val
 	return vm.callFromHook(&vm.execCtx, callable, base, len(args), kwnames)
 }
 
+// Call invokes a callable with positional arguments.
+func (vm *VM) Call(callable val.Value, args ...val.Value) val.Value {
+	return vm.Vectorcall(callable, args, nil)
+}
+
 // callFromHook executes a callable whose arguments are already placed on vm.stack[argBase : argBase+nargs].
 func (vm *VM) callFromHook(ctx *val.ExecContext, callable val.Value, argBase int, nargs int, kwnames []val.Value) val.Value {
 	switch callable.Kind() {
@@ -718,16 +723,18 @@ func (vm *VM) bindFunctionArgs(co *CodeObject, defaults []val.Value, kwDefaults 
 	return argBase + numLocals
 }
 
-func (vm *VM) setupCalleeCells(callee *CodeObject, target val.Value, stack []val.Value, newBase int, argc int) []val.Value {
+func (vm *VM) setupCalleeCellsAndPtrs(callee *CodeObject, target val.Value, stack []val.Value, newBase int, argc int) ([]val.Value, []*val.PyCell) {
 	nCells := len(callee.CellVars)
 	nFree := len(callee.FreeVars)
 	if nCells == 0 && nFree == 0 {
-		return nil
+		return nil, nil
 	}
 	if nCells == 0 && target.IsFunction() {
-		return target.AsFunction().Closure
+		fn := target.AsFunction()
+		return fn.Closure, fn.CellPtrs
 	}
 	res := make([]val.Value, nCells+nFree)
+	ptrs := make([]*val.PyCell, nCells+nFree)
 	boundLimit := len(callee.ParamNames)
 	if !target.IsFunction() && argc < boundLimit {
 		boundLimit = argc
@@ -755,15 +762,42 @@ func (vm *VM) setupCalleeCells(callee *CodeObject, target val.Value, stack []val
 				}
 			}
 		}
-		res[i] = val.NewCellVal(initVal)
+		cVal := val.NewCellVal(initVal)
+		res[i] = cVal
+		ptrs[i] = cVal.AsCell()
 	}
 	if target.IsFunction() {
-		closure := target.AsFunction().Closure
+		fn := target.AsFunction()
+		closure := fn.Closure
+		closurePtrs := fn.CellPtrs
 		for j := 0; j < nFree && j < len(closure); j++ {
 			res[nCells+j] = closure[j]
+			if j < len(closurePtrs) && closurePtrs[j] != nil {
+				ptrs[nCells+j] = closurePtrs[j]
+			} else {
+				ptrs[nCells+j] = closure[j].AsCell()
+			}
 		}
 	}
-	return res
+	return res, ptrs
+}
+
+func (vm *VM) setupCalleeCells(callee *CodeObject, target val.Value, stack []val.Value, newBase int, argc int) []val.Value {
+	cells, _ := vm.setupCalleeCellsAndPtrs(callee, target, stack, newBase, argc)
+	return cells
+}
+
+func extractCellPtrs(cells []val.Value) []*val.PyCell {
+	if len(cells) == 0 {
+		return nil
+	}
+	ptrs := make([]*val.PyCell, len(cells))
+	for i, c := range cells {
+		if c.HeaderPtr() != nil {
+			ptrs[i] = (*val.PyCell)(unsafe.Pointer(c.HeaderPtr()))
+		}
+	}
+	return ptrs
 }
 
 func (vm *VM) initBuiltins() {
@@ -1720,6 +1754,8 @@ func (vm *VM) unwindException(exc val.Value, curCO **CodeObject, ip *int, frameI
 			*consts = caller.consts
 			*baseOffset = caller.baseOffset
 			*cells = caller.cells
+			vm.activeCells = caller.cells
+			vm.activeCellPtrs = caller.cellPtrs
 			*globals = caller.globals
 			if curLocals != nil {
 				*curLocals = caller.locals
@@ -1780,6 +1816,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 	savedActiveCO := vm.activeCO
 	savedActiveBaseOffset := vm.activeBaseOffset
 	savedActiveCells := vm.activeCells
+	savedActiveCellPtrs := vm.activeCellPtrs
 	savedActiveFrameIdx := vm.activeFrameIdx
 	defer func() {
 		if wasVMStack {
@@ -1791,6 +1828,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		vm.activeCO = savedActiveCO
 		vm.activeBaseOffset = savedActiveBaseOffset
 		vm.activeCells = savedActiveCells
+		vm.activeCellPtrs = savedActiveCellPtrs
 		vm.activeFrameIdx = savedActiveFrameIdx
 	}()
 
@@ -1807,9 +1845,18 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		ip = activeCoro.IP
 	}
 	cells := startCells
+	var cellPtrs []*val.PyCell
+	if len(cells) > 0 {
+		cellPtrs = make([]*val.PyCell, len(cells))
+		for i, c := range cells {
+			cellPtrs[i] = c.AsCell()
+		}
+	}
+	var periodicTick uint32
 	vm.activeCO = curCO
 	vm.activeBaseOffset = baseOffset
 	vm.activeCells = cells
+	vm.activeCellPtrs = cellPtrs
 	globals := startGlobals
 	if globals == nil {
 		globals = vm.globals
@@ -2411,6 +2458,26 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			target := int(uint16(inst))
 			if target <= ip {
 				maybeOptimizeCodeObject(curCO)
+				periodicTick++
+				if (periodicTick & 0xFF) == 0 {
+					if vm.limits.Context != nil {
+						if err := vm.limits.Context.Err(); err != nil {
+							vm.unhandledException = val.NewRuntimeError("execution timed out or cancelled")
+							panic(ErrTimeoutExceeded)
+						}
+					}
+					if vm.limits.MaxSteps > 0 {
+						vm.stepCount += 256
+						if vm.stepCount >= vm.limits.MaxSteps {
+							vm.unhandledException = val.NewRuntimeError("instruction step quota exceeded")
+							panic(ErrStepLimitExceeded)
+						}
+					}
+					if vm.limits.MaxStackDepth > 0 && frameIdx >= vm.limits.MaxStackDepth {
+						vm.unhandledException = val.NewRuntimeError("maximum call stack depth exceeded")
+						panic(ErrMaxStackDepthExceeded)
+					}
+				}
 				if vm.signalsPending() {
 					vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 					vm.execCtx.SP = sp
@@ -2545,6 +2612,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.baseOffset = baseOffset
 				saved.retSP = retSP
 				saved.cells = cells
+				saved.cellPtrs = cellPtrs
 				saved.globals = globals
 				saved.locals = curLocals
 				saved.cache = curCodeCache
@@ -2574,7 +2642,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
 				_ = locals[255]
 				maybeOptimizeCodeObject(callee)
-				cells = vm.setupCalleeCells(callee, target, stack, newBase, argc)
+				cells, cellPtrs = vm.setupCalleeCellsAndPtrs(callee, target, stack, newBase, argc)
 				numLocalsCallee := callee.NumLocals
 				if numLocalsCallee < argc {
 					numLocalsCallee = argc
@@ -2587,6 +2655,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				vm.activeCO = curCO
 				vm.activeBaseOffset = baseOffset
 				vm.activeCells = cells
+				vm.activeCellPtrs = cellPtrs
 				vm.activeFrameIdx = frameIdx
 				ip = 0
 				continue
@@ -2594,6 +2663,27 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			case val.KindFunction:
 				fn := target.AsFunction()
 				callee := AsCodeObject(fn.Code)
+				maybeOptimizeCodeObject(callee)
+				periodicTick++
+				if (periodicTick & 0xFF) == 0 {
+					if vm.limits.Context != nil {
+						if err := vm.limits.Context.Err(); err != nil {
+							vm.unhandledException = val.NewRuntimeError("execution timed out or cancelled")
+							panic(ErrTimeoutExceeded)
+						}
+					}
+					if vm.limits.MaxSteps > 0 {
+						vm.stepCount += 256
+						if vm.stepCount >= vm.limits.MaxSteps {
+							vm.unhandledException = val.NewRuntimeError("instruction step quota exceeded")
+							panic(ErrStepLimitExceeded)
+						}
+					}
+					if vm.limits.MaxStackDepth > 0 && frameIdx >= vm.limits.MaxStackDepth {
+						vm.unhandledException = val.NewRuntimeError("maximum call stack depth exceeded")
+						panic(ErrMaxStackDepthExceeded)
+					}
+				}
 				fnGlobals := fn.Globals
 				if fnGlobals == nil {
 					fnGlobals = globals
@@ -2697,6 +2787,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.baseOffset = baseOffset
 				saved.retSP = retSP
 				saved.cells = cells
+				saved.cellPtrs = cellPtrs
 				saved.globals = globals
 				saved.locals = curLocals
 				saved.cache = curCodeCache
@@ -2713,10 +2804,12 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				_ = locals[255]
 				if len(callee.CellVars) == 0 && fn.Closure != nil {
 					cells = fn.Closure
+					cellPtrs = fn.CellPtrs
 				} else if len(callee.CellVars) == 0 && len(callee.FreeVars) == 0 {
 					cells = nil
+					cellPtrs = nil
 				} else {
-					cells = vm.setupCalleeCells(callee, target, stack, newBase, argc)
+					cells, cellPtrs = vm.setupCalleeCellsAndPtrs(callee, target, stack, newBase, argc)
 				}
 				if fn.Globals != nil {
 					globals = fn.Globals
@@ -2728,6 +2821,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				vm.activeCO = curCO
 				vm.activeBaseOffset = baseOffset
 				vm.activeCells = cells
+				vm.activeCellPtrs = cellPtrs
 				vm.activeFrameIdx = frameIdx
 				ip = 0
 				continue
@@ -2896,6 +2990,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.baseOffset = baseOffset
 				saved.retSP = retSP
 				saved.cells = cells
+				saved.cellPtrs = cellPtrs
 				saved.globals = globals
 				saved.locals = curLocals
 				saved.cache = curCodeCache
@@ -2911,7 +3006,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
 				_ = locals[255]
 				maybeOptimizeCodeObject(callee)
-				cells = vm.setupCalleeCells(callee, target, stack, newBase, totalArgs)
+				cells, cellPtrs = vm.setupCalleeCellsAndPtrs(callee, target, stack, newBase, totalArgs)
 				if fn.Globals != nil {
 					globals = fn.Globals
 				}
@@ -2922,6 +3017,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				vm.activeCO = curCO
 				vm.activeBaseOffset = baseOffset
 				vm.activeCells = cells
+				vm.activeCellPtrs = cellPtrs
 				vm.activeFrameIdx = frameIdx
 				ip = 0
 				continue
@@ -3017,6 +3113,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.baseOffset = baseOffset
 				saved.retSP = retSP
 				saved.cells = cells
+				saved.cellPtrs = cellPtrs
 				saved.globals = globals
 				saved.locals = curLocals
 				saved.cache = curCodeCache
@@ -3032,7 +3129,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
 				_ = locals[255]
 				maybeOptimizeCodeObject(callee)
-				cells = vm.setupCalleeCells(callee, target, stack, newBase, totalArgs)
+				cells, cellPtrs = vm.setupCalleeCellsAndPtrs(callee, target, stack, newBase, totalArgs)
 				curCodeCache = vm.getCodeCache(curCO)
 				curIC = curCodeCache.ic
 				curMethodPIC = curCodeCache.methodPIC
@@ -3040,6 +3137,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				vm.activeCO = curCO
 				vm.activeBaseOffset = baseOffset
 				vm.activeCells = cells
+				vm.activeCellPtrs = cellPtrs
 				vm.activeFrameIdx = frameIdx
 				ip = 0
 				continue
@@ -3342,6 +3440,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.baseOffset = baseOffset
 				saved.retSP = retSP
 				saved.cells = cells
+				saved.cellPtrs = cellPtrs
 				saved.globals = globals
 				saved.locals = curLocals
 				saved.cache = curCodeCache
@@ -3358,10 +3457,12 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				_ = locals[255]
 				if len(callee.CellVars) == 0 && fn.Closure != nil {
 					cells = fn.Closure
+					cellPtrs = fn.CellPtrs
 				} else if len(callee.CellVars) == 0 && len(callee.FreeVars) == 0 {
 					cells = nil
+					cellPtrs = nil
 				} else {
-					cells = vm.setupCalleeCells(callee, callable, stack, newBase, totalArgs)
+					cells, cellPtrs = vm.setupCalleeCellsAndPtrs(callee, callable, stack, newBase, totalArgs)
 				}
 				if fn.Globals != nil {
 					globals = fn.Globals
@@ -3373,6 +3474,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				vm.activeCO = curCO
 				vm.activeBaseOffset = baseOffset
 				vm.activeCells = cells
+				vm.activeCellPtrs = cellPtrs
 				vm.activeFrameIdx = frameIdx
 				ip = 0
 				continue
@@ -3436,6 +3538,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.baseOffset = baseOffset
 				saved.retSP = retSP
 				saved.cells = cells
+				saved.cellPtrs = cellPtrs
 				saved.globals = globals
 				saved.locals = curLocals
 				saved.cache = curCodeCache
@@ -3465,7 +3568,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
 				_ = locals[255]
 				maybeOptimizeCodeObject(callee)
-				cells = vm.setupCalleeCells(callee, callable, stack, newBase, totalArgs)
+				cells, cellPtrs = vm.setupCalleeCellsAndPtrs(callee, callable, stack, newBase, totalArgs)
 				numLocalsCallee := callee.NumLocals
 				if numLocalsCallee < totalArgs {
 					numLocalsCallee = totalArgs
@@ -3478,6 +3581,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				vm.activeCO = curCO
 				vm.activeBaseOffset = baseOffset
 				vm.activeCells = cells
+				vm.activeCellPtrs = cellPtrs
 				vm.activeFrameIdx = frameIdx
 				ip = 0
 				continue
@@ -3630,6 +3734,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 						saved.baseOffset = baseOffset
 						saved.retSP = retSP
 						saved.cells = cells
+						saved.cellPtrs = cellPtrs
 						saved.globals = globals
 						saved.locals = curLocals
 						saved.cache = curCodeCache
@@ -3646,10 +3751,12 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 						_ = locals[255]
 						if len(callee.CellVars) == 0 && targetFn.Closure != nil {
 							cells = targetFn.Closure
+							cellPtrs = targetFn.CellPtrs
 						} else if len(callee.CellVars) == 0 && len(callee.FreeVars) == 0 {
 							cells = nil
+							cellPtrs = nil
 						} else {
-							cells = vm.setupCalleeCells(callee, targetVal, stack, newBase, totalArgs)
+							cells, cellPtrs = vm.setupCalleeCellsAndPtrs(callee, targetVal, stack, newBase, totalArgs)
 						}
 						if targetFn.Globals != nil {
 							globals = targetFn.Globals
@@ -3661,6 +3768,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 						vm.activeCO = curCO
 						vm.activeBaseOffset = baseOffset
 						vm.activeCells = cells
+						vm.activeCellPtrs = cellPtrs
 						vm.activeFrameIdx = frameIdx
 						ip = 0
 						continue
@@ -3765,11 +3873,13 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
 			_ = locals[255]
 			cells = caller.cells
+			cellPtrs = caller.cellPtrs
 			globals = caller.globals
 			curLocals = caller.locals
 			vm.activeCO = curCO
 			vm.activeBaseOffset = baseOffset
 			vm.activeCells = cells
+			vm.activeCellPtrs = cellPtrs
 			vm.activeFrameIdx = frameIdx
 			stack[caller.retSP] = retVal
 			sp = caller.retSP + 1
@@ -3895,6 +4005,13 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 							}
 						}
 						if entry.Kind == ICKindDataDescriptor {
+							descr := entry.CachedVal
+							descrType := descr.Type()
+							if descrType != nil && descrType.Name == "struct_field_descriptor" && descrType.Slots.TpDescrGet != nil {
+								stack[sp-1] = descrType.Slots.TpDescrGet(&vm.execCtx, descr, obj, instType)
+								ip++
+								continue
+							}
 							vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 							vm.execCtx.SP = sp
 							attrRes = vm.descrGetSafe(entry.CachedVal, obj, instType)
@@ -4065,6 +4182,14 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 							}
 						}
 						if entry.Kind == ICKindDataDescriptor {
+							descr := entry.CachedVal
+							descrType := descr.Type()
+							if descrType != nil && descrType.Name == "struct_field_descriptor" && descrType.Slots.TpDescrSet != nil {
+								descrType.Slots.TpDescrSet(&vm.execCtx, descr, obj, v)
+								sp -= 2
+								ip++
+								continue
+							}
 							vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 							vm.execCtx.SP = sp
 							vm.descrSetSafe(entry.CachedVal, obj, v)
@@ -4405,8 +4530,13 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 
 		case OP_LOAD_DEREF:
 			bx := int(uint16(inst))
-			cell := (*val.PyCell)(unsafe.Pointer(cells[bx].HeaderPtr()))
-			stack[sp] = cell.Value
+			activePtrs := vm.activeCellPtrs
+			if uint(bx) < uint(len(activePtrs)) && activePtrs[bx] != nil {
+				stack[sp] = activePtrs[bx].Value
+			} else {
+				cell := (*val.PyCell)(unsafe.Pointer(cells[bx].HeaderPtr()))
+				stack[sp] = cell.Value
+			}
 			sp++
 			ip++
 
@@ -4417,13 +4547,24 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			if valToStore.IsString() {
 				valToStore.AsStringObj().Buf = nil
 			}
-			cell := (*val.PyCell)(unsafe.Pointer(cells[bx].HeaderPtr()))
-			cell.Value = valToStore
+			activePtrs := vm.activeCellPtrs
+			if uint(bx) < uint(len(activePtrs)) && activePtrs[bx] != nil {
+				activePtrs[bx].Value = valToStore
+			} else {
+				cell := (*val.PyCell)(unsafe.Pointer(cells[bx].HeaderPtr()))
+				cell.Value = valToStore
+			}
 			ip++
 
 		case OP_INC_DEREF_INT:
 			bx := int(uint16(inst))
-			cell := (*val.PyCell)(unsafe.Pointer(cells[bx].HeaderPtr()))
+			var cell *val.PyCell
+			activePtrs := vm.activeCellPtrs
+			if uint(bx) < uint(len(activePtrs)) && activePtrs[bx] != nil {
+				cell = activePtrs[bx]
+			} else {
+				cell = (*val.PyCell)(unsafe.Pointer(cells[bx].HeaderPtr()))
+			}
 			if cell.Value.IsInt64() {
 				cell.Value = val.Int64Val(cell.Value.AsInt64() + 1)
 				ip += 4
@@ -5744,6 +5885,58 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				continue
 			}
 			DeoptimizeFastSub(code, ip, dstReg, srcRegA, srcRegB)
+			continue
+
+		case OP_FAST_ADD_INT_LOCALS:
+			_ = locals[255]
+			srcA := uint8(inst >> 16)
+			srcB := uint16(inst)
+			va := locals[srcA]
+			vb := locals[srcB]
+			if va.IsInt64() && vb.IsInt64() {
+				ai := va.AsInt64()
+				bi := vb.AsInt64()
+				sum := ai + bi
+				if ((ai ^ sum) & (bi ^ sum)) >= 0 {
+					stack[sp] = val.Int64Val(sum)
+					sp++
+					ip += 3
+					continue
+				}
+				stack[sp] = val.Add(va, vb)
+				sp++
+				ip += 3
+				continue
+			}
+			atomic.StoreUint32(&code[ip], Encode(OP_LOAD_FAST, 0, uint16(srcA)))
+			atomic.StoreUint32(&code[ip+1], Encode(OP_LOAD_FAST, 0, srcB))
+			atomic.StoreUint32(&code[ip+2], Encode(OP_BINARY_ADD, 0, 0))
+			continue
+
+		case OP_FAST_SUB_INT_LOCALS:
+			_ = locals[255]
+			srcA := uint8(inst >> 16)
+			srcB := uint16(inst)
+			va := locals[srcA]
+			vb := locals[srcB]
+			if va.IsInt64() && vb.IsInt64() {
+				ai := va.AsInt64()
+				bi := vb.AsInt64()
+				diff := ai - bi
+				if ((ai ^ bi) & (ai ^ diff)) >= 0 {
+					stack[sp] = val.Int64Val(diff)
+					sp++
+					ip += 3
+					continue
+				}
+				stack[sp] = val.Sub(va, vb)
+				sp++
+				ip += 3
+				continue
+			}
+			atomic.StoreUint32(&code[ip], Encode(OP_LOAD_FAST, 0, uint16(srcA)))
+			atomic.StoreUint32(&code[ip+1], Encode(OP_LOAD_FAST, 0, srcB))
+			atomic.StoreUint32(&code[ip+2], Encode(OP_BINARY_SUB, 0, 0))
 			continue
 
 		case OP_FAST_CMP_EQ_JUMP_IF_FALSE:

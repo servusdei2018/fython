@@ -52,6 +52,14 @@ type pyFile struct {
 	unbuffered bool
 	name       string
 	mu         sync.Mutex
+	pooledBuf  *[]byte
+}
+
+var fileBufferPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 32768)
+		return &b
+	},
 }
 
 func (pf *pyFile) flushLocked() {
@@ -314,25 +322,34 @@ func initIOTypes() {
 				panic("TypeError: write() takes exactly one argument")
 			}
 			sio := (*pyStringIO)(val.AsPointer(args[0]))
-			sio.mu.Lock()
+			isMT := val.IsMultiThreaded()
+			if isMT {
+				sio.mu.Lock()
+			}
 			v := args[1]
 			oldLen := len(sio.buf)
 			if sio.pos == oldLen {
 				var ok bool
 				sio.buf, ok = val.AppendValueBytes(sio.buf, v)
 				if !ok {
-					sio.buf = append(sio.buf, v.AsString()...)
+					s := v.AsString()
+					view := unsafe.Slice(unsafe.StringData(s), len(s))
+					sio.buf = append(sio.buf, view...)
 				}
 				written := len(sio.buf) - oldLen
 				sio.pos = len(sio.buf)
-				sio.mu.Unlock()
+				if isMT {
+					sio.mu.Unlock()
+				}
 				return val.Int64Val(int64(written))
 			} else {
 				var tmp []byte
 				var ok bool
 				tmp, ok = val.AppendValueBytes(tmp, v)
 				if !ok {
-					tmp = append(tmp, v.AsString()...)
+					s := v.AsString()
+					view := unsafe.Slice(unsafe.StringData(s), len(s))
+					tmp = append(tmp, view...)
 				}
 				if sio.pos+len(tmp) <= len(sio.buf) {
 					copy(sio.buf[sio.pos:], tmp)
@@ -340,23 +357,26 @@ func initIOTypes() {
 					sio.buf = append(sio.buf[:sio.pos], tmp...)
 				}
 				sio.pos += len(tmp)
-				sio.mu.Unlock()
+				if isMT {
+					sio.mu.Unlock()
+				}
 				return val.Int64Val(int64(len(tmp)))
 			}
 		}))
 
 		StringIOType.Dict.Set(val.InternString("getvalue"), val.NewBuiltinFuncVal("getvalue", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			sio := (*pyStringIO)(val.AsPointer(args[0]))
-			sio.mu.RLock()
+			isMT := val.IsMultiThreaded()
+			if isMT {
+				sio.mu.RLock()
+				defer sio.mu.RUnlock()
+			}
 			n := len(sio.buf)
 			if n == 0 {
-				sio.mu.RUnlock()
 				return val.NewStringVal("")
 			}
 			if n <= 7 {
-				res := val.SmallStringFromBytes(sio.buf)
-				sio.mu.RUnlock()
-				return res
+				return val.SmallStringFromBytes(sio.buf)
 			}
 			s := unsafe.String(unsafe.SliceData(sio.buf), n)
 			ps := &val.PyString{
@@ -367,7 +387,6 @@ func initIOTypes() {
 				},
 				Data: s,
 			}
-			sio.mu.RUnlock()
 			return val.ObjectVal(&ps.Header)
 		}))
 
@@ -600,6 +619,11 @@ func initIOTypes() {
 			pf.mu.Lock()
 			if !pf.isClosed && pf.f != nil {
 				pf.flushLocked()
+				if pf.pooledBuf != nil {
+					fileBufferPool.Put(pf.pooledBuf)
+					pf.pooledBuf = nil
+					pf.writeBuf = nil
+				}
 				if pf.f != os.Stdin && pf.f != os.Stdout && pf.f != os.Stderr {
 					_ = pf.f.Close()
 					pf.isClosed = true
@@ -611,9 +635,14 @@ func initIOTypes() {
 
 		FileType.Dict.Set(val.InternString("read"), val.NewBuiltinFuncVal("read", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			pf := (*pyFile)(val.AsPointer(args[0]))
-			pf.mu.Lock()
+			isMT := val.IsMultiThreaded()
+			if isMT {
+				pf.mu.Lock()
+			}
 			if pf.isClosed {
-				pf.mu.Unlock()
+				if isMT {
+					pf.mu.Unlock()
+				}
 				panic("ValueError: I/O operation on closed file.")
 			}
 			n := -1
@@ -624,11 +653,20 @@ func initIOTypes() {
 				pf.flushLocked()
 				if pf.reader == nil || pf.reader.Buffered() == 0 {
 					stat, err := pf.f.Stat()
-					if err == nil && stat.Size() > 0 {
+					if err == nil && stat.Mode().IsRegular() && stat.Size() >= 0 {
 						curPos, seekErr := pf.f.Seek(0, io.SeekCurrent)
 						remSize := stat.Size()
 						if seekErr == nil && curPos >= 0 && curPos <= remSize {
 							remSize -= curPos
+						}
+						if remSize == 0 {
+							if isMT {
+								pf.mu.Unlock()
+							}
+							if pf.binary {
+								return val.NewBytesVal(nil)
+							}
+							return val.NewStringVal("")
 						}
 						if remSize > 0 {
 							buf := make([]byte, remSize)
@@ -636,7 +674,9 @@ func initIOTypes() {
 							if readN > 0 {
 								buf = buf[:readN]
 								if pf.binary {
-									pf.mu.Unlock()
+									if isMT {
+										pf.mu.Unlock()
+									}
 									return val.NewBytesVal(buf)
 								}
 								s := unsafe.String(unsafe.SliceData(buf), readN)
@@ -648,7 +688,9 @@ func initIOTypes() {
 									},
 									Data: s,
 								}
-								pf.mu.Unlock()
+								if isMT {
+									pf.mu.Unlock()
+								}
 								return val.ObjectVal(&ps.Header)
 							}
 						}
@@ -656,13 +698,17 @@ func initIOTypes() {
 				}
 				content, err := io.ReadAll(pf.reader)
 				if err != nil && len(content) == 0 {
-					pf.mu.Unlock()
+					if isMT {
+						pf.mu.Unlock()
+					}
 					if pf.binary {
 						return val.NewBytesVal(nil)
 					}
 					return val.NewStringVal("")
 				}
-				pf.mu.Unlock()
+				if isMT {
+					pf.mu.Unlock()
+				}
 				if pf.binary {
 					return val.NewBytesVal(content)
 				}
@@ -679,7 +725,9 @@ func initIOTypes() {
 			}
 			buf := make([]byte, n)
 			readN, _ := io.ReadFull(pf.reader, buf)
-			pf.mu.Unlock()
+			if isMT {
+				pf.mu.Unlock()
+			}
 			if readN <= 0 {
 				if pf.binary {
 					return val.NewBytesVal(nil)
@@ -807,9 +855,14 @@ func initIOTypes() {
 				panic("TypeError: write() takes exactly one argument")
 			}
 			pf := (*pyFile)(val.AsPointer(args[0]))
-			pf.mu.Lock()
+			isMT := val.IsMultiThreaded()
+			if isMT {
+				pf.mu.Lock()
+			}
 			if pf.isClosed {
-				pf.mu.Unlock()
+				if isMT {
+					pf.mu.Unlock()
+				}
 				panic("ValueError: I/O operation on closed file.")
 			}
 			oldLen := len(pf.writeBuf)
@@ -821,25 +874,34 @@ func initIOTypes() {
 				} else if args[1].IsMemoryView() {
 					pf.writeBuf = append(pf.writeBuf, args[1].AsMemoryView().Buf...)
 				} else {
-					pf.mu.Unlock()
+					if isMT {
+						pf.mu.Unlock()
+					}
 					panic("TypeError: a bytes-like object is required, not 'str'")
 				}
 			} else {
+				v := args[1]
 				var ok bool
-				pf.writeBuf, ok = val.AppendValueBytes(pf.writeBuf, args[1])
+				pf.writeBuf, ok = val.AppendValueBytes(pf.writeBuf, v)
 				if !ok {
-					if !args[1].IsAnyString() {
-						pf.mu.Unlock()
-						panic("TypeError: write() argument must be str, not " + args[1].Type().Name)
+					if !v.IsAnyString() {
+						if isMT {
+							pf.mu.Unlock()
+						}
+						panic("TypeError: write() argument must be str, not " + v.Type().Name)
 					}
-					pf.writeBuf = append(pf.writeBuf, args[1].AsString()...)
+					s := v.AsString()
+					view := unsafe.Slice(unsafe.StringData(s), len(s))
+					pf.writeBuf = append(pf.writeBuf, view...)
 				}
 			}
 			written := len(pf.writeBuf) - oldLen
-			if pf.unbuffered || len(pf.writeBuf) >= 65536 {
+			if pf.unbuffered || len(pf.writeBuf) >= 32768 {
 				pf.flushLocked()
 			}
-			pf.mu.Unlock()
+			if isMT {
+				pf.mu.Unlock()
+			}
 			return val.Int64Val(int64(written))
 		}))
 
@@ -918,6 +980,11 @@ func initIOTypes() {
 			defer pf.mu.Unlock()
 			if !pf.isClosed && pf.f != nil {
 				pf.flushLocked()
+				if pf.pooledBuf != nil {
+					fileBufferPool.Put(pf.pooledBuf)
+					pf.pooledBuf = nil
+					pf.writeBuf = nil
+				}
 				if pf.f != os.Stdin && pf.f != os.Stdout && pf.f != os.Stderr {
 					_ = pf.f.Close()
 					pf.isClosed = true
@@ -996,16 +1063,19 @@ func openFileBuiltinVal(fileVal val.Value, mode string) val.Value {
 	}
 
 	var writeBuf []byte
+	var pooledBuf *[]byte
 	if strings.Contains(mode, "w") || strings.Contains(mode, "a") || strings.Contains(mode, "+") {
-		writeBuf = make([]byte, 0, 65536)
+		pooledBuf = fileBufferPool.Get().(*[]byte)
+		writeBuf = (*pooledBuf)[:0]
 	}
 
 	pf := &pyFile{
-		inst:     val.PyInstance{Header: val.ObjectHeader{Kind: val.KindInstance, Type: FileType}, Shape: FileType.RootShape},
-		f:        f,
-		reader:   bufio.NewReader(f),
-		writeBuf: writeBuf,
-		binary:   binary,
+		inst:      val.PyInstance{Header: val.ObjectHeader{Kind: val.KindInstance, Type: FileType}, Shape: FileType.RootShape},
+		f:         f,
+		reader:    bufio.NewReader(f),
+		writeBuf:  writeBuf,
+		binary:    binary,
+		pooledBuf: pooledBuf,
 	}
 	pf.inst.SetAttr(val.InternString("mode"), val.NewStringVal(mode))
 	if fileVal.IsAnyString() {

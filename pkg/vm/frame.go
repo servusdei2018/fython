@@ -72,6 +72,7 @@ type CallFrame struct {
 	baseOffset  int
 	retSP       int // Caller's stack pointer where the return value will be written
 	cells       []val.Value
+	cellPtrs    []*val.PyCell
 	globals     *val.PyDict
 	locals      val.Value
 	cache       *VMCodeCache
@@ -122,6 +123,7 @@ type CodeObject struct {
 	VarNames         []val.Value
 	CellVars         []val.Value
 	FreeVars         []val.Value
+	CellParamIndices []int
 	NumLocals        int
 	NumParams        int
 	MaxStackSize     int
@@ -199,7 +201,38 @@ func (co *CodeObject) Init() *CodeObject {
 	co.Header.Kind = val.KindCode
 	co.Header.Type = val.CodeType
 	co.initID()
+	co.InitCellParamIndices()
 	return co
+}
+
+// InitCellParamIndices precomputes the parameter index for each CellVar to avoid runtime string matching.
+func (co *CodeObject) InitCellParamIndices() {
+	if co == nil || co.CellParamIndices != nil || len(co.CellVars) == 0 {
+		return
+	}
+	indices := make([]int, len(co.CellVars))
+	for i, name := range co.CellVars {
+		indices[i] = -1
+		nameStr := name.AsString()
+		for p, pn := range co.ParamNames {
+			if val.StringEquals(pn, name) {
+				indices[i] = p
+				break
+			}
+			pnStr := pn.AsString()
+			if len(pnStr) > 1 && pnStr[0] == '*' {
+				clean := pnStr[1:]
+				if len(clean) > 0 && clean[0] == '*' {
+					clean = clean[1:]
+				}
+				if clean == nameStr {
+					indices[i] = p
+					break
+				}
+			}
+		}
+	}
+	co.CellParamIndices = indices
 }
 
 // NewCodeVal wraps a *CodeObject as a val.Value with KindCode.
@@ -237,6 +270,7 @@ type VM struct {
 	activeCO           *CodeObject
 	activeBaseOffset   int
 	activeCells        []val.Value
+	activeCellPtrs     []*val.PyCell
 	kwScratch          [64]val.Value
 	kwSet              [64]bool
 	globals            *val.PyDict
@@ -250,6 +284,8 @@ type VM struct {
 	coroFreeList       []*val.PyCoroutine
 	rootCO             CodeObject
 	rootCache          VMCodeCache
+	limits             RuntimeLimits
+	stepCount          uint64
 }
 
 func (vm *VM) getCodeCache(co *CodeObject) *VMCodeCache {
@@ -295,6 +331,7 @@ func (vm *VM) Reset() {
 	vm.activeCO = nil
 	vm.activeBaseOffset = 0
 	vm.activeCells = nil
+	vm.activeCellPtrs = nil
 	vm.lastException = val.NoneVal()
 	vm.unhandledException = val.NoneVal()
 	vm.context = val.NewPyContext()

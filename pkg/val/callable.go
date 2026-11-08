@@ -41,6 +41,7 @@ type PyFunction struct {
 	Defaults   []Value
 	KwDefaults *PyDict
 	Closure    []Value
+	CellPtrs   []*PyCell
 	Globals    *PyDict
 	Dict       *PyDict
 }
@@ -157,6 +158,13 @@ func NewFunctionVal(name string, codeVal Value, defaults ...Value) Value {
 
 // NewFunctionValWithClosure constructs a heap-allocated KindFunction Value with closure cells.
 func NewFunctionValWithClosure(name string, codeVal Value, defaults []Value, closure []Value) Value {
+	var cellPtrs []*PyCell
+	if len(closure) > 0 {
+		cellPtrs = make([]*PyCell, len(closure))
+		for i, c := range closure {
+			cellPtrs[i] = c.AsCell()
+		}
+	}
 	obj := &PyFunction{
 		Header: ObjectHeader{
 			Kind: KindFunction,
@@ -166,6 +174,7 @@ func NewFunctionValWithClosure(name string, codeVal Value, defaults []Value, clo
 		Code:     codeVal,
 		Defaults: defaults,
 		Closure:  closure,
+		CellPtrs: cellPtrs,
 	}
 	return Value{num: 0, ptr: &obj.Header}
 }
@@ -187,6 +196,13 @@ func NewFunctionValWithGlobals(name string, codeVal Value, defaults []Value, glo
 
 // NewFunctionValWithGlobalsAndClosure constructs a heap-allocated KindFunction Value bound to module globals and closure cells.
 func NewFunctionValWithGlobalsAndClosure(name string, codeVal Value, defaults []Value, closure []Value, globals *PyDict) Value {
+	var cellPtrs []*PyCell
+	if len(closure) > 0 {
+		cellPtrs = make([]*PyCell, len(closure))
+		for i, c := range closure {
+			cellPtrs[i] = c.AsCell()
+		}
+	}
 	obj := &PyFunction{
 		Header: ObjectHeader{
 			Kind: KindFunction,
@@ -196,6 +212,7 @@ func NewFunctionValWithGlobalsAndClosure(name string, codeVal Value, defaults []
 		Code:     codeVal,
 		Defaults: defaults,
 		Closure:  closure,
+		CellPtrs: cellPtrs,
 		Globals:  globals,
 	}
 	return Value{num: 0, ptr: &obj.Header}

@@ -167,6 +167,38 @@ func OptimizeCodeObject(co *CodeObject) {
 			}
 		}
 
+		// Pattern 9: OP_LOAD_FAST + OP_LOAD_FAST + (OP_BINARY_ADD | OP_BINARY_ADD_INT)
+		// -> OP_FAST_ADD_INT_LOCALS (when not followed by OP_STORE_FAST)
+		if op0 == OP_LOAD_FAST && op1 == OP_LOAD_FAST &&
+			(op2 == OP_BINARY_ADD || op2 == OP_BINARY_ADD_INT) &&
+			op3 != OP_STORE_FAST {
+			srcA := DecodeArgBx(w0)
+			srcB := DecodeArgBx(w1)
+			if srcA < 256 && srcB < 256 {
+				atomic.StoreUint32(&code[i], Encode(OP_FAST_ADD_INT_LOCALS, uint8(srcA), srcB))
+				atomic.StoreUint32(&code[i+1], Encode(OP_NOP, 0, 0))
+				atomic.StoreUint32(&code[i+2], Encode(OP_NOP, 0, 0))
+				i += 3
+				continue
+			}
+		}
+
+		// Pattern 10: OP_LOAD_FAST + OP_LOAD_FAST + (OP_BINARY_SUB | OP_BINARY_SUB_INT)
+		// -> OP_FAST_SUB_INT_LOCALS (when not followed by OP_STORE_FAST)
+		if op0 == OP_LOAD_FAST && op1 == OP_LOAD_FAST &&
+			(op2 == OP_BINARY_SUB || op2 == OP_BINARY_SUB_INT) &&
+			op3 != OP_STORE_FAST {
+			srcA := DecodeArgBx(w0)
+			srcB := DecodeArgBx(w1)
+			if srcA < 256 && srcB < 256 {
+				atomic.StoreUint32(&code[i], Encode(OP_FAST_SUB_INT_LOCALS, uint8(srcA), srcB))
+				atomic.StoreUint32(&code[i+1], Encode(OP_NOP, 0, 0))
+				atomic.StoreUint32(&code[i+2], Encode(OP_NOP, 0, 0))
+				i += 3
+				continue
+			}
+		}
+
 		// Pattern 6: OP_LOAD_FAST + OP_LOAD_FAST + OP_COMPARE_OP (CMP_EQ) + OP_JUMP_IF_FALSE
 		// -> OP_FAST_CMP_EQ_JUMP_IF_FALSE
 		if op0 == OP_LOAD_FAST && op1 == OP_LOAD_FAST &&
