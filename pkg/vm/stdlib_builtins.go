@@ -99,6 +99,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 	d.Set(val.InternString("NotImplementedError"), val.TypeVal(val.NotImplementedErrorType))
 	d.Set(val.InternString("RecursionError"), val.TypeVal(val.RecursionErrorType))
 	d.Set(val.InternString("SyntaxError"), val.TypeVal(val.SyntaxErrorType))
+	d.Set(val.InternString("_IncompleteInputError"), val.TypeVal(val.IncompleteInputErrorType))
 	d.Set(val.InternString("IndentationError"), val.TypeVal(val.IndentationErrorType))
 	d.Set(val.InternString("TabError"), val.TypeVal(val.TabErrorType))
 	d.Set(val.InternString("SystemError"), val.TypeVal(val.SystemErrorType))
@@ -1325,8 +1326,19 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 	}))
 
 	d.Set(val.InternString("input"), val.NewBuiltinFuncVal("input", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		prompt := ""
 		if len(args) > 0 {
-			fmt.Print(args[0].String())
+			prompt = args[0].String()
+		}
+		if vmInstance, ok := ctx.VM.(*VM); ok && vmInstance.engine.inputHook != nil {
+			line, err := vmInstance.engine.inputHook(prompt)
+			if err != nil {
+				panic(val.NewException(val.EOFErrorType, "EOF when reading a line"))
+			}
+			return val.NewStringVal(line)
+		}
+		if prompt != "" {
+			fmt.Print(prompt)
 		}
 		var line string
 		_, _ = fmt.Scanln(&line)

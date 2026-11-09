@@ -43,6 +43,8 @@ var upstream = []string{
 	"bisect.py",
 	"calendar.py",
 	"code.py",
+	"codeop.py",
+	"rlcompleter.py",
 	"collections/__init__.py",
 	"compression/__init__.py",
 	"compression/_common/__init__.py",

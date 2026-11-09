@@ -6161,6 +6161,13 @@ func initTypes() {
 	RecursionErrorType = MustNewType("RecursionError", []*PyType{RuntimeErrorType}, nil)
 
 	SyntaxErrorType = MustNewType("SyntaxError", []*PyType{ExceptionType}, nil)
+	IncompleteInputErrorType = MustNewType("_IncompleteInputError", []*PyType{SyntaxErrorType}, nil)
+	// CPython SyntaxError location attributes default to None on the class
+	// so instances always expose them (code.InteractiveConsole reads them).
+	for _, attr := range []string{"filename", "lineno", "offset", "text", "end_lineno", "end_offset", "msg", "print_file_and_line"} {
+		SyntaxErrorType.Dict.Set(InternString(attr), NoneVal())
+	}
+	SyntaxErrorType.InvalidateVersion()
 	IndentationErrorType = MustNewType("IndentationError", []*PyType{SyntaxErrorType}, nil)
 	TabErrorType = MustNewType("TabError", []*PyType{IndentationErrorType}, nil)
 

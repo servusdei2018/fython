@@ -802,6 +802,11 @@ func builtinCompile(ctx *val.ExecContext, callable val.Value, args []val.Value, 
 	if mode == "func_type" {
 		panic("ValueError: compile() mode 'func_type' requires flag PyCF_ONLY_AST")
 	}
+	if flags&0x4000 != 0 { // PyCF_ALLOW_INCOMPLETE_INPUT
+		if vmInstance := ctx.VM.(*VM); vmInstance.engine.IncompleteInput(src) {
+			panic(val.NewException(val.IncompleteInputErrorType, "incomplete input"))
+		}
+	}
 	return compileSourceWithOptimize(ctx, src, filename, mode, optimize)
 }
 
@@ -820,7 +825,9 @@ func compileSourceWithOptimize(ctx *val.ExecContext, src []byte, filename, mode 
 	vmInstance := ctx.VM.(*VM)
 	co, err := vmInstance.engine.CompileDynamicWithOptimize(src, filename, m, optimize)
 	if err != nil {
-		panic("SyntaxError: " + err.Error())
+		msg := err.Error()
+		msg = strings.TrimPrefix(msg, "SyntaxError: ")
+		panic("SyntaxError: " + msg)
 	}
 	return NewCodeVal(co)
 }

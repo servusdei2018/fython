@@ -40,6 +40,7 @@ func init() {
 	}
 	vm.SetDynamicCompileHook(hook)
 	vm.SetDynamicCompileOptimizeHook(optHook)
+	vm.SetDefaultIncompleteHook(IncompleteInput)
 	vm.DefaultEngine().SetDynamicCompileHook(hook)
 	vm.DefaultEngine().SetDynamicCompileOptimizeHook(optHook)
 }
@@ -89,6 +90,7 @@ type Compiler struct {
 	filename       string
 	qualnamePrefix string
 	isExec         bool
+	isSingle       bool
 	optimize       int
 }
 
@@ -348,6 +350,7 @@ func CompileSourceModeWithOptimize(src []byte, filename string, mode CompileMode
 		filename:       filename,
 		qualnamePrefix: "",
 		isExec:         true,
+		isSingle:       mode == ModeSingle,
 		curLine:        1,
 		curCol:         1,
 		optimize:       optimize,
@@ -394,6 +397,37 @@ func CompileSourceModeWithOptimize(src []byte, filename string, mode CompileMode
 		LineSpans:      c.lineSpans,
 	}
 	return co.Init(), nil
+}
+
+// stmtAssignsUnderscore reports whether the byte range [start, end) of a
+// single-mode expression statement explicitly binds the name "_"
+// (assignment or walrus). The REPL echo is suppressed in that case.
+func (c *Compiler) stmtAssignsUnderscore(start, end uint32) bool {
+	if start >= end || int(end) > len(c.src) {
+		return false
+	}
+	frag := c.src[start:end]
+	lx := NewLexer(frag)
+	prevUnderscore := false
+	for {
+		t := lx.NextToken()
+		if t.Type == TOKEN_EOF {
+			return false
+		}
+		if t.Type == TOKEN_IDENT && int(t.End) <= len(frag) && string(frag[t.Start:t.End]) == "_" {
+			prevUnderscore = true
+			continue
+		}
+		if (t.Type == TOKEN_ASSIGN || t.Type == TOKEN_WALRUS) && prevUnderscore {
+			return true
+		}
+		if t.Type == TOKEN_WALRUS && prevUnderscore {
+			return true
+		}
+		if t.Type != TOKEN_EOF {
+			prevUnderscore = false
+		}
+	}
 }
 
 func (c *Compiler) extractDocstringFromSlice(stmts []StmtID) (string, bool) {
@@ -499,7 +533,11 @@ func (c *Compiler) compileStmt(stmtID StmtID) error {
 		if err := c.compileExpr(stmt.Expr1); err != nil {
 			return err
 		}
-		c.emitOp(vm.OP_POP_TOP, 0, 0)
+		if c.isSingle && !c.stmtAssignsUnderscore(stmt.Start, stmt.End) {
+			c.emitOp(vm.OP_PRINT_EXPR, 0, 0)
+		} else {
+			c.emitOp(vm.OP_POP_TOP, 0, 0)
+		}
 
 	case StmtKindReturn:
 		retSlot := -1

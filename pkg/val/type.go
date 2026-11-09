@@ -440,6 +440,7 @@ var (
 	NotImplementedErrorType       *PyType
 	RecursionErrorType            *PyType
 	SyntaxErrorType               *PyType
+	IncompleteInputErrorType      *PyType
 	IndentationErrorType          *PyType
 	TabErrorType                  *PyType
 	SystemErrorType               *PyType

@@ -2,7 +2,6 @@ package cli
 
 import (
 	"archive/zip"
-	"bufio"
 	"bytes"
 	"fmt"
 	"io"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/alecthomas/kong"
 
+	"github.com/servusdei2018/fython/internal/repl"
 	"github.com/servusdei2018/fython/pkg/compiler"
 	"github.com/servusdei2018/fython/pkg/val"
 	"github.com/servusdei2018/fython/pkg/vm"
@@ -274,10 +274,10 @@ func (c *CLI) Run() error {
 			data, _ := io.ReadAll(os.Stdin)
 			if len(strings.TrimSpace(string(data))) > 0 {
 				v = eng.NewVM()
-				return runInteractiveREPL(v, bytes.NewReader(data), os.Stderr, eff.Optimize)
+				return startREPL(v, bytes.NewReader(data), nil, eff)
 			}
 		}
-		return nil
+		return startREPL(v, os.Stdin, os.Stdin, eff)
 	}
 
 	if eff.Interactive && v != nil {
@@ -287,11 +287,32 @@ func (c *CLI) Run() error {
 			execErr = nil
 		}
 		if execErr == nil {
-			return runInteractiveREPL(v, os.Stdin, os.Stderr, eff.Optimize)
+			return startREPL(v, os.Stdin, os.Stdin, eff)
 		}
 	}
 
 	return execErr
+}
+
+// startREPL launches the interactive interpreter (TUI or line fallback)
+// over the given streams, preserving the VM namespace.
+func startREPL(v *vm.VM, stdin io.Reader, stdinFile *os.File, eff vm.RuntimeConfig) error {
+	cfg := repl.Config{
+		VM:        v,
+		Optimize:  eff.Optimize,
+		Quiet:     eff.Quiet,
+		IgnoreEnv: eff.IgnoreEnv,
+		Isolated:  eff.Isolated,
+		Stdin:     stdin,
+		StdinFile: stdinFile,
+	}
+	if err := repl.Run(cfg); err != nil {
+		if exit, ok := err.(*repl.ExitError); ok {
+			return &ErrExit{Code: exit.Code, Message: exit.Message}
+		}
+		return err
+	}
+	return nil
 }
 
 func prependSysPath0(v *vm.VM, dir string) {
@@ -309,65 +330,6 @@ func prependSysPath0(v *vm.VM, dir string) {
 		return
 	}
 	list.Items = append([]val.Value{val.NewStringVal(dir)}, list.Items...)
-}
-
-func runInteractiveREPL(v *vm.VM, in io.Reader, errOut io.Writer, optimize int) error {
-	sc := bufio.NewScanner(in)
-	var buf strings.Builder
-	for sc.Scan() {
-		line := sc.Text()
-		if buf.Len() > 0 {
-			if strings.TrimSpace(line) == "" {
-				stmt := buf.String()
-				buf.Reset()
-				if err := evalREPLLine(v, stmt, errOut, optimize); err != nil {
-					return err
-				}
-				continue
-			}
-			buf.WriteString(line)
-			buf.WriteByte('\n')
-			continue
-		}
-		trimmed := strings.TrimRight(line, " \t")
-		if strings.HasSuffix(trimmed, ":") || strings.HasSuffix(trimmed, "\\") {
-			buf.WriteString(line)
-			buf.WriteByte('\n')
-			continue
-		}
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		if err := evalREPLLine(v, line+"\n", errOut, optimize); err != nil {
-			return err
-		}
-	}
-	if buf.Len() > 0 {
-		if err := evalREPLLine(v, buf.String(), errOut, optimize); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func evalREPLLine(v *vm.VM, src string, errOut io.Writer, optimize int) error {
-	co, err := compiler.CompileSourceModeWithOptimize([]byte(src), "<stdin>", compiler.ModeSingle, optimize)
-	if err != nil {
-		co, err = compiler.CompileSourceModeWithOptimize([]byte(src), "<stdin>", compiler.ModeExec, optimize)
-		if err != nil {
-			_, _ = fmt.Fprintln(errOut, err.Error())
-			return nil
-		}
-	}
-	v.RunCode(co)
-	if uerr := unhandledError(v); uerr != nil {
-		if exitErr, ok := uerr.(*ErrExit); ok {
-			return exitErr
-		}
-		_, _ = fmt.Fprintln(errOut, uerr.Error())
-		v.ClearUnhandledException()
-	}
-	return nil
 }
 
 // ErrUncaughtException signals that the program terminated with an uncaught Python exception.

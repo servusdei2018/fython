@@ -2,6 +2,7 @@ package vm
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -67,6 +68,8 @@ type Engine struct {
 	compileWithFilenameHook    func(src []byte, filename string) (*CodeObject, error)
 	dynamicCompileHook         func(src []byte, filename string, mode int) (*CodeObject, error)
 	dynamicCompileOptimizeHook func(src []byte, filename string, mode, optimize int) (*CodeObject, error)
+	incompleteHook             func(src []byte) bool
+	inputHook                  func(prompt string) (string, error)
 	virtualModules             sync.Map
 	asyncMode                  AsyncMode
 	osPathMu                   sync.Mutex
@@ -79,6 +82,7 @@ var (
 	defaultCompileWithFilenameHook    func(src []byte, filename string) (*CodeObject, error)
 	defaultDynamicCompileHook         func(src []byte, filename string, mode int) (*CodeObject, error)
 	defaultDynamicCompileOptimizeHook func(src []byte, filename string, mode, optimize int) (*CodeObject, error)
+	defaultIncompleteHook             func(src []byte) bool
 )
 
 // SetDefaultCompileHook sets the global default callback for source compilation.
@@ -99,6 +103,31 @@ func SetDynamicCompileHook(fn func(src []byte, filename string, mode int) (*Code
 // SetDynamicCompileOptimizeHook sets the global default callback for dynamic compilation with an optimization level.
 func SetDynamicCompileOptimizeHook(fn func(src []byte, filename string, mode, optimize int) (*CodeObject, error)) {
 	defaultDynamicCompileOptimizeHook = fn
+}
+
+// SetInputHook installs the hook used by input() when set (the REPL uses
+// it to multiplex its line reader with the Python input builtin).
+func (e *Engine) SetInputHook(fn func(prompt string) (string, error)) {
+	e.inputHook = fn
+}
+
+// SetDefaultIncompleteHook sets the global callback reporting whether source
+// is incomplete interactive input (used by compile() with
+// PyCF_ALLOW_INCOMPLETE_INPUT, e.g. from codeop).
+func SetDefaultIncompleteHook(fn func(src []byte) bool) {
+	defaultIncompleteHook = fn
+}
+
+// IncompleteInput reports whether src needs more input before it can be
+// compiled, per the registered hook (no hook means "never incomplete").
+func (e *Engine) IncompleteInput(src []byte) bool {
+	if e != nil && e.incompleteHook != nil {
+		return e.incompleteHook(src)
+	}
+	if defaultIncompleteHook != nil {
+		return defaultIncompleteHook(src)
+	}
+	return false
 }
 
 // NewEngine creates and initializes a shared Engine instance.
@@ -127,6 +156,7 @@ func NewEngine() *Engine {
 		compileHook:             defaultCompileHook,
 		compileWithFilenameHook: defaultCompileWithFilenameHook,
 		dynamicCompileHook:      defaultDynamicCompileHook,
+		incompleteHook:          defaultIncompleteHook,
 	}
 	// Temporary bootstrap VM to populate e.builtins
 	bootVM := &VM{
@@ -383,9 +413,68 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 		return val.NewStringVal("surrogateescape")
 	}))
 
-	sysMod.Dict.Set(val.InternString("excepthook"), val.NewBuiltinFuncVal("excepthook", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+	excepthook := val.NewBuiltinFuncVal("excepthook", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		vmInstance, ok := ctx.VM.(*VM)
+		if !ok {
+			return val.NoneVal()
+		}
+		var exc val.Value
+		if len(args) >= 2 && !args[1].IsNone() && args[1].HeaderPtr() != nil {
+			exc = args[1]
+		} else {
+			exc = vmInstance.lastException
+		}
+		text := vmInstance.FormatException(exc)
+		if text == "" {
+			return val.NoneVal()
+		}
+		if sysVal, ok := vmInstance.modules.Get(val.InternString("sys")); ok && sysVal.IsModule() {
+			if stderrVal, ok := sysVal.AsModule().Dict.Get(val.InternString("stderr")); ok && !stderrVal.IsNone() {
+				write := val.GetAttrCtx(ctx, stderrVal, val.InternString("write"))
+				if !write.IsUnbound() && !write.IsNone() {
+					ctx.Invoke1(write, val.NewStringVal(text))
+					return val.NoneVal()
+				}
+				ctx.ClearException()
+			}
+		}
+		fmt.Fprint(os.Stderr, text)
 		return val.NoneVal()
-	}))
+	})
+	sysMod.Dict.Set(val.InternString("excepthook"), excepthook)
+	sysMod.Dict.Set(val.InternString("__excepthook__"), excepthook)
+
+	displayhook := val.NewBuiltinFuncVal("displayhook", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			return val.NoneVal()
+		}
+		v := args[0]
+		if v.IsNone() || v.HeaderPtr() == nil {
+			return val.NoneVal()
+		}
+		if vmInstance, ok := ctx.VM.(*VM); ok && vmInstance.builtins != nil {
+			vmInstance.builtins.Set(val.InternString("_"), v)
+		}
+		text := val.PyRepr(ctx, v) + "\n"
+		if vmInstance, ok := ctx.VM.(*VM); ok {
+			if sysVal, ok := vmInstance.modules.Get(val.InternString("sys")); ok && sysVal.IsModule() {
+				if stdoutVal, ok := sysVal.AsModule().Dict.Get(val.InternString("stdout")); ok && !stdoutVal.IsNone() {
+					write := val.GetAttrCtx(ctx, stdoutVal, val.InternString("write"))
+					if !write.IsUnbound() && !write.IsNone() {
+						ctx.Invoke1(write, val.NewStringVal(text))
+						return val.NoneVal()
+					}
+					ctx.ClearException()
+				}
+			}
+		}
+		_, _ = fmt.Fprint(os.Stdout, text)
+		return val.NoneVal()
+	})
+	sysMod.Dict.Set(val.InternString("displayhook"), displayhook)
+	sysMod.Dict.Set(val.InternString("__displayhook__"), displayhook)
+	sysMod.Dict.Set(val.InternString("ps1"), val.NewStringVal(">>> "))
+	sysMod.Dict.Set(val.InternString("ps2"), val.NewStringVal("... "))
 	sysMod.Dict.Set(val.InternString("unraisablehook"), val.NewBuiltinFuncVal("unraisablehook", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		return val.NoneVal()
 	}))
@@ -861,6 +950,11 @@ func (e *Engine) SetSearchPaths(paths []string) {
 			sysVal.AsModule().Dict.Set(val.InternString("path"), val.NewListVal(pathItems...))
 		}
 	}
+}
+
+// NewFileStream wraps f as a text file Value (for stream substitution).
+func (e *Engine) NewFileStream(f *os.File, name string, writable bool) val.Value {
+	return newStdStream(f, name, writable)
 }
 
 // SearchPaths returns the active directory search paths.

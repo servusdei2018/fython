@@ -2421,6 +2421,9 @@ func (p *Parser) parseAddSub() (ExprID, error) {
 		if err != nil {
 			return ExprNone, err
 		}
+		if rn := p.arena.GetExpr(right); rn != nil && rn.Kind == ExprKindStarred {
+			return ExprNone, errors.New("SyntaxError: cannot use starred expression here")
+		}
 		left = p.arena.AllocExpr(ASTExpr{
 			Kind:  ExprKindBinary,
 			Op:    uint8(opTok.Type),
@@ -2443,6 +2446,9 @@ func (p *Parser) parseMulDiv() (ExprID, error) {
 		right, err := p.parseUnary()
 		if err != nil {
 			return ExprNone, err
+		}
+		if rn := p.arena.GetExpr(right); rn != nil && rn.Kind == ExprKindStarred {
+			return ExprNone, errors.New("SyntaxError: cannot use starred expression here")
 		}
 		left = p.arena.AllocExpr(ASTExpr{
 			Kind:  ExprKindBinary,

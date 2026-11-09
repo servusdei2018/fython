@@ -185,6 +185,9 @@ const (
 	OP_FAST_CMP_EQ_LOCAL_DEREF_JUMP_IF_FALSE
 	OP_FAST_SUB_LOCAL_ADD_DEREF_TO_LOCAL
 	OP_FAST_SELF_RECURSE_INC_LOCAL
+
+	// REPL single-statement echo (CPython single-mode print-expr).
+	OP_PRINT_EXPR
 )
 
 // Comparison operation codes for OP_COMPARE_OP (passed in ArgA field).
@@ -465,6 +468,8 @@ func (op Opcode) String() string {
 		return "OP_FAST_SUB_LOCAL_ADD_DEREF_TO_LOCAL"
 	case OP_FAST_SELF_RECURSE_INC_LOCAL:
 		return "OP_FAST_SELF_RECURSE_INC_LOCAL"
+	case OP_PRINT_EXPR:
+		return "OP_PRINT_EXPR"
 	default:
 		return "OP_UNKNOWN"
 	}

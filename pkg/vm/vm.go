@@ -4735,6 +4735,47 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			sp--
 			ip++
 
+		case OP_PRINT_EXPR:
+			v := stack[sp-1]
+			sp--
+			if !v.IsNone() && v.HeaderPtr() != nil {
+				vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+				vm.execCtx.SP = sp
+				if hook, ok := vm.getDisplayhook(); ok {
+					_, panicValue := vm.invokeDisplayhook(hook, v)
+					if &stack[0] != &vm.execCtx.Stack[0] {
+						stack = vm.execCtx.Stack
+						switch {
+						case activeCoro != nil:
+							activeCoro.Stack = stack
+						case activeGen != nil:
+							activeGen.Stack = stack
+						default:
+							vm.stack = stack
+						}
+						locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+					}
+					if panicValue != nil {
+						exc := panicToPyException(panicValue)
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+							if activeGen != nil {
+								activeGen.State = val.GenClosed
+							}
+							if activeCoro != nil {
+								activeCoro.State = val.CoroClosed
+							}
+							return val.NoneVal()
+						}
+						locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+						curCodeCache = vm.getCodeCache(curCO)
+						continue
+					}
+				} else {
+					vm.defaultPrintExpr(v)
+				}
+			}
+			ip++
+
 		case OP_DUP_TOP:
 			stack[sp] = stack[sp-1]
 			sp++

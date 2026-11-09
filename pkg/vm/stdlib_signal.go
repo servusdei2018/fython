@@ -122,6 +122,15 @@ func (vm *VM) deliverSignalsSafe() {
 	vm.deliverSignals()
 }
 
+// RequestInterrupt queues a SIGINT for this VM, making it raise the
+// default catchable KeyboardInterrupt at the next interpreter back-edge.
+// The REPL uses it when the user presses Ctrl+C while bytecode is running.
+func (vm *VM) RequestInterrupt() {
+	s := vm.engine.sig()
+	s.owner.Store(vm)
+	s.raise(int(syscall.SIGINT))
+}
+
 // sleepInterruptibly sleeps for d, running signal handlers as they arrive.
 func (vm *VM) sleepInterruptibly(d time.Duration) {
 	s := vm.engine.sig()

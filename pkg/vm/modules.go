@@ -61,6 +61,9 @@ func (vm *VM) GetModule(name string) (val.Value, bool) {
 	return vm.modules.Get(val.InternString(name))
 }
 
+// SysPath returns the current sys.path entries (see liveSysPath).
+func (vm *VM) SysPath() []string { return vm.liveSysPath() }
+
 // liveSysPath returns the current string entries of sys.path on the VM,
 // falling back to vm.engine.searchPaths if sys.path is unavailable.
 func (vm *VM) liveSysPath() []string {

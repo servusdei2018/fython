@@ -101,7 +101,7 @@ func TestZeroOverlays(t *testing.T) {
 			t.Errorf("manifest lists %s but it is not embedded", rel)
 		}
 	}
-	for _, must := range []string{"ast.py", "_ast_unparse.py", "textwrap.py", "annotationlib.py"} {
+	for _, must := range []string{"ast.py", "_ast_unparse.py", "textwrap.py", "annotationlib.py", "code.py", "codeop.py", "rlcompleter.py"} {
 		if !seen[must] {
 			t.Errorf("%s must come from upstream", must)
 		}
