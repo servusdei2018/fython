@@ -359,6 +359,9 @@ func initImportlibTypes() {
 			self := args[0]
 			inst := self.AsInstance()
 			mod := args[1].AsModule()
+			if vmInstance, ok := ctx.VM.(*VM); ok && vmInstance != nil && vmInstance.sandboxBlocksNative() {
+				panic("PermissionError: native extensions and ctypes are disabled by sandbox policy")
+			}
 			pVal, ok := inst.GetAttr(val.InternString("path"))
 			if !ok || !pVal.IsAnyString() {
 				panic(val.NewImportError("loader has no path"))
@@ -713,6 +716,18 @@ func findSpecInSingleEntry(vm *VM, fullname, dir string) val.Value {
 		entryPath, isPkg, found := arch.findModule(prefix, leaf)
 		if found {
 			origin := archPath + "/" + entryPath
+			if isExtensionFile(entryPath) {
+				loader := newExtensionFileLoaderVal(fullname, origin)
+				var subLocs []string
+				if isPkg {
+					pkgDir := leaf
+					if prefix != "" {
+						pkgDir = strings.TrimSuffix(prefix, "/") + "/" + leaf
+					}
+					subLocs = []string{archPath + "/" + pkgDir}
+				}
+				return newModuleSpecVal(fullname, loader, origin, isPkg, subLocs)
+			}
 			zLoader := newZipImporterInstance(vm, archPath, prefix)
 			var subLocs []string
 			if isPkg {

@@ -224,6 +224,7 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 	sysMod.Dict.Set(val.InternString("orig_argv"), val.NewListVal(origArgvItems...))
 
 	sysMod.Dict.Set(val.InternString("executable"), val.NewStringVal(eff.Executable))
+	sysMod.Dict.Set(val.InternString("_base_executable"), val.NewStringVal(baseExecutableFor(eff.Executable)))
 	sysMod.Dict.Set(val.InternString("prefix"), val.NewStringVal(disc.prefix))
 	sysMod.Dict.Set(val.InternString("exec_prefix"), val.NewStringVal(disc.prefix))
 	sysMod.Dict.Set(val.InternString("base_prefix"), val.NewStringVal(disc.basePrefix))
@@ -234,6 +235,7 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 	verInfo := newVersionInfoTuple(3, 15, 0, "final", 0)
 	sysMod.Dict.Set(val.InternString("version_info"), verInfo)
 	sysMod.Dict.Set(val.InternString("hexversion"), val.Int64Val(0x030f00f0))
+	sysMod.Dict.Set(val.InternString("api_version"), val.Int64Val(1013))
 	sysMod.Dict.Set(val.InternString("platform"), val.InternString(runtime.GOOS))
 	sysMod.Dict.Set(val.InternString("abiflags"), val.InternString(""))
 	sysMod.Dict.Set(val.InternString("winver"), val.NoneVal())
@@ -260,14 +262,7 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 	}
 	sysMod.Dict.Set(val.InternString("_xoptions"), val.DictVal(xoptsDict))
 
-	implNs := val.NewInstanceOfType(val.ObjectType)
-	implInst := implNs.AsInstance()
-	implInst.SetAttr(val.InternString("name"), val.InternString("fython"))
-	implInst.SetAttr(val.InternString("version"), verInfo)
-	implInst.SetAttr(val.InternString("hexversion"), val.Int64Val(0x030f00f0))
-	implInst.SetAttr(val.InternString("cache_tag"), val.InternString("fython-315"))
-	implInst.SetAttr(val.InternString("_multiarch"), val.InternString(""))
-	sysMod.Dict.Set(val.InternString("implementation"), implNs)
+	sysMod.Dict.Set(val.InternString("implementation"), implementationModule(verInfo))
 
 	sysMod.Dict.Set(val.InternString("flags"), newSysFlags(eff))
 

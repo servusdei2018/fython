@@ -223,6 +223,18 @@ func (z *cachedZipArchive) findModule(innerPrefix, relModule string) (entryPath 
 	if _, ok := z.files[modPy]; ok {
 		return modPy, false, true
 	}
+	for _, suf := range extensionSuffixes() {
+		cand := base + suf
+		if _, ok := z.files[cand]; ok {
+			return cand, false, true
+		}
+	}
+	for _, suf := range extensionSuffixes() {
+		cand := base + "/__init__" + suf
+		if _, ok := z.files[cand]; ok {
+			return cand, true, true
+		}
+	}
 	return "", false, false
 }
 
@@ -295,6 +307,20 @@ func initZipImportTypes() {
 			entryPath, isPkg, found := arch.findModule(strings.TrimSuffix(prefix, "/"), leaf)
 			if found {
 				origin := archPath + "/" + entryPath
+				if isExtensionFile(entryPath) {
+					loader := newExtensionFileLoaderVal(fullname, origin)
+					var subSearch []string
+					if isPkg {
+						pkgDir := strings.TrimSuffix(prefix, "/")
+						if pkgDir != "" {
+							pkgDir = pkgDir + "/" + leaf
+						} else {
+							pkgDir = leaf
+						}
+						subSearch = []string{archPath + "/" + pkgDir}
+					}
+					return newModuleSpecVal(fullname, loader, origin, isPkg, subSearch)
+				}
 				var subSearch []string
 				if isPkg {
 					pkgDir := strings.TrimSuffix(prefix, "/")
@@ -440,7 +466,8 @@ func initZipImportTypes() {
 				panic("TypeError: exec_module() requires a module object")
 			}
 			self := args[0]
-			mod := args[1].AsModule()
+			modVal := args[1]
+			mod := modVal.AsModule()
 			archPath, prefix, arch := getZipImporterState(self)
 			if arch == nil {
 				panic(val.NewException(ZipImportErrorType, fmt.Sprintf("can't find module %q", mod.Name)))
@@ -454,6 +481,21 @@ func initZipImportTypes() {
 				panic(val.NewException(ZipImportErrorType, fmt.Sprintf("can't find module %q", mod.Name)))
 			}
 			origin := archPath + "/" + entryPath
+			if isExtensionFile(entryPath) {
+				if vmInstance, ok := ctx.VM.(*VM); ok && vmInstance != nil && vmInstance.sandboxBlocksNative() {
+					panic("PermissionError: native extensions and ctypes are disabled by sandbox policy")
+				}
+				mod.File = origin
+				mod.Dict.Set(val.InternString("__file__"), val.NewStringVal(origin))
+				mod.Dict.Set(val.InternString("__loader__"), self)
+				if err := execExtensionModule(ctx, modVal, origin); err != nil {
+					if ctx != nil && ctx.HasException() {
+						panic(ctx.ActiveException)
+					}
+					panic(val.NewImportError(err.Error()))
+				}
+				return val.NoneVal()
+			}
 			mod.File = origin
 			mod.Dict.Set(val.InternString("__file__"), val.NewStringVal(origin))
 			mod.Dict.Set(val.InternString("__loader__"), self)

@@ -22,6 +22,19 @@ var (
 func EnableGIL()       { gilEnabled.Store(true) }
 func GILEnabled() bool { return gilEnabled.Load() }
 
+// NativeChargeHook charges native-boundary step costs without importing vm.
+var NativeChargeHook func(ctx *val.ExecContext)
+
+// ChargeNative charges one native callback against the ambient VM limits.
+func ChargeNative(ctx *val.ExecContext) {
+	if ctx == nil {
+		ctx = CurrentContext()
+	}
+	if NativeChargeHook != nil {
+		NativeChargeHook(ctx)
+	}
+}
+
 // goroutine ID via runtime.Stack parsing (no external dep).
 func currentGID() int64 {
 	var buf [64]byte
@@ -118,4 +131,17 @@ func TryWithGIL(ctx *val.ExecContext, fn func()) {
 	release := AcquireGIL(ctx)
 	defer release()
 	fn()
+}
+
+// CheckContextFn re-validates cancellation after a C-API transition.
+var CheckContextFn func(ctx *val.ExecContext)
+
+// CheckLimitsContext invokes the VM post-transition cancellation check.
+func CheckLimitsContext(ctx *val.ExecContext) {
+	if ctx == nil {
+		ctx = CurrentContext()
+	}
+	if CheckContextFn != nil {
+		CheckContextFn(ctx)
+	}
 }

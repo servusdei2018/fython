@@ -3,6 +3,7 @@ package vm
 import (
 	"bufio"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -10,6 +11,46 @@ import (
 
 	"github.com/servusdei2018/fython/pkg/val"
 )
+
+// resolveExecutable returns the invoked interpreter path preserving symlinks.
+// When os.Args[0] is a bare command name (PATH lookup), it is resolved via
+// exec.LookPath and then absolutized without evaluating symlinks, so a
+// `.venv/bin/python` symlink accessed via PATH keeps its venv identity.
+func resolveExecutable() string {
+	if len(os.Args) == 0 || os.Args[0] == "" {
+		if exe, err := os.Executable(); err == nil && exe != "" {
+			return filepath.Clean(exe)
+		}
+		return "fython"
+	}
+	arg0 := os.Args[0]
+	if !strings.ContainsRune(arg0, filepath.Separator) && !strings.ContainsRune(arg0, '/') {
+		if resolved, err := exec.LookPath(arg0); err == nil && resolved != "" {
+			if abs, err := filepath.Abs(filepath.Clean(resolved)); err == nil {
+				return abs
+			}
+			return filepath.Clean(resolved)
+		}
+	}
+	if abs, err := filepath.Abs(filepath.Clean(arg0)); err == nil {
+		return abs
+	}
+	return filepath.Clean(arg0)
+}
+
+// baseExecutableFor returns the resolved target for sys._base_executable.
+func baseExecutableFor(invoked string) string {
+	if resolved, err := filepath.EvalSymlinks(invoked); err == nil && resolved != "" {
+		return filepath.Clean(resolved)
+	}
+	if exe, err := os.Executable(); err == nil && exe != "" {
+		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+			return filepath.Clean(resolved)
+		}
+		return filepath.Clean(exe)
+	}
+	return invoked
+}
 
 // RuntimeConfig holds the CPython-compatible command-line flags and process configuration.
 type RuntimeConfig struct {
@@ -71,11 +112,7 @@ func (cfg RuntimeConfig) Effective() RuntimeConfig {
 		}
 	}
 	if out.Executable == "" {
-		if exe, err := os.Executable(); err == nil {
-			out.Executable = exe
-		} else {
-			out.Executable = "fython"
-		}
+		out.Executable = resolveExecutable()
 	}
 	return out
 }

@@ -300,6 +300,7 @@ type VM struct {
 	rootCO             CodeObject
 	rootCache          VMCodeCache
 	limits             RuntimeLimits
+	limitsActive       bool
 	stepCount          uint64
 	eventLoop          *EventLoop
 }

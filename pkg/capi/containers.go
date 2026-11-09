@@ -266,6 +266,8 @@ func PyObject_Call(callable unsafe.Pointer, args unsafe.Pointer, kwargs unsafe.P
 		pyErrSetTypeError("PyObject_Call called with NULL callable")
 		return nil
 	}
+	ChargeNative(nil)
+	defer CheckLimitsContext(nil)
 	ctx := CurrentContext()
 	fn := val.ArenaFromStub(callable)
 	var argVals []val.Value
@@ -350,6 +352,8 @@ func PyObject_Vectorcall(callable unsafe.Pointer, args unsafe.Pointer, nargsf in
 		pyErrSetTypeError("PyObject_Vectorcall called with NULL")
 		return nil
 	}
+	ChargeNative(nil)
+	defer CheckLimitsContext(nil)
 	// Decode nargsf: low bits = nargs, high flag PY_VECTORCALL_ARGUMENTS_OFFSET (0x8000)
 	nargs := int(nargsf & 0x7FFF)
 	// Actually for 3.15, nargsf is size_t; high bit flag may differ. Use low 15 bits + ignore flag.

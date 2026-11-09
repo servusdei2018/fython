@@ -17,25 +17,7 @@ import (
 // Extension suffixes per platform (CPython 3.15 + PEP 384 abi3).
 func extensionSuffixes() []string {
 	goos := runtime.GOOS
-	goarch := runtime.GOARCH
-	var triple string
-	switch goos {
-	case "linux":
-		switch goarch {
-		case "amd64":
-			triple = "x86_64-linux-gnu"
-		case "arm64":
-			triple = "aarch64-linux-gnu"
-		default:
-			triple = goarch + "-linux"
-		}
-	case "darwin":
-		triple = "darwin"
-	case "windows":
-		triple = "win32"
-	default:
-		triple = goos + "-" + goarch
-	}
+	triple := hostMultiarch()
 	if goos == "windows" {
 		return []string{".cpython-315-" + triple + ".pyd", ".pyd", ".abi3.pyd"}
 	}
@@ -151,6 +133,21 @@ func isExtensionFile(path string) bool {
 //  5. Return module Value
 
 func execExtensionModule(ctx *val.ExecContext, modVal val.Value, filePath string) error {
+	var vm *VM
+	if ctx != nil {
+		if v, ok := ctx.VM.(*VM); ok {
+			vm = v
+		}
+	}
+	if vm != nil && vm.sandboxBlocksNative() {
+		return errors.New("PermissionError: native extensions and ctypes are disabled by sandbox policy")
+	}
+	// Materialize in-zip extensions to a dlopen-able path before shim handling.
+	if resolved, ok, err := resolveExtensionPath(filePath); err != nil {
+		return fmt.Errorf("ImportError: %v", err)
+	} else if ok {
+		filePath = resolved
+	}
 	shimHandle, err := ensureShim()
 	if err != nil {
 		return err
@@ -165,8 +162,16 @@ func execExtensionModule(ctx *val.ExecContext, modVal val.Value, filePath string
 	}
 	initName := "PyInit_" + short
 
+	if vm != nil {
+		vm.chargeNative()
+	}
 	release := capi.AcquireGIL(ctx)
-	defer release()
+	defer func() {
+		release()
+		if vm != nil {
+			vm.checkLimitsContext()
+		}
+	}()
 	// Ensure ctx saved GIL (AcquireGIL already bound).
 	h, err := dynload.Open(filePath)
 	if err != nil {
@@ -183,10 +188,19 @@ func execExtensionModule(ctx *val.ExecContext, modVal val.Value, filePath string
 	// Use recover to catch unexpected Go panics from handlers (handlers shouldn't panic, they set errors).
 	var result unsafe.Pointer
 	var panicked any
+	if vm != nil {
+		vm.chargeNative()
+	}
 	func() {
 		defer func() { panicked = recover() }()
 		result = pyInit()
 	}()
+	if vm != nil {
+		if e, ok := panicked.(error); ok && (errors.Is(e, ErrTimeoutExceeded) || errors.Is(e, ErrStepLimitExceeded)) {
+			panic(e)
+		}
+		vm.checkLimitsContext()
+	}
 	if panicked != nil {
 		if ctx != nil && ctx.HasException() {
 			return errors.New("exception during import")
@@ -243,7 +257,13 @@ func execExtensionModule(ctx *val.ExecContext, modVal val.Value, filePath string
 			if execFn != nil {
 				var exec func(mod unsafe.Pointer) int32
 				dynload.RegisterFunc(&exec, uintptr(execFn))
+				if vm != nil {
+					vm.chargeNative()
+				}
 				ret := exec(modStub)
+				if vm != nil {
+					vm.checkLimitsContext()
+				}
 				if ret != 0 {
 					return errors.New("ImportError: module exec failed")
 				}

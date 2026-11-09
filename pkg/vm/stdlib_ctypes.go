@@ -377,6 +377,9 @@ func (e *Engine) createCtypesLowerModule() val.Value {
 
 	// dlopen / LoadLibrary
 	setF("dlopen", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if vmInstance, ok := ctx.VM.(*VM); ok && vmInstance != nil && vmInstance.sandboxBlocksNative() {
+			panic("PermissionError: native extensions and ctypes are disabled by sandbox policy")
+		}
 		var name string
 		if len(args) >= 1 && !args[0].IsNone() {
 			if args[0].IsAnyString() {
@@ -395,6 +398,9 @@ func (e *Engine) createCtypesLowerModule() val.Value {
 		return val.Int64Val(int64(handle))
 	})
 	setF("LoadLibrary", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if vmInstance, ok := ctx.VM.(*VM); ok && vmInstance != nil && vmInstance.sandboxBlocksNative() {
+			panic("PermissionError: native extensions and ctypes are disabled by sandbox policy")
+		}
 		var name string
 		if len(args) >= 1 && args[0].IsAnyString() {
 			name = args[0].AsString()

@@ -295,6 +295,20 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 		return val.NoneVal(), errors.New("ValueError: Empty module name")
 	}
 
+	// Sandbox guardrail: block native-capable modules eagerly at the import
+	// statement so lazy PEP 690 resolution cannot defer the check.
+	if vm.sandboxBlocksNative() {
+		leaf := canonicalName
+		if idx := strings.LastIndex(canonicalName, "."); idx >= 0 {
+			leaf = canonicalName[idx+1:]
+		}
+		if canonicalName == "ctypes" || canonicalName == "_ctypes" ||
+			strings.HasPrefix(canonicalName, "ctypes.") || strings.HasPrefix(canonicalName, "_ctypes.") ||
+			leaf == "_ctypes" || leaf == "ctypes" {
+			return val.NoneVal(), errors.New("PermissionError: native extensions and ctypes are disabled by sandbox policy")
+		}
+	}
+
 	parts := strings.Split(canonicalName, ".")
 
 	if canonicalName == "os" || canonicalName == "os.path" || canonicalName == "posixpath" || canonicalName == "genericpath" {
@@ -468,24 +482,20 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 			} else if strings.HasPrefix(currName, "_sysconfigdata_") {
 				modVal := val.NewModuleVal(currName, "")
 				prefix, base := vm.engine.sysPrefix()
-				btv := val.NewDictVal(16).AsDict()
-				btv.Set(val.InternString("prefix"), val.NewStringVal(prefix))
-				btv.Set(val.InternString("base"), val.NewStringVal(base))
-				btv.Set(val.InternString("SOABI"), val.NewStringVal("cpython-315"))
-				sufs := extensionSuffixes()
-				extSuffix := ".so"
-				if len(sufs) > 0 {
-					extSuffix = sufs[0]
-				}
-				btv.Set(val.InternString("EXT_SUFFIX"), val.NewStringVal(extSuffix))
-				btv.Set(val.InternString("EXTENSION_SUFFIXES"), val.NewListVal(func() []val.Value {
-					items := make([]val.Value, len(sufs))
-					for i, s := range sufs {
-						items[i] = val.NewStringVal(s)
-					}
-					return items
-				}()...))
+				btv := buildSysconfigData(prefix, base)
 				modVal.AsModule().Dict.Set(val.InternString("build_time_vars"), val.DictVal(btv))
+				vm.modules.Set(internedCurr, modVal)
+				if i > 0 {
+					if parentVal.IsModule() {
+						parentVal.AsModule().Dict.Set(val.InternString(parts[i]), modVal)
+					} else {
+						val.SetAttrCtx(&vm.execCtx, parentVal, val.InternString(parts[i]), modVal)
+					}
+				}
+				parentVal = modVal
+				continue
+			} else if currName == "_sysconfig" {
+				modVal := vm.createSysconfigModule()
 				vm.modules.Set(internedCurr, modVal)
 				if i > 0 {
 					if parentVal.IsModule() {
@@ -505,6 +515,9 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 
 		// Extension fast-path: .so/.pyd modules load via execExtensionModule (no bytecode)
 		if isExtensionFile(filePath) {
+			if vm.sandboxBlocksNative() {
+				return val.NoneVal(), errors.New("PermissionError: native extensions and ctypes are disabled by sandbox policy")
+			}
 			modVal := val.NewModuleVal(currName, filePath)
 			mod := modVal.AsModule()
 			if i > 0 {
