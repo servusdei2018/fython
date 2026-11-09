@@ -30,9 +30,9 @@ def get_total():
 	}
 
 	engine := vm.NewEngine()
-	var compileCount int32
+	var compileCount atomic.Int32
 	engine.SetCompileHook(func(s []byte) (*vm.CodeObject, error) {
-		atomic.AddInt32(&compileCount, 1)
+		compileCount.Add(1)
 		// Small sleep to ensure concurrent goroutines arrive while compilation is in-flight
 		time.Sleep(5 * time.Millisecond)
 		return compiler.CompileSource(s)
@@ -45,7 +45,7 @@ def get_total():
 
 	errCh := make(chan error, numGoroutines)
 
-	for g := 0; g < numGoroutines; g++ {
+	for g := range numGoroutines {
 		go func(gid int) {
 			defer wg.Done()
 			v := engine.NewVM()
@@ -75,7 +75,7 @@ res_%d = concurrent_target.get_total()
 	}
 
 	// Verify that compilation happened exactly 1 time!
-	c := atomic.LoadInt32(&compileCount)
+	c := compileCount.Load()
 	if c != 1 {
 		t.Fatalf("Engine singleflight failed: expected exactly 1 compilation call, got %d", c)
 	}
@@ -115,7 +115,7 @@ def query_a():
 
 	errCh := make(chan error, numGoroutines)
 
-	for g := 0; g < numGoroutines; g++ {
+	for g := range numGoroutines {
 		go func(gid int) {
 			defer wg.Done()
 			v := engine.NewVM()

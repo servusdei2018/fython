@@ -84,10 +84,10 @@ func initBytesMethods() {
 			panic("ValueError: maketrans arguments must have same length")
 		}
 		table := make([]byte, 256)
-		for i := 0; i < 256; i++ {
+		for i := range 256 {
 			table[i] = byte(i)
 		}
-		for i := 0; i < len(f); i++ {
+		for i := range f {
 			table[f[i]] = t[i]
 		}
 		return NewBytesVal(table)
@@ -191,7 +191,7 @@ func initBytesMethods() {
 		}
 		out := make([]byte, w)
 		pad := w - len(self)
-		for i := 0; i < pad; i++ {
+		for i := range pad {
 			out[i] = fill
 		}
 		copy(out[pad:], self)
@@ -299,7 +299,7 @@ func initBytesMethods() {
 
 	stripFn := func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		self := bytesSelf("strip", args)
-		var cut string = " \t\r\n\x00"
+		cut := " \t\r\n\x00"
 		if len(args) > 1 && !args[1].IsNone() {
 			if cb, ok := bytesMethodArg(args[1]); ok {
 				cut = string(cb)
@@ -314,7 +314,7 @@ func initBytesMethods() {
 
 	lstripFn := func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		self := bytesSelf("lstrip", args)
-		var cut string = " \t\r\n\x00"
+		cut := " \t\r\n\x00"
 		if len(args) > 1 && !args[1].IsNone() {
 			if cb, ok := bytesMethodArg(args[1]); ok {
 				cut = string(cb)
@@ -329,7 +329,7 @@ func initBytesMethods() {
 
 	rstripFn := func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		self := bytesSelf("rstrip", args)
-		var cut string = " \t\r\n\x00"
+		cut := " \t\r\n\x00"
 		if len(args) > 1 && !args[1].IsNone() {
 			if cb, ok := bytesMethodArg(args[1]); ok {
 				cut = string(cb)
@@ -374,7 +374,7 @@ func initBytesMethods() {
 		}
 		s := pa[0].AsString()
 		var hexChars []byte
-		for i := 0; i < len(s); i++ {
+		for i := range len(s) {
 			c := s[i]
 			if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
 				continue

@@ -485,11 +485,7 @@ func writeJSONValue(sb *strings.Builder, v val.Value, indent int, level int) err
 				writeIndent(sb, indent, level+1)
 			}
 			writeJSONString(sb, e.Key.AsString())
-			if indent > 0 {
-				sb.WriteString(": ")
-			} else {
-				sb.WriteString(": ")
-			}
+			sb.WriteString(": ")
 			if err := writeJSONValue(sb, e.Value, indent, level+1); err != nil {
 				return err
 			}
@@ -518,7 +514,7 @@ func extractJSONDumpOpts(posArgs []val.Value, allArgs []val.Value, kwnames []val
 		itemSep: ", ",
 		keySep:  ": ",
 	}
-	var indentVal val.Value = val.NoneVal()
+	indentVal := val.NoneVal()
 	if len(posArgs) > indentPosIdx {
 		indentVal = posArgs[indentPosIdx]
 	}
@@ -571,7 +567,7 @@ func writeJSONValueWithOpts(sb *strings.Builder, v val.Value, opts jsonDumpOpts,
 		return writeJSONValue(sb, v, 0, level)
 	}
 	writeLvlIndent := func(lvl int) {
-		for i := 0; i < lvl; i++ {
+		for range lvl {
 			sb.WriteString(opts.indentStr)
 		}
 	}
@@ -681,14 +677,14 @@ func applyJSONObjectHook(ctx *val.ExecContext, v val.Value, hook val.Value) val.
 
 func writeIndent(sb *strings.Builder, indent, level int) {
 	total := indent * level
-	for i := 0; i < total; i++ {
+	for range total {
 		sb.WriteByte(' ')
 	}
 }
 
 func writeJSONString(sb *strings.Builder, s string) {
 	sb.WriteByte('"')
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		b := s[i]
 		switch b {
 		case '"':
@@ -707,7 +703,7 @@ func writeJSONString(sb *strings.Builder, s string) {
 			sb.WriteString(`\f`)
 		default:
 			if b < 0x20 {
-				sb.WriteString(fmt.Sprintf(`\u%04x`, b))
+				fmt.Fprintf(sb, `\u%04x`, b)
 			} else {
 				sb.WriteByte(b)
 			}
@@ -736,15 +732,16 @@ func (e *Engine) createJSONModule() val.Value {
 		}
 		var rawBytes []byte
 		a := pa[0]
-		if a.IsAnyString() {
+		switch {
+		case a.IsAnyString():
 			rawBytes = []byte(a.AsString())
-		} else if a.IsBytes() {
+		case a.IsBytes():
 			rawBytes = a.AsBytes().Data
-		} else if a.IsByteArray() {
+		case a.IsByteArray():
 			rawBytes = a.AsByteArray().Data
-		} else if a.IsMemoryView() {
+		case a.IsMemoryView():
 			rawBytes = a.AsMemoryView().Buf
-		} else {
+		default:
 			panic("TypeError: the JSON object must be str, bytes or bytearray, not " + a.Type().Name)
 		}
 
@@ -789,11 +786,12 @@ func (e *Engine) createJSONModule() val.Value {
 		readMethod := val.GetAttrCtx(ctx, fp, val.InternString("read"))
 		content := ctx.Invoke0(readMethod)
 		var rawBytes []byte
-		if content.IsAnyString() {
+		switch {
+		case content.IsAnyString():
 			rawBytes = []byte(content.AsString())
-		} else if content.IsBytes() {
+		case content.IsBytes():
 			rawBytes = content.AsBytes().Data
-		} else {
+		default:
 			panic("TypeError: fp.read() must return str or bytes")
 		}
 		p := newJSONParser(rawBytes, e.internPool)

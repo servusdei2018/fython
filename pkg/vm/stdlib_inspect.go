@@ -70,9 +70,10 @@ func initInspectTypes() {
 			dflt := val.GetAttrCtx(ctx, self, defaultKey)
 
 			var prefix string
-			if kind == 2 {
+			switch kind {
+			case 2:
 				prefix = "*"
-			} else if kind == 4 {
+			case 4:
 				prefix = "**"
 			}
 			res := prefix + name
@@ -129,9 +130,10 @@ func initInspectTypes() {
 					}
 
 					prefix := ""
-					if pKind == 2 {
+					switch pKind {
+					case 2:
 						prefix = "*"
-					} else if pKind == 4 {
+					case 4:
 						prefix = "**"
 					}
 					itemStr := prefix + pName
@@ -195,7 +197,7 @@ func callableCode(args []val.Value) *CodeObject {
 		return nil
 	}
 	v := args[0]
-	for i := 0; i < 8; i++ {
+	for range 8 {
 		if v.IsBoundMethod() {
 			v = v.AsBoundMethod().Func
 			continue
@@ -457,20 +459,21 @@ func (e *Engine) createInspectModule() val.Value {
 					}
 				}
 			}
-			if obj.IsInstance() {
+			switch {
+			case obj.IsInstance():
 				inst := obj.AsInstance()
 				if inst.Shape != nil {
 					if v, ok := inst.GetAttr(attrName); ok {
 						return v
 					}
 				}
-			} else if obj.IsDict() && objType != val.DictType {
+			case obj.IsDict() && objType != val.DictType:
 				if d := obj.AsDict(); d.Attrs != nil {
 					if v, ok := d.Attrs.Get(attrName); ok {
 						return v
 					}
 				}
-			} else if obj.IsModule() {
+			case obj.IsModule():
 				mod := obj.AsModule()
 				if mod.Dict != nil {
 					if v, ok := mod.Dict.Get(attrName); ok {
@@ -498,7 +501,7 @@ func (e *Engine) createInspectModule() val.Value {
 		}
 		descr := args[0]
 		obj := args[1]
-		var objType = val.NoneVal()
+		var objType val.Value
 		if len(args) > 2 {
 			objType = args[2]
 		} else {
@@ -669,12 +672,12 @@ func (e *Engine) createInspectModule() val.Value {
 		}
 		idx := nargs + nkwargs
 		flags := hook.Flags(co)
-		var varargs val.Value = val.NoneVal()
+		varargs := val.NoneVal()
 		if flags&0x04 != 0 && idx < len(vnames) {
 			varargs = vnames[idx]
 			idx++
 		}
-		var varkw val.Value = val.NoneVal()
+		varkw := val.NoneVal()
 		if flags&0x08 != 0 && idx < len(vnames) {
 			varkw = vnames[idx]
 		}
@@ -692,14 +695,15 @@ func (e *Engine) createInspectModule() val.Value {
 		var defaults []val.Value
 		var kwdefaults *val.PyDict
 
-		if target.IsFunction() {
+		switch {
+		case target.IsFunction():
 			fn := target.AsFunction()
 			co = fn.Code
 			defaults = fn.Defaults
 			kwdefaults = fn.KwDefaults
-		} else if target.IsCode() {
+		case target.IsCode():
 			co = target
-		} else if target.IsType() {
+		case target.IsType():
 			// Check __init__
 			initMethod, _, ok := target.Type().LookupMRO(val.DunderInit)
 			if ok && initMethod.IsFunction() {
@@ -714,7 +718,7 @@ func (e *Engine) createInspectModule() val.Value {
 				val.SetAttrCtx(ctx, sigInst, val.InternString("return_annotation"), EmptyObject)
 				return sigInst
 			}
-		} else {
+		default:
 			tp := target.Type()
 			isCallable := false
 			if tp != nil {
@@ -821,7 +825,6 @@ func (e *Engine) createInspectModule() val.Value {
 			val.SetAttrCtx(ctx, pInst, val.InternString("default"), EmptyObject)
 			val.SetAttrCtx(ctx, pInst, val.InternString("annotation"), EmptyObject)
 			paramDict.Set(name, pInst)
-			idx++
 		}
 
 		sigInst := val.NewInstanceOfType(SignatureType)

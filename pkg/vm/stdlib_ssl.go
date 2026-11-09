@@ -262,7 +262,7 @@ func (e *Engine) createSSLModule() val.Value {
 
 	// Properties on _SSLContext
 	makeCtxProp := func(name string, getter func(st *sslContextState) val.Value, setter func(st *sslContextState, v val.Value)) {
-		var setFn val.Value = val.NoneVal()
+		setFn := val.NoneVal()
 		if setter != nil {
 			setFn = val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 				if len(args) < 2 {
@@ -571,13 +571,14 @@ func (e *Engine) createSSLModule() val.Value {
 
 		var data []byte
 		if len(args) > 1 {
-			if args[1].IsBytes() {
+			switch {
+			case args[1].IsBytes():
 				data = args[1].AsBytes().Data
-			} else if args[1].IsByteArray() {
+			case args[1].IsByteArray():
 				data = args[1].AsByteArray().Data
-			} else if args[1].IsMemoryView() {
+			case args[1].IsMemoryView():
 				data = args[1].AsMemoryView().Buf
-			} else {
+			default:
 				data = []byte(args[1].AsString())
 			}
 		}
@@ -627,10 +628,7 @@ func (e *Engine) createSSLModule() val.Value {
 
 	sslSocketTypeDict.Set(val.InternString("getpeercert"), val.NewBuiltinFuncVal("getpeercert", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		st := getSSLSocketState(args[0])
-		binaryForm := false
-		if len(args) > 1 && args[1].IsTruthy() {
-			binaryForm = true
-		}
+		binaryForm := len(args) > 1 && args[1].IsTruthy()
 		certs := st.tlsConn.ConnectionState().PeerCertificates
 		if len(certs) == 0 {
 			if binaryForm {

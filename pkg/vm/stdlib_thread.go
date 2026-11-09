@@ -647,7 +647,7 @@ func initThreadModule() {
 		}))
 
 		makeProp := func(name string, getter func(st *threadState) val.Value, setter func(st *threadState, v val.Value)) {
-			var setFn val.Value = val.NoneVal()
+			setFn := val.NoneVal()
 			if setter != nil {
 				setFn = val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 					st := getThreadState(args[0])
@@ -946,7 +946,7 @@ func (e *Engine) createThreadingModule() val.Value {
 			panic("ValueError: Semaphore released too many times")
 		}
 		st.value += n
-		for i := int64(0); i < n; i++ {
+		for range n {
 			st.cond.Signal()
 		}
 		st.mu.Unlock()

@@ -19,7 +19,6 @@ var (
 	dateType          *val.PyType
 	timeType          *val.PyType
 	datetimeType      *val.PyType
-	isoCalDateType    *val.PyType
 
 	utcTimezoneVal val.Value
 )
@@ -1114,13 +1113,13 @@ func initDateTimeType() {
 		dt := (*pyDateTime)(val.AsPointer(args[0]))
 		parts := []string{fmt.Sprintf("%d, %d, %d, %d, %d", dt.year, dt.month, dt.day, dt.hour, dt.minute)}
 		if dt.second != 0 || dt.microsecond != 0 {
-			parts = append(parts, fmt.Sprintf("%d", dt.second))
+			parts = append(parts, strconv.Itoa(dt.second))
 		}
 		if dt.microsecond != 0 {
-			parts = append(parts, fmt.Sprintf("%d", dt.microsecond))
+			parts = append(parts, strconv.Itoa(dt.microsecond))
 		}
 		if !dt.tzinfo.IsNone() {
-			parts = append(parts, fmt.Sprintf("tzinfo=%s", val.PyRepr(ctx, dt.tzinfo)))
+			parts = append(parts, "tzinfo="+val.PyRepr(ctx, dt.tzinfo))
 		}
 		return val.NewStringVal("datetime.datetime(" + strings.Join(parts, ", ") + ")")
 	}))
@@ -1178,7 +1177,7 @@ func parseIsoFormat(s string) (val.Value, error) {
 	}
 	for _, l := range layouts {
 		if t, err := time.Parse(l, s); err == nil {
-			var tz val.Value = val.NoneVal()
+			tz := val.NoneVal()
 			if strings.HasSuffix(s, "Z") || strings.Contains(s, "+") || (strings.Count(s, "-") > 2) {
 				_, offset := t.Zone()
 				tz = newTimezoneVal(int64(offset), "")
@@ -1199,25 +1198,25 @@ func pythonStrftime(t time.Time, us int, format string) string {
 			case '%':
 				buf.WriteByte('%')
 			case 'Y':
-				buf.WriteString(fmt.Sprintf("%04d", t.Year()))
+				fmt.Fprintf(&buf, "%04d", t.Year())
 			case 'y':
-				buf.WriteString(fmt.Sprintf("%02d", t.Year()%100))
+				fmt.Fprintf(&buf, "%02d", t.Year()%100)
 			case 'm':
-				buf.WriteString(fmt.Sprintf("%02d", int(t.Month())))
+				fmt.Fprintf(&buf, "%02d", int(t.Month()))
 			case 'B':
 				buf.WriteString(t.Month().String())
 			case 'b', 'h':
 				buf.WriteString(t.Month().String()[:3])
 			case 'd':
-				buf.WriteString(fmt.Sprintf("%02d", t.Day()))
+				fmt.Fprintf(&buf, "%02d", t.Day())
 			case 'H':
-				buf.WriteString(fmt.Sprintf("%02d", t.Hour()))
+				fmt.Fprintf(&buf, "%02d", t.Hour())
 			case 'I':
 				h := t.Hour() % 12
 				if h == 0 {
 					h = 12
 				}
-				buf.WriteString(fmt.Sprintf("%02d", h))
+				fmt.Fprintf(&buf, "%02d", h)
 			case 'p':
 				if t.Hour() < 12 {
 					buf.WriteString("AM")
@@ -1225,11 +1224,11 @@ func pythonStrftime(t time.Time, us int, format string) string {
 					buf.WriteString("PM")
 				}
 			case 'M':
-				buf.WriteString(fmt.Sprintf("%02d", t.Minute()))
+				fmt.Fprintf(&buf, "%02d", t.Minute())
 			case 'S':
-				buf.WriteString(fmt.Sprintf("%02d", t.Second()))
+				fmt.Fprintf(&buf, "%02d", t.Second())
 			case 'f':
-				buf.WriteString(fmt.Sprintf("%06d", us))
+				fmt.Fprintf(&buf, "%06d", us)
 			case 'z':
 				_, off := t.Zone()
 				sign := "+"
@@ -1237,17 +1236,17 @@ func pythonStrftime(t time.Time, us int, format string) string {
 					sign = "-"
 					off = -off
 				}
-				buf.WriteString(fmt.Sprintf("%s%02d%02d", sign, off/3600, (off%3600)/60))
+				fmt.Fprintf(&buf, "%s%02d%02d", sign, off/3600, (off%3600)/60)
 			case 'Z':
 				name, _ := t.Zone()
 				buf.WriteString(name)
 			case 'j':
-				buf.WriteString(fmt.Sprintf("%03d", t.YearDay()))
+				fmt.Fprintf(&buf, "%03d", t.YearDay())
 			case 'w':
-				buf.WriteString(fmt.Sprintf("%d", int(t.Weekday())))
+				buf.WriteString(strconv.Itoa(int(t.Weekday())))
 			case 'u':
 				w := (int(t.Weekday())+6)%7 + 1
-				buf.WriteString(fmt.Sprintf("%d", w))
+				buf.WriteString(strconv.Itoa(w))
 			case 'a':
 				buf.WriteString(t.Weekday().String()[:3])
 			case 'A':

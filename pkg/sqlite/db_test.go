@@ -11,7 +11,7 @@ func TestSQLiteMemoryBasic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	// CREATE TABLE
 	_, err = db.Execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, balance REAL)", nil, nil)
@@ -61,7 +61,7 @@ func TestSQLiteTransactions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	_, err = db.Execute("CREATE TABLE items (id INTEGER PRIMARY KEY, title TEXT)", nil, nil)
 	if err != nil {
@@ -116,7 +116,7 @@ func TestSQLiteFilePersistence(t *testing.T) {
 	if err := db1.Commit(); err != nil {
 		t.Fatalf("Commit failed: %v", err)
 	}
-	db1.Close()
+	_ = db1.Close()
 
 	// Verify file was written
 	if _, err := os.Stat(dbPath); err != nil {
@@ -128,7 +128,7 @@ func TestSQLiteFilePersistence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open 2 failed: %v", err)
 	}
-	defer db2.Close()
+	defer func() { _ = db2.Close() }()
 
 	res, err := db2.Execute("SELECT key, val FROM data", nil, nil)
 	if err != nil {

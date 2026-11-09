@@ -2,6 +2,7 @@ package vm
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
@@ -50,7 +51,7 @@ func getFormatString(v val.Value) (string, error) {
 	if v.IsByteArray() {
 		return string(v.AsByteArray().Data), nil
 	}
-	return "", fmt.Errorf("struct format requires str or bytes")
+	return "", errors.New("struct format requires str or bytes")
 }
 
 func parseStructFormat(fmtStr string) (*parsedFormat, error) {
@@ -108,11 +109,11 @@ func parseStructFormat(fmtStr string) (*parsedFormat, error) {
 			}
 			repNum, err := strconv.Atoi(string(runes[start:idx]))
 			if err != nil {
-				return nil, fmt.Errorf("bad repeat count")
+				return nil, errors.New("bad repeat count")
 			}
 			repeat = repNum
 			if idx >= len(runes) {
-				return nil, fmt.Errorf("repeat count without format character")
+				return nil, errors.New("repeat count without format character")
 			}
 			r = runes[idx]
 		}
@@ -150,7 +151,8 @@ func parseStructFormat(fmtStr string) (*parsedFormat, error) {
 			return nil, fmt.Errorf("bad char in struct format: %c", r)
 		}
 
-		if r == 's' || r == 'p' {
+		switch r {
+		case 's', 'p':
 			count := repeat
 			if !hasRepeat {
 				count = 1
@@ -159,11 +161,11 @@ func parseStructFormat(fmtStr string) (*parsedFormat, error) {
 			fields = append(fields, structField{op: structOpCode(r), count: count, size: fieldSize})
 			totalSize += fieldSize
 			numArgs++
-		} else if r == 'x' {
+		case 'x':
 			fieldSize := repeat * elemSize
 			fields = append(fields, structField{op: structOpCode(r), count: repeat, size: fieldSize})
 			totalSize += fieldSize
-		} else {
+		default:
 			fields = append(fields, structField{op: structOpCode(r), count: repeat, size: elemSize})
 			totalSize += repeat * elemSize
 			if consumesArg {
@@ -200,7 +202,7 @@ func packValues(pf *parsedFormat, args []val.Value, buf []byte) error {
 
 	for _, field := range pf.fields {
 		if field.op == 'x' {
-			for i := 0; i < field.count; i++ {
+			for i := range field.count {
 				buf[offset+i] = 0
 			}
 			offset += field.size
@@ -212,12 +214,9 @@ func packValues(pf *parsedFormat, args []val.Value, buf []byte) error {
 			argIdx++
 			b, ok := getBytesFromValue(v)
 			if !ok {
-				return fmt.Errorf("struct: required bytes-like object for 's' format")
+				return errors.New("struct: required bytes-like object for 's' format")
 			}
-			copyLen := len(b)
-			if copyLen > field.count {
-				copyLen = field.count
-			}
+			copyLen := min(len(b), field.count)
 			copy(buf[offset:offset+copyLen], b[:copyLen])
 			for i := copyLen; i < field.count; i++ {
 				buf[offset+i] = 0
@@ -231,19 +230,11 @@ func packValues(pf *parsedFormat, args []val.Value, buf []byte) error {
 			argIdx++
 			b, ok := getBytesFromValue(v)
 			if !ok {
-				return fmt.Errorf("struct: required bytes-like object for 'p' format")
+				return errors.New("struct: required bytes-like object for 'p' format")
 			}
-			maxStr := field.count - 1
-			if maxStr < 0 {
-				maxStr = 0
-			}
-			pLen := len(b)
-			if pLen > maxStr {
-				pLen = maxStr
-			}
-			if pLen > 255 {
-				pLen = 255
-			}
+			maxStr := max(field.count-1, 0)
+			pLen := min(len(b), maxStr)
+			pLen = min(pLen, 255)
 			buf[offset] = byte(pLen)
 			copy(buf[offset+1:offset+1+pLen], b[:pLen])
 			for i := 1 + pLen; i < field.count; i++ {
@@ -253,7 +244,7 @@ func packValues(pf *parsedFormat, args []val.Value, buf []byte) error {
 			continue
 		}
 
-		for rep := 0; rep < field.count; rep++ {
+		for range field.count {
 			v := args[argIdx]
 			argIdx++
 
@@ -261,7 +252,7 @@ func packValues(pf *parsedFormat, args []val.Value, buf []byte) error {
 			case 'c':
 				b, ok := getBytesFromValue(v)
 				if !ok || len(b) != 1 {
-					return fmt.Errorf("struct: char format requires a bytes object of length 1")
+					return errors.New("struct: char format requires a bytes object of length 1")
 				}
 				buf[offset] = b[0]
 			case '?':
@@ -273,37 +264,37 @@ func packValues(pf *parsedFormat, args []val.Value, buf []byte) error {
 			case 'b':
 				num := v.AsInt64()
 				if num < -128 || num > 127 {
-					return fmt.Errorf("byte format requires -128 <= number <= 127")
+					return errors.New("byte format requires -128 <= number <= 127")
 				}
 				buf[offset] = byte(int8(num))
 			case 'B':
 				num := v.AsInt64()
 				if num < 0 || num > 255 {
-					return fmt.Errorf("ubyte format requires 0 <= number <= 255")
+					return errors.New("ubyte format requires 0 <= number <= 255")
 				}
-				buf[offset] = byte(uint8(num))
+				buf[offset] = byte(num)
 			case 'h':
 				num := v.AsInt64()
 				if num < -32768 || num > 32767 {
-					return fmt.Errorf("short format requires -32768 <= number <= 32767")
+					return errors.New("short format requires -32768 <= number <= 32767")
 				}
 				pf.order.PutUint16(buf[offset:], uint16(int16(num)))
 			case 'H':
 				num := v.AsInt64()
 				if num < 0 || num > 65535 {
-					return fmt.Errorf("ushort format requires 0 <= number <= 65535")
+					return errors.New("ushort format requires 0 <= number <= 65535")
 				}
 				pf.order.PutUint16(buf[offset:], uint16(num))
 			case 'i', 'l':
 				num := v.AsInt64()
 				if num < -2147483648 || num > 2147483647 {
-					return fmt.Errorf("int format requires -2147483648 <= number <= 2147483647")
+					return errors.New("int format requires -2147483648 <= number <= 2147483647")
 				}
 				pf.order.PutUint32(buf[offset:], uint32(int32(num)))
 			case 'I', 'L':
 				num := v.AsInt64()
 				if num < 0 || num > 4294967295 {
-					return fmt.Errorf("uint format requires 0 <= number <= 4294967295")
+					return errors.New("uint format requires 0 <= number <= 4294967295")
 				}
 				pf.order.PutUint32(buf[offset:], uint32(num))
 			case 'q', 'n':
@@ -311,32 +302,35 @@ func packValues(pf *parsedFormat, args []val.Value, buf []byte) error {
 				pf.order.PutUint64(buf[offset:], uint64(num))
 			case 'Q', 'N', 'P':
 				var u uint64
-				if v.IsInt64() {
+				switch {
+				case v.IsInt64():
 					u = uint64(v.AsInt64())
-				} else if v.Kind() == val.KindBigInt {
+				case v.Kind() == val.KindBigInt:
 					u = v.AsBigInt().Val.Uint64()
-				} else {
-					return fmt.Errorf("required integer for Q format")
+				default:
+					return errors.New("required integer for Q format")
 				}
 				pf.order.PutUint64(buf[offset:], u)
 			case 'f':
 				var fl float64
-				if v.IsFloat64() {
+				switch {
+				case v.IsFloat64():
 					fl = v.AsFloat64()
-				} else if v.IsInt64() {
+				case v.IsInt64():
 					fl = float64(v.AsInt64())
-				} else {
-					return fmt.Errorf("required float for f format")
+				default:
+					return errors.New("required float for f format")
 				}
 				pf.order.PutUint32(buf[offset:], math.Float32bits(float32(fl)))
 			case 'd':
 				var fl float64
-				if v.IsFloat64() {
+				switch {
+				case v.IsFloat64():
 					fl = v.AsFloat64()
-				} else if v.IsInt64() {
+				case v.IsInt64():
 					fl = float64(v.AsInt64())
-				} else {
-					return fmt.Errorf("required float for d format")
+				default:
+					return errors.New("required float for d format")
 				}
 				pf.order.PutUint64(buf[offset:], math.Float64bits(fl))
 			}
@@ -381,7 +375,7 @@ func unpackValues(pf *parsedFormat, buf []byte) ([]val.Value, error) {
 			continue
 		}
 
-		for rep := 0; rep < field.count; rep++ {
+		for range field.count {
 			switch field.op {
 			case 'c':
 				results = append(results, val.NewBytesVal([]byte{buf[offset]}))
@@ -390,7 +384,7 @@ func unpackValues(pf *parsedFormat, buf []byte) ([]val.Value, error) {
 			case 'b':
 				results = append(results, val.Int64Val(int64(int8(buf[offset]))))
 			case 'B':
-				results = append(results, val.Int64Val(int64(uint8(buf[offset]))))
+				results = append(results, val.Int64Val(int64(buf[offset])))
 			case 'h':
 				u := pf.order.Uint16(buf[offset:])
 				results = append(results, val.Int64Val(int64(int16(u))))

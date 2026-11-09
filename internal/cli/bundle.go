@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -75,7 +76,7 @@ func IsBundledExecutable() bool {
 	if err != nil {
 		return false
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	fi, err := f.Stat()
 	if err != nil {
@@ -99,7 +100,7 @@ func RunBundledExecutable() error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	fi, err := f.Stat()
 	if err != nil {
@@ -110,7 +111,7 @@ func RunBundledExecutable() error {
 		return err
 	}
 	if !ok {
-		return fmt.Errorf("not a bundled executable")
+		return errors.New("not a bundled executable")
 	}
 
 	payloadSize := fi.Size() - BundleFooterSize - int64(bundleOffset)
@@ -425,7 +426,7 @@ func BuildStandaloneBinary(opts BuildOptions) error {
 	if err != nil {
 		return fmt.Errorf("failed to create output executable %s: %w", outputPath, err)
 	}
-	defer out.Close()
+	defer func() { _ = out.Close() }()
 
 	if _, err := out.Write(baseBytes); err != nil {
 		return fmt.Errorf("failed to write base binary: %w", err)

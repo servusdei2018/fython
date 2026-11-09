@@ -324,8 +324,8 @@ func initImportlibTypes() {
 			base := filepath.Base(filePath)
 			if base == "__init__.py" || base == "__init__.pyc" || base == "__init__.fyc" {
 				pkgDir := filepath.Dir(filePath)
-				if strings.HasPrefix(filePath, "stdlib:") {
-					pkgDir = "stdlib:" + path.Dir(strings.TrimPrefix(filePath, "stdlib:"))
+				if vfsDir, ok := strings.CutPrefix(filePath, "stdlib:"); ok {
+					pkgDir = "stdlib:" + path.Dir(vfsDir)
 				}
 				mod.Dict.Set(val.InternString("__package__"), val.NewStringVal(mod.Name))
 				if _, hasPath := mod.Dict.Get(val.InternString("__path__")); !hasPath {
@@ -361,11 +361,12 @@ func initImportlibTypes() {
 		NamespaceLoaderType = val.MustNewType("NamespaceLoader", []*val.PyType{val.ObjectType}, nil)
 		NamespaceLoaderType.Dict.Set(val.InternString("__init__"), val.NewBuiltinFuncVal("__init__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			inst := args[0].AsInstance()
-			if len(args) > 2 {
+			switch {
+			case len(args) > 2:
 				inst.SetAttr(val.InternString("_path"), args[2])
-			} else if len(args) > 1 {
+			case len(args) > 1:
 				inst.SetAttr(val.InternString("_path"), args[1])
-			} else {
+			default:
 				inst.SetAttr(val.InternString("_path"), val.NewListVal())
 			}
 			return val.NoneVal()
@@ -518,8 +519,7 @@ func initImportlibTypes() {
 }
 
 func readLoaderFileBytes(reqPath string) ([]byte, error) {
-	if strings.HasPrefix(reqPath, "stdlib:") {
-		vfsPath := strings.TrimPrefix(reqPath, "stdlib:")
+	if vfsPath, ok := strings.CutPrefix(reqPath, "stdlib:"); ok {
 		return stdlib.ReadModule(vfsPath)
 	}
 	if archPath, innerPath, arch, ok := splitZipArchivePath(reqPath); ok && arch != nil && innerPath != "" {
@@ -655,8 +655,7 @@ func findSpecInSingleEntry(vm *VM, fullname, dir string) val.Value {
 	}
 
 	// 1. Check embedded stdlib VFS path
-	if strings.HasPrefix(dir, "stdlib:") {
-		vfsDir := strings.TrimPrefix(dir, "stdlib:")
+	if vfsDir, ok := strings.CutPrefix(dir, "stdlib:"); ok {
 		initPath := path.Join(vfsDir, leaf, "__init__.py")
 		if _, err := stdlib.StdlibFS.ReadFile(initPath); err == nil {
 			origin := "stdlib:" + initPath
@@ -709,16 +708,17 @@ func findSpecInSingleEntry(vm *VM, fullname, dir string) val.Value {
 func findSpecOnPath(vm *VM, fullname string, pathArg val.Value) val.Value {
 	var searchDirs []string
 	isTopLevel := false
-	if pathArg.IsNone() || pathArg.IsUnbound() || pathArg.HeaderPtr() == nil {
+	switch {
+	case pathArg.IsNone() || pathArg.IsUnbound() || pathArg.HeaderPtr() == nil:
 		isTopLevel = true
 		searchDirs = vm.liveSysPath()
-	} else if pathArg.IsList() {
+	case pathArg.IsList():
 		for _, item := range pathArg.AsList().Items {
 			if item.IsAnyString() {
 				searchDirs = append(searchDirs, item.AsString())
 			}
 		}
-	} else if pathArg.IsTuple() {
+	case pathArg.IsTuple():
 		for _, item := range pathArg.AsTuple().Items {
 			if item.IsAnyString() {
 				searchDirs = append(searchDirs, item.AsString())

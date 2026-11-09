@@ -469,7 +469,7 @@ func (cs *charSet) slow(r rune) bool {
 }
 
 func (cs *charSet) init() {
-	for i := rune(0); i < 128; i++ {
+	for i := range rune(128) {
 		cs.table[i] = cs.slow(i)
 	}
 }

@@ -197,7 +197,7 @@ func (e *Engine) createItertoolsModule() val.Value {
 			args = args[:kwStart]
 		}
 		pools := make([][]val.Value, 0, len(args)*repeat)
-		for r := 0; r < repeat; r++ {
+		for range repeat {
 			for _, arg := range args {
 				it := iterFor(ctx, arg)
 				var pool []val.Value
@@ -289,7 +289,7 @@ func (e *Engine) createItertoolsModule() val.Value {
 			if first {
 				first = false
 				res := make([]val.Value, r)
-				for i := 0; i < r; i++ {
+				for i := range r {
 					res[i] = pool[indices[i]]
 				}
 				return val.NewTupleVal(res...), true
@@ -306,7 +306,7 @@ func (e *Engine) createItertoolsModule() val.Value {
 					j := cycles[i]
 					indices[i], indices[n-j] = indices[n-j], indices[i]
 					res := make([]val.Value, r)
-					for k := 0; k < r; k++ {
+					for k := range r {
 						res[k] = pool[indices[k]]
 					}
 					return val.NewTupleVal(res...), true
@@ -346,7 +346,7 @@ func (e *Engine) createItertoolsModule() val.Value {
 			if first {
 				first = false
 				res := make([]val.Value, r)
-				for i := 0; i < r; i++ {
+				for i := range r {
 					res[i] = pool[indices[i]]
 				}
 				return val.NewTupleVal(res...), true
@@ -365,7 +365,7 @@ func (e *Engine) createItertoolsModule() val.Value {
 				indices[j] = indices[j-1] + 1
 			}
 			res := make([]val.Value, r)
-			for k := 0; k < r; k++ {
+			for k := range r {
 				res[k] = pool[indices[k]]
 			}
 			return val.NewTupleVal(res...), true
@@ -570,11 +570,12 @@ func (e *Engine) createItertoolsModule() val.Value {
 				return val.NoneVal(), false
 			}
 			var subArgs []val.Value
-			if v.IsTuple() {
+			switch {
+			case v.IsTuple():
 				subArgs = v.AsTuple().Items
-			} else if v.IsList() {
+			case v.IsList():
 				subArgs = v.AsList().Items
-			} else {
+			default:
 				subIt := iterFor(ctx, v)
 				for {
 					item, okItem := subIt.Next()
@@ -624,7 +625,7 @@ func (e *Engine) createItertoolsModule() val.Value {
 		}
 		return val.NewIterValWithNext(func() (val.Value, bool) {
 			batch := make([]val.Value, 0, n)
-			for i := 0; i < n; i++ {
+			for range n {
 				item, ok := it.Next()
 				if !ok {
 					break
@@ -712,7 +713,7 @@ func (e *Engine) createItertoolsModule() val.Value {
 		exhausted := false
 
 		branches := make([]val.Value, n)
-		for b := int64(0); b < n; b++ {
+		for b := range n {
 			myIdx := 0
 			branches[b] = val.NewIterValWithNext(func() (val.Value, bool) {
 				mu.Lock()

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"strings"
 	"testing"
 
 	"github.com/servusdei2018/fython/pkg/compiler"
@@ -92,7 +93,9 @@ func runPyPIScript(t *testing.T, engine *vm.Engine, wheelPaths []string, script 
 				msg += fmt.Sprintf(" (args: %s)", argsVal.String())
 			}
 			if tbVal, ok := excVal.AsInstance().GetAttr(val.InternString("__traceback__")); ok && !tbVal.IsNone() {
-				msg += "\nTraceback:"
+				var sb strings.Builder
+				sb.WriteString(msg)
+				sb.WriteString("\nTraceback:")
 				curTB := tbVal
 				for !curTB.IsNone() && curTB.HeaderPtr() != nil && curTB.Kind() == val.KindTraceback {
 					tb := curTB.AsTraceback()
@@ -105,9 +108,10 @@ func runPyPIScript(t *testing.T, engine *vm.Engine, wheelPaths []string, script 
 							fileName = val.CodeInspectorHook.FileName(fr.CO)
 						}
 					}
-					msg += fmt.Sprintf("\n  File %q, line %d, in %s", fileName, tb.LineNo, fnName)
+					fmt.Fprintf(&sb, "\n  File %q, line %d, in %s", fileName, tb.LineNo, fnName)
 					curTB = tb.Next
 				}
+				msg = sb.String()
 			}
 		}
 		t.Fatalf("Unhandled Python exception: %s\nScript:\n%s", msg, script)

@@ -250,19 +250,20 @@ func (l *Lexer) handleBOL() {
 	scanCol := l.col
 
 	for scanPos < len(l.src) {
-		c := l.src[scanPos]
-		if c == ' ' {
+		switch l.src[scanPos] {
+		case ' ':
 			indent++
 			scanPos++
 			scanCol++
-		} else if c == '\t' {
+		case '\t':
 			indent = (indent + 8) & ^7
 			scanPos++
 			scanCol++
-		} else {
-			break
+		default:
+			goto doneIndent
 		}
 	}
+doneIndent:
 
 	// Blank line or comment-only line: ignore indentation
 	if scanPos < len(l.src) && (l.src[scanPos] == '\n' || l.src[scanPos] == '\r' || l.src[scanPos] == '#') {
@@ -321,7 +322,8 @@ func (l *Lexer) readNumber(startPos uint32, line, col uint32) Token {
 	// Handle hex, bin, oct
 	if l.src[l.pos] == '0' && l.pos+1 < len(l.src) {
 		next := l.src[l.pos+1]
-		if next == 'x' || next == 'X' {
+		switch next {
+		case 'x', 'X':
 			l.pos += 2
 			l.col += 2
 			for l.pos < len(l.src) && (isHexDigit(l.src[l.pos]) || l.src[l.pos] == '_') {
@@ -329,7 +331,7 @@ func (l *Lexer) readNumber(startPos uint32, line, col uint32) Token {
 				l.col++
 			}
 			return Token{Type: TOKEN_INT, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
-		} else if next == 'b' || next == 'B' {
+		case 'b', 'B':
 			l.pos += 2
 			l.col += 2
 			for l.pos < len(l.src) && (l.src[l.pos] == '0' || l.src[l.pos] == '1' || l.src[l.pos] == '_') {
@@ -337,7 +339,7 @@ func (l *Lexer) readNumber(startPos uint32, line, col uint32) Token {
 				l.col++
 			}
 			return Token{Type: TOKEN_INT, Start: startPos, End: uint32(l.pos), Line: line, Col: col}
-		} else if next == 'o' || next == 'O' {
+		case 'o', 'O':
 			l.pos += 2
 			l.col += 2
 			for l.pos < len(l.src) && ((l.src[l.pos] >= '0' && l.src[l.pos] <= '7') || l.src[l.pos] == '_') {
@@ -464,7 +466,6 @@ func (l *Lexer) tryReadPrefixedString(startPos uint32, line, col uint32) (Token,
 		if pfxLen == 2 && (l.src[pos-1] == '\'' || l.src[pos-1] == '"') {
 			pfxLen = 1
 			pos--
-			quote = l.src[pos]
 		} else {
 			return Token{}, false
 		}

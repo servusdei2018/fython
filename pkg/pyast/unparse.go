@@ -61,7 +61,6 @@ type unparser struct {
 	indent   int
 	line     int // 1-based line of the write cursor
 	opts     UnparseOptions
-	atLine0  bool
 	srcEmpty bool
 }
 
@@ -1087,7 +1086,7 @@ func decodeRuneWTF8(s string, i int) (rune, int) {
 func escapeBody(s string, quote byte, bytesMode bool) string {
 	var sb strings.Builder
 	if bytesMode {
-		for i := 0; i < len(s); i++ {
+		for i := range len(s) {
 			c := s[i]
 			switch {
 			case c == '\\':

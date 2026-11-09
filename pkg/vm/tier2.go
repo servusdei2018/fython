@@ -27,7 +27,7 @@ func OptimizeCodeObject(co *CodeObject) {
 
 	// Step 1: Build jump target and exception boundary map
 	isJumpTarget := make([]bool, len(code)+1)
-	for i := 0; i < len(code); i++ {
+	for i := range code {
 		inst := atomic.LoadUint32(&code[i])
 		op := DecodeOpcode(inst)
 		switch op {

@@ -923,7 +923,7 @@ func HashValue(v Value) uint32 {
 		}
 		data := v.AsBytes().Data
 		h := fnvOffset32
-		for i := 0; i < len(data); i++ {
+		for i := range data {
 			h ^= uint32(data[i])
 			h *= fnvPrime32
 		}

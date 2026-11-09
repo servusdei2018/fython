@@ -1,7 +1,7 @@
 package pyast
 
 import (
-	"fmt"
+	"strings"
 )
 
 // Mode selects the grammar start symbol, mirroring compile()'s mode argument.
@@ -22,7 +22,6 @@ type Parser struct {
 	i       int
 	lastEnd int // end offset of the last consumed non-layout token
 	// featureVersion is accepted for API compatibility; all 3.15 syntax parses.
-	inFString int
 }
 
 // Parse parses src in the given mode. Errors are *SyntaxError.
@@ -863,12 +862,14 @@ func lazyVal(lazy bool) any {
 }
 
 func (p *Parser) parseDottedName() string {
-	s := p.parseName()
+	var b strings.Builder
+	b.WriteString(p.parseName())
 	for p.atOp(".") {
 		p.advance()
-		s += "." + p.parseName()
+		b.WriteByte('.')
+		b.WriteString(p.parseName())
 	}
-	return s
+	return b.String()
 }
 
 func (p *Parser) parseImport(start int, lazy bool) *Node {
@@ -893,16 +894,18 @@ func (p *Parser) parseFromImport(start int, lazy bool) *Node {
 	p.expectKw("from")
 	level := 0
 	for {
-		if p.atOp(".") {
+		switch {
+		case p.atOp("."):
 			level++
 			p.advance()
-		} else if p.atOp("...") {
+		case p.atOp("..."):
 			level += 3
 			p.advance()
-		} else {
-			break
+		default:
+			goto doneDots
 		}
 	}
+doneDots:
 	var module any
 	if !p.atKw("import") {
 		module = p.parseDottedName()
@@ -931,7 +934,7 @@ func (p *Parser) parseFromImport(start int, lazy bool) *Node {
 			if paren && p.atOp(")") {
 				break
 			}
-			if !paren && !(p.cur().Kind == TName) {
+			if !paren && p.cur().Kind != TName {
 				p.failAt("SyntaxError", "trailing comma not allowed without surrounding parentheses", p.cur().Start)
 			}
 		}
@@ -1131,5 +1134,5 @@ func describe(n *Node) string {
 	case "Name":
 		return "name"
 	}
-	return fmt.Sprint(n.Spec.Name)
+	return n.Spec.Name
 }

@@ -1,6 +1,9 @@
 package val
 
-import "sync/atomic"
+import (
+	"maps"
+	"sync/atomic"
+)
 
 // ctxEntry is one ContextVar binding inside an immutable context snapshot.
 // Published snapshots are never written, so concurrent Get calls do not allocate
@@ -78,9 +81,7 @@ func (c *PyContext) Set(key uintptr, varObj, v Value) (prev Value, had bool) {
 			had = false
 		}
 		nm := make(map[uintptr]ctxEntry, len(old.m)+1)
-		for k, e := range old.m {
-			nm[k] = e
-		}
+		maps.Copy(nm, old.m)
 		nm[key] = ctxEntry{varObj: varObj, val: v}
 		next := &ctxSnap{m: nm}
 		if c.snap.CompareAndSwap(old, next) {

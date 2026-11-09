@@ -124,28 +124,29 @@ func (s *Server) handleWSGI(w http.ResponseWriter, r *http.Request, v *vm.VM) {
 	}
 
 	// Stream chunks from respVal
-	if respVal.IsList() {
+	switch {
+	case respVal.IsList():
 		for _, item := range respVal.AsList().Items {
 			raw := valueToBytes(item)
 			if len(raw) > 0 {
 				_, _ = w.Write(raw)
 			}
 		}
-	} else if respVal.IsTuple() {
+	case respVal.IsTuple():
 		for _, item := range respVal.AsTuple().Items {
 			raw := valueToBytes(item)
 			if len(raw) > 0 {
 				_, _ = w.Write(raw)
 			}
 		}
-	} else if respVal.IsBytes() || respVal.IsAnyString() {
+	case respVal.IsBytes() || respVal.IsAnyString():
 		raw := valueToBytes(respVal)
 		if len(raw) > 0 {
 			_, _ = w.Write(raw)
 		}
-	} else if respVal.IsInstance() || respVal.IsGenerator() {
+	case respVal.IsInstance() || respVal.IsGenerator():
 		iterFn := val.GetAttrCtx(v.ExecContext(), respVal, val.InternString("__iter__"))
-		var iterVal val.Value = respVal
+		iterVal := respVal
 		if !iterFn.IsUnbound() && !iterFn.IsNone() {
 			iterVal = v.Vectorcall(iterFn, nil, nil)
 		}

@@ -1,7 +1,9 @@
 package compiler
 
 import (
+	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -79,7 +81,6 @@ type Compiler struct {
 	maxStackDepth  int
 	activeLoop     *LoopContext
 	activeCleanup  *CleanupBlock
-	err            error
 	nextChildIdx   int
 	lineStarts     []int
 	lineSpans      []vm.LineSpanEntry
@@ -105,16 +106,10 @@ func (c *Compiler) offsetToLineCol(pos uint32) (uint32, uint32) {
 	if len(c.lineStarts) == 0 {
 		c.lineStarts = buildLineStarts(c.src)
 	}
-	ipos := int(pos)
-	if ipos > len(c.src) {
-		ipos = len(c.src)
-	}
-	idx := sort.Search(len(c.lineStarts), func(i int) bool {
+	ipos := min(int(pos), len(c.src))
+	idx := max(0, sort.Search(len(c.lineStarts), func(i int) bool {
 		return c.lineStarts[i] > ipos
-	}) - 1
-	if idx < 0 {
-		idx = 0
-	}
+	})-1)
 	line := uint32(idx + 1)
 	col := uint32(ipos - c.lineStarts[idx] + 1)
 	return line, col
@@ -465,7 +460,8 @@ func (c *Compiler) emitReturnNone() {
 
 func (c *Compiler) runCleanupsTo(target *CleanupBlock) error {
 	for cl := c.activeCleanup; cl != target && cl != nil; cl = cl.Parent {
-		if cl.Kind == CleanupWith {
+		switch cl.Kind {
+		case CleanupWith:
 			_, exitIdx := c.constPool.InternName("__exit__")
 			noneIdx := c.constPool.Add(val.NoneVal())
 			c.emitOp(vm.OP_LOAD_FAST, 0, uint16(cl.TempSlot))
@@ -474,7 +470,7 @@ func (c *Compiler) runCleanupsTo(target *CleanupBlock) error {
 			c.emitOp(vm.OP_LOAD_CONST, 0, noneIdx)
 			c.emitOp(vm.OP_CALL_METHOD_PIC, 3, exitIdx)
 			c.emitOp(vm.OP_POP_TOP, 0, 0)
-		} else if cl.Kind == CleanupFinally {
+		case CleanupFinally:
 			savedCleanup := c.activeCleanup
 			c.activeCleanup = cl.Parent
 			for _, sID := range c.arena.StmtIDs[cl.Finally.Start : cl.Finally.Start+cl.Finally.Count] {
@@ -484,7 +480,7 @@ func (c *Compiler) runCleanupsTo(target *CleanupBlock) error {
 				}
 			}
 			c.activeCleanup = savedCleanup
-		} else if cl.Kind == CleanupExcept {
+		case CleanupExcept:
 			c.emitOp(vm.OP_POP_EXCEPT, 0, 0)
 		}
 	}
@@ -506,7 +502,7 @@ func (c *Compiler) compileStmt(stmtID StmtID) error {
 		c.emitOp(vm.OP_POP_TOP, 0, 0)
 
 	case StmtKindReturn:
-		var retSlot int = -1
+		retSlot := -1
 		if stmt.Expr1 != ExprNone {
 			if err := c.compileExpr(stmt.Expr1); err != nil {
 				return err
@@ -515,13 +511,11 @@ func (c *Compiler) compileStmt(stmtID StmtID) error {
 				retSlot = c.allocTempLocal()
 				c.emitOp(vm.OP_STORE_FAST, 0, uint16(retSlot))
 			}
-		} else {
-			if c.activeCleanup != nil {
-				noneIdx := c.constPool.Add(val.NoneVal())
-				c.emitOp(vm.OP_LOAD_CONST, 0, noneIdx)
-				retSlot = c.allocTempLocal()
-				c.emitOp(vm.OP_STORE_FAST, 0, uint16(retSlot))
-			}
+		} else if c.activeCleanup != nil {
+			noneIdx := c.constPool.Add(val.NoneVal())
+			c.emitOp(vm.OP_LOAD_CONST, 0, noneIdx)
+			retSlot = c.allocTempLocal()
+			c.emitOp(vm.OP_STORE_FAST, 0, uint16(retSlot))
 		}
 
 		if err := c.runCleanupsTo(nil); err != nil {
@@ -627,7 +621,7 @@ func (c *Compiler) compileStmt(stmtID StmtID) error {
 
 	case StmtKindBreak:
 		if c.activeLoop == nil {
-			return fmt.Errorf("SyntaxError: 'break' outside loop")
+			return errors.New("SyntaxError: 'break' outside loop")
 		}
 		if err := c.runCleanupsTo(c.activeLoop.Cleanup); err != nil {
 			return err
@@ -640,7 +634,7 @@ func (c *Compiler) compileStmt(stmtID StmtID) error {
 
 	case StmtKindContinue:
 		if c.activeLoop == nil {
-			return fmt.Errorf("SyntaxError: 'continue' outside loop")
+			return errors.New("SyntaxError: 'continue' outside loop")
 		}
 		if err := c.runCleanupsTo(c.activeLoop.Cleanup); err != nil {
 			return err
@@ -858,7 +852,7 @@ func (c *Compiler) compileStoreTarget(targetID ExprID) error {
 			subExpr := c.arena.GetExpr(id)
 			if subExpr != nil && subExpr.Kind == ExprKindStarred {
 				if starIdx >= 0 {
-					return fmt.Errorf("SyntaxError: multiple starred expressions in assignment")
+					return errors.New("SyntaxError: multiple starred expressions in assignment")
 				}
 				starIdx = i
 			}
@@ -943,7 +937,7 @@ func (c *Compiler) compileNameLoad(name string) error {
 			c.emitOp(vm.OP_LOAD_DEREF, 0, uint16(cdSym.Offset))
 			if sym != nil && sym.Storage == StorageFree {
 				if sym.Offset > 0xFF {
-					return fmt.Errorf("SyntaxError: too many closure variables in annotation scope")
+					return errors.New("SyntaxError: too many closure variables in annotation scope")
 				}
 				c.emitOp(vm.OP_LOAD_FROM_DICT_OR_DEREF, uint8(sym.Offset), idx)
 			} else {
@@ -986,7 +980,7 @@ func (c *Compiler) compileNameLoad(name string) error {
 
 func (c *Compiler) compileNameStore(name string) error {
 	if name == "__debug__" {
-		return fmt.Errorf("SyntaxError: cannot assign to __debug__")
+		return errors.New("SyntaxError: cannot assign to __debug__")
 	}
 	sym := c.scope.Symbols[name]
 	if sym == nil {
@@ -1070,7 +1064,7 @@ func (c *Compiler) compileIfStmt(stmt *ASTStmt) error {
 	// Elifs
 	elifsStart := stmt.Extra >> 16
 	elifsCount := stmt.Extra & 0xFFFF
-	for i := uint32(0); i < elifsCount; i++ {
+	for i := range elifsCount {
 		elif := &c.arena.Elifs[elifsStart+i]
 		var elifFalseJumps []int
 		if err := c.compileCond(elif.Cond, &elifFalseJumps); err != nil {
@@ -1168,8 +1162,7 @@ func (c *Compiler) compileForStmt(stmt *ASTStmt) error {
 			if calleeName == "range" {
 				rangeSym := c.scope.Symbols["range"]
 				if rangeSym == nil || rangeSym.Storage == StorageGlobal {
-					targetName := string(c.src[targetExpr.Start:targetExpr.End])
-					targetSym := c.scope.Symbols[targetName]
+					targetSym := c.scope.Symbols[string(c.src[targetExpr.Start:targetExpr.End])]
 					if targetSym != nil && targetSym.Storage == StorageFastLocal && targetSym.Offset < 256 {
 						posArgs := c.arena.GetExprSlice(call.PosArgs)
 						kwNames := c.arena.GetIdentSlice(call.KWNames)
@@ -1403,11 +1396,7 @@ func frameLocalCount(s *Scope) int {
 	if s == nil {
 		return 0
 	}
-	n := len(s.FastLocals)
-	if s.NumSlots > n {
-		n = s.NumSlots
-	}
-	return n
+	return max(len(s.FastLocals), s.NumSlots)
 }
 
 func (c *Compiler) allocTempLocal() int {
@@ -1415,10 +1404,7 @@ func (c *Compiler) allocTempLocal() int {
 	// from that slice but still consume frame slots, so indexing by length
 	// overwrites the last real local. Which name sorts last follows map
 	// iteration order and changes from compile to compile.
-	offset := 0
-	if c.scope.NumSlots > offset {
-		offset = c.scope.NumSlots
-	}
+	offset := max(0, c.scope.NumSlots)
 	for _, name := range c.scope.FastLocals {
 		sym := c.scope.Symbols[name]
 		if sym != nil && sym.Storage == StorageFastLocal && sym.Offset >= offset {
@@ -1898,9 +1884,10 @@ func (c *Compiler) compileFuncDef(stmt *ASTStmt) error {
 		tps := c.arena.TypeParams[fnDef.TypeParams.Start : fnDef.TypeParams.Start+uint32(tpCount)]
 		for _, tp := range tps {
 			typeName := "TypeVar"
-			if tp.Kind == TypeParamTypeVarTuple {
+			switch tp.Kind {
+			case TypeParamTypeVarTuple:
 				typeName = "TypeVarTuple"
-			} else if tp.Kind == TypeParamParamSpec {
+			case TypeParamParamSpec:
 				typeName = "ParamSpec"
 			}
 			_, clsIdx := subCompiler.constPool.InternName(typeName)
@@ -1940,10 +1927,7 @@ func (c *Compiler) compileFuncDef(stmt *ASTStmt) error {
 		freeValSlice[i] = val.InternString(fv)
 	}
 
-	numLocals := frameLocalCount(fnScope)
-	if numLocals < len(paramNames) {
-		numLocals = len(paramNames)
-	}
+	numLocals := max(frameLocalCount(fnScope), len(paramNames))
 
 	maxStack := numLocals + subCompiler.maxStackDepth + 16
 	var coFlags uint32
@@ -2040,7 +2024,7 @@ func (c *Compiler) compileFuncDef(stmt *ASTStmt) error {
 		annScope.Symbols["format"] = &Symbol{Name: "format", Storage: StorageFastLocal, Offset: 0}
 
 		if fnDef.TypeParams.Count > 0 {
-			tps := c.arena.TypeParams[fnDef.TypeParams.Start : fnDef.TypeParams.Start+uint32(fnDef.TypeParams.Count)]
+			tps := c.arena.TypeParams[fnDef.TypeParams.Start : fnDef.TypeParams.Start+fnDef.TypeParams.Count]
 			for _, tp := range tps {
 				offset := len(annScope.FastLocals)
 				annScope.FastLocals = append(annScope.FastLocals, tp.Name)
@@ -2071,12 +2055,13 @@ func (c *Compiler) compileFuncDef(stmt *ASTStmt) error {
 		annCompiler.patchJump(annSkip, len(annCompiler.code))
 
 		if fnDef.TypeParams.Count > 0 {
-			tps := c.arena.TypeParams[fnDef.TypeParams.Start : fnDef.TypeParams.Start+uint32(fnDef.TypeParams.Count)]
+			tps := c.arena.TypeParams[fnDef.TypeParams.Start : fnDef.TypeParams.Start+fnDef.TypeParams.Count]
 			for _, tp := range tps {
 				typeName := "TypeVar"
-				if tp.Kind == TypeParamTypeVarTuple {
+				switch tp.Kind {
+				case TypeParamTypeVarTuple:
 					typeName = "TypeVarTuple"
-				} else if tp.Kind == TypeParamParamSpec {
+				case TypeParamParamSpec:
 					typeName = "ParamSpec"
 				}
 				_, clsIdx := annCompiler.constPool.InternName(typeName)
@@ -2176,7 +2161,7 @@ func (c *Compiler) compileFuncDef(stmt *ASTStmt) error {
 	c.emitOp(vm.OP_MAKE_FUNCTION, flags, 0)
 
 	// Apply decorators in reverse order
-	for i := len(decorators) - 1; i >= 0; i-- {
+	for range slices.Backward(decorators) {
 		c.emitOp(vm.OP_CALL, 1, vm.CallFromStack)
 	}
 
@@ -2219,9 +2204,10 @@ func (c *Compiler) compileClassDef(stmt *ASTStmt) error {
 		tps := c.arena.TypeParams[clsDef.TypeParams.Start : clsDef.TypeParams.Start+uint32(clsTPCount)]
 		for _, tp := range tps {
 			typeName := "TypeVar"
-			if tp.Kind == TypeParamTypeVarTuple {
+			switch tp.Kind {
+			case TypeParamTypeVarTuple:
 				typeName = "TypeVarTuple"
-			} else if tp.Kind == TypeParamParamSpec {
+			case TypeParamParamSpec:
 				typeName = "ParamSpec"
 			}
 			_, clsIdx := subCompiler.constPool.InternName(typeName)
@@ -2332,13 +2318,7 @@ func (c *Compiler) compileClassDef(stmt *ASTStmt) error {
 	kwArgs := c.arena.GetExprSlice(clsDef.KWArgs)
 	hasKW := len(kwArgs) > 0
 	if hasKW {
-		hasUnpack := false
-		for _, name := range kwNames {
-			if name == "" {
-				hasUnpack = true
-				break
-			}
-		}
+		hasUnpack := slices.Contains(kwNames, "")
 		if hasUnpack {
 			numDicts := uint16(0)
 			currentKeys := 0
@@ -2383,7 +2363,7 @@ func (c *Compiler) compileClassDef(stmt *ASTStmt) error {
 	}
 
 	// Apply decorators in reverse order
-	for i := len(decorators) - 1; i >= 0; i-- {
+	for range slices.Backward(decorators) {
 		c.emitOp(vm.OP_CALL, 1, vm.CallFromStack)
 	}
 
@@ -2453,13 +2433,14 @@ func (c *Compiler) compileExpr(exprID ExprID) error {
 		if err := c.compileExpr(expr.Left); err != nil {
 			return err
 		}
-		if expr.Op == uint8(TOKEN_MINUS) {
+		switch expr.Op {
+		case uint8(TOKEN_MINUS):
 			c.emitOp(vm.OP_UNARY_NEGATIVE, 0, 0)
-		} else if expr.Op == uint8(TOKEN_PLUS) {
+		case uint8(TOKEN_PLUS):
 			c.emitOp(vm.OP_UNARY_POSITIVE, 0, 0)
-		} else if expr.Op == uint8(TOKEN_NOT) {
+		case uint8(TOKEN_NOT):
 			c.emitOp(vm.OP_UNARY_NOT, 0, 0)
-		} else if expr.Op == uint8(TOKEN_TILDE) {
+		case uint8(TOKEN_TILDE):
 			c.emitOp(vm.OP_UNARY_INVERT, 0, 0)
 		}
 
@@ -2609,14 +2590,14 @@ func (c *Compiler) compileExpr(exprID ExprID) error {
 		start := expr.Extra
 		count := uint32(expr.Right)
 		hasUnpack := false
-		for i := uint32(0); i < count; i++ {
+		for i := range count {
 			if c.arena.DictPairs[start+i].Key == ExprNone {
 				hasUnpack = true
 				break
 			}
 		}
 		if !hasUnpack {
-			for i := uint32(0); i < count; i++ {
+			for i := range count {
 				pair := &c.arena.DictPairs[start+i]
 				if err := c.compileExpr(pair.Key); err != nil {
 					return err
@@ -2629,7 +2610,7 @@ func (c *Compiler) compileExpr(exprID ExprID) error {
 		} else {
 			numDicts := uint16(0)
 			currentKeys := 0
-			for i := uint32(0); i < count; i++ {
+			for i := range count {
 				pair := &c.arena.DictPairs[start+i]
 				if pair.Key == ExprNone {
 					if currentKeys > 0 {
@@ -2851,13 +2832,7 @@ func (c *Compiler) compileCall(expr *ASTExpr) error {
 			break
 		}
 	}
-	hasStarKW := false
-	for _, name := range kwNames {
-		if name == "" {
-			hasStarKW = true
-			break
-		}
-	}
+	hasStarKW := slices.Contains(kwNames, "")
 
 	calleeExpr := c.arena.GetExpr(call.Func)
 	isMethod := !hasStarPos && !hasStarKW && calleeExpr != nil && calleeExpr.Kind == ExprKindAttribute && len(kwNames) == 0
@@ -3303,7 +3278,7 @@ func (c *Compiler) compileDictComp(expr *ASTExpr) error {
 // peephole optimizes bytecode by eliminating redundant jumps.
 func (c *Compiler) peephole() {
 	code := c.code
-	for i := 0; i < len(code); i++ {
+	for i := range code {
 		op := vm.DecodeOpcode(code[i])
 		if op == vm.OP_JUMP {
 			target := int(vm.DecodeArgBx(code[i]))
@@ -3352,12 +3327,12 @@ func (c *Compiler) compileTemplate(fs *ASTFString) error {
 	for i < len(pieces) {
 		e := c.arena.GetExpr(pieces[i])
 		if e == nil || e.Kind != ExprKindFormattedValue {
-			return fmt.Errorf("compiler: malformed template string")
+			return errors.New("compiler: malformed template string")
 		}
 		i++
 		fv := c.arena.GetFormattedValue(e.Extra)
 		if fv == nil {
-			return fmt.Errorf("compiler: missing template interpolation")
+			return errors.New("compiler: missing template interpolation")
 		}
 		if err := c.compileExpr(fv.Value); err != nil {
 			return err
@@ -3682,9 +3657,10 @@ func (c *Compiler) compileTypeAlias(stmt *ASTStmt) error {
 		tps := c.arena.TypeParams[ta.TypeParams.Start : ta.TypeParams.Start+uint32(tpCount)]
 		for _, tp := range tps {
 			typeName := "TypeVar"
-			if tp.Kind == TypeParamTypeVarTuple {
+			switch tp.Kind {
+			case TypeParamTypeVarTuple:
 				typeName = "TypeVarTuple"
-			} else if tp.Kind == TypeParamParamSpec {
+			case TypeParamParamSpec:
 				typeName = "ParamSpec"
 			}
 			_, clsIdx := c.constPool.InternName(typeName)
@@ -3774,12 +3750,13 @@ func (c *Compiler) compileDeleteTarget(targetID ExprID) error {
 	case ExprKindName:
 		name := string(c.src[expr.Start:expr.End])
 		sym := c.scope.Symbols[name]
-		if sym != nil && sym.Storage == StorageFastLocal {
+		switch {
+		case sym != nil && sym.Storage == StorageFastLocal:
 			c.emitOp(vm.OP_DELETE_FAST, 0, uint16(sym.Offset))
-		} else if c.scope.Kind == ScopeClass || (c.scope.Kind == ScopeModule && !c.scope.ExplicitG[name]) {
+		case c.scope.Kind == ScopeClass || (c.scope.Kind == ScopeModule && !c.scope.ExplicitG[name]):
 			_, idx := c.constPool.InternName(name)
 			c.emitOp(vm.OP_DELETE_NAME, 0, idx)
-		} else {
+		default:
 			_, idx := c.constPool.InternName(name)
 			c.emitOp(vm.OP_DELETE_GLOBAL, 0, idx)
 		}
@@ -4010,10 +3987,7 @@ func (c *Compiler) compileGenExp(expr *ASTExpr) error {
 	subCompiler.peephole()
 
 	paramNames := []val.Value{val.InternString(".0")}
-	numLocals := frameLocalCount(genScope)
-	if numLocals < 1 {
-		numLocals = 1
-	}
+	numLocals := max(frameLocalCount(genScope), 1)
 
 	cellValSlice := make([]val.Value, len(genScope.CellVars))
 	for i, cv := range genScope.CellVars {
@@ -4117,12 +4091,9 @@ func (c *Compiler) compileLambda(expr *ASTExpr) error {
 		freeValSlice[i] = val.InternString(fv)
 	}
 
-	numLocals := frameLocalCount(lambdaScope)
-	if numLocals < len(paramNames) {
-		numLocals = len(paramNames)
-	}
+	numLocals := max(frameLocalCount(lambdaScope), len(paramNames))
 
-	var coFlags uint32 = vm.CO_OPTIMIZED | vm.CO_NEWLOCALS
+	coFlags := vm.CO_OPTIMIZED | vm.CO_NEWLOCALS
 	if len(lambdaScope.FreeVars) == 0 && len(lambdaScope.CellVars) == 0 {
 		coFlags |= vm.CO_NOFREE
 	}
@@ -4275,11 +4246,8 @@ func (c *Compiler) emitAnnotateFunction() error {
 	for i, fv := range as.FreeVars {
 		freeVals[i] = val.InternString(fv)
 	}
-	numLocals := frameLocalCount(as)
-	if numLocals < 1 {
-		numLocals = 1
-	}
-	flags := uint32(vm.CO_OPTIMIZED | vm.CO_NEWLOCALS)
+	numLocals := max(frameLocalCount(as), 1)
+	flags := vm.CO_OPTIMIZED | vm.CO_NEWLOCALS
 	if len(as.FreeVars) == 0 && len(as.CellVars) == 0 {
 		flags |= vm.CO_NOFREE
 	}

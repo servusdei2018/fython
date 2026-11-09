@@ -99,8 +99,7 @@ func fspathOf(ctx *val.ExecContext, v val.Value) (val.Value, bool) {
 
 // errnoOf extracts a syscall.Errno from err, or 0.
 func errnoOf(err error) syscall.Errno {
-	var en syscall.Errno
-	if errors.As(err, &en) {
+	if en, ok := errors.AsType[syscall.Errno](err); ok {
 		return en
 	}
 	switch {
@@ -847,15 +846,16 @@ func installPosix(osMod *val.PyModule) {
 		}
 		fd := int(args[0].AsInt64())
 		var data []byte
-		if args[1].IsBytes() {
+		switch {
+		case args[1].IsBytes():
 			data = args[1].AsBytes().Data
-		} else if args[1].IsByteArray() {
+		case args[1].IsByteArray():
 			data = args[1].AsByteArray().Data
-		} else if args[1].IsMemoryView() {
+		case args[1].IsMemoryView():
 			data = args[1].AsMemoryView().Buf
-		} else if args[1].IsAnyString() {
+		case args[1].IsAnyString():
 			data = []byte(args[1].AsString())
-		} else {
+		default:
 			panic("TypeError: a bytes-like object is required")
 		}
 		fdMutex.Lock()
@@ -1491,28 +1491,5 @@ func (e *Engine) createPosixModule() val.Value {
 	modVal := val.NewModuleVal("posix", "")
 	mod := modVal.AsModule()
 	installPosix(mod)
-	return modVal
-}
-
-func (e *Engine) createShutilModule() val.Value {
-	modVal := val.NewModuleVal("shutil", "")
-	mod := modVal.AsModule()
-	mod.Dict.Set(val.InternString("get_terminal_size"), val.NewBuiltinFuncVal("get_terminal_size", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		fc, fl := 80, 24
-		fb := val.NoneVal()
-		if pa := posArgs(args, kwnames); len(pa) >= 1 {
-			fb = pa[0]
-		} else if v, ok := kwArg(args, kwnames, "fallback"); ok {
-			fb = v
-		}
-		if fb.IsTuple() && len(fb.AsTuple().Items) == 2 {
-			it := fb.AsTuple().Items
-			if it[0].IsInt64() && it[1].IsInt64() {
-				fc, fl = int(it[0].AsInt64()), int(it[1].AsInt64())
-			}
-		}
-		c, l := terminalSize(fc, fl)
-		return terminalSizeVal(c, l)
-	}))
 	return modVal
 }

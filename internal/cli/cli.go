@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/alecthomas/kong"
+
 	"github.com/servusdei2018/fython/pkg/compiler"
 	"github.com/servusdei2018/fython/pkg/val"
 	"github.com/servusdei2018/fython/pkg/vm"
@@ -469,7 +470,7 @@ func normalizeArgs(args []string) []string {
 
 		// Short flag cluster (e.g. -c, -m, -ic, -c"print(1)", -Wignore, -W ignore, -Xdev)
 		shorts := arg[1:]
-		for j := 0; j < len(shorts); j++ {
+		for j := range len(shorts) {
 			ch := shorts[j]
 			if ch == 'c' || ch == 'm' {
 				if j+1 < len(shorts) {

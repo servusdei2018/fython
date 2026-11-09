@@ -12,7 +12,6 @@ type sqliteConnState struct {
 	db         *sqlite.DB
 	rowFactory val.Value
 	closed     bool
-	mu         sync.Mutex
 }
 
 type sqliteCursorState struct {
@@ -25,7 +24,6 @@ type sqliteCursorState struct {
 	fetchIdx    int
 	arraySize   int
 	closed      bool
-	mu          sync.Mutex
 }
 
 type sqliteRowState struct {
@@ -319,15 +317,16 @@ func initSqliteTypes() {
 
 		if len(args) >= 3 && !args[2].IsNone() {
 			pArg := args[2]
-			if pArg.IsTuple() {
+			switch {
+			case pArg.IsTuple():
 				for _, it := range pArg.AsTuple().Items {
 					params = append(params, pyToSqlValue(it))
 				}
-			} else if pArg.IsList() {
+			case pArg.IsList():
 				for _, it := range pArg.AsList().Items {
 					params = append(params, pyToSqlValue(it))
 				}
-			} else if pArg.IsDict() {
+			case pArg.IsDict():
 				named = make(map[string]sqlite.Value)
 				for _, entry := range pArg.AsDict().Entries {
 					if entry.Active {
@@ -483,10 +482,7 @@ func initSqliteTypes() {
 		if size <= 0 || cst.fetchIdx >= len(cst.rows) {
 			return val.NewListVal()
 		}
-		end := cst.fetchIdx + size
-		if end > len(cst.rows) {
-			end = len(cst.rows)
-		}
+		end := min(cst.fetchIdx+size, len(cst.rows))
 		res := cst.rows[cst.fetchIdx:end]
 		cst.fetchIdx = end
 		return val.NewListVal(res...)

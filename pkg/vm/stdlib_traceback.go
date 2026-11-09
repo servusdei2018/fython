@@ -3,6 +3,7 @@ package vm
 import (
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 
@@ -25,7 +26,7 @@ func initFrameSummaryType() {
 			fn := args[1]
 			lineno := args[2]
 			name := args[3]
-			var line val.Value = val.NewStringVal("")
+			line := val.NewStringVal("")
 			npos := len(args) - len(kwnames)
 			for i, kn := range kwnames {
 				if kn.AsString() == "line" {
@@ -96,7 +97,7 @@ func (vm *VM) FormatException(exc val.Value) string {
 	if exc.IsNone() || exc.HeaderPtr() == nil {
 		return ""
 	}
-	var tb val.Value = val.NoneVal()
+	tb := val.NoneVal()
 	if exc.IsInstance() {
 		tb, _ = exc.AsInstance().GetAttr(val.InternString("__traceback__"))
 	}
@@ -181,16 +182,17 @@ func (e *Engine) createTracebackModule() val.Value {
 			return val.NewListVal()
 		}
 		var exc val.Value
-		var tb val.Value = val.NoneVal()
-		if len(args) == 1 {
+		tb := val.NoneVal()
+		switch {
+		case len(args) == 1:
 			exc = args[0]
 			if exc.IsInstance() {
 				tb, _ = exc.AsInstance().GetAttr(val.InternString("__traceback__"))
 			}
-		} else if len(args) >= 3 {
+		case len(args) >= 3:
 			exc = args[1]
 			tb = args[2]
-		} else {
+		default:
 			exc = args[0]
 		}
 
@@ -239,7 +241,7 @@ func (e *Engine) createTracebackModule() val.Value {
 	mod.Dict.Set(val.InternString("print_exc"), val.NewBuiltinFuncVal("print_exc", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		fmtExcFn, _ := mod.Dict.Get(val.InternString("format_exc"))
 		res := ctx.Invoke0(fmtExcFn)
-		os.Stderr.WriteString(res.AsString())
+		_, _ = os.Stderr.WriteString(res.AsString())
 		return val.NoneVal()
 	}))
 
@@ -250,7 +252,7 @@ func (e *Engine) createTracebackModule() val.Value {
 		}
 		tbLines := formatTracebackChain(args[0])
 		for _, l := range tbLines {
-			os.Stderr.WriteString(l)
+			_, _ = os.Stderr.WriteString(l)
 		}
 		return val.NoneVal()
 	}))
@@ -263,7 +265,7 @@ func (e *Engine) createTracebackModule() val.Value {
 		if npos > 0 {
 			posArgs = args[:npos]
 		}
-		var fileVal val.Value = val.NoneVal()
+		fileVal := val.NoneVal()
 		for i, kn := range kwnames {
 			if kn.AsString() == "file" {
 				fileVal = args[npos+i]
@@ -294,7 +296,7 @@ func (e *Engine) createTracebackModule() val.Value {
 			}
 			ctx.ClearException()
 		}
-		os.Stderr.WriteString(text)
+		_, _ = os.Stderr.WriteString(text)
 		return val.NoneVal()
 	}))
 
@@ -320,8 +322,8 @@ func (e *Engine) createTracebackModule() val.Value {
 
 		// Reverse so outermost caller is first
 		var listItems []val.Value
-		for i := len(frames) - 1; i >= 0; i-- {
-			f := frames[i].AsFrame()
+		for _, frameVal := range slices.Backward(frames) {
+			f := frameVal.AsFrame()
 			fileName := "<unknown>"
 			fnName := "<unknown>"
 			line := f.IP
@@ -360,5 +362,5 @@ func formatExceptionMessage(ctx *val.ExecContext, exc val.Value) string {
 	if msg != "" {
 		return fmt.Sprintf("%s: %s\n", typeName, msg)
 	}
-	return fmt.Sprintf("%s\n", typeName)
+	return typeName + "\n"
 }

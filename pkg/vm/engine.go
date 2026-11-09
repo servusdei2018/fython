@@ -1,7 +1,7 @@
 package vm
 
 import (
-	"fmt"
+	"errors"
 	"math"
 	"os"
 	"path/filepath"
@@ -69,7 +69,6 @@ type Engine struct {
 	dynamicCompileOptimizeHook func(src []byte, filename string, mode, optimize int) (*CodeObject, error)
 	virtualModules             sync.Map
 	asyncMode                  AsyncMode
-	coroPool                   sync.Pool
 	osPathMu                   sync.Mutex
 	signals                    sigState
 	stdStreams                 [3]atomic.Pointer[val.Value]
@@ -249,7 +248,7 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 		val.TypeVal(PathFinderType),
 	))
 	fileFinderHook, _ := FileFinderType.Dict.Get(val.InternString("path_hook"))
-	var ffHookCallable val.Value = val.TypeVal(FileFinderType)
+	ffHookCallable := val.TypeVal(FileFinderType)
 	if fileFinderHook.IsBuiltinFunc() {
 		ffHookCallable = fileFinderHook.AsBuiltinFunc().Fn(nil, fileFinderHook, nil, nil)
 	}
@@ -924,7 +923,7 @@ func (e *Engine) CompileDynamic(src []byte, filename string, mode int) (*CodeObj
 	if defaultDynamicCompileHook != nil {
 		return defaultDynamicCompileHook(src, filename, mode)
 	}
-	return nil, fmt.Errorf("Engine: dynamic compilation hook not set")
+	return nil, errors.New("Engine: dynamic compilation hook not set")
 }
 
 // CompileDynamicWithOptimize compiles Python source bytes dynamically with an explicit optimize level.

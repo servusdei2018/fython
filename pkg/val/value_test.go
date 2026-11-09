@@ -252,7 +252,7 @@ func BenchmarkIntAddFastPath(b *testing.B) {
 	y := Int64Val(100)
 	b.ReportAllocs()
 
-	var acc Value = x
+	acc := x
 	for b.Loop() {
 		acc = Add(x, y)
 	}
@@ -323,13 +323,13 @@ func TestDictInsertionOrderAndResize(t *testing.T) {
 
 	// Insert 300 keys to trigger uint8 -> uint16 sparse index table growth
 	const N = 300
-	for i := 0; i < N; i++ {
+	for i := range N {
 		d.Set(Int64Val(int64(i)), Int64Val(int64(i*10)))
 	}
 	if d.Len() != N {
 		t.Fatalf("d.Len() = %d, want %d", d.Len(), N)
 	}
-	for i := 0; i < N; i++ {
+	for i := range N {
 		v, ok := d.Get(Int64Val(int64(i)))
 		if !ok || v.AsInt64() != int64(i*10) {
 			t.Fatalf("d.Get(%d) = (%v, %v), want (%d, true)", i, v, ok, i*10)
@@ -403,7 +403,7 @@ func TestHiddenClassShapesAndInstances(t *testing.T) {
 func BenchmarkDictLookupInt(b *testing.B) {
 	dVal := NewDictVal(64)
 	d := dVal.AsDict()
-	for i := int64(0); i < 32; i++ {
+	for i := range int64(32) {
 		d.Set(Int64Val(i), Int64Val(i*100))
 	}
 	probeKey := Int64Val(17)

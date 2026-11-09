@@ -58,14 +58,15 @@ func initRandomClassType() {
 			r := (*pyRandom)(val.AsPointer(args[0]))
 			var s1, s2 uint64
 			if len(args) > 1 && !args[1].IsNone() {
-				if args[1].IsInt64() {
+				switch {
+				case args[1].IsInt64():
 					s1 = uint64(args[1].AsInt64())
 					s2 = s1 ^ 0x5555555555555555
-				} else if args[1].IsBigInt() {
+				case args[1].IsBigInt():
 					bi := args[1].AsBigInt()
 					s1 = bi.Val.Uint64()
 					s2 = s1 ^ 0x5555555555555555
-				} else {
+				default:
 					s1 = uint64(time.Now().UnixNano())
 					s2 = uint64(time.Now().UnixNano() >> 32)
 				}

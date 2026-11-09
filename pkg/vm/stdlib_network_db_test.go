@@ -76,7 +76,9 @@ func generateTestCertAndKey(t *testing.T, dir string) (certPath, keyPath string)
 	if err := pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes}); err != nil {
 		t.Fatalf("failed to write data to cert.pem: %v", err)
 	}
-	certOut.Close()
+	if err := certOut.Close(); err != nil {
+		t.Fatalf("failed to close cert.pem: %v", err)
+	}
 
 	keyPath = filepath.Join(dir, "key.pem")
 	keyOut, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
@@ -90,7 +92,9 @@ func generateTestCertAndKey(t *testing.T, dir string) (certPath, keyPath string)
 	if err := pem.Encode(keyOut, &pem.Block{Type: "PRIVATE KEY", Bytes: privBytes}); err != nil {
 		t.Fatalf("failed to write data to key.pem: %v", err)
 	}
-	keyOut.Close()
+	if err := keyOut.Close(); err != nil {
+		t.Fatalf("failed to close key.pem: %v", err)
+	}
 
 	return certPath, keyPath
 }

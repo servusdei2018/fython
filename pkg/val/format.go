@@ -181,27 +181,12 @@ func groupDigits(d string, sep string, gs int, minWidth int) string {
 	var parts []string
 	for {
 		l := gs
-		m := remaining
-		if minWidth > m {
-			m = minWidth
-		}
-		if m < 1 {
-			m = 1
-		}
+		m := max(1, remaining, minWidth)
 		if m < l {
 			l = m
 		}
-		nZeros := l - remaining
-		if nZeros < 0 {
-			nZeros = 0
-		}
-		nChars := remaining
-		if l < nChars {
-			nChars = l
-		}
-		if nChars < 0 {
-			nChars = 0
-		}
+		nZeros := max(0, l-remaining)
+		nChars := max(0, min(remaining, l))
 		parts = append(parts, strings.Repeat("0", nZeros)+d[pos-nChars:pos])
 		pos -= nChars
 		remaining -= nChars
@@ -221,11 +206,12 @@ func groupDigits(d string, sep string, gs int, minWidth int) string {
 // applying grouping, zero padding and alignment.
 func assembleNumber(fs fmtSpec, neg bool, prefix, digits, tail string, groupSize int) string {
 	sign := ""
-	if neg {
+	switch {
+	case neg:
 		sign = "-"
-	} else if fs.sign == '+' {
+	case fs.sign == '+':
 		sign = "+"
-	} else if fs.sign == ' ' {
+	case fs.sign == ' ':
 		sign = " "
 	}
 	sep := ""
@@ -465,7 +451,7 @@ func floatBody(f float64, typ byte, prec int, alt bool, addDot0 bool) string {
 	// 'g' and 'r'
 	var digs string
 	var decpt int
-	useExp := false
+	var useExp bool
 	if typ == 'r' {
 		digs, decpt = splitE(f, -1)
 		if f == 0 {
@@ -526,7 +512,7 @@ func floatBody(f float64, typ byte, prec int, alt bool, addDot0 bool) string {
 }
 
 func hasNonZeroDigit(body string) bool {
-	for i := 0; i < len(body); i++ {
+	for i := range len(body) {
 		c := body[i]
 		if c == 'e' || c == 'E' {
 			break
@@ -656,10 +642,7 @@ func FormatComplexSpec(re, im float64, spec string) string {
 		}
 	}
 	var sb strings.Builder
-	paren := false
-	if fs.typ == 0 && !skipRe {
-		paren = true
-	}
+	paren := fs.typ == 0 && !skipRe
 	if !skipRe {
 		neg, d, t := formatFloatParts(re, part, true)
 		sb.WriteString(assembleNumber(part, neg, "", d, t, 3))
@@ -682,17 +665,12 @@ func FormatComplexSpec(re, im float64, spec string) string {
 func ComplexRepr(re, im float64) string {
 	imStr := FloatRepr(im)
 	if !math.IsNaN(im) && !math.IsInf(im, 0) {
-		if strings.HasSuffix(imStr, ".0") {
-			imStr = imStr[:len(imStr)-2]
-		}
+		imStr = strings.TrimSuffix(imStr, ".0")
 	}
 	if re == 0 && !math.Signbit(re) {
 		return imStr + "j"
 	}
-	reStr := FloatRepr(re)
-	if strings.HasSuffix(reStr, ".0") {
-		reStr = reStr[:len(reStr)-2]
-	}
+	reStr := strings.TrimSuffix(FloatRepr(re), ".0")
 	if !strings.HasPrefix(imStr, "-") {
 		imStr = "+" + imStr
 	}

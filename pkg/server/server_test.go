@@ -148,7 +148,7 @@ func TestASGIServerConcurrent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("net.Listen failed: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	go func() {
 		_ = srv.Serve(ln)
@@ -173,7 +173,7 @@ func TestASGIServerConcurrent(t *testing.T) {
 	}
 
 	// Warm-up requests
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		reqBody := []byte(`{"id": 42}`)
 		resp, err := client.Post(fmt.Sprintf("http://%s/api/test?user=admin", addr), "application/json", bytes.NewReader(reqBody))
 		if err != nil {
@@ -193,16 +193,16 @@ func TestASGIServerConcurrent(t *testing.T) {
 	var errCount atomic.Int64
 
 	start := time.Now()
-	for g := 0; g < numGoroutines; g++ {
+	for g := range numGoroutines {
 		wg.Add(1)
 		go func(gid int) {
 			defer wg.Done()
-			for reqIdx := 0; reqIdx < requestsPerGoroutine; reqIdx++ {
+			for reqIdx := range requestsPerGoroutine {
 				reqID := (gid * 1000) + reqIdx
 				payload, _ := json.Marshal(map[string]any{"id": reqID})
 				url := fmt.Sprintf("/items/%d?filter=active", reqID)
 
-				req, err := http.NewRequest("POST", url, bytes.NewReader(payload))
+				req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(payload))
 				if err != nil {
 					errCount.Add(1)
 					continue
@@ -278,7 +278,7 @@ func TestWSGIServerConcurrent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("net.Listen failed: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	go func() {
 		_ = srv.Serve(ln)
@@ -309,11 +309,11 @@ func TestWSGIServerConcurrent(t *testing.T) {
 	var errCount atomic.Int64
 
 	start := time.Now()
-	for g := 0; g < numGoroutines; g++ {
+	for g := range numGoroutines {
 		wg.Add(1)
 		go func(gid int) {
 			defer wg.Done()
-			for reqIdx := 0; reqIdx < requestsPerGoroutine; reqIdx++ {
+			for reqIdx := range requestsPerGoroutine {
 				reqID := (gid * 1000) + reqIdx
 				var req *http.Request
 				var err error
@@ -321,12 +321,12 @@ func TestWSGIServerConcurrent(t *testing.T) {
 				if reqIdx%2 == 0 {
 					// GET request
 					url := fmt.Sprintf("http://%s/wsgi/get?id=%d", addr, reqID)
-					req, err = http.NewRequest("GET", url, nil)
+					req, err = http.NewRequest(http.MethodGet, url, nil)
 				} else {
 					// POST request
 					url := fmt.Sprintf("http://%s/wsgi/post?mode=update", addr)
 					payload, _ := json.Marshal(map[string]any{"id": reqID})
-					req, err = http.NewRequest("POST", url, bytes.NewReader(payload))
+					req, err = http.NewRequest(http.MethodPost, url, bytes.NewReader(payload))
 					req.Header.Set("Content-Type", "application/json")
 				}
 
@@ -431,7 +431,7 @@ async def crash_app(scope, receive, send):
 	if err != nil {
 		t.Fatalf("net.Listen failed: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	go func() { _ = srv.Serve(ln) }()
 	defer func() {
@@ -444,7 +444,7 @@ async def crash_app(scope, receive, send):
 	if err != nil {
 		t.Fatalf("GET /fail failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusInternalServerError {
 		t.Errorf("expected 500 Internal Server Error, got %d", resp.StatusCode)

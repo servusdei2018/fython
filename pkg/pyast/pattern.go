@@ -202,7 +202,7 @@ func (p *Parser) parseClosedPattern() *Node {
 			return p.done(New("MatchSingleton", false), start)
 		}
 		name := p.parseName()
-		var expr *Node = p.done(New("Name", name, load()), start)
+		expr := p.done(New("Name", name, load()), start)
 		dotted := false
 		for p.atOp(".") {
 			p.advance()

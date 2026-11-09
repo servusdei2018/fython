@@ -107,13 +107,14 @@ func initIOTypes() {
 			bio.mu.Lock()
 			defer bio.mu.Unlock()
 			var data []byte
-			if args[1].IsBytes() {
+			switch {
+			case args[1].IsBytes():
 				data = args[1].AsBytes().Data
-			} else if args[1].IsByteArray() {
+			case args[1].IsByteArray():
 				data = args[1].AsByteArray().Data
-			} else if args[1].IsMemoryView() {
+			case args[1].IsMemoryView():
 				data = args[1].AsMemoryView().Buf
-			} else {
+			default:
 				panic("TypeError: a bytes-like object is required")
 			}
 			if bio.pos+len(data) > len(bio.buf) {
@@ -282,11 +283,12 @@ func initIOTypes() {
 				src = v
 			}
 			if !src.IsNone() && src.HeaderPtr() != nil {
-				if src.IsBytes() {
+				switch {
+				case src.IsBytes():
 					initBytes = append([]byte(nil), src.AsBytes().Data...)
-				} else if src.IsByteArray() {
+				case src.IsByteArray():
 					initBytes = append([]byte(nil), src.AsByteArray().Data...)
-				} else if src.IsMemoryView() {
+				case src.IsMemoryView():
 					initBytes = append([]byte(nil), src.AsMemoryView().Buf...)
 				}
 			}
@@ -874,13 +876,14 @@ func initIOTypes() {
 			}
 			oldLen := len(pf.writeBuf)
 			if pf.binary {
-				if args[1].IsBytes() {
+				switch {
+				case args[1].IsBytes():
 					pf.writeBuf = append(pf.writeBuf, args[1].AsBytes().Data...)
-				} else if args[1].IsByteArray() {
+				case args[1].IsByteArray():
 					pf.writeBuf = append(pf.writeBuf, args[1].AsByteArray().Data...)
-				} else if args[1].IsMemoryView() {
+				case args[1].IsMemoryView():
 					pf.writeBuf = append(pf.writeBuf, args[1].AsMemoryView().Buf...)
-				} else {
+				default:
 					if isMT {
 						pf.mu.Unlock()
 					}
@@ -1055,11 +1058,12 @@ func openFileBuiltinVal(fileVal val.Value, mode string) val.Value {
 			f = os.NewFile(uintptr(fd), fmt.Sprintf("<fdopen %d>", fd))
 		}
 	} else {
-		if strings.Contains(mode, "w") {
+		switch {
+		case strings.Contains(mode, "w"):
 			flag = os.O_CREATE | os.O_WRONLY | os.O_TRUNC
-		} else if strings.Contains(mode, "a") {
+		case strings.Contains(mode, "a"):
 			flag = os.O_CREATE | os.O_WRONLY | os.O_APPEND
-		} else if strings.Contains(mode, "+") {
+		case strings.Contains(mode, "+"):
 			flag = os.O_RDWR
 		}
 		pathStr := fileVal.AsString()

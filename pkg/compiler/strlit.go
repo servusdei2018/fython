@@ -2,6 +2,7 @@ package compiler
 
 import (
 	"bytes"
+	"slices"
 	"strings"
 	"unicode/utf8"
 
@@ -79,7 +80,7 @@ func parseHexN(s []byte, i, n int) (int, bool) {
 		return 0, false
 	}
 	v := 0
-	for k := 0; k < n; k++ {
+	for k := range n {
 		h := hexVal(s[i+k])
 		if h < 0 {
 			return 0, false
@@ -195,12 +196,7 @@ func decodeEscapes(s []byte, isBytes bool) []byte {
 }
 
 func containsByte(s []byte, b byte) bool {
-	for _, c := range s {
-		if c == b {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(s, b)
 }
 
 func isBytesToken(s string) bool {

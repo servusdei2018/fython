@@ -264,13 +264,14 @@ func (p *parser) parseAlt(top bool) (*node, error) {
 func (p *parser) skipVerbose() {
 	for p.more() {
 		c := p.peek()
-		if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f' {
+		switch c {
+		case ' ', '\t', '\n', '\r', '\v', '\f':
 			p.pos++
-		} else if c == '#' {
+		case '#':
 			for p.more() && p.peek() != '\n' {
 				p.pos++
 			}
-		} else {
+		default:
 			return
 		}
 	}
@@ -688,7 +689,7 @@ func (p *parser) parseFlagsGroup(start int, atStart bool) (*node, bool, error) {
 		if c == ')' || c == ':' || c == '-' {
 			break
 		}
-		f := 0
+		var f int
 		switch c {
 		case 'a':
 			f = FlagASCII
@@ -724,7 +725,7 @@ func (p *parser) parseFlagsGroup(start int, atStart bool) (*node, bool, error) {
 			if c == ':' {
 				break
 			}
-			f := 0
+			var f int
 			switch c {
 			case 'i':
 				f = FlagIgnoreCase

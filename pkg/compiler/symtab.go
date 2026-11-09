@@ -2,6 +2,7 @@ package compiler
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -395,7 +396,7 @@ func (st *SymbolTable) visitStmt(stmtID StmtID) error {
 		}
 		elifsStart := stmt.Extra >> 16
 		elifsCount := stmt.Extra & 0xFFFF
-		for i := uint32(0); i < elifsCount; i++ {
+		for i := range elifsCount {
 			elif := &st.arena.Elifs[elifsStart+i]
 			if err := st.visitExpr(elif.Cond); err != nil {
 				return err
@@ -638,7 +639,7 @@ func (st *SymbolTable) bindAndVisitPattern(patID PatternID) error {
 		}
 	case PatternKindOr:
 		count := uint32(pat.Expr1)
-		for i := uint32(0); i < count; i++ {
+		for i := range count {
 			subID := st.arena.PatternIDs[pat.Extra+i]
 			if err := st.bindAndVisitPattern(subID); err != nil {
 				return err
@@ -646,7 +647,7 @@ func (st *SymbolTable) bindAndVisitPattern(patID PatternID) error {
 		}
 	case PatternKindSequence:
 		count := uint32(pat.Expr1)
-		for i := uint32(0); i < count; i++ {
+		for i := range count {
 			subID := st.arena.PatternIDs[pat.Extra+i]
 			if err := st.bindAndVisitPattern(subID); err != nil {
 				return err
@@ -654,7 +655,7 @@ func (st *SymbolTable) bindAndVisitPattern(patID PatternID) error {
 		}
 	case PatternKindMapping:
 		count := uint32(pat.Expr2)
-		for i := uint32(0); i < count; i++ {
+		for i := range count {
 			subID := st.arena.PatternIDs[pat.Extra+i]
 			if err := st.bindAndVisitPattern(subID); err != nil {
 				return err
@@ -672,7 +673,7 @@ func (st *SymbolTable) bindAndVisitPattern(patID PatternID) error {
 		posCount := uint32(pat.Expr2) >> 16
 		kwCount := uint32(pat.Expr2) & 0xFFFF
 		totalCount := posCount + kwCount
-		for i := uint32(0); i < totalCount; i++ {
+		for i := range totalCount {
 			subID := st.arena.PatternIDs[pat.Extra+i]
 			if err := st.bindAndVisitPattern(subID); err != nil {
 				return err
@@ -803,7 +804,7 @@ func (st *SymbolTable) visitExpr(exprID ExprID) error {
 	case ExprKindDict:
 		start := expr.Extra
 		count := uint32(expr.Right)
-		for i := uint32(0); i < count; i++ {
+		for i := range count {
 			pair := &st.arena.DictPairs[start+i]
 			if err := st.visitExpr(pair.Key); err != nil {
 				return err
@@ -1135,13 +1136,14 @@ func (st *SymbolTable) resolveScope(s *Scope) error {
 			if s.Symbols[name] != nil {
 				continue
 			}
-			if s.Parent != nil && s.Parent.Kind == ScopeFunction && s.Parent.Bound[name] {
+			switch {
+			case s.Parent != nil && s.Parent.Kind == ScopeFunction && s.Parent.Bound[name]:
 				s.Symbols[name] = &Symbol{Name: name, Storage: StorageFastLocal}
-			} else if st.isBoundInFunctionAncestors(s.Parent, name) {
+			case st.isBoundInFunctionAncestors(s.Parent, name):
 				s.Symbols[name] = &Symbol{Name: name, Storage: StorageFree}
 				s.FreeVars = append(s.FreeVars, name)
 				st.markAncestorCell(s.Parent, name)
-			} else {
+			default:
 				s.Symbols[name] = &Symbol{Name: name, Storage: StorageGlobal}
 			}
 		}
@@ -1423,12 +1425,7 @@ func isParam(params []string, name string) bool {
 }
 
 func containsString(slice []string, s string) bool {
-	for _, x := range slice {
-		if x == s {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(slice, s)
 }
 
 func removeString(slice []string, s string) []string {

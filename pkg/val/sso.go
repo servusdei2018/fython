@@ -16,7 +16,7 @@ const (
 // Guarantees a non-zero hash value so 0 can represent "uncomputed" in ObjectHeader.Hash.
 func HashString(s string) uint32 {
 	h := fnvOffset32
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		h ^= uint32(s[i])
 		h *= fnvPrime32
 	}
@@ -31,7 +31,7 @@ func InlineStrHash(v Value) uint32 {
 	num := v.num
 	n := int(num & 0xFF)
 	h := fnvOffset32
-	for i := 0; i < n; i++ {
+	for i := range n {
 		b := uint8(num >> ((i + 1) * 8))
 		h ^= uint32(b)
 		h *= fnvPrime32
@@ -51,7 +51,7 @@ func SmallStringVal(s string) Value {
 		panic("val.SmallStringVal: string length exceeds 7 bytes")
 	}
 	num := uint64(n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		num |= uint64(s[i]) << ((i + 1) * 8)
 	}
 	return Value{
@@ -69,7 +69,7 @@ func SmallStringFromBytes(b []byte) Value {
 		panic("val.SmallStringFromBytes: byte slice length exceeds 7 bytes")
 	}
 	num := uint64(n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		num |= uint64(b[i]) << ((i + 1) * 8)
 	}
 	return Value{
@@ -81,7 +81,7 @@ func SmallStringFromBytes(b []byte) Value {
 // HashBytes computes the 32-bit FNV-1a hash of a byte slice.
 func HashBytes(b []byte) uint32 {
 	h := fnvOffset32
-	for i := 0; i < len(b); i++ {
+	for i := range b {
 		h ^= uint32(b[i])
 		h *= fnvPrime32
 	}
@@ -97,7 +97,7 @@ func HashBytes(b []byte) uint32 {
 func AppendValueBytes(dst []byte, v Value) ([]byte, bool) {
 	if v.ptr == &tagInlineStr {
 		n := int(v.num & 0xFF)
-		for i := 0; i < n; i++ {
+		for i := range n {
 			dst = append(dst, byte(v.num>>((i+1)*8)))
 		}
 		return dst, true
@@ -191,7 +191,7 @@ func inlineEqualsHeapString(num uint64, s string) bool {
 	if len(s) != n {
 		return false
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if s[i] != byte(num>>((i+1)*8)) {
 			return false
 		}
@@ -219,7 +219,7 @@ func (v Value) AsString() string {
 			return ""
 		}
 		var buf [7]byte
-		for i := 0; i < n; i++ {
+		for i := range n {
 			buf[i] = byte(v.num >> ((i + 1) * 8))
 		}
 		return string(buf[:n])
@@ -248,10 +248,7 @@ type internShard struct {
 }
 
 func (s *internShard) grow() {
-	newCap := uint32(len(s.buckets) * 2)
-	if newCap < 32 {
-		newCap = 32
-	}
+	newCap := max(32, uint32(len(s.buckets)*2))
 	newBuckets := make([]*PyString, newCap)
 	newMask := newCap - 1
 	for _, b := range s.buckets {
@@ -282,7 +279,7 @@ func NewInternPool(capacity int) *InternPool {
 		shardCap <<= 1
 	}
 	p := &InternPool{}
-	for i := 0; i < internShardCount; i++ {
+	for i := range internShardCount {
 		p.shards[i] = internShard{
 			buckets: make([]*PyString, shardCap),
 			mask:    shardCap - 1,
@@ -523,36 +520,35 @@ func ConcatStrings(a, b Value) Value {
 		dst, _ = AppendValueBytes(dst, b)
 		return SmallStringFromBytes(dst)
 	}
-	capSize := totalLen
-	if capSize < 128 {
-		capSize = 128
-	}
+	capSize := max(128, totalLen)
 	buf := make([]byte, totalLen, capSize)
 	var pos int
-	if a.ptr == &tagInlineStr {
+	switch {
+	case a.ptr == &tagInlineStr:
 		n := int(a.num & 0xFF)
-		for i := 0; i < n; i++ {
+		for i := range n {
 			buf[i] = byte(a.num >> ((i + 1) * 8))
 		}
 		pos = n
-	} else if a.ptr.Kind == KindString {
+	case a.ptr.Kind == KindString:
 		data := (*PyString)(unsafe.Pointer(a.ptr)).Data
 		copy(buf, data)
 		pos = len(data)
-	} else {
+	default:
 		s := a.AsString()
 		copy(buf, s)
 		pos = len(s)
 	}
-	if b.ptr == &tagInlineStr {
+	switch {
+	case b.ptr == &tagInlineStr:
 		n := int(b.num & 0xFF)
-		for i := 0; i < n; i++ {
+		for i := range n {
 			buf[pos+i] = byte(b.num >> ((i + 1) * 8))
 		}
-	} else if b.ptr.Kind == KindString {
+	case b.ptr.Kind == KindString:
 		data := (*PyString)(unsafe.Pointer(b.ptr)).Data
 		copy(buf[pos:], data)
-	} else {
+	default:
 		s := b.AsString()
 		copy(buf[pos:], s)
 	}

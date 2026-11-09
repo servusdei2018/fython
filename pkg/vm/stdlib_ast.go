@@ -216,7 +216,7 @@ func astInitMethod(ctx *val.ExecContext, args []val.Value, kwnames []val.Value) 
 		panic("TypeError: " + clsName + " constructor takes at most " + strconv.Itoa(len(sp.Fields)) + " positional argument" + plural(len(sp.Fields)))
 	}
 	set := make([]bool, len(sp.Fields))
-	for i := 0; i < npos; i++ {
+	for i := range npos {
 		inst.SetAttr(internS(sp.Fields[i].Name), args[1+i])
 		set[i] = true
 	}

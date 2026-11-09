@@ -2,7 +2,8 @@ package sqlite
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
+	"maps"
 	"os"
 	"strings"
 	"sync"
@@ -142,9 +143,7 @@ func (db *DB) cloneTables() map[string]*Table {
 			Rows:        make([][]Value, len(tbl.Rows)),
 			NextAutoInc: tbl.NextAutoInc,
 		}
-		for k, v := range tbl.ColIndex {
-			newTbl.ColIndex[k] = v
-		}
+		maps.Copy(newTbl.ColIndex, tbl.ColIndex)
 		for i, r := range tbl.Rows {
 			newTbl.Rows[i] = append([]Value(nil), r...)
 		}
@@ -159,7 +158,7 @@ func (db *DB) Begin() error {
 	defer db.mu.Unlock()
 
 	if db.inTx {
-		return fmt.Errorf("OperationalError: cannot start a transaction within a transaction")
+		return errors.New("OperationalError: cannot start a transaction within a transaction")
 	}
 	db.snapshot = db.cloneTables()
 	db.inTx = true

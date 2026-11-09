@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -33,13 +34,13 @@ func resolveRelativeImport(name string, level int, callerGlobals *val.PyDict) (s
 	}
 
 	if basePkg == "" {
-		return "", fmt.Errorf("ImportError: attempted relative import with no known parent package")
+		return "", errors.New("ImportError: attempted relative import with no known parent package")
 	}
 
 	parts := strings.Split(basePkg, ".")
 	steps := level - 1
 	if steps >= len(parts) {
-		return "", fmt.Errorf("ImportError: attempted relative import beyond top-level package")
+		return "", errors.New("ImportError: attempted relative import beyond top-level package")
 	}
 
 	remaining := parts[:len(parts)-steps]
@@ -47,7 +48,7 @@ func resolveRelativeImport(name string, level int, callerGlobals *val.PyDict) (s
 		remaining = append(remaining, name)
 	}
 	if len(remaining) == 0 {
-		return "", fmt.Errorf("ImportError: attempted relative import beyond top-level package")
+		return "", errors.New("ImportError: attempted relative import beyond top-level package")
 	}
 	return strings.Join(remaining, "."), nil
 }
@@ -83,20 +84,6 @@ func (vm *VM) liveSysPath() []string {
 	return []string{"."}
 }
 
-func (vm *VM) dontWriteBytecode() bool {
-	if vm != nil && vm.modules != nil {
-		if sysVal, ok := vm.modules.Get(val.InternString("sys")); ok && sysVal.IsModule() {
-			if dwb, ok := sysVal.AsModule().Dict.Get(val.InternString("dont_write_bytecode")); ok {
-				return dwb.IsTruthy()
-			}
-		}
-	}
-	if vm != nil && vm.engine != nil {
-		return vm.engine.runtimeConfig.Effective().DontWriteBytecode
-	}
-	return false
-}
-
 // findModuleFile searches the provided search paths for a module or package file.
 func (e *Engine) findModuleFile(moduleName string, searchDirs []string) (string, bool, bool) {
 	parts := strings.Split(moduleName, ".")
@@ -107,8 +94,7 @@ func (e *Engine) findModuleFile(moduleName string, searchDirs []string) (string,
 		if dir == "" {
 			dir = "."
 		}
-		if strings.HasPrefix(dir, "stdlib:") {
-			vfsDir := strings.TrimPrefix(dir, "stdlib:")
+		if vfsDir, ok := strings.CutPrefix(dir, "stdlib:"); ok {
 			initPath := path.Join(vfsDir, relSlash, "__init__.py")
 			if _, err := stdlib.StdlibFS.ReadFile(initPath); err == nil {
 				return "stdlib:" + initPath, true, true
@@ -183,18 +169,18 @@ func (e *Engine) LoadOrCompileModule(filePath, moduleName string) (*CodeObject, 
 			return co, nil
 		}
 
-		if strings.HasPrefix(filePath, "stdlib:") {
-			vfsPath := strings.TrimPrefix(filePath, "stdlib:")
+		if vfsPath, ok := strings.CutPrefix(filePath, "stdlib:"); ok {
 			src, err := stdlib.ReadModule(vfsPath)
 			if err != nil {
 				return nil, fmt.Errorf("ModuleNotFoundError: No module named '%s' (%v)", moduleName, err)
 			}
 			var co *CodeObject
-			if e.compileWithFilenameHook != nil {
+			switch {
+			case e.compileWithFilenameHook != nil:
 				co, err = e.compileWithFilenameHook(src, filePath)
-			} else if e.compileHook != nil {
+			case e.compileHook != nil:
 				co, err = e.compileHook(src)
-			} else {
+			default:
 				return nil, fmt.Errorf("Engine: no compileHook set to compile stdlib file '%s'", filePath)
 			}
 			if err != nil {
@@ -216,11 +202,12 @@ func (e *Engine) LoadOrCompileModule(filePath, moduleName string) (*CodeObject, 
 			}
 			var co *CodeObject
 			var err error
-			if e.compileWithFilenameHook != nil {
+			switch {
+			case e.compileWithFilenameHook != nil:
 				co, err = e.compileWithFilenameHook(src, filePath)
-			} else if e.compileHook != nil {
+			case e.compileHook != nil:
 				co, err = e.compileHook(src)
-			} else {
+			default:
 				return nil, fmt.Errorf("Engine: no compileHook set to compile zip module '%s'", filePath)
 			}
 			if err != nil {
@@ -257,11 +244,12 @@ func (e *Engine) LoadOrCompileModule(filePath, moduleName string) (*CodeObject, 
 		}
 
 		var co *CodeObject
-		if e.compileWithFilenameHook != nil {
+		switch {
+		case e.compileWithFilenameHook != nil:
 			co, err = e.compileWithFilenameHook(src, filePath)
-		} else if e.compileHook != nil {
+		case e.compileHook != nil:
 			co, err = e.compileHook(src)
-		} else {
+		default:
 			return nil, fmt.Errorf("Engine: no compileHook set to compile source file '%s'", filePath)
 		}
 		if err != nil {
@@ -286,7 +274,7 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 		return val.NoneVal(), err
 	}
 	if canonicalName == "" {
-		return val.NoneVal(), fmt.Errorf("ValueError: Empty module name")
+		return val.NoneVal(), errors.New("ValueError: Empty module name")
 	}
 
 	parts := strings.Split(canonicalName, ".")
@@ -310,7 +298,7 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 
 	// Incrementally resolve and load parent packages
 	var parentVal val.Value
-	for i := 0; i < len(parts); i++ {
+	for i := range parts {
 		currName := strings.Join(parts[:i+1], ".")
 		internedCurr := val.InternString(currName)
 
@@ -343,11 +331,11 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 							return val.NoneVal(), nil
 						}
 						if !spec.IsNone() && spec.HeaderPtr() != nil {
-							var loaderVal val.Value = val.NoneVal()
+							loaderVal := val.NoneVal()
 							if l, ok := vmGetAttrSafe(&vm.execCtx, spec, "loader"); ok {
 								loaderVal = l
 							}
-							var modVal val.Value = val.NoneVal()
+							modVal := val.NoneVal()
 							if !loaderVal.IsNone() {
 								if createFn, ok := vmGetAttrSafe(&vm.execCtx, loaderVal, "create_module"); ok && !createFn.IsNone() {
 									modVal = vm.execCtx.Call(createFn, []val.Value{spec}, nil)
@@ -501,8 +489,8 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 		var subSearchLocs []string
 		if isPackage {
 			pkgPath := filepath.Dir(filePath)
-			if strings.HasPrefix(filePath, "stdlib:") {
-				pkgPath = "stdlib:" + path.Dir(strings.TrimPrefix(filePath, "stdlib:"))
+			if vfsDir, ok := strings.CutPrefix(filePath, "stdlib:"); ok {
+				pkgPath = "stdlib:" + path.Dir(vfsDir)
 			}
 			subSearchLocs = []string{pkgPath}
 			mod.Dict.Set(val.InternString("__package__"), val.NewStringVal(currName))
@@ -579,7 +567,7 @@ func init() {
 	val.ResolveLazyImportHook = func(v any, mod *val.PyModule, name val.Value, lazyVal val.Value) (val.Value, error) {
 		vm, ok := v.(*VM)
 		if !ok || vm == nil {
-			return val.NoneVal(), fmt.Errorf("no active VM to resolve lazy import")
+			return val.NoneVal(), errors.New("no active VM to resolve lazy import")
 		}
 		return vm.resolveLazyImport(mod, name, lazyVal)
 	}

@@ -81,7 +81,7 @@ func (e *Engine) createBinasciiModule() val.Value {
 		if v, ok := kwArg(args, kwnames, "wrapcol"); ok && v.IsInt64() {
 			wrapcol = int(v.AsInt64())
 		}
-		var enc *base64.Encoding = base64.StdEncoding
+		enc := base64.StdEncoding
 		if v, ok := kwArg(args, kwnames, "alphabet"); ok && !v.IsNone() {
 			if b, ok := getBytesFromValue(v); ok && len(b) == 64 {
 				enc = base64.NewEncoding(string(b))
@@ -122,7 +122,7 @@ func (e *Engine) createBinasciiModule() val.Value {
 		if v, ok := kwArg(args, kwnames, "padded"); ok {
 			padded = v.IsTruthy()
 		}
-		var enc *base64.Encoding = base64.StdEncoding
+		enc := base64.StdEncoding
 		if v, ok := kwArg(args, kwnames, "alphabet"); ok && !v.IsNone() {
 			if b, ok := getBytesFromValue(v); ok && len(b) == 64 {
 				enc = base64.NewEncoding(string(b))

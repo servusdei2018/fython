@@ -41,7 +41,7 @@ func TestMemoryViewSliceZeroPayloadCopied(t *testing.T) {
 	sl := val.NewSliceVal(val.Int64Val(1000), val.Int64Val(2000), val.NoneVal())
 
 	const iterations = 1000000
-	for i := 0; i < iterations; i++ {
+	for range iterations {
 		sub := val.GetItemCtx(nil, mvVal, sl)
 		mv := sub.AsMemoryView()
 		// Pointer must point directly into raw at offset 1000

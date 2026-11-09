@@ -130,12 +130,13 @@ func (e *Engine) createSocketModule() val.Value {
 		}
 		globalTimeoutMu.Lock()
 		defer globalTimeoutMu.Unlock()
-		if args[0].IsNone() {
+		switch {
+		case args[0].IsNone():
 			globalDefaultTimeout = nil
-		} else if args[0].IsFloat64() {
+		case args[0].IsFloat64():
 			v := args[0].AsFloat64()
 			globalDefaultTimeout = &v
-		} else if args[0].IsInt64() {
+		case args[0].IsInt64():
 			v := float64(args[0].AsInt64())
 			globalDefaultTimeout = &v
 		}
@@ -241,20 +242,22 @@ func (e *Engine) createSocketModule() val.Value {
 		if ip == nil {
 			panic("OSError: illegal IP address string passed to inet_pton")
 		}
-		if af == syscall.AF_INET {
+		switch af {
+		case syscall.AF_INET:
 			ip4 := ip.To4()
 			if ip4 == nil {
 				panic("OSError: illegal IP address string passed to inet_pton")
 			}
 			return val.NewBytesVal(ip4)
-		} else if af == syscall.AF_INET6 {
+		case syscall.AF_INET6:
 			ip16 := ip.To16()
 			if ip16 == nil {
 				panic("OSError: illegal IP address string passed to inet_pton")
 			}
 			return val.NewBytesVal(ip16)
+		default:
+			panic("OSError: unknown address family")
 		}
-		panic("OSError: unknown address family")
 	}))
 
 	mod.Dict.Set(val.InternString("inet_ntop"), val.NewModuleFuncVal("inet_ntop", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -263,20 +266,22 @@ func (e *Engine) createSocketModule() val.Value {
 		}
 		af := int(args[0].AsInt64())
 		b := args[1].AsBytes().Data
-		if af == syscall.AF_INET {
+		switch af {
+		case syscall.AF_INET:
 			if len(b) != 4 {
 				panic("ValueError: invalid length of packed IP address string")
 			}
 			ip := net.IPv4(b[0], b[1], b[2], b[3])
 			return val.NewStringVal(ip.String())
-		} else if af == syscall.AF_INET6 {
+		case syscall.AF_INET6:
 			if len(b) != 16 {
 				panic("ValueError: invalid length of packed IP address string")
 			}
 			ip := net.IP(b)
 			return val.NewStringVal(ip.String())
+		default:
+			panic("ValueError: unknown address family")
 		}
-		panic("ValueError: unknown address family")
 	}))
 
 	// getaddrinfo
@@ -357,9 +362,10 @@ func (e *Engine) createSocketModule() val.Value {
 		}
 
 		types := []int{syscall.SOCK_STREAM}
-		if sockType == syscall.SOCK_DGRAM {
+		switch sockType {
+		case syscall.SOCK_DGRAM:
 			types = []int{syscall.SOCK_DGRAM}
-		} else if sockType == 0 {
+		case 0:
 			types = []int{syscall.SOCK_STREAM, syscall.SOCK_DGRAM}
 		}
 
@@ -644,18 +650,17 @@ func (e *Engine) createSocketModule() val.Value {
 			fd = newFd
 		}
 
-		var initialTimeout float64 = -1.0
+		initialTimeout := -1.0
 		globalTimeoutMu.RLock()
 		if globalDefaultTimeout != nil {
 			initialTimeout = *globalDefaultTimeout
 		}
 		globalTimeoutMu.RUnlock()
 
-		if initialTimeout == 0 {
+		switch {
+		case initialTimeout >= 0:
 			_ = syscall.SetNonblock(fd, true)
-		} else if initialTimeout > 0 {
-			_ = syscall.SetNonblock(fd, true)
-		} else {
+		default:
 			_ = syscall.SetNonblock(fd, false)
 		}
 
@@ -811,13 +816,14 @@ func (e *Engine) createSocketModule() val.Value {
 		}
 		st := getSockState(args[0])
 		var data []byte
-		if args[1].IsBytes() {
+		switch {
+		case args[1].IsBytes():
 			data = args[1].AsBytes().Data
-		} else if args[1].IsByteArray() {
+		case args[1].IsByteArray():
 			data = args[1].AsByteArray().Data
-		} else if args[1].IsMemoryView() {
+		case args[1].IsMemoryView():
 			data = args[1].AsMemoryView().Buf
-		} else {
+		default:
 			data = []byte(args[1].AsString())
 		}
 
@@ -851,13 +857,14 @@ func (e *Engine) createSocketModule() val.Value {
 		}
 		st := getSockState(args[0])
 		var data []byte
-		if args[1].IsBytes() {
+		switch {
+		case args[1].IsBytes():
 			data = args[1].AsBytes().Data
-		} else if args[1].IsByteArray() {
+		case args[1].IsByteArray():
 			data = args[1].AsByteArray().Data
-		} else if args[1].IsMemoryView() {
+		case args[1].IsMemoryView():
 			data = args[1].AsMemoryView().Buf
-		} else {
+		default:
 			data = []byte(args[1].AsString())
 		}
 
@@ -928,11 +935,12 @@ func (e *Engine) createSocketModule() val.Value {
 		}
 		st := getSockState(args[0])
 		var target []byte
-		if args[1].IsByteArray() {
+		switch {
+		case args[1].IsByteArray():
 			target = args[1].AsByteArray().Data
-		} else if args[1].IsMemoryView() {
+		case args[1].IsMemoryView():
 			target = args[1].AsMemoryView().Buf
-		} else {
+		default:
 			panic("TypeError: a bytes-like object is required")
 		}
 

@@ -100,14 +100,18 @@ func (e *Engine) createStringModule() val.Value {
 			// Find ':' that separates formatSpec (not inside nested braces)
 			colonIdx := -1
 			nested := 0
+		loopColon:
 			for idx, ch := range fieldContent {
-				if ch == '{' {
+				switch ch {
+				case '{':
 					nested++
-				} else if ch == '}' {
+				case '}':
 					nested--
-				} else if ch == ':' && nested == 0 {
-					colonIdx = idx
-					break
+				case ':':
+					if nested == 0 {
+						colonIdx = idx
+						break loopColon
+					}
 				}
 			}
 
@@ -124,7 +128,7 @@ func (e *Engine) createStringModule() val.Value {
 				hasConversion = true
 			}
 
-			var convVal val.Value = val.NoneVal()
+			convVal := val.NoneVal()
 			if hasConversion {
 				convVal = val.NewStringVal(conversion)
 			}
@@ -170,7 +174,8 @@ func (e *Engine) createStringModule() val.Value {
 		idx := firstEnd
 		n := len(fieldName)
 		for idx < n {
-			if fieldName[idx] == '.' {
+			switch fieldName[idx] {
+			case '.':
 				idx++
 				attrStart := idx
 				for idx < n && fieldName[idx] != '.' && fieldName[idx] != '[' {
@@ -178,7 +183,7 @@ func (e *Engine) createStringModule() val.Value {
 				}
 				attrName := fieldName[attrStart:idx]
 				rest = append(rest, val.NewTupleVal(val.BoolVal(true), val.NewStringVal(attrName)))
-			} else if fieldName[idx] == '[' {
+			case '[':
 				idx++
 				itemStart := idx
 				for idx < n && fieldName[idx] != ']' {
@@ -196,7 +201,7 @@ func (e *Engine) createStringModule() val.Value {
 					itemVal = val.NewStringVal(itemStr)
 				}
 				rest = append(rest, val.NewTupleVal(val.BoolVal(false), itemVal))
-			} else {
+			default:
 				idx++
 			}
 		}

@@ -192,13 +192,14 @@ func (e *Engine) createCodecsModule() val.Value {
 			panic("TypeError: utf_8_decode() takes at least 1 argument")
 		}
 		var b []byte
-		if args[0].IsBytes() {
+		switch {
+		case args[0].IsBytes():
 			b = args[0].AsBytes().Data
-		} else if args[0].IsByteArray() {
+		case args[0].IsByteArray():
 			b = args[0].AsByteArray().Data
-		} else if args[0].IsMemoryView() {
+		case args[0].IsMemoryView():
 			b = args[0].AsMemoryView().Buf
-		} else {
+		default:
 			b = []byte(args[0].AsString())
 		}
 		return val.NewTupleVal(val.NewStringVal(string(b)), val.Int64Val(int64(len(b))))
@@ -225,13 +226,14 @@ func (e *Engine) createCodecsModule() val.Value {
 			panic("TypeError: latin_1_decode() takes at least 1 argument")
 		}
 		var b []byte
-		if args[0].IsBytes() {
+		switch {
+		case args[0].IsBytes():
 			b = args[0].AsBytes().Data
-		} else if args[0].IsByteArray() {
+		case args[0].IsByteArray():
 			b = args[0].AsByteArray().Data
-		} else if args[0].IsMemoryView() {
+		case args[0].IsMemoryView():
 			b = args[0].AsMemoryView().Buf
-		} else {
+		default:
 			b = []byte(args[0].AsString())
 		}
 		runes := make([]rune, len(b))
@@ -262,13 +264,14 @@ func (e *Engine) createCodecsModule() val.Value {
 			panic("TypeError: ascii_decode() takes at least 1 argument")
 		}
 		var b []byte
-		if args[0].IsBytes() {
+		switch {
+		case args[0].IsBytes():
 			b = args[0].AsBytes().Data
-		} else if args[0].IsByteArray() {
+		case args[0].IsByteArray():
 			b = args[0].AsByteArray().Data
-		} else if args[0].IsMemoryView() {
+		case args[0].IsMemoryView():
 			b = args[0].AsMemoryView().Buf
-		} else {
+		default:
 			b = []byte(args[0].AsString())
 		}
 		return val.NewTupleVal(val.NewStringVal(string(b)), val.Int64Val(int64(len(b))))
@@ -288,11 +291,12 @@ func (e *Engine) createCodecsModule() val.Value {
 			panic("TypeError: raw_unicode_escape_decode() takes at least 1 argument")
 		}
 		var b []byte
-		if args[0].IsBytes() {
+		switch {
+		case args[0].IsBytes():
 			b = args[0].AsBytes().Data
-		} else if args[0].IsByteArray() {
+		case args[0].IsByteArray():
 			b = args[0].AsByteArray().Data
-		} else {
+		default:
 			b = []byte(args[0].AsString())
 		}
 		return val.NewTupleVal(val.NewStringVal(string(b)), val.Int64Val(int64(len(b))))
@@ -328,13 +332,14 @@ func (e *Engine) createCodecsModule() val.Value {
 			panic("TypeError: decode() takes at least 1 argument")
 		}
 		var b []byte
-		if args[0].IsBytes() {
+		switch {
+		case args[0].IsBytes():
 			b = args[0].AsBytes().Data
-		} else if args[0].IsByteArray() {
+		case args[0].IsByteArray():
 			b = args[0].AsByteArray().Data
-		} else if args[0].IsMemoryView() {
+		case args[0].IsMemoryView():
 			b = args[0].AsMemoryView().Buf
-		} else {
+		default:
 			b = []byte(args[0].AsString())
 		}
 		return val.NewStringVal(string(b))

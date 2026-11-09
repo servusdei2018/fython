@@ -706,11 +706,8 @@ func compareSliceRich(ctx *ExecContext, ia, ib []Value, op uint8) Value {
 	case CmpNEQ:
 		return BoolVal(!compareSliceRich(ctx, ia, ib, CmpEQ).IsTruthy())
 	case CmpLT, CmpLTE, CmpGT, CmpGTE:
-		minLen := len(ia)
-		if len(ib) < minLen {
-			minLen = len(ib)
-		}
-		for i := 0; i < minLen; i++ {
+		minLen := min(len(ia), len(ib))
+		for i := range minLen {
 			if !RichCompare(ctx, ia[i], ib[i], CmpEQ).IsTruthy() {
 				return RichCompare(ctx, ia[i], ib[i], op)
 			}
@@ -1206,7 +1203,7 @@ func InCtx(ctx *ExecContext, item, container Value) Value {
 	}
 	if container.IsTuple() && cType == TupleType {
 		items := container.AsTuple().Items
-		for i := 0; i < len(items); i++ {
+		for i := range items {
 			if Equals(items[i], item) {
 				return BoolVal(true)
 			}
@@ -1248,11 +1245,12 @@ func InCtx(ctx *ExecContext, item, container Value) Value {
 	}
 	if container.IsBytes() || container.IsByteArray() || container.IsMemoryView() {
 		var buf []byte
-		if container.IsBytes() {
+		switch {
+		case container.IsBytes():
 			buf = container.AsBytes().Data
-		} else if container.IsByteArray() {
+		case container.IsByteArray():
 			buf = container.AsByteArray().Data
-		} else {
+		default:
 			buf = container.AsMemoryView().Buf
 		}
 		if item.IsInt64() {
@@ -1764,10 +1762,6 @@ func MatMul(ctx *ExecContext, a, b Value) Value {
 	return raiseTypeError(ctx, "unsupported operand type(s) for @: '"+a.Type().Name+"' and '"+b.Type().Name+"'")
 }
 
-func formatStringMod(fmtStr string, arg Value) Value {
-	return formatStringModCtx(nil, fmtStr, arg)
-}
-
 func formatStringModCtx(ctx *ExecContext, fmtStr string, arg Value) Value {
 	var items []Value
 	var argDict *PyDict
@@ -1787,11 +1781,12 @@ func formatStringModCtx(ctx *ExecContext, fmtStr string, arg Value) Value {
 		}
 	}
 
-	if arg.IsTuple() {
+	switch {
+	case arg.IsTuple():
 		items = arg.AsTuple().Items
-	} else if arg.IsDict() && !hasPositional {
+	case arg.IsDict() && !hasPositional:
 		argDict = arg.AsDict()
-	} else {
+	default:
 		items = []Value{arg}
 	}
 
@@ -1863,10 +1858,10 @@ func formatStringModCtx(ctx *ExecContext, fmtStr string, arg Value) Value {
 			val, ok = argDict.Get(InternString(mapKey))
 			if !ok {
 				if ctx != nil {
-					ctx.Raise(NewException(KeyErrorType, fmt.Sprintf("KeyError: %s", mapKey)))
+					ctx.Raise(NewException(KeyErrorType, "KeyError: "+mapKey))
 					return NoneVal()
 				}
-				panic(NewException(KeyErrorType, fmt.Sprintf("KeyError: %s", mapKey)))
+				panic(NewException(KeyErrorType, "KeyError: "+mapKey))
 			}
 		} else {
 			if itemIdx >= len(items) {
@@ -1923,11 +1918,12 @@ func formatStringModCtx(ctx *ExecContext, fmtStr string, arg Value) Value {
 			fVal := toFloat64(val)
 			rendered = fmt.Sprintf("%"+specifier+"g", fVal)
 		case 'c':
-			if val.IsAnyString() {
+			switch {
+			case val.IsAnyString():
 				rendered = val.AsString()
-			} else if val.IsInt64() {
+			case val.IsInt64():
 				rendered = string(rune(val.AsInt64()))
-			} else {
+			default:
 				return raiseTypeError(ctx, "%c requires int or char")
 			}
 		default:

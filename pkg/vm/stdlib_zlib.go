@@ -198,7 +198,8 @@ func (c *pyZlibCompress) compress(data []byte) []byte {
 	if lvl < -1 || lvl > 9 {
 		lvl = flate.DefaultCompression
 	}
-	if c.wbits < 0 {
+	switch {
+	case c.wbits < 0:
 		if c.fw == nil {
 			fw, err := flate.NewWriter(&c.buf, lvl)
 			if err != nil {
@@ -206,9 +207,13 @@ func (c *pyZlibCompress) compress(data []byte) []byte {
 			}
 			c.fw = fw
 		}
-		c.fw.Write(data)
-		c.fw.Flush()
-	} else if c.wbits > 15 {
+		if _, err := c.fw.Write(data); err != nil {
+			panic(val.NewException(zlibErrorType, err.Error()))
+		}
+		if err := c.fw.Flush(); err != nil {
+			panic(val.NewException(zlibErrorType, err.Error()))
+		}
+	case c.wbits > 15:
 		if c.gw == nil {
 			gw, err := gzip.NewWriterLevel(&c.buf, lvl)
 			if err != nil {
@@ -216,9 +221,13 @@ func (c *pyZlibCompress) compress(data []byte) []byte {
 			}
 			c.gw = gw
 		}
-		c.gw.Write(data)
-		c.gw.Flush()
-	} else {
+		if _, err := c.gw.Write(data); err != nil {
+			panic(val.NewException(zlibErrorType, err.Error()))
+		}
+		if err := c.gw.Flush(); err != nil {
+			panic(val.NewException(zlibErrorType, err.Error()))
+		}
+	default:
 		if c.zw == nil {
 			zw, err := zlib.NewWriterLevel(&c.buf, lvl)
 			if err != nil {
@@ -226,8 +235,12 @@ func (c *pyZlibCompress) compress(data []byte) []byte {
 			}
 			c.zw = zw
 		}
-		c.zw.Write(data)
-		c.zw.Flush()
+		if _, err := c.zw.Write(data); err != nil {
+			panic(val.NewException(zlibErrorType, err.Error()))
+		}
+		if err := c.zw.Flush(); err != nil {
+			panic(val.NewException(zlibErrorType, err.Error()))
+		}
 	}
 	out := append([]byte(nil), c.buf.Bytes()...)
 	c.buf.Reset()
@@ -237,26 +250,38 @@ func (c *pyZlibCompress) compress(data []byte) []byte {
 func (c *pyZlibCompress) flush(mode int) []byte {
 	if mode == 4 /* Z_FINISH */ {
 		if c.fw != nil {
-			c.fw.Close()
+			if err := c.fw.Close(); err != nil {
+				panic(val.NewException(zlibErrorType, err.Error()))
+			}
 			c.fw = nil
 		}
 		if c.gw != nil {
-			c.gw.Close()
+			if err := c.gw.Close(); err != nil {
+				panic(val.NewException(zlibErrorType, err.Error()))
+			}
 			c.gw = nil
 		}
 		if c.zw != nil {
-			c.zw.Close()
+			if err := c.zw.Close(); err != nil {
+				panic(val.NewException(zlibErrorType, err.Error()))
+			}
 			c.zw = nil
 		}
 	} else {
 		if c.fw != nil {
-			c.fw.Flush()
+			if err := c.fw.Flush(); err != nil {
+				panic(val.NewException(zlibErrorType, err.Error()))
+			}
 		}
 		if c.gw != nil {
-			c.gw.Flush()
+			if err := c.gw.Flush(); err != nil {
+				panic(val.NewException(zlibErrorType, err.Error()))
+			}
 		}
 		if c.zw != nil {
-			c.zw.Flush()
+			if err := c.zw.Flush(); err != nil {
+				panic(val.NewException(zlibErrorType, err.Error()))
+			}
 		}
 	}
 	out := append([]byte(nil), c.buf.Bytes()...)
@@ -270,50 +295,61 @@ func (d *pyZlibDecompress) decompress(data []byte, maxLen int) []byte {
 	}
 	if !d.streamFinished && len(d.inBuf) > 0 {
 		br := bytes.NewReader(d.inBuf)
-		var r io.Reader = br
+		var r io.Reader
 		var closeReader io.Closer
-		if d.wbits < 0 {
+		switch {
+		case d.wbits < 0:
 			fr := flate.NewReader(br)
 			r = fr
 			closeReader = fr
-		} else if d.wbits > 15 && d.wbits <= 31 {
+		case d.wbits > 15 && d.wbits <= 31:
 			gzr, err := gzip.NewReader(br)
 			if err == nil {
 				r = gzr
 				closeReader = gzr
+			} else {
+				r = br
 			}
-		} else if d.wbits > 31 {
-			if len(d.inBuf) >= 2 && d.inBuf[0] == 0x1f && d.inBuf[1] == 0x8b {
+		case d.wbits > 31:
+			switch {
+			case len(d.inBuf) >= 2 && d.inBuf[0] == 0x1f && d.inBuf[1] == 0x8b:
 				gzr, err := gzip.NewReader(br)
 				if err == nil {
 					r = gzr
 					closeReader = gzr
+				} else {
+					r = br
 				}
-			} else if len(d.inBuf) >= 1 && (d.inBuf[0] == 0x78 || d.inBuf[0] == 0x58) {
+			case len(d.inBuf) >= 1 && (d.inBuf[0] == 0x78 || d.inBuf[0] == 0x58):
 				zr, err := zlib.NewReader(br)
 				if err == nil {
 					r = zr
 					closeReader = zr
+				} else {
+					r = br
 				}
-			} else {
+			default:
 				fr := flate.NewReader(br)
 				r = fr
 				closeReader = fr
 			}
-		} else {
+		default:
 			zr, err := zlib.NewReader(br)
 			if err == nil {
 				r = zr
 				closeReader = zr
+			} else {
+				r = br
 			}
 		}
 
 		decoded, err := io.ReadAll(r)
 		if closeReader != nil {
-			closeReader.Close()
+			_ = closeReader.Close()
 		}
 
-		if err == nil || err == io.EOF {
+		switch err {
+		case nil, io.EOF:
 			d.streamFinished = true
 			unread := br.Len()
 			d.savedUnusedData = append([]byte(nil), d.inBuf[len(d.inBuf)-unread:]...)
@@ -322,13 +358,13 @@ func (d *pyZlibDecompress) decompress(data []byte, maxLen int) []byte {
 				d.outPending = append(d.outPending, decoded[d.totalDecodedSoFar:]...)
 				d.totalDecodedSoFar = len(decoded)
 			}
-		} else if err == io.ErrUnexpectedEOF {
+		case io.ErrUnexpectedEOF:
 			d.streamFinished = false
 			if len(decoded) > d.totalDecodedSoFar {
 				d.outPending = append(d.outPending, decoded[d.totalDecodedSoFar:]...)
 				d.totalDecodedSoFar = len(decoded)
 			}
-		} else {
+		default:
 			panic(val.NewException(zlibErrorType, err.Error()))
 		}
 	}
@@ -523,27 +559,40 @@ func (e *Engine) createZlibModule() val.Value {
 			lvl = flate.DefaultCompression
 		}
 		var buf bytes.Buffer
-		if wbits < 0 {
+		switch {
+		case wbits < 0:
 			fw, err := flate.NewWriter(&buf, lvl)
 			if err != nil {
 				panic(val.NewException(zlibErrorType, err.Error()))
 			}
-			fw.Write(b)
-			fw.Close()
-		} else if wbits > 15 {
+			if _, err := fw.Write(b); err != nil {
+				panic(val.NewException(zlibErrorType, err.Error()))
+			}
+			if err := fw.Close(); err != nil {
+				panic(val.NewException(zlibErrorType, err.Error()))
+			}
+		case wbits > 15:
 			gw, err := gzip.NewWriterLevel(&buf, lvl)
 			if err != nil {
 				panic(val.NewException(zlibErrorType, err.Error()))
 			}
-			gw.Write(b)
-			gw.Close()
-		} else {
+			if _, err := gw.Write(b); err != nil {
+				panic(val.NewException(zlibErrorType, err.Error()))
+			}
+			if err := gw.Close(); err != nil {
+				panic(val.NewException(zlibErrorType, err.Error()))
+			}
+		default:
 			zw, err := zlib.NewWriterLevel(&buf, lvl)
 			if err != nil {
 				panic(val.NewException(zlibErrorType, err.Error()))
 			}
-			zw.Write(b)
-			zw.Close()
+			if _, err := zw.Write(b); err != nil {
+				panic(val.NewException(zlibErrorType, err.Error()))
+			}
+			if err := zw.Close(); err != nil {
+				panic(val.NewException(zlibErrorType, err.Error()))
+			}
 		}
 		return val.NewBytesVal(buf.Bytes())
 	}))
@@ -564,40 +613,42 @@ func (e *Engine) createZlibModule() val.Value {
 		}
 
 		br := bytes.NewReader(b)
-		var r io.Reader = br
+		var r io.Reader
 		var closeReader io.Closer
-		if wbits < 0 {
+		switch {
+		case wbits < 0:
 			fr := flate.NewReader(br)
 			r = fr
 			closeReader = fr
-		} else if wbits > 15 && wbits <= 31 {
+		case wbits > 15 && wbits <= 31:
 			gzr, err := gzip.NewReader(br)
 			if err != nil {
 				panic(val.NewException(zlibErrorType, err.Error()))
 			}
 			r = gzr
 			closeReader = gzr
-		} else if wbits > 31 {
-			if len(b) >= 2 && b[0] == 0x1f && b[1] == 0x8b {
+		case wbits > 31:
+			switch {
+			case len(b) >= 2 && b[0] == 0x1f && b[1] == 0x8b:
 				gzr, err := gzip.NewReader(br)
 				if err != nil {
 					panic(val.NewException(zlibErrorType, err.Error()))
 				}
 				r = gzr
 				closeReader = gzr
-			} else if len(b) >= 1 && (b[0] == 0x78 || b[0] == 0x58) {
+			case len(b) >= 1 && (b[0] == 0x78 || b[0] == 0x58):
 				zr, err := zlib.NewReader(br)
 				if err != nil {
 					panic(val.NewException(zlibErrorType, err.Error()))
 				}
 				r = zr
 				closeReader = zr
-			} else {
+			default:
 				fr := flate.NewReader(br)
 				r = fr
 				closeReader = fr
 			}
-		} else {
+		default:
 			zr, err := zlib.NewReader(br)
 			if err != nil {
 				panic(val.NewException(zlibErrorType, err.Error()))
@@ -608,7 +659,7 @@ func (e *Engine) createZlibModule() val.Value {
 
 		out, err := io.ReadAll(r)
 		if closeReader != nil {
-			closeReader.Close()
+			_ = closeReader.Close()
 		}
 		if err != nil && err != io.EOF {
 			panic(val.NewException(zlibErrorType, err.Error()))

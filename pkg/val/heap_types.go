@@ -83,7 +83,7 @@ type PyCell struct {
 type PyChan struct {
 	Header ObjectHeader
 	Ch     chan Value
-	closed uint32
+	closed atomic.Uint32
 }
 
 // PyModule represents a Python module or package object.
@@ -658,13 +658,13 @@ func (c *PyCell) Set(v Value) {
 }
 
 // Send sends v over the channel. Returns an error if the channel is closed.
-func (c *PyChan) Send(v Value) error {
-	if atomic.LoadUint32(&c.closed) == 1 {
+func (c *PyChan) Send(v Value) (err error) {
+	if c.closed.Load() == 1 {
 		return errors.New("cannot send on closed channel")
 	}
 	defer func() {
 		if r := recover(); r != nil {
-			// Channel was closed concurrently
+			err = errors.New("cannot send on closed channel")
 		}
 	}()
 	c.Ch <- v
@@ -682,7 +682,7 @@ func (c *PyChan) Recv() (Value, bool) {
 
 // Close closes the underlying Go channel. Safe to call concurrently.
 func (c *PyChan) Close() bool {
-	if atomic.CompareAndSwapUint32(&c.closed, 0, 1) {
+	if c.closed.CompareAndSwap(0, 1) {
 		close(c.Ch)
 		return true
 	}
@@ -698,31 +698,32 @@ func NewIterVal(obj Value) Value {
 		Header: ObjectHeader{Kind: KindIter, Type: IterType},
 		Obj:    obj,
 	}
-	if obj.IsList() {
+	switch {
+	case obj.IsList():
 		it.Kind = IterKindList
-	} else if obj.IsTuple() {
+	case obj.IsTuple():
 		it.Kind = IterKindTuple
-	} else if obj.IsDict() {
+	case obj.IsDict():
 		it.Kind = IterKindDict
-	} else if obj.IsRange() {
+	case obj.IsRange():
 		it.Kind = IterKindRange
 		it.Cur = int64(obj.RangeStart())
 		it.Stop = int64(obj.RangeStop())
 		it.Step = 1
-	} else if obj.IsGenerator() {
+	case obj.IsGenerator():
 		it.Kind = IterKindGenerator
-	} else if obj.IsSet() {
+	case obj.IsSet():
 		it.Kind = IterKindList
 		it.Obj = NewListVal(obj.AsSet().Items()...)
-	} else if obj.IsAnyString() {
+	case obj.IsAnyString():
 		it.Kind = IterKindString
-	} else if obj.IsBytes() {
+	case obj.IsBytes():
 		it.Kind = IterKindBytes
-	} else if obj.IsByteArray() {
+	case obj.IsByteArray():
 		it.Kind = IterKindByteArray
-	} else if obj.Type() != nil && obj.Type().Slots.TpIter != nil {
+	case obj.Type() != nil && obj.Type().Slots.TpIter != nil:
 		return obj.Type().Slots.TpIter(nil, obj)
-	} else {
+	default:
 		it.Kind = IterKindInvalid
 	}
 	return Value{num: 0, ptr: &it.Header}

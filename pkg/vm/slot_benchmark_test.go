@@ -22,7 +22,7 @@ func BenchmarkSingleThreadSlotAccess(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
+	for i := range b.N {
 		inst.SetSlot(xIdx, val.Int64Val(int64(i)))
 		inst.SetSlot(yIdx, val.Int64Val(int64(i+1)))
 		xVal, _ := inst.GetSlot(xIdx)
@@ -46,7 +46,7 @@ func BenchmarkMultiThreadSlotAccess(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
+	for i := range b.N {
 		inst.SetSlot(xIdx, val.Int64Val(int64(i)))
 		inst.SetSlot(yIdx, val.Int64Val(int64(i+1)))
 		xVal, _ := inst.GetSlot(xIdx)
@@ -82,7 +82,7 @@ for i in range(1000):
 	b.ResetTimer()
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		v.RunCode(co)
 	}
 }

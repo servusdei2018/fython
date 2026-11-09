@@ -230,12 +230,13 @@ func (l *EventLoop) RunUntilCompleteIn(target val.Value, parent *val.PyContext) 
 	defer l.running.Store(false)
 
 	var rootTask *val.PyTask
-	if target.IsCoroutine() {
+	switch {
+	case target.IsCoroutine():
 		rootTask = l.CreateTaskIn(target, parent)
-	} else if target.IsTask() {
+	case target.IsTask():
 		rootTask = target.AsTask()
 		l.queue.Push(rootTask)
-	} else if target.IsFuture() {
+	case target.IsFuture():
 		fut := target.AsFuture()
 		<-fut.DoneChan()
 		res, exc := fut.Result()
@@ -243,7 +244,7 @@ func (l *EventLoop) RunUntilCompleteIn(target val.Value, parent *val.PyContext) 
 			return val.NoneVal(), fmt.Errorf("%s", exc.String())
 		}
 		return res, nil
-	} else {
+	default:
 		return val.NoneVal(), fmt.Errorf("TypeError: a coroutine was expected, got %s", target.Type().Name)
 	}
 
@@ -284,18 +285,13 @@ func (l *EventLoop) runSingleThread(rootTask *val.PyTask) (val.Value, error) {
 }
 
 func (l *EventLoop) runMultiCore(rootTask *val.PyTask) (val.Value, error) {
-	numWorkers := runtime.NumCPU()
-	if numWorkers < 2 {
-		numWorkers = 2
-	}
+	numWorkers := max(runtime.NumCPU(), 2)
 
 	var wg sync.WaitGroup
 	done := make(chan struct{})
 
-	for w := 0; w < numWorkers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range numWorkers {
+		wg.Go(func() {
 			workerVM := l.engine.AcquireVM()
 			defer l.engine.ReleaseVM(workerVM)
 
@@ -320,14 +316,14 @@ func (l *EventLoop) runMultiCore(rootTask *val.PyTask) (val.Value, error) {
 					return
 				}
 			}
-		}()
+		})
 	}
 
 	// Wait for rootTask completion
 	<-rootTask.Future.DoneChan()
 	close(done)
 	// Wake workers so they can exit
-	for w := 0; w < numWorkers*2; w++ {
+	for range numWorkers * 2 {
 		select {
 		case l.queue.wake <- struct{}{}:
 		default:
@@ -357,10 +353,11 @@ func (l *EventLoop) stepTask(vm *VM, task *val.PyTask) {
 	task.NextSent = val.NoneVal()
 
 	_, status := vm.resumeCoroutine(&vm.execCtx, coro, sent)
-	if status == val.IterExhausted {
+	switch status {
+	case val.IterExhausted:
 		task.SetResult(coro.RetVal)
 		vm.releaseCoroutine(coro)
-	} else if status == val.IterYielded {
+	case val.IterYielded:
 		aw := coro.YieldVal
 		if aw.IsFuture() || aw.IsTask() {
 			fut := aw.AsFuture()
@@ -373,7 +370,7 @@ func (l *EventLoop) stepTask(vm *VM, task *val.PyTask) {
 		} else {
 			l.queue.Push(task)
 		}
-	} else if status == val.IterError {
+	case val.IterError:
 		exc := vm.execCtx.ActiveException
 		vm.execCtx.ClearException()
 		if exc.IsNone() || exc.HeaderPtr() == nil {

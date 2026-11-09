@@ -477,11 +477,12 @@ func (v Value) AsClassMethod() *PyClassMethod {
 func classMethodDescrGet(ctx *ExecContext, descr, obj Value, owner *PyType) Value {
 	cm := descr.AsClassMethod()
 	var selfType *PyType
-	if owner != nil {
+	switch {
+	case owner != nil:
 		selfType = owner
-	} else if !obj.IsNone() && !obj.IsUnbound() {
+	case !obj.IsNone() && !obj.IsUnbound():
 		selfType = obj.Type()
-	} else {
+	default:
 		selfType = ObjectType
 	}
 	return NewBoundMethodVal(TypeVal(selfType), cm.Callable)
@@ -580,7 +581,7 @@ func newFunctionFromArgs(args []Value, kwnames []Value) Value {
 	if npos > len(names) {
 		panic("TypeError: function() takes at most 6 arguments")
 	}
-	for i := 0; i < npos; i++ {
+	for i := range npos {
 		slots[i], set[i] = args[i], true
 	}
 	for i, kn := range kwnames {
@@ -1013,7 +1014,7 @@ func typeTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value)
 			return TypeVal(args[0].Type())
 		}
 		var nameArg, basesArg, dictArg Value
-		var metacls *PyType = cls
+		metacls := cls
 		matched := false
 		if posCount == 3 {
 			nameArg = args[0]
@@ -1258,7 +1259,7 @@ func strMpSubscript(ctx *ExecContext, a, idxVal Value) Value {
 			var buf strings.Builder
 			buf.Grow(sliceLen)
 			cur := start
-			for i := 0; i < sliceLen; i++ {
+			for range sliceLen {
 				buf.WriteByte(s[cur])
 				cur += step
 			}
@@ -1277,7 +1278,7 @@ func strMpSubscript(ctx *ExecContext, a, idxVal Value) Value {
 		}
 		resRunes := make([]rune, sliceLen)
 		cur := start
-		for i := 0; i < sliceLen; i++ {
+		for i := range sliceLen {
 			resRunes[i] = runes[cur]
 			cur += step
 		}
@@ -1316,7 +1317,7 @@ func listMpSubscript(ctx *ExecContext, a, idxVal Value) Value {
 		}
 		res := make([]Value, sliceLen)
 		cur := start
-		for i := 0; i < sliceLen; i++ {
+		for i := range sliceLen {
 			res[i] = items[cur]
 			cur += step
 		}
@@ -1341,11 +1342,12 @@ func listMpAssSubscript(ctx *ExecContext, a, idxVal, val Value) Value {
 			panic(err.Error())
 		}
 		var rhsItems []Value
-		if val.IsList() {
+		switch {
+		case val.IsList():
 			rhsItems = val.AsList().Items
-		} else if val.IsTuple() {
+		case val.IsTuple():
 			rhsItems = val.AsTuple().Items
-		} else {
+		default:
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
@@ -1367,7 +1369,7 @@ func listMpAssSubscript(ctx *ExecContext, a, idxVal, val Value) Value {
 			panic("ValueError: attempt to assign sequence of size X to extended slice of size Y")
 		}
 		cur := start
-		for i := 0; i < sliceLen; i++ {
+		for i := range sliceLen {
 			l.Items[cur] = rhsItems[i]
 			cur += step
 		}
@@ -1409,7 +1411,7 @@ func tupleMpSubscript(ctx *ExecContext, a, idxVal Value) Value {
 		}
 		res := make([]Value, sliceLen)
 		cur := start
-		for i := 0; i < sliceLen; i++ {
+		for i := range sliceLen {
 			res[i] = items[cur]
 			cur += step
 		}
@@ -1443,7 +1445,7 @@ func bytesMpSubscript(ctx *ExecContext, a, idxVal Value) Value {
 		}
 		res := make([]byte, sliceLen)
 		cur := start
-		for i := 0; i < sliceLen; i++ {
+		for i := range sliceLen {
 			res[i] = data[cur]
 			cur += step
 		}
@@ -1488,7 +1490,7 @@ func byteArrayMpSubscript(ctx *ExecContext, a, idxVal Value) Value {
 		}
 		res := make([]byte, sliceLen)
 		cur := start
-		for i := 0; i < sliceLen; i++ {
+		for i := range sliceLen {
 			res[i] = data[cur]
 			cur += step
 		}
@@ -1515,13 +1517,14 @@ func byteArrayMpAssSubscript(ctx *ExecContext, a, idxVal, val Value) Value {
 			panic(err.Error())
 		}
 		var rhsBytes []byte
-		if val.IsBytes() {
+		switch {
+		case val.IsBytes():
 			rhsBytes = val.AsBytes().Data
-		} else if val.IsByteArray() {
+		case val.IsByteArray():
 			rhsBytes = val.AsByteArray().Data
-		} else if val.IsMemoryView() {
+		case val.IsMemoryView():
 			rhsBytes = val.AsMemoryView().Buf
-		} else {
+		default:
 			panic("TypeError: can't set slice with non-bytes-like object")
 		}
 		if step == 1 {
@@ -1536,7 +1539,7 @@ func byteArrayMpAssSubscript(ctx *ExecContext, a, idxVal, val Value) Value {
 			panic("ValueError: attempt to assign sequence of size X to extended slice of size Y")
 		}
 		cur := start
-		for i := 0; i < sliceLen; i++ {
+		for i := range sliceLen {
 			ba.Data[cur] = rhsBytes[i]
 			cur += step
 		}
@@ -1633,13 +1636,14 @@ func memoryViewMpAssSubscript(ctx *ExecContext, a, idxVal, val Value) Value {
 			panic("NotImplementedError: non-contiguous memoryview slice assignment")
 		}
 		var rhsBytes []byte
-		if val.IsBytes() {
+		switch {
+		case val.IsBytes():
 			rhsBytes = val.AsBytes().Data
-		} else if val.IsByteArray() {
+		case val.IsByteArray():
 			rhsBytes = val.AsByteArray().Data
-		} else if val.IsMemoryView() {
+		case val.IsMemoryView():
 			rhsBytes = val.AsMemoryView().Buf
-		} else {
+		default:
 			panic("TypeError: must assign bytes-like object")
 		}
 		if len(rhsBytes) != sliceLen {
@@ -1773,11 +1777,12 @@ func bytesNbAdd(ctx *ExecContext, a, b Value) Value {
 	} else {
 		panic("TypeError: can't concat " + a.Type().Name + " to bytes")
 	}
-	if b.IsBytes() {
+	switch {
+	case b.IsBytes():
 		bBytes = b.AsBytes().Data
-	} else if b.IsByteArray() {
+	case b.IsByteArray():
 		bBytes = b.AsByteArray().Data
-	} else {
+	default:
 		panic("TypeError: can't concat " + b.Type().Name + " to bytes")
 	}
 	res := make([]byte, len(aBytes)+len(bBytes))
@@ -1788,27 +1793,29 @@ func bytesNbAdd(ctx *ExecContext, a, b Value) Value {
 
 func byteArrayNbAdd(ctx *ExecContext, a, b Value) Value {
 	var aBytes, bBytes []byte
-	if a.IsByteArray() {
+	switch {
+	case a.IsByteArray():
 		ba := a.AsByteArray()
 		ba.mu.RLock()
 		aBytes = ba.Data
 		ba.mu.RUnlock()
-	} else if a.IsBytes() {
+	case a.IsBytes():
 		aBytes = a.AsBytes().Data
-	} else {
+	default:
 		panic("TypeError: can't concat " + a.Type().Name + " to bytearray")
 	}
 
-	if b.IsByteArray() {
+	switch {
+	case b.IsByteArray():
 		bb := b.AsByteArray()
 		bb.mu.RLock()
 		bBytes = bb.Data
 		bb.mu.RUnlock()
-	} else if b.IsBytes() {
+	case b.IsBytes():
 		bBytes = b.AsBytes().Data
-	} else if b.IsMemoryView() {
+	case b.IsMemoryView():
 		bBytes = b.AsMemoryView().Buf
-	} else {
+	default:
 		panic("TypeError: can't concat " + b.Type().Name + " to bytearray")
 	}
 
@@ -1821,13 +1828,14 @@ func byteArrayNbAdd(ctx *ExecContext, a, b Value) Value {
 func bytesNbMul(ctx *ExecContext, a, b Value) Value {
 	var data []byte
 	var n int64
-	if a.IsBytes() && (b.IsInt64() || b.IsBool()) {
+	switch {
+	case a.IsBytes() && (b.IsInt64() || b.IsBool()):
 		data = a.AsBytes().Data
 		n = b.AsInt64()
-	} else if (a.IsInt64() || a.IsBool()) && b.IsBytes() {
+	case (a.IsInt64() || a.IsBool()) && b.IsBytes():
 		data = b.AsBytes().Data
 		n = a.AsInt64()
-	} else {
+	default:
 		return NotImplementedVal()
 	}
 	if n <= 0 {
@@ -1839,19 +1847,20 @@ func bytesNbMul(ctx *ExecContext, a, b Value) Value {
 func byteArrayNbMul(ctx *ExecContext, a, b Value) Value {
 	var data []byte
 	var n int64
-	if a.IsByteArray() && (b.IsInt64() || b.IsBool()) {
+	switch {
+	case a.IsByteArray() && (b.IsInt64() || b.IsBool()):
 		ba := a.AsByteArray()
 		ba.mu.RLock()
 		data = ba.Data
 		ba.mu.RUnlock()
 		n = b.AsInt64()
-	} else if (a.IsInt64() || a.IsBool()) && b.IsByteArray() {
+	case (a.IsInt64() || a.IsBool()) && b.IsByteArray():
 		ba := b.AsByteArray()
 		ba.mu.RLock()
 		data = ba.Data
 		ba.mu.RUnlock()
 		n = a.AsInt64()
-	} else {
+	default:
 		return NotImplementedVal()
 	}
 	if n <= 0 {
@@ -2217,12 +2226,10 @@ func localsProxyCollectPairs(p *PyLocalsProxy) []DictEntry {
 				}
 			}
 		}
-	} else {
-		if f.SavedLocals != nil {
-			for _, e := range f.SavedLocals.Entries {
-				if !e.Key.IsUnbound() {
-					entries = append(entries, e)
-				}
+	} else if f.SavedLocals != nil {
+		for _, e := range f.SavedLocals.Entries {
+			if !e.Key.IsUnbound() {
+				entries = append(entries, e)
 			}
 		}
 	}
@@ -2270,11 +2277,9 @@ func localsProxyMpSubscript(ctx *ExecContext, obj, key Value) Value {
 				return v
 			}
 		}
-	} else {
-		if f.SavedLocals != nil {
-			if v, ok := f.SavedLocals.Get(key); ok {
-				return v
-			}
+	} else if f.SavedLocals != nil {
+		if v, ok := f.SavedLocals.Get(key); ok {
+			return v
 		}
 	}
 	panic("KeyError: '" + keyStr + "'")
@@ -2521,13 +2526,14 @@ func tupleNbAdd(ctx *ExecContext, a, b Value) Value {
 func listNbMul(ctx *ExecContext, a, b Value) Value {
 	var lVal Value
 	var n int64
-	if a.IsList() && (b.IsInt64() || b.IsBool()) {
+	switch {
+	case a.IsList() && (b.IsInt64() || b.IsBool()):
 		lVal = a
 		n = b.AsInt64()
-	} else if (a.IsInt64() || a.IsBool()) && b.IsList() {
+	case (a.IsInt64() || a.IsBool()) && b.IsList():
 		lVal = b
 		n = a.AsInt64()
-	} else {
+	default:
 		return NotImplementedVal()
 	}
 	if n <= 0 {
@@ -2535,7 +2541,7 @@ func listNbMul(ctx *ExecContext, a, b Value) Value {
 	}
 	items := lVal.AsList().Items
 	newItems := make([]Value, 0, len(items)*int(n))
-	for i := int64(0); i < n; i++ {
+	for range n {
 		newItems = append(newItems, items...)
 	}
 	return NewListVal(newItems...)
@@ -2544,13 +2550,14 @@ func listNbMul(ctx *ExecContext, a, b Value) Value {
 func tupleNbMul(ctx *ExecContext, a, b Value) Value {
 	var tVal Value
 	var n int64
-	if a.IsTuple() && (b.IsInt64() || b.IsBool()) {
+	switch {
+	case a.IsTuple() && (b.IsInt64() || b.IsBool()):
 		tVal = a
 		n = b.AsInt64()
-	} else if (a.IsInt64() || a.IsBool()) && b.IsTuple() {
+	case (a.IsInt64() || a.IsBool()) && b.IsTuple():
 		tVal = b
 		n = a.AsInt64()
-	} else {
+	default:
 		return NotImplementedVal()
 	}
 	if n <= 0 {
@@ -2558,7 +2565,7 @@ func tupleNbMul(ctx *ExecContext, a, b Value) Value {
 	}
 	items := tVal.AsTuple().Items
 	newItems := make([]Value, 0, len(items)*int(n))
-	for i := int64(0); i < n; i++ {
+	for range n {
 		newItems = append(newItems, items...)
 	}
 	return NewTupleVal(newItems...)
@@ -2567,13 +2574,14 @@ func tupleNbMul(ctx *ExecContext, a, b Value) Value {
 func strNbMul(ctx *ExecContext, a, b Value) Value {
 	var s string
 	var n int64
-	if a.IsAnyString() && (b.IsInt64() || b.IsBool()) {
+	switch {
+	case a.IsAnyString() && (b.IsInt64() || b.IsBool()):
 		s = a.AsString()
 		n = b.AsInt64()
-	} else if (a.IsInt64() || a.IsBool()) && b.IsAnyString() {
+	case (a.IsInt64() || a.IsBool()) && b.IsAnyString():
 		s = b.AsString()
 		n = a.AsInt64()
-	} else {
+	default:
 		return NotImplementedVal()
 	}
 	if n <= 0 {
@@ -2916,23 +2924,24 @@ func initTypes() {
 	IntType.Slots.NbAbs = intNbAbs
 
 	intNewBuiltin := NewBuiltinFuncVal("int.__new__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		var valToConvert Value = Int64Val(0)
+		valToConvert := Int64Val(0)
 		if len(args) > 1 {
 			valToConvert = args[1]
 		}
 		var num int64
-		if valToConvert.IsInt64() {
+		switch {
+		case valToConvert.IsInt64():
 			num = valToConvert.AsInt64()
-		} else if valToConvert.IsFloat64() {
+		case valToConvert.IsFloat64():
 			num = int64(valToConvert.AsFloat64())
-		} else if valToConvert.IsBool() {
+		case valToConvert.IsBool():
 			if valToConvert.AsBool() {
 				num = 1
 			}
-		} else if valToConvert.IsAnyString() {
+		case valToConvert.IsAnyString():
 			n, _ := strconv.ParseInt(strings.TrimSpace(valToConvert.AsString()), 10, 64)
 			num = n
-		} else if valToConvert.IsInstance() {
+		case valToConvert.IsInstance():
 			inst := valToConvert.AsInstance()
 			if len(inst.Slots) > 0 && inst.Slots[0].IsInt64() {
 				num = inst.Slots[0].AsInt64()
@@ -3247,19 +3256,21 @@ func initTypes() {
 		}
 		if a.IsAnyString() || a.IsBytes() || a.IsByteArray() {
 			var s string
-			if a.IsAnyString() {
+			switch {
+			case a.IsAnyString():
 				s = strings.TrimSpace(a.AsString())
-			} else if a.IsBytes() {
+			case a.IsBytes():
 				s = strings.TrimSpace(string(a.AsBytes().Data))
-			} else {
+			default:
 				s = strings.TrimSpace(string(a.AsByteArray().Data))
 			}
 			if base == 16 {
-				if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
+				switch {
+				case strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X"):
 					s = s[2:]
-				} else if strings.HasPrefix(s, "+0x") || strings.HasPrefix(s, "+0X") {
+				case strings.HasPrefix(s, "+0x") || strings.HasPrefix(s, "+0X"):
 					s = s[3:]
-				} else if strings.HasPrefix(s, "-0x") || strings.HasPrefix(s, "-0X") {
+				case strings.HasPrefix(s, "-0x") || strings.HasPrefix(s, "-0X"):
 					s = "-" + s[3:]
 				}
 			}
@@ -3434,24 +3445,25 @@ func initTypes() {
 		var f float64
 		if len(args) > 1 {
 			a := args[1]
-			if a.IsFloat64() {
+			switch {
+			case a.IsFloat64():
 				f = a.AsFloat64()
-			} else if a.IsInt64() {
+			case a.IsInt64():
 				f = float64(a.AsInt64())
-			} else if a.IsBool() {
+			case a.IsBool():
 				if a.AsBool() {
 					f = 1.0
 				} else {
 					f = 0.0
 				}
-			} else if a.IsAnyString() {
+			case a.IsAnyString():
 				v, err := strconv.ParseFloat(strings.TrimSpace(a.AsString()), 64)
 				if err == nil {
 					f = v
 				} else {
 					panic("ValueError: could not convert string to float: " + a.AsString())
 				}
-			} else if a.IsInstance() {
+			case a.IsInstance():
 				inst := a.AsInstance()
 				if len(inst.Slots) > 0 && inst.Slots[0].IsFloat64() {
 					f = inst.Slots[0].AsFloat64()
@@ -3652,7 +3664,7 @@ func initTypes() {
 		return NewIterVal(o)
 	}
 	strNewBuiltin := NewBuiltinFuncVal("str.__new__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		var s Value = NewStringVal("")
+		s := NewStringVal("")
 		npos := len(args) - len(kwnames)
 		if npos > 1 {
 			a := args[1]
@@ -3666,9 +3678,10 @@ func initTypes() {
 			}
 			for i, kn := range kwnames {
 				name, _ := unwrapStrVal(kn)
-				if name == "encoding" {
+				switch name {
+				case "encoding":
 					encodingVal = args[npos+i]
-				} else if name == "errors" {
+				case "errors":
 					errorsVal = args[npos+i]
 				}
 			}
@@ -3677,7 +3690,8 @@ func initTypes() {
 				encodingVal = NewStringVal("utf-8")
 			}
 
-			if encodingVal.ptr != nil && !encodingVal.IsNone() {
+			switch {
+			case encodingVal.ptr != nil && !encodingVal.IsNone():
 				b, ok := bytesMethodArg(a)
 				if !ok {
 					panic("TypeError: decoding to str need a bytes-like object, got '" + a.Type().Name + "'")
@@ -3691,15 +3705,16 @@ func initTypes() {
 					panic(err.Error())
 				}
 				s = NewStringVal(decoded)
-			} else if a.IsInt64() {
+			case a.IsInt64():
 				s = IntToStringVal(a.AsInt64())
-			} else if a.IsAnyString() {
+			case a.IsAnyString():
 				s = a
-			} else if a.IsInstance() {
+			case a.IsInstance():
 				inst := a.AsInstance()
-				if len(inst.Slots) > 0 && inst.Slots[0].IsAnyString() {
+				switch {
+				case len(inst.Slots) > 0 && inst.Slots[0].IsAnyString():
 					s = inst.Slots[0]
-				} else if ctx != nil && a.Type() != nil && a.Type() != StrType {
+				case ctx != nil && a.Type() != nil && a.Type() != StrType:
 					if strFn, _, ok := a.Type().LookupMRO(InternString("__str__")); ok {
 						res := ctx.Invoke1(strFn, a)
 						if res.IsAnyString() {
@@ -3710,10 +3725,10 @@ func initTypes() {
 					} else {
 						s = NewStringVal(a.String())
 					}
-				} else {
+				default:
 					s = NewStringVal(a.String())
 				}
-			} else if ctx != nil && a.Type() != nil && a.Type() != StrType {
+			case ctx != nil && a.Type() != nil && a.Type() != StrType:
 				if strFn, _, ok := a.Type().LookupMRO(InternString("__str__")); ok {
 					res := ctx.Invoke1(strFn, a)
 					if res.IsAnyString() {
@@ -3731,7 +3746,7 @@ func initTypes() {
 				} else {
 					s = NewStringVal(a.String())
 				}
-			} else {
+			default:
 				s = NewStringVal(a.String())
 			}
 		}
@@ -3869,9 +3884,10 @@ func initTypes() {
 		}
 		for i, kn := range kwnames {
 			name, _ := unwrapStrVal(kn)
-			if name == "encoding" {
+			switch name {
+			case "encoding":
 				encodingVal = args[npos+i]
-			} else if name == "errors" {
+			case "errors":
 				errorsVal = args[npos+i]
 			}
 		}
@@ -3970,7 +3986,7 @@ func initTypes() {
 			}
 		}
 		if len(args) >= 3 {
-			for _, r := range []rune(args[2].AsString()) {
+			for _, r := range args[2].AsString() {
 				resDict.Set(Int64Val(int64(r)), NoneVal())
 			}
 		}
@@ -5572,19 +5588,20 @@ func initTypes() {
 		}
 		if len(posArgs) > 0 {
 			arg := posArgs[0]
-			if arg.IsDict() {
+			switch {
+			case arg.IsDict():
 				d := arg.AsDict()
 				for _, it := range d.Items() {
 					targetDict.Set(it.Key, it.Value)
 				}
-			} else if arg.IsMappingProxy() {
+			case arg.IsMappingProxy():
 				mp := arg.AsMappingProxy()
 				if mp.Mapping.IsDict() {
 					for _, it := range mp.Mapping.AsDict().Items() {
 						targetDict.Set(it.Key, it.Value)
 					}
 				}
-			} else {
+			default:
 				items := ExtractIterableItems(ctx, arg)
 				for _, it := range items {
 					if it.IsTuple() && len(it.AsTuple().Items) >= 2 {
@@ -5635,7 +5652,7 @@ func initTypes() {
 	SentinelType.Slots.TpCall = func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		posCount := len(args) - len(kwnames)
 		var nameVal Value
-		var reprVal Value = NoneVal()
+		reprVal := NoneVal()
 		if posCount > 0 {
 			nameVal = args[0]
 		}
@@ -5743,7 +5760,7 @@ func initTypes() {
 		case 1:
 			return NewCellVal(args[0])
 		}
-		panic("TypeError: cell expected at most 1 argument, got " + fmt.Sprint(len(args)))
+		panic("TypeError: cell expected at most 1 argument, got " + strconv.Itoa(len(args)))
 	}
 	CellType.Slots.TpSetAttr = func(ctx *ExecContext, obj, name, value Value) Value {
 		if name.AsString() == "cell_contents" {
@@ -5783,12 +5800,13 @@ func initTypes() {
 	RangeType.Slots.TpCall = func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		var start, stop, step int64
 		step = 1
-		if len(args) == 1 {
+		switch {
+		case len(args) == 1:
 			stop = args[0].AsInt64()
-		} else if len(args) == 2 {
+		case len(args) == 2:
 			start = args[0].AsInt64()
 			stop = args[1].AsInt64()
-		} else if len(args) >= 3 {
+		case len(args) >= 3:
 			start = args[0].AsInt64()
 			stop = args[1].AsInt64()
 			step = args[2].AsInt64()
@@ -6212,10 +6230,7 @@ func initTypes() {
 	ImportErrorType.Dict.Set(DunderInit, NewBuiltinFuncVal("__init__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) > 0 && args[0].IsInstance() {
 			inst := args[0].AsInstance()
-			posEnd := len(args) - len(kwnames)
-			if posEnd < 1 {
-				posEnd = 1
-			}
+			posEnd := max(1, len(args)-len(kwnames))
 			rest := append([]Value(nil), args[1:posEnd]...)
 			inst.SetAttr(InternString("args"), NewTupleVal(rest...))
 			if len(rest) == 1 {
@@ -6618,11 +6633,12 @@ func initTypes() {
 		}
 		b := args[0].AsBytes().Data
 		var prefix []byte
-		if args[1].IsBytes() {
+		switch {
+		case args[1].IsBytes():
 			prefix = args[1].AsBytes().Data
-		} else if args[1].IsByteArray() {
+		case args[1].IsByteArray():
 			prefix = args[1].AsByteArray().Data
-		} else {
+		default:
 			panic("TypeError: startswith first arg must be bytes or a tuple of bytes")
 		}
 		return BoolVal(bytes.HasPrefix(b, prefix))
@@ -6633,11 +6649,12 @@ func initTypes() {
 		}
 		b := args[0].AsBytes().Data
 		var suffix []byte
-		if args[1].IsBytes() {
+		switch {
+		case args[1].IsBytes():
 			suffix = args[1].AsBytes().Data
-		} else if args[1].IsByteArray() {
+		case args[1].IsByteArray():
 			suffix = args[1].AsByteArray().Data
-		} else {
+		default:
 			panic("TypeError: endswith first arg must be bytes or a tuple of bytes")
 		}
 		return BoolVal(bytes.HasSuffix(b, suffix))
@@ -6648,11 +6665,12 @@ func initTypes() {
 		}
 		b := args[0].AsBytes().Data
 		var sub []byte
-		if args[1].IsBytes() {
+		switch {
+		case args[1].IsBytes():
 			sub = args[1].AsBytes().Data
-		} else if args[1].IsByteArray() {
+		case args[1].IsByteArray():
 			sub = args[1].AsByteArray().Data
-		} else {
+		default:
 			panic("TypeError: find argument must be bytes")
 		}
 		return Int64Val(int64(bytes.Index(b, sub)))
@@ -6698,13 +6716,14 @@ func initTypes() {
 		ba := args[0].AsByteArray()
 		val := args[1]
 		var toAppend []byte
-		if val.IsBytes() {
+		switch {
+		case val.IsBytes():
 			toAppend = val.AsBytes().Data
-		} else if val.IsByteArray() {
+		case val.IsByteArray():
 			toAppend = val.AsByteArray().Data
-		} else if val.IsMemoryView() {
+		case val.IsMemoryView():
 			toAppend = val.AsMemoryView().Buf
-		} else if val.IsList() {
+		case val.IsList():
 			for _, item := range val.AsList().Items {
 				b := item.AsInt64()
 				if b < 0 || b > 255 {
@@ -6712,7 +6731,7 @@ func initTypes() {
 				}
 				toAppend = append(toAppend, byte(b))
 			}
-		} else {
+		default:
 			panic("TypeError: 'extend' requires an iterable of ints or bytes-like object")
 		}
 		ba.mu.Lock()
@@ -7106,7 +7125,7 @@ func initTypes() {
 				}
 			}
 		}
-		var metaType *PyType = TypeType
+		metaType := TypeType
 		if mcls.IsType() {
 			metaType = mcls.AsType()
 		}
@@ -7388,8 +7407,8 @@ func initTypes() {
 
 		if self.IsInstance() {
 			inst := self.AsInstance()
-			var dictState Value = NoneVal()
-			var slotState Value = NoneVal()
+			dictState := NoneVal()
+			slotState := NoneVal()
 
 			if (cls.Flags & FlagForbidDynamicAttrs) != 0 {
 				if inst.Shape != nil && len(inst.Shape.Attrs) > 0 {
@@ -7417,7 +7436,7 @@ func initTypes() {
 				}
 			}
 
-			var state Value = NoneVal()
+			state := NoneVal()
 			if slotState.HeaderPtr() != nil {
 				state = NewTupleVal(NoneVal(), slotState)
 			} else if dictState.HeaderPtr() != nil && !dictState.IsNone() {

@@ -174,7 +174,7 @@ func splitZipArchivePath(target string) (string, string, *cachedZipArchive, bool
 			suffixParts = append(suffixParts, filepath.Base(curr))
 			curr = parent
 			if v, ok := zipArchiveCacheMap.Load(curr); ok {
-				prefix := ""
+				var prefix string
 				for i, j := 0, len(suffixParts)-1; i < j; i, j = i+1, j-1 {
 					suffixParts[i], suffixParts[j] = suffixParts[j], suffixParts[i]
 				}
@@ -189,7 +189,7 @@ func splitZipArchivePath(target string) (string, string, *cachedZipArchive, bool
 	var suffixParts []string
 	for {
 		if arch, err := loadZipArchive(curr); err == nil {
-			prefix := ""
+			var prefix string
 			if len(suffixParts) > 0 {
 				for i, j := 0, len(suffixParts)-1; i < j; i, j = i+1, j-1 {
 					suffixParts[i], suffixParts[j] = suffixParts[j], suffixParts[i]
@@ -393,8 +393,8 @@ func initZipImportTypes() {
 			}
 			rel := filepath.ToSlash(reqPath)
 			slashArch := filepath.ToSlash(archPath)
-			if strings.HasPrefix(rel, slashArch+"/") {
-				rel = strings.TrimPrefix(rel, slashArch+"/")
+			if trimmed, ok := strings.CutPrefix(rel, slashArch+"/"); ok {
+				rel = trimmed
 			} else {
 				rel = strings.TrimPrefix(rel, "/")
 			}

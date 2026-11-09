@@ -21,22 +21,22 @@ func TestUnparseRoundTrip(t *testing.T) {
 	var pairs []string
 	n := 0
 	for _, root := range roots {
-		filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
-			if err != nil || info.IsDir() || !strings.HasSuffix(p, ".py") {
-				return nil
+		_ = filepath.Walk(root, func(p string, info os.FileInfo, walkErr error) error {
+			if walkErr != nil || info.IsDir() || !strings.HasSuffix(p, ".py") {
+				return nil //nolint:nilerr
 			}
-			src, err := os.ReadFile(p)
-			if err != nil || strings.Contains(string(src), `\N{`) {
-				return nil
+			src, readErr := os.ReadFile(p)
+			if readErr != nil || strings.Contains(string(src), `\N{`) {
+				return nil //nolint:nilerr
 			}
 			tree, perr := Parse(src, ModeExec)
 			if perr != nil {
-				return nil
+				return nil //nolint:nilerr
 			}
 			out := Unparse(tree, UnparseOptions{PadLines: true})
 			n++
 			f := filepath.Join(tmp, "u"+strings.ReplaceAll(strings.ReplaceAll(p, "/", "_"), "..", "")+".py")
-			os.WriteFile(f, []byte(out+"\n"), 0o644)
+			_ = os.WriteFile(f, []byte(out+"\n"), 0o644)
 			pairs = append(pairs, p+"::"+f)
 			return nil
 		})

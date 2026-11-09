@@ -158,13 +158,14 @@ func initAsyncIOTypes() {
 			defer sw.mu.Unlock()
 
 			var data []byte
-			if args[1].IsBytes() {
+			switch {
+			case args[1].IsBytes():
 				data = args[1].AsBytes().Data
-			} else if args[1].IsByteArray() {
+			case args[1].IsByteArray():
 				data = args[1].AsByteArray().Data
-			} else if args[1].IsMemoryView() {
+			case args[1].IsMemoryView():
 				data = args[1].AsMemoryView().Buf
-			} else {
+			default:
 				panic("TypeError: a bytes-like object is required")
 			}
 
@@ -544,18 +545,19 @@ func (e *Engine) createAsyncioModule() val.Value {
 			idx := i
 			var childFut *val.PyFuture
 
-			if aw.IsCoroutine() {
+			switch {
+			case aw.IsCoroutine():
 				var parent *val.PyContext
 				if ctx != nil && ctx.VM != nil {
 					parent = ctx.VM.(*VM).ActiveContext()
 				}
 				task := loop.CreateTaskIn(aw, parent)
 				childFut = &task.Future
-			} else if aw.IsTask() {
+			case aw.IsTask():
 				childFut = &aw.AsTask().Future
-			} else if aw.IsFuture() {
+			case aw.IsFuture():
 				childFut = aw.AsFuture()
-			} else {
+			default:
 				results[idx] = aw
 				remaining--
 				if remaining == 0 {

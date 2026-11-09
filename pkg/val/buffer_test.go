@@ -100,7 +100,7 @@ func TestMemoryViewReadOnlyBytes(t *testing.T) {
 
 func TestTupleZeroCopySlice(t *testing.T) {
 	items := make([]Value, 100)
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		items[i] = Int64Val(int64(i * 10))
 	}
 	tup := NewTupleVal(items...)
@@ -130,7 +130,7 @@ func TestTupleZeroCopySlice(t *testing.T) {
 	}
 
 	// Verify items match
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		if slicedTup.Items[i].AsInt64() != int64((i+10)*10) {
 			t.Fatalf("item %d mismatch: got %d, want %d", i, slicedTup.Items[i].AsInt64(), (i+10)*10)
 		}

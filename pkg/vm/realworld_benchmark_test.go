@@ -84,7 +84,7 @@ func BenchmarkRealWorldOOP(b *testing.B) {
 
 	b.ResetTimer()
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		res := v.Vectorcall(fnVal, nil, nil)
 		_ = res
 	}
@@ -119,7 +119,7 @@ func TestRealWorldIO(t *testing.T) {
 	val.SetMultiThreaded(false)
 	v := vm.NewVM()
 	tmpFile := fmt.Sprintf("/tmp/realworld_bench_io_%d.txt", time.Now().UnixNano())
-	defer os.Remove(tmpFile)
+	defer func() { _ = os.Remove(tmpFile) }()
 
 	src := getIOSource(tmpFile)
 	co, err := compiler.CompileString(src)
@@ -156,7 +156,7 @@ func BenchmarkRealWorldIO(b *testing.B) {
 	val.SetMultiThreaded(false)
 	v := vm.NewVM()
 	tmpFile := fmt.Sprintf("/tmp/realworld_bench_io_b_%d.txt", time.Now().UnixNano())
-	defer os.Remove(tmpFile)
+	defer func() { _ = os.Remove(tmpFile) }()
 
 	src := getIOSource(tmpFile)
 	co, err := compiler.CompileString(src)
@@ -174,7 +174,7 @@ func BenchmarkRealWorldIO(b *testing.B) {
 
 	b.ResetTimer()
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		res := v.Vectorcall(fnVal, nil, nil)
 		_ = res
 	}
@@ -257,7 +257,7 @@ func BenchmarkRealWorldNQueens(b *testing.B) {
 	args := []val.Value{val.Int64Val(10)}
 	b.ResetTimer()
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		res := v.Vectorcall(fnVal, args, nil)
 		_ = res
 	}
@@ -326,7 +326,7 @@ func BenchmarkRealWorldAsync(b *testing.B) {
 
 	b.ResetTimer()
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		coro := v.Vectorcall(benchFn, []val.Value{val.Int64Val(100)}, nil)
 		_ = v.Vectorcall(runFn, []val.Value{coro}, nil)
 	}
@@ -365,7 +365,7 @@ func BenchmarkRealWorldBinary(b *testing.B) {
 
 	b.ResetTimer()
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		sub := val.GetItemCtx(nil, mvVal, sl)
 		_ = sub
 	}
@@ -376,11 +376,11 @@ func BenchmarkRealWorldBinary(b *testing.B) {
 func TestRealWorldJSON(t *testing.T) {
 	var sb strings.Builder
 	sb.WriteString("[\n")
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		if i > 0 {
 			sb.WriteString(",\n")
 		}
-		sb.WriteString(fmt.Sprintf(`  {"id": %d, "name": "usr%d", "age": %d, "active": true, "score": 95.5}`, i, i, 20+(i%50)))
+		fmt.Fprintf(&sb, `  {"id": %d, "name": "usr%d", "age": %d, "active": true, "score": 95.5}`, i, i, 20+(i%50))
 	}
 	sb.WriteString("\n]")
 	jsonBytes := []byte(sb.String())
@@ -407,11 +407,11 @@ func TestRealWorldJSON(t *testing.T) {
 func BenchmarkRealWorldJSON(b *testing.B) {
 	var sb strings.Builder
 	sb.WriteString("[\n")
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		if i > 0 {
 			sb.WriteString(",\n")
 		}
-		sb.WriteString(fmt.Sprintf(`  {"id": %d, "name": "usr%d", "age": %d, "active": true, "score": 95.5}`, i, i, 20+(i%50)))
+		fmt.Fprintf(&sb, `  {"id": %d, "name": "usr%d", "age": %d, "active": true, "score": 95.5}`, i, i, 20+(i%50))
 	}
 	sb.WriteString("\n]")
 	jsonBytes := []byte(sb.String())
@@ -431,7 +431,7 @@ func BenchmarkRealWorldJSON(b *testing.B) {
 	arg := []val.Value{val.NewBytesVal(jsonBytes)}
 	b.ResetTimer()
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		res := loadsFn.AsBuiltinFunc().Fn(nil, loadsFn, arg, nil)
 		_ = res
 	}

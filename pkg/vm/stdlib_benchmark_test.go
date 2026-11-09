@@ -14,11 +14,11 @@ func BenchmarkNativeJSONLoads(b *testing.B) {
 	// Generate JSON array containing 1,000 objects with keys: "id", "name", "age", "active", "score" (all <= 7 bytes)
 	var sb strings.Builder
 	sb.WriteString("[\n")
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		if i > 0 {
 			sb.WriteString(",\n")
 		}
-		sb.WriteString(fmt.Sprintf(`  {"id": %d, "name": "usr%d", "age": %d, "active": true, "score": 95.5}`, i, i, 20+(i%50)))
+		fmt.Fprintf(&sb, `  {"id": %d, "name": "usr%d", "age": %d, "active": true, "score": 95.5}`, i, i, 20+(i%50))
 	}
 	sb.WriteString("\n]")
 	jsonBytes := []byte(sb.String())
@@ -48,11 +48,11 @@ func BenchmarkNativeJSONLoads(b *testing.B) {
 func TestNativeJSONLoadsZeroHeapStringsForShortKeys(t *testing.T) {
 	var sb strings.Builder
 	sb.WriteString("[\n")
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		if i > 0 {
 			sb.WriteString(",\n")
 		}
-		sb.WriteString(fmt.Sprintf(`  {"id": %d, "name": "usr%d", "age": %d, "active": true, "score": 95.5}`, i, i, 20+(i%50)))
+		fmt.Fprintf(&sb, `  {"id": %d, "name": "usr%d", "age": %d, "active": true, "score": 95.5}`, i, i, 20+(i%50))
 	}
 	sb.WriteString("\n]")
 	jsonBytes := []byte(sb.String())

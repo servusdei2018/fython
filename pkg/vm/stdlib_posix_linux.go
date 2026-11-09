@@ -20,10 +20,10 @@ func sysStatInfo(info fs.FileInfo, si *statInfo) {
 	si.Nlink = int64(st.Nlink)
 	si.Uid = int64(st.Uid)
 	si.Gid = int64(st.Gid)
-	si.Size = int64(st.Size)
-	si.AtimeNs = int64(st.Atim.Sec)*1e9 + int64(st.Atim.Nsec)
-	si.MtimeNs = int64(st.Mtim.Sec)*1e9 + int64(st.Mtim.Nsec)
-	si.CtimeNs = int64(st.Ctim.Sec)*1e9 + int64(st.Ctim.Nsec)
+	si.Size = st.Size
+	si.AtimeNs = st.Atim.Sec*1e9 + st.Atim.Nsec
+	si.MtimeNs = st.Mtim.Sec*1e9 + st.Mtim.Nsec
+	si.CtimeNs = st.Ctim.Sec*1e9 + st.Ctim.Nsec
 }
 
 // ttySize reads the window size of the controlling terminal.

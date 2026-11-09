@@ -2,6 +2,7 @@ package val
 
 import (
 	"errors"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -336,10 +337,10 @@ type PyType struct {
 // Compile-time assertion that PyType.Header is at byte offset 0.
 var _ [0 - unsafe.Offsetof(PyType{}.Header)]byte
 
-var nextTypeVersion uint64
+var nextTypeVersion atomic.Uint64
 
 func allocTypeVersion() uint64 {
-	return atomic.AddUint64(&nextTypeVersion, 1)
+	return nextTypeVersion.Add(1)
 }
 
 // Built-in type singletons and static lookup table indexed by Kind.
@@ -569,7 +570,7 @@ func ComputeMRO(cls *PyType) ([]*PyType, error) {
 	}
 
 	// Reject duplicate direct bases (e.g., class C(A, A)).
-	for i := 0; i < len(bases); i++ {
+	for i := range bases {
 		if bases[i] == cls {
 			return nil, ErrInconsistentMRO
 		}
@@ -735,33 +736,34 @@ func NewTypeWithMeta(name string, bases []*PyType, dict *PyDict, meta *PyType) (
 		hasDict := !hasSlots
 		if hasSlots {
 			var slotNames []string
-			if slotsVal.IsAnyString() {
+			switch {
+			case slotsVal.IsAnyString():
 				slotNames = append(slotNames, slotsVal.AsString())
-			} else if slotsVal.IsTuple() {
+			case slotsVal.IsTuple():
 				for _, item := range slotsVal.AsTuple().Items {
 					if item.IsAnyString() {
 						slotNames = append(slotNames, item.AsString())
 					}
 				}
-			} else if slotsVal.IsList() {
+			case slotsVal.IsList():
 				for _, item := range slotsVal.AsList().Items {
 					if item.IsAnyString() {
 						slotNames = append(slotNames, item.AsString())
 					}
 				}
-			} else if slotsVal.IsDict() {
+			case slotsVal.IsDict():
 				for _, item := range slotsVal.AsDict().Keys() {
 					if item.IsAnyString() {
 						slotNames = append(slotNames, item.AsString())
 					}
 				}
-			} else if slotsVal.IsSet() {
+			case slotsVal.IsSet():
 				for _, item := range slotsVal.AsSet().Items() {
 					if item.IsAnyString() {
 						slotNames = append(slotNames, item.AsString())
 					}
 				}
-			} else if slotsVal.IsIter() {
+			case slotsVal.IsIter():
 				it := slotsVal.AsIter()
 				for {
 					item, ok := it.Next()
@@ -775,11 +777,12 @@ func NewTypeWithMeta(name string, bases []*PyType, dict *PyDict, meta *PyType) (
 			}
 
 			for _, sn := range slotNames {
-				if sn == "__dict__" {
+				switch sn {
+				case "__dict__":
 					hasDict = true
-				} else if sn == "__weakref__" {
+				case "__weakref__":
 					continue
-				} else {
+				default:
 					internedSn := InternString(sn)
 					if !seenAttr(internedSn) {
 						cleanSlots = append(cleanSlots, sn)
@@ -815,7 +818,7 @@ func NewTypeWithMeta(name string, bases []*PyType, dict *PyDict, meta *PyType) (
 		}
 
 		if hasSlots && !hasDict {
-			t.Flags |= uint32(FlagForbidDynamicAttrs)
+			t.Flags |= FlagForbidDynamicAttrs
 		}
 	}
 
@@ -824,13 +827,7 @@ func NewTypeWithMeta(name string, bases []*PyType, dict *PyDict, meta *PyType) (
 		t.Slots.TpCall = nil
 	}
 
-	isTypeSubclass := false
-	for _, b := range t.MRO {
-		if b == TypeType {
-			isTypeSubclass = true
-			break
-		}
-	}
+	isTypeSubclass := slices.Contains(t.MRO, TypeType)
 	if isTypeSubclass {
 		t.Slots.TpGetAttr = typeGetAttr
 		t.Slots.TpSetAttr = typeSetAttr
@@ -840,15 +837,7 @@ func NewTypeWithMeta(name string, bases []*PyType, dict *PyDict, meta *PyType) (
 			t.Slots.TpCall = TypeType.Slots.TpCall
 		}
 	} else {
-		isModuleSubclass := false
-		if ModuleType != nil {
-			for _, b := range t.MRO {
-				if b == ModuleType {
-					isModuleSubclass = true
-					break
-				}
-			}
-		}
+		isModuleSubclass := ModuleType != nil && slices.Contains(t.MRO, ModuleType)
 		if isModuleSubclass {
 			t.Slots.TpGetAttr = moduleGetAttr
 			t.Slots.TpSetAttr = moduleSetAttr
@@ -1370,10 +1359,10 @@ func (t *PyType) syncDunderSlots() {
 	// Reflection, attributes & lifecycle
 	if fn, owner, ok := t.LookupMRO(DunderGetAttribute); ok && owner != ObjectType && owner != ModuleType {
 		t.dunderGetAttribute = fn
-		t.Flags |= uint32(FlagCustomGetAttribute)
+		t.Flags |= FlagCustomGetAttribute
 	} else {
 		t.dunderGetAttribute = Value{}
-		t.Flags &= ^uint32(FlagCustomGetAttribute)
+		t.Flags &= ^FlagCustomGetAttribute
 	}
 	if fn, owner, ok := t.LookupMRO(DunderDelAttr); ok && owner != ObjectType && owner != TypeType && owner != ModuleType {
 		t.dunderDelAttr = fn
@@ -1480,12 +1469,7 @@ func IsSubclass(cls, base *PyType) bool {
 	if cls == nil || base == nil {
 		return false
 	}
-	for _, m := range cls.MRO {
-		if m == base {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(cls.MRO, base)
 }
 
 // IsInstance reports whether v is an instance of cls or any of its subclasses.

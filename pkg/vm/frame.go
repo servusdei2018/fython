@@ -330,11 +330,8 @@ func (vm *VM) Engine() *Engine {
 
 // Reset clears the active stack and execution frame state for reuse in Engine's sync.Pool.
 func (vm *VM) Reset() {
-	sp := vm.execCtx.SP
-	if sp > len(vm.stack) {
-		sp = len(vm.stack)
-	}
-	for i := 0; i < sp; i++ {
+	sp := min(vm.execCtx.SP, len(vm.stack))
+	for i := range sp {
 		vm.stack[i] = val.NoneVal()
 	}
 	for i := range vm.frames {

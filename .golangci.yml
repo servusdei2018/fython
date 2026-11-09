@@ -1,0 +1,27 @@
+version: "2"
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes: github.com/servusdei2018/fython
+
+linters:
+  enable:
+    - copyloopvar
+    - errcheck
+    - gocritic
+    - govet
+    - ineffassign
+    - intrange
+    - modernize
+    - nilerr
+    - perfsprint
+    - staticcheck
+    - unconvert
+    - unused
+    - usestdlibvars
+    - usetesting
+    - wastedassign

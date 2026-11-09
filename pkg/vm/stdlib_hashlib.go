@@ -228,7 +228,7 @@ func initHashlibTypes() {
 			ph := (*pyHmac)(val.AsPointer(obj))
 			switch name.AsString() {
 			case "name":
-				return val.InternString(fmt.Sprintf("hmac-%s", ph.info.name))
+				return val.InternString("hmac-" + ph.info.name)
 			case "digest_size":
 				return val.Int64Val(int64(ph.info.digestSize))
 			case "block_size":
@@ -338,12 +338,12 @@ func (e *Engine) createHashlibModule() val.Value {
 			panic("TypeError: new() takes at least 1 argument")
 		}
 		if !pa[0].IsAnyString() {
-			panic(fmt.Sprintf("TypeError: new() argument 'name' must be str, not %s", pa[0].Type().Name))
+			panic("TypeError: new() argument 'name' must be str, not " + pa[0].Type().Name)
 		}
 		norm := normalizeHashName(pa[0].AsString())
 		info, ok := supportedHashAlgorithms[norm]
 		if !ok {
-			panic(fmt.Sprintf("ValueError: unsupported hash algorithm %s", pa[0].AsString()))
+			panic("ValueError: unsupported hash algorithm " + pa[0].AsString())
 		}
 		var data []byte
 		if len(pa) > 1 && !pa[1].IsNone() {
@@ -390,20 +390,19 @@ func (e *Engine) createHashlibModule() val.Value {
 			panic("TypeError: msg must be bytes-like")
 		}
 		var algName string
-		if pa[2].IsAnyString() {
+		switch {
+		case pa[2].IsAnyString():
 			algName = pa[2].AsString()
-		} else if pa[2].IsBuiltinFunc() {
+		case pa[2].IsBuiltinFunc():
 			algName = pa[2].AsBuiltinFunc().Name
-			if strings.HasPrefix(algName, "openssl_") {
-				algName = algName[len("openssl_"):]
-			}
-		} else {
+			algName = strings.TrimPrefix(algName, "openssl_")
+		default:
 			algName = pa[2].Type().Name
 		}
 		norm := normalizeHashName(algName)
 		info, exists := supportedHashAlgorithms[norm]
 		if !exists {
-			exc := val.NewException(unsupportedDigestmodErrorType, fmt.Sprintf("Unsupported digestmod %s", algName))
+			exc := val.NewException(unsupportedDigestmodErrorType, "Unsupported digestmod "+algName)
 			panic(exc)
 		}
 		mac := hmac.New(info.constructor, key)
@@ -436,20 +435,19 @@ func (e *Engine) createHashlibModule() val.Value {
 			dmodVal = pa[2]
 		}
 		var algName string
-		if dmodVal.IsAnyString() {
+		switch {
+		case dmodVal.IsAnyString():
 			algName = dmodVal.AsString()
-		} else if dmodVal.IsBuiltinFunc() {
+		case dmodVal.IsBuiltinFunc():
 			algName = dmodVal.AsBuiltinFunc().Name
-			if strings.HasPrefix(algName, "openssl_") {
-				algName = algName[len("openssl_"):]
-			}
-		} else {
+			algName = strings.TrimPrefix(algName, "openssl_")
+		default:
 			algName = dmodVal.Type().Name
 		}
 		norm := normalizeHashName(algName)
 		info, exists := supportedHashAlgorithms[norm]
 		if !exists {
-			exc := val.NewException(unsupportedDigestmodErrorType, fmt.Sprintf("Unsupported digestmod %s", algName))
+			exc := val.NewException(unsupportedDigestmodErrorType, "Unsupported digestmod "+algName)
 			panic(exc)
 		}
 		return newHmacVal(info, key, msg)
@@ -467,7 +465,7 @@ func (e *Engine) createHashlibModule() val.Value {
 		norm := normalizeHashName(pa[0].AsString())
 		info, ok := supportedHashAlgorithms[norm]
 		if !ok {
-			panic(fmt.Sprintf("ValueError: unsupported hash algorithm %s", pa[0].AsString()))
+			panic("ValueError: unsupported hash algorithm " + pa[0].AsString())
 		}
 		password, ok := getBytesFromValue(pa[1])
 		if !ok {
@@ -523,7 +521,7 @@ func (e *Engine) createHashlibModule() val.Value {
 				mac.Reset()
 				mac.Write(u)
 				u = mac.Sum(u[:0])
-				for k := 0; k < len(block); k++ {
+				for k := range block {
 					block[k] ^= u[k]
 				}
 			}

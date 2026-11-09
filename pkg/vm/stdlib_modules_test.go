@@ -1,6 +1,9 @@
 package vm_test
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestArgparseUpstream(t *testing.T) {
 	runSnippet(t, `
@@ -216,14 +219,14 @@ assert res.testsRun == 2 and res.wasSuccessful()
 }
 
 func bigDictPairs() string {
-	s := ""
+	var sb strings.Builder
 	for i := 1; i < 300; i++ {
 		if i > 1 {
-			s += ", "
+			sb.WriteString(", ")
 		}
-		s += itoa(i) + ": " + itoa(i)
+		sb.WriteString(itoa(i) + ": " + itoa(i))
 	}
-	return s
+	return sb.String()
 }
 
 func itoa(i int) string {

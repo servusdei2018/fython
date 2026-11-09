@@ -392,11 +392,12 @@ func installParamSpecMethods() {
 		}
 		ps := asParamSpec(args[0])
 		prefix := ""
-		if ps.InferVariance {
+		switch {
+		case ps.InferVariance:
 			prefix = "~"
-		} else if ps.Covariant {
+		case ps.Covariant:
 			prefix = "+"
-		} else if ps.Contravariant {
+		case ps.Contravariant:
 			prefix = "-"
 		}
 		return val.InternString(prefix + ps.Name)
@@ -898,11 +899,12 @@ func installGenericAliasMethods() {
 		cls := pos[0]
 		origin := pos[1]
 		var items []val.Value
-		if pos[2].IsTuple() {
+		switch {
+		case pos[2].IsTuple():
 			items = pos[2].AsTuple().Items
-		} else if pos[2].IsList() {
+		case pos[2].IsList():
 			items = pos[2].AsList().Items
-		} else {
+		default:
 			items = []val.Value{pos[2]}
 		}
 		targetType := GenericAliasType

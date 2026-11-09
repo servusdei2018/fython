@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"math"
 	"math/big"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -75,7 +76,7 @@ func hexAt(s []byte, i, n int) (int, bool) {
 		return 0, false
 	}
 	v := 0
-	for k := 0; k < n; k++ {
+	for k := range n {
 		h := hexVal(s[i+k])
 		if h < 0 {
 			return 0, false
@@ -88,14 +89,7 @@ func hexAt(s []byte, i, n int) (int, bool) {
 // decodeEscapes decodes backslash escapes of a str (isBytes=false) or bytes
 // literal body.
 func decodeEscapes(s []byte, isBytes bool) []byte {
-	has := false
-	for _, c := range s {
-		if c == '\\' {
-			has = true
-			break
-		}
-	}
-	if !has {
+	if !slices.Contains(s, '\\') {
 		return s
 	}
 	out := make([]byte, 0, len(s))

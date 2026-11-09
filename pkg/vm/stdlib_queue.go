@@ -15,10 +15,9 @@ var (
 )
 
 type simpleQueueState struct {
-	mu     sync.Mutex
-	cond   *sync.Cond
-	items  []val.Value
-	closed bool
+	mu    sync.Mutex
+	cond  *sync.Cond
+	items []val.Value
 }
 
 func initQueueModule() {

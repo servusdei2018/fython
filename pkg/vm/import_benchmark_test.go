@@ -106,7 +106,7 @@ def safe_divide(a, b):
 	b.Run("CompileSource", func(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
+		for range b.N {
 			c, err := compiler.CompileSource(srcBytes)
 			if err != nil || c == nil {
 				b.Fatalf("compile failed: %v", err)
@@ -117,7 +117,7 @@ def safe_divide(a, b):
 	b.Run("FycDeserialize", func(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
+		for range b.N {
 			c, _, err := vm.DeserializeCodeObject(fycData)
 			if err != nil || c == nil {
 				b.Fatalf("deserialize failed: %v", err)

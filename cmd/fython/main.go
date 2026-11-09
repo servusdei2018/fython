@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"runtime/debug"
 
@@ -15,14 +16,13 @@ func main() {
 	if cli.IsBundledExecutable() {
 		err := cli.RunBundledExecutable()
 		if err != nil {
-			var exit *cli.ErrExit
-			if errors.As(err, &exit) {
+			if exit, ok := errors.AsType[*cli.ErrExit](err); ok {
 				if exit.Message != "" {
-					os.Stderr.WriteString(exit.Message + "\n")
+					fmt.Fprintln(os.Stderr, exit.Message)
 				}
 				os.Exit(exit.Code)
 			}
-			os.Stderr.WriteString(err.Error() + "\n")
+			fmt.Fprintln(os.Stderr, err.Error())
 			os.Exit(1)
 		}
 		os.Exit(0)
@@ -31,7 +31,7 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "build" {
 		err := cli.RunBuild(os.Args[2:])
 		if err != nil {
-			os.Stderr.WriteString(err.Error() + "\n")
+			fmt.Fprintln(os.Stderr, err.Error())
 			os.Exit(1)
 		}
 		os.Exit(0)
@@ -40,7 +40,7 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "serve" {
 		err := cli.RunServe(os.Args[2:])
 		if err != nil {
-			os.Stderr.WriteString(err.Error() + "\n")
+			fmt.Fprintln(os.Stderr, err.Error())
 			os.Exit(1)
 		}
 		os.Exit(0)
@@ -55,14 +55,13 @@ func main() {
 	parser.FatalIfErrorf(err)
 	err = c.Run()
 	if err != nil {
-		var exit *cli.ErrExit
-		if errors.As(err, &exit) {
+		if exit, ok := errors.AsType[*cli.ErrExit](err); ok {
 			if exit.Message != "" {
-				os.Stderr.WriteString(exit.Message + "\n")
+				fmt.Fprintln(os.Stderr, exit.Message)
 			}
 			os.Exit(exit.Code)
 		}
-		os.Stderr.WriteString(err.Error() + "\n")
+		fmt.Fprintln(os.Stderr, err.Error())
 		os.Exit(1)
 	}
 }

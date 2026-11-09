@@ -113,7 +113,7 @@ func BenchmarkGenericDirectCall(b *testing.B) {
 	args := []val.Value{val.Int64Val(10), val.Int64Val(20)}
 	b.ResetTimer()
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		res := fn(nil, bound, args, nil)
 		if res.AsInt64() != 30 {
 			b.Fatal("wrong result")

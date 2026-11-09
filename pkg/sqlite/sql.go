@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -25,7 +26,7 @@ func (db *DB) Execute(sql string, params []Value, named map[string]Value) (*Resu
 	upper := strings.ToUpper(trimmed)
 	if upper == "BEGIN" || upper == "BEGIN TRANSACTION" {
 		if db.inTx {
-			return nil, fmt.Errorf("OperationalError: cannot start a transaction within a transaction")
+			return nil, errors.New("OperationalError: cannot start a transaction within a transaction")
 		}
 		db.snapshot = db.cloneTables()
 		db.inTx = true
@@ -110,14 +111,15 @@ func splitStatements(script string) []string {
 				}
 			}
 		} else {
-			if ch == '\'' || ch == '"' {
+			switch ch {
+			case '\'', '"':
 				inQuote = true
 				quoteChar = ch
 				current.WriteByte(ch)
-			} else if ch == ';' {
+			case ';':
 				stmts = append(stmts, current.String())
 				current.Reset()
-			} else {
+			default:
 				current.WriteByte(ch)
 			}
 		}
@@ -222,7 +224,7 @@ func (db *DB) execCreateTable(tokens []string) (*Result, error) {
 	}
 
 	if idx >= len(tokens) {
-		return nil, fmt.Errorf("OperationalError: missing table name in CREATE TABLE")
+		return nil, errors.New("OperationalError: missing table name in CREATE TABLE")
 	}
 	tableName := cleanIdentifier(tokens[idx])
 	lowerName := strings.ToLower(tableName)
@@ -257,15 +259,16 @@ func (db *DB) execCreateTable(tokens []string) (*Result, error) {
 
 		for idx < len(tokens) && tokens[idx] != "," && tokens[idx] != ")" {
 			u := strings.ToUpper(tokens[idx])
-			if u == "PRIMARY" && idx+1 < len(tokens) && strings.ToUpper(tokens[idx+1]) == "KEY" {
+			switch {
+			case u == "PRIMARY" && idx+1 < len(tokens) && strings.ToUpper(tokens[idx+1]) == "KEY":
 				pk = true
 				idx += 2
-			} else if u == "AUTOINCREMENT" {
+			case u == "AUTOINCREMENT":
 				autoInc = true
 				idx++
-			} else if u == "NOT" && idx+1 < len(tokens) && strings.ToUpper(tokens[idx+1]) == "NULL" {
+			case u == "NOT" && idx+1 < len(tokens) && strings.ToUpper(tokens[idx+1]) == "NULL":
 				idx += 2
-			} else {
+			default:
 				cType = u
 				idx++
 			}
@@ -307,7 +310,7 @@ func (db *DB) execDropTable(tokens []string) (*Result, error) {
 		idx += 2
 	}
 	if idx >= len(tokens) {
-		return nil, fmt.Errorf("OperationalError: missing table name in DROP TABLE")
+		return nil, errors.New("OperationalError: missing table name in DROP TABLE")
 	}
 	tblName := cleanIdentifier(tokens[idx])
 	lowerName := strings.ToLower(tblName)
@@ -330,7 +333,7 @@ func (db *DB) execInsert(tokens []string, params []Value, named map[string]Value
 		idx++
 	}
 	if idx >= len(tokens) {
-		return nil, fmt.Errorf("OperationalError: near INSERT: syntax error")
+		return nil, errors.New("OperationalError: near INSERT: syntax error")
 	}
 
 	tblName := cleanIdentifier(tokens[idx])
@@ -456,7 +459,7 @@ func (db *DB) execSelect(tokens []string, params []Value, named map[string]Value
 	idx++ // skip FROM
 
 	if idx >= len(tokens) {
-		return nil, fmt.Errorf("OperationalError: missing table in FROM")
+		return nil, errors.New("OperationalError: missing table in FROM")
 	}
 	tblName := cleanIdentifier(tokens[idx])
 	lowerName := strings.ToLower(tblName)
@@ -513,7 +516,6 @@ func (db *DB) execSelect(tokens []string, params []Value, named map[string]Value
 				if n, err := strconv.Atoi(tokens[idx]); err == nil {
 					offset = n
 				}
-				idx++
 			}
 		}
 	}
@@ -621,7 +623,8 @@ func (db *DB) evalAggregates(projItems []string, tbl *Table, rows [][]Value) (*R
 		u := strings.ToUpper(item)
 		cols = append(cols, item)
 
-		if strings.HasPrefix(u, "COUNT(") {
+		switch {
+		case strings.HasPrefix(u, "COUNT("):
 			inner := strings.TrimSpace(item[6 : len(item)-1])
 			if inner == "*" {
 				outRow = append(outRow, int64(len(rows)))
@@ -639,7 +642,7 @@ func (db *DB) evalAggregates(projItems []string, tbl *Table, rows [][]Value) (*R
 					outRow = append(outRow, cnt)
 				}
 			}
-		} else if strings.HasPrefix(u, "SUM(") {
+		case strings.HasPrefix(u, "SUM("):
 			inner := cleanIdentifier(strings.TrimSpace(item[4 : len(item)-1]))
 			cIdx, found := tbl.ColIndex[strings.ToLower(inner)]
 			if !found || len(rows) == 0 {
@@ -659,7 +662,7 @@ func (db *DB) evalAggregates(projItems []string, tbl *Table, rows [][]Value) (*R
 					outRow = append(outRow, nil)
 				}
 			}
-		} else if strings.HasPrefix(u, "AVG(") {
+		case strings.HasPrefix(u, "AVG("):
 			inner := cleanIdentifier(strings.TrimSpace(item[4 : len(item)-1]))
 			cIdx, found := tbl.ColIndex[strings.ToLower(inner)]
 			if !found || len(rows) == 0 {
@@ -679,7 +682,7 @@ func (db *DB) evalAggregates(projItems []string, tbl *Table, rows [][]Value) (*R
 					outRow = append(outRow, nil)
 				}
 			}
-		} else if strings.HasPrefix(u, "MIN(") {
+		case strings.HasPrefix(u, "MIN("):
 			inner := cleanIdentifier(strings.TrimSpace(item[4 : len(item)-1]))
 			cIdx, found := tbl.ColIndex[strings.ToLower(inner)]
 			if !found || len(rows) == 0 {
@@ -693,7 +696,7 @@ func (db *DB) evalAggregates(projItems []string, tbl *Table, rows [][]Value) (*R
 				}
 				outRow = append(outRow, minVal)
 			}
-		} else if strings.HasPrefix(u, "MAX(") {
+		case strings.HasPrefix(u, "MAX("):
 			inner := cleanIdentifier(strings.TrimSpace(item[4 : len(item)-1]))
 			cIdx, found := tbl.ColIndex[strings.ToLower(inner)]
 			if !found || len(rows) == 0 {
@@ -707,7 +710,7 @@ func (db *DB) evalAggregates(projItems []string, tbl *Table, rows [][]Value) (*R
 				}
 				outRow = append(outRow, maxVal)
 			}
-		} else {
+		default:
 			outRow = append(outRow, nil)
 		}
 	}
@@ -721,7 +724,7 @@ func (db *DB) evalAggregates(projItems []string, tbl *Table, rows [][]Value) (*R
 // UPDATE table SET col1 = val1, ... [WHERE ...]
 func (db *DB) execUpdate(tokens []string, params []Value, named map[string]Value) (*Result, error) {
 	if len(tokens) < 4 {
-		return nil, fmt.Errorf("OperationalError: syntax error near UPDATE")
+		return nil, errors.New("OperationalError: syntax error near UPDATE")
 	}
 	tblName := cleanIdentifier(tokens[1])
 	lowerName := strings.ToLower(tblName)
@@ -759,7 +762,7 @@ func (db *DB) execUpdate(tokens []string, params []Value, named map[string]Value
 		}
 		idx++
 		if idx >= len(tokens) {
-			return nil, fmt.Errorf("OperationalError: syntax error near =")
+			return nil, errors.New("OperationalError: syntax error near =")
 		}
 		val, err := resolveValue(tokens[idx], params, named, &paramIdx)
 		if err != nil {
@@ -803,7 +806,7 @@ func (db *DB) execDelete(tokens []string, params []Value, named map[string]Value
 		idx++
 	}
 	if idx >= len(tokens) {
-		return nil, fmt.Errorf("OperationalError: syntax error near DELETE")
+		return nil, errors.New("OperationalError: syntax error near DELETE")
 	}
 	tblName := cleanIdentifier(tokens[idx])
 	lowerName := strings.ToLower(tblName)
@@ -851,16 +854,17 @@ func splitProjection(tokens []string) []string {
 	depth := 0
 
 	for _, t := range tokens {
-		if t == "(" {
+		switch {
+		case t == "(":
 			depth++
 			cur.WriteString(t)
-		} else if t == ")" {
+		case t == ")":
 			depth--
 			cur.WriteString(t)
-		} else if t == "," && depth == 0 {
+		case t == "," && depth == 0:
 			items = append(items, strings.TrimSpace(cur.String()))
 			cur.Reset()
-		} else {
+		default:
 			if cur.Len() > 0 && !strings.HasSuffix(cur.String(), "(") {
 				cur.WriteString(" ")
 			}
@@ -990,9 +994,10 @@ func evalWhere(tokens []string, tbl *Table, row []Value, params []Value, named m
 			result = m
 		} else {
 			op := ops[i-1]
-			if op == "AND" {
+			switch op {
+			case "AND":
 				result = result && m
-			} else if op == "OR" {
+			case "OR":
 				result = result || m
 			}
 		}
@@ -1002,7 +1007,7 @@ func evalWhere(tokens []string, tbl *Table, row []Value, params []Value, named m
 
 func evalSingleCondition(tokens []string, tbl *Table, row []Value, params []Value, named map[string]Value, paramIdx *int) (bool, error) {
 	if len(tokens) < 3 {
-		return false, fmt.Errorf("OperationalError: incomplete condition")
+		return false, errors.New("OperationalError: incomplete condition")
 	}
 
 	// Check for IS NULL / IS NOT NULL
@@ -1173,7 +1178,7 @@ func toInt64(v Value) (int64, bool) {
 
 func sortRows(rows [][]Value, colIdx int, desc bool) [][]Value {
 	sorted := append([][]Value(nil), rows...)
-	for i := 0; i < len(sorted)-1; i++ {
+	for i := range len(sorted) - 1 {
 		for j := i + 1; j < len(sorted); j++ {
 			cmp := compareValues(sorted[i][colIdx], sorted[j][colIdx])
 			if (desc && cmp < 0) || (!desc && cmp > 0) {

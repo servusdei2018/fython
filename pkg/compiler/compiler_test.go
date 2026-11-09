@@ -257,8 +257,8 @@ def fib(n):
 func BenchmarkArenaReuse500Lines(b *testing.B) {
 	// Generate a 500-line valid Python script
 	var sb strings.Builder
-	for i := 0; i < 500; i++ {
-		sb.WriteString(fmt.Sprintf("x_%d = (%d + %d) * 2\n", i, i, i+1))
+	for i := range 500 {
+		fmt.Fprintf(&sb, "x_%d = (%d + %d) * 2\n", i, i, i+1)
 	}
 	src := []byte(sb.String())
 
@@ -289,8 +289,8 @@ func BenchmarkArenaReuse500Lines(b *testing.B) {
 
 func BenchmarkFullCompile500Lines(b *testing.B) {
 	var sb strings.Builder
-	for i := 0; i < 500; i++ {
-		sb.WriteString(fmt.Sprintf("x_%d = (%d + %d) * 2\n", i, i, i+1))
+	for i := range 500 {
+		fmt.Fprintf(&sb, "x_%d = (%d + %d) * 2\n", i, i, i+1)
 	}
 	src := []byte(sb.String())
 	arena := NewASTArena(4096)
@@ -569,7 +569,7 @@ for x in my_range(5):
 	if len(items) != 5 {
 		t.Fatalf("len(items) = %d, want 5", len(items))
 	}
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		if items[i].AsInt64() != int64(i) {
 			t.Fatalf("items[%d] = %v, want %d", i, items[i], i)
 		}

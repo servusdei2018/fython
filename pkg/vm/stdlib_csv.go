@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -165,13 +166,13 @@ func resolveDialect(v val.Value, kw map[string]val.Value) (*csvDialect, error) {
 	}
 
 	if len(d.delimiter) != 1 {
-		return nil, fmt.Errorf("delimiter must be a 1-character string")
+		return nil, errors.New("delimiter must be a 1-character string")
 	}
 	if len(d.quotechar) > 1 {
-		return nil, fmt.Errorf("quotechar must be set to a 1-character string")
+		return nil, errors.New("quotechar must be set to a 1-character string")
 	}
 	if len(d.escapechar) > 1 {
-		return nil, fmt.Errorf("escapechar must be set to a 1-character string")
+		return nil, errors.New("escapechar must be set to a 1-character string")
 	}
 	return d, nil
 }
@@ -224,11 +225,12 @@ func initCsvTypes() {
 			var parts []string
 			for _, item := range items {
 				var s string
-				if item.IsAnyString() {
+				switch {
+				case item.IsAnyString():
 					s = item.AsString()
-				} else if item.IsNone() {
+				case item.IsNone():
 					s = ""
-				} else {
+				default:
 					s = item.String()
 				}
 

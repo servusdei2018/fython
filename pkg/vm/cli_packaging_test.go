@@ -24,7 +24,7 @@ var (
 func buildFythonBinary(t *testing.T) string {
 	t.Helper()
 	builtFythonOnce.Do(func() {
-		tmpDir, err := os.MkdirTemp("", "fython-cli-bin-*")
+		tmpDir, err := os.MkdirTemp("", "fython-cli-bin-*") //nolint:usetesting // binary must outlive a single test; sync.Once shares it across tests, so t.TempDir cleanup would delete it too early
 		if err != nil {
 			builtFythonErr = err
 			return

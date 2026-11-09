@@ -2,7 +2,9 @@ package pyast
 
 import (
 	"fmt"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -49,10 +51,7 @@ func NewSource(src []byte) *Source {
 
 // Pos converts a byte offset to a 1-based line and 0-based byte column.
 func (s *Source) Pos(off int) (line, col int) {
-	i := sort.Search(len(s.lines), func(i int) bool { return s.lines[i] > off }) - 1
-	if i < 0 {
-		i = 0
-	}
+	i := max(0, sort.Search(len(s.lines), func(i int) bool { return s.lines[i] > off })-1)
 	return i + 1, off - s.lines[i]
 }
 
@@ -181,13 +180,13 @@ func (l *Lexer) Next() Token {
 			return l.eof()
 		}
 		c := src[l.pos]
-		switch {
-		case c == '#':
+		switch c {
+		case '#':
 			for l.pos < len(src) && src[l.pos] != '\n' && src[l.pos] != '\r' {
 				l.pos++
 			}
 			continue
-		case c == '\n' || c == '\r':
+		case '\n', '\r':
 			start := l.pos
 			l.pos++
 			if c == '\r' && l.pos < len(src) && src[l.pos] == '\n' {
@@ -340,9 +339,7 @@ func (l *Lexer) lineStart() (Token, bool) {
 			l.pos = p
 			continue
 		case '\\':
-			if p+1 < len(src) && (src[p+1] == '\n' || src[p+1] == '\r') {
-				// a continuation line right at BOL: treat as ordinary indentation start
-			}
+			// a continuation line right at BOL: treat as ordinary indentation start
 		}
 		start := l.pos
 		l.pos = p
@@ -375,18 +372,14 @@ func (l *Lexer) opLen() int {
 	src := l.S.Src[l.pos:]
 	if len(src) >= 3 {
 		s := string(src[:3])
-		for _, o := range ops3 {
-			if s == o {
-				return 3
-			}
+		if slices.Contains(ops3, s) {
+			return 3
 		}
 	}
 	if len(src) >= 2 {
 		s := string(src[:2])
-		for _, o := range ops2 {
-			if s == o {
-				return 2
-			}
+		if slices.Contains(ops2, s) {
+			return 2
 		}
 	}
 	switch src[0] {
@@ -513,7 +506,7 @@ func (l *Lexer) lineOf(off int) int {
 	return ln
 }
 
-func itoa(i int) string { return fmt.Sprint(i) }
+func itoa(i int) string { return strconv.Itoa(i) }
 
 func (l *Lexer) scanFString(pstart, p int, quote byte, triple, raw bool) int {
 	src := l.S.Src

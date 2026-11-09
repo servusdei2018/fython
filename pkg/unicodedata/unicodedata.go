@@ -45,7 +45,7 @@ func gunzipLines(b []byte, fn func(line string)) {
 	if err != nil {
 		return
 	}
-	defer zr.Close()
+	defer func() { _ = zr.Close() }()
 	sc := bufio.NewScanner(zr)
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 	for sc.Scan() {
@@ -62,15 +62,14 @@ func load() {
 			if alias {
 				line = line[1:]
 			}
-			tab := strings.IndexByte(line, '\t')
-			if tab < 0 {
+			hexCP, name, ok := strings.Cut(line, "\t")
+			if !ok {
 				return
 			}
-			cp, err := strconv.ParseUint(line[:tab], 16, 32)
+			cp, err := strconv.ParseUint(hexCP, 16, 32)
 			if err != nil {
 				return
 			}
-			name := line[tab+1:]
 			byName[name] = rune(cp)
 			if !alias {
 				byRune[rune(cp)] = name
@@ -79,16 +78,16 @@ func load() {
 		decomp = make(map[rune]decomposition, 1200)
 		compose = make(map[[2]rune]rune, 1000)
 		gunzipLines(decompGz, func(line string) {
-			tab := strings.IndexByte(line, '\t')
-			if tab < 0 {
+			hexCP, rest, ok := strings.Cut(line, "\t")
+			if !ok {
 				return
 			}
-			cp, err := strconv.ParseUint(line[:tab], 16, 32)
+			cp, err := strconv.ParseUint(hexCP, 16, 32)
 			if err != nil {
 				return
 			}
 			var d decomposition
-			for _, f := range strings.Fields(line[tab+1:]) {
+			for f := range strings.FieldsSeq(rest) {
 				if strings.HasPrefix(f, "<") {
 					d.compat = true
 					continue
@@ -169,7 +168,7 @@ func Lookup(name string) (rune, bool) {
 		}
 	}
 	if rest, ok := strings.CutPrefix(name, hangulPrefix); ok {
-		for s := 0; s < sCount; s++ {
+		for s := range sCount {
 			if jamoL[s/nCount]+jamoV[(s%nCount)/tCount]+jamoT[s%tCount] == rest {
 				return rune(sBase + s), true
 			}

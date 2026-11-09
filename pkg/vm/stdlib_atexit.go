@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"slices"
 	"sync"
 
 	"github.com/servusdei2018/fython/pkg/val"
@@ -69,8 +70,7 @@ func (e *Engine) createAtexitModule() val.Value {
 		globalAtexit.mu.Unlock()
 
 		// Run in LIFO order
-		for i := len(cbs) - 1; i >= 0; i-- {
-			cb := cbs[i]
+		for _, cb := range slices.Backward(cbs) {
 			if tpCall := cb.fn.Type().Slots.TpCall; tpCall != nil {
 				tpCall(ctx, cb.fn, cb.args, cb.kwnames)
 			}

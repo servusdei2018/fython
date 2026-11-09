@@ -325,7 +325,7 @@ got = build("CacheInfo", ("hits", "misses", "maxsize", "currsize"))
 want = "lambda _cls, hits, misses, maxsize, currsize: _tuple_new(_cls, (hits, misses, maxsize, currsize))"
 assert got == want, got
 `
-	for i := 0; i < 40; i++ {
+	for range 40 {
 		runSnippet(t, code)
 	}
 }

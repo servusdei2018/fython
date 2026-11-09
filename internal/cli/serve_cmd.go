@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/alecthomas/kong"
+
 	"github.com/servusdei2018/fython/pkg/server"
 )
 

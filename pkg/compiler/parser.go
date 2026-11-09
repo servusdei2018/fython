@@ -2,6 +2,7 @@ package compiler
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"math/big"
 	"strconv"
@@ -429,7 +430,7 @@ func (p *Parser) parseFuncDefFull(isAsync bool, startPos uint32, decorators Expr
 	}
 
 	// Optional return annotation: -> Ret
-	var returnType ExprID = ExprNone
+	returnType := ExprNone
 	if p.match(TOKEN_ARROW) {
 		returnType, err = p.parseTernary()
 		if err != nil {
@@ -504,7 +505,8 @@ func (p *Parser) parseClassDefFull(startPos uint32, decorators ExprSlice) (StmtI
 	if p.match(TOKEN_LPAREN) {
 		for p.cur.Type != TOKEN_RPAREN && p.cur.Type != TOKEN_EOF {
 			// Check for keyword arg: name = expr
-			if isIdentToken(p.cur.Type) && p.peek().Type == TOKEN_ASSIGN {
+			switch {
+			case isIdentToken(p.cur.Type) && p.peek().Type == TOKEN_ASSIGN:
 				kwTok, err := p.expectIdent()
 				if err != nil {
 					return StmtNone, err
@@ -518,7 +520,7 @@ func (p *Parser) parseClassDefFull(startPos uint32, decorators ExprSlice) (StmtI
 				keywords = append(keywords, kwVal)
 				kwNames = append(kwNames, kwName)
 				kwArgs = append(kwArgs, kwVal)
-			} else if p.cur.Type == TOKEN_STARSTAR {
+			case p.cur.Type == TOKEN_STARSTAR:
 				p.advance() // **
 				kwVal, err := p.parseTernary()
 				if err != nil {
@@ -527,7 +529,7 @@ func (p *Parser) parseClassDefFull(startPos uint32, decorators ExprSlice) (StmtI
 				keywords = append(keywords, kwVal)
 				kwNames = append(kwNames, "") // empty name indicates **unpack
 				kwArgs = append(kwArgs, kwVal)
-			} else if p.cur.Type == TOKEN_STAR {
+			case p.cur.Type == TOKEN_STAR:
 				startTok := p.cur
 				p.advance() // *
 				starVal, err := p.parseTernary()
@@ -540,7 +542,7 @@ func (p *Parser) parseClassDefFull(startPos uint32, decorators ExprSlice) (StmtI
 					Start: startTok.Start,
 				})
 				bases = append(bases, starredExpr)
-			} else {
+			default:
 				baseExpr, err := p.parseTernary()
 				if err != nil {
 					return StmtNone, err
@@ -864,7 +866,7 @@ func (p *Parser) parseTryStmt() (StmtID, error) {
 	}
 
 	if len(handlers) == 0 && finBody == 0 {
-		return StmtNone, fmt.Errorf("SyntaxError: expected 'except' or 'finally' block")
+		return StmtNone, errors.New("SyntaxError: expected 'except' or 'finally' block")
 	}
 
 	exceptSlice := p.arena.AddExceptSlice(handlers)
@@ -922,10 +924,7 @@ func (p *Parser) parseRaiseStmt() (StmtID, error) {
 func (p *Parser) parseWithItems() ([]ASTWithItem, error) {
 	grouped := p.match(TOKEN_LPAREN)
 	var items []ASTWithItem
-	for {
-		if grouped && p.cur.Type == TOKEN_RPAREN {
-			break
-		}
+	for !grouped || p.cur.Type != TOKEN_RPAREN {
 		// Commas separate with-items, so the expression and target must not
 		// swallow a following item the way parseExpr's tuple rule would.
 		expr, err := p.parseWalrus()
@@ -1059,16 +1058,18 @@ func (p *Parser) parseDottedName() (string, uint32, uint32, error) {
 	}
 	start := tok.Start
 	end := tok.End
-	name := p.tokenText(tok)
+	var b strings.Builder
+	b.WriteString(p.tokenText(tok))
 	for p.match(TOKEN_DOT) {
 		nextTok, err := p.expectIdent()
 		if err != nil {
 			return "", 0, 0, err
 		}
 		end = nextTok.End
-		name += "." + p.tokenText(nextTok)
+		b.WriteByte('.')
+		b.WriteString(p.tokenText(nextTok))
 	}
-	return name, start, end, nil
+	return b.String(), start, end, nil
 }
 
 func (p *Parser) parseImportStmt(isLazyOpt ...bool) (StmtID, error) {
@@ -1224,7 +1225,7 @@ func (p *Parser) parseSimpleStmt() (StmtID, error) {
 		if err != nil {
 			return StmtNone, err
 		}
-		var val ExprID = ExprNone
+		val := ExprNone
 		if p.match(TOKEN_ASSIGN) {
 			val, err = p.parseExpr()
 			if err != nil {
@@ -1400,7 +1401,7 @@ func (p *Parser) parseMatchStmt() (StmtID, error) {
 		if err != nil {
 			return StmtNone, err
 		}
-		var guard ExprID = ExprNone
+		guard := ExprNone
 		if p.match(TOKEN_IF) {
 			guard, err = p.parseTernary()
 			if err != nil {
@@ -1697,7 +1698,7 @@ func (p *Parser) parseClassPattern(clsExpr ExprID) (PatternID, error) {
 		Kind:    PatternKindClass,
 		Expr1:   clsExpr,
 		Extra:   posSlice.Start,
-		Expr2:   ExprID((uint32(posSlice.Count) << 16) | uint32(kwSlice.Count)),
+		Expr2:   ExprID((posSlice.Count << 16) | kwSlice.Count),
 		Name:    "",
 		StarIdx: int32(kwIdentSlice.Start),
 	}), nil
@@ -1767,18 +1768,19 @@ func (p *Parser) parseTypeParams() ([]ASTTypeParam, error) {
 	var tps []ASTTypeParam
 	for p.cur.Type != TOKEN_RBRACKET && p.cur.Type != TOKEN_EOF {
 		var kind TypeParamKind
-		if p.match(TOKEN_STARSTAR) {
+		switch {
+		case p.match(TOKEN_STARSTAR):
 			kind = TypeParamParamSpec
-		} else if p.match(TOKEN_STAR) {
+		case p.match(TOKEN_STAR):
 			kind = TypeParamTypeVarTuple
-		} else {
+		default:
 			kind = TypeParamTypeVar
 		}
 		nameTok, err := p.expectIdent()
 		if err != nil {
 			return nil, err
 		}
-		var bound ExprID = ExprNone
+		bound := ExprNone
 		if kind == TypeParamTypeVar && p.match(TOKEN_COLON) {
 			bound, err = p.parseTernary()
 			if err != nil {
@@ -1806,7 +1808,7 @@ func (p *Parser) parseAssertStmt() (StmtID, error) {
 	if err != nil {
 		return StmtNone, err
 	}
-	var msg ExprID = ExprNone
+	msg := ExprNone
 	if p.match(TOKEN_COMMA) {
 		msg, err = p.parseTernary()
 		if err != nil {
@@ -1865,7 +1867,8 @@ func (p *Parser) parseInterpolated(template bool) (ExprID, error) {
 	defer func() { p.interpRaw = prevRaw }()
 	var pieces []ExprID
 	for p.cur.Type != TOKEN_FSTRING_END && p.cur.Type != TOKEN_EOF {
-		if p.cur.Type == TOKEN_FSTRING_MIDDLE {
+		switch {
+		case p.cur.Type == TOKEN_FSTRING_MIDDLE:
 			midTok := p.advance()
 			pieces = append(pieces, p.arena.AllocExpr(ASTExpr{
 				Kind:  ExprKindString,
@@ -1873,16 +1876,17 @@ func (p *Parser) parseInterpolated(template bool) (ExprID, error) {
 				Start: midTok.Start,
 				End:   midTok.End,
 			}))
-		} else if p.match(TOKEN_LBRACE) {
+		case p.match(TOKEN_LBRACE):
 			fv, err := p.parseFormattedValue(template)
 			if err != nil {
 				return ExprNone, err
 			}
 			pieces = append(pieces, fv)
-		} else {
-			break
+		default:
+			goto donePieces
 		}
 	}
+donePieces:
 	if _, err := p.expect(TOKEN_FSTRING_END); err != nil {
 		return ExprNone, err
 	}
@@ -1932,7 +1936,7 @@ func (p *Parser) parseFormattedValue(template bool) (ExprID, error) {
 	if template && debugText != "" && conversion == 0 {
 		conversion = 'r'
 	}
-	var formatSpec ExprID = ExprNone
+	formatSpec := ExprNone
 	if p.match(TOKEN_COLON) {
 		formatSpec, err = p.parseFormatSpec(template)
 		if err != nil {
@@ -2024,18 +2028,19 @@ func (p *Parser) parseLambda() (ExprID, error) {
 	var defaults []ExprID
 	if p.cur.Type != TOKEN_COLON {
 		for p.cur.Type != TOKEN_COLON && p.cur.Type != TOKEN_EOF {
-			if p.match(TOKEN_STARSTAR) {
+			switch {
+			case p.match(TOKEN_STARSTAR):
 				pTok, err := p.expectIdent()
 				if err != nil {
 					return ExprNone, err
 				}
 				paramNames = append(paramNames, "**"+p.tokenText(pTok))
-			} else if p.match(TOKEN_STAR) {
+			case p.match(TOKEN_STAR):
 				if isIdentToken(p.cur.Type) {
 					pTok, _ := p.expectIdent()
 					paramNames = append(paramNames, "*"+p.tokenText(pTok))
 				}
-			} else {
+			default:
 				pTok, err := p.expectIdent()
 				if err != nil {
 					return ExprNone, err
@@ -2579,14 +2584,15 @@ func (p *Parser) parsePrimary() (ExprID, error) {
 			var kwArgs []ExprID
 
 			for p.cur.Type != TOKEN_RPAREN && p.cur.Type != TOKEN_EOF {
-				if p.match(TOKEN_STARSTAR) {
+				switch {
+				case p.match(TOKEN_STARSTAR):
 					kwVal, err := p.parseTernary()
 					if err != nil {
 						return ExprNone, err
 					}
 					kwNames = append(kwNames, "") // "" indicates **kwargs
 					kwArgs = append(kwArgs, kwVal)
-				} else if p.match(TOKEN_STAR) {
+				case p.match(TOKEN_STAR):
 					arg, err := p.parseTernary()
 					if err != nil {
 						return ExprNone, err
@@ -2596,7 +2602,7 @@ func (p *Parser) parsePrimary() (ExprID, error) {
 						Left: arg,
 					})
 					posArgs = append(posArgs, starred)
-				} else if isIdentToken(p.cur.Type) && p.peek().Type == TOKEN_ASSIGN {
+				case isIdentToken(p.cur.Type) && p.peek().Type == TOKEN_ASSIGN:
 					nameTok, _ := p.expectIdent()
 					p.advance() // =
 					kwVal, err := p.parseTernary()
@@ -2605,7 +2611,7 @@ func (p *Parser) parsePrimary() (ExprID, error) {
 					}
 					kwNames = append(kwNames, p.tokenText(nameTok))
 					kwArgs = append(kwArgs, kwVal)
-				} else {
+				default:
 					arg, err := p.parseWalrus()
 					if err != nil {
 						return ExprNone, err

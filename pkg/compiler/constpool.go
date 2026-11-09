@@ -78,7 +78,7 @@ func exactTypeAndValueEqual(a, b val.Value) bool {
 		if len(ta) != len(tb) {
 			return false
 		}
-		for i := 0; i < len(ta); i++ {
+		for i := range ta {
 			if !exactTypeAndValueEqual(ta[i], tb[i]) {
 				return false
 			}

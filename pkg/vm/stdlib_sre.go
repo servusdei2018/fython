@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -224,7 +225,7 @@ func newPatternError(msg string, pattern val.Value, pos int) val.Value {
 			pos = len(text)
 		}
 		lineno, last := 1, -1
-		for i := 0; i < pos; i++ {
+		for i := range pos {
 			if text[i] == '\n' {
 				lineno++
 				last = i
@@ -232,11 +233,8 @@ func newPatternError(msg string, pattern val.Value, pos int) val.Value {
 		}
 		colno := pos - last
 		linenoV, colnoV = val.Int64Val(int64(lineno)), val.Int64Val(int64(colno))
-		for _, r := range text {
-			if r == '\n' {
-				full += " (line " + strconv.Itoa(lineno) + ", column " + strconv.Itoa(colno) + ")"
-				break
-			}
+		if slices.Contains(text, '\n') {
+			full += " (line " + strconv.Itoa(lineno) + ", column " + strconv.Itoa(colno) + ")"
 		}
 	}
 	inst.SetAttr(val.InternString("args"), val.NewTupleVal(val.NewStringVal(full)))
@@ -483,9 +481,7 @@ func (p *pyPattern) split(ctx *val.ExecContext, strVal, maxV val.Value) val.Valu
 func (p *pyPattern) sub(ctx *val.ExecContext, patVal, repl, strVal, countV val.Value) (val.Value, int64) {
 	in := p.subject(strVal)
 	count := intArg(ctx, countV, 0)
-	if count < 0 {
-		count = 0
-	}
+	count = max(count, 0)
 	var tmpl *sre.Template
 	var literal []rune
 	isLiteral := false
@@ -580,12 +576,7 @@ func (p *pyPattern) valueRunes(v val.Value) []rune {
 }
 
 func containsRune(rs []rune, r rune) bool {
-	for _, c := range rs {
-		if c == r {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(rs, r)
 }
 
 func (sc *pyScanner) step(ctx *val.ExecContext, mode sre.Mode) val.Value {
@@ -822,7 +813,6 @@ func initSRETypes() {
 			name string
 			mode sre.Mode
 		}{{"match", sre.ModeMatch}, {"prefixmatch", sre.ModeMatch}, {"fullmatch", sre.ModeFullMatch}, {"search", sre.ModeSearch}} {
-			spec := spec
 			method(PatternType, spec.name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 				p := asPattern(args[0])
 				b := bindArgs(spec.name, args[1:], kwnames, "string", "pos", "endpos")
@@ -1027,7 +1017,6 @@ func (e *Engine) createReModule() val.Value {
 		name string
 		mode sre.Mode
 	}{{"match", sre.ModeMatch}, {"prefixmatch", sre.ModeMatch}, {"fullmatch", sre.ModeFullMatch}, {"search", sre.ModeSearch}} {
-		spec := spec
 		fn(spec.name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			b := bindArgs(spec.name, args, kwnames, "pattern", "string", "flags")
 			pv, p := pat(ctx, required(spec.name, b[0], "pattern"), b[2])

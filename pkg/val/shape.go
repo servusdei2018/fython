@@ -7,7 +7,7 @@ import (
 )
 
 var (
-	nextShapeID     uint32
+	nextShapeID     atomic.Uint32
 	isMultiThreaded atomic.Bool
 )
 
@@ -22,7 +22,7 @@ func IsMultiThreaded() bool {
 }
 
 func allocShapeID() uint32 {
-	return atomic.AddUint32(&nextShapeID, 1)
+	return nextShapeID.Add(1)
 }
 
 // ShapeAttr maps an interned attribute name Value to its flat slot index in PyInstance.Slots.
@@ -179,10 +179,7 @@ func NewInstanceVal(shape *Shape) Value {
 		shape = defaultRootShape
 	}
 	n := len(shape.Attrs)
-	slotCap := 8
-	if n > slotCap {
-		slotCap = n
-	}
+	slotCap := max(8, n)
 	obj := &PyInstance{
 		Header: ObjectHeader{Kind: KindInstance, Type: ObjectType},
 		Shape:  shape,
@@ -208,10 +205,7 @@ func NewInstanceOfType(cls *PyType) Value {
 		shape = defaultRootShape
 	}
 	n := len(shape.Attrs)
-	slotCap := 8
-	if n > slotCap {
-		slotCap = n
-	}
+	slotCap := max(8, n)
 	obj := &PyInstance{
 		Header: ObjectHeader{Kind: KindInstance, Type: cls},
 		Shape:  shape,
@@ -322,7 +316,7 @@ func (inst *PyInstance) SetAttr(name, value Value) int {
 		}
 		return idx
 	}
-	if inst.Header.Type != nil && (inst.Header.Type.Flags&uint32(FlagForbidDynamicAttrs)) != 0 {
+	if inst.Header.Type != nil && (inst.Header.Type.Flags&FlagForbidDynamicAttrs) != 0 {
 		if BaseExceptionType != nil && IsSubclass(inst.Header.Type, BaseExceptionType) {
 			switch name.AsString() {
 			case "__traceback__", "__cause__", "__context__", "__suppress_context__":

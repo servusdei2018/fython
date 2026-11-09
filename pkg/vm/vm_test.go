@@ -191,7 +191,7 @@ func BenchmarkVMLoop100M(b *testing.B) {
 	start := time.Now()
 	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		res := v.Run(code, consts, 1)
 		if !res.IsInt64() || res.AsInt64() != limit {
 			b.Fatalf("res = %v, want %d", res.AsInt64(), limit)
@@ -932,7 +932,7 @@ func BenchmarkTryBlockHappyPath(b *testing.B) {
 	b.Run("WithoutTry", func(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
+		for range b.N {
 			res := v.RunCode(coNoTry)
 			if !res.IsInt64() || res.AsInt64() != 1000 {
 				b.Fatalf("res = %v, want 1000", res)
@@ -943,7 +943,7 @@ func BenchmarkTryBlockHappyPath(b *testing.B) {
 	b.Run("WithTryHappyPath", func(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
+		for range b.N {
 			res := v.RunCode(coWithTry)
 			if !res.IsInt64() || res.AsInt64() != 1000 {
 				b.Fatalf("res = %v, want 1000", res)
@@ -986,7 +986,7 @@ func BenchmarkForLoopRangeAndList(b *testing.B) {
 
 	// 2. Preallocated list of 100_000 integers:
 	listItems := make([]val.Value, 100_000)
-	for i := 0; i < 100_000; i++ {
+	for i := range 100_000 {
 		listItems[i] = val.Int64Val(int64(i))
 	}
 	preallocList := val.NewListVal(listItems...)
@@ -1020,7 +1020,7 @@ func BenchmarkForLoopRangeAndList(b *testing.B) {
 	b.Run("Range_100k", func(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
+		for range b.N {
 			res := v.RunCode(coRange)
 			if !res.IsInt64() || res.AsInt64() != 4999950000 {
 				b.Fatalf("res = %v, want 4999950000", res)
@@ -1031,7 +1031,7 @@ func BenchmarkForLoopRangeAndList(b *testing.B) {
 	b.Run("PreallocatedList_100k", func(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
+		for range b.N {
 			res := v.RunCode(coList)
 			if !res.IsInt64() || res.AsInt64() != 4999950000 {
 				b.Fatalf("res = %v, want 4999950000", res)
@@ -1263,16 +1263,14 @@ func TestConcurrentTier2Execution(t *testing.T) {
 	co := &CodeObject{Code: code, Consts: consts, NumLocals: 1}
 
 	var wg sync.WaitGroup
-	for i := 0; i < 8; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 8 {
+		wg.Go(func() {
 			vm := NewVM()
 			res := vm.RunCode(co)
 			if !res.IsInt64() || res.AsInt64() != limit {
 				panic("concurrent run mismatch")
 			}
-		}()
+		})
 	}
 	wg.Wait()
 }

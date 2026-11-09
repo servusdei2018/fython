@@ -42,11 +42,12 @@ func Unbox[T any](v val.Value) T {
 	case string:
 		return any(v.AsString()).(T)
 	case []byte:
-		if v.IsBytes() {
+		switch {
+		case v.IsBytes():
 			return any(v.AsBytes().Data).(T)
-		} else if v.IsByteArray() {
+		case v.IsByteArray():
 			return any(v.AsByteArray().Data).(T)
-		} else if v.IsMemoryView() {
+		case v.IsMemoryView():
 			return any(v.AsMemoryView().Buf).(T)
 		}
 		s := v.AsString()
@@ -559,7 +560,7 @@ func (sb *StructBinding[T]) RegisterMethod1R(name string, fn any) {
 			return val.NewStringVal(f(self, args[1].AsString()))
 		}))
 	default:
-		panic(fmt.Sprintf("RegisterMethod1R: unsupported signature for %s", name))
+		panic("RegisterMethod1R: unsupported signature for " + name)
 	}
 }
 
@@ -582,7 +583,7 @@ func (sb *StructBinding[T]) RegisterMethod2R(name string, fn any) {
 			return val.Int64Val(f(self, args[1].AsInt64(), args[2].AsInt64()))
 		}))
 	default:
-		panic(fmt.Sprintf("RegisterMethod2R: unsupported signature for %s", name))
+		panic("RegisterMethod2R: unsupported signature for " + name)
 	}
 }
 

@@ -25,10 +25,10 @@ func TestConcurrentDictOperations(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(numGoroutines)
 
-	for g := 0; g < numGoroutines; g++ {
+	for g := range numGoroutines {
 		go func(gid int) {
 			defer wg.Done()
-			for i := 0; i < opsPerGoroutine; i++ {
+			for i := range opsPerGoroutine {
 				key := val.Int64Val(int64((gid * 1000) + (i % 50)))
 				v := val.Int64Val(int64(i))
 				d.Set(key, v)
@@ -61,10 +61,10 @@ func TestConcurrentListOperations(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(numGoroutines)
 
-	for g := 0; g < numGoroutines; g++ {
+	for g := range numGoroutines {
 		go func(gid int) {
 			defer wg.Done()
-			for i := 0; i < opsPerGoroutine; i++ {
+			for i := range opsPerGoroutine {
 				l.Append(val.Int64Val(int64(gid*1000 + i)))
 				_ = l.Len()
 				_, _ = l.Get(0)
@@ -91,10 +91,10 @@ func TestConcurrentInstanceShapes(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(numGoroutines)
 
-	for g := 0; g < numGoroutines; g++ {
+	for g := range numGoroutines {
 		go func(gid int) {
 			defer wg.Done()
-			for i := 0; i < numInstances; i++ {
+			for i := range numInstances {
 				instVal := val.NewInstanceVal(root)
 				inst := instVal.AsInstance()
 
@@ -124,10 +124,10 @@ func TestConcurrentInterning(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(numGoroutines)
 
-	for g := 0; g < numGoroutines; g++ {
+	for g := range numGoroutines {
 		go func(gid int) {
 			defer wg.Done()
-			for i := 0; i < iters; i++ {
+			for i := range iters {
 				sShared := fmt.Sprintf("shared_ident_%d", i%10)
 				vShared := pool.Intern(sShared)
 				if !vShared.IsAnyString() || vShared.AsString() != sShared {
@@ -156,10 +156,10 @@ func TestConcurrentClosures(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(numGoroutines)
 
-	for g := 0; g < numGoroutines; g++ {
+	for g := range numGoroutines {
 		go func(gid int) {
 			defer wg.Done()
-			for i := 0; i < iters; i++ {
+			for i := range iters {
 				cell.Set(val.Int64Val(int64(gid*1000 + i)))
 				_ = cell.Get()
 			}
@@ -205,12 +205,12 @@ for _ in range(8):
 
 	// Verify all expected results (0, 10, 20, 30, 40, 50, 60, 70) were received
 	seen := make(map[int64]bool)
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		item, _ := resList.Get(i)
 		seen[item.AsInt64()] = true
 	}
 
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		expected := int64(i * 10)
 		if !seen[expected] {
 			t.Errorf("missing expected result: %d", expected)
@@ -253,7 +253,7 @@ for msg in ch:
 		t.Fatalf("expected 5 collected items, got %d", collected.Len())
 	}
 
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		item, _ := collected.Get(i)
 		if item.AsInt64() != int64(i) {
 			t.Errorf("collected[%d] = %v, want %d", i, item.AsInt64(), i)

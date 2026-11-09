@@ -213,7 +213,7 @@ func unmarshalValue(r *bytes.Reader) (val.Value, error) {
 		}
 		length := int(binary.LittleEndian.Uint32(lenBuf[:]))
 		items := make([]val.Value, length)
-		for i := 0; i < length; i++ {
+		for i := range length {
 			v, err := unmarshalValue(r)
 			if err != nil {
 				return val.NoneVal(), err
@@ -228,7 +228,7 @@ func unmarshalValue(r *bytes.Reader) (val.Value, error) {
 		}
 		length := int(binary.LittleEndian.Uint32(lenBuf[:]))
 		items := make([]val.Value, length)
-		for i := 0; i < length; i++ {
+		for i := range length {
 			v, err := unmarshalValue(r)
 			if err != nil {
 				return val.NoneVal(), err
@@ -294,7 +294,7 @@ func unmarshalValue(r *bytes.Reader) (val.Value, error) {
 		}
 		codeLen := int(binary.LittleEndian.Uint32(lenBuf[:]))
 		code := make([]uint32, codeLen)
-		for i := 0; i < codeLen; i++ {
+		for i := range codeLen {
 			if _, err := r.Read(lenBuf[:]); err != nil {
 				return val.NoneVal(), err
 			}
@@ -306,7 +306,7 @@ func unmarshalValue(r *bytes.Reader) (val.Value, error) {
 		}
 		constsLen := int(binary.LittleEndian.Uint32(lenBuf[:]))
 		consts := make([]val.Value, constsLen)
-		for i := 0; i < constsLen; i++ {
+		for i := range constsLen {
 			c, err := unmarshalValue(r)
 			if err != nil {
 				return val.NoneVal(), err
@@ -353,11 +353,12 @@ func (e *Engine) createMarshalModule() val.Value {
 			panic("TypeError: loads() takes at least 1 argument")
 		}
 		var b []byte
-		if args[0].IsBytes() {
+		switch {
+		case args[0].IsBytes():
 			b = args[0].AsBytes().Data
-		} else if args[0].IsByteArray() {
+		case args[0].IsByteArray():
 			b = args[0].AsByteArray().Data
-		} else {
+		default:
 			panic("TypeError: a bytes-like object is required")
 		}
 		r := bytes.NewReader(b)
@@ -395,11 +396,12 @@ func (e *Engine) createMarshalModule() val.Value {
 		}
 		content := ctx.Invoke0(readMeth)
 		var b []byte
-		if content.IsBytes() {
+		switch {
+		case content.IsBytes():
 			b = content.AsBytes().Data
-		} else if content.IsByteArray() {
+		case content.IsByteArray():
 			b = content.AsByteArray().Data
-		} else {
+		default:
 			panic("TypeError: a bytes-like object is required")
 		}
 		r := bytes.NewReader(b)

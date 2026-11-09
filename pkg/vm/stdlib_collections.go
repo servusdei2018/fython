@@ -84,7 +84,7 @@ func (d *pyDeque) rotate(n int) {
 	if l <= 1 {
 		return
 	}
-	n = n % l
+	n %= l
 	if n < 0 {
 		n += l
 	}

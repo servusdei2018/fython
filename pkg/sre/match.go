@@ -205,7 +205,7 @@ func (m *matcher) backtrack(base int) (pc, pos int, ok bool) {
 			floor := e.a
 			next := &m.prog[e.pc]
 			for cur >= floor {
-				if next.op == opChar && !(cur < m.end && m.in[cur] == next.r) {
+				if next.op == opChar && (cur >= m.end || m.in[cur] != next.r) {
 					cur--
 					continue
 				}
@@ -331,14 +331,14 @@ func (m *matcher) run(pc, pos int) (int, bool) {
 			}
 			if in.sub == opCharFold {
 				ascii := in.flags&flAscii != 0
-				for i := 0; i < e-s; i++ {
+				for i := range e - s {
 					if canon(m.in[s+i], ascii) != canon(m.in[pos+i], ascii) {
 						ok = false
 						break
 					}
 				}
 			} else {
-				for i := 0; i < e-s; i++ {
+				for i := range e - s {
 					if m.in[s+i] != m.in[pos+i] {
 						ok = false
 						break
@@ -375,16 +375,17 @@ func (m *matcher) run(pc, pos int) (int, bool) {
 			}
 			top := len(m.stack)
 			_, sok := m.run(pc+1, start)
-			if neg {
+			switch {
+			case neg:
 				if sok {
 					m.unwind(top)
 					ok = false
 				} else {
 					pc = in.x
 				}
-			} else if !sok {
+			case !sok:
 				ok = false
-			} else {
+			default:
 				m.compact(top)
 				pc = in.x
 			}

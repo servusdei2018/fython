@@ -195,8 +195,6 @@ func TemplateFromArgs(args []Value) Value {
 	}
 	if hasPending {
 		strs = append(strs, NewStringVal(pending))
-	} else if len(interps) == 0 {
-		strs = append(strs, NewStringVal(""))
 	} else {
 		strs = append(strs, NewStringVal(""))
 	}

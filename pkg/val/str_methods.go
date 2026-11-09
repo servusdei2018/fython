@@ -291,13 +291,15 @@ func strFormatImpl(ctx *ExecContext, format string, pos []Value, kw func(string)
 		// Split field_name[!conv][:spec]
 		fieldName, conv, spec := field, byte(0), ""
 		bracket := 0
-		for k := 0; k < len(field); k++ {
+	loopSplit:
+		for k := range len(field) {
 			ch := field[k]
-			if ch == '[' {
+			switch {
+			case ch == '[':
 				bracket++
-			} else if ch == ']' {
+			case ch == ']':
 				bracket--
-			} else if bracket == 0 && (ch == '!' || ch == ':') {
+			case bracket == 0 && (ch == '!' || ch == ':'):
 				fieldName = field[:k]
 				rest := field[k:]
 				if ch == '!' {
@@ -315,7 +317,7 @@ func strFormatImpl(ctx *ExecContext, format string, pos []Value, kw func(string)
 				} else {
 					spec = rest[1:]
 				}
-				break
+				break loopSplit
 			}
 		}
 		if strings.IndexByte(spec, '{') >= 0 {
@@ -325,7 +327,7 @@ func strFormatImpl(ctx *ExecContext, format string, pos []Value, kw func(string)
 		// Resolve the first component of field name.
 		first := fieldName
 		restIdx := len(fieldName)
-		for k := 0; k < len(fieldName); k++ {
+		for k := range len(fieldName) {
 			if fieldName[k] == '.' || fieldName[k] == '[' {
 				first = fieldName[:k]
 				restIdx = k
@@ -361,14 +363,15 @@ func strFormatImpl(ctx *ExecContext, format string, pos []Value, kw func(string)
 		// Attribute / index chain.
 		rest := fieldName[restIdx:]
 		for len(rest) > 0 {
-			if rest[0] == '.' {
+			switch rest[0] {
+			case '.':
 				k := 1
 				for k < len(rest) && rest[k] != '.' && rest[k] != '[' {
 					k++
 				}
 				obj = GetAttrCtx(ctx, obj, InternString(rest[1:k]))
 				rest = rest[k:]
-			} else if rest[0] == '[' {
+			case '[':
 				k := strings.IndexByte(rest, ']')
 				if k < 0 {
 					panic("ValueError: Missing ']' in format string")
@@ -382,7 +385,7 @@ func strFormatImpl(ctx *ExecContext, format string, pos []Value, kw func(string)
 				}
 				obj = GetItemCtx(ctx, obj, keyVal)
 				rest = rest[k+1:]
-			} else {
+			default:
 				panic("ValueError: Only '.' or '[' may follow ']' in format field specifier")
 			}
 		}
@@ -410,19 +413,20 @@ func PyASCII(ctx *ExecContext, v Value) string {
 func asciiEscape(s string) string {
 	var sb strings.Builder
 	for _, r := range s {
-		if r < 128 {
+		switch {
+		case r < 128:
 			sb.WriteRune(r)
-		} else if r <= 0xff {
+		case r <= 0xff:
 			sb.WriteString("\\x")
 			h := strconv.FormatInt(int64(r), 16)
 			if len(h) < 2 {
 				sb.WriteByte('0')
 			}
 			sb.WriteString(h)
-		} else if r <= 0xffff {
+		case r <= 0xffff:
 			h := strconv.FormatInt(int64(r), 16)
 			sb.WriteString("\\u" + strings.Repeat("0", 4-len(h)) + h)
-		} else {
+		default:
 			h := strconv.FormatInt(int64(r), 16)
 			sb.WriteString("\\U" + strings.Repeat("0", 8-len(h)) + h)
 		}
@@ -436,10 +440,10 @@ func isPyIdentifier(s string) bool {
 	}
 	for i, r := range s {
 		if i == 0 {
-			if !(r == '_' || unicode.IsLetter(r)) {
+			if r != '_' && !unicode.IsLetter(r) {
 				return false
 			}
-		} else if !(r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r) || unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r) || unicode.Is(unicode.Nd, r) || unicode.Is(unicode.Pc, r)) {
+		} else if r != '_' && !unicode.IsLetter(r) && !unicode.IsDigit(r) && !unicode.Is(unicode.Mn, r) && !unicode.Is(unicode.Mc, r) && !unicode.Is(unicode.Nd, r) && !unicode.Is(unicode.Pc, r) {
 			return false
 		}
 	}
@@ -534,7 +538,7 @@ func strFindImpl(s, sub string, extra []Value, last bool) int {
 }
 
 func isASCII(s string) bool {
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		if s[i] >= 0x80 {
 			return false
 		}
@@ -674,17 +678,18 @@ func initStrExtraMethods() {
 		s := strSelf("istitle", args)
 		cased, prevCased := false, false
 		for _, r := range s {
-			if unicode.IsUpper(r) || unicode.IsTitle(r) {
+			switch {
+			case unicode.IsUpper(r) || unicode.IsTitle(r):
 				if prevCased {
 					return BoolVal(false)
 				}
 				prevCased, cased = true, true
-			} else if unicode.IsLower(r) {
+			case unicode.IsLower(r):
 				if !prevCased {
 					return BoolVal(false)
 				}
 				prevCased, cased = true, true
-			} else {
+			default:
 				prevCased = false
 			}
 		}

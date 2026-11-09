@@ -107,18 +107,20 @@ func readAllSourceLines(ctx *val.ExecContext, source val.Value) []string {
 		return strings.SplitAfter(raw, "\n")
 	}
 
+readLoop:
 	for {
 		res, stop := safeCallReadline(ctx, source)
 		if stop || res.IsNone() {
 			break
 		}
 		var line string
-		if res.IsBytes() {
+		switch {
+		case res.IsBytes():
 			line = string(res.AsBytes().Data)
-		} else if res.IsAnyString() {
+		case res.IsAnyString():
 			line = res.AsString()
-		} else {
-			break
+		default:
+			break readLoop
 		}
 		if len(line) == 0 {
 			break
@@ -169,7 +171,7 @@ func tokenizeSourceLines(lines []string, extraTokens bool) []val.Value {
 	tripleStartCol := 0
 	var tripleBuilder strings.Builder
 
-	for rowIdx := 0; rowIdx < len(lines); rowIdx++ {
+	for rowIdx := range lines {
 		row = rowIdx + 1
 		line := lines[rowIdx]
 
@@ -423,22 +425,23 @@ func scanLineRest(
 		// Numbers
 		if unicode.IsDigit(rune(c)) || (c == '.' && *col+1 < n && unicode.IsDigit(rune(line[*col+1]))) {
 			startCol := *col
-			if c == '0' && *col+1 < n && (line[*col+1] == 'x' || line[*col+1] == 'X') {
+			switch {
+			case c == '0' && *col+1 < n && (line[*col+1] == 'x' || line[*col+1] == 'X'):
 				*col += 2
 				for *col < n && (isHexDigit(line[*col]) || line[*col] == '_') {
 					*col++
 				}
-			} else if c == '0' && *col+1 < n && (line[*col+1] == 'b' || line[*col+1] == 'B') {
+			case c == '0' && *col+1 < n && (line[*col+1] == 'b' || line[*col+1] == 'B'):
 				*col += 2
 				for *col < n && (line[*col] == '0' || line[*col] == '1' || line[*col] == '_') {
 					*col++
 				}
-			} else if c == '0' && *col+1 < n && (line[*col+1] == 'o' || line[*col+1] == 'O') {
+			case c == '0' && *col+1 < n && (line[*col+1] == 'o' || line[*col+1] == 'O'):
 				*col += 2
 				for *col < n && ((line[*col] >= '0' && line[*col] <= '7') || line[*col] == '_') {
 					*col++
 				}
-			} else {
+			default:
 				for *col < n && (unicode.IsDigit(rune(line[*col])) || line[*col] == '_') {
 					*col++
 				}
@@ -472,11 +475,12 @@ func scanLineRest(
 			startCol := *col
 			endCol := *col + opLen
 			emit(tokOP, opStr, row, startCol, row, endCol, line)
-			for i := 0; i < opLen; i++ {
+			for i := range opLen {
 				ch := line[*col+i]
-				if ch == '(' || ch == '[' || ch == '{' {
+				switch ch {
+				case '(', '[', '{':
 					parenDepth++
-				} else if ch == ')' || ch == ']' || ch == '}' {
+				case ')', ']', '}':
 					if parenDepth > 0 {
 						parenDepth--
 					}

@@ -22,11 +22,7 @@ var (
 func getFythonBinary(t *testing.T) string {
 	t.Helper()
 	builtFythonOnce.Do(func() {
-		tmpDir, err := os.MkdirTemp("", "fython-build-bin-*")
-		if err != nil {
-			builtFythonErr = err
-			return
-		}
+		tmpDir := t.TempDir()
 		binPath := filepath.Join(tmpDir, "fython")
 		cmd := exec.Command("go", "build", "-o", binPath, "../../cmd/fython")
 		out, err := cmd.CombinedOutput()

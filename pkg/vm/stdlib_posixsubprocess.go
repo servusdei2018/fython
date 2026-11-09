@@ -105,10 +105,7 @@ func (e *Engine) createPosixSubprocessModule() val.Value {
 		errwrite := int(args[11].AsInt64())
 		errpipeWrite := int(args[13].AsInt64())
 
-		startNewSession := false
-		if len(args) > 15 && args[15].IsTruthy() {
-			startNewSession = true
-		}
+		startNewSession := len(args) > 15 && args[15].IsTruthy()
 
 		var files []*os.File
 		// Stdin

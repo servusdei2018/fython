@@ -156,18 +156,24 @@ func contextVarGet(ctx *val.ExecContext, callable val.Value, args []val.Value, k
 	pos := args
 	if len(kwnames) > 0 {
 		pos = args[:len(args)-len(kwnames)]
+		var defVal val.Value
+		hasDef := false
 		for i, kn := range kwnames {
 			if kn.AsString() != "default" {
 				panic(val.NewTypeError("get() got an unexpected keyword argument"))
 			}
-			return args[len(args)-len(kwnames)+i]
+			defVal = args[len(args)-len(kwnames)+i]
+			hasDef = true
 		}
-	}
-	if len(pos) >= 2 {
-		return pos[1]
+		if hasDef {
+			return defVal
+		}
 	}
 	if len(pos) > 2 {
 		panic(val.NewTypeError("get() takes at most 2 arguments"))
+	}
+	if len(pos) >= 2 {
+		return pos[1]
 	}
 	if cv.HasDefault {
 		return cv.Default

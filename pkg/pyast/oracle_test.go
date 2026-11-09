@@ -2,6 +2,7 @@ package pyast
 
 import (
 	"bufio"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -10,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -25,9 +27,9 @@ func genConst(v any) any {
 	case bool:
 		return map[string]any{"t": "bool", "v": x}
 	case int64:
-		return map[string]any{"t": "int", "v": fmt.Sprint(x)}
+		return map[string]any{"t": "int", "v": strconv.FormatInt(x, 10)}
 	case int:
-		return map[string]any{"t": "int", "v": fmt.Sprint(x)}
+		return map[string]any{"t": "int", "v": strconv.Itoa(x)}
 	case *big.Int:
 		return map[string]any{"t": "int", "v": x.String()}
 	case float64:
@@ -37,7 +39,7 @@ func genConst(v any) any {
 	case string:
 		return map[string]any{"t": "str", "v": x}
 	case []byte:
-		return map[string]any{"t": "bytes", "v": fmt.Sprintf("%x", x)}
+		return map[string]any{"t": "bytes", "v": hex.EncodeToString(x)}
 	}
 	return fmt.Sprintf("?%T", v)
 }
@@ -182,7 +184,7 @@ func runOracle(t *testing.T, args []string) map[string]oracleResult {
 		}
 		res[raw.Path] = r
 	}
-	cmd.Wait()
+	_ = cmd.Wait()
 	return res
 }
 
@@ -204,7 +206,7 @@ func compareFile(path string, mode Mode, o oracleResult) string {
 	g := toGeneric(n)
 	b, _ := json.Marshal(g)
 	var g2 any
-	json.Unmarshal(b, &g2)
+	_ = json.Unmarshal(b, &g2)
 	return diff("$", g2, o.Tree)
 }
 
@@ -215,7 +217,7 @@ func TestOracleCorpus(t *testing.T) {
 		roots = append(roots, strings.Split(extra, string(os.PathListSeparator))...)
 	}
 	for _, root := range roots {
-		filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
+		_ = filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
 			if err == nil && !info.IsDir() && strings.HasSuffix(p, ".py") {
 				files = append(files, p)
 			}

@@ -102,14 +102,10 @@ if mono2 < mono1:
 }
 
 func TestNativeOSAndPath(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "fython_os_test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	testFile := filepath.Join(tmpDir, "test.txt")
-	err = os.WriteFile(testFile, []byte("hello fython"), 0644)
+	err := os.WriteFile(testFile, []byte("hello fython"), 0644)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,11 +135,7 @@ if os.path.exists(sub):
 }
 
 func TestNativeIOAndContextManager(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "fython_io_test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	testFilePath := filepath.ToSlash(filepath.Join(tmpDir, "sample.txt"))
 

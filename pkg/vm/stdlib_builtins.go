@@ -504,14 +504,15 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		r := args[0].String()
 		var sb strings.Builder
 		for _, runeVal := range r {
-			if runeVal < 128 && unicode.IsPrint(runeVal) {
+			switch {
+			case runeVal < 128 && unicode.IsPrint(runeVal):
 				sb.WriteRune(runeVal)
-			} else if runeVal <= 0xFF {
-				sb.WriteString(fmt.Sprintf("\\x%02x", runeVal))
-			} else if runeVal <= 0xFFFF {
-				sb.WriteString(fmt.Sprintf("\\u%04x", runeVal))
-			} else {
-				sb.WriteString(fmt.Sprintf("\\U%08x", runeVal))
+			case runeVal <= 0xFF:
+				fmt.Fprintf(&sb, "\\x%02x", runeVal)
+			case runeVal <= 0xFFFF:
+				fmt.Fprintf(&sb, "\\u%04x", runeVal)
+			default:
+				fmt.Fprintf(&sb, "\\U%08x", runeVal)
 			}
 		}
 		return val.NewStringVal(sb.String())
@@ -708,11 +709,9 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 					done = true
 					if strict {
 						if i > 0 {
-							plural := ""
+							plural := " "
 							if i > 1 {
 								plural = "s 1-"
-							} else {
-								plural = " "
 							}
 							panic("ValueError: zip() argument " + strconv.Itoa(i+1) + " is shorter than argument" + plural + strconv.Itoa(i))
 						}
@@ -1032,7 +1031,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		}
 		if obj.IsInstance() {
 			inst := obj.AsInstance()
-			if inst.Shape != nil && inst.Shape.Type != nil && (inst.Shape.Type.Flags&uint32(val.FlagForbidDynamicAttrs)) != 0 {
+			if inst.Shape != nil && inst.Shape.Type != nil && (inst.Shape.Type.Flags&val.FlagForbidDynamicAttrs) != 0 {
 				if ctx != nil {
 					ctx.Raise(val.NewTypeError("vars() argument must have __dict__ attribute"))
 					return val.NoneVal()
@@ -1098,9 +1097,10 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		vmInstance := ctx.VM.(*VM)
 		var co *CodeObject
 
-		if expr.Kind() == val.KindCode {
+		switch {
+		case expr.Kind() == val.KindCode:
 			co = AsCodeObject(expr)
-		} else if expr.IsAnyString() || expr.IsBytes() {
+		case expr.IsAnyString() || expr.IsBytes():
 			var srcBytes []byte
 			if expr.IsAnyString() {
 				srcBytes = []byte(expr.AsString())
@@ -1112,22 +1112,23 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 				panic("SyntaxError: " + err.Error())
 			}
 			co = compiled
-		} else {
+		default:
 			panic("TypeError: eval() arg 1 must be a string, bytes or code object")
 		}
 
 		var globalsDict *val.PyDict
-		if globalsVal.IsNone() {
+		switch {
+		case globalsVal.IsNone():
 			globalsDict = vmInstance.currentGlobals()
 			if localsVal.IsNone() {
 				localsVal = vmInstance.currentLocalsVal()
 			}
-		} else if globalsVal.IsDict() {
+		case globalsVal.IsDict():
 			globalsDict = globalsVal.AsDict()
 			if localsVal.IsNone() {
 				localsVal = globalsVal
 			}
-		} else {
+		default:
 			panic("TypeError: globals must be a dict")
 		}
 
@@ -1192,9 +1193,10 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		vmInstance := ctx.VM.(*VM)
 		var co *CodeObject
 
-		if codeObj.Kind() == val.KindCode {
+		switch {
+		case codeObj.Kind() == val.KindCode:
 			co = AsCodeObject(codeObj)
-		} else if codeObj.IsAnyString() || codeObj.IsBytes() {
+		case codeObj.IsAnyString() || codeObj.IsBytes():
 			var srcBytes []byte
 			if codeObj.IsAnyString() {
 				srcBytes = []byte(codeObj.AsString())
@@ -1206,22 +1208,23 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 				panic("SyntaxError: " + err.Error())
 			}
 			co = compiled
-		} else {
+		default:
 			panic("TypeError: exec() arg 1 must be a string, bytes or code object")
 		}
 
 		var globalsDict *val.PyDict
-		if globalsVal.IsNone() {
+		switch {
+		case globalsVal.IsNone():
 			globalsDict = vmInstance.currentGlobals()
 			if localsVal.IsNone() {
 				localsVal = vmInstance.currentLocalsVal()
 			}
-		} else if globalsVal.IsDict() {
+		case globalsVal.IsDict():
 			globalsDict = globalsVal.AsDict()
 			if localsVal.IsNone() {
 				localsVal = globalsVal
 			}
-		} else {
+		default:
 			panic("TypeError: globals must be a dict")
 		}
 
@@ -1326,7 +1329,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			fmt.Print(args[0].String())
 		}
 		var line string
-		fmt.Scanln(&line)
+		_, _ = fmt.Scanln(&line)
 		return val.NewStringVal(line)
 	}))
 }

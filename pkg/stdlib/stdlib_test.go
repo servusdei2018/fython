@@ -56,7 +56,7 @@ func TestZeroOverlays(t *testing.T) {
 		t.Fatalf("missing manifest: %v", err)
 	}
 	want := map[string]string{}
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}

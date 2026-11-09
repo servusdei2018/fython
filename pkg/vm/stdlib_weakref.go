@@ -137,7 +137,7 @@ func (e *Engine) createWeakrefCModule() val.Value {
 		if hdr == nil {
 			panic("TypeError: cannot create weak reference to '" + ob.Type().Name + "' object")
 		}
-		var callback val.Value = val.NoneVal()
+		callback := val.NoneVal()
 		if len(args) > 1 {
 			callback = args[1]
 		}
@@ -175,7 +175,7 @@ func (e *Engine) createWeakrefCModule() val.Value {
 		if hdr == nil {
 			panic("TypeError: cannot create weak reference to '" + ob.Type().Name + "' object")
 		}
-		var callback val.Value = val.NoneVal()
+		callback := val.NoneVal()
 		if len(args) > 1 {
 			callback = args[1]
 		}
@@ -366,7 +366,7 @@ func initWeakrefTypes(e *Engine) {
 			}
 			self := args[0]
 			key := args[1]
-			var dflt val.Value = val.NoneVal()
+			dflt := val.NoneVal()
 			if len(args) > 2 {
 				dflt = args[2]
 			}
@@ -514,7 +514,7 @@ func initWeakrefTypes(e *Engine) {
 			}
 			self := args[0]
 			key := args[1]
-			var dflt val.Value = val.NoneVal()
+			dflt := val.NoneVal()
 			if len(args) > 2 {
 				dflt = args[2]
 			}

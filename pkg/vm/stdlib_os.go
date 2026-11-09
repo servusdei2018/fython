@@ -141,7 +141,6 @@ func (e *Engine) createOSModule() val.Value {
 		} else if len(args) >= 2 {
 			existOk = args[1].IsTruthy()
 		}
-		args = posArgs(args, kwnames)
 		if _, serr := os.Stat(path); serr == nil && !existOk {
 			panic(newOSError(syscall.EEXIST, path, true))
 		}
@@ -276,13 +275,14 @@ func (e *Engine) createOSModule() val.Value {
 		}
 		fd := int(args[0].AsInt64())
 		var data []byte
-		if args[1].IsBytes() {
+		switch {
+		case args[1].IsBytes():
 			data = args[1].AsBytes().Data
-		} else if args[1].IsByteArray() {
+		case args[1].IsByteArray():
 			data = args[1].AsByteArray().Data
-		} else if args[1].IsAnyString() {
+		case args[1].IsAnyString():
 			data = []byte(args[1].AsString())
-		} else {
+		default:
 			panic("TypeError: a bytes-like object is required")
 		}
 		fdMutex.Lock()

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -185,9 +186,10 @@ func NewServer(target string, cfg Config) (*Server, error) {
 	}
 
 	var appVal val.Value
-	if !cfg.App.IsNone() && cfg.App.HeaderPtr() != nil {
+	switch {
+	case !cfg.App.IsNone() && cfg.App.HeaderPtr() != nil:
 		appVal = cfg.App
-	} else if target != "" {
+	case target != "":
 		bootstrapVM := cfg.Engine.AcquireVM()
 		defer cfg.Engine.ReleaseVM(bootstrapVM)
 
@@ -196,8 +198,8 @@ func NewServer(target string, cfg Config) (*Server, error) {
 			return nil, err
 		}
 		appVal = resolved
-	} else {
-		return nil, fmt.Errorf("server: application target or callable must be specified")
+	default:
+		return nil, errors.New("server: application target or callable must be specified")
 	}
 
 	s.app = appVal
@@ -212,7 +214,7 @@ func NewServer(target string, cfg Config) (*Server, error) {
 	}
 
 	s.vmRing = make(chan *vm.VM, cfg.Workers)
-	for i := 0; i < cfg.Workers; i++ {
+	for range cfg.Workers {
 		s.vmRing <- s.engine.NewVM()
 	}
 

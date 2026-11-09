@@ -435,7 +435,7 @@ func DeserializeCodeObject(data []byte) (*CodeObject, *FycHeader, error) {
 	}
 
 	lengths := make([]uint32, stringCount)
-	for i := uint32(0); i < stringCount; i++ {
+	for i := range stringCount {
 		l, err := r.readUint32()
 		if err != nil {
 			return nil, nil, err
@@ -451,7 +451,7 @@ func DeserializeCodeObject(data []byte) (*CodeObject, *FycHeader, error) {
 	// Bulk-intern all strings with zero duplicate allocations
 	stringTable := make([]val.Value, stringCount)
 	blobOff := 0
-	for i := uint32(0); i < stringCount; i++ {
+	for i := range stringCount {
 		l := int(lengths[i])
 		s := string(blob[blobOff : blobOff+l])
 		stringTable[i] = val.InternString(s)
@@ -531,7 +531,7 @@ func decodeCodeObject(r *binaryReader, stringTable []val.Value) (*CodeObject, er
 		return nil, err
 	}
 	code := make([]uint32, codeLen)
-	for i := uint32(0); i < codeLen; i++ {
+	for i := range codeLen {
 		inst, err := r.readUint32()
 		if err != nil {
 			return nil, err
@@ -545,7 +545,7 @@ func decodeCodeObject(r *binaryReader, stringTable []val.Value) (*CodeObject, er
 		return nil, err
 	}
 	consts := make([]val.Value, constsLen)
-	for i := uint32(0); i < constsLen; i++ {
+	for i := range constsLen {
 		v, err := decodeValue(r, stringTable)
 		if err != nil {
 			return nil, err
@@ -559,7 +559,7 @@ func decodeCodeObject(r *binaryReader, stringTable []val.Value) (*CodeObject, er
 		return nil, err
 	}
 	paramNames := make([]val.Value, paramLen)
-	for i := uint32(0); i < paramLen; i++ {
+	for i := range paramLen {
 		idx, err := r.readUint32()
 		if err != nil {
 			return nil, err
@@ -576,7 +576,7 @@ func decodeCodeObject(r *binaryReader, stringTable []val.Value) (*CodeObject, er
 		return nil, err
 	}
 	varNames := make([]val.Value, varLen)
-	for i := uint32(0); i < varLen; i++ {
+	for i := range varLen {
 		idx, err := r.readUint32()
 		if err != nil {
 			return nil, err
@@ -593,7 +593,7 @@ func decodeCodeObject(r *binaryReader, stringTable []val.Value) (*CodeObject, er
 		return nil, err
 	}
 	cellVars := make([]val.Value, cellLen)
-	for i := uint32(0); i < cellLen; i++ {
+	for i := range cellLen {
 		idx, err := r.readUint32()
 		if err != nil {
 			return nil, err
@@ -610,7 +610,7 @@ func decodeCodeObject(r *binaryReader, stringTable []val.Value) (*CodeObject, er
 		return nil, err
 	}
 	freeVars := make([]val.Value, freeLen)
-	for i := uint32(0); i < freeLen; i++ {
+	for i := range freeLen {
 		idx, err := r.readUint32()
 		if err != nil {
 			return nil, err
@@ -629,7 +629,7 @@ func decodeCodeObject(r *binaryReader, stringTable []val.Value) (*CodeObject, er
 	var excTable []ExceptionEntry
 	if excLen > 0 {
 		excTable = make([]ExceptionEntry, excLen)
-		for i := uint32(0); i < excLen; i++ {
+		for i := range excLen {
 			sIP, err := r.readUint32()
 			if err != nil {
 				return nil, err
@@ -668,7 +668,7 @@ func decodeCodeObject(r *binaryReader, stringTable []val.Value) (*CodeObject, er
 	var lineSpans []LineSpanEntry
 	if lineSpansLen > 0 {
 		lineSpans = make([]LineSpanEntry, lineSpansLen)
-		for i := uint32(0); i < lineSpansLen; i++ {
+		for i := range lineSpansLen {
 			sIP, err := r.readUint32()
 			if err != nil {
 				return nil, err
@@ -776,7 +776,7 @@ func decodeValue(r *binaryReader, stringTable []val.Value) (val.Value, error) {
 			return val.NoneVal(), err
 		}
 		items := make([]val.Value, count)
-		for i := uint32(0); i < count; i++ {
+		for i := range count {
 			item, err := decodeValue(r, stringTable)
 			if err != nil {
 				return val.NoneVal(), err

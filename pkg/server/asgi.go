@@ -142,7 +142,8 @@ func (s *Server) handleASGI(w http.ResponseWriter, r *http.Request, v *vm.VM) {
 	if coroVal.IsCoroutine() {
 		coro := coroVal.AsCoroutine()
 		_, status := v.StepCoroutine(coro, val.NoneVal())
-		if status == val.IterYielded {
+		switch status {
+		case val.IterYielded:
 			// If suspended by a non-immediate future or timer, advance on EventLoop
 			loop := vm.NewEventLoop(s.engine, vm.AsyncModeSingleThread)
 			_, err := loop.RunUntilComplete(coroVal)
@@ -152,7 +153,7 @@ func (s *Server) handleASGI(w http.ResponseWriter, r *http.Request, v *vm.VM) {
 				}
 				return
 			}
-		} else if status == val.IterError {
+		case val.IterError:
 			exc := v.UnhandledException()
 			if !exc.IsNone() && exc.HeaderPtr() != nil {
 				fmt.Fprintf(os.Stderr, "ASGI application error:\n%s\n", v.FormatException(exc))

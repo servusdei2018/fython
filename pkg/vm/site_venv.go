@@ -63,7 +63,7 @@ func (cfg RuntimeConfig) Effective() RuntimeConfig {
 			}
 		}
 		if warnEnv := os.Getenv("PYTHONWARNINGS"); warnEnv != "" {
-			for _, part := range strings.Split(warnEnv, ",") {
+			for part := range strings.SplitSeq(warnEnv, ",") {
 				if trimmed := strings.TrimSpace(part); trimmed != "" {
 					out.WarnOptions = append(out.WarnOptions, trimmed)
 				}
@@ -216,7 +216,7 @@ func parsePyvenvCfgHome(cfgPath string) string {
 	if err != nil {
 		return ""
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -296,7 +296,7 @@ func parseSinglePthFile(siteDir, pthPath string) ([]string, []string) {
 	if err != nil {
 		return nil, nil
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	var addedPaths []string
 	var importLines []string
