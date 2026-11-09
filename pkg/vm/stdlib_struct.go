@@ -122,6 +122,27 @@ func parseStructFormat(fmtStr string) (*parsedFormat, error) {
 		var elemSize int
 		var consumesArg bool
 
+		// Complex types: Zf (2x float=8), Zd (2x double=16). Zg not supported by struct.
+		if r == 'Z' {
+			if idx >= len(runes) {
+				return nil, fmt.Errorf("bad char in struct format: %c", r)
+			}
+			sub := runes[idx]
+			switch sub {
+			case 'f':
+				elemSize = 8
+			case 'd':
+				elemSize = 16
+			default:
+				return nil, fmt.Errorf("bad char in struct format: %c", r)
+			}
+			idx++ // consume sub char
+			fields = append(fields, structField{op: structOpCode('z'), count: repeat, size: elemSize})
+			totalSize += repeat * elemSize
+			numArgs += repeat
+			continue
+		}
+
 		switch r {
 		case 'x': // pad byte
 			elemSize = 1
@@ -132,8 +153,16 @@ func parseStructFormat(fmtStr string) (*parsedFormat, error) {
 		case 'h', 'H', 'e':
 			elemSize = 2
 			consumesArg = true
-		case 'i', 'I', 'l', 'L':
+		case 'i', 'I':
 			elemSize = 4
+			consumesArg = true
+		case 'l', 'L':
+			// Standard mode ('<','>','=','!'): 4 bytes. Native mode ('@'): 8 bytes on LP64.
+			if isNative {
+				elemSize = 8
+			} else {
+				elemSize = 4
+			}
 			consumesArg = true
 		case 'q', 'Q', 'n', 'N', 'P':
 			elemSize = 8

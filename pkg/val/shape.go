@@ -188,10 +188,36 @@ func NewInstanceVal(shape *Shape) Value {
 	return Value{num: 0, ptr: &obj.Header}
 }
 
+// NewCInstanceVal constructs a new C-extension instance (KindNative) belonging to cls.
+// The off-heap payload is allocated lazily on first ToStub/BorrowStub conversion;
+// AllocCInstanceStub forces allocation (used by capi tp_new/tp_init bridging).
+func NewCInstanceVal(cls *PyType) Value {
+	if cls == nil {
+		cls = ObjectType
+	}
+	obj := &PyCInstance{
+		Header: ObjectHeader{Kind: KindNative, Type: cls},
+	}
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+// AllocCInstanceStub ensures v has an off-heap PyObject* (allocates custom payload if needed)
+// and returns it. Used by capi when bridging tp_new/tp_init.
+func AllocCInstanceStub(v Value) unsafe.Pointer {
+	return GetDefaultArena().ToStub(v)
+}
+
 // NewInstanceOfType constructs a new heap-allocated KindInstance Value belonging to cls.
 func NewInstanceOfType(cls *PyType) Value {
 	if cls == nil {
 		cls = ObjectType
+	}
+	// C extension types (tp_basicsize > 16) use PyCInstance even for Python subclasses,
+	// so C private fields at offsets 16.. survive Python __dict__ additions.
+	for _, base := range cls.MRO {
+		if base != nil && base.Basicsize > 16 {
+			return NewCInstanceVal(cls)
+		}
 	}
 	if ModuleType != nil && IsSubclass(cls, ModuleType) {
 		mod := &PyModule{

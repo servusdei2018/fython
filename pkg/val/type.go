@@ -205,21 +205,38 @@ type (
 	BufferFunc     func(ctx *ExecContext, obj Value, view *PyBuffer, flags int) error
 )
 
-// BufferFlags for TpAsBuffer / GetBuffer.
+// BufferFlags for TpAsBuffer / GetBuffer (PEP 3118 / CPython bufferinfo).
 const (
-	PyBUF_SIMPLE   = 0
-	PyBUF_WRITABLE = 0x0001
-	PyBUF_FORMAT   = 0x0004
-	PyBUF_ND       = 0x0008
-	PyBUF_STRIDES  = 0x0010 | PyBUF_ND
+	PyBUF_SIMPLE         = 0
+	PyBUF_WRITABLE       = 0x0001
+	PyBUF_FORMAT         = 0x0004
+	PyBUF_ND             = 0x0008
+	PyBUF_STRIDES        = 0x0010 | PyBUF_ND
+	PyBUF_C_CONTIGUOUS   = 0x0020 | PyBUF_STRIDES
+	PyBUF_F_CONTIGUOUS   = 0x0040 | PyBUF_STRIDES
+	PyBUF_ANY_CONTIGUOUS = 0x0080 | PyBUF_STRIDES
+	PyBUF_INDIRECT       = 0x0100 | PyBUF_STRIDES
+	PyBUF_FULL_RO        = PyBUF_INDIRECT | 0x0200
+	PyBUF_FULL           = PyBUF_INDIRECT | PyBUF_WRITABLE
+	PyBUF_RECORDS_RO     = PyBUF_STRIDES | PyBUF_FORMAT | PyBUF_WRITABLE // compat alias
 )
 
 // PyBuffer represents a zero-allocation direct memory view into an underlying binary object.
+// PEP 3118: Format, NDim, Shape, Strides, Suboffsets describe typed, multi-dimensional data.
+// Release is called when the C side releases the view; Unpin undoes pinning.
 type PyBuffer struct {
-	Buf      []byte
-	ReadOnly bool
-	ItemSize int
-	Obj      Value
+	Buf        []byte
+	ReadOnly   bool
+	ItemSize   int
+	Obj        Value
+	Format     string
+	NDim       int
+	Shape      []int
+	Strides    []int
+	Suboffsets []int
+	Release    func()
+	// Pinner pins Buf backing array for zero-copy C access; nil when off-heap.
+	Pinner *PinnerState
 }
 
 // BufferProvider interface for Go types that can export a zero-copy byte buffer.
@@ -247,6 +264,19 @@ type TypeSlots struct {
 	TpIter         IterFunc
 	TpIterNext     IterNextFunc
 	TpAsBuffer     BufferFunc
+	// Extended slots for C extension types (PyType_FromSpec / static PyTypeObject).
+	TpNew         VectorcallFunc
+	TpInit        VectorcallFunc
+	TpDealloc     func(ctx *ExecContext, v Value)
+	TpRepr        UnaryOpFunc
+	TpStr         UnaryOpFunc
+	TpHash        UnaryOpFunc
+	TpRichCompare func(ctx *ExecContext, a, b Value, op int) Value
+	NbBool        UnaryOpFunc
+	SqContains    BinaryOpFunc
+	SqConcat      BinaryOpFunc
+	SqRepeat      BinaryOpFunc
+	MpLen         LenFunc
 }
 
 // PyType represents a Python type/class object with CPython-style TypeSlots,
@@ -332,6 +362,32 @@ type PyType struct {
 	dunderInitSubclass Value
 	dunderSetName      Value
 	dunderHash         Value
+
+	// C extension type payload info (PEP 384 / PyType_FromSpec).
+	// Zero for pure-Python types. Basicsize includes PyObject header.
+	Basicsize int
+	Itemsize  int
+	// CImports tracks raw C slot function pointers for bridging.
+	Native *NativeTypeInfo
+}
+
+// NativeTypeInfo holds raw C function pointers for a C-defined type.
+// Pointers are unsafe.Pointer; they are interpreted only via capi bridges.
+type NativeTypeInfo struct {
+	CDealloc unsafe.Pointer
+	CNew     unsafe.Pointer
+	CInit    unsafe.Pointer
+	CRepr    unsafe.Pointer
+	CStr     unsafe.Pointer
+	CHash    unsafe.Pointer
+	CRichcmp unsafe.Pointer
+	CCall    unsafe.Pointer
+	CFree    unsafe.Pointer
+	// Number/Sequence/Mapping slot tables (opaque to Go, parsed by capi).
+	AsNumber   unsafe.Pointer
+	AsSequence unsafe.Pointer
+	AsMapping  unsafe.Pointer
+	AsBuffer   unsafe.Pointer
 }
 
 // Compile-time assertion that PyType.Header is at byte offset 0.
@@ -1524,6 +1580,14 @@ func defaultObjectGetAttr(ctx *ExecContext, obj, name Value) Value {
 		}
 	}
 
+	if obj.IsCInstance() {
+		if ci := obj.AsCInstance(); ci != nil && ci.Dict != nil {
+			if val, ok := ci.Dict.Get(interned); ok {
+				return val
+			}
+		}
+	}
+
 	if obj.IsModule() {
 		mod := obj.AsModule()
 		if interned.AsString() == "__dict__" {
@@ -1603,6 +1667,15 @@ func defaultObjectGetAttr(ctx *ExecContext, obj, name Value) Value {
 		inst := obj.AsInstance()
 		if inst.Shape != nil {
 			return NewInstanceDictProxy(inst)
+		}
+	}
+	if interned.AsString() == "__dict__" && obj.IsCInstance() && (tp.Flags&FlagForbidDynamicAttrs) == 0 {
+		ci := obj.AsCInstance()
+		if ci != nil {
+			if ci.Dict == nil {
+				ci.Dict = NewDictVal(8).AsDict()
+			}
+			return DictVal(ci.Dict)
 		}
 	}
 
@@ -1717,6 +1790,22 @@ func objectSetAttr(ctx *ExecContext, obj, name, value Value) Value {
 			return NoneVal()
 		}
 		obj.AsInstance().SetAttr(interned, value)
+		return NoneVal()
+	}
+
+	if obj.IsCInstance() {
+		ci := obj.AsCInstance()
+		if interned.AsString() == "__dict__" {
+			if !value.IsDict() {
+				panic("TypeError: __dict__ must be set to a dictionary, not a '" + value.Type().Name + "'")
+			}
+			ci.Dict = value.AsDict()
+			return NoneVal()
+		}
+		if ci.Dict == nil {
+			ci.Dict = NewDictVal(8).AsDict()
+		}
+		ci.Dict.Set(interned, value)
 		return NoneVal()
 	}
 

@@ -529,6 +529,22 @@ func (v Value) AsMemoryView() *PyMemoryView {
 	return (*PyMemoryView)(unsafe.Pointer(v.ptr))
 }
 
+// AsCInstance performs an offset-0 downcast from Value to *PyCInstance (C extension instance).
+func (v Value) AsCInstance() *PyCInstance {
+	return (*PyCInstance)(unsafe.Pointer(v.ptr))
+}
+
+// IsCInstance reports whether v is a C extension instance (KindNative with PyCInstance header).
+func (v Value) IsCInstance() bool {
+	if v.ptr == nil || v.ptr.Kind != KindNative {
+		return false
+	}
+	if v.ptr.Type == nil {
+		return false
+	}
+	return v.ptr.Type.Basicsize > 16 || v.ptr.Type.Native != nil
+}
+
 // IsSlice reports whether v is a heap-allocated PySlice.
 func (v Value) IsSlice() bool {
 	return v.ptr != nil && v.ptr.Kind == KindSlice

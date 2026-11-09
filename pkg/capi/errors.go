@@ -173,7 +173,8 @@ func PyType_IsSubtype(a unsafe.Pointer, b unsafe.Pointer) int32 {
 	}
 	return 0
 }
-func PyType_Ready(t unsafe.Pointer) int32 { return 0 }
+
+// PyType_Ready is implemented in typespec.go (parses static PyTypeObject).
 func PyObject_Type(o unsafe.Pointer) unsafe.Pointer {
 	if o == nil {
 		return nil

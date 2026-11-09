@@ -27,11 +27,11 @@ struct _fython_object { void *a, *b; };
 struct _fython_typeobject { char dummy[512]; };
 
 // Dispatch table
-static void *dispatch[70] = {0};
+static void *dispatch[80] = {0};
 
 int fython_abi3_bind(void **table, int n) {
     if (!table || n <= 0) return -1;
-    if (n > 70) n = 70;
+    if (n > 80) n = 80;
     for (int i = 0; i < n; i++) dispatch[i] = table[i];
     return 0;
 }
@@ -53,6 +53,11 @@ struct { char dummy[512]; } PyDict_Type;
 struct { char dummy[512]; } PyCFunction_Type;
 struct { char dummy[512]; } PyComplex_Type;
 struct { char dummy[512]; } PyBool_Type;
+struct { char dummy[512]; } _Py_NoneStruct;
+struct { char dummy[512]; } _Py_TrueStruct;
+struct { char dummy[512]; } _Py_FalseStruct;
+struct { char dummy[512]; } _Py_NotImplementedStruct;
+struct { char dummy[512]; } _Py_EllipsisStruct;
 // Exception type variables (PyObject* variables holding exception type objects).
 // Go initializes these on BindToShim to point at shadow type objects.
 void *PyExc_BaseException;
@@ -470,6 +475,55 @@ PyObject *PyErr_GetCause(void) {
 PyObject *PyErr_GetContext(void) {
     if (!dispatch[69]) return NULL;
     return ((PyObject *(*)(void))dispatch[69])();
+}
+
+// --- Milestone 2: custom types + buffer protocol ---
+typedef struct {
+    const char *name;
+    int basicsize;
+    int itemsize;
+    unsigned int flags;
+    void *slots;
+} FythonPyTypeSpec;
+PyObject *PyType_FromSpec(FythonPyTypeSpec *spec) {
+    if (!dispatch[70]) return NULL;
+    return ((PyObject *(*)(void *))dispatch[70])(spec);
+}
+PyObject *PyType_FromSpecWithBases(FythonPyTypeSpec *spec, PyObject *bases) {
+    if (!dispatch[71]) return NULL;
+    return ((PyObject *(*)(void *, PyObject *))dispatch[71])(spec, bases);
+}
+PyObject *PyType_FromModuleAndSpec(PyObject *module, FythonPyTypeSpec *spec, PyObject *dict) {
+    if (!dispatch[72]) return NULL;
+    return ((PyObject *(*)(PyObject *, void *, PyObject *))dispatch[72])(module, spec, dict);
+}
+int PyObject_GetBuffer(PyObject *obj, void *view, int flags) {
+    if (!dispatch[73]) return -1;
+    return ((int (*)(PyObject *, void *, int))dispatch[73])(obj, view, flags);
+}
+void PyBuffer_Release(void *view) {
+    if (!dispatch[74]) return;
+    ((void (*)(void *))dispatch[74])(view);
+}
+int PyObject_CheckBuffer(PyObject *obj) {
+    if (!dispatch[75]) return 0;
+    return ((int (*)(PyObject *))dispatch[75])(obj);
+}
+Py_ssize_t PyBuffer_SizeFromFormat(const char *format) {
+    if (!dispatch[76]) return -1;
+    return ((Py_ssize_t (*)(const char *))dispatch[76])(format);
+}
+void PyBuffer_FillContiguousStrides(int ndims, Py_ssize_t *shape, Py_ssize_t *strides, int itemsize, char order) {
+    if (!dispatch[77]) return;
+    ((void (*)(int, Py_ssize_t *, Py_ssize_t *, int, char))dispatch[77])(ndims, shape, strides, itemsize, order);
+}
+int PyBuffer_FillInfo(void *view, PyObject *o, void *buf, Py_ssize_t len, int readonly, int flags) {
+    if (!dispatch[78]) return -1;
+    return ((int (*)(void *, PyObject *, void *, Py_ssize_t, int, int))dispatch[78])(view, o, buf, len, readonly, flags);
+}
+int PyBuffer_IsContiguous(const void *view, char order) {
+    if (!dispatch[79]) return 0;
+    return ((int (*)(const void *, char))dispatch[79])(view, order);
 }
 
 // Additional stubs for robustness (not in dispatch table): return NULL with no crash.

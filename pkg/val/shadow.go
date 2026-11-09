@@ -24,6 +24,10 @@ const (
 	StubOffFlags   = 24
 	ImmortalRefcnt = int64(1) << 30
 	TypeBlockSize  = 512
+	// CustomPayloadPrefixSize is the off-heap prefix before a C instance's PyObject*.
+	// Layout: [handle uint64][magic uint64][PyObject basicsize bytes].
+	CustomPayloadPrefixSize = 16
+	CustomPayloadMagic      = uint64(0x46595453313233) // "FyTS123"
 )
 
 type arenaPage struct {
@@ -35,6 +39,11 @@ type typePage struct {
 	data []byte
 	next int
 }
+
+// CDeallocHook is invoked when a C instance's off-heap stub is deallocated
+// (refcount 0 from C) or when Go GC collects it (AddCleanup). capi sets this
+// to bridge to the C tp_dealloc slot. val never imports capi (avoids cycle).
+var CDeallocHook func(v Value)
 
 // ShadowArena holds handle table + reverse identity maps + freelist.
 type ShadowArena struct {
@@ -52,6 +61,10 @@ type ShadowArena struct {
 	freeTypeBlk   []unsafe.Pointer
 	immortalDone  bool
 	immortalStubs map[Value]unsafe.Pointer
+	// Custom (tp_basicsize > 16) allocation: side maps keyed by returned PyObject* base.
+	customPages   []arenaPage
+	customAlloc   map[unsafe.Pointer]int // base -> total size incl. prefix
+	customHandles map[unsafe.Pointer]uint64
 }
 
 var (
@@ -68,12 +81,14 @@ func GetDefaultArena() *ShadowArena {
 
 func NewShadowArena() *ShadowArena {
 	a := &ShadowArena{
-		handleTable: make([]Value, 0, 1024),
-		reverse:     make(map[Value]unsafe.Pointer),
-		typeMap:     make(map[*PyType]unsafe.Pointer),
-		typeReverse: make(map[unsafe.Pointer]*PyType),
-		typeNames:   make(map[unsafe.Pointer][]byte),
-		strCache:    make(map[unsafe.Pointer][]byte),
+		handleTable:   make([]Value, 0, 1024),
+		reverse:       make(map[Value]unsafe.Pointer),
+		typeMap:       make(map[*PyType]unsafe.Pointer),
+		typeReverse:   make(map[unsafe.Pointer]*PyType),
+		typeNames:     make(map[unsafe.Pointer][]byte),
+		strCache:      make(map[unsafe.Pointer][]byte),
+		customAlloc:   make(map[unsafe.Pointer]int),
+		customHandles: make(map[unsafe.Pointer]uint64),
 	}
 	return a
 }
@@ -118,6 +133,74 @@ func (a *ShadowArena) allocStubLocked() unsafe.Pointer {
 	*stubHandle(p) = 0
 	*stubFlags(p) = 0
 	return p
+}
+
+// needsCustomLocked reports whether v's type requires a tp_basicsize payload stub (prefix).
+func needsCustomLocked(v Value) bool {
+	tp := v.Type()
+	if tp == nil {
+		return false
+	}
+	return effectiveBasicsize(tp) > 16
+}
+
+// allocCustomLocked allocates a variable-size payload stub for tp_basicsize > 16.
+// Layout: [16B prefix: handle u64][magic u64][PyObject basicsize bytes].
+// Caller holds mu. Returns the PyObject* base (after prefix). Handle stored in map.
+func effectiveBasicsize(tp *PyType) int {
+	if tp == nil {
+		return 16
+	}
+	best := tp.Basicsize
+	for _, b := range tp.MRO {
+		if b != nil && b.Basicsize > best {
+			best = b.Basicsize
+		}
+	}
+	if best < 16 {
+		best = 16
+	}
+	return best
+}
+
+func (a *ShadowArena) allocCustomLocked(v Value) unsafe.Pointer {
+	tp := v.Type()
+	basicsize := max(effectiveBasicsize(tp), 16)
+	// Align total to 8 for Go/C ABI.
+	total := basicsize + CustomPayloadPrefixSize
+	if total%8 != 0 {
+		total += 8 - (total % 8)
+	}
+	// Allocate from customPages (append-only; freed blocks leak as holes — acceptable for MVP,
+	// sizes are small and process lifetime is bounded; alternatively reuse via free list).
+	if len(a.customPages) == 0 || a.customPages[len(a.customPages)-1].next+total > len(a.customPages[len(a.customPages)-1].data) {
+		data, _, err := arenaMmap(256 * 1024)
+		if err != nil {
+			panic("val: shadow custom mmap failed: " + err.Error())
+		}
+		a.customPages = append(a.customPages, arenaPage{data: data, next: 0})
+	}
+	pg := &a.customPages[len(a.customPages)-1]
+	base := unsafe.Pointer(&pg.data[pg.next])
+	pg.next += total
+	// Zero the whole block incl. payload (C expects zeroed tp_alloc memory).
+	for i := range total {
+		*(*byte)(unsafe.Add(base, i)) = 0
+	}
+	stub := unsafe.Add(base, CustomPayloadPrefixSize)
+	*stubRefcnt(stub) = 1
+	*stubTypePtr(stub) = a.shadowTypeLocked(v.Type())
+	idx := a.allocHandleLocked(v)
+	*(*uint64)(base) = idx
+	*(*uint64)(unsafe.Add(base, 8)) = CustomPayloadMagic
+	// Keep size + handle in side maps for FromStub/Dealloc (C may overwrite bytes 16..).
+	a.customAlloc[stub] = total
+	a.customHandles[stub] = idx
+	if v.ptr != nil && v.ptr.Kind == KindNative {
+		// Remember arena base on the Go object for tp_dealloc access.
+		v.AsCInstance().ArenaPtr = stub
+	}
+	return stub
 }
 
 func (a *ShadowArena) allocHandleLocked(v Value) uint64 {
@@ -218,6 +301,45 @@ func (a *ShadowArena) shadowTypeLocked(t *PyType) unsafe.Pointer {
 		bs = 64
 	}
 	*(*int64)(unsafe.Add(blk, 32)) = bs
+	// tp_flags @168 for FastSubclass checks; propagate from MRO bases so int subclasses pass PyLong_Check.
+	var cflags uint64
+	for _, b := range t.MRO {
+		switch b {
+		case IntType, BoolType:
+			cflags |= 1 << 24
+		case ListType:
+			cflags |= 1 << 25
+		case TupleType:
+			cflags |= 1 << 26
+		case BytesType, ByteArrayType:
+			cflags |= 1 << 27
+		case StrType:
+			cflags |= 1 << 28
+		case DictType:
+			cflags |= 1 << 29
+		case TypeType:
+			cflags |= 1 << 31
+		}
+	}
+	// Self case when MRO not yet built (early init: t itself is builtin).
+	switch t {
+	case IntType, BoolType:
+		cflags |= 1 << 24
+	case ListType:
+		cflags |= 1 << 25
+	case TupleType:
+		cflags |= 1 << 26
+	case BytesType, ByteArrayType:
+		cflags |= 1 << 27
+	case StrType:
+		cflags |= 1 << 28
+	case DictType:
+		cflags |= 1 << 29
+	case TypeType:
+		cflags |= 1 << 31
+	}
+	cflags |= 1 << 10
+	*(*uint64)(unsafe.Add(blk, 168)) = cflags
 	// tp_itemsize at 40
 	*(*int64)(unsafe.Add(blk, 40)) = 0
 	a.typeMap[t] = blk
@@ -233,11 +355,16 @@ func (a *ShadowArena) ToStub(v Value) unsafe.Pointer {
 	a.mu.Lock()
 	a.ensureImmortalsLocked()
 	if stub, ok := a.reverse[v]; ok {
-		// check immortal
 		rc := *stubRefcnt(stub)
 		if rc < ImmortalRefcnt {
 			*stubRefcnt(stub) = rc + 1
 		}
+		a.mu.Unlock()
+		return stub
+	}
+	if needsCustomLocked(v) {
+		stub := a.allocCustomLocked(v)
+		a.reverse[v] = stub
 		a.mu.Unlock()
 		return stub
 	}
@@ -262,6 +389,12 @@ func (a *ShadowArena) BorrowStub(v Value) unsafe.Pointer {
 		a.mu.Unlock()
 		return stub
 	}
+	if needsCustomLocked(v) {
+		stub := a.allocCustomLocked(v)
+		a.reverse[v] = stub
+		a.mu.Unlock()
+		return stub
+	}
 	stub := a.allocStubLocked()
 	*stubRefcnt(stub) = 1
 	*stubTypePtr(stub) = a.shadowTypeLocked(v.Type())
@@ -279,7 +412,12 @@ func (a *ShadowArena) FromStub(p unsafe.Pointer) Value {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	// fast immortal check via reverse? need handle lookup
+	if idx, ok := a.customHandles[p]; ok {
+		if idx >= uint64(len(a.handleTable)) {
+			return NoneVal()
+		}
+		return a.handleTable[idx]
+	}
 	idx := *stubHandle(p)
 	if idx >= uint64(len(a.handleTable)) {
 		return NoneVal()
@@ -303,22 +441,54 @@ func (a *ShadowArena) DeallocStub(p unsafe.Pointer) {
 		return
 	}
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	rc := *stubRefcnt(p)
 	if rc >= ImmortalRefcnt {
-		// immortal: ignore (CPython immortal DECREF is no-op)
+		a.mu.Unlock()
 		return
 	}
 	if rc != 0 {
+		a.mu.Unlock()
 		return
 	}
-	idx := *stubHandle(p)
+	// Resolve handle (custom side map first; C may have overwritten offset 16).
+	var idx uint64
+	isCustom := false
+	if h, ok := a.customHandles[p]; ok {
+		idx = h
+		isCustom = true
+	} else {
+		idx = *stubHandle(p)
+	}
 	var v Value
 	if idx < uint64(len(a.handleTable)) {
 		v = a.handleTable[idx]
 		a.handleTable[idx] = NoneVal()
 		a.freeHandles = append(a.freeHandles, idx)
 	}
+	if isCustom {
+		delete(a.customHandles, p)
+		delete(a.customAlloc, p)
+		delete(a.reverse, v)
+		if buf, ok := a.strCache[p]; ok {
+			_ = buf
+			delete(a.strCache, p)
+		}
+		// Mark payload zeroed; block is leaked (append-only arena) to avoid use-after-free
+		// with C code retaining the pointer during tp_dealloc. Call tp_dealloc hook, then release.
+		if v.ptr != nil && v.ptr.Kind == KindNative {
+			ci := v.AsCInstance()
+			if ci != nil && !ci.DeallocCalled {
+				ci.DeallocCalled = true
+			}
+		}
+		hook := CDeallocHook
+		a.mu.Unlock()
+		if hook != nil && v.ptr != nil {
+			hook(v)
+		}
+		return
+	}
+	// Non-custom path: lock still held from top (no re-acquire). Release at end.
 	// delete reverse entry (find by value)
 	if v.ptr != nil || v.num != 0 {
 		delete(a.reverse, v)
@@ -364,6 +534,7 @@ func (a *ShadowArena) DeallocStub(p unsafe.Pointer) {
 			}
 		}
 	}
+	a.mu.Unlock()
 }
 
 // ShadowType returns PyTypeObject* for t.
@@ -464,6 +635,63 @@ func AliasShadowType(a *ShadowArena, t *PyType, blk unsafe.Pointer) {
 	defer a.mu.Unlock()
 	a.typeMap[t] = blk
 	a.typeReverse[blk] = t
+}
+
+// AliasShadowStub registers an external object block (shim _Py_*Struct) as the stub for v.
+// The block must be at least 32 bytes; it is initialized as an immortal stub
+// with refcnt=Immortal, type=shadow of v.Type(), handle pointing at v.
+func AliasShadowStub(a *ShadowArena, v Value, blk unsafe.Pointer) {
+	if a == nil || blk == nil || v.HeaderPtr() == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.ensureImmortalsLocked()
+	*stubRefcnt(blk) = ImmortalRefcnt
+	*stubTypePtr(blk) = a.shadowTypeLocked(v.Type())
+	idx := a.allocHandleLocked(v)
+	*stubHandle(blk) = idx
+	*stubFlags(blk) = 0
+	a.reverse[v] = blk
+	if v.IsNone() || v.IsBool() || v.IsNotImplemented() || v.IsEllipsis() {
+		a.immortalStubs[v] = blk
+	}
+}
+
+// ForgetStubForValue drops reverse/handle entries when Go GC collects a C instance
+// whose C refcount never hit zero (orphaned). Safe to call multiple times.
+func (a *ShadowArena) ForgetStubForValue(v Value) {
+	if v.HeaderPtr() == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	// If the stub still exists and refcount is 1 (Go-owned), free it.
+	// If refcount >1 (C holds refs), leave handle so C can still FromStub, but clear reverse
+	// so GC'd Value is not returned for a stale pointer. For MVP, only free when refcount==1.
+	if stub, ok := a.reverse[v]; ok {
+		rc := *stubRefcnt(stub)
+		if rc < ImmortalRefcnt && rc <= 1 {
+			if h, isCustom := a.customHandles[stub]; isCustom {
+				_ = h
+				delete(a.customHandles, stub)
+				delete(a.customAlloc, stub)
+				// Free handle.
+				if h < uint64(len(a.handleTable)) {
+					a.handleTable[h] = NoneVal()
+					a.freeHandles = append(a.freeHandles, h)
+				}
+			} else if idx := *stubHandle(stub); idx < uint64(len(a.handleTable)) {
+				a.handleTable[idx] = NoneVal()
+				a.freeHandles = append(a.freeHandles, idx)
+			}
+			*stubRefcnt(stub) = 0
+			delete(a.reverse, v)
+			if _, isCustom := a.customHandles[stub]; !isCustom {
+				a.freeStubs = append(a.freeStubs, stub)
+			}
+		}
+	}
 }
 
 // ArenaStats exposes counts for GC/leak tests.

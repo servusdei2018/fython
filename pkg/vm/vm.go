@@ -813,7 +813,14 @@ func (vm *VM) initBuiltins() {
 			return val.Int64Val(int64(len(a.AsByteArray().Data)))
 		}
 		if a.IsMemoryView() {
-			return val.Int64Val(int64(len(a.AsMemoryView().Buf)))
+			mv := a.AsMemoryView()
+			if len(mv.Shape) > 0 {
+				return val.Int64Val(int64(mv.Shape[0]))
+			}
+			if mv.ItemSize > 1 {
+				return val.Int64Val(int64(len(mv.Buf) / mv.ItemSize))
+			}
+			return val.Int64Val(int64(len(mv.Buf)))
 		}
 		if sqLen := a.Type().Slots.SqLen; sqLen != nil {
 			return val.Int64Val(sqLen(ctx, a))
@@ -2188,7 +2195,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		case OP_BINARY_SUBSCR:
 			key := stack[sp-1]
 			obj := stack[sp-2]
-			if obj.Kind() == val.KindMemoryView && key.IsInt64() {
+			if obj.Kind() == val.KindMemoryView && key.IsInt64() && obj.AsMemoryView().ItemSize <= 1 && obj.AsMemoryView().NDim <= 1 {
 				mv := obj.AsMemoryView()
 				buf := mv.Buf
 				k := key.AsInt64()
@@ -2305,7 +2312,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			key := stack[sp-1]
 			obj := stack[sp-2]
 			valToStore := stack[sp-3]
-			if obj.Kind() == val.KindMemoryView && key.IsInt64() && valToStore.IsInt64() {
+			if obj.Kind() == val.KindMemoryView && key.IsInt64() && valToStore.IsInt64() && obj.AsMemoryView().ItemSize <= 1 && obj.AsMemoryView().NDim <= 1 {
 				mv := obj.AsMemoryView()
 				if !mv.ReadOnly {
 					buf := mv.Buf
@@ -2573,7 +2580,15 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				arg := stack[newBase]
 				switch arg.Kind() {
 				case val.KindMemoryView:
-					stack[retSP] = val.Int64Val(int64(len(arg.AsMemoryView().Buf)))
+					mv := arg.AsMemoryView()
+					switch {
+					case len(mv.Shape) > 0:
+						stack[retSP] = val.Int64Val(int64(mv.Shape[0]))
+					case mv.ItemSize > 1:
+						stack[retSP] = val.Int64Val(int64(len(mv.Buf) / mv.ItemSize))
+					default:
+						stack[retSP] = val.Int64Val(int64(len(mv.Buf)))
+					}
 					sp = retSP + 1
 					ip++
 					continue
@@ -5570,7 +5585,14 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 
 			if container.Kind() == val.KindMemoryView {
 				mv := container.AsMemoryView()
-				start, stop, _, sliceLen, err := val.NormalizeSliceIndices(startVal, stopVal, val.NoneVal(), len(mv.Buf))
+				// ND/typed: slice in element space (shape[0]); byte 1D is a special case.
+				mvLen := len(mv.Buf)
+				if len(mv.Shape) > 0 {
+					mvLen = mv.Shape[0]
+				} else if mv.ItemSize > 1 {
+					mvLen = len(mv.Buf) / mv.ItemSize
+				}
+				start, stop, _, sliceLen, err := val.NormalizeSliceIndices(startVal, stopVal, val.NoneVal(), mvLen)
 				if err != nil {
 					exc := val.NewTypeError(err.Error())
 					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
@@ -5583,13 +5605,55 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				newMv := vm.allocMemoryView()
 				newMv.Header = val.ObjectHeader{Kind: val.KindMemoryView, Type: val.MemoryViewType}
 				newMv.Obj = mv.Obj
-				if sliceLen == 0 {
-					newMv.Buf = mv.Buf[start:start:start]
+				// Convert element indices to byte offset via stride[0].
+				stride0 := mv.ItemSize
+				if stride0 == 0 {
+					stride0 = 1
+				}
+				if len(mv.Strides) > 0 {
+					stride0 = mv.Strides[0]
+				}
+				byteStart := start * stride0
+				byteStop := stop * stride0
+				if byteStart < 0 {
+					byteStart = 0
+				}
+				if byteStop < byteStart {
+					byteStop = byteStart
+				}
+				if byteStart >= len(mv.Buf) {
+					newMv.Buf = mv.Buf[len(mv.Buf):len(mv.Buf):len(mv.Buf)]
 				} else {
-					newMv.Buf = mv.Buf[start:stop:stop]
+					if byteStop > len(mv.Buf) {
+						byteStop = len(mv.Buf)
+					}
+					newMv.Buf = mv.Buf[byteStart:byteStop:byteStop]
 				}
 				newMv.ReadOnly = mv.ReadOnly
 				newMv.ItemSize = mv.ItemSize
+				if newMv.ItemSize == 0 {
+					newMv.ItemSize = 1
+				}
+				newMv.Format = mv.Format
+				if newMv.Format == "" {
+					newMv.Format = "B"
+				}
+				newMv.NDim = len(mv.Shape)
+				if newMv.NDim == 0 {
+					newMv.NDim = 1
+				}
+				newShape := append([]int(nil), mv.Shape...)
+				if len(newShape) == 0 {
+					newShape = []int{sliceLen}
+				} else {
+					newShape[0] = sliceLen
+				}
+				newMv.Shape = newShape
+				newStrides := append([]int(nil), mv.Strides...)
+				if len(newStrides) == 0 {
+					newStrides = val.CContiguousStrides(newShape, newMv.ItemSize)
+				}
+				newMv.Strides = newStrides
 				stack[sp-3] = val.ObjectVal(&newMv.Header)
 				sp -= 2
 				ip++

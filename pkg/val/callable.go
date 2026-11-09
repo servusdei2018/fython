@@ -1561,7 +1561,14 @@ func byteArrayMpAssSubscript(ctx *ExecContext, a, idxVal, val Value) Value {
 }
 
 func memoryViewSqLen(ctx *ExecContext, a Value) int64 {
-	return int64(len(a.AsMemoryView().Buf))
+	mv := a.AsMemoryView()
+	if mv.NDim > 0 && len(mv.Shape) > 0 {
+		return int64(mv.Shape[0])
+	}
+	if mv.ItemSize > 1 {
+		return int64(len(mv.Buf) / mv.ItemSize)
+	}
+	return int64(len(mv.Buf))
 }
 
 func memoryViewTpAsBuffer(ctx *ExecContext, obj Value, view *PyBuffer, flags int) error {
@@ -1573,49 +1580,79 @@ func memoryViewMpSubscript(ctx *ExecContext, a, idxVal Value) Value {
 	if mv.released {
 		panic("ValueError: operation on released memoryview")
 	}
+	shape := mvEffectiveShape(mv)
+	strides := mvEffectiveStrides(mv)
+	itemSize := mv.ItemSize
+	if itemSize == 0 {
+		itemSize = 1
+	}
+	format := mv.Format
+	if format == "" {
+		format = "B"
+	}
+	ndim := len(shape)
+
+	// Slice on first dimension (PEP 3118: mv[start:stop:step] keeps ndim).
 	if idxVal.IsSlice() {
 		sl := idxVal.AsSlice()
-		start, stop, step, sliceLen, err := NormalizeSliceIndices(sl.Start, sl.Stop, sl.Step, len(mv.Buf))
+		start, _, step, sliceLen, err := NormalizeSliceIndices(sl.Start, sl.Stop, sl.Step, shape[0])
 		if err != nil {
 			panic(err.Error())
 		}
+		byteOffset := start * strides[0]
+		newShape := append([]int(nil), shape...)
+		newShape[0] = sliceLen
+		newStrides := append([]int(nil), strides...)
 		if step != 1 {
-			panic("NotImplementedError: non-contiguous memoryview slice not supported")
+			newStrides[0] = strides[0] * step
 		}
 		if sliceLen == 0 {
-			obj := &PyMemoryView{
-				Header: ObjectHeader{
-					Kind: KindMemoryView,
-					Type: MemoryViewType,
-				},
-				Obj:      mv.Obj,
-				Buf:      mv.Buf[start:start:start],
-				ReadOnly: mv.ReadOnly,
-				ItemSize: mv.ItemSize,
+			return mvSubview(mv, byteOffset, newShape, newStrides)
+		}
+		return mvSubview(mv, byteOffset, newShape, newStrides)
+	}
+
+	// Multi-index (tuple) or single int.
+	var indices []int
+	switch {
+	case idxVal.IsTuple():
+		tup := idxVal.AsTuple().Items
+		for _, it := range tup {
+			if !it.IsInt64() && !it.IsBool() {
+				panic("TypeError: memoryview indices must be integers or slices")
 			}
-			return Value{num: 0, ptr: &obj.Header}
+			indices = append(indices, int(it.AsInt64()))
 		}
-		// Zero-copy sub-slice view! 0 bytes copied, shares underlying buffer!
-		obj := &PyMemoryView{
-			Header: ObjectHeader{
-				Kind: KindMemoryView,
-				Type: MemoryViewType,
-			},
-			Obj:      mv.Obj,
-			Buf:      mv.Buf[start:stop:stop],
-			ReadOnly: mv.ReadOnly,
-			ItemSize: mv.ItemSize,
+	case idxVal.IsInt64() || idxVal.IsBool():
+		indices = []int{int(idxVal.AsInt64())}
+	default:
+		panic("TypeError: memoryview indices must be integers, slices, or tuples of integers")
+	}
+
+	if len(indices) == 0 {
+		return a
+	}
+	if len(indices) > ndim {
+		panic("IndexError: too many indices for memoryview")
+	}
+	offset := 0
+	for dim, raw := range indices {
+		dimLen := shape[dim]
+		idx := raw
+		if idx < 0 {
+			idx += dimLen
 		}
-		return Value{num: 0, ptr: &obj.Header}
+		if idx < 0 || idx >= dimLen {
+			panic("IndexError: index out of bounds")
+		}
+		offset += idx * strides[dim]
 	}
-	idx := int(idxVal.AsInt64())
-	if idx < 0 {
-		idx += len(mv.Buf)
+	// Scalar access when all dims indexed; otherwise subview dropping leading dims.
+	if len(indices) == ndim {
+		return decodeValue(mv.Buf, offset, format, itemSize)
 	}
-	if idx < 0 || idx >= len(mv.Buf) {
-		panic("IndexError: index out of bounds")
-	}
-	return Int64Val(int64(mv.Buf[idx]))
+	// Subview: shape/strides from first unindexed dim onward.
+	return mvSubview(mv, offset, shape[len(indices):], strides[len(indices):])
 }
 
 func memoryViewMpAssSubscript(ctx *ExecContext, a, idxVal, val Value) Value {
@@ -1626,15 +1663,26 @@ func memoryViewMpAssSubscript(ctx *ExecContext, a, idxVal, val Value) Value {
 	if mv.ReadOnly {
 		panic("TypeError: cannot modify read-only memoryview")
 	}
+	shape := mvEffectiveShape(mv)
+	strides := mvEffectiveStrides(mv)
+	itemSize := mv.ItemSize
+	if itemSize == 0 {
+		itemSize = 1
+	}
+	fmtCode := mv.Format
+	if fmtCode == "" {
+		fmtCode = "B"
+	}
 	if idxVal.IsSlice() {
 		sl := idxVal.AsSlice()
-		start, stop, step, sliceLen, err := NormalizeSliceIndices(sl.Start, sl.Stop, sl.Step, len(mv.Buf))
+		start, stop, step, sliceLen, err := NormalizeSliceIndices(sl.Start, sl.Stop, sl.Step, shape[0])
 		if err != nil {
 			panic(err.Error())
 		}
 		if step != 1 {
 			panic("NotImplementedError: non-contiguous memoryview slice assignment")
 		}
+		_ = stop
 		var rhsBytes []byte
 		switch {
 		case val.IsBytes():
@@ -1646,24 +1694,60 @@ func memoryViewMpAssSubscript(ctx *ExecContext, a, idxVal, val Value) Value {
 		default:
 			panic("TypeError: must assign bytes-like object")
 		}
-		if len(rhsBytes) != sliceLen {
+		// For 1D byte views, length is in bytes; for typed views, count elements.
+		expected := sliceLen
+		if itemSize == 1 && len(shape) == 1 {
+			expected = sliceLen * itemSize
+		}
+		if len(rhsBytes) != expected {
 			panic("ValueError: cannot resize memoryview")
 		}
-		copy(mv.Buf[start:stop], rhsBytes)
+		byteOff := start * strides[0]
+		// Fast path: contiguous 1D copy.
+		if IsCContiguous(shape, strides, itemSize) {
+			copy(mv.Buf[byteOff:byteOff+expected], rhsBytes)
+			return NoneVal()
+		}
+		// Strided copy element by element.
+		for i := range sliceLen {
+			dstOff := byteOff + i*strides[0]
+			srcOff := i * itemSize
+			copy(mv.Buf[dstOff:dstOff+itemSize], rhsBytes[srcOff:srcOff+itemSize])
+		}
 		return NoneVal()
 	}
-	idx := int(idxVal.AsInt64())
-	if idx < 0 {
-		idx += len(mv.Buf)
+	// Scalar assignment: single index or tuple multi-index.
+	var indices []int
+	switch {
+	case idxVal.IsTuple():
+		for _, it := range idxVal.AsTuple().Items {
+			if !it.IsInt64() && !it.IsBool() {
+				panic("TypeError: memoryview indices must be integers")
+			}
+			indices = append(indices, int(it.AsInt64()))
+		}
+	case idxVal.IsInt64() || idxVal.IsBool():
+		indices = []int{int(idxVal.AsInt64())}
+	default:
+		panic("TypeError: memoryview indices must be integers")
 	}
-	if idx < 0 || idx >= len(mv.Buf) {
-		panic("IndexError: index out of bounds")
+	if len(indices) != len(shape) {
+		// Assignment requires full index; slice assignment handled above.
+		panic("IndexError: too few indices for memoryview")
 	}
-	b := val.AsInt64()
-	if b < 0 || b > 255 {
-		panic("ValueError: byte must be in range(0, 256)")
+	offset := 0
+	for dim, raw := range indices {
+		dimLen := shape[dim]
+		idx := raw
+		if idx < 0 {
+			idx += dimLen
+		}
+		if idx < 0 || idx >= dimLen {
+			panic("IndexError: index out of bounds")
+		}
+		offset += idx * strides[dim]
 	}
-	mv.Buf[idx] = byte(b)
+	encodeValue(mv.Buf, offset, val, fmtCode, itemSize)
 	return NoneVal()
 }
 
@@ -6806,8 +6890,32 @@ func initTypes() {
 		if mv.released {
 			panic("ValueError: operation on released memoryview")
 		}
-		res := make([]byte, len(mv.Buf))
-		copy(res, mv.Buf)
+		shape := mvEffectiveShape(mv)
+		strides := mvEffectiveStrides(mv)
+		itemSize := mv.ItemSize
+		if itemSize == 0 {
+			itemSize = 1
+		}
+		nbytes := ShapeNumElements(shape) * itemSize
+		// Fast path: contiguous.
+		if len(shape) <= 1 || IsCContiguous(shape, strides, itemSize) {
+			res := make([]byte, nbytes)
+			copy(res, mv.Buf[:nbytes])
+			return NewBytesVal(res)
+		}
+		// Gather in C order.
+		res := make([]byte, 0, nbytes)
+		var walk func(dim, off int)
+		walk = func(dim, off int) {
+			if dim == len(shape) {
+				res = append(res, mv.Buf[off:off+itemSize]...)
+				return
+			}
+			for i := range shape[dim] {
+				walk(dim+1, off+i*strides[dim])
+			}
+		}
+		walk(0, 0)
 		return NewBytesVal(res)
 	}))
 	MemoryViewType.Dict.Set(InternString("tolist"), NewBuiltinFuncVal("tolist", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
@@ -6818,11 +6926,28 @@ func initTypes() {
 		if mv.released {
 			panic("ValueError: operation on released memoryview")
 		}
-		items := make([]Value, len(mv.Buf))
-		for i, b := range mv.Buf {
-			items[i] = Int64Val(int64(b))
+		shape := mvEffectiveShape(mv)
+		strides := mvEffectiveStrides(mv)
+		itemSize := mv.ItemSize
+		if itemSize == 0 {
+			itemSize = 1
 		}
-		return NewListVal(items...)
+		format := mv.Format
+		if format == "" {
+			format = "B"
+		}
+		var walk func(dim, off int) Value
+		walk = func(dim, off int) Value {
+			if dim == len(shape) {
+				return decodeValue(mv.Buf, off, format, itemSize)
+			}
+			items := make([]Value, shape[dim])
+			for i := range shape[dim] {
+				items[i] = walk(dim+1, off+i*strides[dim])
+			}
+			return NewListVal(items...)
+		}
+		return walk(0, 0)
 	}))
 
 	TypeType.Dict.Set(DunderCall, NewBuiltinFuncVal("type.__call__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
@@ -6863,15 +6988,63 @@ func initTypes() {
 		if mv.released {
 			panic("ValueError: operation forbidden on released memoryview object")
 		}
+		format := args[1].AsString()
+		newItemSize, err := FormatSize(format)
+		if err != nil {
+			panic("TypeError: " + err.Error())
+		}
+		if newItemSize <= 0 {
+			panic("TypeError: invalid format for cast")
+		}
+		oldShape := mvEffectiveShape(mv)
+		oldItemSize := mv.ItemSize
+		if oldItemSize == 0 {
+			oldItemSize = 1
+		}
+		nbytes := ShapeNumElements(oldShape) * oldItemSize
+		// Substrides case: cast requires C-contiguous view of identical nbytes.
+		if len(oldShape) > 1 || (len(mv.Strides) > 0 && !IsCContiguous(oldShape, mvEffectiveStrides(mv), oldItemSize)) {
+			// Allow only if underlying buffer gaps account for same nbytes; check C-contiguous.
+			if !IsCContiguous(oldShape, mvEffectiveStrides(mv), oldItemSize) {
+				panic("TypeError: cannot cast non-contiguous memoryview")
+			}
+		}
+		var newShape []int
+		if len(args) >= 3 && !args[2].IsNone() {
+			switch {
+			case args[2].IsTuple():
+				for _, it := range args[2].AsTuple().Items {
+					newShape = append(newShape, int(it.AsInt64()))
+				}
+			case args[2].IsList():
+				for _, it := range args[2].AsList().Items {
+					newShape = append(newShape, int(it.AsInt64()))
+				}
+			case args[2].IsInt64():
+				newShape = []int{int(args[2].AsInt64())}
+			default:
+				panic("TypeError: shape must be a tuple of ints")
+			}
+			if ShapeNumElements(newShape)*newItemSize != nbytes {
+				panic("TypeError: cannot cast to shape; size mismatch")
+			}
+		} else {
+			if nbytes%newItemSize != 0 {
+				panic("TypeError: cannot cast; buffer size not divisible by item size")
+			}
+			newShape = []int{nbytes / newItemSize}
+		}
+		newStrides := CContiguousStrides(newShape, newItemSize)
 		obj := &PyMemoryView{
-			Header: ObjectHeader{
-				Kind: KindMemoryView,
-				Type: MemoryViewType,
-			},
+			Header:   ObjectHeader{Kind: KindMemoryView, Type: MemoryViewType},
 			Obj:      mv.Obj,
 			Buf:      mv.Buf,
 			ReadOnly: mv.ReadOnly,
-			ItemSize: 1,
+			ItemSize: newItemSize,
+			Format:   format,
+			NDim:     len(newShape),
+			Shape:    newShape,
+			Strides:  newStrides,
 		}
 		return Value{num: 0, ptr: &obj.Header}
 	}))
@@ -6881,11 +7054,91 @@ func initTypes() {
 				panic("TypeError: nbytes missing self")
 			}
 			mv := args[0].AsMemoryView()
-			return Int64Val(int64(len(mv.Buf)))
+			shape := mvEffectiveShape(mv)
+			itemSize := mv.ItemSize
+			if itemSize == 0 {
+				itemSize = 1
+			}
+			return Int64Val(int64(ShapeNumElements(shape) * itemSize))
 		}),
 		NoneVal(),
 		NoneVal(),
 	))
+	// PEP 3118 read-only attributes.
+	setMvProp := func(name, desc string, getter func(mv *PyMemoryView) Value) {
+		_ = desc
+		MemoryViewType.Dict.Set(InternString(name), NewPropertyVal(
+			NewBuiltinFuncVal(name, func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+				if len(args) < 1 {
+					panic("TypeError: " + name + " missing self")
+				}
+				mv := args[0].AsMemoryView()
+				if mv.released {
+					panic("ValueError: operation on released memoryview")
+				}
+				return getter(mv)
+			}),
+			NoneVal(),
+			NoneVal(),
+		))
+	}
+	setMvProp("format", "PEP3118 format code", func(mv *PyMemoryView) Value {
+		f := mv.Format
+		if f == "" {
+			f = "B"
+		}
+		return NewStringVal(f)
+	})
+	setMvProp("itemsize", "item size in bytes", func(mv *PyMemoryView) Value {
+		is := mv.ItemSize
+		if is == 0 {
+			is = 1
+		}
+		return Int64Val(int64(is))
+	})
+	setMvProp("ndim", "number of dimensions", func(mv *PyMemoryView) Value {
+		return Int64Val(int64(len(mvEffectiveShape(mv))))
+	})
+	setMvProp("shape", "shape tuple", func(mv *PyMemoryView) Value {
+		shape := mvEffectiveShape(mv)
+		items := make([]Value, len(shape))
+		for i, d := range shape {
+			items[i] = Int64Val(int64(d))
+		}
+		return NewTupleVal(items...)
+	})
+	setMvProp("strides", "strides tuple", func(mv *PyMemoryView) Value {
+		strides := mvEffectiveStrides(mv)
+		items := make([]Value, len(strides))
+		for i, s := range strides {
+			items[i] = Int64Val(int64(s))
+		}
+		return NewTupleVal(items...)
+	})
+	setMvProp("c_contiguous", "C contiguous?", func(mv *PyMemoryView) Value {
+		return BoolVal(IsCContiguous(mvEffectiveShape(mv), mvEffectiveStrides(mv), max(mv.ItemSize, 1)))
+	})
+	setMvProp("f_contiguous", "F contiguous?", func(mv *PyMemoryView) Value {
+		return BoolVal(IsFContiguous(mvEffectiveShape(mv), mvEffectiveStrides(mv), max(mv.ItemSize, 1)))
+	})
+	setMvProp("contiguous", "contiguous?", func(mv *PyMemoryView) Value {
+		shape := mvEffectiveShape(mv)
+		strides := mvEffectiveStrides(mv)
+		is := max(mv.ItemSize, 1)
+		return BoolVal(IsCContiguous(shape, strides, is) || IsFContiguous(shape, strides, is))
+	})
+	setMvProp("readonly", "readonly?", func(mv *PyMemoryView) Value { return BoolVal(mv.ReadOnly) })
+	setMvProp("obj", "underlying object", func(mv *PyMemoryView) Value { return mv.Obj })
+	setMvProp("suboffsets", "suboffsets", func(mv *PyMemoryView) Value {
+		if len(mv.Suboffsets) == 0 {
+			return NoneVal()
+		}
+		items := make([]Value, len(mv.Suboffsets))
+		for i, s := range mv.Suboffsets {
+			items[i] = Int64Val(int64(s))
+		}
+		return NewTupleVal(items...)
+	})
 
 	SliceType = MustNewType("slice", []*PyType{ObjectType}, nil)
 	SliceType.Slots.TpGetAttr = sliceGetAttr

@@ -90,7 +90,17 @@ func BuildDispatchTable() []uintptr {
 	// 67 PyErr_NormalizeException
 	// 68 PyErr_GetCause
 	// 69 PyErr_GetContext
-	// To keep table in sync, shim header defines FYTHON_SLOT_COUNT=70
+	// 70 PyType_FromSpec
+	// 71 PyType_FromSpecWithBases
+	// 72 PyType_FromModuleAndSpec
+	// 73 PyObject_GetBuffer
+	// 74 PyBuffer_Release
+	// 75 PyObject_CheckBuffer
+	// 76 PyBuffer_SizeFromFormat
+	// 77 PyBuffer_FillContiguousStrides
+	// 78 PyBuffer_FillInfo
+	// 79 PyBuffer_IsContiguous
+	// To keep table in sync, shim header defines FYTHON_SLOT_COUNT=80
 
 	return []uintptr{
 		cb(PyLong_FromLong),
@@ -163,6 +173,16 @@ func BuildDispatchTable() []uintptr {
 		cb(PyErr_NormalizeException),
 		cb(PyErr_GetCause),
 		cb(PyErr_GetContext),
+		cb(PyType_FromSpec),
+		cb(PyType_FromSpecWithBases),
+		cb(PyType_FromModuleAndSpec),
+		cb(PyObject_GetBuffer),
+		cb(PyBuffer_Release),
+		cb(PyObject_CheckBuffer),
+		cb(PyBuffer_SizeFromFormat),
+		cb(PyBuffer_FillContiguousStrides),
+		cb(PyBuffer_FillInfo),
+		cb(PyBuffer_IsContiguous),
 	}
 }
 
@@ -265,6 +285,26 @@ func BindToShim(shimHandle dynload.Handle) error {
 		initShimTypeBlock(t, ptr)
 	}
 
+	// Alias singleton objects (_Py_NoneStruct etc.) to immortal stubs so C code can
+	// return/compare Py_None, Py_True, Py_False, Py_NotImplemented, Py_Ellipsis.
+	{
+		arena := val.GetDefaultArena()
+		singletons := map[string]val.Value{
+			"_Py_NoneStruct":           val.NoneVal(),
+			"_Py_TrueStruct":           val.BoolVal(true),
+			"_Py_FalseStruct":          val.BoolVal(false),
+			"_Py_NotImplementedStruct": val.NotImplementedVal(),
+			"_Py_EllipsisStruct":       val.EllipsisVal(),
+		}
+		for name, v := range singletons {
+			addr, err := dynload.Sym(shimHandle, name)
+			if err != nil || addr == 0 {
+				continue
+			}
+			ptr := *(*unsafe.Pointer)(unsafe.Pointer(&addr))
+			val.AliasShadowStub(arena, v, ptr)
+		}
+	}
 	// Pre-create shadow types for all builtin types to populate typeMap.
 	for _, t := range allBuiltinTypes() {
 		_ = val.ArenaShadowType(t)
@@ -276,6 +316,27 @@ func BindToShim(shimHandle dynload.Handle) error {
 func initShimTypeBlock(t *val.PyType, blk unsafe.Pointer) {
 	// Same layout as val shadow: refcnt @0, type @8, size @16, tp_name @24
 	*(*int64)(blk) = val.ImmortalRefcnt
+	// tp_flags @168 (unsigned long) for PyType_FastSubclass checks (PyLong_Check etc.).
+	var cflags uint64
+	switch t {
+	case val.IntType, val.BoolType:
+		cflags |= 1 << 24 // Py_TPFLAGS_LONG_SUBCLASS
+	case val.ListType:
+		cflags |= 1 << 25
+	case val.TupleType:
+		cflags |= 1 << 26
+	case val.BytesType, val.ByteArrayType:
+		cflags |= 1 << 27
+	case val.StrType:
+		cflags |= 1 << 28
+	case val.DictType:
+		cflags |= 1 << 29
+	case val.TypeType:
+		cflags |= 1 << 31
+	}
+	// Py_TPFLAGS_BASETYPE (1<<10) to indicate subclassing allowed for heap types.
+	cflags |= 1 << 10
+	*(*uint64)(unsafe.Add(blk, 168)) = cflags
 	// ob_type for TypeType points to self, others to TypeType's shadow
 	if t == val.TypeType {
 		*(*unsafe.Pointer)(unsafe.Add(blk, 8)) = blk

@@ -111,7 +111,7 @@ type PyByteArray struct {
 	mu     sync.RWMutex
 }
 
-// PyMemoryView represents a zero-copy buffer view on the heap.
+// PyMemoryView represents a zero-copy buffer view on the heap (PEP 3118).
 // Header MUST be at offset 0.
 type PyMemoryView struct {
 	Header   ObjectHeader
@@ -120,6 +120,22 @@ type PyMemoryView struct {
 	ReadOnly bool
 	ItemSize int
 	released bool
+	// PEP 3118 typed / multi-dimensional view metadata.
+	Format     string
+	NDim       int
+	Shape      []int
+	Strides    []int
+	Suboffsets []int
+}
+
+// PyCInstance represents an instance of a C extension type (PyType_FromSpec / static PyTypeObject).
+// Header MUST be at offset 0. The C payload lives off-heap in ShadowArena; this Go struct
+// holds only the bookkeeping (dict for Python subclass attrs, dealloc tracking).
+type PyCInstance struct {
+	Header        ObjectHeader
+	Dict          *PyDict // lazily created for Python subclass __dict__
+	DeallocCalled bool
+	ArenaPtr      unsafe.Pointer // off-heap PyObject* (base, prefix-adjusted view)
 }
 
 // PySlice represents a Python slice(start, stop, step) object.
@@ -450,18 +466,52 @@ func NewMemoryViewVal(target Value) Value {
 	if tp.Slots.TpAsBuffer == nil {
 		panic("TypeError: a bytes-like object is required, not '" + tp.Name + "'")
 	}
-	if err := tp.Slots.TpAsBuffer(nil, target, &view, PyBUF_SIMPLE); err != nil {
+	if err := tp.Slots.TpAsBuffer(nil, target, &view, PyBUF_STRIDES|PyBUF_FORMAT); err != nil {
 		panic("BufferError: " + err.Error())
 	}
+	// Default to 1D unsigned-byte view if provider left metadata empty.
+	format := view.Format
+	if format == "" {
+		format = "B"
+	}
+	ndim := view.NDim
+	shape := view.Shape
+	strides := view.Strides
+	itemSize := view.ItemSize
+	if itemSize == 0 {
+		if sz, err := FormatSize(format); err == nil && sz > 0 {
+			itemSize = sz
+		} else {
+			itemSize = 1
+		}
+	}
+	if ndim == 0 && shape == nil {
+		ndim = 1
+		// nbytes = len(view.Buf); shape = [nbytes/itemSize]
+		if itemSize > 0 {
+			shape = []int{len(view.Buf) / itemSize}
+		} else {
+			shape = []int{len(view.Buf)}
+		}
+		strides = CContiguousStrides(shape, itemSize)
+	}
+	if strides == nil && shape != nil {
+		strides = CContiguousStrides(shape, itemSize)
+	}
+	if ndim == 0 {
+		ndim = len(shape)
+	}
 	obj := &PyMemoryView{
-		Header: ObjectHeader{
-			Kind: KindMemoryView,
-			Type: MemoryViewType,
-		},
-		Obj:      target,
-		Buf:      view.Buf,
-		ReadOnly: view.ReadOnly,
-		ItemSize: view.ItemSize,
+		Header:     ObjectHeader{Kind: KindMemoryView, Type: MemoryViewType},
+		Obj:        target,
+		Buf:        view.Buf,
+		ReadOnly:   view.ReadOnly,
+		ItemSize:   itemSize,
+		Format:     format,
+		NDim:       ndim,
+		Shape:      shape,
+		Strides:    strides,
+		Suboffsets: view.Suboffsets,
 	}
 	return Value{num: 0, ptr: &obj.Header}
 }
@@ -516,10 +566,19 @@ func (b *PyBytes) GetBuffer(ctx *ExecContext, view *PyBuffer, flags int) error {
 	view.ReadOnly = true
 	view.ItemSize = 1
 	view.Obj = ObjectVal(&b.Header)
+	view.Format = "B"
+	view.NDim = 1
+	view.Shape = []int{len(b.Data)}
+	view.Strides = []int{1}
+	view.Suboffsets = nil
 	return nil
 }
 
-func (b *PyBytes) ReleaseBuffer(view *PyBuffer) {}
+func (b *PyBytes) ReleaseBuffer(view *PyBuffer) {
+	if view != nil && view.Release != nil {
+		view.Release()
+	}
+}
 
 func (ba *PyByteArray) GetBuffer(ctx *ExecContext, view *PyBuffer, flags int) error {
 	ba.mu.RLock()
@@ -528,10 +587,18 @@ func (ba *PyByteArray) GetBuffer(ctx *ExecContext, view *PyBuffer, flags int) er
 	view.ReadOnly = false
 	view.ItemSize = 1
 	view.Obj = ObjectVal(&ba.Header)
+	view.Format = "B"
+	view.NDim = 1
+	view.Shape = []int{len(ba.Data)}
+	view.Strides = []int{1}
 	return nil
 }
 
-func (ba *PyByteArray) ReleaseBuffer(view *PyBuffer) {}
+func (ba *PyByteArray) ReleaseBuffer(view *PyBuffer) {
+	if view != nil && view.Release != nil {
+		view.Release()
+	}
+}
 
 func (mv *PyMemoryView) GetBuffer(ctx *ExecContext, view *PyBuffer, flags int) error {
 	if mv.released {
@@ -543,11 +610,47 @@ func (mv *PyMemoryView) GetBuffer(ctx *ExecContext, view *PyBuffer, flags int) e
 	view.Buf = mv.Buf
 	view.ReadOnly = mv.ReadOnly
 	view.ItemSize = mv.ItemSize
+	if view.ItemSize == 0 {
+		view.ItemSize = 1
+	}
 	view.Obj = mv.Obj
+	view.Format = mv.Format
+	if view.Format == "" {
+		view.Format = "B"
+	}
+	view.NDim = mv.NDim
+	if view.NDim == 0 {
+		view.NDim = 1
+	}
+	view.Shape = mv.Shape
+	if view.Shape == nil {
+		view.Shape = []int{len(mv.Buf) / max(view.ItemSize, 1)}
+	}
+	view.Strides = mv.Strides
+	if view.Strides == nil {
+		view.Strides = CContiguousStrides(view.Shape, view.ItemSize)
+	}
+	view.Suboffsets = mv.Suboffsets
+	// Contiguity checks: if C_CONTIGUOUS requested but view isn't, error.
+	if (flags&PyBUF_C_CONTIGUOUS) != 0 && (flags&PyBUF_C_CONTIGUOUS) == PyBUF_C_CONTIGUOUS {
+		// PyBUF_C_CONTIGUOUS includes STRIDES bits; check actual contiguity.
+		if !IsCContiguous(view.Shape, view.Strides, view.ItemSize) {
+			return errors.New("buffer is not C-contiguous")
+		}
+	}
+	if (flags&PyBUF_F_CONTIGUOUS) != 0 && (flags&PyBUF_F_CONTIGUOUS) != PyBUF_STRIDES {
+		if !IsFContiguous(view.Shape, view.Strides, view.ItemSize) {
+			return errors.New("buffer is not F-contiguous")
+		}
+	}
 	return nil
 }
 
-func (mv *PyMemoryView) ReleaseBuffer(view *PyBuffer) {}
+func (mv *PyMemoryView) ReleaseBuffer(view *PyBuffer) {
+	if view != nil && view.Release != nil {
+		view.Release()
+	}
+}
 
 // NewCellVal constructs a heap-allocated KindCell Value initialized to v.
 func NewCellVal(v Value) Value {

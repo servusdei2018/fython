@@ -635,6 +635,7 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 	modules.Set(val.InternString("_queue"), e.createQueueModule())
 	modules.Set(val.InternString("atexit"), e.createAtexitModule())
 	modules.Set(val.InternString("_testcapi"), e.createTestCapiModule())
+	modules.Set(val.InternString("_ctypes"), e.createCtypesLowerModule())
 	testMod, testSupportMod := e.createTestPackage()
 	modules.Set(val.InternString("test"), testMod)
 	modules.Set(val.InternString("test.support"), testSupportMod)

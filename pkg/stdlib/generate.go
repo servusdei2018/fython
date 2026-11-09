@@ -246,6 +246,17 @@ var upstream = []string{
 	"xml/etree/__init__.py",
 	"xml/etree/ElementTree.py",
 	"xml/etree/ElementPath.py",
+	// ctypes (native _ctypes accelerator must implement these imports)
+	"ctypes/__init__.py",
+	"ctypes/_layout.py",
+	"ctypes/_endian.py",
+	"ctypes/util.py",
+	"ctypes/wintypes.py",
+	"ctypes/_aix.py",
+	"ctypes/macholib/__init__.py",
+	"ctypes/macholib/dyld.py",
+	"ctypes/macholib/dylib.py",
+	"ctypes/macholib/framework.py",
 }
 
 func main() {
