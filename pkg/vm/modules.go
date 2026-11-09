@@ -128,6 +128,21 @@ func (e *Engine) findModuleFile(moduleName string, searchDirs []string) (string,
 		if info, err := os.Stat(modPath); err == nil && !info.IsDir() {
 			return modPath, false, true
 		}
+
+		// Extension suffixes (cpython-315-*.so / abi3.so / .so / .pyd)
+		for _, suf := range extensionSuffixes() {
+			extPath := filepath.Join(dir, relPath+suf)
+			if info, err := os.Stat(extPath); err == nil && !info.IsDir() {
+				return extPath, false, true
+			}
+		}
+		// Extension package __init__<suffix>
+		for _, suf := range extensionSuffixes() {
+			extInit := filepath.Join(dir, relPath, "__init__"+suf)
+			if info, err := os.Stat(extInit); err == nil && !info.IsDir() {
+				return extInit, true, true
+			}
+		}
 	}
 
 	// 3. Check embedded stdlib
@@ -457,7 +472,19 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 				btv.Set(val.InternString("prefix"), val.NewStringVal(prefix))
 				btv.Set(val.InternString("base"), val.NewStringVal(base))
 				btv.Set(val.InternString("SOABI"), val.NewStringVal("cpython-315"))
-				btv.Set(val.InternString("EXT_SUFFIX"), val.NewStringVal(".so"))
+				sufs := extensionSuffixes()
+				extSuffix := ".so"
+				if len(sufs) > 0 {
+					extSuffix = sufs[0]
+				}
+				btv.Set(val.InternString("EXT_SUFFIX"), val.NewStringVal(extSuffix))
+				btv.Set(val.InternString("EXTENSION_SUFFIXES"), val.NewListVal(func() []val.Value {
+					items := make([]val.Value, len(sufs))
+					for i, s := range sufs {
+						items[i] = val.NewStringVal(s)
+					}
+					return items
+				}()...))
 				modVal.AsModule().Dict.Set(val.InternString("build_time_vars"), val.DictVal(btv))
 				vm.modules.Set(internedCurr, modVal)
 				if i > 0 {
@@ -474,6 +501,69 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 
 		if !found {
 			return val.NoneVal(), fmt.Errorf("ModuleNotFoundError: No module named '%s'", currName)
+		}
+
+		// Extension fast-path: .so/.pyd modules load via execExtensionModule (no bytecode)
+		if isExtensionFile(filePath) {
+			modVal := val.NewModuleVal(currName, filePath)
+			mod := modVal.AsModule()
+			if i > 0 {
+				mod.Package = strings.Join(parts[:i], ".")
+			}
+			// Set __package__/__path__ for packages
+			if isPackage {
+				pkgPath := filepath.Dir(filePath)
+				if vfsDir, ok := strings.CutPrefix(filePath, "stdlib:"); ok {
+					pkgPath = "stdlib:" + path.Dir(vfsDir)
+				}
+				mod.Dict.Set(val.InternString("__package__"), val.NewStringVal(currName))
+				mod.Dict.Set(val.InternString("__path__"), val.NewListVal(val.NewStringVal(pkgPath)))
+			} else {
+				if mod.Package != "" {
+					mod.Dict.Set(val.InternString("__package__"), val.NewStringVal(mod.Package))
+				} else {
+					mod.Dict.Set(val.InternString("__package__"), val.NewStringVal(""))
+				}
+			}
+			// Loader/spec
+			loaderVal := newExtensionFileLoaderVal(currName, filePath)
+			specVal := newModuleSpecVal(currName, loaderVal, filePath, isPackage, nil)
+			if isPackage {
+				pkgPath := filepath.Dir(filePath)
+				// Re-create spec with search locations for packages? Use spec with subLocs
+				specVal = newModuleSpecVal(currName, loaderVal, filePath, true, []string{pkgPath})
+				mod.Dict.Set(val.InternString("__path__"), val.NewListVal(val.NewStringVal(pkgPath)))
+			}
+			mod.Dict.Set(val.InternString("__loader__"), loaderVal)
+			mod.Dict.Set(val.InternString("__spec__"), specVal)
+			vm.modules.Set(internedCurr, modVal)
+			if i > 0 {
+				if parentVal.IsModule() {
+					parentVal.AsModule().Dict.Set(val.InternString(parts[i]), modVal)
+				} else {
+					val.SetAttrCtx(&vm.execCtx, parentVal, val.InternString(parts[i]), modVal)
+				}
+			}
+			if err := execExtensionModule(&vm.execCtx, modVal, filePath); err != nil {
+				vm.modules.Delete(internedCurr)
+				return val.NoneVal(), err
+			}
+			if !vm.unhandledException.IsNone() && vm.unhandledException.HeaderPtr() != nil {
+				vm.modules.Delete(internedCurr)
+				return val.NoneVal(), nil
+			}
+			if replaced, ok := vm.modules.Get(internedCurr); ok && !replaced.IsNone() {
+				modVal = replaced
+			}
+			if i > 0 {
+				if parentVal.IsModule() {
+					parentVal.AsModule().Dict.Set(val.InternString(parts[i]), modVal)
+				} else {
+					val.SetAttrCtx(&vm.execCtx, parentVal, val.InternString(parts[i]), modVal)
+				}
+			}
+			parentVal = modVal
+			continue
 		}
 
 		// Load or compile CodeObject

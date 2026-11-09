@@ -1,0 +1,104 @@
+#ifndef FYTHON_ABI3_SHIM_H
+#define FYTHON_ABI3_SHIM_H
+#include <stddef.h>
+#include <stdint.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Minimal type definitions for shim (stable ABI struct layout).
+typedef struct _fython_object PyObject;
+typedef struct _fython_typeobject PyTypeObject;
+typedef intptr_t Py_ssize_t;
+typedef struct _fython_moduledef PyModuleDef;
+
+// Actually use real Python types when available? Shim is built with Python.h available for abi3,
+// but to keep shim self-contained we declare opaque structs and let extension headers provide real types.
+// For shim implementation, we cast to void* as needed.
+
+// Slot indices — MUST match pkg/capi/registry.go BuildDispatchTable order (70 slots).
+enum FythonSlot {
+    FYTHON_PY_LONG_FROMLONG = 0,
+    FYTHON_PY_LONG_FROMLONGLONG,
+    FYTHON_PY_LONG_FROMUNSIGNEDLONGLONG,
+    FYTHON_PY_LONG_FROMSIZE_T,
+    FYTHON_PY_LONG_ASLONG,
+    FYTHON_PY_LONG_ASLONGLONG,
+    FYTHON_PY_LONG_ASSIZE_T,
+    FYTHON_PY_BOOL_FROMLONG,
+    FYTHON_PY_FLOAT_FROMDOUBLE,
+    FYTHON_PY_FLOAT_ASDOUBLE,
+    FYTHON_PY_COMPLEX_FROMDOUBLES,
+    FYTHON_PY_UNICODE_FROMSTRING,
+    FYTHON_PY_UNICODE_FROMSTRINGANDSIZE,
+    FYTHON_PY_UNICODE_ASUTF8,
+    FYTHON_PY_UNICODE_ASUTF8ANDSIZE,
+    FYTHON_PY_BYTES_FROMSTRINGANDSIZE,
+    FYTHON_PY_BYTES_ASSTRING,
+    FYTHON_PY_BYTES_SIZE,
+    FYTHON_PY_TUPLE_NEW,
+    FYTHON_PY_TUPLE_PACK,
+    FYTHON_PY_TUPLE_GETITEM,
+    FYTHON_PY_TUPLE_SETITEM,
+    FYTHON_PY_TUPLE_SIZE,
+    FYTHON_PY_LIST_NEW,
+    FYTHON_PY_LIST_APPEND,
+    FYTHON_PY_LIST_GETITEM,
+    FYTHON_PY_LIST_SETITEM,
+    FYTHON_PY_LIST_SIZE,
+    FYTHON_PY_DICT_NEW,
+    FYTHON_PY_DICT_SETITEMSTRING,
+    FYTHON_PY_DICT_GETITEMSTRING,
+    FYTHON_PY_DICT_SETITEM,
+    FYTHON_PY_DICT_GETITEMWITHERROR,
+    FYTHON_PY_DICT_NEXT,
+    FYTHON_PY_OBJECT_CALL,
+    FYTHON_PY_OBJECT_CALLNOARGS,
+    FYTHON_PY_OBJECT_VECTORCALL,
+    FYTHON_PY_OBJECT_GETATTRSTRING,
+    FYTHON_PY_OBJECT_SETATTRSTRING,
+    FYTHON_PY_ARG_PARSETUPLE,
+    FYTHON_PY_ARG_PARSETUPLEANDKEYWORDS,
+    FYTHON_PY_ARG_UNPACKTUPLE,
+    FYTHON_PY_BUILDVALUE,
+    FYTHON_PY_MODULE_CREATE2,
+    FYTHON_PY_MODULEDEF_INIT,
+    FYTHON_PY_MODULE_ADDOBJECT,
+    FYTHON_PY_MODULE_ADDOBJECTREF,
+    FYTHON_PY_MODULE_ADDINTCONSTANT,
+    FYTHON_PY_MODULE_ADDSTRINGCONSTANT,
+    FYTHON_PY_MODULE_GETSTATE,
+    FYTHON_PY_CAPSULE_NEW,
+    FYTHON_PY_CAPSULE_GETPOINTER,
+    FYTHON_PY_CAPSULE_IMPORT,
+    FYTHON_PYERR_SETSTRING,
+    FYTHON_PYERR_SETOBJECT,
+    FYTHON_PYERR_OCCURRED,
+    FYTHON_PYERR_CLEAR,
+    FYTHON_PYERR_FORMATFORMATTED,
+    FYTHON_PY_GILSTATE_ENSURE,
+    FYTHON_PY_GILSTATE_RELEASE,
+    FYTHON_PY_EVAL_SAVETHREAD,
+    FYTHON_PY_EVAL_RESTORETHREAD,
+    FYTHON_PY_DEALLOC,
+    FYTHON_PY_TYPE_ISSUBTYPE,
+    FYTHON_PY_TYPE_READY,
+    FYTHON_PY_OBJECT_TYPE,
+    FYTHON_PY_CFUNCTION_NEWEX,
+    FYTHON_PYERR_NORMALIZE,
+    FYTHON_PYERR_GETCAUSE,
+    FYTHON_PYERR_GETCONTEXT,
+    FYTHON_SLOT_COUNT = 70
+};
+
+// Called by Go (via purego) to install dispatch table.
+int fython_abi3_bind(void **table, int n);
+
+// Exported Py_* symbols (forward to Go handlers via table).
+// All declared as extern "C" functions with CPython-compatible signatures.
+// Implementation in fython_abi3_shim.c.
+
+#ifdef __cplusplus
+}
+#endif
+#endif

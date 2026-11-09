@@ -1,3 +1,10 @@
 __pycache__/
 *.fyc
 bin/
+libfython_abi3.so
+libfython_abi3.dylib
+python315.dll
+shim/libfython_abi3.so
+shim/libfython_abi3.dylib
+shim/python315.dll
+testdata/capi/build/

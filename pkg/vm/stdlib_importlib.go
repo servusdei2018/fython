@@ -349,6 +349,33 @@ func initImportlibTypes() {
 		SourcelessFileLoaderType.InvalidateVersion()
 
 		ExtensionFileLoaderType = val.MustNewType("ExtensionFileLoader", []*val.PyType{FileLoaderType, LoaderBasicsType}, nil)
+		ExtensionFileLoaderType.Dict.Set(val.InternString("create_module"), val.NewBuiltinFuncVal("create_module", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			return val.NoneVal()
+		}))
+		ExtensionFileLoaderType.Dict.Set(val.InternString("exec_module"), val.NewBuiltinFuncVal("exec_module", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) < 2 || !args[1].IsModule() {
+				panic("TypeError: exec_module() requires a module")
+			}
+			self := args[0]
+			inst := self.AsInstance()
+			mod := args[1].AsModule()
+			pVal, ok := inst.GetAttr(val.InternString("path"))
+			if !ok || !pVal.IsAnyString() {
+				panic(val.NewImportError("loader has no path"))
+			}
+			filePath := pVal.AsString()
+			mod.File = filePath
+			mod.Dict.Set(val.InternString("__file__"), val.NewStringVal(filePath))
+			mod.Dict.Set(val.InternString("__loader__"), self)
+			if err := execExtensionModule(ctx, args[1], filePath); err != nil {
+				// Map to ImportError
+				if ctx != nil && ctx.HasException() {
+					panic(ctx.ActiveException)
+				}
+				panic(val.NewImportError(err.Error()))
+			}
+			return val.NoneVal()
+		}))
 		ExtensionFileLoaderType.InvalidateVersion()
 
 		AppleFrameworkLoaderType = val.MustNewType("AppleFrameworkLoader", []*val.PyType{ExtensionFileLoaderType}, nil)
@@ -573,6 +600,15 @@ func isBuiltinModuleName(vm *VM, name string) bool {
 	return false
 }
 
+func newExtensionFileLoaderVal(name, filePath string) val.Value {
+	initImportlibTypes()
+	instVal := val.NewInstanceOfType(ExtensionFileLoaderType)
+	inst := instVal.AsInstance()
+	inst.SetAttr(val.InternString("name"), val.NewStringVal(name))
+	inst.SetAttr(val.InternString("path"), val.NewStringVal(filePath))
+	return instVal
+}
+
 func newSourceFileLoaderVal(name, filePath string) val.Value {
 	initImportlibTypes()
 	instVal := val.NewInstanceOfType(SourceFileLoaderType)
@@ -702,6 +738,22 @@ func findSpecInSingleEntry(vm *VM, fullname, dir string) val.Value {
 		loader := newSourceFileLoaderVal(fullname, modPath)
 		return newModuleSpecVal(fullname, loader, modPath, false, nil)
 	}
+	// Extension modules (cpython-315-*.so / .abi3.so / .so / .pyd)
+	for _, suf := range extensionSuffixes() {
+		extPath := filepath.Join(dir, leaf+suf)
+		if info, err := os.Stat(extPath); err == nil && !info.IsDir() {
+			loader := newExtensionFileLoaderVal(fullname, extPath)
+			return newModuleSpecVal(fullname, loader, extPath, false, nil)
+		}
+	}
+	// Extension package: leaf/__init__<suffix>
+	for _, suf := range extensionSuffixes() {
+		extInit := filepath.Join(dir, leaf, "__init__"+suf)
+		if info, err := os.Stat(extInit); err == nil && !info.IsDir() {
+			loader := newExtensionFileLoaderVal(fullname, extInit)
+			return newModuleSpecVal(fullname, loader, extInit, true, []string{filepath.Join(dir, leaf)})
+		}
+	}
 	return val.NoneVal()
 }
 
@@ -797,7 +849,12 @@ func (e *Engine) createImpModule() val.Value {
 		return val.NewBytesVal(h[:8])
 	}))
 	mod.Dict.Set(val.InternString("extension_suffixes"), val.NewBuiltinFuncVal("extension_suffixes", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		return val.NewListVal(val.NewStringVal(".so"))
+		suf := extensionSuffixes()
+		items := make([]val.Value, len(suf))
+		for i, s := range suf {
+			items[i] = val.NewStringVal(s)
+		}
+		return val.NewListVal(items...)
 	}))
 	mod.Dict.Set(val.InternString("is_builtin"), val.NewBuiltinFuncVal("is_builtin", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 || !args[0].IsAnyString() {
@@ -833,6 +890,25 @@ func (e *Engine) createImpModule() val.Value {
 		return val.NoneVal()
 	}))
 	mod.Dict.Set(val.InternString("exec_dynamic"), val.NewBuiltinFuncVal("exec_dynamic", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 2 || !args[1].IsModule() {
+			return val.Int64Val(-1)
+		}
+		// args[0] is spec (instance with path?), args[1] is module. Try to resolve file path from spec.
+		// CPython signature: exec_dynamic(spec, module). spec.origin holds .so path.
+		pathStr := ""
+		if len(args) >= 1 && args[0].IsInstance() {
+			if v, ok := args[0].AsInstance().GetAttr(val.InternString("origin")); ok && v.IsAnyString() {
+				pathStr = v.AsString()
+			}
+			if pathStr == "" {
+				panic("ImportError: exec_dynamic missing origin")
+			}
+		} else {
+			panic("TypeError: exec_dynamic requires spec and module")
+		}
+		if err := execExtensionModule(ctx, args[1], pathStr); err != nil {
+			panic(val.NewImportError(err.Error()))
+		}
 		return val.Int64Val(0)
 	}))
 	mod.Dict.Set(val.InternString("acquire_lock"), val.NewBuiltinFuncVal("acquire_lock", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -1057,7 +1133,14 @@ func (e *Engine) createFrozenImportlibExternalModule() val.Value {
 	mod.Dict.Set(val.InternString("BYTECODE_SUFFIXES"), val.NewListVal(val.NewStringVal(".pyc"), val.NewStringVal(".fyc")))
 	mod.Dict.Set(val.InternString("DEBUG_BYTECODE_SUFFIXES"), val.NewListVal(val.NewStringVal(".pyc"), val.NewStringVal(".fyc")))
 	mod.Dict.Set(val.InternString("OPTIMIZED_BYTECODE_SUFFIXES"), val.NewListVal(val.NewStringVal(".pyc"), val.NewStringVal(".fyc")))
-	mod.Dict.Set(val.InternString("EXTENSION_SUFFIXES"), val.NewListVal(val.NewStringVal(".so")))
+	mod.Dict.Set(val.InternString("EXTENSION_SUFFIXES"), func() val.Value {
+		suf := extensionSuffixes()
+		items := make([]val.Value, len(suf))
+		for i, s := range suf {
+			items[i] = val.NewStringVal(s)
+		}
+		return val.NewListVal(items...)
+	}())
 	mod.Dict.Set(val.InternString("MAGIC_NUMBER"), val.NewBytesVal([]byte{0xcb, 0x0d, 0x0d, 0x0a}))
 	mod.Dict.Set(val.InternString("_POPULATE"), populateSentinel)
 
