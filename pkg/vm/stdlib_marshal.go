@@ -325,6 +325,7 @@ func unmarshalValue(r *bytes.Reader) (val.Value, error) {
 			Code:         code,
 			Consts:       consts,
 		}
+		co.Init()
 		return val.ObjectVal(&co.Header), nil
 	default:
 		return val.NoneVal(), fmt.Errorf("ValueError: bad marshal data (unknown tag %q)", tag)

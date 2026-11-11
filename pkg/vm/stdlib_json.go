@@ -7,10 +7,93 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode/utf16"
 
 	"github.com/servusdei2018/fython/pkg/val"
 )
+
+// jsonDecodeError describes a malformed JSON document: the CPython-style
+// message and the character offset the failure was detected at.
+type jsonDecodeError struct {
+	msg string
+	pos int
+}
+
+func (e *jsonDecodeError) Error() string { return e.msg }
+
+var (
+	jsonDecodeErrorOnce sync.Once
+	jsonDecodeErrorType *val.PyType
+)
+
+// initJSONDecodeErrorType creates the json.JSONDecodeError exception type once
+// per process so that identity comparisons keep working across engines.
+func initJSONDecodeErrorType() *val.PyType {
+	jsonDecodeErrorOnce.Do(func() {
+		jsonDecodeErrorType = val.MustNewType("JSONDecodeError", []*val.PyType{val.ValueErrorType}, nil)
+		jsonDecodeErrorType.Dict.Set(val.InternString("msg"), val.NoneVal())
+		jsonDecodeErrorType.Dict.Set(val.InternString("doc"), val.NoneVal())
+		jsonDecodeErrorType.Dict.Set(val.InternString("pos"), val.NoneVal())
+		jsonDecodeErrorType.Dict.Set(val.InternString("lineno"), val.NoneVal())
+		jsonDecodeErrorType.Dict.Set(val.InternString("colno"), val.NoneVal())
+		jsonDecodeErrorType.Dict.Set(val.InternString("__init__"), val.NewBuiltinFuncVal("__init__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) < 4 {
+				panic("TypeError: JSONDecodeError() takes exactly 3 arguments")
+			}
+			self := args[0]
+			msg := args[1].AsString()
+			doc := args[2].AsString()
+			pos := int(args[3].AsInt64())
+			pos = min(max(pos, 0), len(doc))
+			lineno := strings.Count(doc[:pos], "\n") + 1
+			colno := pos - strings.LastIndex(doc[:pos], "\n")
+			errmsg := fmt.Sprintf("%s: line %d column %d (char %d)", msg, lineno, colno, pos)
+			if self.IsInstance() {
+				inst := self.AsInstance()
+				inst.SetAttr(val.InternString("args"), val.NewTupleVal(val.NewStringVal(errmsg)))
+				inst.SetAttr(val.InternString("msg"), val.NewStringVal(msg))
+				inst.SetAttr(val.InternString("doc"), val.NewStringVal(doc))
+				inst.SetAttr(val.InternString("pos"), val.Int64Val(int64(pos)))
+				inst.SetAttr(val.InternString("lineno"), val.Int64Val(int64(lineno)))
+				inst.SetAttr(val.InternString("colno"), val.Int64Val(int64(colno)))
+			}
+			return val.NoneVal()
+		}))
+		jsonDecodeErrorType.InvalidateVersion()
+	})
+	return jsonDecodeErrorType
+}
+
+// newJSONDecodeError builds a json.JSONDecodeError instance for a malformed
+// document, mirroring CPython's message layout.
+func newJSONDecodeError(err error, doc []byte) val.Value {
+	msg := "Expecting value"
+	pos := 0
+	if decErr, ok := errors.AsType[*jsonDecodeError](err); ok {
+		msg = decErr.msg
+		pos = decErr.pos
+	} else if err != nil {
+		msg = err.Error()
+	}
+	pos = min(max(pos, 0), len(doc))
+	docStr := string(doc)
+	lineno := strings.Count(docStr[:pos], "\n") + 1
+	colno := pos - strings.LastIndex(docStr[:pos], "\n")
+	errmsg := fmt.Sprintf("%s: line %d column %d (char %d)", msg, lineno, colno, pos)
+	inst := val.NewInstanceOfType(initJSONDecodeErrorType())
+	inst.AsInstance().SetAttr(val.InternString("args"), val.NewTupleVal(val.NewStringVal(errmsg)))
+	inst.AsInstance().SetAttr(val.InternString("msg"), val.NewStringVal(msg))
+	inst.AsInstance().SetAttr(val.InternString("doc"), val.NewStringVal(docStr))
+	inst.AsInstance().SetAttr(val.InternString("pos"), val.Int64Val(int64(pos)))
+	inst.AsInstance().SetAttr(val.InternString("lineno"), val.Int64Val(int64(lineno)))
+	inst.AsInstance().SetAttr(val.InternString("colno"), val.Int64Val(int64(colno)))
+	inst.AsInstance().SetAttr(val.InternString("__traceback__"), val.NoneVal())
+	inst.AsInstance().SetAttr(val.InternString("__cause__"), val.NoneVal())
+	inst.AsInstance().SetAttr(val.InternString("__context__"), val.NoneVal())
+	inst.AsInstance().SetAttr(val.InternString("__suppress_context__"), val.BoolVal(false))
+	return val.ObjectVal(&inst.AsInstance().Header)
+}
 
 // jsonParser provides direct, allocation-optimized JSON parsing into fython Values.
 type jsonParser struct {
@@ -40,10 +123,26 @@ func (p *jsonParser) skipWhitespace() {
 	}
 }
 
+// errAt reports a decoding failure at a known character offset.
+func (p *jsonParser) errAt(pos int, msg string) error {
+	if pos < 0 {
+		pos = 0
+	}
+	if pos > len(p.src) {
+		pos = len(p.src)
+	}
+	return &jsonDecodeError{msg: msg, pos: pos}
+}
+
+// errNow reports a decoding failure at the current character offset.
+func (p *jsonParser) errNow(msg string) error {
+	return p.errAt(p.pos, msg)
+}
+
 func (p *jsonParser) parseValue() (val.Value, error) {
 	p.skipWhitespace()
 	if p.pos >= len(p.src) {
-		return val.NoneVal(), errors.New("json: unexpected end of JSON input")
+		return val.NoneVal(), p.errNow("Expecting value")
 	}
 
 	switch p.src[p.pos] {
@@ -62,7 +161,7 @@ func (p *jsonParser) parseValue() (val.Value, error) {
 	case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
 		return p.parseNumber()
 	default:
-		return val.NoneVal(), fmt.Errorf("json: invalid character %q looking for beginning of value", p.src[p.pos])
+		return val.NoneVal(), p.errNow("Expecting value")
 	}
 }
 
@@ -80,7 +179,7 @@ func (p *jsonParser) parseObject() (val.Value, error) {
 	for {
 		p.skipWhitespace()
 		if p.pos >= len(p.src) || p.src[p.pos] != '"' {
-			return val.NoneVal(), errors.New("json: expected object key string")
+			return val.NoneVal(), p.errNow("Expecting property name enclosed in double quotes")
 		}
 
 		keyVal, err := p.parseString(true)
@@ -90,7 +189,7 @@ func (p *jsonParser) parseObject() (val.Value, error) {
 
 		p.skipWhitespace()
 		if p.pos >= len(p.src) || p.src[p.pos] != ':' {
-			return val.NoneVal(), errors.New("json: expected ':' after key")
+			return val.NoneVal(), p.errNow("Expecting ':' delimiter")
 		}
 		p.pos++ // consume ':'
 
@@ -103,7 +202,7 @@ func (p *jsonParser) parseObject() (val.Value, error) {
 
 		p.skipWhitespace()
 		if p.pos >= len(p.src) {
-			return val.NoneVal(), errors.New("json: unexpected end of JSON input in object")
+			return val.NoneVal(), p.errNow("Expecting ',' delimiter")
 		}
 
 		if p.src[p.pos] == '}' {
@@ -111,10 +210,15 @@ func (p *jsonParser) parseObject() (val.Value, error) {
 			return dictVal, nil
 		}
 		if p.src[p.pos] == ',' {
+			commaPos := p.pos
 			p.pos++
+			p.skipWhitespace()
+			if p.pos < len(p.src) && p.src[p.pos] == '}' {
+				return val.NoneVal(), p.errAt(commaPos, "Illegal trailing comma before end of object")
+			}
 			continue
 		}
-		return val.NoneVal(), fmt.Errorf("json: expected ',' or '}' in object, got %q", p.src[p.pos])
+		return val.NoneVal(), p.errNow("Expecting ',' delimiter")
 	}
 }
 
@@ -137,7 +241,7 @@ func (p *jsonParser) parseArray() (val.Value, error) {
 
 		p.skipWhitespace()
 		if p.pos >= len(p.src) {
-			return val.NoneVal(), errors.New("json: unexpected end of JSON input in array")
+			return val.NoneVal(), p.errNow("Expecting ',' delimiter")
 		}
 
 		if p.src[p.pos] == ']' {
@@ -145,10 +249,15 @@ func (p *jsonParser) parseArray() (val.Value, error) {
 			return val.NewListVal(items...), nil
 		}
 		if p.src[p.pos] == ',' {
+			commaPos := p.pos
 			p.pos++
+			p.skipWhitespace()
+			if p.pos < len(p.src) && p.src[p.pos] == ']' {
+				return val.NoneVal(), p.errAt(commaPos, "Illegal trailing comma before end of array")
+			}
 			continue
 		}
-		return val.NoneVal(), fmt.Errorf("json: expected ',' or ']' in array, got %q", p.src[p.pos])
+		return val.NoneVal(), p.errNow("Expecting ',' delimiter")
 	}
 }
 
@@ -179,7 +288,7 @@ func (p *jsonParser) parseString(isKey bool) (val.Value, error) {
 			}
 
 			// Has escapes: decode via scratch buffer
-			decoded, err := p.decodeEscapes(raw)
+			decoded, err := p.decodeEscapes(raw, start)
 			if err != nil {
 				return val.NoneVal(), err
 			}
@@ -200,15 +309,18 @@ func (p *jsonParser) parseString(isKey bool) (val.Value, error) {
 			continue
 		}
 		if b < 0x20 {
-			return val.NoneVal(), errors.New("json: unescaped control character in string")
+			return val.NoneVal(), p.errNow("Invalid control character at")
 		}
 		p.pos++
 	}
 
-	return val.NoneVal(), errors.New("json: unterminated string")
+	return val.NoneVal(), p.errAt(start-1, "Unterminated string starting at")
 }
 
-func (p *jsonParser) decodeEscapes(raw []byte) ([]byte, error) {
+// decodeEscapes decodes the escape sequences of a JSON string literal. base
+// is the offset of raw within the source document, so that failures can be
+// reported at the right character position.
+func (p *jsonParser) decodeEscapes(raw []byte, base int) ([]byte, error) {
 	p.scratch = p.scratch[:0]
 	i := 0
 	for i < len(raw) {
@@ -233,11 +345,11 @@ func (p *jsonParser) decodeEscapes(raw []byte) ([]byte, error) {
 				p.scratch = append(p.scratch, '\t')
 			case 'u':
 				if i+4 >= len(raw) {
-					return nil, errors.New("json: incomplete \\u escape")
+					return nil, p.errAt(base+i, "Invalid \\uXXXX escape")
 				}
 				r, err := strconv.ParseUint(string(raw[i+1:i+5]), 16, 16)
 				if err != nil {
-					return nil, errors.New("json: invalid \\u escape")
+					return nil, p.errAt(base+i, "Invalid \\uXXXX escape")
 				}
 				i += 4
 				// Handle surrogate pairs
@@ -350,7 +462,7 @@ func (p *jsonParser) parseLiteral(literal string, result val.Value) (val.Value, 
 		p.pos += len(literal)
 		return result, nil
 	}
-	return val.NoneVal(), fmt.Errorf("json: invalid literal looking for %q", literal)
+	return val.NoneVal(), p.errNow("Expecting value")
 }
 
 // jsonDumps serializes a Value directly to JSON string without reflection.
@@ -718,7 +830,7 @@ func (e *Engine) createJSONModule() val.Value {
 	mod := modVal.AsModule()
 	mod.Dict.Set(val.InternString("__package__"), val.NewStringVal("json"))
 	mod.Dict.Set(val.InternString("__path__"), val.NewListVal(val.NewStringVal("stdlib:lib/json")))
-	jsonDecErrType := val.MustNewType("JSONDecodeError", []*val.PyType{val.ValueErrorType}, nil)
+	jsonDecErrType := initJSONDecodeErrorType()
 	mod.Dict.Set(val.InternString("JSONDecodeError"), val.TypeVal(jsonDecErrType))
 
 	mod.Dict.Set(val.InternString("loads"), val.NewBuiltinFuncVal("loads", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -748,7 +860,7 @@ func (e *Engine) createJSONModule() val.Value {
 		p := newJSONParser(rawBytes, e.internPool)
 		res, err := p.parseValue()
 		if err != nil {
-			panic("ValueError: " + err.Error())
+			panic(newJSONDecodeError(err, rawBytes))
 		}
 		if hook, ok := kwArg(args, kwnames, "object_hook"); ok && !hook.IsNone() {
 			res = applyJSONObjectHook(ctx, res, hook)
@@ -797,7 +909,7 @@ func (e *Engine) createJSONModule() val.Value {
 		p := newJSONParser(rawBytes, e.internPool)
 		res, err := p.parseValue()
 		if err != nil {
-			panic("ValueError: " + err.Error())
+			panic(newJSONDecodeError(err, rawBytes))
 		}
 		if hook, ok := kwArg(args, kwnames, "object_hook"); ok && !hook.IsNone() {
 			res = applyJSONObjectHook(ctx, res, hook)

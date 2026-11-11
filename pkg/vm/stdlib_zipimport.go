@@ -610,7 +610,12 @@ func populateZipDirectoryCache(vm *VM, archivePath string, arch *cachedZipArchiv
 	}
 	zipModVal, ok := vm.modules.Get(val.InternString("zipimport"))
 	if !ok || !zipModVal.IsModule() {
-		return
+		// The zipimport module is created on demand.
+		if modVal, materialized := vm.materializeBuiltinModule("zipimport"); materialized {
+			zipModVal = modVal
+		} else {
+			return
+		}
 	}
 	cacheVal, ok := zipModVal.AsModule().Dict.Get(val.InternString("_zip_directory_cache"))
 	if !ok || !cacheVal.IsDict() {

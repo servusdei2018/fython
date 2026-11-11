@@ -249,6 +249,9 @@ func mvEffectiveShape(mv *PyMemoryView) []int {
 	if len(mv.Shape) > 0 {
 		return mv.Shape
 	}
+	if mv.NDim == 1 {
+		return []int{mv.Dim0}
+	}
 	is := mv.ItemSize
 	if is <= 0 {
 		is = 1
@@ -260,6 +263,9 @@ func mvEffectiveShape(mv *PyMemoryView) []int {
 func mvEffectiveStrides(mv *PyMemoryView) []int {
 	if len(mv.Strides) > 0 && len(mv.Strides) == len(mv.Shape) {
 		return mv.Strides
+	}
+	if mv.NDim == 1 && len(mv.Shape) == 0 {
+		return []int{mv.Stride0}
 	}
 	return CContiguousStrides(mvEffectiveShape(mv), max(mv.ItemSize, 1))
 }

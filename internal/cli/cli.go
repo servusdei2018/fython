@@ -282,7 +282,9 @@ func (c *CLI) Run() error {
 
 	if eff.Interactive && v != nil {
 		if uncaught, ok := execErr.(*ErrUncaughtException); ok {
-			_, _ = fmt.Fprintln(os.Stderr, uncaught.Error())
+			if !uncaught.Reported {
+				_, _ = fmt.Fprintln(os.Stderr, uncaught.Error())
+			}
 			v.ClearUnhandledException()
 			execErr = nil
 		}
@@ -333,7 +335,12 @@ func prependSysPath0(v *vm.VM, dir string) {
 }
 
 // ErrUncaughtException signals that the program terminated with an uncaught Python exception.
-type ErrUncaughtException struct{ Traceback string }
+type ErrUncaughtException struct {
+	Traceback string
+	// Reported is set when the traceback was already written to stderr by a
+	// user-installed sys.excepthook, so it must not be printed a second time.
+	Reported bool
+}
 
 func (e *ErrUncaughtException) Error() string { return strings.TrimRight(e.Traceback, "\n") }
 
@@ -360,6 +367,10 @@ func unhandledError(v *vm.VM) error {
 		default:
 			return &ErrExit{Code: 1, Message: val.PyStr(nil, code)}
 		}
+	}
+	// A user-installed sys.excepthook takes over the reporting.
+	if v.CallUserExcepthook(exc) {
+		return &ErrUncaughtException{Traceback: v.FormatException(exc), Reported: true}
 	}
 	return &ErrUncaughtException{Traceback: v.FormatException(exc)}
 }

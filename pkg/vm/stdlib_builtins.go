@@ -1293,7 +1293,9 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			panic(exc)
 		}
 		if err != nil {
-			panic("ModuleNotFoundError: " + err.Error())
+			// The error already carries its Python exception prefix; adding
+			// another one would duplicate it in the rendered message.
+			panic(err.Error())
 		}
 
 		if len(fromList) > 0 {

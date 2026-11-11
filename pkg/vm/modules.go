@@ -328,6 +328,15 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 		return topVal, nil
 	}
 
+	// Native modules are created on first import.
+	if modVal, ok := vm.materializeBuiltinModule(canonicalName); ok {
+		if returnLeaf {
+			return modVal, nil
+		}
+		topVal, _ := vm.modules.Get(val.InternString(parts[0]))
+		return topVal, nil
+	}
+
 	// Incrementally resolve and load parent packages
 	var parentVal val.Value
 	for i := range parts {
@@ -336,6 +345,13 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 
 		if existing, ok := vm.modules.Get(internedCurr); ok {
 			parentVal = existing
+			continue
+		}
+
+		// A native parent package (asyncio, test, ...) has to exist before
+		// its submodules can be resolved.
+		if modVal, ok := vm.materializeBuiltinModule(currName); ok {
+			parentVal = modVal
 			continue
 		}
 
@@ -856,7 +872,13 @@ var (
 func (vm *VM) ensureOSPath() {
 	osVal, ok := vm.modules.Get(osModName)
 	if !ok || !osVal.IsModule() {
-		return
+		// The os module is created on demand: materialize it now so that
+		// os.path can be bound to it.
+		if modVal, materialized := vm.materializeBuiltinModule("os"); materialized {
+			osVal = modVal
+		} else {
+			return
+		}
 	}
 	osMod := osVal.AsModule()
 	if _, bound := osMod.Dict.Get(pathAttr); bound || vm.bindingOSPath {

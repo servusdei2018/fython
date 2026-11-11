@@ -1562,8 +1562,8 @@ func byteArrayMpAssSubscript(ctx *ExecContext, a, idxVal, val Value) Value {
 
 func memoryViewSqLen(ctx *ExecContext, a Value) int64 {
 	mv := a.AsMemoryView()
-	if mv.NDim > 0 && len(mv.Shape) > 0 {
-		return int64(mv.Shape[0])
+	if mv.NDim > 0 {
+		return int64(mv.Dim(0))
 	}
 	if mv.ItemSize > 1 {
 		return int64(len(mv.Buf) / mv.ItemSize)
@@ -6217,6 +6217,29 @@ func initTypes() {
 		}
 		return self
 	}))
+	// PEP 678: exception notes are rendered below the exception line of a
+	// traceback and are reachable through the instance's __notes__ list.
+	BaseExceptionType.Dict.Set(InternString("add_note"), NewBuiltinFuncVal("add_note", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: add_note() takes exactly one argument")
+		}
+		self := args[0]
+		note := args[1]
+		if !note.IsAnyString() {
+			panic("TypeError: add_note() argument must be str, not " + note.Type().Name)
+		}
+		if !self.IsInstance() {
+			panic("TypeError: add_note() called on a non-exception object")
+		}
+		inst := self.AsInstance()
+		notes, ok := inst.GetAttr(InternString("__notes__"))
+		if !ok || !notes.IsList() {
+			notes = NewListVal()
+			inst.SetAttr(InternString("__notes__"), notes)
+		}
+		notes.AsList().Append(note)
+		return NoneVal()
+	}))
 	BaseExceptionType.InvalidateVersion()
 	ExceptionType = MustNewType("Exception", []*PyType{BaseExceptionType}, nil)
 	TypeErrorType = MustNewType("TypeError", []*PyType{ExceptionType}, nil)
@@ -6831,6 +6854,19 @@ func initTypes() {
 		return NoneVal()
 	}))
 
+	ByteArrayType.Dict.Set(DunderGetItem, NewBuiltinFuncVal("__getitem__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: descriptor '__getitem__' of 'bytearray' object needs an argument")
+		}
+		return byteArrayMpSubscript(ctx, args[0], args[1])
+	}))
+	ByteArrayType.Dict.Set(DunderSetItem, NewBuiltinFuncVal("__setitem__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 3 {
+			panic("TypeError: descriptor '__setitem__' of 'bytearray' object needs 2 arguments")
+		}
+		byteArrayMpAssSubscript(ctx, args[0], args[1], args[2])
+		return NoneVal()
+	}))
 	ByteArrayType.Dict.Set(InternString("decode"), NewBuiltinFuncVal("decode", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
 			panic("TypeError: decode() takes at least 1 argument")
@@ -7003,7 +7039,7 @@ func initTypes() {
 		}
 		nbytes := ShapeNumElements(oldShape) * oldItemSize
 		// Substrides case: cast requires C-contiguous view of identical nbytes.
-		if len(oldShape) > 1 || (len(mv.Strides) > 0 && !IsCContiguous(oldShape, mvEffectiveStrides(mv), oldItemSize)) {
+		if len(oldShape) > 1 || (mv.NDim > 1 && !IsCContiguous(oldShape, mvEffectiveStrides(mv), oldItemSize)) {
 			// Allow only if underlying buffer gaps account for same nbytes; check C-contiguous.
 			if !IsCContiguous(oldShape, mvEffectiveStrides(mv), oldItemSize) {
 				panic("TypeError: cannot cast non-contiguous memoryview")
@@ -7043,9 +7079,8 @@ func initTypes() {
 			ItemSize: newItemSize,
 			Format:   format,
 			NDim:     len(newShape),
-			Shape:    newShape,
-			Strides:  newStrides,
 		}
+		obj.SetShape(newShape, newStrides)
 		return Value{num: 0, ptr: &obj.Header}
 	}))
 	MemoryViewType.Dict.Set(InternString("nbytes"), NewPropertyVal(

@@ -61,6 +61,13 @@ func main() {
 			}
 			os.Exit(exit.Code)
 		}
+		if uncaught, ok := errors.AsType[*cli.ErrUncaughtException](err); ok {
+			// A user-installed sys.excepthook already reported the failure.
+			if !uncaught.Reported {
+				fmt.Fprintln(os.Stderr, uncaught.Error())
+			}
+			os.Exit(1)
+		}
 		fmt.Fprintln(os.Stderr, err.Error())
 		os.Exit(1)
 	}

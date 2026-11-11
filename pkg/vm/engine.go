@@ -75,6 +75,10 @@ type Engine struct {
 	osPathMu                   sync.Mutex
 	signals                    sigState
 	stdStreams                 [3]atomic.Pointer[val.Value]
+	// builtinModuleMu serialises the creation of the native modules, so
+	// that two VMs sharing a module namespace cannot create two copies of
+	// the same module.
+	builtinModuleMu sync.Mutex
 }
 
 var (
@@ -165,9 +169,22 @@ func NewEngine() *Engine {
 	}
 	bootVM.initBuiltins()
 	builtinsDict := e.builtins
+	// Every VM of the engine shares the builtins dictionary, so it always
+	// takes its lock.
+	builtinsDict.Shared = true
 	val.FunctionBuiltinsHook = func() val.Value { return val.DictVal(builtinsDict) }
 
-	e.sharedModules = e.newSysModules()
+	// The builtins module carries the loader and the spec of the builtins
+	// dictionary. It is installed once, because that dictionary is shared
+	// by every VM of the engine.
+	initImportlibTypes()
+	builtinsModVal := val.NewModuleVal("builtins", "")
+	builtinsModVal.AsModule().Dict = e.builtins
+	finalizeBuiltinModule(builtinsModVal)
+
+	// The shared module namespace is built lazily: by default every VM gets
+	// its own sys.modules, so building it here would be wasted work.
+	e.sharedModules = nil
 
 	e.vmPool = sync.Pool{
 		New: func() any {
@@ -185,6 +202,10 @@ func (e *Engine) newSysModules() *val.PyDict {
 func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 	initImportlibTypes()
 	initZipImportTypes()
+	// The typing types install the __class_getitem__ hook of the builtin
+	// container types and the union operator hook, so they have to exist
+	// even when the _typing module itself is never imported.
+	initTypingTypes()
 
 	modules := val.NewDictVal(64).AsDict()
 	eff := e.runtimeConfig.Effective()
@@ -342,7 +363,6 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 	}))
 
 	// sys.stdout, stderr, stdin
-	ioMod := e.createIOModule()
 	outStream := e.stdStream(1)
 	errStream := e.stdStream(2)
 	inStream := e.stdStream(0)
@@ -565,108 +585,14 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 	builtinsMod.Dict = e.builtins
 	modules.Set(val.InternString("builtins"), builtinsModVal)
 
-	// 3. Native standard library modules
-	modules.Set(val.InternString("json"), e.createJSONModule())
-	modules.Set(val.InternString("math"), e.createMathModule())
-	modules.Set(val.InternString("time"), e.createTimeModule())
-	modules.Set(val.InternString("os"), e.createOSModule())
-	modules.Set(val.InternString("io"), ioMod)
-	modules.Set(val.InternString("_io"), ioMod)
-	asyncioMod := e.createAsyncioModule()
-	modules.Set(val.InternString("asyncio"), asyncioMod)
-	if coroMod, ok := asyncioMod.AsModule().Dict.Get(val.InternString("coroutines")); ok {
-		modules.Set(val.InternString("asyncio.coroutines"), coroMod)
-	}
-	modules.Set(val.InternString("_weakref"), e.createWeakrefCModule())
-	modules.Set(val.InternString("weakref"), e.createWeakrefModule())
-	modules.Set(val.InternString("traceback"), e.createTracebackModule())
-	modules.Set(val.InternString("inspect"), e.createInspectModule())
-	modules.Set(val.InternString("gc"), e.createGCModule())
-	modules.Set(val.InternString("types"), e.createTypesModule())
-	modules.Set(val.InternString("_types"), e.createTypesModule())
-	modules.Set(val.InternString("_abc"), e.createABCModule())
-	modules.Set(val.InternString("_collections"), e.createCollectionsModule())
-	modules.Set(val.InternString("itertools"), e.createItertoolsModule())
-	modules.Set(val.InternString("_functools"), e.createFunctoolsModule())
-	modules.Set(val.InternString("operator"), e.createOperatorModule())
-	modules.Set(val.InternString("_operator"), e.createOperatorModule())
-	modules.Set(val.InternString("_sre"), e.createSREModule())
-	modules.Set(val.InternString("unicodedata"), e.createUnicodedataModule())
-	modules.Set(val.InternString("re"), e.createReModule())
-	modules.Set(val.InternString("_ast"), e.createASTModule())
-	modules.Set(val.InternString("_thread"), e.createThreadModule())
-	modules.Set(val.InternString("threading"), e.createThreadingModule())
-	modules.Set(val.InternString("_typing"), e.createTypingModule())
-	modules.Set(val.InternString("_tokenize"), e.createTokenizeModule())
-	modules.Set(val.InternString("faulthandler"), e.createFaulthandlerModule())
-	modules.Set(val.InternString("_colorize"), e.createColorizeModule())
-	modules.Set(val.InternString("_contextvars"), e.createContextVarsModule())
-	modules.Set(val.InternString("_signal"), e.createSignalModule())
-	posixMod := e.createPosixModule()
-	modules.Set(val.InternString("posix"), posixMod)
-	modules.Set(val.InternString("nt"), posixMod)
-	modules.Set(val.InternString("_posixsubprocess"), e.createPosixSubprocessModule())
-	modules.Set(val.InternString("select"), e.createSelectModule())
-	modules.Set(val.InternString("_string"), e.createStringModule())
-	modules.Set(val.InternString("_codecs"), e.createCodecsModule())
-	modules.Set(val.InternString("_socket"), e.createSocketModule())
-	modules.Set(val.InternString("_ssl"), e.createSSLModule())
-	modules.Set(val.InternString("_sqlite3"), e.createSqlite3Module())
-	modules.Set(val.InternString("_random"), e.createRandomModule())
-	modules.Set(val.InternString("_datetime"), e.createDateTimeModule())
-	modules.Set(val.InternString("binascii"), e.createBinasciiModule())
-	modules.Set(val.InternString("_hashlib"), e.createHashlibModule())
-	modules.Set(val.InternString("_struct"), e.createStructModule())
-	modules.Set(val.InternString("_csv"), e.createCsvModule())
-	modules.Set(val.InternString("zlib"), e.createZlibModule())
-	modules.Set(val.InternString("errno"), e.createErrnoModule())
-	modules.Set(val.InternString("gettext"), e.createGettextModule())
-	localeMod := e.createLocaleModule()
-	modules.Set(val.InternString("locale"), localeMod)
-	modules.Set(val.InternString("_locale"), localeMod)
-	modules.Set(val.InternString("pdb"), e.createPdbModule())
-	modules.Set(val.InternString("_heapq"), e.createHeapQModule())
-	modules.Set(val.InternString("_bisect"), e.createBisectModule())
-	modules.Set(val.InternString("_queue"), e.createQueueModule())
-	modules.Set(val.InternString("atexit"), e.createAtexitModule())
-	modules.Set(val.InternString("_testcapi"), e.createTestCapiModule())
-	modules.Set(val.InternString("_ctypes"), e.createCtypesLowerModule())
-	testMod, testSupportMod := e.createTestPackage()
-	modules.Set(val.InternString("test"), testMod)
-	modules.Set(val.InternString("test.support"), testSupportMod)
-	if ih, ok := testSupportMod.AsModule().Dict.Get(val.InternString("import_helper")); ok {
-		modules.Set(val.InternString("test.support.import_helper"), ih)
-	}
-	if oh, ok := testSupportMod.AsModule().Dict.Get(val.InternString("os_helper")); ok {
-		modules.Set(val.InternString("test.support.os_helper"), oh)
-	}
-	if wh, ok := testSupportMod.AsModule().Dict.Get(val.InternString("warnings_helper")); ok {
-		modules.Set(val.InternString("test.support.warnings_helper"), wh)
-	}
-	modules.Set(val.InternString("marshal"), e.createMarshalModule())
-	modules.Set(val.InternString("_imp"), e.createImpModule())
-	modules.Set(val.InternString("_frozen_importlib"), e.createFrozenImportlibModule())
-	modules.Set(val.InternString("_frozen_importlib_external"), e.createFrozenImportlibExternalModule())
-	modules.Set(val.InternString("zipimport"), e.createZipImportModule())
-	modules.Set(val.InternString("site"), e.createSiteModule())
-
-	// Populate __loader__ and __spec__ on all built-in modules
-	for _, entry := range modules.Items() {
-		if entry.Value.IsModule() {
-			m := entry.Value.AsModule()
-			m.Dict.Set(val.InternString("__loader__"), val.TypeVal(BuiltinImporterType))
-			if pathVal, hasPath := m.Dict.Get(val.InternString("__path__")); hasPath && pathVal.IsList() {
-				var locs []string
-				for _, it := range pathVal.AsList().Items {
-					if it.IsAnyString() {
-						locs = append(locs, it.AsString())
-					}
-				}
-				m.Dict.Set(val.InternString("__spec__"), newModuleSpecVal(m.Name, val.TypeVal(BuiltinImporterType), "built-in", true, locs))
-			} else {
-				m.Dict.Set(val.InternString("__spec__"), newBuiltinModuleSpecVal(m.Name))
-			}
-		}
+	// 3. Native standard library modules are created on first import, see
+	//    builtinModuleLoaders.
+	//
+	// The builtins module is not finalized here: its dictionary is shared
+	// by every VM of the engine, so the engine finalizes it once, when the
+	// engine is created.
+	if m, ok := modules.Get(val.InternString("sys")); ok && m.IsModule() {
+		finalizeBuiltinModule(m)
 	}
 
 	return modules, disc.pthImports
@@ -840,9 +766,6 @@ func (e *Engine) newVMInternal(stackCap, frameCap int) *VM {
 		engine:       e,
 		stack:        make([]val.Value, stackCap),
 		frames:       make([]CallFrame, frameCap),
-		ic:           make([]ICSlot, DefaultICSlabSize),
-		methodPIC:    make([][4]val.MethodPICEntry, DefaultICSlabSize),
-		attrPIC:      make([][4]AttrPICEntry, DefaultICSlabSize),
 		internPool:   e.internPool,
 		globals:      val.NewDictVal(64).AsDict(),
 		builtins:     e.builtins,
@@ -856,11 +779,6 @@ func (e *Engine) newVMInternal(stackCap, frameCap int) *VM {
 	}
 	if openVal, ok := e.builtins.Get(val.InternString("open")); ok {
 		v.builtinOpen = openVal
-	}
-	v.rootCache = VMCodeCache{
-		ic:        v.ic,
-		methodPIC: v.methodPIC,
-		attrPIC:   v.attrPIC,
 	}
 	v.execCtx.Stack = v.stack
 	v.execCtx.CallHook = v.callFromHook
@@ -930,6 +848,9 @@ func (e *Engine) SetSharedModules(enabled bool) {
 	e.isSharedModules = enabled
 	if enabled && e.sharedModules == nil {
 		e.sharedModules = e.newSysModules()
+		// Every VM of the engine reaches this namespace, so it always takes
+		// its lock.
+		e.sharedModules.Shared = true
 	}
 }
 

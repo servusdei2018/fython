@@ -60,8 +60,21 @@ func (e *Engine) sig() *sigState {
 			s.handlers[n] = val.Int64Val(sigDfl)
 		}
 		s.handlers[int(syscall.SIGPIPE)] = val.Int64Val(sigIgn)
+		// The default SIGINT handler turns the signal into a catchable
+		// KeyboardInterrupt. It is installed together with the signal table
+		// so that it is in place even when the _signal module is never
+		// imported.
+		s.handlers[int(syscall.SIGINT)] = defaultSIGINTHandler()
 	})
 	return s
+}
+
+// defaultSIGINTHandler returns the handler that turns SIGINT into a
+// KeyboardInterrupt.
+func defaultSIGINTHandler() val.Value {
+	return val.NewBuiltinFuncVal("default_int_handler", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		panic(val.NewException(val.KeyboardInterruptType, ""))
+	})
 }
 
 // pump turns Go signal deliveries into pending bits.
@@ -186,9 +199,7 @@ func (e *Engine) createSignalModule() val.Value {
 
 	s := e.sig()
 
-	defaultInt := val.NewBuiltinFuncVal("default_int_handler", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		panic(val.NewException(val.KeyboardInterruptType, ""))
-	})
+	defaultInt := defaultSIGINTHandler()
 	mod.Dict.Set(val.InternString("default_int_handler"), defaultInt)
 	s.mu.Lock()
 	if s.handlers[int(syscall.SIGINT)].IsInt64() && s.handlers[int(syscall.SIGINT)].AsInt64() == sigDfl {

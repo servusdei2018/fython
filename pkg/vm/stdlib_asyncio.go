@@ -354,9 +354,6 @@ func (e *Engine) createAsyncioModule() val.Value {
 	isCoroSentinel := val.NewInstanceOfType(val.ObjectType)
 	coroSubmodVal.AsModule().Dict.Set(val.InternString("_is_coroutine"), isCoroSentinel)
 	mod.Dict.Set(val.InternString("coroutines"), coroSubmodVal)
-	if e != nil && e.sharedModules != nil {
-		e.sharedModules.Set(val.InternString("asyncio.coroutines"), coroSubmodVal)
-	}
 
 	mod.Dict.Set(val.InternString("iscoroutinefunction"), val.NewBuiltinFuncVal("iscoroutinefunction", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {

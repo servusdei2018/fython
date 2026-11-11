@@ -380,14 +380,16 @@ func initIOTypes() {
 			if n <= 7 {
 				return val.SmallStringFromBytes(sio.buf)
 			}
-			s := unsafe.String(unsafe.SliceData(sio.buf), n)
+			// Copy the buffer: the returned string must not alias the live
+			// StringIO buffer, or a later write would mutate it in place.
+			copied := string(sio.buf)
 			ps := &val.PyString{
 				Header: val.ObjectHeader{
 					Kind: val.KindString,
-					Hash: val.HashString(s),
+					Hash: val.HashString(copied),
 					Type: val.StrType,
 				},
-				Data: s,
+				Data: copied,
 			}
 			return val.ObjectVal(&ps.Header)
 		}))

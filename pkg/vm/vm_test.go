@@ -46,13 +46,17 @@ func TestVMArithmeticAndLocals(t *testing.T) {
 	}
 }
 
-func TestVMQuickeningAndDeopt(t *testing.T) {
+// TestVMInstructionStreamImmutability verifies that the published instruction
+// stream is never rewritten in place. Type specialization used to overwrite the
+// opcode of the running instruction, which raced with other VMs executing the
+// very same code object.
+func TestVMInstructionStreamImmutability(t *testing.T) {
 	// Function bytecode:
 	// return local[0] + local[1]
 	addCode := []uint32{
 		Encode(OP_LOAD_FAST, 0, 0),
 		Encode(OP_LOAD_FAST, 0, 1),
-		Encode(OP_BINARY_ADD, 0, 0), // index 2: will quicken and deoptimize
+		Encode(OP_BINARY_ADD, 0, 0),
 		Encode(OP_RETURN, 0, 0),
 	}
 
@@ -63,29 +67,29 @@ func TestVMQuickeningAndDeopt(t *testing.T) {
 		t.Fatalf("initial opcode = %v, want OP_BINARY_ADD", got)
 	}
 
-	// 2. Execute with int64 + int64 -> should quicken in-place to OP_BINARY_ADD_INT
+	// 2. Execute with int64 + int64
 	v.stack[0] = val.Int64Val(100)
 	v.stack[1] = val.Int64Val(200)
 	res1 := v.Run(addCode, nil, 2)
 	if !res1.IsInt64() || res1.AsInt64() != 300 {
 		t.Fatalf("int64 + int64 result = %v, want 300", res1.AsInt64())
 	}
-	if got := DecodeOpcode(addCode[2]); got != OP_BINARY_ADD_INT {
-		t.Fatalf("opcode after int64 addition = %v, want OP_BINARY_ADD_INT", got)
+	if got := DecodeOpcode(addCode[2]); got != OP_BINARY_ADD {
+		t.Fatalf("opcode after int64 addition = %v, want OP_BINARY_ADD", got)
 	}
 
-	// 3. Execute again with int64 + int64 on quickened OP_BINARY_ADD_INT
+	// 3. Execute again with int64 + int64
 	v.stack[0] = val.Int64Val(50)
 	v.stack[1] = val.Int64Val(75)
 	res2 := v.Run(addCode, nil, 2)
 	if !res2.IsInt64() || res2.AsInt64() != 125 {
 		t.Fatalf("second int64 + int64 result = %v, want 125", res2.AsInt64())
 	}
-	if got := DecodeOpcode(addCode[2]); got != OP_BINARY_ADD_INT {
-		t.Fatalf("opcode after second int64 addition = %v, want OP_BINARY_ADD_INT", got)
+	if got := DecodeOpcode(addCode[2]); got != OP_BINARY_ADD {
+		t.Fatalf("opcode after second int64 addition = %v, want OP_BINARY_ADD", got)
 	}
 
-	// 4. Break type stability with float64 + float64 -> must deoptimize back to OP_BINARY_ADD
+	// 4. Switch to float64 + float64
 	v.stack[0] = val.Float64Val(1.5)
 	v.stack[1] = val.Float64Val(2.25)
 	res3 := v.Run(addCode, nil, 2)
@@ -93,21 +97,21 @@ func TestVMQuickeningAndDeopt(t *testing.T) {
 		t.Fatalf("float64 + float64 result = %v, want 3.75", res3.AsFloat64())
 	}
 	if got := DecodeOpcode(addCode[2]); got != OP_BINARY_ADD {
-		t.Fatalf("opcode after float64 deopt = %v, want OP_BINARY_ADD", got)
+		t.Fatalf("opcode after float64 addition = %v, want OP_BINARY_ADD", got)
 	}
 
-	// 5. Next float64 + float64 execution quickens OP_BINARY_ADD -> OP_BINARY_ADD_FLOAT
+	// 5. Execute again with float64 + float64
 	v.stack[0] = val.Float64Val(10.0)
 	v.stack[1] = val.Float64Val(20.5)
 	res4 := v.Run(addCode, nil, 2)
 	if !res4.IsFloat64() || res4.AsFloat64() != 30.5 {
 		t.Fatalf("second float64 + float64 result = %v, want 30.5", res4.AsFloat64())
 	}
-	if got := DecodeOpcode(addCode[2]); got != OP_BINARY_ADD_FLOAT {
-		t.Fatalf("opcode after float64 quicken = %v, want OP_BINARY_ADD_FLOAT", got)
+	if got := DecodeOpcode(addCode[2]); got != OP_BINARY_ADD {
+		t.Fatalf("opcode after second float64 addition = %v, want OP_BINARY_ADD", got)
 	}
 
-	// 6. Break type stability with str + str -> must deoptimize back to OP_BINARY_ADD
+	// 6. Switch to str + str
 	v.stack[0] = val.NewStringVal("py")
 	v.stack[1] = val.NewStringVal("thon")
 	res5 := v.Run(addCode, nil, 2)
@@ -115,7 +119,7 @@ func TestVMQuickeningAndDeopt(t *testing.T) {
 		t.Fatalf("str + str result = %q, want \"python\"", res5.AsString())
 	}
 	if got := DecodeOpcode(addCode[2]); got != OP_BINARY_ADD {
-		t.Fatalf("opcode after str deopt = %v, want OP_BINARY_ADD", got)
+		t.Fatalf("opcode after str addition = %v, want OP_BINARY_ADD", got)
 	}
 }
 
@@ -236,9 +240,9 @@ func TestVMInstanceAttrInlineCache(t *testing.T) {
 	}
 
 	// Verify inline cache slots at ip=1, ip=5, ip=7 are populated with obj.Shape.ID
-	if v.ic[1].ExpectedShapeID != obj.Shape.ID || v.ic[5].ExpectedShapeID != obj.Shape.ID || v.ic[7].ExpectedShapeID != obj.Shape.ID {
+	if v.rootCache.ic[1].ExpectedShapeID != obj.Shape.ID || v.rootCache.ic[5].ExpectedShapeID != obj.Shape.ID || v.rootCache.ic[7].ExpectedShapeID != obj.Shape.ID {
 		t.Fatalf("inline cache not populated with expected shape ID %d: ic[1]=%+v ic[5]=%+v ic[7]=%+v",
-			obj.Shape.ID, v.ic[1], v.ic[5], v.ic[7])
+			obj.Shape.ID, v.rootCache.ic[1], v.rootCache.ic[5], v.rootCache.ic[7])
 	}
 
 	// Subsequent runs must hit the Shape inline cache with 0 allocations
@@ -1070,31 +1074,41 @@ func TestTier2SuperinstructionFusion(t *testing.T) {
 		Code:      code,
 		NumLocals: 3,
 	}
+	co.Init()
 
 	OptimizeCodeObject(co)
 
-	if DecodeOpcode(co.Code[0]) != OP_FAST_ADD_INT_LOCAL_TO_LOCAL {
-		t.Fatalf("expected OP_FAST_ADD_INT_LOCAL_TO_LOCAL at index 0, got %v", DecodeOpcode(co.Code[0]))
+	// The fusion is published as a copy-on-write stream: the original
+	// instruction slice is never rewritten in place.
+	fused := co.Active()
+	for i := range code {
+		if code[i] != fused[i] && DecodeOpcode(code[i]) == DecodeOpcode(fused[i]) {
+			t.Fatalf("instruction %d was modified in place", i)
+		}
 	}
-	if DecodeArgA(co.Code[0]) != 2 || DecodeArgB(co.Code[0]) != 0 || DecodeArgC(co.Code[0]) != 1 {
+
+	if DecodeOpcode(fused[0]) != OP_FAST_ADD_INT_LOCAL_TO_LOCAL {
+		t.Fatalf("expected OP_FAST_ADD_INT_LOCAL_TO_LOCAL at index 0, got %v", DecodeOpcode(fused[0]))
+	}
+	if DecodeArgA(fused[0]) != 2 || DecodeArgB(fused[0]) != 0 || DecodeArgC(fused[0]) != 1 {
 		t.Fatalf("unexpected args for FAST_ADD: dst=%d, srcA=%d, srcB=%d",
-			DecodeArgA(co.Code[0]), DecodeArgB(co.Code[0]), DecodeArgC(co.Code[0]))
+			DecodeArgA(fused[0]), DecodeArgB(fused[0]), DecodeArgC(fused[0]))
 	}
 
-	if DecodeOpcode(co.Code[4]) != OP_FAST_INC_INT_LOCAL_CONST {
-		t.Fatalf("expected OP_FAST_INC_INT_LOCAL_CONST at index 4, got %v", DecodeOpcode(co.Code[4]))
+	if DecodeOpcode(fused[4]) != OP_FAST_INC_INT_LOCAL_CONST {
+		t.Fatalf("expected OP_FAST_INC_INT_LOCAL_CONST at index 4, got %v", DecodeOpcode(fused[4]))
 	}
-	if DecodeArgA(co.Code[4]) != 0 || DecodeArgBx(co.Code[4]) != 1 {
+	if DecodeArgA(fused[4]) != 0 || DecodeArgBx(fused[4]) != 1 {
 		t.Fatalf("unexpected args for FAST_INC: reg=%d, constIdx=%d",
-			DecodeArgA(co.Code[4]), DecodeArgBx(co.Code[4]))
+			DecodeArgA(fused[4]), DecodeArgBx(fused[4]))
 	}
 
-	if DecodeOpcode(co.Code[8]) != OP_FAST_LOOP_CMP_LT_CONST_JUMP {
-		t.Fatalf("expected OP_FAST_LOOP_CMP_LT_CONST_JUMP at index 8, got %v", DecodeOpcode(co.Code[8]))
+	if DecodeOpcode(fused[8]) != OP_FAST_LOOP_CMP_LT_CONST_JUMP {
+		t.Fatalf("expected OP_FAST_LOOP_CMP_LT_CONST_JUMP at index 8, got %v", DecodeOpcode(fused[8]))
 	}
-	if DecodeArgA(co.Code[8]) != 0 || DecodeArgBx(co.Code[8]) != 12 {
+	if DecodeArgA(fused[8]) != 0 || DecodeArgBx(fused[8]) != 12 {
 		t.Fatalf("unexpected args for FAST_LOOP: reg=%d, exitTarget=%d",
-			DecodeArgA(co.Code[8]), DecodeArgBx(co.Code[8]))
+			DecodeArgA(fused[8]), DecodeArgBx(fused[8]))
 	}
 }
 

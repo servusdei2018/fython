@@ -359,8 +359,34 @@ func formatExceptionMessage(ctx *val.ExecContext, exc val.Value) string {
 	if msg == "" && !exc.IsInstance() {
 		msg = exc.String()
 	}
+	var sb strings.Builder
 	if msg != "" {
-		return fmt.Sprintf("%s: %s\n", typeName, msg)
+		fmt.Fprintf(&sb, "%s: %s\n", typeName, msg)
+	} else {
+		sb.WriteString(typeName + "\n")
 	}
-	return typeName + "\n"
+	// PEP 678 notes are rendered on their own lines below the exception.
+	for _, note := range exceptionNotes(exc) {
+		sb.WriteString(note)
+		sb.WriteString("\n")
+	}
+	return sb.String()
+}
+
+// exceptionNotes returns the PEP 678 notes attached to an exception.
+func exceptionNotes(exc val.Value) []string {
+	if !exc.IsInstance() {
+		return nil
+	}
+	notesVal, ok := exc.AsInstance().GetAttr(val.InternString("__notes__"))
+	if !ok || !notesVal.IsList() {
+		return nil
+	}
+	var notes []string
+	for _, item := range notesVal.AsList().Items {
+		if item.IsAnyString() {
+			notes = append(notes, item.AsString())
+		}
+	}
+	return notes
 }

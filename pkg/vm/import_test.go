@@ -260,18 +260,18 @@ from ..outside import foo
 		t.Fatalf("CompileString failed: %v", err)
 	}
 
-	defer func() {
-		r := recover()
-		if r == nil {
-			t.Fatalf("expected panic for relative import beyond top level, got nil")
-		}
-		msg := r.(string)
-		if !strings.Contains(msg, "ImportError") {
-			t.Errorf("unexpected panic message: %v", msg)
-		}
-	}()
-
+	// A failing import must be reported as a regular Python exception, never
+	// as a Go panic.
 	v.RunCode(co)
+
+	exc := v.UnhandledException()
+	if exc.IsNone() || exc.HeaderPtr() == nil {
+		t.Fatalf("expected an ImportError for a relative import beyond top level, got none")
+	}
+	msg := v.FormatException(exc)
+	if !strings.Contains(msg, "ImportError") {
+		t.Errorf("unexpected exception message: %v", msg)
+	}
 }
 
 func TestCircularImports(t *testing.T) {

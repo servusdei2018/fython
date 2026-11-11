@@ -3,6 +3,7 @@ package val
 import (
 	"errors"
 	"math/big"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -24,6 +25,11 @@ type PyString struct {
 	Header ObjectHeader
 	Data   string
 	Buf    []byte
+	// BufClaimed records that the spare capacity of Buf has been handed over
+	// to a derived string. It is manipulated with sync/atomic only, so that
+	// two VMs concatenating the very same string can never both mutate the
+	// shared backing bytes.
+	BufClaimed uint32
 }
 
 // PyList represents a dynamic array of Value on the heap.
@@ -63,7 +69,12 @@ type PyDict struct {
 	indexShift uint8 // 0: uint8 slots, 1: uint16 slots, 2: uint32 slots
 	VersionTag uint64
 	mu         sync.RWMutex
-	Attrs      *PyDict
+	// Shared marks a dictionary that several VMs can reach at the same
+	// time, such as the builtins of an engine. Such a dictionary always
+	// takes its lock, even when the runtime believes it is
+	// single-threaded.
+	Shared bool
+	Attrs  *PyDict
 	// Live, when non-nil, turns this dict into a zero-copy view over a
 	// Shape-backed instance: every read and write is resolved through
 	// Live.Shape and Live.Slots (see NewInstanceDictProxy).
@@ -121,11 +132,105 @@ type PyMemoryView struct {
 	ItemSize int
 	released bool
 	// PEP 3118 typed / multi-dimensional view metadata.
-	Format     string
-	NDim       int
+	Format string
+	NDim   int
+	// Dim0 and Stride0 hold the extent and the stride of the first dimension
+	// inline. The common 1-D case therefore needs no Shape/Strides slices at
+	// all, which keeps slicing allocation-free apart from the view itself.
+	Dim0    int
+	Stride0 int
+	// Shape and Strides are only allocated for views with more than one
+	// dimension.
 	Shape      []int
 	Strides    []int
 	Suboffsets []int
+}
+
+// Dims returns the extent of every dimension of the view.
+func (mv *PyMemoryView) Dims() []int {
+	if mv == nil {
+		return nil
+	}
+	if len(mv.Shape) > 0 {
+		return mv.Shape
+	}
+	if mv.NDim <= 1 {
+		if mv.NDim == 0 {
+			return nil
+		}
+		return []int{mv.Dim0}
+	}
+	return nil
+}
+
+// Dim returns the extent of the i-th dimension of the view.
+func (mv *PyMemoryView) Dim(i int) int {
+	if mv == nil || i < 0 {
+		return 0
+	}
+	if len(mv.Shape) > 0 {
+		if i < len(mv.Shape) {
+			return mv.Shape[i]
+		}
+		return 0
+	}
+	if i == 0 {
+		return mv.Dim0
+	}
+	return 0
+}
+
+// Stride returns the stride of the i-th dimension of the view, in bytes.
+func (mv *PyMemoryView) Stride(i int) int {
+	if mv == nil || i < 0 {
+		return 0
+	}
+	if len(mv.Strides) > 0 {
+		if i < len(mv.Strides) {
+			return mv.Strides[i]
+		}
+		return 0
+	}
+	if i == 0 {
+		return mv.Stride0
+	}
+	return 0
+}
+
+// SetShape installs the shape and strides of a view, keeping the inline
+// Dim0/Stride0 fields in sync for the 1-D case.
+func (mv *PyMemoryView) SetShape(shape []int, strides []int) {
+	if mv.NDim <= 1 {
+		// 1-D views keep their extent and stride inline, so no Shape or
+		// Strides slice has to be allocated for them.
+		mv.Shape = nil
+		mv.Strides = nil
+		itemSize := mv.ItemSize
+		if itemSize <= 0 {
+			itemSize = 1
+		}
+		mv.Dim0 = 0
+		if len(shape) > 0 {
+			mv.Dim0 = shape[0]
+		} else if mv.NDim == 1 {
+			mv.Dim0 = len(mv.Buf) / itemSize
+		}
+		mv.Stride0 = itemSize
+		if len(strides) > 0 {
+			mv.Stride0 = strides[0]
+		}
+		return
+	}
+	mv.Shape = shape
+	mv.Strides = strides
+	mv.Dim0 = 0
+	mv.Stride0 = 0
+	if len(shape) > 0 {
+		mv.Dim0 = shape[0]
+	}
+	if len(strides) > 0 {
+		mv.Stride0 = strides[0]
+	}
 }
 
 // PyCInstance represents an instance of a C extension type (PyType_FromSpec / static PyTypeObject).
@@ -509,10 +614,9 @@ func NewMemoryViewVal(target Value) Value {
 		ItemSize:   itemSize,
 		Format:     format,
 		NDim:       ndim,
-		Shape:      shape,
-		Strides:    strides,
 		Suboffsets: view.Suboffsets,
 	}
+	obj.SetShape(shape, strides)
 	return Value{num: 0, ptr: &obj.Header}
 }
 
@@ -562,7 +666,7 @@ func (b *PyBytes) GetBuffer(ctx *ExecContext, view *PyBuffer, flags int) error {
 	if (flags & PyBUF_WRITABLE) != 0 {
 		return errors.New("cannot create writable buffer view into immutable bytes")
 	}
-	view.Buf = b.Data[:len(b.Data):len(b.Data)]
+	view.Buf = slices.Clip(b.Data)
 	view.ReadOnly = true
 	view.ItemSize = 1
 	view.Obj = ObjectVal(&b.Header)
@@ -624,11 +728,19 @@ func (mv *PyMemoryView) GetBuffer(ctx *ExecContext, view *PyBuffer, flags int) e
 	}
 	view.Shape = mv.Shape
 	if view.Shape == nil {
-		view.Shape = []int{len(mv.Buf) / max(view.ItemSize, 1)}
+		if view.NDim == 1 {
+			view.Shape = []int{mv.Dim(0)}
+		} else {
+			view.Shape = mv.Dims()
+		}
 	}
 	view.Strides = mv.Strides
 	if view.Strides == nil {
-		view.Strides = CContiguousStrides(view.Shape, view.ItemSize)
+		if view.NDim == 1 {
+			view.Strides = []int{mv.Stride(0)}
+		} else {
+			view.Strides = CContiguousStrides(view.Shape, view.ItemSize)
+		}
 	}
 	view.Suboffsets = mv.Suboffsets
 	// Contiguity checks: if C_CONTIGUOUS requested but view isn't, error.
@@ -1398,13 +1510,36 @@ func (d *PyDict) resize(minEntries int) {
 
 // Set inserts or updates a key-value pair in PyDict while preserving insertion order
 // and keeping the first-inserted key on value updates (Python dict invariant) in a thread-safe manner.
+// lockDict takes the dictionary lock when the runtime is multi-threaded.
+//
+// A single-threaded program never shares a dictionary between goroutines, so
+// the mutex is skipped entirely: the hot loop reads globals and builtins on
+// every instruction and the read/write lock shows up in profiles there.
+func (d *PyDict) lockDict() bool {
+	if !d.Shared && !isMultiThreaded.Load() {
+		return false
+	}
+	d.mu.Lock()
+	return true
+}
+
+// rlockDict takes the dictionary read lock when the runtime is multi-threaded.
+func (d *PyDict) rlockDict() bool {
+	if !d.Shared && !isMultiThreaded.Load() {
+		return false
+	}
+	d.mu.RLock()
+	return true
+}
+
 func (d *PyDict) Set(key, value Value) {
 	if d.Live != nil {
 		d.Live.SetAttr(InternValue(key), value)
 		return
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	if d.lockDict() {
+		defer d.mu.Unlock()
+	}
 	d.setLocked(key, value)
 }
 
@@ -1497,8 +1632,9 @@ func (d *PyDict) Get(key Value) (Value, bool) {
 	if d.Live != nil {
 		return d.Live.GetAttr(key)
 	}
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+	if d.rlockDict() {
+		defer d.mu.RUnlock()
+	}
 	return d.getLocked(key)
 }
 
@@ -1508,8 +1644,9 @@ func (d *PyDict) GetWithSlot(key Value) (Value, int, bool) {
 	if d.Live != nil {
 		return d.liveGetWithSlot(key)
 	}
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+	if d.rlockDict() {
+		defer d.mu.RUnlock()
+	}
 	return d.getWithSlotLocked(key)
 }
 
@@ -1616,8 +1753,9 @@ func (d *PyDict) Delete(key Value) bool {
 	if d.Live != nil {
 		return d.Live.DeleteAttr(InternValue(key))
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	if d.lockDict() {
+		defer d.mu.Unlock()
+	}
 	return d.deleteLocked(key)
 }
 
@@ -1672,8 +1810,9 @@ func (d *PyDict) Keys() []Value {
 		}
 		return keys
 	}
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+	if d.rlockDict() {
+		defer d.mu.RUnlock()
+	}
 	keys := make([]Value, 0, d.used)
 	for i := range d.Entries {
 		if d.Entries[i].Active {
@@ -1704,8 +1843,9 @@ func (d *PyDict) Values() []Value {
 		}
 		return vals
 	}
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+	if d.rlockDict() {
+		defer d.mu.RUnlock()
+	}
 	vals := make([]Value, 0, d.used)
 	for i := range d.Entries {
 		if d.Entries[i].Active {
@@ -1729,8 +1869,9 @@ func (d *PyDict) Items() []DictItem {
 	if d.Live != nil {
 		return d.liveItems()
 	}
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+	if d.rlockDict() {
+		defer d.mu.RUnlock()
+	}
 	items := make([]DictItem, 0, d.used)
 	for i := range d.Entries {
 		if d.Entries[i].Active {
@@ -2428,8 +2569,9 @@ func (d *PyDict) ActiveEntries() []DictEntry {
 		}
 		return out
 	}
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+	if d.rlockDict() {
+		defer d.mu.RUnlock()
+	}
 	out := make([]DictEntry, 0, d.used)
 	for i := range d.Entries {
 		if d.Entries[i].Active {
@@ -2447,7 +2589,9 @@ func (d *PyDict) Clear() {
 		}
 		return
 	}
-	d.mu.Lock()
+	if d.lockDict() {
+		defer d.mu.Unlock()
+	}
 	d.Entries = d.Entries[:0]
 	for i := range d.indices {
 		d.indices[i] = 0
@@ -2455,7 +2599,6 @@ func (d *PyDict) Clear() {
 	d.used = 0
 	d.filled = 0
 	atomic.AddUint64(&d.VersionTag, 1)
-	d.mu.Unlock()
 }
 
 // PopItem removes and returns the last (key, value) pair in LIFO order.
@@ -2473,8 +2616,9 @@ func (d *PyDict) PopItem() (Value, Value, bool) {
 		d.Live.DeleteAttr(last.Key)
 		return last.Key, last.Value, true
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	if d.lockDict() {
+		defer d.mu.Unlock()
+	}
 	for i := len(d.Entries) - 1; i >= 0; i-- {
 		e := &d.Entries[i]
 		if e.Active {

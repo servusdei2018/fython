@@ -43,6 +43,7 @@ var (
 	threadRLockType *val.PyType
 	threadCondType  *val.PyType
 	threadType      *val.PyType
+	localType       *val.PyType
 	threadStateMap  sync.Map // map[*val.PyInstance]*threadState
 	lockStateMap    sync.Map // map[*val.PyInstance]*lockState
 	rlockStateMap   sync.Map // map[*val.PyInstance]*rlockState
@@ -494,6 +495,7 @@ func initThreadModule() {
 
 		threadTypeDict := val.NewDictVal(16).AsDict()
 		threadType = val.MustNewType("Thread", []*val.PyType{val.ObjectType}, threadTypeDict)
+		localType = initLocalType()
 		threadType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			inst := val.NewInstanceOfType(threadType)
 			initArgs := append([]val.Value{inst}, args...)
@@ -690,6 +692,7 @@ func (e *Engine) createThreadModule() val.Value {
 
 	mod.Dict.Set(val.InternString("LockType"), val.TypeVal(threadLockType))
 	mod.Dict.Set(val.InternString("RLock"), val.TypeVal(threadRLockType))
+	mod.Dict.Set(val.InternString("_local"), val.TypeVal(localType))
 	mod.Dict.Set(val.InternString("allocate_lock"), val.NewBuiltinFuncVal("allocate_lock", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		return val.NewInstanceOfType(threadLockType)
 	}))
@@ -1028,7 +1031,7 @@ func (e *Engine) createThreadingModule() val.Value {
 		return inst
 	}))
 
-	mod.Dict.Set(val.InternString("local"), val.TypeVal(val.ObjectType))
+	mod.Dict.Set(val.InternString("local"), val.TypeVal(localType))
 
 	defaultExcepthook := val.NewBuiltinFuncVal("excepthook", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		return val.NoneVal()

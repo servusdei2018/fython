@@ -896,6 +896,11 @@ func (e *Engine) createImpModule() val.Value {
 		if m, ok := vmInstance.modules.Get(val.InternValue(nameVal)); ok {
 			return m
 		}
+		// Native modules are created on first import: materialize it here so
+		// that the caller gets the real module instead of an empty shell.
+		if m, ok := vmInstance.materializeBuiltinModule(nameVal.AsString()); ok {
+			return m
+		}
 		return val.NewModuleVal(nameVal.AsString(), "")
 	}))
 	mod.Dict.Set(val.InternString("exec_builtin"), val.NewBuiltinFuncVal("exec_builtin", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {

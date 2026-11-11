@@ -15,8 +15,10 @@ const (
 	DefaultStackSize = 65536
 	// DefaultFrameSlabSize is the default pre-allocated CallFrame slab capacity per VM instance.
 	DefaultFrameSlabSize = 256
-	// DefaultICSlabSize is the default pre-allocated Inline Cache side-table capacity per VM instance.
-	DefaultICSlabSize = 65536
+	// DefaultICSlabSize is the initial Inline Cache side-table capacity per
+	// VM instance. The slabs grow on demand, so a small initial size keeps
+	// the resident set of the interpreter low.
+	DefaultICSlabSize = 4096
 )
 
 // ICKind identifies the cached resolution category in an ICSlot.
@@ -135,6 +137,71 @@ type CodeObject struct {
 	LineSpans        []LineSpanEntry
 	Hotness          int32
 	IsTier2Optimized int32
+	// stream publishes the instruction slice the VM executes. It is created
+	// together with the code object, before the object is shared between VMs.
+	stream *codeStream
+	// StreamGen counts the publications of the instruction stream. A VM uses
+	// it to notice that a newer stream is available without having to load
+	// the stream itself on every frame switch.
+	StreamGen int32
+}
+
+// Active returns the instruction slice that must be executed for this code
+// object. It is the compiled stream until the Tier-2 optimizer publishes a
+// fused copy of it.
+func (co *CodeObject) Active() []uint32 {
+	if co == nil {
+		return nil
+	}
+	if co.stream == nil {
+		return co.Code
+	}
+	return co.stream.Active()
+}
+
+// initStream creates the publication stream of the code object. It has to run
+// before the object is shared between VMs, so it is called from Init.
+func (co *CodeObject) initStream() {
+	if co == nil || co.stream != nil {
+		return
+	}
+	co.stream = &codeStream{}
+	co.stream.active.Store(&co.Code)
+}
+
+// publish installs a new instruction slice for every VM executing the code
+// object.
+//
+// The publication stream is created together with the code object, so it is
+// never created here: doing so would race with the VMs that read it.
+func (co *CodeObject) publish(code []uint32) {
+	if co == nil || co.stream == nil {
+		return
+	}
+	co.stream.Publish(code)
+	// The generation is bumped after the stream was stored, so a VM that
+	// observes the new generation also observes the new stream.
+	atomic.AddInt32(&co.StreamGen, 1)
+}
+
+// refreshCode returns the instruction slice that must be executed for co.
+//
+// The stream is only reloaded when the Tier-2 optimizer published a newer
+// one; the generation counter makes that check a single atomic load.
+func refreshCode(co *CodeObject, cache *VMCodeCache) []uint32 {
+	if gen := atomic.LoadInt32(&co.StreamGen); gen != cache.streamGen {
+		return reloadCode(co, cache, gen)
+	}
+	return cache.active
+}
+
+// reloadCode installs the instruction stream that the code object published.
+//
+//go:noinline
+func reloadCode(co *CodeObject, cache *VMCodeCache, gen int32) []uint32 {
+	cache.streamGen = gen
+	cache.active = co.Active()
+	return cache.active
 }
 
 var nextCodeObjectID uint32
@@ -189,6 +256,46 @@ type VMCodeCache struct {
 	ic        []ICSlot
 	methodPIC [][4]val.MethodPICEntry
 	attrPIC   [][4]AttrPICEntry
+	// hotness counts how often this VM executed the code object. It is
+	// VM-local, so it never shares a cache line with another VM.
+	hotness uint32
+	// active is the instruction stream this VM loaded for the code object,
+	// and streamGen the generation it belongs to. The pair lets the VM pick
+	// up a stream published by the Tier-2 optimizer without loading it on
+	// every frame switch.
+	active    []uint32
+	streamGen int32
+}
+
+// codeStream publishes the instruction slice that VMs execute for a code
+// object.
+//
+// The slice a VM reads is never modified in place: the Tier-2 optimizer and
+// the deoptimizer both build a fresh copy and publish it with a single atomic
+// store. A VM that is already executing therefore never observes a partially
+// rewritten instruction window.
+type codeStream struct {
+	active atomic.Pointer[[]uint32]
+}
+
+// Active returns the instruction slice that must be executed.
+func (s *codeStream) Active() []uint32 {
+	if s == nil {
+		return nil
+	}
+	p := s.active.Load()
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
+// Publish installs a new instruction slice for every VM.
+func (s *codeStream) Publish(code []uint32) {
+	if s == nil {
+		return
+	}
+	s.active.Store(&code)
 }
 
 // Compile-time check that CodeObject.Header is at byte offset 0.
@@ -203,6 +310,7 @@ func (co *CodeObject) Init() *CodeObject {
 	co.Header.Type = val.CodeType
 	co.initID()
 	co.InitCellParamIndices()
+	co.initStream()
 	return co
 }
 
@@ -242,6 +350,10 @@ func NewCodeVal(co *CodeObject) val.Value {
 		return val.NoneVal()
 	}
 	co.initID()
+	// The publication stream has to exist before the code object is shared
+	// between VMs, and a code object becomes shareable as soon as it is
+	// turned into a value.
+	co.initStream()
 	if co.Header.Kind != val.KindCode {
 		co.Header.Kind = val.KindCode
 		co.Header.Type = val.CodeType
@@ -269,15 +381,10 @@ type VM struct {
 	engine             *Engine
 	stack              []val.Value
 	frames             []CallFrame
-	ic                 []ICSlot
-	methodPIC          [][4]val.MethodPICEntry
-	attrPIC            [][4]AttrPICEntry
 	codeCaches         []VMCodeCache
 	builtinRange       val.Value
 	builtinLen         val.Value
 	builtinOpen        val.Value
-	mvRing             [1024]val.PyMemoryView
-	mvRingIdx          uint16
 	strScratch         []byte
 	internPool         *val.InternPool
 	execCtx            val.ExecContext
@@ -307,7 +414,25 @@ type VM struct {
 
 func (vm *VM) getCodeCache(co *CodeObject) *VMCodeCache {
 	if co == nil || co == &vm.rootCO {
-		return &vm.rootCache
+		// The root slabs are only used by the low-level Run() API, so they
+		// are allocated on demand instead of for every VM.
+		cache := &vm.rootCache
+		need := DefaultICSlabSize
+		if co != nil && len(co.Code) > need {
+			need = len(co.Code)
+		}
+		if len(cache.ic) < need {
+			cache.ic = make([]ICSlot, need)
+			cache.methodPIC = make([][4]val.MethodPICEntry, need)
+			cache.attrPIC = make([][4]AttrPICEntry, need)
+		}
+		if co != nil {
+			// The root code object is recreated for every Run() call, so its
+			// instruction stream is always fetched anew.
+			cache.streamGen = atomic.LoadInt32(&co.StreamGen)
+			cache.active = co.Active()
+		}
+		return cache
 	}
 	id := int(co.initID())
 	if id >= len(vm.codeCaches) {
@@ -316,7 +441,13 @@ func (vm *VM) getCodeCache(co *CodeObject) *VMCodeCache {
 		vm.codeCaches = newCaches
 	}
 	cache := &vm.codeCaches[id]
-	if len(cache.ic) < len(co.Code) {
+	if cache.active == nil {
+		// The generation is read before the stream, so a publication that
+		// happens in between is picked up by the next refresh.
+		cache.streamGen = atomic.LoadInt32(&co.StreamGen)
+		cache.active = co.Active()
+	}
+	if len(cache.ic) < len(co.Code) || len(cache.methodPIC) < len(co.Code) || len(cache.attrPIC) < len(co.Code) {
 		cache.ic = make([]ICSlot, len(co.Code))
 		cache.methodPIC = make([][4]val.MethodPICEntry, len(co.Code))
 		cache.attrPIC = make([][4]AttrPICEntry, len(co.Code))

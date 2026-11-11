@@ -3,6 +3,7 @@ package val
 import (
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"unicode/utf8"
 	"unsafe"
 )
@@ -563,4 +564,69 @@ func ConcatStrings(a, b Value) Value {
 		Buf:  buf,
 	}
 	return Value{num: 0, ptr: &ps.Header}
+}
+
+// TryConcatInPlace concatenates the heap string a with b, reusing the spare
+// capacity that a's backing buffer was allocated with.
+//
+// Python strings are immutable, so the bytes a already exposes must never
+// change. The returned Value is therefore always a freshly allocated
+// *PyString header that owns the grown buffer; a keeps its own Data, and
+// hence its original length and bytes, so every alias of a keeps observing
+// the original string.
+//
+// The backing buffer is claimed with a compare-and-swap, so at most one
+// goroutine can ever read or write it: concurrent concatenations of the same
+// string fall back to ConcatStrings instead of racing on the shared bytes.
+//
+// ok reports whether the buffer could be reused; when it is false the caller
+// must fall back to ConcatStrings.
+func TryConcatInPlace(a, b Value) (Value, bool) {
+	if a.ptr == nil || a.ptr.Kind != KindString {
+		return NoneVal(), false
+	}
+	psA := (*PyString)(unsafe.Pointer(a.ptr))
+	oldLen := len(psA.Data)
+	bLen := b.StringByteLen()
+	// Claim the buffer before touching it: from here on exactly one
+	// goroutine owns Buf, so the bytes behind a are never mutated twice.
+	if !atomic.CompareAndSwapUint32(&psA.BufClaimed, 0, 1) {
+		return NoneVal(), false
+	}
+	buf := psA.Buf
+	if buf == nil || len(buf) < oldLen || cap(buf) < oldLen+bLen {
+		return NoneVal(), false
+	}
+	grown, ok := AppendValueBytes(buf[:oldLen], b)
+	if !ok || len(grown) != oldLen+bLen {
+		return NoneVal(), false
+	}
+	s := unsafe.String(unsafe.SliceData(grown), len(grown))
+	ps := &PyString{
+		Header: ObjectHeader{
+			Kind: KindString,
+			Hash: HashString(s),
+			Type: StrType,
+		},
+		Data: s,
+		Buf:  grown,
+	}
+	return Value{num: 0, ptr: &ps.Header}, true
+}
+
+// DetachStringBuf releases the spare capacity of a heap string so that the
+// string can no longer be extended in place.
+//
+// It is called whenever a string becomes reachable from more than one place:
+// stored into a variable, a container, an attribute, or duplicated on the
+// evaluation stack. The buffer is claimed first, so the release is performed
+// by at most one goroutine and never races with a concurrent concatenation.
+func DetachStringBuf(v Value) {
+	if v.ptr == nil || v.ptr.Kind != KindString {
+		return
+	}
+	ps := (*PyString)(unsafe.Pointer(v.ptr))
+	if atomic.CompareAndSwapUint32(&ps.BufClaimed, 0, 1) {
+		ps.Buf = nil
+	}
 }

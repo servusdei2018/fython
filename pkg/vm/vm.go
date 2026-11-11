@@ -18,13 +18,42 @@ import (
 // compiler allocates them to CPU registers across loop iterations.
 func (vm *VM) Run(code []uint32, consts []val.Value, numLocals int) val.Value {
 	vm.unhandledException = val.NoneVal()
-	vm.rootCO = CodeObject{
-		Code:         code,
-		Consts:       consts,
-		NumLocals:    numLocals,
-		MaxStackSize: numLocals + 64,
+	// The root code object is reused across calls, so that the Tier-2 state
+	// of an unchanged instruction stream survives. A different stream resets
+	// it, because the published instruction slice would not match.
+	if !sameCodeStream(vm.rootCO.Code, code) || !sameConstStream(vm.rootCO.Consts, consts) {
+		vm.rootCO.Code = code
+		vm.rootCO.Consts = consts
+		vm.rootCO.NumLocals = numLocals
+		vm.rootCO.MaxStackSize = numLocals + 64
+		vm.rootCO.IsTier2Optimized = 0
+		vm.rootCO.Hotness = 0
+		vm.rootCO.stream = nil
 	}
+	vm.rootCO.initStream()
 	return vm.runLoopWithGlobals(&vm.rootCO, 0, numLocals, 0, nil, vm.globals, val.NoneVal(), vm.stack, nil, nil)
+}
+
+// sameCodeStream reports whether two instruction slices are the same buffer.
+func sameCodeStream(a, b []uint32) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	if len(a) == 0 {
+		return true
+	}
+	return &a[0] == &b[0]
+}
+
+// sameConstStream reports whether two constant pools are the same buffer.
+func sameConstStream(a, b []val.Value) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	if len(a) == 0 {
+		return true
+	}
+	return &a[0] == &b[0]
 }
 
 // RunCode executes a *CodeObject on the VM.
@@ -776,10 +805,14 @@ func (vm *VM) setupCalleeCells(callee *CodeObject, target val.Value, stack []val
 	return cells
 }
 
+// allocMemoryView allocates a fresh memoryview on the Go heap.
+//
+// Memoryviews used to be handed out from a fixed 1024-entry ring, which
+// silently overwrote live views once more than 1024 of them existed. Every
+// view is now an ordinary heap object, so all of them stay valid for as long
+// as they are referenced.
 func (vm *VM) allocMemoryView() *val.PyMemoryView {
-	idx := vm.mvRingIdx & 1023
-	vm.mvRingIdx++
-	return &vm.mvRing[idx]
+	return new(val.PyMemoryView)
 }
 
 func (vm *VM) initBuiltins() {
@@ -814,8 +847,8 @@ func (vm *VM) initBuiltins() {
 		}
 		if a.IsMemoryView() {
 			mv := a.AsMemoryView()
-			if len(mv.Shape) > 0 {
-				return val.Int64Val(int64(mv.Shape[0]))
+			if mv.NDim > 0 {
+				return val.Int64Val(int64(mv.Dim(0)))
 			}
 			if mv.ItemSize > 1 {
 				return val.Int64Val(int64(len(mv.Buf) / mv.ItemSize))
@@ -1282,6 +1315,39 @@ func (vm *VM) StepCoroutine(coro *val.PyCoroutine, sent val.Value) (val.Value, v
 // ExecContext returns the execution context for this VM.
 func (vm *VM) ExecContext() *val.ExecContext {
 	return &vm.execCtx
+}
+
+// CallUserExcepthook invokes a user-installed sys.excepthook for an unhandled
+// exception.
+//
+// It reports whether a user override was found and invoked. When it returns
+// false the caller is responsible for rendering the traceback itself.
+func (vm *VM) CallUserExcepthook(exc val.Value) bool {
+	if vm.engine == nil || vm.modules == nil {
+		return false
+	}
+	sysVal, ok := vm.modules.Get(val.InternString("sys"))
+	if !ok || !sysVal.IsModule() {
+		return false
+	}
+	hook, ok := sysVal.AsModule().Dict.Get(val.InternString("excepthook"))
+	if !ok || hook.IsNone() || hook.HeaderPtr() == nil {
+		return false
+	}
+	// The default hook is also published as sys.__excepthook__, so a user
+	// override can be detected by comparing the two.
+	if def, ok := sysVal.AsModule().Dict.Get(val.InternString("__excepthook__")); ok &&
+		def.HeaderPtr() != nil && hook.HeaderPtr() == def.HeaderPtr() {
+		return false
+	}
+	tb := val.NoneVal()
+	if exc.IsInstance() {
+		tb, _ = exc.AsInstance().GetAttr(val.InternString("__traceback__"))
+	}
+	vm.execCtx.SP = 0
+	vm.Vectorcall(hook, []val.Value{val.TypeVal(exc.Type()), exc, tb}, nil)
+	vm.execCtx.ClearException()
+	return true
 }
 
 func (vm *VM) instantiateCoroutine(co *CodeObject, callable val.Value, defaults []val.Value, kwDefaults *val.PyDict, callerStack []val.Value, argBase int, nargs int, kwnames []val.Value, globals *val.PyDict) val.Value {
@@ -1822,7 +1888,6 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 	}()
 
 	curCO := co
-	code := curCO.Code
 	consts := curCO.Consts
 	frameIdx := startFrameIdx
 	baseOffset := startBase
@@ -1877,8 +1942,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 	curIC := curCodeCache.ic
 	curMethodPIC := curCodeCache.methodPIC
 	curAttrPIC := curCodeCache.attrPIC
+	code := refreshCode(curCO, curCodeCache)
 
-	maybeOptimizeCodeObject(curCO)
+	maybeOptimizeCodeObject(vm, curCO, curCodeCache)
 
 	if (activeGen != nil || activeCoro != nil) && vm.execCtx.HasException() {
 		exc := vm.execCtx.ActiveException
@@ -1902,7 +1968,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 	}
 
 	for {
-		inst := atomic.LoadUint32(&code[ip])
+		inst := code[ip]
 		op := Opcode(inst >> 24)
 
 		switch op {
@@ -1926,9 +1992,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			bx := uint16(inst)
 			sp--
 			valToStore := stack[sp]
-			if valToStore.IsString() {
-				valToStore.AsStringObj().Buf = nil
-			}
+			val.DetachStringBuf(valToStore)
 			if bx < 256 {
 				locals[uint8(bx)] = valToStore
 			} else {
@@ -1941,8 +2005,6 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			a := stack[sp-2]
 			switch {
 			case a.IsInt64() && b.IsInt64():
-				// Quickening: specialize in-place to OP_BINARY_ADD_INT
-				atomic.StoreUint32(&code[ip], (inst&0x00FFFFFF)|(uint32(OP_BINARY_ADD_INT)<<24))
 				ai := a.AsInt64()
 				bi := b.AsInt64()
 				sum := ai + bi
@@ -1952,17 +2014,15 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					stack[sp-2] = val.Add(a, b)
 				}
 			case a.IsFloat64() && b.IsFloat64():
-				// Quickening: specialize in-place to OP_BINARY_ADD_FLOAT
-				atomic.StoreUint32(&code[ip], (inst&0x00FFFFFF)|(uint32(OP_BINARY_ADD_FLOAT)<<24))
 				stack[sp-2] = val.Float64Val(a.AsFloat64() + b.AsFloat64())
 			case a.IsAnyString() && b.IsAnyString():
 				if a.IsString() {
-					psA := a.AsStringObj()
-					bLen := b.StringByteLen()
-					if psA.Buf != nil && cap(psA.Buf) >= len(psA.Buf)+bLen {
-						psA.Buf, _ = val.AppendValueBytes(psA.Buf, b)
-						psA.Data = unsafe.String(unsafe.SliceData(psA.Buf), len(psA.Buf))
-						psA.Header.Hash = 0
+					// Reuse the spare capacity of a's backing buffer when it is
+					// available. The helper hands the buffer over to a freshly
+					// allocated header, so a and every alias of it keep their
+					// original bytes: Python strings are immutable.
+					if res, ok := val.TryConcatInPlace(a, b); ok {
+						stack[sp-2] = res
 						sp--
 						ip++
 						continue
@@ -2009,8 +2069,6 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					stack[sp-2] = val.Add(a, b)
 				}
 			} else {
-				// Type stability broken: deoptimize in-place back to OP_BINARY_ADD
-				atomic.StoreUint32(&code[ip], (inst&0x00FFFFFF)|(uint32(OP_BINARY_ADD)<<24))
 				vm.execCtx.SP = sp
 				vm.activeFrameIdx = frameIdx
 				stack[sp-2] = val.AddCtx(&vm.execCtx, a, b)
@@ -2043,8 +2101,6 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			if a.IsFloat64() && b.IsFloat64() {
 				stack[sp-2] = val.Float64Val(a.AsFloat64() + b.AsFloat64())
 			} else {
-				// Type stability broken: deoptimize in-place back to OP_BINARY_ADD
-				atomic.StoreUint32(&code[ip], (inst&0x00FFFFFF)|(uint32(OP_BINARY_ADD)<<24))
 				vm.execCtx.SP = sp
 				vm.activeFrameIdx = frameIdx
 				stack[sp-2] = val.AddCtx(&vm.execCtx, a, b)
@@ -2075,8 +2131,6 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			b := stack[sp-1]
 			a := stack[sp-2]
 			if a.IsInt64() && b.IsInt64() {
-				// Quickening: specialize in-place to OP_BINARY_SUB_INT
-				atomic.StoreUint32(&code[ip], (inst&0x00FFFFFF)|(uint32(OP_BINARY_SUB_INT)<<24))
 				ai := a.AsInt64()
 				bi := b.AsInt64()
 				diff := ai - bi
@@ -2125,8 +2179,6 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					stack[sp-2] = val.Sub(a, b)
 				}
 			} else {
-				// Type stability broken: deoptimize in-place back to OP_BINARY_SUB
-				atomic.StoreUint32(&code[ip], (inst&0x00FFFFFF)|(uint32(OP_BINARY_SUB)<<24))
 				vm.execCtx.SP = sp
 				vm.activeFrameIdx = frameIdx
 				stack[sp-2] = val.SubCtx(&vm.execCtx, a, b)
@@ -2312,6 +2364,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			key := stack[sp-1]
 			obj := stack[sp-2]
 			valToStore := stack[sp-3]
+			val.DetachStringBuf(valToStore)
 			if obj.Kind() == val.KindMemoryView && key.IsInt64() && valToStore.IsInt64() && obj.AsMemoryView().ItemSize <= 1 && obj.AsMemoryView().NDim <= 1 {
 				mv := obj.AsMemoryView()
 				if !mv.ReadOnly {
@@ -2411,8 +2464,6 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			b := stack[sp-1]
 			a := stack[sp-2]
 			if a.IsInt64() && b.IsInt64() {
-				// Quickening: specialize in-place to OP_COMPARE_LT_INT
-				atomic.StoreUint32(&code[ip], (inst&0x00FFFFFF)|(uint32(OP_COMPARE_LT_INT)<<24))
 				stack[sp-2] = val.BoolVal(a.AsInt64() < b.AsInt64())
 			} else {
 				vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
@@ -2449,8 +2500,6 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			if a.IsInt64() && b.IsInt64() {
 				stack[sp-2] = val.BoolVal(a.AsInt64() < b.AsInt64())
 			} else {
-				// Type stability broken: deoptimize in-place back to OP_COMPARE_LT
-				atomic.StoreUint32(&code[ip], (inst&0x00FFFFFF)|(uint32(OP_COMPARE_LT)<<24))
 				vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 				vm.execCtx.SP = sp
 				res := vm.compareOpSafe(a, b, CMP_LT)
@@ -2491,7 +2540,10 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		case OP_JUMP:
 			target := int(uint16(inst))
 			if target <= ip {
-				maybeOptimizeCodeObject(curCO)
+				maybeOptimizeCodeObject(vm, curCO, curCodeCache)
+				// A backward jump is the place where the hot loop re-enters:
+				// pick up a stream that was published since the last reload.
+				code = refreshCode(curCO, curCodeCache)
 				periodicTick++
 				if (periodicTick & 0xFF) == 0 {
 					if vm.limits.Context != nil {
@@ -2582,8 +2634,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				case val.KindMemoryView:
 					mv := arg.AsMemoryView()
 					switch {
-					case len(mv.Shape) > 0:
-						stack[retSP] = val.Int64Val(int64(mv.Shape[0]))
+					case mv.NDim > 0:
+						stack[retSP] = val.Int64Val(int64(mv.Dim(0)))
 					case mv.ItemSize > 1:
 						stack[retSP] = val.Int64Val(int64(len(mv.Buf) / mv.ItemSize))
 					default:
@@ -2770,7 +2822,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				curLocals = val.NoneVal()
 				frameIdx++
 				curCO = callee
-				code = callee.Code
+				curCodeCache = vm.getCodeCache(curCO)
+				code = refreshCode(callee, curCodeCache)
 				consts = callee.Consts
 				baseOffset = newBase
 				minCap := max(baseOffset+256, baseOffset+callee.NumLocals+64)
@@ -2788,11 +2841,11 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				}
 				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
 				_ = locals[255]
-				maybeOptimizeCodeObject(callee)
+				curCodeCache = vm.getCodeCache(curCO)
+				maybeOptimizeCodeObject(vm, callee, curCodeCache)
 				cells, cellPtrs = vm.setupCalleeCellsAndPtrs(callee, target, stack, newBase, argc)
 				numLocalsCallee := max(callee.NumLocals, argc)
 				sp = newBase + numLocalsCallee
-				curCodeCache = vm.getCodeCache(curCO)
 				curIC = curCodeCache.ic
 				curMethodPIC = curCodeCache.methodPIC
 				curAttrPIC = curCodeCache.attrPIC
@@ -2807,7 +2860,11 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			case val.KindFunction:
 				fn := target.AsFunction()
 				callee := AsCodeObject(fn.Code)
-				maybeOptimizeCodeObject(callee)
+				if callee == curCO {
+					// The recursive fast path below keeps the current code
+					// object, so its cache still holds the counter.
+					maybeOptimizeCodeObject(vm, callee, curCodeCache)
+				}
 				periodicTick++
 				if (periodicTick & 0xFF) == 0 {
 					if vm.limits.Context != nil {
@@ -2838,6 +2895,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					}
 					saved := &vm.frames[frameIdx]
 					saved.co = curCO
+					// Pick up a stream that the Tier-2 optimizer published for this
+					// code object since the last reload.
+					code = refreshCode(callee, curCodeCache)
 					saved.code = code
 					saved.consts = consts
 					if isDirectAwait && callee.IsCoroutine {
@@ -2988,7 +3048,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				frameIdx++
 				curCO = callee
 				sp = nextSP
-				code = callee.Code
+				curCodeCache = vm.getCodeCache(curCO)
+				code = refreshCode(callee, curCodeCache)
 				consts = callee.Consts
 				baseOffset = newBase
 				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
@@ -3197,17 +3258,18 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				frameIdx++
 				curCO = callee
 				sp = nextSP
-				code = callee.Code
+				curCodeCache = vm.getCodeCache(curCO)
+				code = refreshCode(callee, curCodeCache)
 				consts = callee.Consts
 				baseOffset = newBase
 				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
 				_ = locals[255]
-				maybeOptimizeCodeObject(callee)
+				curCodeCache = vm.getCodeCache(curCO)
+				maybeOptimizeCodeObject(vm, callee, curCodeCache)
 				cells, cellPtrs = vm.setupCalleeCellsAndPtrs(callee, target, stack, newBase, totalArgs)
 				if fn.Globals != nil {
 					globals = fn.Globals
 				}
-				curCodeCache = vm.getCodeCache(curCO)
 				curIC = curCodeCache.ic
 				curMethodPIC = curCodeCache.methodPIC
 				curAttrPIC = curCodeCache.attrPIC
@@ -3322,14 +3384,15 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				frameIdx++
 				curCO = callee
 				sp = nextSP
-				code = callee.Code
+				curCodeCache = vm.getCodeCache(curCO)
+				code = refreshCode(callee, curCodeCache)
 				consts = callee.Consts
 				baseOffset = newBase
 				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
 				_ = locals[255]
-				maybeOptimizeCodeObject(callee)
-				cells, cellPtrs = vm.setupCalleeCellsAndPtrs(callee, target, stack, newBase, totalArgs)
 				curCodeCache = vm.getCodeCache(curCO)
+				maybeOptimizeCodeObject(vm, callee, curCodeCache)
+				cells, cellPtrs = vm.setupCalleeCellsAndPtrs(callee, target, stack, newBase, totalArgs)
 				curIC = curCodeCache.ic
 				curMethodPIC = curCodeCache.methodPIC
 				curAttrPIC = curCodeCache.attrPIC
@@ -3744,7 +3807,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				frameIdx++
 				curCO = callee
 				sp = nextSP
-				code = callee.Code
+				curCodeCache = vm.getCodeCache(curCO)
+				code = refreshCode(callee, curCodeCache)
 				consts = callee.Consts
 				baseOffset = newBase
 				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
@@ -3846,7 +3910,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				curLocals = val.NoneVal()
 				frameIdx++
 				curCO = callee
-				code = callee.Code
+				curCodeCache = vm.getCodeCache(curCO)
+				code = refreshCode(callee, curCodeCache)
 				consts = callee.Consts
 				baseOffset = newBase
 				minCap := max(baseOffset+256, baseOffset+callee.NumLocals+64)
@@ -3864,11 +3929,11 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				}
 				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
 				_ = locals[255]
-				maybeOptimizeCodeObject(callee)
+				curCodeCache = vm.getCodeCache(curCO)
+				maybeOptimizeCodeObject(vm, callee, curCodeCache)
 				cells, cellPtrs = vm.setupCalleeCellsAndPtrs(callee, callable, stack, newBase, totalArgs)
 				numLocalsCallee := max(callee.NumLocals, totalArgs)
 				sp = newBase + numLocalsCallee
-				curCodeCache = vm.getCodeCache(curCO)
 				curIC = curCodeCache.ic
 				curMethodPIC = curCodeCache.methodPIC
 				curAttrPIC = curCodeCache.attrPIC
@@ -4238,7 +4303,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 						frameIdx++
 						curCO = callee
 						sp = nextSP
-						code = callee.Code
+						curCodeCache = vm.getCodeCache(curCO)
+						code = refreshCode(callee, curCodeCache)
 						consts = callee.Consts
 						baseOffset = newBase
 						locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
@@ -4337,6 +4403,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		case OP_RETURN:
 			sp--
 			retVal := stack[sp]
+			// The result escapes the frame, so it must not be extendable in place.
+			val.DetachStringBuf(retVal)
 			if curShadow := vm.frames[frameIdx].shadowFrame; curShadow != nil {
 				curShadow.Detach()
 				vm.frames[frameIdx].shadowFrame = nil
@@ -4592,6 +4660,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		case OP_STORE_ATTR:
 			v := stack[sp-2]
 			obj := stack[sp-1]
+			val.DetachStringBuf(v)
 			if obj.IsInstance() && obj.AsInstance().Shape != nil && obj.AsInstance().Header.Type != nil {
 				instObj := obj.AsInstance()
 				instType := instObj.Header.Type
@@ -4792,6 +4861,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			ip++
 
 		case OP_DUP_TOP:
+			// The duplicated value is now reachable from two stack slots, so it
+			// must not be extendable in place any more.
+			val.DetachStringBuf(stack[sp-1])
 			stack[sp] = stack[sp-1]
 			sp++
 			ip++
@@ -4971,9 +5043,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			nameVal := consts[bx]
 			sp--
 			valToStore := stack[sp]
-			if valToStore.IsString() {
-				valToStore.AsStringObj().Buf = nil
-			}
+			val.DetachStringBuf(valToStore)
 			globals.Set(nameVal, valToStore)
 			ip++
 
@@ -5062,6 +5132,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			nameVal := consts[bx]
 			sp--
 			valToStore := stack[sp]
+			val.DetachStringBuf(valToStore)
 
 			if !curLocals.IsNone() && curLocals.HeaderPtr() != nil {
 				if curLocals.Type() == val.DictType {
@@ -5095,9 +5166,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			bx := int(uint16(inst))
 			sp--
 			valToStore := stack[sp]
-			if valToStore.IsString() {
-				valToStore.AsStringObj().Buf = nil
-			}
+			val.DetachStringBuf(valToStore)
 			activePtrs := vm.activeCellPtrs
 			if uint(bx) < uint(len(activePtrs)) && activePtrs[bx] != nil {
 				activePtrs[bx].Value = valToStore
@@ -5177,9 +5246,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if activeCoro != nil {
 						activeCoro.State = val.CoroClosed
 					}
-					if startFrameIdx == 0 {
-						panic("vm: " + err.Error())
-					}
+					// The exception could not be unwound any further: it is
+					// already recorded in vm.unhandledException, so the caller
+					// can report it as a regular Python traceback.
 					return val.NoneVal()
 				}
 				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
@@ -5235,9 +5304,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if activeCoro != nil {
 						activeCoro.State = val.CoroClosed
 					}
-					if startFrameIdx == 0 {
-						panic("vm: " + err.Error())
-					}
+					// The exception could not be unwound any further: it is
+					// already recorded in vm.unhandledException, so the caller
+					// can report it as a regular Python traceback.
 					return val.NoneVal()
 				}
 				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
@@ -5291,9 +5360,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if activeCoro != nil {
 						activeCoro.State = val.CoroClosed
 					}
-					if startFrameIdx == 0 {
-						panic("vm: " + err.Error())
-					}
+					// The exception could not be unwound any further: it is
+					// already recorded in vm.unhandledException, so the caller
+					// can report it as a regular Python traceback.
 					return val.NoneVal()
 				}
 				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
@@ -5392,7 +5461,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				stop := it.RangeStop()
 				if cur < stop {
 					stack[sp-1] = val.RangeVal(cur+1, stop)
-					instNext := atomic.LoadUint32(&code[ip+1])
+					instNext := code[ip+1]
 					if DecodeOpcode(instNext) == OP_STORE_FAST {
 						reg := DecodeArgBx(instNext)
 						if reg < 256 {
@@ -5517,6 +5586,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			count := int(uint16(inst))
 			items := make([]val.Value, count)
 			copy(items, stack[sp-count:sp])
+			for i := range items {
+				val.DetachStringBuf(items[i])
+			}
 			sp -= count
 			stack[sp] = val.NewListVal(items...)
 			sp++
@@ -5527,6 +5599,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			listVal := stack[sp-depth-1]
 			item := stack[sp-1]
 			sp--
+			val.DetachStringBuf(item)
 			l := listVal.AsList()
 			l.Append(item)
 			ip++
@@ -5536,6 +5609,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			dictVal := val.NewDictVal(count)
 			d := dictVal.AsDict()
 			for i := sp - count*2; i < sp; i += 2 {
+				val.DetachStringBuf(stack[i])
+				val.DetachStringBuf(stack[i+1])
 				d.Set(stack[i], stack[i+1])
 			}
 			sp -= count * 2
@@ -5549,6 +5624,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			v := stack[sp-1]
 			k := stack[sp-2]
 			sp -= 2
+			val.DetachStringBuf(k)
+			val.DetachStringBuf(v)
 			dictVal.AsDict().Set(k, v)
 			ip++
 
@@ -5556,6 +5633,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			count := int(uint16(inst))
 			items := make([]val.Value, count)
 			copy(items, stack[sp-count:sp])
+			for i := range items {
+				val.DetachStringBuf(items[i])
+			}
 			sp -= count
 			stack[sp] = val.NewTupleVal(items...)
 			sp++
@@ -5587,8 +5667,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				mv := container.AsMemoryView()
 				// ND/typed: slice in element space (shape[0]); byte 1D is a special case.
 				mvLen := len(mv.Buf)
-				if len(mv.Shape) > 0 {
-					mvLen = mv.Shape[0]
+				if mv.NDim > 0 {
+					mvLen = mv.Dim(0)
 				} else if mv.ItemSize > 1 {
 					mvLen = len(mv.Buf) / mv.ItemSize
 				}
@@ -5606,12 +5686,12 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				newMv.Header = val.ObjectHeader{Kind: val.KindMemoryView, Type: val.MemoryViewType}
 				newMv.Obj = mv.Obj
 				// Convert element indices to byte offset via stride[0].
-				stride0 := mv.ItemSize
+				stride0 := mv.Stride(0)
+				if stride0 == 0 {
+					stride0 = mv.ItemSize
+				}
 				if stride0 == 0 {
 					stride0 = 1
-				}
-				if len(mv.Strides) > 0 {
-					stride0 = mv.Strides[0]
 				}
 				byteStart := start * stride0
 				byteStop := stop * stride0
@@ -5638,22 +5718,29 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if newMv.Format == "" {
 					newMv.Format = "B"
 				}
-				newMv.NDim = len(mv.Shape)
+				newMv.NDim = mv.NDim
 				if newMv.NDim == 0 {
 					newMv.NDim = 1
 				}
-				newShape := append([]int(nil), mv.Shape...)
-				if len(newShape) == 0 {
-					newShape = []int{sliceLen}
+				if newMv.NDim == 1 {
+					// 1-D slices keep their extent and stride inline.
+					newMv.Dim0 = sliceLen
+					newMv.Stride0 = stride0
+					newMv.Shape = nil
+					newMv.Strides = nil
 				} else {
-					newShape[0] = sliceLen
+					newShape := append([]int(nil), mv.Shape...)
+					if len(newShape) == 0 {
+						newShape = []int{sliceLen}
+					} else {
+						newShape[0] = sliceLen
+					}
+					newStrides := append([]int(nil), mv.Strides...)
+					if len(newStrides) == 0 {
+						newStrides = val.CContiguousStrides(newShape, newMv.ItemSize)
+					}
+					newMv.SetShape(newShape, newStrides)
 				}
-				newMv.Shape = newShape
-				newStrides := append([]int(nil), mv.Strides...)
-				if len(newStrides) == 0 {
-					newStrides = val.CContiguousStrides(newShape, newMv.ItemSize)
-				}
-				newMv.Strides = newStrides
 				stack[sp-3] = val.ObjectVal(&newMv.Header)
 				sp -= 2
 				ip++
@@ -6553,7 +6640,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				ip += 4
 				continue
 			}
-			DeoptimizeFastAdd(code, ip, dstReg, srcRegA, srcRegB)
+			code = deoptimizeAt(curCO, ip, func(c []uint32) { DeoptimizeFastAdd(c, ip, dstReg, srcRegA, srcRegB) })
 			continue
 
 		case OP_FAST_INC_INT_LOCAL_CONST:
@@ -6575,18 +6662,18 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				ip += 4
 				continue
 			}
-			DeoptimizeFastInc(code, ip, reg, constIdx)
+			code = deoptimizeAt(curCO, ip, func(c []uint32) { DeoptimizeFastInc(c, ip, reg, constIdx) })
 			continue
 
 		case OP_FAST_LOOP_CMP_LT_CONST_JUMP:
 			_ = locals[255]
 			reg := uint8(inst >> 16)
 			exitTarget := uint16(inst)
-			constIdx := uint16(atomic.LoadUint32(&code[ip+1]))
+			constIdx := uint16(code[ip+1])
 			v := locals[reg]
 			c := consts[constIdx]
 			if !v.IsInt64() || !c.IsInt64() {
-				DeoptimizeFastLoop(code, ip, reg, constIdx, exitTarget)
+				code = deoptimizeAt(curCO, ip, func(c []uint32) { DeoptimizeFastLoop(c, ip, reg, constIdx, exitTarget) })
 				continue
 			}
 			limit := c.AsInt64()
@@ -6595,8 +6682,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			// Hot-Loop Register Optimizer:
 			// If followed by OP_FAST_INC_INT_LOCAL_CONST (same reg) and back-edge OP_JUMP back to this instruction
 			if ip+8 < len(code) {
-				inst4 := atomic.LoadUint32(&code[ip+4])
-				inst8 := atomic.LoadUint32(&code[ip+8])
+				inst4 := code[ip+4]
+				inst8 := code[ip+8]
 				if DecodeOpcode(inst4) == OP_FAST_INC_INT_LOCAL_CONST &&
 					DecodeArgA(inst4) == reg &&
 					DecodeOpcode(inst8) == OP_JUMP &&
@@ -6650,7 +6737,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				ip += 4
 				continue
 			}
-			DeoptimizeFastSub(code, ip, dstReg, srcRegA, srcRegB)
+			code = deoptimizeAt(curCO, ip, func(c []uint32) { DeoptimizeFastSub(c, ip, dstReg, srcRegA, srcRegB) })
 			continue
 
 		case OP_FAST_ADD_INT_LOCALS:
@@ -6674,9 +6761,11 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				ip += 3
 				continue
 			}
-			atomic.StoreUint32(&code[ip], Encode(OP_LOAD_FAST, 0, uint16(srcA)))
-			atomic.StoreUint32(&code[ip+1], Encode(OP_LOAD_FAST, 0, srcB))
-			atomic.StoreUint32(&code[ip+2], Encode(OP_BINARY_ADD, 0, 0))
+			code = deoptimizeAt(curCO, ip, func(c []uint32) {
+				c[ip] = Encode(OP_LOAD_FAST, 0, uint16(srcA))
+				c[ip+1] = Encode(OP_LOAD_FAST, 0, srcB)
+				c[ip+2] = Encode(OP_BINARY_ADD, 0, 0)
+			})
 			continue
 
 		case OP_FAST_SUB_INT_LOCALS:
@@ -6700,16 +6789,18 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				ip += 3
 				continue
 			}
-			atomic.StoreUint32(&code[ip], Encode(OP_LOAD_FAST, 0, uint16(srcA)))
-			atomic.StoreUint32(&code[ip+1], Encode(OP_LOAD_FAST, 0, srcB))
-			atomic.StoreUint32(&code[ip+2], Encode(OP_BINARY_SUB, 0, 0))
+			code = deoptimizeAt(curCO, ip, func(c []uint32) {
+				c[ip] = Encode(OP_LOAD_FAST, 0, uint16(srcA))
+				c[ip+1] = Encode(OP_LOAD_FAST, 0, srcB)
+				c[ip+2] = Encode(OP_BINARY_SUB, 0, 0)
+			})
 			continue
 
 		case OP_FAST_CMP_EQ_JUMP_IF_FALSE:
 			_ = locals[255]
 			srcA := uint8(inst >> 16)
 			exitTarget := uint16(inst)
-			srcB := uint8(atomic.LoadUint32(&code[ip+1]) >> 16)
+			srcB := uint8(code[ip+1] >> 16)
 			va := locals[srcA]
 			vb := locals[srcB]
 			if va.IsInt64() && vb.IsInt64() {
@@ -6720,7 +6811,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				ip += 4
 				continue
 			}
-			DeoptimizeFastCmpEq(code, ip, srcA, srcB, exitTarget)
+			code = deoptimizeAt(curCO, ip, func(c []uint32) { DeoptimizeFastCmpEq(c, ip, srcA, srcB, exitTarget) })
 			continue
 
 		case OP_FAST_SUBSCR_DEREF_LIST_LOCAL:
@@ -6744,7 +6835,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					}
 				}
 			}
-			DeoptimizeFastSubscr(code, ip, dstReg, cellIdx, idxReg)
+			code = deoptimizeAt(curCO, ip, func(c []uint32) { DeoptimizeFastSubscr(c, ip, dstReg, cellIdx, idxReg) })
 			continue
 
 		case OP_FAST_NEG_INT_LOCAL:
@@ -6756,7 +6847,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				ip += 3
 				continue
 			}
-			DeoptimizeFastNeg(code, ip, reg)
+			code = deoptimizeAt(curCO, ip, func(c []uint32) { DeoptimizeFastNeg(c, ip, reg) })
 			continue
 
 		case OP_FORMAT_VALUE:
@@ -7921,6 +8012,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		case OP_BUILD_SET:
 			count := int(uint16(inst))
 			sp -= count
+			for i := range count {
+				val.DetachStringBuf(stack[sp+i])
+			}
 			setVal := val.NewSetVal(stack[sp : sp+count]...)
 			stack[sp] = setVal
 			sp++
@@ -7930,6 +8024,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			offset := int(uint16(inst))
 			item := stack[sp-1]
 			sp--
+			val.DetachStringBuf(item)
 			setVal := stack[sp-offset]
 			setVal.AsSet().Add(item)
 			ip++
@@ -8141,12 +8236,16 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			listVal := stack[sp-offset]
 			if listVal.IsList() {
 				lst := listVal.AsList()
+				var added int
 				switch {
 				case iterVal.IsList():
+					added = len(iterVal.AsList().Items)
 					lst.Items = append(lst.Items, iterVal.AsList().Items...)
 				case iterVal.IsTuple():
+					added = len(iterVal.AsTuple().Items)
 					lst.Items = append(lst.Items, iterVal.AsTuple().Items...)
 				case iterVal.IsSet():
+					added = len(iterVal.AsSet().Items())
 					lst.Items = append(lst.Items, iterVal.AsSet().Items()...)
 				default:
 					vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
@@ -8172,7 +8271,11 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 						curCodeCache = vm.getCodeCache(curCO)
 						continue
 					}
+					added = len(items)
 					lst.Items = append(lst.Items, items...)
+				}
+				for _, it := range lst.Items[len(lst.Items)-added:] {
+					val.DetachStringBuf(it)
 				}
 			}
 			ip++

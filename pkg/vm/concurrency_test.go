@@ -16,6 +16,11 @@ import (
 // TestConcurrentDictOperations tests 32 concurrent goroutines reading, writing,
 // and deleting entries in a shared PyDict without race conditions or memory corruption.
 func TestConcurrentDictOperations(t *testing.T) {
+	// The dictionary only takes its lock when the runtime is multi-threaded,
+	// which is exactly the situation this test creates.
+	val.SetMultiThreaded(true)
+	defer val.SetMultiThreaded(false)
+
 	dictVal := val.NewDictVal(64)
 	d := dictVal.AsDict()
 
