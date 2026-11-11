@@ -1044,7 +1044,7 @@ func openFileBuiltinVal(fileVal val.Value, mode string) val.Value {
 	if mode == "" {
 		mode = "r"
 	}
-	flag := os.O_RDONLY
+	var flag int
 	binary := strings.Contains(mode, "b")
 
 	var f *os.File
@@ -1060,13 +1060,22 @@ func openFileBuiltinVal(fileVal val.Value, mode string) val.Value {
 			f = os.NewFile(uintptr(fd), fmt.Sprintf("<fdopen %d>", fd))
 		}
 	} else {
+		// The mode is parsed the way CPython parses it: the first letter
+		// selects the access, and a '+' anywhere turns the file into one
+		// that can be read and written.
 		switch {
 		case strings.Contains(mode, "w"):
 			flag = os.O_CREATE | os.O_WRONLY | os.O_TRUNC
 		case strings.Contains(mode, "a"):
 			flag = os.O_CREATE | os.O_WRONLY | os.O_APPEND
-		case strings.Contains(mode, "+"):
-			flag = os.O_RDWR
+		case strings.Contains(mode, "x"):
+			flag = os.O_CREATE | os.O_EXCL | os.O_WRONLY
+		default:
+			flag = os.O_RDONLY
+		}
+		if strings.Contains(mode, "+") {
+			flag &^= os.O_WRONLY | os.O_RDONLY
+			flag |= os.O_RDWR
 		}
 		pathStr := fileVal.AsString()
 		f, err = os.OpenFile(pathStr, flag, 0666)

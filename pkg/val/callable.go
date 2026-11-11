@@ -2864,6 +2864,30 @@ func init() {
 	initTypes()
 }
 
+// floatFromInstance converts an object that is not a built-in number into a
+// float. It uses the __float__ method when the object has one, and the
+// __index__ method otherwise.
+func floatFromInstance(ctx *ExecContext, a Value) (float64, bool) {
+	inst := a.AsInstance()
+	if inst.Header.Type == nil {
+		return 0, false
+	}
+	if fn, _, ok := inst.Header.Type.LookupMRO(InternString("__float__")); ok && !fn.IsNone() {
+		res := ctx.Invoke1(fn, a)
+		if res.IsFloat64() {
+			return res.AsFloat64(), true
+		}
+		return 0, false
+	}
+	if fn, _, ok := inst.Header.Type.LookupMRO(InternString("__index__")); ok && !fn.IsNone() {
+		res := ctx.Invoke1(fn, a)
+		if res.IsInt64() {
+			return float64(res.AsInt64()), true
+		}
+	}
+	return 0, false
+}
+
 func initTypes() {
 	// 1. Pre-intern canonical dunder method names.
 	DunderAdd = InternString("__add__")
@@ -3711,6 +3735,12 @@ func initTypes() {
 		if a.IsAnyString() {
 			f, err := strconv.ParseFloat(strings.TrimSpace(a.AsString()), 64)
 			if err == nil {
+				return Float64Val(f)
+			}
+		}
+		if a.IsInstance() {
+			// A number-like object converts through __float__ or __index__.
+			if f, ok := floatFromInstance(ctx, a); ok {
 				return Float64Val(f)
 			}
 		}

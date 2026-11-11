@@ -630,3 +630,27 @@ func DetachStringBuf(v Value) {
 		ps.Buf = nil
 	}
 }
+
+// StringEquals reports whether v holds the string s. It never allocates, so it
+// can be used on the hot paths that compare a constant against a name.
+func (v Value) StringEquals(s string) bool {
+	if v.ptr == nil {
+		return s == ""
+	}
+	if v.ptr == &tagInlineStr {
+		n := int(v.num & 0xFF)
+		if n != len(s) {
+			return false
+		}
+		for i := range n {
+			if byte(v.num>>((i+1)*8)) != s[i] {
+				return false
+			}
+		}
+		return true
+	}
+	if v.ptr.Kind == KindString {
+		return (*PyString)(unsafe.Pointer(v.ptr)).Data == s
+	}
+	return false
+}

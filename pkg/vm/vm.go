@@ -583,6 +583,14 @@ func (vm *VM) callFromHook(ctx *val.ExecContext, callable val.Value, argBase int
 // with 0 heap allocations, returning the initial sp for the callee frame.
 func (vm *VM) bindFunctionArgs(co *CodeObject, defaults []val.Value, kwDefaults *val.PyDict, stack []val.Value, argBase int, nargs int, kwnames []val.Value) int {
 	numParams := co.NumParams
+	if len(kwnames) == 0 && co.SimplePositionalOnly && nargs == co.PositionalParamCount &&
+		len(defaults) == 0 && kwDefaults == nil {
+		numLocals := max(co.NumLocals, numParams)
+		for i := nargs; i < numLocals; i++ {
+			stack[argBase+i] = val.NoneVal()
+		}
+		return argBase + numLocals
+	}
 	numLocals := max(co.NumLocals, numParams)
 
 	paramNames := co.ParamNames
@@ -805,6 +813,83 @@ func (vm *VM) setupCalleeCells(callee *CodeObject, target val.Value, stack []val
 	return cells
 }
 
+// reclaimViewSlot returns the memory view a slot held to the free list, once
+// the slot is overwritten. A view that is still referenced somewhere else is
+// kept alive.
+func (vm *VM) reclaimViewSlot(old, incoming val.Value) {
+	if old.Kind() != val.KindMemoryView || old == incoming {
+		return
+	}
+	mv := old.AsMemoryView()
+	if mv.Escaped {
+		return
+	}
+	vm.recycleMemoryView(mv)
+}
+
+// claimViewSlot records that a slot now holds a memory view. A view that no
+// slot owned yet belongs to this slot alone; a view that another slot owned
+// is shared from now on.
+func (vm *VM) claimViewSlot(v val.Value, key uint32) {
+	if v.Kind() != val.KindMemoryView {
+		return
+	}
+	mv := v.AsMemoryView()
+	switch {
+	case mv.OwnerKey == 0:
+		mv.OwnerKey = key
+	case mv.OwnerKey != key:
+		mv.Escaped = true
+	}
+}
+
+// reusableViewFor returns the memory view that the slot of the store
+// instruction right after the slice already holds, when that view is not
+// shared with anybody else. Reusing it keeps the slice loop free of
+// allocations and of pointer stores the write barrier would have to record.
+//
+// The instruction after the slice is inspected, so the reuse only happens
+// when the slice result is stored into a local slot right away.
+func reusableViewFor(codePtr unsafe.Pointer, ip int, locals []val.Value) *val.PyMemoryView {
+	next := *(*uint32)(unsafe.Add(codePtr, uintptr(ip+1)*4))
+	if DecodeOpcode(next) != OP_STORE_FAST {
+		return nil
+	}
+	slot := int(DecodeArgBx(next))
+	if slot >= len(locals) {
+		return nil
+	}
+	old := locals[slot]
+	if old.Kind() != val.KindMemoryView {
+		return nil
+	}
+	mv := old.AsMemoryView()
+	if mv.Escaped {
+		return nil
+	}
+	return mv
+}
+
+// viewSlotKey identifies the frame slot that owns a memory view.
+func viewSlotKey(frameIdx int, slot int) uint32 {
+	return uint32(frameIdx)<<16 | uint32(uint16(slot))
+}
+
+// markViewEscaped marks a memory view as shared, so that it is never
+// recycled while another reference to it is still live.
+func markViewEscaped(v val.Value) {
+	if v.Kind() == val.KindMemoryView {
+		v.AsMemoryView().Escaped = true
+	}
+}
+
+// markViewsEscaped marks every memory view in vals as shared.
+func markViewsEscaped(vals []val.Value) {
+	for i := range vals {
+		markViewEscaped(vals[i])
+	}
+}
+
 // allocMemoryView allocates a fresh memoryview on the Go heap.
 //
 // Memoryviews used to be handed out from a fixed 1024-entry ring, which
@@ -812,7 +897,29 @@ func (vm *VM) setupCalleeCells(callee *CodeObject, target val.Value, stack []val
 // view is now an ordinary heap object, so all of them stay valid for as long
 // as they are referenced.
 func (vm *VM) allocMemoryView() *val.PyMemoryView {
+	if n := len(vm.mvFree); n > 0 {
+		mv := vm.mvFree[n-1]
+		vm.mvFree = vm.mvFree[:n-1]
+		return mv
+	}
 	return new(val.PyMemoryView)
+}
+
+// recycleMemoryView returns an unreferenced memory view to the per-VM free
+// list, so that the next slice can reuse it without allocating.
+func (vm *VM) recycleMemoryView(mv *val.PyMemoryView) {
+	// The pointer fields are left alone: the slice that reuses the view
+	// overwrites all of them, and clearing them here would add a write
+	// barrier to every recycled view.
+	mv.Suboffsets = nil
+	mv.NDim = 0
+	mv.Dim0 = 0
+	mv.Stride0 = 0
+	mv.ItemSize = 0
+	mv.ReadOnly = false
+	mv.Escaped = false
+	mv.OwnerKey = 0
+	vm.mvFree = append(vm.mvFree, mv)
 }
 
 func (vm *VM) initBuiltins() {
@@ -1700,11 +1807,12 @@ func (vm *VM) resumeCoroutine(ctx *val.ExecContext, coro *val.PyCoroutine, sentV
 	return res, val.IterExhausted
 }
 
-func (vm *VM) syncActiveFrame(frameIdx int, co *CodeObject, code []uint32, consts []val.Value, ip int, baseOffset int, cells []val.Value, globals *val.PyDict, locals val.Value, cache *VMCodeCache) {
+func (vm *VM) syncActiveFrame(frameIdx int, co *CodeObject, codePtr unsafe.Pointer, codeLen int, consts []val.Value, ip int, baseOffset int, cells []val.Value, globals *val.PyDict, locals val.Value, cache *VMCodeCache) {
 	if frameIdx >= 0 && frameIdx < len(vm.frames) {
 		saved := &vm.frames[frameIdx]
 		saved.co = co
-		saved.code = code
+		saved.codePtr = codePtr
+		saved.codeLen = codeLen
 		saved.consts = consts
 		saved.ip = ip
 		saved.baseOffset = baseOffset
@@ -1721,7 +1829,7 @@ func (vm *VM) syncActiveFrame(frameIdx int, co *CodeObject, code []uint32, const
 	}
 }
 
-func (vm *VM) unwindException(exc val.Value, curCO **CodeObject, ip *int, frameIdx *int, startFrameIdx int, baseOffset *int, sp *int, code *[]uint32, consts *[]val.Value, cells *[]val.Value, globals **val.PyDict, curLocals *val.Value, stack []val.Value, curIC *[]ICSlot, curMethodPIC *[][4]val.MethodPICEntry, curAttrPIC *[][4]AttrPICEntry) bool {
+func (vm *VM) unwindException(exc val.Value, curCO **CodeObject, ip *int, frameIdx *int, startFrameIdx int, baseOffset *int, sp *int, codePtr *unsafe.Pointer, codeLen *int, consts *[]val.Value, cells *[]val.Value, globals **val.PyDict, curLocals *val.Value, stack []val.Value, curIC *[]ICSlot, curMethodPIC *[][4]val.MethodPICEntry, curAttrPIC *[][4]AttrPICEntry) bool {
 	curTB := val.NoneVal()
 	if exc.IsInstance() {
 		curTB, _ = exc.AsInstance().GetAttr(val.InternString("__traceback__"))
@@ -1734,8 +1842,9 @@ func (vm *VM) unwindException(exc val.Value, curCO **CodeObject, ip *int, frameI
 	if faultFrameIdx >= 0 && faultFrameIdx < len(vm.frames) {
 		fSlot := &vm.frames[faultFrameIdx]
 		fSlot.co = faultCO
-		if code != nil {
-			fSlot.code = *code
+		if codePtr != nil {
+			fSlot.codePtr = *codePtr
+			fSlot.codeLen = *codeLen
 		}
 		if consts != nil {
 			fSlot.consts = *consts
@@ -1814,7 +1923,8 @@ func (vm *VM) unwindException(exc val.Value, curCO **CodeObject, ip *int, frameI
 				vm.excStack = vm.excStack[:caller.excStackLen]
 			}
 			*curCO = caller.co
-			*code = caller.code
+			*codePtr = caller.codePtr
+			*codeLen = caller.codeLen
 			*consts = caller.consts
 			*baseOffset = caller.baseOffset
 			*cells = caller.cells
@@ -1860,6 +1970,48 @@ func ensureStack(stack []val.Value, minCap int) []val.Value {
 	newStack := make([]val.Value, newCap)
 	copy(newStack, stack)
 	return newStack
+}
+
+// interpreterSafepoint is a safepoint for the Go runtime.
+//
+// The interpreter executes long stretches of bytecode without calling into the
+// Go runtime, so the garbage collector could not preempt it and its mark
+// phase stalled until the bytecode ran out. This function is called from the
+// dispatch loop, which lets the collector finish a cycle and lets the
+// scheduler run the other goroutines.
+//
+//go:noinline
+func interpreterSafepoint() {
+}
+
+// The method names that the call fast paths compare against. They are
+// interned once, so the comparison is a word compare instead of a call into
+// the value package: the dispatch loop is too large for the Go inliner, so
+// every call there is a real call.
+var (
+	nameStringIO = val.InternString("StringIO")
+	nameEnter    = val.InternString("__enter__")
+	nameGetValue = val.InternString("getvalue")
+	nameRead     = val.InternString("read")
+	nameWrite    = val.InternString("write")
+	nameExists   = val.InternString("exists")
+	nameRemove   = val.InternString("remove")
+	nameUnlink   = val.InternString("unlink")
+)
+
+// attrInstance resolves a value to the instance and the type that the fast
+// attribute path needs. The dispatch loop is too large for the Go inliner, so
+// the value accessors are real calls there; folding them into one helper
+// keeps the attribute access down to a single call.
+func attrInstance(v val.Value) (*val.PyInstance, *val.PyType, bool) {
+	if !v.IsInstance() {
+		return nil, nil, false
+	}
+	inst := v.AsInstance()
+	if inst.Shape == nil || inst.Header.Type == nil {
+		return nil, nil, false
+	}
+	return inst, inst.Header.Type, true
 }
 
 func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, startFrameIdx int, startCells []val.Value, startGlobals *val.PyDict, startLocals val.Value, stack []val.Value, activeGen *val.PyGenerator, activeCoro *val.PyCoroutine) val.Value {
@@ -1942,18 +2094,20 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 	curIC := curCodeCache.ic
 	curMethodPIC := curCodeCache.methodPIC
 	curAttrPIC := curCodeCache.attrPIC
-	code := refreshCode(curCO, curCodeCache)
+	codePtr, codeLen := vm.loadWindow(curCO, curCodeCache)
 
-	maybeOptimizeCodeObject(vm, curCO, curCodeCache)
+	if atomic.LoadInt32(&curCO.IsTier2Optimized) == 0 {
+		maybeOptimizeCodeObject(vm, curCO, curCodeCache)
+	}
 
 	if (activeGen != nil || activeCoro != nil) && vm.execCtx.HasException() {
 		exc := vm.execCtx.ActiveException
 		vm.execCtx.ClearException()
 		unwindIP := ip
-		if unwindIP > 0 && (unwindIP >= len(code) || Opcode(code[unwindIP-1]>>24) == OP_YIELD_VALUE) {
+		if unwindIP > 0 && (unwindIP >= codeLen || Opcode(*(*uint32)(unsafe.Add(codePtr, uintptr(unwindIP-1)*4))>>24) == OP_YIELD_VALUE) {
 			unwindIP = ip - 1
 		}
-		if !vm.unwindException(exc, &curCO, &unwindIP, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+		if !vm.unwindException(exc, &curCO, &unwindIP, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 			if activeGen != nil {
 				activeGen.State = val.GenClosed
 			}
@@ -1968,7 +2122,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 	}
 
 	for {
-		inst := code[ip]
+		inst := atomic.LoadUint32((*uint32)(unsafe.Add(codePtr, uintptr(ip)*4)))
 		op := Opcode(inst >> 24)
 
 		switch op {
@@ -1994,8 +2148,12 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			valToStore := stack[sp]
 			val.DetachStringBuf(valToStore)
 			if bx < 256 {
+				vm.reclaimViewSlot(locals[uint8(bx)], valToStore)
+				vm.claimViewSlot(valToStore, viewSlotKey(frameIdx, int(bx)))
 				locals[uint8(bx)] = valToStore
 			} else {
+				vm.reclaimViewSlot(stack[baseOffset+int(bx)], valToStore)
+				vm.claimViewSlot(valToStore, viewSlotKey(frameIdx, int(bx)))
 				stack[baseOffset+int(bx)] = valToStore
 			}
 			ip++
@@ -2039,7 +2197,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if stackIsVM && &stack[0] != &vm.stack[0] {
 						stack = vm.stack
 					}
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						if activeGen != nil {
 							activeGen.State = val.GenClosed
 						}
@@ -2078,7 +2236,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if stackIsVM && &stack[0] != &vm.stack[0] {
 						stack = vm.stack
 					}
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						if activeGen != nil {
 							activeGen.State = val.GenClosed
 						}
@@ -2110,7 +2268,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if stackIsVM && &stack[0] != &vm.stack[0] {
 						stack = vm.stack
 					}
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						if activeGen != nil {
 							activeGen.State = val.GenClosed
 						}
@@ -2149,7 +2307,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if stackIsVM && &stack[0] != &vm.stack[0] {
 						stack = vm.stack
 					}
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						if activeGen != nil {
 							activeGen.State = val.GenClosed
 						}
@@ -2188,7 +2346,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if stackIsVM && &stack[0] != &vm.stack[0] {
 						stack = vm.stack
 					}
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						if activeGen != nil {
 							activeGen.State = val.GenClosed
 						}
@@ -2228,7 +2386,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if stackIsVM && &stack[0] != &vm.stack[0] {
 					stack = vm.stack
 				}
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -2274,7 +2432,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				valItem, ok := lst.Get(int(k))
 				if !ok {
 					exc := val.NewIndexError("list index out of range")
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						if activeGen != nil {
 							activeGen.State = val.GenClosed
 						}
@@ -2301,7 +2459,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 						if stackIsVM && &stack[0] != &vm.stack[0] {
 							stack = vm.stack
 						}
-						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 							if activeGen != nil {
 								activeGen.State = val.GenClosed
 							}
@@ -2317,7 +2475,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				}
 				if !ok {
 					exc := val.NewKeyError(key)
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						if activeGen != nil {
 							activeGen.State = val.GenClosed
 						}
@@ -2332,7 +2490,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				}
 				stack[sp-2] = v
 			default:
-				vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+				vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 				vm.execCtx.SP = sp
 				res := vm.getItemSafe(obj, key)
 				if stackIsVM && &stack[0] != &vm.stack[0] {
@@ -2342,7 +2500,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if vm.execCtx.HasException() {
 					exc := vm.execCtx.ActiveException
 					vm.execCtx.ClearException()
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						if activeGen != nil {
 							activeGen.State = val.GenClosed
 						}
@@ -2365,6 +2523,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			obj := stack[sp-2]
 			valToStore := stack[sp-3]
 			val.DetachStringBuf(valToStore)
+			markViewEscaped(valToStore)
 			if obj.Kind() == val.KindMemoryView && key.IsInt64() && valToStore.IsInt64() && obj.AsMemoryView().ItemSize <= 1 && obj.AsMemoryView().NDim <= 1 {
 				mv := obj.AsMemoryView()
 				if !mv.ReadOnly {
@@ -2393,7 +2552,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				}
 				if !lst.Set(int(k), valToStore) {
 					exc := val.NewIndexError("list assignment index out of range")
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						if activeGen != nil {
 							activeGen.State = val.GenClosed
 						}
@@ -2418,7 +2577,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if vm.execCtx.HasException() {
 						exc := vm.execCtx.ActiveException
 						vm.execCtx.ClearException()
-						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 							if activeGen != nil {
 								activeGen.State = val.GenClosed
 							}
@@ -2433,7 +2592,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					}
 				}
 			default:
-				vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+				vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 				vm.execCtx.SP = sp
 				vm.setItemSafe(obj, key, valToStore)
 				if stackIsVM && &stack[0] != &vm.stack[0] {
@@ -2443,7 +2602,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if vm.execCtx.HasException() {
 					exc := vm.execCtx.ActiveException
 					vm.execCtx.ClearException()
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						if activeGen != nil {
 							activeGen.State = val.GenClosed
 						}
@@ -2466,7 +2625,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			if a.IsInt64() && b.IsInt64() {
 				stack[sp-2] = val.BoolVal(a.AsInt64() < b.AsInt64())
 			} else {
-				vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+				vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 				vm.execCtx.SP = sp
 				res := vm.compareOpSafe(a, b, CMP_LT)
 				if stackIsVM && &stack[0] != &vm.stack[0] {
@@ -2476,7 +2635,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if vm.execCtx.HasException() {
 					exc := vm.execCtx.ActiveException
 					vm.execCtx.ClearException()
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						if activeGen != nil {
 							activeGen.State = val.GenClosed
 						}
@@ -2500,7 +2659,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			if a.IsInt64() && b.IsInt64() {
 				stack[sp-2] = val.BoolVal(a.AsInt64() < b.AsInt64())
 			} else {
-				vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+				vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 				vm.execCtx.SP = sp
 				res := vm.compareOpSafe(a, b, CMP_LT)
 				if stackIsVM && &stack[0] != &vm.stack[0] {
@@ -2510,7 +2669,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if vm.execCtx.HasException() {
 					exc := vm.execCtx.ActiveException
 					vm.execCtx.ClearException()
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						if activeGen != nil {
 							activeGen.State = val.GenClosed
 						}
@@ -2540,12 +2699,17 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		case OP_JUMP:
 			target := int(uint16(inst))
 			if target <= ip {
-				maybeOptimizeCodeObject(vm, curCO, curCodeCache)
+				if atomic.LoadInt32(&curCO.IsTier2Optimized) == 0 {
+					maybeOptimizeCodeObject(vm, curCO, curCodeCache)
+				}
 				// A backward jump is the place where the hot loop re-enters:
 				// pick up a stream that was published since the last reload.
-				code = refreshCode(curCO, curCodeCache)
+				if atomic.LoadInt32(&curCO.StreamGen) != curCodeCache.streamGen {
+					codePtr, codeLen = vm.loadWindow(curCO, curCodeCache)
+				}
 				periodicTick++
 				if (periodicTick & 0xFF) == 0 {
+					interpreterSafepoint()
 					if vm.limits.Context != nil {
 						if err := vm.limits.Context.Err(); err != nil {
 							vm.unhandledException = val.NewRuntimeError("execution timed out or cancelled")
@@ -2565,7 +2729,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					}
 				}
 				if vm.signalsPending() {
-					vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+					vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 					vm.execCtx.SP = sp
 					vm.deliverSignalsSafe()
 					if stackIsVM && &stack[0] != &vm.stack[0] {
@@ -2575,7 +2739,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if vm.execCtx.HasException() {
 						exc := vm.execCtx.ActiveException
 						vm.execCtx.ClearException()
-						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 							if activeGen != nil {
 								activeGen.State = val.GenClosed
 							}
@@ -2595,9 +2759,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		case OP_CALL:
 			argc := int(uint8(inst >> 16))
 			bx := int(uint16(inst))
-			isDirectAwait := ip+2 < len(code) &&
-				DecodeOpcode(code[ip+1]) == OP_GET_AWAITABLE &&
-				DecodeOpcode(code[ip+2]) == OP_AWAIT
+			isDirectAwait := ip+2 < codeLen &&
+				DecodeOpcode(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+1)*4))) == OP_GET_AWAITABLE &&
+				DecodeOpcode(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+2)*4))) == OP_AWAIT
 
 			var target val.Value
 			var newBase int
@@ -2741,6 +2905,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				}
 			}
 
+			if argc > 0 {
+				markViewsEscaped(stack[newBase : newBase+argc])
+			}
 			switch target.Kind() {
 			case val.KindCode:
 				callee := AsCodeObject(target)
@@ -2749,7 +2916,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if !ok {
 						exc := vm.execCtx.ActiveException
 						vm.execCtx.ClearException()
-						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 							if activeGen != nil {
 								activeGen.State = val.GenClosed
 							}
@@ -2775,7 +2942,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 						if !ok {
 							exc := vm.execCtx.ActiveException
 							vm.execCtx.ClearException()
-							if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+							if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 								if activeGen != nil {
 									activeGen.State = val.GenClosed
 								}
@@ -2799,7 +2966,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				}
 				saved := &vm.frames[frameIdx]
 				saved.co = curCO
-				saved.code = code
+				saved.codePtr = codePtr
+				saved.codeLen = codeLen
 				saved.consts = consts
 				if isDirectAwait && callee.IsCoroutine {
 					saved.ip = ip + 3
@@ -2823,7 +2991,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				frameIdx++
 				curCO = callee
 				curCodeCache = vm.getCodeCache(curCO)
-				code = refreshCode(callee, curCodeCache)
+				codePtr, codeLen = vm.loadWindow(callee, curCodeCache)
 				consts = callee.Consts
 				baseOffset = newBase
 				minCap := max(baseOffset+256, baseOffset+callee.NumLocals+64)
@@ -2841,8 +3009,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				}
 				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
 				_ = locals[255]
-				curCodeCache = vm.getCodeCache(curCO)
-				maybeOptimizeCodeObject(vm, callee, curCodeCache)
+				if atomic.LoadInt32(&callee.IsTier2Optimized) == 0 {
+					maybeOptimizeCodeObject(vm, callee, curCodeCache)
+				}
 				cells, cellPtrs = vm.setupCalleeCellsAndPtrs(callee, target, stack, newBase, argc)
 				numLocalsCallee := max(callee.NumLocals, argc)
 				sp = newBase + numLocalsCallee
@@ -2851,8 +3020,10 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				curAttrPIC = curCodeCache.attrPIC
 				vm.activeCO = curCO
 				vm.activeBaseOffset = baseOffset
-				vm.activeCells = cells
-				vm.activeCellPtrs = cellPtrs
+				if vm.activeCellPtrs != nil || cellPtrs != nil {
+					vm.activeCells = cells
+					vm.activeCellPtrs = cellPtrs
+				}
 				vm.activeFrameIdx = frameIdx
 				ip = 0
 				continue
@@ -2863,10 +3034,13 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if callee == curCO {
 					// The recursive fast path below keeps the current code
 					// object, so its cache still holds the counter.
-					maybeOptimizeCodeObject(vm, callee, curCodeCache)
+					if atomic.LoadInt32(&callee.IsTier2Optimized) == 0 {
+						maybeOptimizeCodeObject(vm, callee, curCodeCache)
+					}
 				}
 				periodicTick++
 				if (periodicTick & 0xFF) == 0 {
+					interpreterSafepoint()
 					if vm.limits.Context != nil {
 						if err := vm.limits.Context.Err(); err != nil {
 							vm.unhandledException = val.NewRuntimeError("execution timed out or cancelled")
@@ -2897,8 +3071,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					saved.co = curCO
 					// Pick up a stream that the Tier-2 optimizer published for this
 					// code object since the last reload.
-					code = refreshCode(callee, curCodeCache)
-					saved.code = code
+					codePtr, codeLen = vm.loadWindow(callee, curCodeCache)
+					saved.codePtr = codePtr
+					saved.codeLen = codeLen
 					saved.consts = consts
 					if isDirectAwait && callee.IsCoroutine {
 						saved.ip = ip + 3
@@ -2941,7 +3116,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if !ok {
 						exc := vm.execCtx.ActiveException
 						vm.execCtx.ClearException()
-						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 							if activeGen != nil {
 								activeGen.State = val.GenClosed
 							}
@@ -2967,7 +3142,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 						if !ok {
 							exc := vm.execCtx.ActiveException
 							vm.execCtx.ClearException()
-							if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+							if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 								if activeGen != nil {
 									activeGen.State = val.GenClosed
 								}
@@ -3009,7 +3184,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if !ok {
 						exc := vm.execCtx.ActiveException
 						vm.execCtx.ClearException()
-						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 							if activeGen != nil {
 								activeGen.State = val.GenClosed
 							}
@@ -3028,7 +3203,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				}
 				saved := &vm.frames[frameIdx]
 				saved.co = curCO
-				saved.code = code
+				saved.codePtr = codePtr
+				saved.codeLen = codeLen
 				saved.consts = consts
 				if isDirectAwait && callee.IsCoroutine {
 					saved.ip = ip + 3
@@ -3049,7 +3225,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				curCO = callee
 				sp = nextSP
 				curCodeCache = vm.getCodeCache(curCO)
-				code = refreshCode(callee, curCodeCache)
+				codePtr, codeLen = vm.loadWindow(callee, curCodeCache)
 				consts = callee.Consts
 				baseOffset = newBase
 				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
@@ -3067,21 +3243,22 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if fn.Globals != nil {
 					globals = fn.Globals
 				}
-				curCodeCache = vm.getCodeCache(curCO)
 				curIC = curCodeCache.ic
 				curMethodPIC = curCodeCache.methodPIC
 				curAttrPIC = curCodeCache.attrPIC
 				vm.activeCO = curCO
 				vm.activeBaseOffset = baseOffset
-				vm.activeCells = cells
-				vm.activeCellPtrs = cellPtrs
+				if vm.activeCellPtrs != nil || cellPtrs != nil {
+					vm.activeCells = cells
+					vm.activeCellPtrs = cellPtrs
+				}
 				vm.activeFrameIdx = frameIdx
 				ip = 0
 				continue
 
 			case val.KindBuiltinFunc:
 				builtin := target.AsBuiltinFunc()
-				vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+				vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 				vm.execCtx.SP = newBase + argc
 				res := vm.invokeBuiltinSafe(builtin.Fn, target, stack[newBase:newBase+argc], nil)
 				if stackIsVM && &stack[0] != &vm.stack[0] {
@@ -3091,7 +3268,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if vm.execCtx.HasException() {
 					exc := vm.execCtx.ActiveException
 					vm.execCtx.ClearException()
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						if activeGen != nil {
 							activeGen.State = val.GenClosed
 						}
@@ -3109,7 +3286,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				ip++
 
 			default:
-				vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+				vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 				vm.execCtx.SP = newBase + argc
 				res := vm.callFromHookSafe(target, newBase, argc, nil)
 				if stackIsVM && &stack[0] != &vm.stack[0] {
@@ -3119,7 +3296,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if vm.execCtx.HasException() {
 					exc := vm.execCtx.ActiveException
 					vm.execCtx.ClearException()
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						if activeGen != nil {
 							activeGen.State = val.GenClosed
 						}
@@ -3141,14 +3318,17 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			totalArgs := int(uint8(inst >> 16))
 			bx := int(uint16(inst))
 			kwnames := consts[bx].AsTuple().Items
-			isDirectAwait := ip+2 < len(code) &&
-				DecodeOpcode(code[ip+1]) == OP_GET_AWAITABLE &&
-				DecodeOpcode(code[ip+2]) == OP_AWAIT
+			isDirectAwait := ip+2 < codeLen &&
+				DecodeOpcode(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+1)*4))) == OP_GET_AWAITABLE &&
+				DecodeOpcode(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+2)*4))) == OP_AWAIT
 
 			target := stack[sp-totalArgs-1]
 			newBase := sp - totalArgs
 			retSP := sp - totalArgs - 1
 
+			if totalArgs > 0 {
+				markViewsEscaped(stack[newBase : newBase+totalArgs])
+			}
 			switch target.Kind() {
 			case val.KindFunction:
 				fn := target.AsFunction()
@@ -3162,7 +3342,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if !ok {
 						exc := vm.execCtx.ActiveException
 						vm.execCtx.ClearException()
-						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 							if activeGen != nil {
 								activeGen.State = val.GenClosed
 							}
@@ -3185,7 +3365,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if !ok {
 						exc := vm.execCtx.ActiveException
 						vm.execCtx.ClearException()
-						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 							if activeGen != nil {
 								activeGen.State = val.GenClosed
 							}
@@ -3220,7 +3400,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if !ok {
 					exc := vm.execCtx.ActiveException
 					vm.execCtx.ClearException()
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						if activeGen != nil {
 							activeGen.State = val.GenClosed
 						}
@@ -3238,7 +3418,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				}
 				saved := &vm.frames[frameIdx]
 				saved.co = curCO
-				saved.code = code
+				saved.codePtr = codePtr
+				saved.codeLen = codeLen
 				saved.consts = consts
 				if isDirectAwait && callee.IsCoroutine {
 					saved.ip = ip + 3
@@ -3259,13 +3440,14 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				curCO = callee
 				sp = nextSP
 				curCodeCache = vm.getCodeCache(curCO)
-				code = refreshCode(callee, curCodeCache)
+				codePtr, codeLen = vm.loadWindow(callee, curCodeCache)
 				consts = callee.Consts
 				baseOffset = newBase
 				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
 				_ = locals[255]
-				curCodeCache = vm.getCodeCache(curCO)
-				maybeOptimizeCodeObject(vm, callee, curCodeCache)
+				if atomic.LoadInt32(&callee.IsTier2Optimized) == 0 {
+					maybeOptimizeCodeObject(vm, callee, curCodeCache)
+				}
 				cells, cellPtrs = vm.setupCalleeCellsAndPtrs(callee, target, stack, newBase, totalArgs)
 				if fn.Globals != nil {
 					globals = fn.Globals
@@ -3275,8 +3457,10 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				curAttrPIC = curCodeCache.attrPIC
 				vm.activeCO = curCO
 				vm.activeBaseOffset = baseOffset
-				vm.activeCells = cells
-				vm.activeCellPtrs = cellPtrs
+				if vm.activeCellPtrs != nil || cellPtrs != nil {
+					vm.activeCells = cells
+					vm.activeCellPtrs = cellPtrs
+				}
 				vm.activeFrameIdx = frameIdx
 				ip = 0
 				continue
@@ -3288,7 +3472,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if !ok {
 						exc := vm.execCtx.ActiveException
 						vm.execCtx.ClearException()
-						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 							if activeGen != nil {
 								activeGen.State = val.GenClosed
 							}
@@ -3311,7 +3495,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if !ok {
 						exc := vm.execCtx.ActiveException
 						vm.execCtx.ClearException()
-						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 							if activeGen != nil {
 								activeGen.State = val.GenClosed
 							}
@@ -3346,7 +3530,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if !ok {
 					exc := vm.execCtx.ActiveException
 					vm.execCtx.ClearException()
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						if activeGen != nil {
 							activeGen.State = val.GenClosed
 						}
@@ -3364,7 +3548,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				}
 				saved := &vm.frames[frameIdx]
 				saved.co = curCO
-				saved.code = code
+				saved.codePtr = codePtr
+				saved.codeLen = codeLen
 				saved.consts = consts
 				if isDirectAwait && callee.IsCoroutine {
 					saved.ip = ip + 3
@@ -3385,28 +3570,31 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				curCO = callee
 				sp = nextSP
 				curCodeCache = vm.getCodeCache(curCO)
-				code = refreshCode(callee, curCodeCache)
+				codePtr, codeLen = vm.loadWindow(callee, curCodeCache)
 				consts = callee.Consts
 				baseOffset = newBase
 				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
 				_ = locals[255]
-				curCodeCache = vm.getCodeCache(curCO)
-				maybeOptimizeCodeObject(vm, callee, curCodeCache)
+				if atomic.LoadInt32(&callee.IsTier2Optimized) == 0 {
+					maybeOptimizeCodeObject(vm, callee, curCodeCache)
+				}
 				cells, cellPtrs = vm.setupCalleeCellsAndPtrs(callee, target, stack, newBase, totalArgs)
 				curIC = curCodeCache.ic
 				curMethodPIC = curCodeCache.methodPIC
 				curAttrPIC = curCodeCache.attrPIC
 				vm.activeCO = curCO
 				vm.activeBaseOffset = baseOffset
-				vm.activeCells = cells
-				vm.activeCellPtrs = cellPtrs
+				if vm.activeCellPtrs != nil || cellPtrs != nil {
+					vm.activeCells = cells
+					vm.activeCellPtrs = cellPtrs
+				}
 				vm.activeFrameIdx = frameIdx
 				ip = 0
 				continue
 
 			case val.KindBuiltinFunc:
 				builtin := target.AsBuiltinFunc()
-				vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+				vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 				vm.execCtx.SP = newBase + totalArgs
 				res := vm.invokeBuiltinSafe(builtin.Fn, target, stack[newBase:newBase+totalArgs], kwnames)
 				if stackIsVM && &stack[0] != &vm.stack[0] {
@@ -3416,7 +3604,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if vm.execCtx.HasException() {
 					exc := vm.execCtx.ActiveException
 					vm.execCtx.ClearException()
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						if activeGen != nil {
 							activeGen.State = val.GenClosed
 						}
@@ -3434,7 +3622,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				ip++
 
 			default:
-				vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+				vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 				vm.execCtx.SP = newBase + totalArgs
 				res := vm.callFromHookSafe(target, newBase, totalArgs, kwnames)
 				if stackIsVM && &stack[0] != &vm.stack[0] {
@@ -3444,7 +3632,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if vm.execCtx.HasException() {
 					exc := vm.execCtx.ActiveException
 					vm.execCtx.ClearException()
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						if activeGen != nil {
 							activeGen.State = val.GenClosed
 						}
@@ -3536,7 +3724,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					continue
 				}
 			}
-			vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+			vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 			vm.execCtx.SP = sp
 			rec, meth := vm.loadMethodSlowSafe(obj, consts[uint16(inst)], ip, sp, frameIdx, curIC, curMethodPIC)
 			if &stack[0] != &vm.execCtx.Stack[0] {
@@ -3554,7 +3742,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			if vm.execCtx.HasException() {
 				exc := vm.execCtx.ActiveException
 				vm.execCtx.ClearException()
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -3577,9 +3765,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			retSP := sp - argc - 2
 			receiver := stack[retSP]
 			callable := stack[retSP+1]
-			isDirectAwait := ip+2 < len(code) &&
-				DecodeOpcode(code[ip+1]) == OP_GET_AWAITABLE &&
-				DecodeOpcode(code[ip+2]) == OP_AWAIT
+			isDirectAwait := ip+2 < codeLen &&
+				DecodeOpcode(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+1)*4))) == OP_GET_AWAITABLE &&
+				DecodeOpcode(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+2)*4))) == OP_AWAIT
 
 			var newBase int
 			var totalArgs int
@@ -3647,6 +3835,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				}
 			}
 
+			if totalArgs > 0 {
+				markViewsEscaped(stack[newBase : newBase+totalArgs])
+			}
 			switch callable.Kind() {
 			case val.KindFunction:
 				fn := callable.AsFunction()
@@ -3661,7 +3852,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					}
 					saved := &vm.frames[frameIdx]
 					saved.co = curCO
-					saved.code = code
+					saved.codePtr = codePtr
+					saved.codeLen = codeLen
 					saved.consts = consts
 					if isDirectAwait && callee.IsCoroutine {
 						saved.ip = ip + 3
@@ -3704,7 +3896,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if !ok {
 						exc := vm.execCtx.ActiveException
 						vm.execCtx.ClearException()
-						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 							if activeGen != nil {
 								activeGen.State = val.GenClosed
 							}
@@ -3727,7 +3919,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if !ok {
 						exc := vm.execCtx.ActiveException
 						vm.execCtx.ClearException()
-						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 							if activeGen != nil {
 								activeGen.State = val.GenClosed
 							}
@@ -3768,7 +3960,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if !ok {
 						exc := vm.execCtx.ActiveException
 						vm.execCtx.ClearException()
-						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 							if activeGen != nil {
 								activeGen.State = val.GenClosed
 							}
@@ -3787,7 +3979,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				}
 				saved := &vm.frames[frameIdx]
 				saved.co = curCO
-				saved.code = code
+				saved.codePtr = codePtr
+				saved.codeLen = codeLen
 				saved.consts = consts
 				if isDirectAwait && callee.IsCoroutine {
 					saved.ip = ip + 3
@@ -3808,7 +4001,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				curCO = callee
 				sp = nextSP
 				curCodeCache = vm.getCodeCache(curCO)
-				code = refreshCode(callee, curCodeCache)
+				codePtr, codeLen = vm.loadWindow(callee, curCodeCache)
 				consts = callee.Consts
 				baseOffset = newBase
 				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
@@ -3826,14 +4019,15 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if fn.Globals != nil {
 					globals = fn.Globals
 				}
-				curCodeCache = vm.getCodeCache(curCO)
 				curIC = curCodeCache.ic
 				curMethodPIC = curCodeCache.methodPIC
 				curAttrPIC = curCodeCache.attrPIC
 				vm.activeCO = curCO
 				vm.activeBaseOffset = baseOffset
-				vm.activeCells = cells
-				vm.activeCellPtrs = cellPtrs
+				if vm.activeCellPtrs != nil || cellPtrs != nil {
+					vm.activeCells = cells
+					vm.activeCellPtrs = cellPtrs
+				}
 				vm.activeFrameIdx = frameIdx
 				ip = 0
 				continue
@@ -3845,7 +4039,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if !ok {
 						exc := vm.execCtx.ActiveException
 						vm.execCtx.ClearException()
-						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 							if activeGen != nil {
 								activeGen.State = val.GenClosed
 							}
@@ -3868,7 +4062,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if !ok {
 						exc := vm.execCtx.ActiveException
 						vm.execCtx.ClearException()
-						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 							if activeGen != nil {
 								activeGen.State = val.GenClosed
 							}
@@ -3891,7 +4085,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				}
 				saved := &vm.frames[frameIdx]
 				saved.co = curCO
-				saved.code = code
+				saved.codePtr = codePtr
+				saved.codeLen = codeLen
 				saved.consts = consts
 				if isDirectAwait && callee.IsCoroutine {
 					saved.ip = ip + 3
@@ -3911,7 +4106,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				frameIdx++
 				curCO = callee
 				curCodeCache = vm.getCodeCache(curCO)
-				code = refreshCode(callee, curCodeCache)
+				codePtr, codeLen = vm.loadWindow(callee, curCodeCache)
 				consts = callee.Consts
 				baseOffset = newBase
 				minCap := max(baseOffset+256, baseOffset+callee.NumLocals+64)
@@ -3929,8 +4124,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				}
 				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
 				_ = locals[255]
-				curCodeCache = vm.getCodeCache(curCO)
-				maybeOptimizeCodeObject(vm, callee, curCodeCache)
+				if atomic.LoadInt32(&callee.IsTier2Optimized) == 0 {
+					maybeOptimizeCodeObject(vm, callee, curCodeCache)
+				}
 				cells, cellPtrs = vm.setupCalleeCellsAndPtrs(callee, callable, stack, newBase, totalArgs)
 				numLocalsCallee := max(callee.NumLocals, totalArgs)
 				sp = newBase + numLocalsCallee
@@ -3939,15 +4135,17 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				curAttrPIC = curCodeCache.attrPIC
 				vm.activeCO = curCO
 				vm.activeBaseOffset = baseOffset
-				vm.activeCells = cells
-				vm.activeCellPtrs = cellPtrs
+				if vm.activeCellPtrs != nil || cellPtrs != nil {
+					vm.activeCells = cells
+					vm.activeCellPtrs = cellPtrs
+				}
 				vm.activeFrameIdx = frameIdx
 				ip = 0
 				continue
 
 			case val.KindBuiltinFunc:
 				builtin := callable.AsBuiltinFunc()
-				vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+				vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 				vm.execCtx.SP = newBase + totalArgs
 				res := vm.invokeBuiltinSafe(builtin.Fn, callable, stack[newBase:newBase+totalArgs], nil)
 				if stackIsVM && &stack[0] != &vm.stack[0] {
@@ -3957,7 +4155,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if vm.execCtx.HasException() {
 					exc := vm.execCtx.ActiveException
 					vm.execCtx.ClearException()
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						if activeGen != nil {
 							activeGen.State = val.GenClosed
 						}
@@ -3975,7 +4173,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				ip++
 
 			default:
-				vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+				vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 				vm.execCtx.SP = newBase + totalArgs
 				res := vm.callFromHookSafe(callable, newBase, totalArgs, nil)
 				if stackIsVM && &stack[0] != &vm.stack[0] {
@@ -3985,7 +4183,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if vm.execCtx.HasException() {
 					exc := vm.execCtx.ActiveException
 					vm.execCtx.ClearException()
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						if activeGen != nil {
 							activeGen.State = val.GenClosed
 						}
@@ -4010,11 +4208,11 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			receiver := stack[newBase]
 			retSP := newBase
 			totalArgs := argc + 1
-			isDirectAwait := ip+2 < len(code) &&
-				DecodeOpcode(code[ip+1]) == OP_GET_AWAITABLE &&
-				DecodeOpcode(code[ip+2]) == OP_AWAIT
+			isDirectAwait := ip+2 < codeLen &&
+				DecodeOpcode(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+1)*4))) == OP_GET_AWAITABLE &&
+				DecodeOpcode(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+2)*4))) == OP_AWAIT
 
-			if argc == 1 && receiver.IsInstance() && methIdx < uint16(len(consts)) && consts[methIdx].AsString() == "write" {
+			if argc == 1 && receiver.IsInstance() && methIdx < uint16(len(consts)) && consts[methIdx] == nameWrite {
 				tp := receiver.Type()
 				if tp == StringIOType {
 					sio := (*pyStringIO)(val.AsPointer(receiver))
@@ -4064,8 +4262,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 
 			switch {
 			case argc == 0 && methIdx < uint16(len(consts)):
-				mName := consts[methIdx].AsString()
-				if mName == "StringIO" && (receiver.IsModule() || receiver.IsType()) {
+				mName := consts[methIdx]
+				if mName == nameStringIO && (receiver.IsModule() || receiver.IsType()) {
 					sio := &pyStringIO{
 						inst: val.PyInstance{
 							Header: val.ObjectHeader{Kind: val.KindInstance, Type: StringIOType},
@@ -4081,14 +4279,14 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if receiver.IsInstance() {
 					tp := receiver.Type()
 					switch mName {
-					case "__enter__":
+					case nameEnter:
 						if tp == FileType || tp == StringIOType {
 							stack[retSP] = receiver
 							sp = retSP + 1
 							ip++
 							continue
 						}
-					case "getvalue":
+					case nameGetValue:
 						if tp == StringIOType {
 							sio := (*pyStringIO)(val.AsPointer(receiver))
 							s := string(sio.buf)
@@ -4104,7 +4302,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 							ip++
 							continue
 						}
-					case "read":
+					case nameRead:
 						if tp == FileType {
 							pf := (*pyFile)(val.AsPointer(receiver))
 							if !pf.isClosed && pf.f != nil {
@@ -4189,8 +4387,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					continue
 				}
 			case argc == 1 && methIdx < uint16(len(consts)):
-				mName := consts[methIdx].AsString()
-				if mName == "exists" {
+				mName := consts[methIdx]
+				if mName == nameExists {
 					pathVal := stack[newBase+1]
 					if pathVal.IsAnyString() {
 						_, err := os.Stat(pathVal.AsString())
@@ -4199,7 +4397,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 						ip++
 						continue
 					}
-				} else if mName == "remove" || mName == "unlink" {
+				} else if mName == nameRemove || mName == nameUnlink {
 					pathVal := stack[newBase+1]
 					if pathVal.IsAnyString() {
 						_ = os.Remove(pathVal.AsString())
@@ -4209,6 +4407,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 						continue
 					}
 				}
+			}
+			if totalArgs > 0 {
+				markViewsEscaped(stack[newBase : newBase+totalArgs])
 			}
 
 			if receiver.IsInstance() {
@@ -4264,7 +4465,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 							if !ok {
 								exc := vm.execCtx.ActiveException
 								vm.execCtx.ClearException()
-								if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+								if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 									if activeGen != nil {
 										activeGen.State = val.GenClosed
 									}
@@ -4283,7 +4484,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 						}
 						saved := &vm.frames[frameIdx]
 						saved.co = curCO
-						saved.code = code
+						saved.codePtr = codePtr
+						saved.codeLen = codeLen
 						saved.consts = consts
 						if isDirectAwait && callee.IsCoroutine {
 							saved.ip = ip + 3
@@ -4304,7 +4506,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 						curCO = callee
 						sp = nextSP
 						curCodeCache = vm.getCodeCache(curCO)
-						code = refreshCode(callee, curCodeCache)
+						codePtr, codeLen = vm.loadWindow(callee, curCodeCache)
 						consts = callee.Consts
 						baseOffset = newBase
 						locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
@@ -4328,14 +4530,16 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 						curAttrPIC = curCodeCache.attrPIC
 						vm.activeCO = curCO
 						vm.activeBaseOffset = baseOffset
-						vm.activeCells = cells
-						vm.activeCellPtrs = cellPtrs
+						if vm.activeCellPtrs != nil || cellPtrs != nil {
+							vm.activeCells = cells
+							vm.activeCellPtrs = cellPtrs
+						}
 						vm.activeFrameIdx = frameIdx
 						ip = 0
 						continue
 					}
 				} else if nativeFn != nil {
-					vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+					vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 					vm.execCtx.SP = newBase + totalArgs
 					res := vm.invokeBuiltinSafe(nativeFn, targetVal, stack[newBase:newBase+totalArgs], nil)
 					if stackIsVM && &stack[0] != &vm.stack[0] {
@@ -4345,7 +4549,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if vm.execCtx.HasException() {
 						exc := vm.execCtx.ActiveException
 						vm.execCtx.ClearException()
-						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 							if activeGen != nil {
 								activeGen.State = val.GenClosed
 							}
@@ -4365,7 +4569,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				}
 			}
 
-			vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+			vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 			vm.execCtx.SP = newBase + totalArgs
 			res := vm.callMethodPICSlowSafe(receiver, consts[methIdx], ip, newBase, argc, frameIdx, curMethodPIC)
 			if &stack[0] != &vm.execCtx.Stack[0] {
@@ -4383,7 +4587,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			if vm.execCtx.HasException() {
 				exc := vm.execCtx.ActiveException
 				vm.execCtx.ClearException()
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -4405,6 +4609,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			retVal := stack[sp]
 			// The result escapes the frame, so it must not be extendable in place.
 			val.DetachStringBuf(retVal)
+			markViewEscaped(retVal)
 			if curShadow := vm.frames[frameIdx].shadowFrame; curShadow != nil {
 				curShadow.Detach()
 				vm.frames[frameIdx].shadowFrame = nil
@@ -4441,7 +4646,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				continue
 			}
 			curCO = caller.co
-			code = caller.code
+			codePtr = caller.codePtr
+			codeLen = caller.codeLen
 			consts = caller.consts
 			ip = caller.ip
 			baseOffset = caller.baseOffset
@@ -4453,8 +4659,10 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			curLocals = caller.locals
 			vm.activeCO = curCO
 			vm.activeBaseOffset = baseOffset
-			vm.activeCells = cells
-			vm.activeCellPtrs = cellPtrs
+			if vm.activeCellPtrs != nil || cellPtrs != nil {
+				vm.activeCells = cells
+				vm.activeCellPtrs = cellPtrs
+			}
 			vm.activeFrameIdx = frameIdx
 			stack[caller.retSP] = retVal
 			sp = caller.retSP + 1
@@ -4471,18 +4679,16 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		case OP_LOAD_ATTR:
 			obj := stack[sp-1]
 			var attrRes val.Value
-			switch {
-			case obj.IsInstance() && obj.AsInstance().Shape != nil && obj.AsInstance().Header.Type != nil:
-				instObj := obj.AsInstance()
-				instType := instObj.Header.Type
+			switch instObj, instType, ok := attrInstance(obj); {
+			case ok:
 				if instType.Flags&val.FlagCustomGetAttribute != 0 {
-					vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+					vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 					vm.execCtx.SP = sp
 					attrRes = vm.getAttrSafe(obj, consts[uint16(inst)])
 				} else {
 					instShape := instObj.Shape
 					pic := &curAttrPIC[ip]
-					isMT := val.IsMultiThreaded()
+					isMT := val.MultiThreadedFlag.Load()
 					if pic[0].Shape == instShape {
 						slotIdx := pic[0].SlotIndex
 						if !isMT {
@@ -4588,13 +4794,13 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 								ip++
 								continue
 							}
-							vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+							vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 							vm.execCtx.SP = sp
 							attrRes = vm.descrGetSafe(entry.CachedVal, obj, instType)
 							goto loadAttrDone
 						}
 					}
-					vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+					vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 					vm.execCtx.SP = sp
 					attrRes = vm.loadAttrInstanceSlowSafe(instObj, obj, consts[uint16(inst)], ip, sp, frameIdx, curIC, curAttrPIC)
 				}
@@ -4617,11 +4823,11 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					ip++
 					continue
 				}
-				vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+				vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 				vm.execCtx.SP = sp
 				attrRes = vm.getAttrSafe(obj, attrName)
 			default:
-				vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+				vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 				vm.execCtx.SP = sp
 				attrRes = vm.getAttrSafe(obj, consts[uint16(inst)])
 			}
@@ -4641,7 +4847,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			if vm.execCtx.HasException() {
 				exc := vm.execCtx.ActiveException
 				vm.execCtx.ClearException()
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -4661,17 +4867,16 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			v := stack[sp-2]
 			obj := stack[sp-1]
 			val.DetachStringBuf(v)
-			if obj.IsInstance() && obj.AsInstance().Shape != nil && obj.AsInstance().Header.Type != nil {
-				instObj := obj.AsInstance()
-				instType := instObj.Header.Type
+			markViewEscaped(v)
+			if instObj, instType, ok := attrInstance(obj); ok {
 				if instType.Flags&val.FlagCustomSetAttr != 0 {
-					vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+					vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 					vm.execCtx.SP = sp
 					vm.setAttrSafe(obj, consts[uint16(inst)], v)
 				} else {
 					instShape := instObj.Shape
 					pic := &curAttrPIC[ip]
-					isMT := val.IsMultiThreaded()
+					isMT := val.MultiThreadedFlag.Load()
 					if pic[0].Shape == instShape {
 						slotIdx := pic[0].SlotIndex
 						if !isMT {
@@ -4768,18 +4973,18 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 								ip++
 								continue
 							}
-							vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+							vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 							vm.execCtx.SP = sp
 							vm.descrSetSafe(entry.CachedVal, obj, v)
 							goto storeAttrDone
 						}
 					}
-					vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+					vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 					vm.execCtx.SP = sp
 					vm.storeAttrInstanceSlowSafe(instObj, obj, consts[uint16(inst)], v, ip, sp, frameIdx, curIC, curAttrPIC)
 				}
 			} else {
-				vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+				vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 				vm.execCtx.SP = sp
 				vm.setAttrSafe(obj, consts[uint16(inst)], v)
 			}
@@ -4799,7 +5004,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			if vm.execCtx.HasException() {
 				exc := vm.execCtx.ActiveException
 				vm.execCtx.ClearException()
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -4817,13 +5022,14 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 
 		case OP_POP_TOP:
 			sp--
+			vm.reclaimViewSlot(stack[sp], val.NoneVal())
 			ip++
 
 		case OP_PRINT_EXPR:
 			v := stack[sp-1]
 			sp--
 			if !v.IsNone() && v.HeaderPtr() != nil {
-				vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+				vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 				vm.execCtx.SP = sp
 				if hook, ok := vm.getDisplayhook(); ok {
 					_, panicValue := vm.invokeDisplayhook(hook, v)
@@ -4841,7 +5047,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					}
 					if panicValue != nil {
 						exc := panicToPyException(panicValue)
-						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 							if activeGen != nil {
 								activeGen.State = val.GenClosed
 							}
@@ -4864,6 +5070,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			// The duplicated value is now reachable from two stack slots, so it
 			// must not be extendable in place any more.
 			val.DetachStringBuf(stack[sp-1])
+			markViewEscaped(stack[sp-1])
 			stack[sp] = stack[sp-1]
 			sp++
 			ip++
@@ -4881,7 +5088,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					continue
 				}
 				if _, _, has := globals.Header.Type.LookupMRO(val.DunderMissing); has {
-					vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+					vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 					vm.execCtx.SP = sp
 					res := vm.getItemSafe(val.ObjectVal(&globals.Header), nameVal)
 					if stackIsVM && &stack[0] != &vm.stack[0] {
@@ -4891,7 +5098,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if vm.execCtx.HasException() {
 						exc := vm.execCtx.ActiveException
 						vm.execCtx.ClearException()
-						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 							if activeGen != nil {
 								activeGen.State = val.GenClosed
 							}
@@ -4916,7 +5123,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					continue
 				}
 				exc := val.NewNameError("name '" + nameVal.AsString() + "' is not defined")
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -4974,7 +5181,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				continue
 			}
 			exc := val.NewNameError("name '" + nameVal.AsString() + "' is not defined")
-			if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+			if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 				if activeGen != nil {
 					activeGen.State = val.GenClosed
 				}
@@ -4998,7 +5205,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			nameVal := consts[uint16(inst)]
 			sp--
 			mapping := stack[sp]
-			vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+			vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 			vm.execCtx.SP = sp
 			res, found := vm.mappingGetOptional(mapping, nameVal)
 			if !found && !vm.execCtx.HasException() {
@@ -5021,7 +5228,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				} else {
 					exc = val.NewNameError("name '" + nameVal.AsString() + "' is not defined")
 				}
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -5044,6 +5251,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			sp--
 			valToStore := stack[sp]
 			val.DetachStringBuf(valToStore)
+			markViewEscaped(valToStore)
 			globals.Set(nameVal, valToStore)
 			ip++
 
@@ -5096,7 +5304,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 
 			if !found {
 				exc := val.NewNameError("name '" + nameVal.AsString() + "' is not defined")
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -5133,6 +5341,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			sp--
 			valToStore := stack[sp]
 			val.DetachStringBuf(valToStore)
+			markViewEscaped(valToStore)
 
 			if !curLocals.IsNone() && curLocals.HeaderPtr() != nil {
 				if curLocals.Type() == val.DictType {
@@ -5206,7 +5415,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			level := int(argA & 0x7F)
 			returnLeaf := (argA & 0x80) != 0
 
-			vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+			vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 			vm.execCtx.SP = sp
 			modVal, err := vm.ImportModule(nameVal.AsString(), level, returnLeaf, globals)
 			if &stack[0] != &vm.execCtx.Stack[0] {
@@ -5224,7 +5433,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			if !vm.unhandledException.IsNone() && vm.unhandledException.HeaderPtr() != nil {
 				exc := vm.unhandledException
 				vm.unhandledException = val.NoneVal()
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -5239,7 +5448,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			}
 			if err != nil {
 				exc := panicToPyException(err)
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -5264,7 +5473,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			symVal := consts[bx]
 			modVal := stack[sp-1]
 
-			vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+			vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 			vm.execCtx.SP = sp
 			v, err := vm.ImportFrom(modVal, symVal.AsString(), globals)
 			if &stack[0] != &vm.execCtx.Stack[0] {
@@ -5282,7 +5491,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			if !vm.unhandledException.IsNone() && vm.unhandledException.HeaderPtr() != nil {
 				exc := vm.unhandledException
 				vm.unhandledException = val.NoneVal()
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -5297,7 +5506,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			}
 			if err != nil {
 				exc := panicToPyException(err)
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -5320,7 +5529,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		case OP_IMPORT_STAR:
 			sp--
 			modVal := stack[sp]
-			vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+			vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 			vm.execCtx.SP = sp
 			err := vm.ImportStar(modVal, globals)
 			if &stack[0] != &vm.execCtx.Stack[0] {
@@ -5338,7 +5547,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			if !vm.unhandledException.IsNone() && vm.unhandledException.HeaderPtr() != nil {
 				exc := vm.unhandledException
 				vm.unhandledException = val.NoneVal()
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -5353,7 +5562,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			}
 			if err != nil {
 				exc := panicToPyException(err)
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -5426,7 +5635,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				continue
 			}
 			if !top.IsIter() && !top.IsGenerator() {
-				vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+				vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 				vm.execCtx.SP = sp
 				itVal := vm.getIterSafe(top)
 				if stackIsVM && &stack[0] != &vm.stack[0] {
@@ -5436,7 +5645,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if vm.execCtx.HasException() {
 					exc := vm.execCtx.ActiveException
 					vm.execCtx.ClearException()
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						if activeGen != nil {
 							activeGen.State = val.GenClosed
 						}
@@ -5461,7 +5670,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				stop := it.RangeStop()
 				if cur < stop {
 					stack[sp-1] = val.RangeVal(cur+1, stop)
-					instNext := code[ip+1]
+					instNext := *(*uint32)(unsafe.Add(codePtr, uintptr(ip+1)*4))
 					if DecodeOpcode(instNext) == OP_STORE_FAST {
 						reg := DecodeArgBx(instNext)
 						if reg < 256 {
@@ -5485,7 +5694,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				pyIter := it.AsIter()
 				if pyIter.Kind == val.IterKindInvalid {
 					exc := val.NewTypeError(fmt.Sprintf("'%s' object is not iterable", pyIter.Obj.Type().Name))
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						if activeGen != nil {
 							activeGen.State = val.GenClosed
 						}
@@ -5498,7 +5707,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					curCodeCache = vm.getCodeCache(curCO)
 					continue
 				}
-				vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+				vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 				vm.execCtx.SP = sp
 				nextVal, ok := pyIter.Next()
 				if stackIsVM && &stack[0] != &vm.stack[0] {
@@ -5508,7 +5717,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if vm.execCtx.HasException() {
 					exc := vm.execCtx.ActiveException
 					vm.execCtx.ClearException()
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						if activeGen != nil {
 							activeGen.State = val.GenClosed
 						}
@@ -5532,7 +5741,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				continue
 			}
 			if tpIterNext := it.Type().Slots.TpIterNext; tpIterNext != nil {
-				vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+				vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 				vm.execCtx.SP = sp
 				nextVal, status := vm.iterNextSafe(tpIterNext, it)
 				if stackIsVM && &stack[0] != &vm.stack[0] {
@@ -5553,7 +5762,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if vm.execCtx.HasException() {
 					exc := vm.execCtx.ActiveException
 					vm.execCtx.ClearException()
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						if activeGen != nil {
 							activeGen.State = val.GenClosed
 						}
@@ -5569,7 +5778,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				panic(fmt.Sprintf("vm: RuntimeError: iterator '%s' returned status %d without active exception in %s", it.Type().Name, status, curCO.Name))
 			}
 			exc := val.NewTypeError(fmt.Sprintf("'%s' object is not an iterator", it.Type().Name))
-			if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+			if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 				if activeGen != nil {
 					activeGen.State = val.GenClosed
 				}
@@ -5588,6 +5797,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			copy(items, stack[sp-count:sp])
 			for i := range items {
 				val.DetachStringBuf(items[i])
+				markViewEscaped(items[i])
 			}
 			sp -= count
 			stack[sp] = val.NewListVal(items...)
@@ -5600,6 +5810,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			item := stack[sp-1]
 			sp--
 			val.DetachStringBuf(item)
+			markViewEscaped(item)
 			l := listVal.AsList()
 			l.Append(item)
 			ip++
@@ -5626,6 +5837,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			sp -= 2
 			val.DetachStringBuf(k)
 			val.DetachStringBuf(v)
+			markViewEscaped(v)
 			dictVal.AsDict().Set(k, v)
 			ip++
 
@@ -5635,6 +5847,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			copy(items, stack[sp-count:sp])
 			for i := range items {
 				val.DetachStringBuf(items[i])
+				markViewEscaped(items[i])
 			}
 			sp -= count
 			stack[sp] = val.NewTupleVal(items...)
@@ -5665,6 +5878,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 
 			if container.Kind() == val.KindMemoryView {
 				mv := container.AsMemoryView()
+				// The sub-view shares the payload of its parent, so the parent
+				// must never be recycled while the sub-view exists.
+				mv.Escaped = true
 				// ND/typed: slice in element space (shape[0]); byte 1D is a special case.
 				mvLen := len(mv.Buf)
 				if mv.NDim > 0 {
@@ -5675,16 +5891,23 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				start, stop, _, sliceLen, err := val.NormalizeSliceIndices(startVal, stopVal, val.NoneVal(), mvLen)
 				if err != nil {
 					exc := val.NewTypeError(err.Error())
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						return val.NoneVal()
 					}
 					locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
 					curCodeCache = vm.getCodeCache(curCO)
 					continue
 				}
-				newMv := vm.allocMemoryView()
-				newMv.Header = val.ObjectHeader{Kind: val.KindMemoryView, Type: val.MemoryViewType}
-				newMv.Obj = mv.Obj
+				// A slice that is stored into a local slot right away reuses
+				// the view that slot already holds, so the loop allocates no
+				// view at all and touches no pointer field it does not have
+				// to change.
+				newMv := reusableViewFor(codePtr, ip, locals)
+				if newMv == nil {
+					newMv = vm.allocMemoryView()
+					newMv.Header = val.ObjectHeader{Kind: val.KindMemoryView, Type: val.MemoryViewType}
+					newMv.Obj = mv.Obj
+				}
 				// Convert element indices to byte offset via stride[0].
 				stride0 := mv.Stride(0)
 				if stride0 == 0 {
@@ -5714,7 +5937,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if newMv.ItemSize == 0 {
 					newMv.ItemSize = 1
 				}
-				newMv.Format = mv.Format
+				if newMv.Format != mv.Format {
+					newMv.Format = mv.Format
+				}
 				if newMv.Format == "" {
 					newMv.Format = "B"
 				}
@@ -5726,8 +5951,12 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					// 1-D slices keep their extent and stride inline.
 					newMv.Dim0 = sliceLen
 					newMv.Stride0 = stride0
-					newMv.Shape = nil
-					newMv.Strides = nil
+					if newMv.Shape != nil {
+						newMv.Shape = nil
+					}
+					if newMv.Strides != nil {
+						newMv.Strides = nil
+					}
 				} else {
 					newShape := append([]int(nil), mv.Shape...)
 					if len(newShape) == 0 {
@@ -5826,7 +6055,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				}
 			}
 
-			vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+			vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 			vm.execCtx.SP = sp
 			sl := val.NewSliceVal(startVal, stopVal, val.NoneVal())
 			res := vm.getItemSafe(container, sl)
@@ -5837,7 +6066,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			if vm.execCtx.HasException() {
 				exc := vm.execCtx.ActiveException
 				vm.execCtx.ClearException()
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -5885,7 +6114,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				origBases = []val.Value{basesVal}
 			}
 
-			vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+			vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 			vm.execCtx.SP = sp
 
 			newClsVal := vm.buildClassSafe(classBody, nameVal, origBases, kwdsVal, globals)
@@ -5904,7 +6133,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			if vm.execCtx.HasException() {
 				exc := vm.execCtx.ActiveException
 				vm.execCtx.ClearException()
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -5938,7 +6167,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					items[i] = val.NewStringVal(string(r[i]))
 				}
 			default:
-				vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+				vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 				vm.execCtx.SP = sp
 				items = vm.extractIterableSafe(seq)
 				if stackIsVM && &stack[0] != &vm.stack[0] {
@@ -5948,7 +6177,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if vm.execCtx.HasException() {
 					exc := vm.execCtx.ActiveException
 					vm.execCtx.ClearException()
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						if activeGen != nil {
 							activeGen.State = val.GenClosed
 						}
@@ -5964,7 +6193,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			}
 			if len(items) != count {
 				exc := val.NewValueError(fmt.Sprintf("not enough or too many values to unpack (expected %d, got %d)", count, len(items)))
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -6047,7 +6276,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					continue
 				}
 			}
-			vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+			vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 			vm.execCtx.SP = sp
 			res := vm.compareOpSafe(a, b, cmpOp)
 			if &stack[0] != &vm.execCtx.Stack[0] {
@@ -6065,7 +6294,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			if vm.execCtx.HasException() {
 				exc := vm.execCtx.ActiveException
 				vm.execCtx.ClearException()
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -6094,7 +6323,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if stackIsVM && &stack[0] != &vm.stack[0] {
 					stack = vm.stack
 				}
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -6122,7 +6351,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if stackIsVM && &stack[0] != &vm.stack[0] {
 					stack = vm.stack
 				}
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -6164,7 +6393,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if stackIsVM && &stack[0] != &vm.stack[0] {
 					stack = vm.stack
 				}
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -6190,7 +6419,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if stackIsVM && &stack[0] != &vm.stack[0] {
 					stack = vm.stack
 				}
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -6225,7 +6454,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if stackIsVM && &stack[0] != &vm.stack[0] {
 						stack = vm.stack
 					}
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						if activeGen != nil {
 							activeGen.State = val.GenClosed
 						}
@@ -6256,7 +6485,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if stackIsVM && &stack[0] != &vm.stack[0] {
 						stack = vm.stack
 					}
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						if activeGen != nil {
 							activeGen.State = val.GenClosed
 						}
@@ -6329,7 +6558,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					exc.AsInstance().SetAttr(val.InternString("__suppress_context__"), val.BoolVal(true))
 				}
 			}
-			if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+			if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 				if activeGen != nil {
 					activeGen.State = val.GenClosed
 				}
@@ -6412,7 +6641,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			case vm.execCtx.HasException():
 				exc := vm.execCtx.ActiveException
 				vm.execCtx.ClearException()
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -6446,7 +6675,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				continue
 			}
 			exc := val.NewTypeError(fmt.Sprintf("object %s can't be used in 'await' expression", top.Type().Name))
-			if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+			if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 				if activeCoro != nil {
 					activeCoro.State = val.CoroClosed
 				}
@@ -6466,7 +6695,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if fut.IsDone() {
 					res, exc := fut.Result()
 					if !exc.IsNone() && exc.HeaderPtr() != nil {
-						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 							if activeCoro != nil {
 								activeCoro.State = val.CoroClosed
 							}
@@ -6513,7 +6742,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if vm.execCtx.HasException() {
 						exc := vm.execCtx.ActiveException
 						vm.execCtx.ClearException()
-						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 							if activeCoro != nil {
 								activeCoro.State = val.CoroClosed
 							}
@@ -6549,7 +6778,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if vm.execCtx.HasException() {
 						exc := vm.execCtx.ActiveException
 						vm.execCtx.ClearException()
-						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 							if activeCoro != nil {
 								activeCoro.State = val.CoroClosed
 							}
@@ -6640,7 +6869,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				ip += 4
 				continue
 			}
-			code = deoptimizeAt(curCO, ip, func(c []uint32) { DeoptimizeFastAdd(c, ip, dstReg, srcRegA, srcRegB) })
+			codePtr, codeLen = deoptimizeAt(curCO, ip, func(c []uint32) { DeoptimizeFastAdd(c, ip, dstReg, srcRegA, srcRegB) })
 			continue
 
 		case OP_FAST_INC_INT_LOCAL_CONST:
@@ -6662,18 +6891,18 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				ip += 4
 				continue
 			}
-			code = deoptimizeAt(curCO, ip, func(c []uint32) { DeoptimizeFastInc(c, ip, reg, constIdx) })
+			codePtr, codeLen = deoptimizeAt(curCO, ip, func(c []uint32) { DeoptimizeFastInc(c, ip, reg, constIdx) })
 			continue
 
 		case OP_FAST_LOOP_CMP_LT_CONST_JUMP:
 			_ = locals[255]
 			reg := uint8(inst >> 16)
 			exitTarget := uint16(inst)
-			constIdx := uint16(code[ip+1])
+			constIdx := uint16(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+1)*4)))
 			v := locals[reg]
 			c := consts[constIdx]
 			if !v.IsInt64() || !c.IsInt64() {
-				code = deoptimizeAt(curCO, ip, func(c []uint32) { DeoptimizeFastLoop(c, ip, reg, constIdx, exitTarget) })
+				codePtr, codeLen = deoptimizeAt(curCO, ip, func(c []uint32) { DeoptimizeFastLoop(c, ip, reg, constIdx, exitTarget) })
 				continue
 			}
 			limit := c.AsInt64()
@@ -6681,9 +6910,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 
 			// Hot-Loop Register Optimizer:
 			// If followed by OP_FAST_INC_INT_LOCAL_CONST (same reg) and back-edge OP_JUMP back to this instruction
-			if ip+8 < len(code) {
-				inst4 := code[ip+4]
-				inst8 := code[ip+8]
+			if ip+8 < codeLen {
+				inst4 := *(*uint32)(unsafe.Add(codePtr, uintptr(ip+4)*4))
+				inst8 := *(*uint32)(unsafe.Add(codePtr, uintptr(ip+8)*4))
 				if DecodeOpcode(inst4) == OP_FAST_INC_INT_LOCAL_CONST &&
 					DecodeArgA(inst4) == reg &&
 					DecodeOpcode(inst8) == OP_JUMP &&
@@ -6737,7 +6966,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				ip += 4
 				continue
 			}
-			code = deoptimizeAt(curCO, ip, func(c []uint32) { DeoptimizeFastSub(c, ip, dstReg, srcRegA, srcRegB) })
+			codePtr, codeLen = deoptimizeAt(curCO, ip, func(c []uint32) { DeoptimizeFastSub(c, ip, dstReg, srcRegA, srcRegB) })
 			continue
 
 		case OP_FAST_ADD_INT_LOCALS:
@@ -6761,7 +6990,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				ip += 3
 				continue
 			}
-			code = deoptimizeAt(curCO, ip, func(c []uint32) {
+			codePtr, codeLen = deoptimizeAt(curCO, ip, func(c []uint32) {
 				c[ip] = Encode(OP_LOAD_FAST, 0, uint16(srcA))
 				c[ip+1] = Encode(OP_LOAD_FAST, 0, srcB)
 				c[ip+2] = Encode(OP_BINARY_ADD, 0, 0)
@@ -6789,7 +7018,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				ip += 3
 				continue
 			}
-			code = deoptimizeAt(curCO, ip, func(c []uint32) {
+			codePtr, codeLen = deoptimizeAt(curCO, ip, func(c []uint32) {
 				c[ip] = Encode(OP_LOAD_FAST, 0, uint16(srcA))
 				c[ip+1] = Encode(OP_LOAD_FAST, 0, srcB)
 				c[ip+2] = Encode(OP_BINARY_SUB, 0, 0)
@@ -6800,7 +7029,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			_ = locals[255]
 			srcA := uint8(inst >> 16)
 			exitTarget := uint16(inst)
-			srcB := uint8(code[ip+1] >> 16)
+			srcB := uint8(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+1)*4)) >> 16)
 			va := locals[srcA]
 			vb := locals[srcB]
 			if va.IsInt64() && vb.IsInt64() {
@@ -6811,7 +7040,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				ip += 4
 				continue
 			}
-			code = deoptimizeAt(curCO, ip, func(c []uint32) { DeoptimizeFastCmpEq(c, ip, srcA, srcB, exitTarget) })
+			codePtr, codeLen = deoptimizeAt(curCO, ip, func(c []uint32) { DeoptimizeFastCmpEq(c, ip, srcA, srcB, exitTarget) })
 			continue
 
 		case OP_FAST_SUBSCR_DEREF_LIST_LOCAL:
@@ -6835,7 +7064,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					}
 				}
 			}
-			code = deoptimizeAt(curCO, ip, func(c []uint32) { DeoptimizeFastSubscr(c, ip, dstReg, cellIdx, idxReg) })
+			codePtr, codeLen = deoptimizeAt(curCO, ip, func(c []uint32) { DeoptimizeFastSubscr(c, ip, dstReg, cellIdx, idxReg) })
 			continue
 
 		case OP_FAST_NEG_INT_LOCAL:
@@ -6847,7 +7076,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				ip += 3
 				continue
 			}
-			code = deoptimizeAt(curCO, ip, func(c []uint32) { DeoptimizeFastNeg(c, ip, reg) })
+			codePtr, codeLen = deoptimizeAt(curCO, ip, func(c []uint32) { DeoptimizeFastNeg(c, ip, reg) })
 			continue
 
 		case OP_FORMAT_VALUE:
@@ -6865,7 +7094,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				ip++
 				continue
 			}
-			vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+			vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 			vm.execCtx.SP = sp
 			fres := vm.formatValueSafe(valToFormat, specStr, conversion)
 			if &stack[0] != &vm.execCtx.Stack[0] {
@@ -6883,7 +7112,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			if vm.execCtx.HasException() {
 				exc := vm.execCtx.ActiveException
 				vm.execCtx.ClearException()
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -7054,7 +7283,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			case seq.IsList():
 				items = seq.AsList().Items
 			default:
-				vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+				vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 				vm.execCtx.SP = sp
 				items = vm.extractIterableSafe(seq)
 				if stackIsVM && &stack[0] != &vm.stack[0] {
@@ -7064,7 +7293,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if vm.execCtx.HasException() {
 					exc := vm.execCtx.ActiveException
 					vm.execCtx.ClearException()
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 						if activeGen != nil {
 							activeGen.State = val.GenClosed
 						}
@@ -7081,7 +7310,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			minNeeded := beforeCount + afterCount
 			if len(items) < minNeeded {
 				exc := val.NewValueError(fmt.Sprintf("not enough values to unpack (expected at least %d, got %d)", minNeeded, len(items)))
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -7142,7 +7371,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if stackIsVM && &stack[0] != &vm.stack[0] {
 					stack = vm.stack
 				}
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -7177,7 +7406,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if stackIsVM && &stack[0] != &vm.stack[0] {
 					stack = vm.stack
 				}
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -7212,7 +7441,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if stackIsVM && &stack[0] != &vm.stack[0] {
 					stack = vm.stack
 				}
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -7254,7 +7483,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if stackIsVM && &stack[0] != &vm.stack[0] {
 					stack = vm.stack
 				}
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -7300,7 +7529,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if stackIsVM && &stack[0] != &vm.stack[0] {
 					stack = vm.stack
 				}
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -7329,7 +7558,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if stackIsVM && &stack[0] != &vm.stack[0] {
 					stack = vm.stack
 				}
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -7362,7 +7591,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if stackIsVM && &stack[0] != &vm.stack[0] {
 					stack = vm.stack
 				}
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -7410,22 +7639,22 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					var isWriteLoop bool
 					var localIdx uint32
 					var constIdx uint32
-					if ip+5 < len(code) && DecodeOpcode(code[ip+5]) == OP_JUMP && int(DecodeArgBx(code[ip+5])) == ip {
-						op1 := DecodeOpcode(code[ip+1])
+					if ip+5 < codeLen && DecodeOpcode(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+5)*4))) == OP_JUMP && int(DecodeArgBx(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+5)*4)))) == ip {
+						op1 := DecodeOpcode(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+1)*4)))
 						if op1 == OP_FAST_STREAM_WRITE_LOCAL_CONST {
-							writeInst := code[ip+1]
+							writeInst := *(*uint32)(unsafe.Add(codePtr, uintptr(ip+1)*4))
 							localIdx = uint32(uint8(writeInst >> 16))
 							constIdx = uint32(uint16(writeInst))
 							isWriteLoop = true
-						} else if op1 == OP_LOAD_FAST && DecodeOpcode(code[ip+2]) == OP_LOAD_CONST &&
-							(DecodeOpcode(code[ip+3]) == OP_CALL_METHOD_PIC || DecodeOpcode(code[ip+3]) == OP_CALL_METHOD) &&
-							DecodeOpcode(code[ip+4]) == OP_POP_TOP {
-							w3 := code[ip+3]
+						} else if op1 == OP_LOAD_FAST && DecodeOpcode(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+2)*4))) == OP_LOAD_CONST &&
+							(DecodeOpcode(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+3)*4))) == OP_CALL_METHOD_PIC || DecodeOpcode(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+3)*4))) == OP_CALL_METHOD) &&
+							DecodeOpcode(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+4)*4))) == OP_POP_TOP {
+							w3 := *(*uint32)(unsafe.Add(codePtr, uintptr(ip+3)*4))
 							methIdx := DecodeArgBx(w3)
 							argc := DecodeArgA(w3)
-							if argc == 1 && int(methIdx) < len(consts) && consts[methIdx].AsString() == "write" {
-								localIdx = uint32(DecodeArgBx(code[ip+1]))
-								constIdx = uint32(DecodeArgBx(code[ip+2]))
+							if argc == 1 && int(methIdx) < len(consts) && consts[methIdx] == nameWrite {
+								localIdx = uint32(DecodeArgBx(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+1)*4))))
+								constIdx = uint32(DecodeArgBx(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+2)*4))))
 								isWriteLoop = true
 							}
 						}
@@ -7687,7 +7916,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			} else if int(cellIdx) < len(cells) {
 				cVal = (*val.PyCell)(unsafe.Pointer(cells[cellIdx].HeaderPtr())).Value
 			}
-			vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+			vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 			vm.execCtx.SP = sp
 			res := vm.getItemSafe(cVal, locals[uint8(localIdx)])
 			if stackIsVM && &stack[0] != &vm.stack[0] {
@@ -7697,7 +7926,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			if vm.execCtx.HasException() {
 				exc := vm.execCtx.ActiveException
 				vm.execCtx.ClearException()
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -7738,7 +7967,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		case OP_FAST_JUMP_IF_DEREF_LIST_SUBSCR_TRUE:
 			cellIdx := uint8(inst >> 16)
 			exitTarget := int(uint16(inst))
-			localIdx := uint16(code[ip+1])
+			localIdx := uint16(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+1)*4)))
 			if int(cellIdx) < len(cellPtrs) && cellPtrs[cellIdx] != nil {
 				cVal := cellPtrs[cellIdx].Value
 				if cVal.IsList() && int(localIdx) < 256 {
@@ -7774,7 +8003,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		case OP_FAST_STORE_DEREF_LIST_LOCAL_CONST:
 			cellIdx := uint8(inst >> 16)
 			localIdx := uint16(inst)
-			constIdx := uint16(code[ip+1])
+			constIdx := uint16(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+1)*4)))
 			if int(cellIdx) < len(cellPtrs) && cellPtrs[cellIdx] != nil {
 				cVal := cellPtrs[cellIdx].Value
 				if cVal.IsList() && int(localIdx) < 256 {
@@ -7820,8 +8049,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 							}
 							sio.buf = append(sio.buf, data...)
 							sio.pos = len(sio.buf)
-							if ip+4 < len(code) && DecodeOpcode(code[ip+4]) == OP_JUMP {
-								ip = int(DecodeArgBx(code[ip+4]))
+							if ip+4 < codeLen && DecodeOpcode(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+4)*4))) == OP_JUMP {
+								ip = int(DecodeArgBx(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+4)*4))))
 								continue
 							}
 							ip += 4
@@ -7829,8 +8058,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 						}
 						sio.buf, _ = val.AppendValueBytes(sio.buf, arg)
 						sio.pos = len(sio.buf)
-						if ip+4 < len(code) && DecodeOpcode(code[ip+4]) == OP_JUMP {
-							ip = int(DecodeArgBx(code[ip+4]))
+						if ip+4 < codeLen && DecodeOpcode(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+4)*4))) == OP_JUMP {
+							ip = int(DecodeArgBx(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+4)*4))))
 							continue
 						}
 						ip += 4
@@ -7846,8 +8075,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 								_, _ = pf.f.Write(pf.writeBuf)
 								pf.writeBuf = pf.writeBuf[:0]
 							}
-							if ip+4 < len(code) && DecodeOpcode(code[ip+4]) == OP_JUMP {
-								ip = int(DecodeArgBx(code[ip+4]))
+							if ip+4 < codeLen && DecodeOpcode(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+4)*4))) == OP_JUMP {
+								ip = int(DecodeArgBx(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+4)*4))))
 								continue
 							}
 							ip += 4
@@ -7858,8 +8087,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 							_, _ = pf.f.Write(pf.writeBuf)
 							pf.writeBuf = pf.writeBuf[:0]
 						}
-						if ip+4 < len(code) && DecodeOpcode(code[ip+4]) == OP_JUMP {
-							ip = int(DecodeArgBx(code[ip+4]))
+						if ip+4 < codeLen && DecodeOpcode(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+4)*4))) == OP_JUMP {
+							ip = int(DecodeArgBx(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+4)*4))))
 							continue
 						}
 						ip += 4
@@ -7867,7 +8096,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					}
 				}
 			}
-			vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+			vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 			methVal := vm.getAttrSafe(receiver, val.InternString("write"))
 			if !methVal.IsNone() {
 				vm.Vectorcall(methVal, []val.Value{arg}, nil)
@@ -7879,7 +8108,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			if vm.execCtx.HasException() {
 				exc := vm.execCtx.ActiveException
 				vm.execCtx.ClearException()
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -7898,7 +8127,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		case OP_FAST_CMP_EQ_LOCAL_DEREF_JUMP_IF_FALSE:
 			localIdx := uint8(inst >> 16)
 			exitTarget := int(uint16(inst))
-			cellIdx := uint16(code[ip+1])
+			cellIdx := uint16(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+1)*4)))
 			if int(cellIdx) < len(cellPtrs) && cellPtrs[cellIdx] != nil {
 				cVal := cellPtrs[cellIdx].Value
 				lVal := locals[localIdx]
@@ -7928,7 +8157,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			dst := uint8(inst >> 16)
 			srcA := uint8(inst >> 8)
 			srcB := uint8(inst)
-			cellIdx := uint16(code[ip+1])
+			cellIdx := uint16(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+1)*4)))
 			if int(cellIdx) < len(cellPtrs) && cellPtrs[cellIdx] != nil {
 				cVal := cellPtrs[cellIdx].Value
 				vA := locals[srcA]
@@ -7952,8 +8181,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 
 		case OP_FAST_SELF_RECURSE_INC_LOCAL:
 			localReg := uint8(inst >> 16)
-			cellIdx := uint16(code[ip+1])
-			constIdx := uint16(code[ip+2])
+			cellIdx := uint16(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+1)*4)))
+			constIdx := uint16(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+2)*4)))
 			if int(cellIdx) < len(cellPtrs) && cellPtrs[cellIdx] != nil {
 				fnVal := cellPtrs[cellIdx].Value
 				if fnVal.IsFunction() {
@@ -7974,7 +8203,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 						}
 						saved := &vm.frames[frameIdx]
 						saved.co = curCO
-						saved.code = code
+						saved.codePtr = codePtr
+						saved.codeLen = codeLen
 						saved.consts = consts
 						saved.ip = ip + 6
 						saved.baseOffset = baseOffset
@@ -8025,6 +8255,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			item := stack[sp-1]
 			sp--
 			val.DetachStringBuf(item)
+			markViewEscaped(item)
 			setVal := stack[sp-offset]
 			setVal.AsSet().Add(item)
 			ip++
@@ -8032,8 +8263,10 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		case OP_DELETE_FAST:
 			reg := uint16(inst)
 			if reg < 256 {
+				vm.reclaimViewSlot(locals[uint8(reg)], val.UnboundVal())
 				locals[uint8(reg)] = val.UnboundVal()
 			} else {
+				vm.reclaimViewSlot(stack[baseOffset+int(reg)], val.UnboundVal())
 				stack[baseOffset+int(reg)] = val.UnboundVal()
 			}
 			ip++
@@ -8067,7 +8300,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			}
 			if !deleted {
 				exc := val.NewNameError("name '" + nameVal.AsString() + "' is not defined")
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -8087,7 +8320,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			attrName := consts[bx]
 			sp--
 			obj := stack[sp]
-			vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+			vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 			vm.execCtx.SP = sp
 			vm.delAttrSafe(obj, attrName)
 			if &stack[0] != &vm.execCtx.Stack[0] {
@@ -8105,7 +8338,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			if vm.execCtx.HasException() {
 				exc := vm.execCtx.ActiveException
 				vm.execCtx.ClearException()
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -8124,7 +8357,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			key := stack[sp-1]
 			obj := stack[sp-2]
 			sp -= 2
-			vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+			vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 			vm.execCtx.SP = sp
 			vm.delSubscrSafe(obj, key)
 			if &stack[0] != &vm.execCtx.Stack[0] {
@@ -8142,7 +8375,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			if vm.execCtx.HasException() {
 				exc := vm.execCtx.ActiveException
 				vm.execCtx.ClearException()
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -8196,7 +8429,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			sp -= count
 			resVal := val.NewDictVal(8)
 			resDict := resVal.AsDict()
-			vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+			vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 			vm.execCtx.SP = sp
 			for i := range count {
 				d := stack[sp+i]
@@ -8212,7 +8445,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			if vm.execCtx.HasException() {
 				exc := vm.execCtx.ActiveException
 				vm.execCtx.ClearException()
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}
@@ -8248,7 +8481,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					added = len(iterVal.AsSet().Items())
 					lst.Items = append(lst.Items, iterVal.AsSet().Items()...)
 				default:
-					vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+					vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 					vm.execCtx.SP = sp
 					items := vm.extractIterableSafe(iterVal)
 					if stackIsVM && &stack[0] != &vm.stack[0] {
@@ -8258,7 +8491,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					if vm.execCtx.HasException() {
 						exc := vm.execCtx.ActiveException
 						vm.execCtx.ClearException()
-						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 							if activeGen != nil {
 								activeGen.State = val.GenClosed
 							}
@@ -8312,7 +8545,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				callable = stack[sp-2]
 				sp -= 2
 			}
-			vm.syncActiveFrame(frameIdx, curCO, code, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+			vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 			vm.execCtx.SP = sp
 			res := vm.callFunctionExSafe(callable, argsVal, kwDictVal, hasKW)
 			if &stack[0] != &vm.execCtx.Stack[0] {
@@ -8330,7 +8563,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			if vm.execCtx.HasException() {
 				exc := vm.execCtx.ActiveException
 				vm.execCtx.ClearException()
-				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &code, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
+				if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curIC, &curMethodPIC, &curAttrPIC) {
 					if activeGen != nil {
 						activeGen.State = val.GenClosed
 					}

@@ -68,7 +68,8 @@ type ExceptionEntry struct {
 // It is never heap-allocated per function call.
 type CallFrame struct {
 	co          *CodeObject
-	code        []uint32
+	codePtr     unsafe.Pointer
+	codeLen     int
 	consts      []val.Value
 	ip          int
 	baseOffset  int
@@ -137,6 +138,13 @@ type CodeObject struct {
 	LineSpans        []LineSpanEntry
 	Hotness          int32
 	IsTier2Optimized int32
+	// SimplePositionalOnly reports that every parameter of the code object is
+	// a required positional-only parameter: no keyword-only parameter, no
+	// *args and no **kwargs. PositionalParamCount is then the exact number of
+	// positional parameters, which lets a call skip argument binding.
+	SimplePositionalOnly bool
+	PositionalParamCount int
+	ParamShapeComputed   bool
 	// stream publishes the instruction slice the VM executes. It is created
 	// together with the code object, before the object is shared between VMs.
 	stream *codeStream
@@ -310,6 +318,7 @@ func (co *CodeObject) Init() *CodeObject {
 	co.Header.Type = val.CodeType
 	co.initID()
 	co.InitCellParamIndices()
+	co.computeParamShape()
 	co.initStream()
 	return co
 }
@@ -350,6 +359,7 @@ func NewCodeVal(co *CodeObject) val.Value {
 		return val.NoneVal()
 	}
 	co.initID()
+	co.computeParamShape()
 	// The publication stream has to exist before the code object is shared
 	// between VMs, and a code object becomes shareable as soon as it is
 	// turned into a value.
@@ -404,12 +414,23 @@ type VM struct {
 	context            *val.PyContext
 	bindingOSPath      bool
 	coroFreeList       []*val.PyCoroutine
-	rootCO             CodeObject
-	rootCache          VMCodeCache
-	limits             RuntimeLimits
-	limitsActive       bool
-	stepCount          uint64
-	eventLoop          *EventLoop
+	// mvFree holds the memory views that are no longer referenced and can
+	// be handed out again by the next slice.
+	mvFree       []*val.PyMemoryView
+	rootCO       CodeObject
+	rootCache    VMCodeCache
+	limits       RuntimeLimits
+	limitsActive bool
+	stepCount    uint64
+	eventLoop    *EventLoop
+}
+
+// loadWindow returns the instruction window of co as a base pointer and a
+// length. The window is refreshed when the Tier-2 optimizer published a newer
+// instruction stream for the code object.
+func (vm *VM) loadWindow(co *CodeObject, cache *VMCodeCache) (unsafe.Pointer, int) {
+	stream := refreshCode(co, cache)
+	return unsafe.Pointer(unsafe.SliceData(stream)), len(stream)
 }
 
 func (vm *VM) getCodeCache(co *CodeObject) *VMCodeCache {
@@ -848,4 +869,28 @@ func (vm *VM) Intern(s string) val.Value {
 // InternValue canonicalizes a string Value in the canonical intern pool.
 func (vm *VM) InternValue(v val.Value) val.Value {
 	return val.InternValue(v)
+}
+
+// computeParamShape derives the precomputed argument-binding shape of the
+// code object.
+func (co *CodeObject) computeParamShape() {
+	if co == nil || co.ParamShapeComputed {
+		return
+	}
+	co.ParamShapeComputed = true
+	co.PositionalParamCount = 0
+	simple := co.KWOnlyArgCount == 0 && co.Flags&(CO_VARARGS|CO_VARKEYWORDS) == 0
+	for _, pn := range co.ParamNames {
+		if !pn.IsAnyString() {
+			simple = false
+			break
+		}
+		name := pn.AsString()
+		if len(name) > 0 && name[0] == '*' {
+			simple = false
+			break
+		}
+		co.PositionalParamCount++
+	}
+	co.SimplePositionalOnly = simple && co.PositionalParamCount == len(co.ParamNames)
 }

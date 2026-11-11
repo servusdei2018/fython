@@ -122,6 +122,27 @@ type PyByteArray struct {
 	mu     sync.RWMutex
 }
 
+// The access modes of the mmap module.
+const (
+	ACCESS_READ    = 1
+	ACCESS_WRITE   = 2
+	ACCESS_COPY    = 3
+	ACCESS_DEFAULT = 0
+)
+
+// The mapping flags of the mmap module.
+const (
+	MAP_SHARED  = 1
+	MAP_PRIVATE = 2
+)
+
+// The protection flags of the mmap module.
+const (
+	PROT_READ  = 1
+	PROT_WRITE = 2
+	PROT_EXEC  = 4
+)
+
 // PyMemoryView represents a zero-copy buffer view on the heap (PEP 3118).
 // Header MUST be at offset 0.
 type PyMemoryView struct {
@@ -144,6 +165,15 @@ type PyMemoryView struct {
 	Shape      []int
 	Strides    []int
 	Suboffsets []int
+	// Escaped marks a view that is reachable from somewhere other than the
+	// single frame slot that owns it. Such a view is never recycled, because
+	// the slot that owns it may be overwritten while the other reference is
+	// still live.
+	Escaped bool
+	// OwnerKey identifies the frame slot that owns the view: the frame index
+	// shifted left by 16 bits plus the slot index. Zero means that no slot
+	// owns the view yet.
+	OwnerKey uint32
 }
 
 // Dims returns the extent of every dimension of the view.
@@ -1516,7 +1546,7 @@ func (d *PyDict) resize(minEntries int) {
 // the mutex is skipped entirely: the hot loop reads globals and builtins on
 // every instruction and the read/write lock shows up in profiles there.
 func (d *PyDict) lockDict() bool {
-	if !d.Shared && !isMultiThreaded.Load() {
+	if !d.Shared && !MultiThreadedFlag.Load() {
 		return false
 	}
 	d.mu.Lock()
@@ -1525,7 +1555,7 @@ func (d *PyDict) lockDict() bool {
 
 // rlockDict takes the dictionary read lock when the runtime is multi-threaded.
 func (d *PyDict) rlockDict() bool {
-	if !d.Shared && !isMultiThreaded.Load() {
+	if !d.Shared && !MultiThreadedFlag.Load() {
 		return false
 	}
 	d.mu.RLock()

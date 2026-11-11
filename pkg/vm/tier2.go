@@ -2,6 +2,7 @@ package vm
 
 import (
 	"sync/atomic"
+	"unsafe"
 
 	"github.com/servusdei2018/fython/pkg/val"
 )
@@ -607,19 +608,19 @@ func fusionCopy(co *CodeObject, code []uint32) []uint32 {
 // is patched and then published atomically, so no VM ever observes a
 // half-rewritten instruction window. The patched stream is returned so that
 // the calling VM can continue with it.
-func deoptimizeAt(co *CodeObject, ip int, patch func([]uint32)) []uint32 {
+func deoptimizeAt(co *CodeObject, ip int, patch func([]uint32)) (unsafe.Pointer, int) {
 	if co == nil {
-		return nil
+		return nil, 0
 	}
 	base := co.Active()
 	if len(base) == 0 {
-		return base
+		return unsafe.Pointer(unsafe.SliceData(base)), 0
 	}
 	newCode := make([]uint32, len(base))
 	copy(newCode, base)
 	patch(newCode)
 	co.publish(newCode)
-	return newCode
+	return unsafe.Pointer(unsafe.SliceData(newCode)), len(newCode)
 }
 
 // DeoptimizeFastAdd restores the original 4 instructions for OP_FAST_ADD_INT_LOCAL_TO_LOCAL.

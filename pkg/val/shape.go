@@ -7,18 +7,23 @@ import (
 )
 
 var (
-	nextShapeID     atomic.Uint32
-	isMultiThreaded atomic.Bool
+	nextShapeID atomic.Uint32
 )
 
 // SetMultiThreaded enables or disables multi-threaded mode for instance slots.
 func SetMultiThreaded(v bool) {
-	isMultiThreaded.Store(v)
+	MultiThreadedFlag.Store(v)
 }
+
+// MultiThreadedFlag holds the state of the multi-threaded flag. It is
+// exported so that the dispatch loop of the interpreter can read it without
+// a function call: the interpreter runs in a function that is too large for
+// the Go inliner, so every call there is a real call.
+var MultiThreadedFlag atomic.Bool
 
 // IsMultiThreaded reports whether concurrent execution is active.
 func IsMultiThreaded() bool {
-	return isMultiThreaded.Load()
+	return MultiThreadedFlag.Load()
 }
 
 func allocShapeID() uint32 {
@@ -247,7 +252,7 @@ func (v Value) AsInstance() *PyInstance {
 
 // GetSlot returns the Value at slot index idx.
 func (inst *PyInstance) GetSlot(idx int) (Value, bool) {
-	if !isMultiThreaded.Load() {
+	if !MultiThreadedFlag.Load() {
 		if uint(idx) < uint(len(inst.Slots)) {
 			return inst.Slots[idx], true
 		}
@@ -265,7 +270,7 @@ func (inst *PyInstance) GetSlot(idx int) (Value, bool) {
 
 // SetSlot sets the Value at slot index idx.
 func (inst *PyInstance) SetSlot(idx int, val Value) bool {
-	if !isMultiThreaded.Load() {
+	if !MultiThreadedFlag.Load() {
 		if uint(idx) < uint(len(inst.Slots)) {
 			inst.Slots[idx] = val
 			return true
@@ -284,7 +289,7 @@ func (inst *PyInstance) SetSlot(idx int, val Value) bool {
 
 // GetAttr looks up an attribute by name on the instance using its Shape.
 func (inst *PyInstance) GetAttr(name Value) (Value, bool) {
-	if !isMultiThreaded.Load() {
+	if !MultiThreadedFlag.Load() {
 		idx, ok := inst.Shape.Lookup(name)
 		if !ok || uint(idx) >= uint(len(inst.Slots)) {
 			return NoneVal(), false
@@ -311,7 +316,7 @@ func (inst *PyInstance) GetAttr(name Value) (Value, bool) {
 
 // DeleteAttr removes an attribute from the instance by marking its slot unbound.
 func (inst *PyInstance) DeleteAttr(name Value) bool {
-	if !isMultiThreaded.Load() {
+	if !MultiThreadedFlag.Load() {
 		idx, ok := inst.Shape.Lookup(name)
 		if !ok || uint(idx) >= uint(len(inst.Slots)) || inst.Slots[idx].IsUnbound() {
 			return false

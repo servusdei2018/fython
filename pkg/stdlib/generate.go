@@ -257,6 +257,14 @@ var upstream = []string{
 	"ctypes/macholib/dyld.py",
 	"ctypes/macholib/dylib.py",
 	"ctypes/macholib/framework.py",
+	// POSIX terminals, statistics and the zoneinfo database
+	"statistics.py",
+	"tty.py",
+	"pty.py",
+	"zoneinfo/__init__.py",
+	"zoneinfo/_common.py",
+	"zoneinfo/_tzpath.py",
+	"zoneinfo/_zoneinfo.py",
 }
 
 func main() {

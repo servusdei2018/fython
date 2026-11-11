@@ -117,9 +117,33 @@ func (e *Engine) createMathModule() val.Value {
 			return val.Float64Val(fn(toFloat(args[0]), toFloat(args[1])))
 		}))
 	}
+	registerUnary("cosh", math.Cosh)
+	registerUnary("sinh", math.Sinh)
+	registerUnary("tanh", math.Tanh)
 	registerBinary("hypot", math.Hypot)
+	// erfc is the complementary error function. The Go standard library has
+	// no counterpart, so it is evaluated with the standard rational
+	// approximation of Numerical Recipes.
+	registerUnary("erfc", mathErfc)
 	registerBinary("fmod", math.Mod)
 	registerBinary("remainder", math.Remainder)
+
+	// fsum sums the values with a compensated summation, so that the result
+	// is accurate even for a long series of inexact values.
+	mod.Dict.Set(val.InternString("fsum"), val.NewBuiltinFuncVal("fsum", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: fsum() takes at least one argument")
+		}
+		return val.Float64Val(mathFsum(ctx, args[0]))
+	}))
+
+	// sumprod sums the products of the values taken from the iterables.
+	mod.Dict.Set(val.InternString("sumprod"), val.NewBuiltinFuncVal("sumprod", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			panic("TypeError: sumprod() takes at least one argument")
+		}
+		return val.Float64Val(mathSumprod(ctx, args))
+	}))
 
 	// log(x[, base])
 	mod.Dict.Set(val.InternString("log"), val.NewBuiltinFuncVal("log", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -353,4 +377,137 @@ func (e *Engine) createMathModule() val.Value {
 	}))
 
 	return modVal
+}
+
+// mathErfc evaluates the complementary error function 1 - erf(x).
+func mathErfc(x float64) float64 {
+	if math.IsNaN(x) {
+		return math.NaN()
+	}
+	if x >= 0 {
+		return mathErfcPositive(x)
+	}
+	return 2 - mathErfcPositive(-x)
+}
+
+// mathErfcPositive evaluates the complementary error function for x >= 0.
+//
+// The complementary error function is the regularized upper incomplete gamma
+// function Q(1/2, x*x), which is evaluated with the series and continued
+// fraction representations of the incomplete gamma function.
+func mathErfcPositive(x float64) float64 {
+	if x == 0 {
+		return 1
+	}
+	return mathGammaQ(0.5, x*x)
+}
+
+// mathGammaQ evaluates the regularized upper incomplete gamma function.
+func mathGammaQ(a, x float64) float64 {
+	if x < a+1 {
+		return 1 - mathGammaPSeries(a, x)
+	}
+	return mathGammaQContinuedFraction(a, x)
+}
+
+// mathGammaPSeries evaluates the regularized lower incomplete gamma function
+// with its series representation.
+func mathGammaPSeries(a, x float64) float64 {
+	const eps = 3e-16
+	const itmax = 1000
+	ap := a
+	sum := 1.0 / a
+	del := sum
+	for range itmax {
+		ap++
+		del *= x / ap
+		sum += del
+		if math.Abs(del) < math.Abs(sum)*eps {
+			break
+		}
+	}
+	lgamma, _ := math.Lgamma(a)
+	return sum * math.Exp(-x+a*math.Log(x)-lgamma)
+}
+
+// mathGammaQContinuedFraction evaluates the regularized upper incomplete
+// gamma function with its continued fraction representation.
+func mathGammaQContinuedFraction(a, x float64) float64 {
+	const eps = 3e-16
+	const itmax = 1000
+	const tiny = 1e-300
+	b := x + 1 - a
+	c := 1 / tiny
+	d := 1 / b
+	h := d
+	for i := 1; i <= itmax; i++ {
+		an := -float64(i) * (float64(i) - a)
+		b += 2
+		d = an*d + b
+		if math.Abs(d) < tiny {
+			d = tiny
+		}
+		c = b + an/c
+		if math.Abs(c) < tiny {
+			c = tiny
+		}
+		d = 1 / d
+		del := d * c
+		h *= del
+		if math.Abs(del-1) < eps {
+			break
+		}
+	}
+	lgamma, _ := math.Lgamma(a)
+	return math.Exp(-x+a*math.Log(x)-lgamma) * h
+}
+
+// mathFsum sums the values of an iterable with a compensated summation.
+func mathFsum(ctx *val.ExecContext, v val.Value) float64 {
+	it := iterFor(ctx, v)
+	total := 0.0
+	comp := 0.0
+	for {
+		item, ok := it.Next()
+		if !ok {
+			break
+		}
+		x := toFloat(item)
+		y := x - comp
+		t := total + y
+		comp = (t - total) - y
+		total = t
+	}
+	return total
+}
+
+// mathSumprod sums the products of the values taken from the iterables.
+func mathSumprod(ctx *val.ExecContext, args []val.Value) float64 {
+	iterables := make([][]val.Value, 0, len(args))
+	length := -1
+	for _, a := range args {
+		it := iterFor(ctx, a)
+		items := make([]val.Value, 0, 8)
+		for {
+			item, ok := it.Next()
+			if !ok {
+				break
+			}
+			items = append(items, item)
+		}
+		if length >= 0 && len(items) != length {
+			panic("ValueError: sumprod() arguments have different lengths")
+		}
+		length = len(items)
+		iterables = append(iterables, items)
+	}
+	total := 0.0
+	for i := range length {
+		product := 1.0
+		for _, items := range iterables {
+			product *= toFloat(items[i])
+		}
+		total += product
+	}
+	return total
 }
