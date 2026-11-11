@@ -152,6 +152,10 @@ type CodeObject struct {
 	// it to notice that a newer stream is available without having to load
 	// the stream itself on every frame switch.
 	StreamGen int32
+	// primary publishes the code cache of the VM that most recently executed
+	// this code object. The interpreter loop reads it to reach the cache
+	// without calling getCodeCache.
+	primary unsafe.Pointer
 }
 
 // Active returns the instruction slice that must be executed for this code
@@ -261,6 +265,9 @@ func (co *CodeObject) LineTableBytes() []byte {
 
 // VMCodeCache holds per-CodeObject inline caches isolated per VM instance (0 races, 0 cross-call thrashing).
 type VMCodeCache struct {
+	// owner is the VM this cache belongs to. It lets a code object publish
+	// its cache without carrying a VM pointer of its own.
+	owner     *VM
 	ic        []ICSlot
 	methodPIC [][4]val.MethodPICEntry
 	attrPIC   [][4]AttrPICEntry
@@ -391,7 +398,7 @@ type VM struct {
 	engine             *Engine
 	stack              []val.Value
 	frames             []CallFrame
-	codeCaches         []VMCodeCache
+	codeCaches         []*VMCodeCache
 	builtinRange       val.Value
 	builtinLen         val.Value
 	builtinOpen        val.Value
@@ -457,11 +464,15 @@ func (vm *VM) getCodeCache(co *CodeObject) *VMCodeCache {
 	}
 	id := int(co.initID())
 	if id >= len(vm.codeCaches) {
-		newCaches := make([]VMCodeCache, id+16)
+		newCaches := make([]*VMCodeCache, id+16)
 		copy(newCaches, vm.codeCaches)
 		vm.codeCaches = newCaches
 	}
-	cache := &vm.codeCaches[id]
+	cache := vm.codeCaches[id]
+	if cache == nil {
+		cache = &VMCodeCache{owner: vm}
+		vm.codeCaches[id] = cache
+	}
 	if cache.active == nil {
 		// The generation is read before the stream, so a publication that
 		// happens in between is picked up by the next refresh.
@@ -473,6 +484,9 @@ func (vm *VM) getCodeCache(co *CodeObject) *VMCodeCache {
 		cache.methodPIC = make([][4]val.MethodPICEntry, len(co.Code))
 		cache.attrPIC = make([][4]AttrPICEntry, len(co.Code))
 	}
+	// Publish the cache so that the interpreter loop can reach it without a
+	// call into getCodeCache.
+	atomic.StorePointer(&co.primary, unsafe.Pointer(cache))
 	return cache
 }
 

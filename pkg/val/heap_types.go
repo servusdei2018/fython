@@ -594,6 +594,205 @@ func NewByteArrayVal(data []byte) Value {
 	return Value{num: 0, ptr: &obj.Header}
 }
 
+// LargeBufferThreshold is the size from which a byte buffer is mapped outside
+// the Go heap instead of being allocated on it.
+//
+// A buffer that large would otherwise grow the Go heap past the garbage
+// collector's trigger and make the collector mark the whole heap while the
+// program is still starting up. Mapping it keeps the collector out of the
+// picture entirely.
+const LargeBufferThreshold = 1 << 20
+
+// NewMappedBytesVal constructs a heap-allocated KindBytes Value whose payload
+// is a freshly allocated buffer of n bytes.
+//
+// Buffers of at least LargeBufferThreshold bytes are mapped outside the Go
+// heap and returned to the operating system when the object is collected.
+func NewMappedBytesVal(n int) Value {
+	buf, m := allocZeroedBytes(n)
+	obj := &PyBytes{
+		Header: ObjectHeader{
+			Kind: KindBytes,
+			Type: BytesType,
+		},
+		Data: buf,
+	}
+	attachByteMapping(obj, m)
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+// NewMappedByteArrayVal constructs a heap-allocated KindByteArray Value whose
+// payload is a freshly allocated buffer of n bytes.
+//
+// Buffers of at least LargeBufferThreshold bytes are mapped outside the Go
+// heap and returned to the operating system when the object is collected.
+func NewMappedByteArrayVal(n int) Value {
+	buf, m := allocZeroedBytes(n)
+	obj := &PyByteArray{
+		Header: ObjectHeader{
+			Kind: KindByteArray,
+			Type: ByteArrayType,
+		},
+		Data: buf,
+	}
+	attachByteMapping(obj, m)
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+// NewMappedBytesFromBytes constructs a bytes object holding a copy of src.
+//
+// Large copies are mapped outside the Go heap.
+func NewMappedBytesFromBytes(src []byte) Value {
+	buf, m := allocZeroedBytes(len(src))
+	copy(buf, src)
+	obj := &PyBytes{
+		Header: ObjectHeader{
+			Kind: KindBytes,
+			Type: BytesType,
+		},
+		Data: buf,
+	}
+	attachByteMapping(obj, m)
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+// NewMappedByteArrayFromBytes constructs a bytearray holding a copy of src.
+//
+// Large copies are mapped outside the Go heap.
+func NewMappedByteArrayFromBytes(src []byte) Value {
+	buf, m := allocZeroedBytes(len(src))
+	copy(buf, src)
+	obj := &PyByteArray{
+		Header: ObjectHeader{
+			Kind: KindByteArray,
+			Type: ByteArrayType,
+		},
+		Data: buf,
+	}
+	attachByteMapping(obj, m)
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+// NewMappedRepeatedBytes constructs a bytes object holding n copies of data.
+//
+// Large results are mapped outside the Go heap.
+func NewMappedRepeatedBytes(data []byte, n int) Value {
+	buf, m := allocZeroedBytes(len(data) * n)
+	for i := range n {
+		copy(buf[i*len(data):(i+1)*len(data)], data)
+	}
+	obj := &PyBytes{
+		Header: ObjectHeader{
+			Kind: KindBytes,
+			Type: BytesType,
+		},
+		Data: buf,
+	}
+	attachByteMapping(obj, m)
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+// NewMappedRepeatedByteArray constructs a bytearray holding n copies of data.
+//
+// Large results are mapped outside the Go heap.
+func NewMappedRepeatedByteArray(data []byte, n int) Value {
+	buf, m := allocZeroedBytes(len(data) * n)
+	for i := range n {
+		copy(buf[i*len(data):(i+1)*len(data)], data)
+	}
+	obj := &PyByteArray{
+		Header: ObjectHeader{
+			Kind: KindByteArray,
+			Type: ByteArrayType,
+		},
+		Data: buf,
+	}
+	attachByteMapping(obj, m)
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+// NewMappedBytesFromString constructs a bytes object holding the bytes of s.
+//
+// Large results are mapped outside the Go heap.
+func NewMappedBytesFromString(s string) Value {
+	buf, m := allocZeroedBytes(len(s))
+	copy(buf, s)
+	obj := &PyBytes{
+		Header: ObjectHeader{
+			Kind: KindBytes,
+			Type: BytesType,
+		},
+		Data: buf,
+	}
+	attachByteMapping(obj, m)
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+// NewMappedByteArrayFromString constructs a bytearray holding the bytes of s.
+//
+// Large results are mapped outside the Go heap.
+func NewMappedByteArrayFromString(s string) Value {
+	buf, m := allocZeroedBytes(len(s))
+	copy(buf, s)
+	obj := &PyByteArray{
+		Header: ObjectHeader{
+			Kind: KindByteArray,
+			Type: ByteArrayType,
+		},
+		Data: buf,
+	}
+	attachByteMapping(obj, m)
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+// NewBytesFromConcat constructs a bytes object holding a followed by b.
+//
+// Large results are mapped outside the Go heap.
+func NewBytesFromConcat(a, b []byte) Value {
+	if len(a)+len(b) >= LargeBufferThreshold {
+		buf, m := allocZeroedBytes(len(a) + len(b))
+		copy(buf, a)
+		copy(buf[len(a):], b)
+		obj := &PyBytes{
+			Header: ObjectHeader{
+				Kind: KindBytes,
+				Type: BytesType,
+			},
+			Data: buf,
+		}
+		attachByteMapping(obj, m)
+		return Value{num: 0, ptr: &obj.Header}
+	}
+	res := make([]byte, len(a)+len(b))
+	copy(res, a)
+	copy(res[len(a):], b)
+	return NewBytesVal(res)
+}
+
+// NewByteArrayFromConcat constructs a bytearray holding a followed by b.
+//
+// Large results are mapped outside the Go heap.
+func NewByteArrayFromConcat(a, b []byte) Value {
+	if len(a)+len(b) >= LargeBufferThreshold {
+		buf, m := allocZeroedBytes(len(a) + len(b))
+		copy(buf, a)
+		copy(buf[len(a):], b)
+		obj := &PyByteArray{
+			Header: ObjectHeader{
+				Kind: KindByteArray,
+				Type: ByteArrayType,
+			},
+			Data: buf,
+		}
+		attachByteMapping(obj, m)
+		return Value{num: 0, ptr: &obj.Header}
+	}
+	res := make([]byte, len(a)+len(b))
+	copy(res, a)
+	copy(res[len(a):], b)
+	return NewByteArrayVal(res)
+}
+
 // NewMemoryViewVal constructs a zero-copy PyMemoryView Value referencing the buffer of target.
 func NewMemoryViewVal(target Value) Value {
 	var view PyBuffer

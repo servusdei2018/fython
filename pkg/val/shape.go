@@ -245,6 +245,16 @@ func NewInstanceOfType(cls *PyType) Value {
 	return Value{num: 0, ptr: &obj.Header}
 }
 
+// AsInstanceChecked returns the instance of v, or nil when v does not hold an
+// instance. It is kept small (inlinable cost <= 20) so that the interpreter
+// loop can use it without growing its own body.
+func (v Value) AsInstanceChecked() *PyInstance {
+	if v.ptr == nil || v.ptr.Kind != KindInstance {
+		return nil
+	}
+	return (*PyInstance)(unsafe.Pointer(v.ptr))
+}
+
 // AsInstance performs a zero-cost offset-0 downcast from Value to *PyInstance.
 func (v Value) AsInstance() *PyInstance {
 	return (*PyInstance)(unsafe.Pointer(v.ptr))

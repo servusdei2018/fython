@@ -1443,13 +1443,18 @@ func bytesMpSubscript(ctx *ExecContext, a, idxVal Value) Value {
 			// Zero-copy sub-slice view! 0 bytes copied!
 			return NewBytesVal(data[start:stop:stop])
 		}
-		res := make([]byte, sliceLen)
+		buf, m := allocZeroedBytes(sliceLen)
 		cur := start
 		for i := range sliceLen {
-			res[i] = data[cur]
+			buf[i] = data[cur]
 			cur += step
 		}
-		return NewBytesVal(res)
+		obj := &PyBytes{
+			Header: ObjectHeader{Kind: KindBytes, Type: BytesType},
+			Data:   buf,
+		}
+		attachByteMapping(obj, m)
+		return Value{num: 0, ptr: &obj.Header}
 	}
 	idx := int(idxVal.AsInt64())
 	if idx < 0 {
@@ -1528,11 +1533,23 @@ func byteArrayMpAssSubscript(ctx *ExecContext, a, idxVal, val Value) Value {
 			panic("TypeError: can't set slice with non-bytes-like object")
 		}
 		if step == 1 {
-			newData := make([]byte, 0, len(ba.Data)-sliceLen+len(rhsBytes))
+			capacity := len(ba.Data) - sliceLen + len(rhsBytes)
+			var newData []byte
+			var mapping *byteMapping
+			if capacity >= LargeBufferThreshold {
+				buf, m := allocZeroedBytes(capacity)
+				newData = buf[:0]
+				mapping = m
+			} else {
+				newData = make([]byte, 0, capacity)
+			}
 			newData = append(newData, ba.Data[:start]...)
 			newData = append(newData, rhsBytes...)
 			newData = append(newData, ba.Data[stop:]...)
 			ba.Data = newData
+			if mapping != nil {
+				attachByteMapping(ba, mapping)
+			}
 			return NoneVal()
 		}
 		if len(rhsBytes) != sliceLen {
@@ -1869,10 +1886,7 @@ func bytesNbAdd(ctx *ExecContext, a, b Value) Value {
 	default:
 		panic("TypeError: can't concat " + b.Type().Name + " to bytes")
 	}
-	res := make([]byte, len(aBytes)+len(bBytes))
-	copy(res, aBytes)
-	copy(res[len(aBytes):], bBytes)
-	return NewBytesVal(res)
+	return NewBytesFromConcat(aBytes, bBytes)
 }
 
 func byteArrayNbAdd(ctx *ExecContext, a, b Value) Value {
@@ -1903,10 +1917,7 @@ func byteArrayNbAdd(ctx *ExecContext, a, b Value) Value {
 		panic("TypeError: can't concat " + b.Type().Name + " to bytearray")
 	}
 
-	res := make([]byte, len(aBytes)+len(bBytes))
-	copy(res, aBytes)
-	copy(res[len(aBytes):], bBytes)
-	return NewByteArrayVal(res)
+	return NewByteArrayFromConcat(aBytes, bBytes)
 }
 
 func bytesNbMul(ctx *ExecContext, a, b Value) Value {
@@ -1925,7 +1936,7 @@ func bytesNbMul(ctx *ExecContext, a, b Value) Value {
 	if n <= 0 {
 		return NewBytesVal([]byte{})
 	}
-	return NewBytesVal(bytes.Repeat(data, int(n)))
+	return NewMappedRepeatedBytes(data, int(n))
 }
 
 func byteArrayNbMul(ctx *ExecContext, a, b Value) Value {
@@ -1950,7 +1961,7 @@ func byteArrayNbMul(ctx *ExecContext, a, b Value) Value {
 	if n <= 0 {
 		return NewByteArrayVal([]byte{})
 	}
-	return NewByteArrayVal(bytes.Repeat(data, int(n)))
+	return NewMappedRepeatedByteArray(data, int(n))
 }
 
 func bytesTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
@@ -1963,49 +1974,55 @@ func bytesTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value
 		if n < 0 {
 			panic("ValueError: negative count")
 		}
-		return NewBytesVal(make([]byte, n))
+		return NewMappedBytesVal(n)
 	}
 	if arg.IsBytes() {
 		return arg
 	}
 	if arg.IsByteArray() {
 		ba := arg.AsByteArray()
-		res := make([]byte, len(ba.Data))
-		copy(res, ba.Data)
-		return NewBytesVal(res)
+		return NewMappedBytesFromBytes(ba.Data)
 	}
 	if arg.IsMemoryView() {
 		mv := arg.AsMemoryView()
-		res := make([]byte, len(mv.Buf))
-		copy(res, mv.Buf)
-		return NewBytesVal(res)
+		return NewMappedBytesFromBytes(mv.Buf)
 	}
 	if arg.IsAnyString() {
-		return NewBytesVal([]byte(arg.AsString()))
+		return NewMappedBytesFromString(arg.AsString())
 	}
 	if arg.IsList() {
 		items := arg.AsList().Items
-		res := make([]byte, len(items))
+		buf, m := allocZeroedBytes(len(items))
 		for i, it := range items {
 			b := it.AsInt64()
 			if b < 0 || b > 255 {
 				panic("ValueError: bytes must be in range(0, 256)")
 			}
-			res[i] = byte(b)
+			buf[i] = byte(b)
 		}
-		return NewBytesVal(res)
+		obj := &PyBytes{
+			Header: ObjectHeader{Kind: KindBytes, Type: BytesType},
+			Data:   buf,
+		}
+		attachByteMapping(obj, m)
+		return Value{num: 0, ptr: &obj.Header}
 	}
 	if arg.IsTuple() {
 		items := arg.AsTuple().Items
-		res := make([]byte, len(items))
+		buf, m := allocZeroedBytes(len(items))
 		for i, it := range items {
 			b := it.AsInt64()
 			if b < 0 || b > 255 {
 				panic("ValueError: bytes must be in range(0, 256)")
 			}
-			res[i] = byte(b)
+			buf[i] = byte(b)
 		}
-		return NewBytesVal(res)
+		obj := &PyBytes{
+			Header: ObjectHeader{Kind: KindBytes, Type: BytesType},
+			Data:   buf,
+		}
+		attachByteMapping(obj, m)
+		return Value{num: 0, ptr: &obj.Header}
 	}
 	// Fall back to general iterable extraction (generators, ranges, etc.)
 	if ctx != nil {
@@ -2033,51 +2050,55 @@ func byteArrayTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []V
 		if n < 0 {
 			panic("ValueError: negative count")
 		}
-		return NewByteArrayVal(make([]byte, n))
+		return NewMappedByteArrayVal(n)
 	}
 	if arg.IsBytes() {
-		res := make([]byte, len(arg.AsBytes().Data))
-		copy(res, arg.AsBytes().Data)
-		return NewByteArrayVal(res)
+		return NewMappedByteArrayFromBytes(arg.AsBytes().Data)
 	}
 	if arg.IsByteArray() {
 		ba := arg.AsByteArray()
-		res := make([]byte, len(ba.Data))
-		copy(res, ba.Data)
-		return NewByteArrayVal(res)
+		return NewMappedByteArrayFromBytes(ba.Data)
 	}
 	if arg.IsMemoryView() {
 		mv := arg.AsMemoryView()
-		res := make([]byte, len(mv.Buf))
-		copy(res, mv.Buf)
-		return NewByteArrayVal(res)
+		return NewMappedByteArrayFromBytes(mv.Buf)
 	}
 	if arg.IsAnyString() {
-		return NewByteArrayVal([]byte(arg.AsString()))
+		return NewMappedByteArrayFromString(arg.AsString())
 	}
 	if arg.IsList() {
 		items := arg.AsList().Items
-		res := make([]byte, len(items))
+		buf, m := allocZeroedBytes(len(items))
 		for i, it := range items {
 			b := it.AsInt64()
 			if b < 0 || b > 255 {
 				panic("ValueError: byte must be in range(0, 256)")
 			}
-			res[i] = byte(b)
+			buf[i] = byte(b)
 		}
-		return NewByteArrayVal(res)
+		obj := &PyByteArray{
+			Header: ObjectHeader{Kind: KindByteArray, Type: ByteArrayType},
+			Data:   buf,
+		}
+		attachByteMapping(obj, m)
+		return Value{num: 0, ptr: &obj.Header}
 	}
 	if arg.IsTuple() {
 		items := arg.AsTuple().Items
-		res := make([]byte, len(items))
+		buf, m := allocZeroedBytes(len(items))
 		for i, it := range items {
 			b := it.AsInt64()
 			if b < 0 || b > 255 {
 				panic("ValueError: byte must be in range(0, 256)")
 			}
-			res[i] = byte(b)
+			buf[i] = byte(b)
 		}
-		return NewByteArrayVal(res)
+		obj := &PyByteArray{
+			Header: ObjectHeader{Kind: KindByteArray, Type: ByteArrayType},
+			Data:   buf,
+		}
+		attachByteMapping(obj, m)
+		return Value{num: 0, ptr: &obj.Header}
 	}
 	// Fall back to general iterable extraction (generators, ranges, etc.)
 	if ctx != nil {

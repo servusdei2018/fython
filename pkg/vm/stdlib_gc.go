@@ -24,6 +24,9 @@ func (e *Engine) createGCModule() val.Value {
 					vmInstance.rootCache.ic[i] = ICSlot{}
 				}
 				for _, cache := range vmInstance.codeCaches {
+					if cache == nil {
+						continue
+					}
 					for i := range cache.ic {
 						cache.ic[i] = ICSlot{}
 					}
