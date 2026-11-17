@@ -99,7 +99,8 @@ func RegisterFunc0Err[R any](name string, fn func() (R, error)) val.Value {
 	return val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		r, err := fn()
 		if err != nil {
-			panic(val.NewRuntimeError(err.Error()))
+			ctx.Raise(val.NewRuntimeError(err.Error()))
+			return val.NoneVal()
 		}
 		return Box[R](r)
 	})
@@ -109,7 +110,8 @@ func RegisterFunc0Err[R any](name string, fn func() (R, error)) val.Value {
 func RegisterFunc1[A, R any](name string, fn func(A) R) val.Value {
 	return val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic(fmt.Sprintf("TypeError: %s() missing 1 required positional argument", name))
+			ctx.Raise(val.NewException(val.TypeErrorType, name+"() missing 1 required positional argument"))
+			return val.NoneVal()
 		}
 		a := Unbox[A](args[0])
 		return Box[R](fn(a))
@@ -120,12 +122,14 @@ func RegisterFunc1[A, R any](name string, fn func(A) R) val.Value {
 func RegisterFunc1Err[A, R any](name string, fn func(A) (R, error)) val.Value {
 	return val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic(fmt.Sprintf("TypeError: %s() missing 1 required positional argument", name))
+			ctx.Raise(val.NewException(val.TypeErrorType, name+"() missing 1 required positional argument"))
+			return val.NoneVal()
 		}
 		a := Unbox[A](args[0])
 		r, err := fn(a)
 		if err != nil {
-			panic(val.NewRuntimeError(err.Error()))
+			ctx.Raise(val.NewRuntimeError(err.Error()))
+			return val.NoneVal()
 		}
 		return Box[R](r)
 	})
@@ -135,7 +139,8 @@ func RegisterFunc1Err[A, R any](name string, fn func(A) (R, error)) val.Value {
 func RegisterFunc2[A, B, R any](name string, fn func(A, B) R) val.Value {
 	return val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic(fmt.Sprintf("TypeError: %s() missing required positional arguments", name))
+			ctx.Raise(val.NewException(val.TypeErrorType, name+"() missing required positional arguments"))
+			return val.NoneVal()
 		}
 		a := Unbox[A](args[0])
 		b := Unbox[B](args[1])
@@ -147,13 +152,15 @@ func RegisterFunc2[A, B, R any](name string, fn func(A, B) R) val.Value {
 func RegisterFunc2Err[A, B, R any](name string, fn func(A, B) (R, error)) val.Value {
 	return val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic(fmt.Sprintf("TypeError: %s() missing required positional arguments", name))
+			ctx.Raise(val.NewException(val.TypeErrorType, name+"() missing required positional arguments"))
+			return val.NoneVal()
 		}
 		a := Unbox[A](args[0])
 		b := Unbox[B](args[1])
 		r, err := fn(a, b)
 		if err != nil {
-			panic(val.NewRuntimeError(err.Error()))
+			ctx.Raise(val.NewRuntimeError(err.Error()))
+			return val.NoneVal()
 		}
 		return Box[R](r)
 	})
@@ -163,7 +170,8 @@ func RegisterFunc2Err[A, B, R any](name string, fn func(A, B) (R, error)) val.Va
 func RegisterFunc3[A, B, C, R any](name string, fn func(A, B, C) R) val.Value {
 	return val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 3 {
-			panic(fmt.Sprintf("TypeError: %s() missing required positional arguments", name))
+			ctx.Raise(val.NewException(val.TypeErrorType, name+"() missing required positional arguments"))
+			return val.NoneVal()
 		}
 		a := Unbox[A](args[0])
 		b := Unbox[B](args[1])
@@ -176,14 +184,16 @@ func RegisterFunc3[A, B, C, R any](name string, fn func(A, B, C) R) val.Value {
 func RegisterFunc3Err[A, B, C, R any](name string, fn func(A, B, C) (R, error)) val.Value {
 	return val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 3 {
-			panic(fmt.Sprintf("TypeError: %s() missing required positional arguments", name))
+			ctx.Raise(val.NewException(val.TypeErrorType, name+"() missing required positional arguments"))
+			return val.NoneVal()
 		}
 		a := Unbox[A](args[0])
 		b := Unbox[B](args[1])
 		c := Unbox[C](args[2])
 		r, err := fn(a, b, c)
 		if err != nil {
-			panic(val.NewRuntimeError(err.Error()))
+			ctx.Raise(val.NewRuntimeError(err.Error()))
+			return val.NoneVal()
 		}
 		return Box[R](r)
 	})
@@ -193,7 +203,8 @@ func RegisterFunc3Err[A, B, C, R any](name string, fn func(A, B, C) (R, error)) 
 func RegisterFunc4[A, B, C, D, R any](name string, fn func(A, B, C, D) R) val.Value {
 	return val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 4 {
-			panic(fmt.Sprintf("TypeError: %s() missing required positional arguments", name))
+			ctx.Raise(val.NewException(val.TypeErrorType, name+"() missing required positional arguments"))
+			return val.NoneVal()
 		}
 		a := Unbox[A](args[0])
 		b := Unbox[B](args[1])
@@ -207,7 +218,8 @@ func RegisterFunc4[A, B, C, D, R any](name string, fn func(A, B, C, D) R) val.Va
 func RegisterFunc4Err[A, B, C, D, R any](name string, fn func(A, B, C, D) (R, error)) val.Value {
 	return val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 4 {
-			panic(fmt.Sprintf("TypeError: %s() missing required positional arguments", name))
+			ctx.Raise(val.NewException(val.TypeErrorType, name+"() missing required positional arguments"))
+			return val.NoneVal()
 		}
 		a := Unbox[A](args[0])
 		b := Unbox[B](args[1])
@@ -215,7 +227,8 @@ func RegisterFunc4Err[A, B, C, D, R any](name string, fn func(A, B, C, D) (R, er
 		d := Unbox[D](args[3])
 		r, err := fn(a, b, c, d)
 		if err != nil {
-			panic(val.NewRuntimeError(err.Error()))
+			ctx.Raise(val.NewRuntimeError(err.Error()))
+			return val.NoneVal()
 		}
 		return Box[R](r)
 	})
@@ -226,7 +239,8 @@ func RegisterRawFunc(name string, fn func(ctx *val.ExecContext, args []val.Value
 	return val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		r, err := fn(ctx, args)
 		if err != nil {
-			panic(val.NewRuntimeError(err.Error()))
+			ctx.Raise(val.NewRuntimeError(err.Error()))
+			return val.NoneVal()
 		}
 		return r
 	})
@@ -257,7 +271,8 @@ func BindAction0(name string, fn func()) val.Value {
 func BindAction1[A any](name string, fn func(A)) val.Value {
 	return val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic(fmt.Sprintf("TypeError: %s() missing 1 required positional argument", name))
+			ctx.Raise(val.NewException(val.TypeErrorType, name+"() missing 1 required positional argument"))
+			return val.NoneVal()
 		}
 		fn(Unbox[A](args[0]))
 		return val.NoneVal()
@@ -266,7 +281,8 @@ func BindAction1[A any](name string, fn func(A)) val.Value {
 func BindAction2[A, B any](name string, fn func(A, B)) val.Value {
 	return val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic(fmt.Sprintf("TypeError: %s() missing required positional arguments", name))
+			ctx.Raise(val.NewException(val.TypeErrorType, name+"() missing required positional arguments"))
+			return val.NoneVal()
 		}
 		fn(Unbox[A](args[0]), Unbox[B](args[1]))
 		return val.NoneVal()
@@ -275,7 +291,8 @@ func BindAction2[A, B any](name string, fn func(A, B)) val.Value {
 func BindAction3[A, B, C any](name string, fn func(A, B, C)) val.Value {
 	return val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 3 {
-			panic(fmt.Sprintf("TypeError: %s() missing required positional arguments", name))
+			ctx.Raise(val.NewException(val.TypeErrorType, name+"() missing required positional arguments"))
+			return val.NoneVal()
 		}
 		fn(Unbox[A](args[0]), Unbox[B](args[1]), Unbox[C](args[2]))
 		return val.NoneVal()
@@ -284,7 +301,8 @@ func BindAction3[A, B, C any](name string, fn func(A, B, C)) val.Value {
 func BindAction4[A, B, C, D any](name string, fn func(A, B, C, D)) val.Value {
 	return val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 4 {
-			panic(fmt.Sprintf("TypeError: %s() missing required positional arguments", name))
+			ctx.Raise(val.NewException(val.TypeErrorType, name+"() missing required positional arguments"))
+			return val.NoneVal()
 		}
 		fn(Unbox[A](args[0]), Unbox[B](args[1]), Unbox[C](args[2]), Unbox[D](args[3]))
 		return val.NoneVal()
@@ -316,7 +334,8 @@ func initStructFieldType() {
 	structFieldType.Slots.TpDescrSet = func(ctx *val.ExecContext, descr, obj, v val.Value) {
 		sfd := (*StructFieldDescriptor)(unsafe.Pointer(descr.HeaderPtr()))
 		if sfd.SetFunc == nil {
-			panic(fmt.Sprintf("AttributeError: attribute '%s' is read-only", sfd.Name))
+			ctx.Raise(val.NewException(val.AttributeErrorType, fmt.Sprintf("attribute '%s' is read-only", sfd.Name)))
+			return
 		}
 		sfd.SetFunc(ctx, obj, v)
 	}
@@ -515,12 +534,14 @@ func (sb *StructBinding[T]) RegisterMethod0R(name string, fn any) {
 	case func(*T) (val.Value, error):
 		sb.pyType.Dict.Set(val.InternString(name), val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: method requires 'self' argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "method requires 'self' argument"))
+				return val.NoneVal()
 			}
 			self := unboxSelf[T](args[0])
 			r, err := f(self)
 			if err != nil {
-				panic(val.NewRuntimeError(err.Error()))
+				ctx.Raise(val.NewRuntimeError(err.Error()))
+				return val.NoneVal()
 			}
 			return r
 		}))
@@ -538,7 +559,8 @@ func (sb *StructBinding[T]) RegisterMethod1R(name string, fn any) {
 	case func(*T, float64) float64:
 		sb.pyType.Dict.Set(val.InternString(name), val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: method requires 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "method requires 1 argument"))
+				return val.NoneVal()
 			}
 			self := unboxSelf[T](args[0])
 			return val.Float64Val(f(self, args[1].AsFloat64()))
@@ -546,7 +568,8 @@ func (sb *StructBinding[T]) RegisterMethod1R(name string, fn any) {
 	case func(*T, int64) int64:
 		sb.pyType.Dict.Set(val.InternString(name), val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: method requires 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "method requires 1 argument"))
+				return val.NoneVal()
 			}
 			self := unboxSelf[T](args[0])
 			return val.Int64Val(f(self, args[1].AsInt64()))
@@ -554,7 +577,8 @@ func (sb *StructBinding[T]) RegisterMethod1R(name string, fn any) {
 	case func(*T, string) string:
 		sb.pyType.Dict.Set(val.InternString(name), val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: method requires 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "method requires 1 argument"))
+				return val.NoneVal()
 			}
 			self := unboxSelf[T](args[0])
 			return val.NewStringVal(f(self, args[1].AsString()))
@@ -569,7 +593,8 @@ func (sb *StructBinding[T]) RegisterMethod2R(name string, fn any) {
 	case func(*T, float64, float64) float64:
 		sb.pyType.Dict.Set(val.InternString(name), val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 3 {
-				panic("TypeError: method requires 2 arguments")
+				ctx.Raise(val.NewException(val.TypeErrorType, "method requires 2 arguments"))
+				return val.NoneVal()
 			}
 			self := unboxSelf[T](args[0])
 			return val.Float64Val(f(self, args[1].AsFloat64(), args[2].AsFloat64()))
@@ -577,7 +602,8 @@ func (sb *StructBinding[T]) RegisterMethod2R(name string, fn any) {
 	case func(*T, int64, int64) int64:
 		sb.pyType.Dict.Set(val.InternString(name), val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 3 {
-				panic("TypeError: method requires 2 arguments")
+				ctx.Raise(val.NewException(val.TypeErrorType, "method requires 2 arguments"))
+				return val.NoneVal()
 			}
 			self := unboxSelf[T](args[0])
 			return val.Int64Val(f(self, args[1].AsInt64(), args[2].AsInt64()))
@@ -591,7 +617,8 @@ func (sb *StructBinding[T]) RegisterMethod2R(name string, fn any) {
 func BindMethod0[T any](sb *StructBinding[T], name string, fn func(*T)) {
 	sb.pyType.Dict.Set(val.InternString(name), val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: method requires 'self' argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "method requires 'self' argument"))
+			return val.NoneVal()
 		}
 		self := unboxSelf[T](args[0])
 		fn(self)
@@ -603,7 +630,8 @@ func BindMethod0[T any](sb *StructBinding[T], name string, fn func(*T)) {
 func BindMethod0R[T, R any](sb *StructBinding[T], name string, fn func(*T) R) {
 	sb.pyType.Dict.Set(val.InternString(name), val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: method requires 'self' argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "method requires 'self' argument"))
+			return val.NoneVal()
 		}
 		self := unboxSelf[T](args[0])
 		r := fn(self)
@@ -615,7 +643,8 @@ func BindMethod0R[T, R any](sb *StructBinding[T], name string, fn func(*T) R) {
 func BindMethod1[T, A any](sb *StructBinding[T], name string, fn func(*T, A)) {
 	sb.pyType.Dict.Set(val.InternString(name), val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: method requires 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "method requires 1 argument"))
+			return val.NoneVal()
 		}
 		self := unboxSelf[T](args[0])
 		a := Unbox[A](args[1])
@@ -628,7 +657,8 @@ func BindMethod1[T, A any](sb *StructBinding[T], name string, fn func(*T, A)) {
 func BindMethod1R[T, A, R any](sb *StructBinding[T], name string, fn func(*T, A) R) {
 	sb.pyType.Dict.Set(val.InternString(name), val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: method requires 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "method requires 1 argument"))
+			return val.NoneVal()
 		}
 		self := unboxSelf[T](args[0])
 		a := Unbox[A](args[1])
@@ -641,7 +671,8 @@ func BindMethod1R[T, A, R any](sb *StructBinding[T], name string, fn func(*T, A)
 func BindMethod2R[T, A, B, R any](sb *StructBinding[T], name string, fn func(*T, A, B) R) {
 	sb.pyType.Dict.Set(val.InternString(name), val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 3 {
-			panic("TypeError: method requires 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "method requires 2 arguments"))
+			return val.NoneVal()
 		}
 		self := unboxSelf[T](args[0])
 		a := Unbox[A](args[1])

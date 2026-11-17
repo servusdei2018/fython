@@ -24,7 +24,8 @@ func (e *Engine) createTimeModule() val.Value {
 
 	mod.Dict.Set(val.InternString("sleep"), val.NewBuiltinFuncVal("sleep", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: sleep() takes exactly one argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "sleep() takes exactly one argument"))
+			return val.NoneVal()
 		}
 		secs := toFloat(args[0])
 		if secs > 0 {

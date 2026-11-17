@@ -22,7 +22,8 @@ func getSeqLen(ctx *val.ExecContext, a val.Value) int {
 
 func parseBisectArgs(ctx *val.ExecContext, args []val.Value, kwnames []val.Value, name string) (a, x val.Value, lo, hi int, keyFn val.Value) {
 	if len(args) < 2 {
-		panic("TypeError: " + name + "() takes at least 2 arguments")
+		ctx.Raise(val.NewException(val.TypeErrorType, name+"() takes at least 2 arguments"))
+		return val.NoneVal(), val.NoneVal(), 0, 0, val.NoneVal()
 	}
 	a = args[0]
 	x = args[1]
@@ -59,7 +60,8 @@ func parseBisectArgs(ctx *val.ExecContext, args []val.Value, kwnames []val.Value
 	}
 
 	if lo < 0 {
-		panic(val.NewException(val.ValueErrorType, "lo must be non-negative"))
+		ctx.Raise(val.NewException(val.ValueErrorType, "lo must be non-negative"))
+		return val.NoneVal(), val.NoneVal(), 0, 0, val.NoneVal()
 	}
 	if hi < 0 {
 		hi = 0
@@ -167,7 +169,7 @@ func seqInsert(ctx *val.ExecContext, a, x val.Value, idx int) {
 		ctx.Invoke2(insertFn, val.Int64Val(int64(idx)), x)
 		return
 	}
-	panic("TypeError: sequence does not support insert")
+	ctx.Raise(val.NewException(val.TypeErrorType, "sequence does not support insert"))
 }
 
 func (e *Engine) createBisectModule() val.Value {

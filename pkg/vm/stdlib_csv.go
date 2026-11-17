@@ -199,7 +199,8 @@ func initCsvTypes() {
 		csvDialectType.Dict.Set(val.InternString("__module__"), val.InternString("_csv"))
 		csvDialectType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: Dialect requires an argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "Dialect requires an argument"))
+				return val.NoneVal()
 			}
 			_, err := resolveDialect(args[0], nil)
 			if err != nil {
@@ -215,7 +216,8 @@ func initCsvTypes() {
 
 		csvWriterType.Dict.Set(val.InternString("writerow"), val.NewBuiltinFuncVal("writerow", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: writerow() missing row argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "writerow() missing row argument"))
+				return val.NoneVal()
 			}
 			pw := (*pyCsvWriter)(val.AsPointer(args[0]))
 			row := args[1]
@@ -279,7 +281,8 @@ func initCsvTypes() {
 
 		csvWriterType.Dict.Set(val.InternString("writerows"), val.NewBuiltinFuncVal("writerows", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: writerows() missing rows argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "writerows() missing rows argument"))
+				return val.NoneVal()
 			}
 			rowIter := val.ExtractIterableItems(ctx, args[1])
 			wrow := val.ObjectGetAttr(ctx, args[0], val.InternString("writerow"))

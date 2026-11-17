@@ -754,33 +754,24 @@ func (vm *VM) ImportFrom(modVal val.Value, symbolName string, callerGlobals *val
 		}
 	}
 
-	// 2. Try val.GetAttrCtx (descriptor / custom ModuleType / PEP 562 __getattr__)
-	var attrVal val.Value
-	var attrErr any
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				attrErr = r
-			}
-		}()
-		attrVal = val.GetAttrCtx(&vm.execCtx, modVal, interned)
-	}()
-	if attrErr == nil && !attrVal.IsNone() && !attrVal.IsUnbound() {
+	// 2. Try val.LookupAttrOptional (descriptor / custom ModuleType / PEP 562 __getattr__)
+	if attrVal, ok := val.LookupAttrOptional(&vm.execCtx, modVal, interned); ok {
 		return attrVal, nil
+	}
+	if vm.execCtx.HasException() {
+		exc := vm.execCtx.ActiveException
+		vm.execCtx.ClearException()
+		return val.NoneVal(), fmt.Errorf("%s", val.PyStr(&vm.execCtx, exc))
 	}
 
 	// 3. Fall back to loading submodule mod.Name + "." + symbolName
 	modName := ""
 	if modVal.IsModule() {
 		modName = modVal.AsModule().Name
+	} else if nameVal, ok := val.LookupAttrOptional(&vm.execCtx, modVal, val.InternString("__name__")); ok && nameVal.IsAnyString() {
+		modName = nameVal.AsString()
 	} else {
-		func() {
-			defer func() { _ = recover() }()
-			nameVal := val.GetAttrCtx(&vm.execCtx, modVal, val.InternString("__name__"))
-			if nameVal.IsAnyString() {
-				modName = nameVal.AsString()
-			}
-		}()
+		vm.execCtx.ClearException()
 	}
 
 	if modName != "" {

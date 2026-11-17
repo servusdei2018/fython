@@ -53,7 +53,8 @@ func initRandomClassType() {
 
 		t.Dict.Set(val.InternString("seed"), val.NewBuiltinFuncVal("seed", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: descriptor 'seed' of 'Random' object needs an argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "descriptor 'seed' of 'Random' object needs an argument"))
+				return val.NoneVal()
 			}
 			r := (*pyRandom)(val.AsPointer(args[0]))
 			var s1, s2 uint64
@@ -83,7 +84,8 @@ func initRandomClassType() {
 
 		t.Dict.Set(val.InternString("random"), val.NewBuiltinFuncVal("random", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: descriptor 'random' of 'Random' object needs an argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "descriptor 'random' of 'Random' object needs an argument"))
+				return val.NoneVal()
 			}
 			r := (*pyRandom)(val.AsPointer(args[0]))
 			r.mu.Lock()
@@ -98,11 +100,13 @@ func initRandomClassType() {
 
 		t.Dict.Set(val.InternString("getrandbits"), val.NewBuiltinFuncVal("getrandbits", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 || !args[1].IsInt64() {
-				panic("TypeError: getrandbits() takes an integer argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "getrandbits() takes an integer argument"))
+				return val.NoneVal()
 			}
 			k := int(args[1].AsInt64())
 			if k <= 0 {
-				panic("ValueError: number of bits must be greater than zero")
+				ctx.Raise(val.NewException(val.ValueErrorType, "number of bits must be greater than zero"))
+				return val.NoneVal()
 			}
 			r := (*pyRandom)(val.AsPointer(args[0]))
 			r.mu.Lock()

@@ -57,7 +57,8 @@ func (e *Engine) createStatisticsExtModule() val.Value {
 	mod := modVal.AsModule()
 	mod.Dict.Set(val.InternString("_normal_dist_inv_cdf"), val.NewBuiltinFuncVal("_normal_dist_inv_cdf", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 3 {
-			panic("TypeError: _normal_dist_inv_cdf() takes 3 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "_normal_dist_inv_cdf() takes 3 arguments"))
+			return val.NoneVal()
 		}
 		return val.Float64Val(normalDistInvCDF(toFloat(args[0]), toFloat(args[1]), toFloat(args[2])))
 	}))

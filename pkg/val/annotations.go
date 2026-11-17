@@ -18,11 +18,16 @@ func callAnnotate(ctx *ExecContext, fn Value) Value {
 	switch {
 	case ctx != nil:
 		res = ctx.Invoke1(fn, Int64Val(1))
+		if ctx.HasException() {
+			return NoneVal()
+		}
 	default:
-		panic("RuntimeError: cannot evaluate annotations without an execution context")
+		ctx.Raise(NewException(RuntimeErrorType, "cannot evaluate annotations without an execution context"))
+		return NoneVal()
 	}
 	if !res.IsDict() {
-		panic("TypeError: __annotate__ returned non-dict of type '" + res.Type().Name + "'")
+		ctx.Raise(NewException(TypeErrorType, "__annotate__ returned non-dict of type '"+res.Type().Name+"'"))
+		return NoneVal()
 	}
 	return res
 }
@@ -56,7 +61,8 @@ func TypeAnnotations(ctx *ExecContext, cls *PyType) Value {
 		if ann, ok := cls.Dict.Get(keyAnnotations); ok && ann.IsDict() {
 			return ann
 		}
-		panic("val: AttributeError: type object '" + cls.Name + "' has no attribute '__annotations__'")
+		ctx.Raise(NewException(AttributeErrorType, "type object '"+cls.Name+"' has no attribute '__annotations__'"))
+		return NoneVal()
 	}
 	if ann, ok := cls.Dict.Get(keyAnnotations); ok {
 		return ann
@@ -67,6 +73,9 @@ func TypeAnnotations(ctx *ExecContext, cls *PyType) Value {
 	var ann Value
 	if fn, ok := annotateFuncOf(cls.Dict, false); ok {
 		ann = callAnnotate(ctx, fn)
+		if ctx != nil && ctx.HasException() {
+			return NoneVal()
+		}
 	} else {
 		ann = NewDictVal(4)
 	}
@@ -102,10 +111,10 @@ func TypeDelAnnotations(cls *PyType) {
 	cls.Dict.Delete(keyAnnotate)
 }
 
-// TypeAnnotate implements `type.__annotate__`.
-func TypeAnnotate(cls *PyType) Value {
+// TypeAnnotateCtx implements `type.__annotate__` with an execution context.
+func TypeAnnotateCtx(ctx *ExecContext, cls *PyType) Value {
 	if (cls.Flags & FlagHeapType) == 0 {
-		panic("val: AttributeError: type object '" + cls.Name + "' has no attribute '__annotate__'")
+		return RaiseAttributeError(ctx, cls, keyAnnotate)
 	}
 	if fn, ok := annotateFuncOf(cls.Dict, false); ok {
 		return fn
@@ -113,13 +122,20 @@ func TypeAnnotate(cls *PyType) Value {
 	return NoneVal()
 }
 
-// TypeSetAnnotate implements `cls.__annotate__ = value`.
-func TypeSetAnnotate(cls *PyType, value Value) {
+// TypeAnnotate implements `type.__annotate__`.
+func TypeAnnotate(cls *PyType) Value {
+	return TypeAnnotateCtx(nil, cls)
+}
+
+// TypeSetAnnotateCtx implements `cls.__annotate__ = value` with an execution context.
+func TypeSetAnnotateCtx(ctx *ExecContext, cls *PyType, value Value) {
 	if (cls.Flags & FlagHeapType) == 0 {
-		panic("TypeError: cannot set '__annotate__' attribute of immutable type '" + cls.Name + "'")
+		RaiseTypeError(ctx, "cannot set '__annotate__' attribute of immutable type '"+cls.Name+"'")
+		return
 	}
 	if !value.IsNone() && !isCallableValue(value) {
-		panic("TypeError: __annotate__ must be callable or None")
+		RaiseTypeError(ctx, "__annotate__ must be callable or None")
+		return
 	}
 	if cls.Dict == nil {
 		cls.Dict = NewDictVal(8).AsDict()
@@ -131,6 +147,11 @@ func TypeSetAnnotate(cls *PyType, value Value) {
 	}
 }
 
+// TypeSetAnnotate implements `cls.__annotate__ = value`.
+func TypeSetAnnotate(cls *PyType, value Value) {
+	TypeSetAnnotateCtx(nil, cls, value)
+}
+
 // ModuleAnnotations implements `module.__annotations__`: the cached entry in the
 // module dict, else the result of the module's __annotate__(1), else `{}`.
 func ModuleAnnotations(ctx *ExecContext, mod *PyModule) Value {
@@ -140,6 +161,9 @@ func ModuleAnnotations(ctx *ExecContext, mod *PyModule) Value {
 	var ann Value
 	if fn, ok := annotateFuncOf(mod.Dict, true); ok {
 		ann = callAnnotate(ctx, fn)
+		if ctx != nil && ctx.HasException() {
+			return NoneVal()
+		}
 	} else {
 		ann = NewDictVal(4)
 	}

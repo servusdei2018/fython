@@ -172,12 +172,14 @@ func initHashlibTypes() {
 
 		hashType.Dict.Set(val.InternString("update"), val.NewBuiltinFuncVal("update", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: update() takes 1 positional argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "update() takes 1 positional argument"))
+				return val.NoneVal()
 			}
 			ph := (*pyHash)(val.AsPointer(args[0]))
 			data, ok := getBytesFromValue(args[1])
 			if !ok {
-				panic("TypeError: a bytes-like object is required")
+				ctx.Raise(val.NewException(val.TypeErrorType, "a bytes-like object is required"))
+				return val.NoneVal()
 			}
 			dataCopy := make([]byte, len(data))
 			copy(dataCopy, data)
@@ -188,7 +190,8 @@ func initHashlibTypes() {
 
 		hashType.Dict.Set(val.InternString("digest"), val.NewBuiltinFuncVal("digest", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: digest() takes no arguments")
+				ctx.Raise(val.NewException(val.TypeErrorType, "digest() takes no arguments"))
+				return val.NoneVal()
 			}
 			ph := (*pyHash)(val.AsPointer(args[0]))
 			res := ph.h.Sum(nil)
@@ -197,7 +200,8 @@ func initHashlibTypes() {
 
 		hashType.Dict.Set(val.InternString("hexdigest"), val.NewBuiltinFuncVal("hexdigest", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: hexdigest() takes no arguments")
+				ctx.Raise(val.NewException(val.TypeErrorType, "hexdigest() takes no arguments"))
+				return val.NoneVal()
 			}
 			ph := (*pyHash)(val.AsPointer(args[0]))
 			res := ph.h.Sum(nil)
@@ -206,7 +210,8 @@ func initHashlibTypes() {
 
 		hashType.Dict.Set(val.InternString("copy"), val.NewBuiltinFuncVal("copy", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: copy() takes no arguments")
+				ctx.Raise(val.NewException(val.TypeErrorType, "copy() takes no arguments"))
+				return val.NoneVal()
 			}
 			ph := (*pyHash)(val.AsPointer(args[0]))
 			clone := newHashVal(ph.info, nil)
@@ -239,12 +244,14 @@ func initHashlibTypes() {
 
 		hmacType.Dict.Set(val.InternString("update"), val.NewBuiltinFuncVal("update", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: update() takes 1 positional argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "update() takes 1 positional argument"))
+				return val.NoneVal()
 			}
 			ph := (*pyHmac)(val.AsPointer(args[0]))
 			data, ok := getBytesFromValue(args[1])
 			if !ok {
-				panic("TypeError: a bytes-like object is required")
+				ctx.Raise(val.NewException(val.TypeErrorType, "a bytes-like object is required"))
+				return val.NoneVal()
 			}
 			dataCopy := make([]byte, len(data))
 			copy(dataCopy, data)
@@ -255,7 +262,8 @@ func initHashlibTypes() {
 
 		hmacType.Dict.Set(val.InternString("digest"), val.NewBuiltinFuncVal("digest", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: digest() takes no arguments")
+				ctx.Raise(val.NewException(val.TypeErrorType, "digest() takes no arguments"))
+				return val.NoneVal()
 			}
 			ph := (*pyHmac)(val.AsPointer(args[0]))
 			res := ph.h.Sum(nil)
@@ -264,7 +272,8 @@ func initHashlibTypes() {
 
 		hmacType.Dict.Set(val.InternString("hexdigest"), val.NewBuiltinFuncVal("hexdigest", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: hexdigest() takes no arguments")
+				ctx.Raise(val.NewException(val.TypeErrorType, "hexdigest() takes no arguments"))
+				return val.NoneVal()
 			}
 			ph := (*pyHmac)(val.AsPointer(args[0]))
 			res := ph.h.Sum(nil)
@@ -273,7 +282,8 @@ func initHashlibTypes() {
 
 		hmacType.Dict.Set(val.InternString("copy"), val.NewBuiltinFuncVal("copy", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: copy() takes no arguments")
+				ctx.Raise(val.NewException(val.TypeErrorType, "copy() takes no arguments"))
+				return val.NoneVal()
 			}
 			ph := (*pyHmac)(val.AsPointer(args[0]))
 			clone := newHmacVal(ph.info, ph.key, nil)
@@ -319,7 +329,8 @@ func (e *Engine) createHashlibModule() val.Value {
 			if len(pa) > 0 && !pa[0].IsNone() {
 				b, ok := getBytesFromValue(pa[0])
 				if !ok {
-					panic("TypeError: a bytes-like object is required")
+					ctx.Raise(val.NewException(val.TypeErrorType, "a bytes-like object is required"))
+					return val.NoneVal()
 				}
 				data = b
 			}
@@ -335,21 +346,25 @@ func (e *Engine) createHashlibModule() val.Value {
 	set("new", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		pa := posArgs(args, kwnames)
 		if len(pa) < 1 {
-			panic("TypeError: new() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "new() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		if !pa[0].IsAnyString() {
-			panic("TypeError: new() argument 'name' must be str, not " + pa[0].Type().Name)
+			ctx.Raise(val.NewException(val.TypeErrorType, "new() argument 'name' must be str, not"+pa[0].Type().Name))
+			return val.NoneVal()
 		}
 		norm := normalizeHashName(pa[0].AsString())
 		info, ok := supportedHashAlgorithms[norm]
 		if !ok {
-			panic("ValueError: unsupported hash algorithm " + pa[0].AsString())
+			ctx.Raise(val.NewException(val.ValueErrorType, "unsupported hash algorithm"+pa[0].AsString()))
+			return val.NoneVal()
 		}
 		var data []byte
 		if len(pa) > 1 && !pa[1].IsNone() {
 			b, ok := getBytesFromValue(pa[1])
 			if !ok {
-				panic("TypeError: a bytes-like object is required")
+				ctx.Raise(val.NewException(val.TypeErrorType, "a bytes-like object is required"))
+				return val.NoneVal()
 			}
 			data = b
 		}
@@ -360,7 +375,8 @@ func (e *Engine) createHashlibModule() val.Value {
 	set("compare_digest", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		pa := posArgs(args, kwnames)
 		if len(pa) < 2 {
-			panic("TypeError: compare_digest() takes exactly 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "compare_digest() takes exactly 2 arguments"))
+			return val.NoneVal()
 		}
 		a, b := pa[0], pa[1]
 		if a.IsAnyString() && b.IsAnyString() {
@@ -372,22 +388,26 @@ func (e *Engine) createHashlibModule() val.Value {
 		if aOk && bOk {
 			return val.BoolVal(subtle.ConstantTimeCompare(ba, bb) == 1)
 		}
-		panic(fmt.Sprintf("TypeError: unsupported operand types(s) or combination of types for compare_digest(): '%s' and '%s'", a.Type().Name, b.Type().Name))
+		ctx.Raise(val.NewException(val.TypeErrorType, fmt.Sprintf("unsupported operand types(s) or combination of types for compare_digest(): '%s' and '%s'", a.Type().Name, b.Type().Name)))
+		return val.NoneVal()
 	})
 
 	// hmac_digest(key, msg, digest)
 	set("hmac_digest", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		pa := posArgs(args, kwnames)
 		if len(pa) < 3 {
-			panic("TypeError: hmac_digest() takes exactly 3 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "hmac_digest() takes exactly 3 arguments"))
+			return val.NoneVal()
 		}
 		key, ok := getBytesFromValue(pa[0])
 		if !ok {
-			panic("TypeError: key must be bytes-like")
+			ctx.Raise(val.NewException(val.TypeErrorType, "key must be bytes-like"))
+			return val.NoneVal()
 		}
 		msg, ok := getBytesFromValue(pa[1])
 		if !ok {
-			panic("TypeError: msg must be bytes-like")
+			ctx.Raise(val.NewException(val.TypeErrorType, "msg must be bytes-like"))
+			return val.NoneVal()
 		}
 		var algName string
 		switch {
@@ -414,17 +434,20 @@ func (e *Engine) createHashlibModule() val.Value {
 	set("hmac_new", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		pa := posArgs(args, kwnames)
 		if len(pa) < 1 {
-			panic("TypeError: hmac_new() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "hmac_new() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		key, ok := getBytesFromValue(pa[0])
 		if !ok {
-			panic("TypeError: key must be bytes-like")
+			ctx.Raise(val.NewException(val.TypeErrorType, "key must be bytes-like"))
+			return val.NoneVal()
 		}
 		var msg []byte
 		if len(pa) > 1 && !pa[1].IsNone() {
 			b, ok := getBytesFromValue(pa[1])
 			if !ok {
-				panic("TypeError: msg must be bytes-like")
+				ctx.Raise(val.NewException(val.TypeErrorType, "msg must be bytes-like"))
+				return val.NoneVal()
 			}
 			msg = b
 		}
@@ -457,47 +480,58 @@ func (e *Engine) createHashlibModule() val.Value {
 	set("pbkdf2_hmac", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		pa := posArgs(args, kwnames)
 		if len(pa) < 4 {
-			panic("TypeError: pbkdf2_hmac() takes at least 4 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "pbkdf2_hmac() takes at least 4 arguments"))
+			return val.NoneVal()
 		}
 		if !pa[0].IsAnyString() {
-			panic("TypeError: hash_name must be a string")
+			ctx.Raise(val.NewException(val.TypeErrorType, "hash_name must be a string"))
+			return val.NoneVal()
 		}
 		norm := normalizeHashName(pa[0].AsString())
 		info, ok := supportedHashAlgorithms[norm]
 		if !ok {
-			panic("ValueError: unsupported hash algorithm " + pa[0].AsString())
+			ctx.Raise(val.NewException(val.ValueErrorType, "unsupported hash algorithm"+pa[0].AsString()))
+			return val.NoneVal()
 		}
 		password, ok := getBytesFromValue(pa[1])
 		if !ok {
-			panic("TypeError: password must be bytes-like")
+			ctx.Raise(val.NewException(val.TypeErrorType, "password must be bytes-like"))
+			return val.NoneVal()
 		}
 		salt, ok := getBytesFromValue(pa[2])
 		if !ok {
-			panic("TypeError: salt must be bytes-like")
+			ctx.Raise(val.NewException(val.TypeErrorType, "salt must be bytes-like"))
+			return val.NoneVal()
 		}
 		if !pa[3].IsInt64() {
-			panic("TypeError: iterations must be an integer")
+			ctx.Raise(val.NewException(val.TypeErrorType, "iterations must be an integer"))
+			return val.NoneVal()
 		}
 		iter := int(pa[3].AsInt64())
 		if iter < 1 {
-			panic("ValueError: iterations must be positive")
+			ctx.Raise(val.NewException(val.ValueErrorType, "iterations must be positive"))
+			return val.NoneVal()
 		}
 		dklen := info.digestSize
 		if len(pa) > 4 && !pa[4].IsNone() {
 			if !pa[4].IsInt64() {
-				panic("TypeError: dklen must be an integer")
+				ctx.Raise(val.NewException(val.TypeErrorType, "dklen must be an integer"))
+				return val.NoneVal()
 			}
 			dklen = int(pa[4].AsInt64())
 			if dklen < 1 {
-				panic("ValueError: dklen must be positive")
+				ctx.Raise(val.NewException(val.ValueErrorType, "dklen must be positive"))
+				return val.NoneVal()
 			}
 		} else if v, ok := kwArg(args, kwnames, "dklen"); ok && !v.IsNone() {
 			if !v.IsInt64() {
-				panic("TypeError: dklen must be an integer")
+				ctx.Raise(val.NewException(val.TypeErrorType, "dklen must be an integer"))
+				return val.NoneVal()
 			}
 			dklen = int(v.AsInt64())
 			if dklen < 1 {
-				panic("ValueError: dklen must be positive")
+				ctx.Raise(val.NewException(val.ValueErrorType, "dklen must be positive"))
+				return val.NoneVal()
 			}
 		}
 

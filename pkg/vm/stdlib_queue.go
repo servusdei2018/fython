@@ -51,7 +51,8 @@ func initQueueModule() {
 
 		simpleQueueDict.Set(val.InternString("put"), val.NewBuiltinFuncVal("SimpleQueue.put", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: put() takes at least 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "put() takes at least 1 argument"))
+				return val.NoneVal()
 			}
 			inst := args[0]
 			item := args[1]
@@ -67,7 +68,8 @@ func initQueueModule() {
 
 		simpleQueueDict.Set(val.InternString("put_nowait"), val.NewBuiltinFuncVal("SimpleQueue.put_nowait", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: put_nowait() takes at least 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "put_nowait() takes at least 1 argument"))
+				return val.NoneVal()
 			}
 			inst := args[0]
 			item := args[1]
@@ -83,7 +85,8 @@ func initQueueModule() {
 
 		simpleQueueDict.Set(val.InternString("get"), val.NewBuiltinFuncVal("SimpleQueue.get", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: get() takes at least 0 arguments")
+				ctx.Raise(val.NewException(val.TypeErrorType, "get() takes at least 0 arguments"))
+				return val.NoneVal()
 			}
 			inst := args[0]
 			st := getQueueState(inst.AsInstance())
@@ -126,7 +129,8 @@ func initQueueModule() {
 
 			if !block {
 				if len(st.items) == 0 {
-					panic(val.NewException(queueEmptyType, "Queue is empty"))
+					ctx.Raise(val.NewException(queueEmptyType, "Queue is empty"))
+					return val.NoneVal()
 				}
 				item := st.items[0]
 				st.items = st.items[1:]
@@ -147,7 +151,8 @@ func initQueueModule() {
 			for len(st.items) == 0 {
 				rem := time.Until(deadline)
 				if rem <= 0 {
-					panic(val.NewException(queueEmptyType, "Queue is empty"))
+					ctx.Raise(val.NewException(queueEmptyType, "Queue is empty"))
+					return val.NoneVal()
 				}
 				done := make(chan struct{})
 				go func() {
@@ -165,7 +170,8 @@ func initQueueModule() {
 				case <-time.After(rem):
 					st.mu.Lock()
 					if len(st.items) == 0 {
-						panic(val.NewException(queueEmptyType, "Queue is empty"))
+						ctx.Raise(val.NewException(queueEmptyType, "Queue is empty"))
+						return val.NoneVal()
 					}
 				}
 			}
@@ -177,7 +183,8 @@ func initQueueModule() {
 
 		simpleQueueDict.Set(val.InternString("get_nowait"), val.NewBuiltinFuncVal("SimpleQueue.get_nowait", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: get_nowait() takes at least 0 arguments")
+				ctx.Raise(val.NewException(val.TypeErrorType, "get_nowait() takes at least 0 arguments"))
+				return val.NoneVal()
 			}
 			inst := args[0]
 			st := getQueueState(inst.AsInstance())
@@ -186,7 +193,8 @@ func initQueueModule() {
 			defer st.mu.Unlock()
 
 			if len(st.items) == 0 {
-				panic(val.NewException(queueEmptyType, "Queue is empty"))
+				ctx.Raise(val.NewException(queueEmptyType, "Queue is empty"))
+				return val.NoneVal()
 			}
 			item := st.items[0]
 			st.items = st.items[1:]
@@ -195,7 +203,8 @@ func initQueueModule() {
 
 		simpleQueueDict.Set(val.InternString("empty"), val.NewBuiltinFuncVal("SimpleQueue.empty", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: empty() takes at least 0 arguments")
+				ctx.Raise(val.NewException(val.TypeErrorType, "empty() takes at least 0 arguments"))
+				return val.NoneVal()
 			}
 			st := getQueueState(args[0].AsInstance())
 			st.mu.Lock()
@@ -206,7 +215,8 @@ func initQueueModule() {
 
 		simpleQueueDict.Set(val.InternString("qsize"), val.NewBuiltinFuncVal("SimpleQueue.qsize", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: qsize() takes at least 0 arguments")
+				ctx.Raise(val.NewException(val.TypeErrorType, "qsize() takes at least 0 arguments"))
+				return val.NoneVal()
 			}
 			st := getQueueState(args[0].AsInstance())
 			st.mu.Lock()

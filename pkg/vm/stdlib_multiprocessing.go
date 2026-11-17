@@ -171,7 +171,8 @@ func initMultiprocessingTypes() {
 		p.mu.Lock()
 		if p.started {
 			p.mu.Unlock()
-			panic("RuntimeError: process has already started")
+			ctx.Raise(val.NewException(val.RuntimeErrorType, "process has already started"))
+			return val.NoneVal()
 		}
 		p.started = true
 		p.pid = int64(os.Getpid())
@@ -289,7 +290,8 @@ func initMultiprocessingTypes() {
 	mpQueueType.Dict.Set(val.InternString("put"), val.NewBuiltinFuncVal("Queue.put", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		q := (*pyQueue)(val.AsPointer(args[0]))
 		if len(args) < 2 {
-			panic("TypeError: put() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "put() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		q.ch <- args[1]
 		return val.NoneVal()
@@ -415,7 +417,8 @@ func initMultiprocessingTypes() {
 	mpPoolType.Dict.Set(val.InternString("map"), val.NewBuiltinFuncVal("Pool.map", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		// The pool itself is the first argument of the method.
 		if len(args) < 3 {
-			panic("TypeError: map() takes at least 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "map() takes at least 2 arguments"))
+			return val.NoneVal()
 		}
 		fn := args[1]
 		runVM, _ := ctx.VM.(*VM)
@@ -434,7 +437,8 @@ func initMultiprocessingTypes() {
 	mpPoolType.Dict.Set(val.InternString("apply"), val.NewBuiltinFuncVal("Pool.apply", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		// The pool itself is the first argument of the method.
 		if len(args) < 2 {
-			panic("TypeError: apply() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "apply() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		runVM, _ := ctx.VM.(*VM)
 		if runVM == nil {

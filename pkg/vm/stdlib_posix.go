@@ -76,7 +76,8 @@ func pathArg(ctx *val.ExecContext, v val.Value) string {
 			return string(r.AsBytes().Data)
 		}
 	}
-	panic("TypeError: expected str, bytes or os.PathLike object, not " + typeNameOf(v))
+	ctx.Raise(val.NewException(val.TypeErrorType, "expected str, bytes or os.PathLike object, not"+typeNameOf(v)))
+	return ""
 }
 
 // fspathOf calls v.__fspath__() when the type defines it.
@@ -92,7 +93,8 @@ func fspathOf(ctx *val.ExecContext, v val.Value) (val.Value, bool) {
 	m := val.GetAttrCtx(ctx, v, name)
 	r := ctx.Invoke0(m)
 	if !r.IsAnyString() && !r.IsBytes() {
-		panic("TypeError: expected " + typeNameOf(v) + ".__fspath__() to return str or bytes, not " + typeNameOf(r))
+		ctx.Raise(val.NewException(val.TypeErrorType, "expected"+typeNameOf(v)+".__fspath__() to return str or bytes, not "+typeNameOf(r)))
+		return val.NoneVal(), false
 	}
 	return r, true
 }
@@ -200,12 +202,14 @@ func newOSError(en syscall.Errno, filename string, hasFilename bool) val.Value {
 	return exc
 }
 
-// raiseOSError panics with the Python exception matching a Go error.
-func raiseOSError(err error, filename string) {
+// raiseOSError raises the Python exception matching a Go error via ctx.
+func raiseOSError(ctx *val.ExecContext, err error, filename string) val.Value {
 	if en := errnoOf(err); en != 0 {
-		panic(newOSError(en, filename, filename != ""))
+		ctx.Raise(newOSError(en, filename, filename != ""))
+		return val.NoneVal()
 	}
-	panic("OSError: " + err.Error())
+	ctx.Raise(val.NewException(val.OSErrorType, err.Error()))
+	return val.NoneVal()
 }
 
 // ---- stat_result ------------------------------------------------------
@@ -332,7 +336,7 @@ func initDirEntryType() {
 				info, err = os.Lstat(p)
 			}
 			if err != nil {
-				raiseOSError(err, p)
+				return raiseOSError(ctx, err, p)
 			}
 			return fileInfoToStat(info)
 		}))
@@ -341,7 +345,7 @@ func initDirEntryType() {
 			pVal, _ := inst.GetAttr(val.InternString("path"))
 			info, err := os.Lstat(pVal.AsString())
 			if err != nil {
-				raiseOSError(err, pVal.AsString())
+				return raiseOSError(ctx, err, pVal.AsString())
 			}
 			st := fileInfoToStat(info).AsInstance()
 			ino, _ := st.GetAttr(val.InternString("st_ino"))
@@ -392,7 +396,8 @@ func initScandirIterType() {
 					ctx.Raise(val.NewStopIteration(val.NoneVal()))
 					return val.NoneVal()
 				}
-				panic(val.NewStopIteration(val.NoneVal()))
+				ctx.Raise(val.NewStopIteration(val.NoneVal()))
+				return val.NoneVal()
 			}
 			idxVal, _ := inst.GetAttr(val.InternString("_idx"))
 			entriesVal, _ := inst.GetAttr(val.InternString("_entries"))
@@ -403,7 +408,8 @@ func initScandirIterType() {
 					ctx.Raise(val.NewStopIteration(val.NoneVal()))
 					return val.NoneVal()
 				}
-				panic(val.NewStopIteration(val.NoneVal()))
+				ctx.Raise(val.NewStopIteration(val.NoneVal()))
+				return val.NoneVal()
 			}
 			inst.SetAttr(val.InternString("_idx"), val.Int64Val(int64(idx+1)))
 			return entries[idx]
@@ -466,7 +472,8 @@ func initStatResultType() {
 				i += len(items)
 			}
 			if i < 0 || i >= len(items) {
-				panic("IndexError: tuple index out of range")
+				ctx.Raise(val.NewException(val.IndexErrorType, "tuple index out of range"))
+				return val.NoneVal()
 			}
 			return items[i]
 		}))
@@ -548,7 +555,8 @@ func initUnameResultType() {
 				i += len(items)
 			}
 			if i < 0 || i >= len(items) {
-				panic("IndexError: tuple index out of range")
+				ctx.Raise(val.NewException(val.IndexErrorType, "tuple index out of range"))
+				return val.NoneVal()
 			}
 			return items[i]
 		}))
@@ -675,7 +683,8 @@ func installPosix(osMod *val.PyModule) {
 	})
 	set("umask", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: umask() takes exactly one argument (0 given)")
+			ctx.Raise(val.NewException(val.TypeErrorType, "umask() takes exactly one argument (0 given)"))
+			return val.NoneVal()
 		}
 		mask := int(args[0].AsInt64())
 		oldMask := syscall.Umask(mask)
@@ -714,10 +723,12 @@ func installPosix(osMod *val.PyModule) {
 			if v, ok := kwArg(args, kwnames, "path"); ok {
 				p = v
 			} else {
-				panic("TypeError: fspath() missing required argument 'path' (pos 1)")
+				ctx.Raise(val.NewException(val.TypeErrorType, "fspath() missing required argument 'path' (pos 1)"))
+				return val.NoneVal()
 			}
 		default:
-			panic("TypeError: fspath() takes exactly one argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "fspath() takes exactly one argument"))
+			return val.NoneVal()
 		}
 		if p.IsAnyString() || p.IsBytes() {
 			return p
@@ -725,11 +736,13 @@ func installPosix(osMod *val.PyModule) {
 		if r, ok := fspathOf(ctx, p); ok {
 			return r
 		}
-		panic("TypeError: expected str, bytes or os.PathLike object, not " + typeNameOf(p))
+		ctx.Raise(val.NewException(val.TypeErrorType, "expected str, bytes or os.PathLike object, not"+typeNameOf(p)))
+		return val.NoneVal()
 	})
 	set("fsencode", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: fsencode() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "fsencode() takes 1 argument"))
+			return val.NoneVal()
 		}
 		if args[0].IsBytes() {
 			return args[0]
@@ -738,7 +751,8 @@ func installPosix(osMod *val.PyModule) {
 	})
 	set("fsdecode", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: fsdecode() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "fsdecode() takes 1 argument"))
+			return val.NoneVal()
 		}
 		if args[0].IsAnyString() {
 			return args[0]
@@ -769,7 +783,8 @@ func installPosix(osMod *val.PyModule) {
 
 	set("_get_exports_list", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: _get_exports_list() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "_get_exports_list() takes 1 argument"))
+			return val.NoneVal()
 		}
 		var names []val.Value
 		if args[0].IsModule() {
@@ -789,7 +804,7 @@ func installPosix(osMod *val.PyModule) {
 	set("pipe", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		r, w, err := os.Pipe()
 		if err != nil {
-			raiseOSError(err, "")
+			return raiseOSError(ctx, err, "")
 		}
 		rFd := int(r.Fd())
 		wFd := int(w.Fd())
@@ -802,7 +817,8 @@ func installPosix(osMod *val.PyModule) {
 
 	set("close", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: close() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "close() takes 1 argument"))
+			return val.NoneVal()
 		}
 		fd := int(args[0].AsInt64())
 		fdMutex.Lock()
@@ -819,7 +835,8 @@ func installPosix(osMod *val.PyModule) {
 
 	set("read", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: read() takes 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "read() takes 2 arguments"))
+			return val.NoneVal()
 		}
 		fd := int(args[0].AsInt64())
 		n := int(args[1].AsInt64())
@@ -842,7 +859,8 @@ func installPosix(osMod *val.PyModule) {
 
 	set("write", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: write() takes 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "write() takes 2 arguments"))
+			return val.NoneVal()
 		}
 		fd := int(args[0].AsInt64())
 		var data []byte
@@ -856,7 +874,8 @@ func installPosix(osMod *val.PyModule) {
 		case args[1].IsAnyString():
 			data = []byte(args[1].AsString())
 		default:
-			panic("TypeError: a bytes-like object is required")
+			ctx.Raise(val.NewException(val.TypeErrorType, "a bytes-like object is required"))
+			return val.NoneVal()
 		}
 		fdMutex.Lock()
 		f, ok := fdMap[fd]
@@ -869,52 +888,56 @@ func installPosix(osMod *val.PyModule) {
 			writtenN, err = syscall.Write(fd, data)
 		}
 		if err != nil {
-			raiseOSError(err, "")
+			return raiseOSError(ctx, err, "")
 		}
 		return val.Int64Val(int64(writtenN))
 	})
 
 	set("dup", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: dup() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "dup() takes 1 argument"))
+			return val.NoneVal()
 		}
 		oldfd := int(args[0].AsInt64())
 		newfd, err := syscall.Dup(oldfd)
 		if err != nil {
-			raiseOSError(err, "")
+			return raiseOSError(ctx, err, "")
 		}
 		return val.Int64Val(int64(newfd))
 	})
 
 	set("dup2", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: dup2() takes at least 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "dup2() takes at least 2 arguments"))
+			return val.NoneVal()
 		}
 		oldfd := int(args[0].AsInt64())
 		newfd := int(args[1].AsInt64())
 		if err := syscall.Dup2(oldfd, newfd); err != nil {
-			raiseOSError(err, "")
+			return raiseOSError(ctx, err, "")
 		}
 		return val.Int64Val(int64(newfd))
 	})
 
 	set("waitpid", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: waitpid() takes 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "waitpid() takes 2 arguments"))
+			return val.NoneVal()
 		}
 		pid := int(args[0].AsInt64())
 		options := int(args[1].AsInt64())
 		var wstatus syscall.WaitStatus
 		wpid, err := syscall.Wait4(pid, &wstatus, options, nil)
 		if err != nil {
-			raiseOSError(err, "")
+			return raiseOSError(ctx, err, "")
 		}
 		return val.NewTupleVal(val.Int64Val(int64(wpid)), val.Int64Val(int64(wstatus)))
 	})
 
 	set("waitstatus_to_exitcode", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: waitstatus_to_exitcode() takes exactly 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "waitstatus_to_exitcode() takes exactly 1 argument"))
+			return val.NoneVal()
 		}
 		st := int(args[0].AsInt64())
 		ws := syscall.WaitStatus(st)
@@ -929,37 +952,43 @@ func installPosix(osMod *val.PyModule) {
 
 	set("WIFEXITED", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: WIFEXITED() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "WIFEXITED() takes 1 argument"))
+			return val.NoneVal()
 		}
 		return val.BoolVal(syscall.WaitStatus(int(args[0].AsInt64())).Exited())
 	})
 	set("WEXITSTATUS", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: WEXITSTATUS() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "WEXITSTATUS() takes 1 argument"))
+			return val.NoneVal()
 		}
 		return val.Int64Val(int64(syscall.WaitStatus(int(args[0].AsInt64())).ExitStatus()))
 	})
 	set("WIFSIGNALED", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: WIFSIGNALED() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "WIFSIGNALED() takes 1 argument"))
+			return val.NoneVal()
 		}
 		return val.BoolVal(syscall.WaitStatus(int(args[0].AsInt64())).Signaled())
 	})
 	set("WTERMSIG", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: WTERMSIG() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "WTERMSIG() takes 1 argument"))
+			return val.NoneVal()
 		}
 		return val.Int64Val(int64(syscall.WaitStatus(int(args[0].AsInt64())).Signal()))
 	})
 	set("WIFSTOPPED", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: WIFSTOPPED() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "WIFSTOPPED() takes 1 argument"))
+			return val.NoneVal()
 		}
 		return val.BoolVal(syscall.WaitStatus(int(args[0].AsInt64())).Stopped())
 	})
 	set("WSTOPSIG", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: WSTOPSIG() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "WSTOPSIG() takes 1 argument"))
+			return val.NoneVal()
 		}
 		return val.Int64Val(int64(syscall.WaitStatus(int(args[0].AsInt64())).StopSignal()))
 	})
@@ -967,28 +996,31 @@ func installPosix(osMod *val.PyModule) {
 
 	set("strerror", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 || !args[0].IsInt64() {
-			panic("TypeError: strerror() argument must be int")
+			ctx.Raise(val.NewException(val.TypeErrorType, "strerror() argument must be int"))
+			return val.NoneVal()
 		}
 		return val.NewStringVal(strerrorOf(int(args[0].AsInt64())))
 	})
 	set("getcwdb", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		wd, err := os.Getwd()
 		if err != nil {
-			raiseOSError(err, "")
+			return raiseOSError(ctx, err, "")
 		}
 		return val.NewBytesVal([]byte(wd))
 	})
 	set("kill", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) != 2 {
-			panic("TypeError: kill expected 2 arguments, got " + itoa(len(args)))
+			ctx.Raise(val.NewException(val.TypeErrorType, "kill expected 2 arguments, got"+itoa(len(args))))
+			return val.NoneVal()
 		}
 		pid, ok1 := intOf(ctx, args[0])
 		sig, ok2 := intOf(ctx, args[1])
 		if !ok1 || !ok2 {
-			panic("TypeError: kill() arguments must be integers")
+			ctx.Raise(val.NewException(val.TypeErrorType, "kill() arguments must be integers"))
+			return val.NoneVal()
 		}
 		if err := killProcess(int(pid), syscall.Signal(sig)); err != nil {
-			raiseOSError(err, "")
+			return raiseOSError(ctx, err, "")
 		}
 		return val.NoneVal()
 	})
@@ -1004,10 +1036,11 @@ func installPosix(osMod *val.PyModule) {
 	set("stat", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		pa := posArgs(args, kwnames)
 		if len(pa) < 1 {
-			panic("TypeError: stat() missing required argument 'path' (pos 1)")
+			ctx.Raise(val.NewException(val.TypeErrorType, "stat() missing required argument 'path' (pos 1)"))
+			return val.NoneVal()
 		}
 		if pa[0].IsInt64() {
-			return fstatFD(int(pa[0].AsInt64()))
+			return fstatFD(ctx, int(pa[0].AsInt64()))
 		}
 		p := pathArg(ctx, pa[0])
 		follow := true
@@ -1024,37 +1057,40 @@ func installPosix(osMod *val.PyModule) {
 			info, err = os.Lstat(p)
 		}
 		if err != nil {
-			raiseOSError(err, p)
+			return raiseOSError(ctx, err, p)
 		}
 		return fileInfoToStat(info)
 	})
 	set("lstat", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		pa := posArgs(args, kwnames)
 		if len(pa) < 1 {
-			panic("TypeError: lstat() missing required argument 'path' (pos 1)")
+			ctx.Raise(val.NewException(val.TypeErrorType, "lstat() missing required argument 'path' (pos 1)"))
+			return val.NoneVal()
 		}
 		p := pathArg(ctx, pa[0])
 		info, err := os.Lstat(p)
 		if err != nil {
-			raiseOSError(err, p)
+			return raiseOSError(ctx, err, p)
 		}
 		return fileInfoToStat(info)
 	})
 	set("fstat", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 || !args[0].IsInt64() {
-			panic("TypeError: fstat() argument must be int")
+			ctx.Raise(val.NewException(val.TypeErrorType, "fstat() argument must be int"))
+			return val.NoneVal()
 		}
-		return fstatFD(int(args[0].AsInt64()))
+		return fstatFD(ctx, int(args[0].AsInt64()))
 	})
 	set("readlink", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		pa := posArgs(args, kwnames)
 		if len(pa) < 1 {
-			panic("TypeError: readlink() missing required argument 'path' (pos 1)")
+			ctx.Raise(val.NewException(val.TypeErrorType, "readlink() missing required argument 'path' (pos 1)"))
+			return val.NoneVal()
 		}
 		p := pathArg(ctx, pa[0])
 		dst, err := os.Readlink(p)
 		if err != nil {
-			raiseOSError(err, p)
+			return raiseOSError(ctx, err, p)
 		}
 		if pa[0].IsBytes() {
 			return val.NewBytesVal([]byte(dst))
@@ -1130,19 +1166,20 @@ func installPosix(osMod *val.PyModule) {
 		}
 		entries, err := os.ReadDir(dir)
 		if err != nil {
-			raiseOSError(err, dir)
+			return raiseOSError(ctx, err, dir)
 		}
 		return newScandirIterVal(dir, entries)
 	})
 
 	set("replace", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: replace() takes 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "replace() takes 2 arguments"))
+			return val.NoneVal()
 		}
 		src := pathArg(ctx, args[0])
 		dst := pathArg(ctx, args[1])
 		if err := os.Rename(src, dst); err != nil {
-			raiseOSError(err, src)
+			return raiseOSError(ctx, err, src)
 		}
 		return val.NoneVal()
 	})
@@ -1150,12 +1187,13 @@ func installPosix(osMod *val.PyModule) {
 	set("symlink", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		pa := posArgs(args, kwnames)
 		if len(pa) < 2 {
-			panic("TypeError: symlink() takes at least 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "symlink() takes at least 2 arguments"))
+			return val.NoneVal()
 		}
 		src := pathArg(ctx, pa[0])
 		dst := pathArg(ctx, pa[1])
 		if err := os.Symlink(src, dst); err != nil {
-			raiseOSError(err, src)
+			return raiseOSError(ctx, err, src)
 		}
 		return val.NoneVal()
 	})
@@ -1163,15 +1201,17 @@ func installPosix(osMod *val.PyModule) {
 	set("chmod", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		pa := posArgs(args, kwnames)
 		if len(pa) < 2 {
-			panic("TypeError: chmod() takes 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "chmod() takes 2 arguments"))
+			return val.NoneVal()
 		}
 		p := pathArg(ctx, pa[0])
 		mode, ok := intOf(ctx, pa[1])
 		if !ok {
-			panic("TypeError: chmod() mode must be int")
+			ctx.Raise(val.NewException(val.TypeErrorType, "chmod() mode must be int"))
+			return val.NoneVal()
 		}
 		if err := os.Chmod(p, os.FileMode(mode)); err != nil {
-			raiseOSError(err, p)
+			return raiseOSError(ctx, err, p)
 		}
 		return val.NoneVal()
 	})
@@ -1179,7 +1219,8 @@ func installPosix(osMod *val.PyModule) {
 	set("utime", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		pa := posArgs(args, kwnames)
 		if len(pa) < 1 {
-			panic("TypeError: utime() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "utime() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		p := pathArg(ctx, pa[0])
 		now := time.Now()
@@ -1210,22 +1251,25 @@ func installPosix(osMod *val.PyModule) {
 			}
 		}
 		if err := os.Chtimes(p, atime, mtime); err != nil {
-			raiseOSError(err, p)
+			return raiseOSError(ctx, err, p)
 		}
 		return val.NoneVal()
 	})
 
 	set("urandom", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: urandom() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "urandom() takes 1 argument"))
+			return val.NoneVal()
 		}
 		n, ok := intOf(ctx, args[0])
 		if !ok || n < 0 {
-			panic("ValueError: negative size")
+			ctx.Raise(val.NewException(val.ValueErrorType, "negative size"))
+			return val.NoneVal()
 		}
 		buf := make([]byte, n)
 		if _, err := crand.Read(buf); err != nil {
-			panic("OSError: urandom failed: " + err.Error())
+			ctx.Raise(val.NewException(val.OSErrorType, "urandom failed:"+err.Error()))
+			return val.NoneVal()
 		}
 		return val.NewBytesVal(buf)
 	})
@@ -1249,14 +1293,15 @@ func installPosix(osMod *val.PyModule) {
 	})
 }
 
-func fstatFD(fd int) val.Value {
+func fstatFD(ctx *val.ExecContext, fd int) val.Value {
 	f, ok := lookupFD(fd)
 	if !ok {
-		panic(newOSError(syscall.EBADF, "", false))
+		ctx.Raise(newOSError(syscall.EBADF, "", false))
+		return val.NoneVal()
 	}
 	info, err := f.Stat()
 	if err != nil {
-		raiseOSError(err, "")
+		return raiseOSError(ctx, err, "")
 	}
 	return fileInfoToStat(info)
 }
@@ -1425,7 +1470,8 @@ func terminalSizeVal(cols, lines int) val.Value {
 				i += 2
 			}
 			if i < 0 || i > 1 {
-				panic("IndexError: tuple index out of range")
+				ctx.Raise(val.NewException(val.IndexErrorType, "tuple index out of range"))
+				return val.NoneVal()
 			}
 			return pair(args[0]).AsTuple().Items[i]
 		}))

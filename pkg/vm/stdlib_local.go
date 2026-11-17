@@ -59,28 +59,33 @@ func initLocalType() *val.PyType {
 	}
 	dict.Set(val.InternString("__getattr__"), val.NewBuiltinFuncVal("__getattr__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: __getattr__() missing attribute name")
+			ctx.Raise(val.NewException(val.TypeErrorType, "__getattr__() missing attribute name"))
+			return val.NoneVal()
 		}
 		self := args[0]
 		name := args[1]
 		if !self.IsInstance() {
-			panic("TypeError: __getattr__() called on a non-local object")
+			ctx.Raise(val.NewException(val.TypeErrorType, "__getattr__() called on a non-local object"))
+			return val.NoneVal()
 		}
 		attrs := localStateOf(self.AsInstance()).threadAttrs(getCurrentThreadIdent(ctx))
 		if v, ok := attrs.Get(val.InternValue(name)); ok {
 			return v
 		}
-		panic("AttributeError: '" + self.Type().Name + "' object has no attribute '" + name.AsString() + "'")
+		ctx.Raise(val.NewException(val.AttributeErrorType, "'"+self.Type().Name+"' object has no attribute '"+name.AsString()+"'"))
+		return val.NoneVal()
 	}))
 	dict.Set(val.InternString("__setattr__"), val.NewBuiltinFuncVal("__setattr__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 3 {
-			panic("TypeError: __setattr__() missing attribute name or value")
+			ctx.Raise(val.NewException(val.TypeErrorType, "__setattr__() missing attribute name or value"))
+			return val.NoneVal()
 		}
 		self := args[0]
 		name := args[1]
 		value := args[2]
 		if !self.IsInstance() {
-			panic("TypeError: __setattr__() called on a non-local object")
+			ctx.Raise(val.NewException(val.TypeErrorType, "__setattr__() called on a non-local object"))
+			return val.NoneVal()
 		}
 		attrs := localStateOf(self.AsInstance()).threadAttrs(getCurrentThreadIdent(ctx))
 		attrs.Set(val.InternValue(name), value)

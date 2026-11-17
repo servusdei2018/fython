@@ -105,17 +105,20 @@ func (e *Engine) createContextVarsModule() val.Value {
 
 func contextVarTpCall(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 	if len(args) < 1 || (len(kwnames) == 0 && len(args) != 1) || (len(kwnames) > 0 && len(args)-len(kwnames) != 1) {
-		panic(val.NewTypeError("ContextVar() takes exactly 1 positional argument"))
+		ctx.Raise(val.NewTypeError("ContextVar() takes exactly 1 positional argument"))
+		return val.NoneVal()
 	}
 	name := args[0]
 	if !name.IsAnyString() {
-		panic(val.NewTypeError("ContextVar() name must be a str"))
+		ctx.Raise(val.NewTypeError("ContextVar() name must be a str"))
+		return val.NoneVal()
 	}
 	hasDefault := false
 	def := val.NoneVal()
 	for i, kn := range kwnames {
 		if kn.AsString() != "default" {
-			panic(val.NewTypeError("ContextVar() got an unexpected keyword argument"))
+			ctx.Raise(val.NewTypeError("ContextVar() got an unexpected keyword argument"))
+			return val.NoneVal()
 		}
 		def = args[len(args)-len(kwnames)+i]
 		hasDefault = true
@@ -147,7 +150,8 @@ func vmContext(ctx *val.ExecContext) *val.PyContext {
 
 func contextVarGet(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 	if len(args) < 1 {
-		panic(val.NewTypeError("get() missing self"))
+		ctx.Raise(val.NewTypeError("get() missing self"))
+		return val.NoneVal()
 	}
 	cv := asContextVar(args[0])
 	if v, ok := vmContext(ctx).Get(cv.Key); ok {
@@ -160,7 +164,8 @@ func contextVarGet(ctx *val.ExecContext, callable val.Value, args []val.Value, k
 		hasDef := false
 		for i, kn := range kwnames {
 			if kn.AsString() != "default" {
-				panic(val.NewTypeError("get() got an unexpected keyword argument"))
+				ctx.Raise(val.NewTypeError("get() got an unexpected keyword argument"))
+				return val.NoneVal()
 			}
 			defVal = args[len(args)-len(kwnames)+i]
 			hasDef = true
@@ -170,7 +175,8 @@ func contextVarGet(ctx *val.ExecContext, callable val.Value, args []val.Value, k
 		}
 	}
 	if len(pos) > 2 {
-		panic(val.NewTypeError("get() takes at most 2 arguments"))
+		ctx.Raise(val.NewTypeError("get() takes at most 2 arguments"))
+		return val.NoneVal()
 	}
 	if len(pos) >= 2 {
 		return pos[1]
@@ -178,12 +184,14 @@ func contextVarGet(ctx *val.ExecContext, callable val.Value, args []val.Value, k
 	if cv.HasDefault {
 		return cv.Default
 	}
-	panic(val.NewException(val.LookupErrorType, "ContextVar "+cv.Name.AsString()+" is unset"))
+	ctx.Raise(val.NewException(val.LookupErrorType, "ContextVar "+cv.Name.AsString()+" is unset"))
+	return val.NoneVal()
 }
 
 func contextVarSet(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 	if len(kwnames) > 0 || len(args) != 2 {
-		panic(val.NewTypeError("set() takes exactly 1 positional argument"))
+		ctx.Raise(val.NewTypeError("set() takes exactly 1 positional argument"))
+		return val.NoneVal()
 	}
 	cv := asContextVar(args[0])
 	cur := vmContext(ctx)
@@ -204,15 +212,18 @@ func contextVarSet(ctx *val.ExecContext, callable val.Value, args []val.Value, k
 
 func contextVarReset(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 	if len(args) != 2 {
-		panic(val.NewTypeError("reset() takes exactly 1 positional argument"))
+		ctx.Raise(val.NewTypeError("reset() takes exactly 1 positional argument"))
+		return val.NoneVal()
 	}
 	cv := asContextVar(args[0])
 	if args[1].Type() != tokenType {
-		panic(val.NewTypeError("reset() argument must be a Token"))
+		ctx.Raise(val.NewTypeError("reset() argument must be a Token"))
+		return val.NoneVal()
 	}
 	tok := (*pyToken)(unsafe.Pointer(args[1].HeaderPtr()))
 	if tok.Used || tok.Var.HeaderPtr() != args[0].HeaderPtr() || tok.Ctx != vmContext(ctx) {
-		panic(val.NewException(val.ValueErrorType, "token was created in a different Context"))
+		ctx.Raise(val.NewException(val.ValueErrorType, "token was created in a different Context"))
+		return val.NoneVal()
 	}
 	tok.Used = true
 	cur := tok.Ctx
@@ -238,7 +249,8 @@ func tokenGetAttr(ctx *val.ExecContext, obj, name val.Value) val.Value {
 
 func contextTpCall(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 	if len(args) != 0 || len(kwnames) != 0 {
-		panic(val.NewTypeError("Context() takes no arguments"))
+		ctx.Raise(val.NewTypeError("Context() takes no arguments"))
+		return val.NoneVal()
 	}
 	return wrapContext(val.NewPyContext())
 }
@@ -271,7 +283,8 @@ func requireVar(v val.Value) *pyContextVar {
 
 func contextRun(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 	if len(args) < 2 {
-		panic(val.NewTypeError("run() missing required argument: 'callable'"))
+		ctx.Raise(val.NewTypeError("run() missing required argument: 'callable'"))
+		return val.NoneVal()
 	}
 	self := requireContext(args[0])
 	vm := ctx.VM.(*VM)
@@ -283,14 +296,16 @@ func contextRun(ctx *val.ExecContext, callable val.Value, args []val.Value, kwna
 
 func contextCopy(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 	if len(args) != 1 {
-		panic(val.NewTypeError("copy() takes no arguments"))
+		ctx.Raise(val.NewTypeError("copy() takes no arguments"))
+		return val.NoneVal()
 	}
 	return wrapContext(requireContext(args[0]).Ctx.ShallowCopy())
 }
 
 func contextGet(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 	if len(args) < 2 {
-		panic(val.NewTypeError("get() missing required argument"))
+		ctx.Raise(val.NewTypeError("get() missing required argument"))
+		return val.NoneVal()
 	}
 	self := requireContext(args[0])
 	cv := requireVar(args[1])
@@ -305,19 +320,22 @@ func contextGet(ctx *val.ExecContext, callable val.Value, args []val.Value, kwna
 
 func contextGetItem(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 	if len(args) != 2 {
-		panic(val.NewTypeError("__getitem__() takes exactly one argument"))
+		ctx.Raise(val.NewTypeError("__getitem__() takes exactly one argument"))
+		return val.NoneVal()
 	}
 	self := requireContext(args[0])
 	cv := requireVar(args[1])
 	if v, ok := self.Ctx.Get(cv.Key); ok {
 		return v
 	}
-	panic(val.NewKeyError(args[1]))
+	ctx.Raise(val.NewKeyError(args[1]))
+	return val.NoneVal()
 }
 
 func contextContains(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 	if len(args) != 2 {
-		panic(val.NewTypeError("__contains__() takes exactly one argument"))
+		ctx.Raise(val.NewTypeError("__contains__() takes exactly one argument"))
+		return val.NoneVal()
 	}
 	self := requireContext(args[0])
 	if args[1].Type() != contextVarType {
@@ -329,14 +347,16 @@ func contextContains(ctx *val.ExecContext, callable val.Value, args []val.Value,
 
 func contextLen(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 	if len(args) != 1 {
-		panic(val.NewTypeError("__len__() takes no arguments"))
+		ctx.Raise(val.NewTypeError("__len__() takes no arguments"))
+		return val.NoneVal()
 	}
 	return val.Int64Val(int64(requireContext(args[0]).Ctx.Len()))
 }
 
 func contextIter(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 	if len(args) != 1 {
-		panic(val.NewTypeError("__iter__() takes no arguments"))
+		ctx.Raise(val.NewTypeError("__iter__() takes no arguments"))
+		return val.NoneVal()
 	}
 	vars := requireContext(args[0]).Ctx.Vars()
 	return val.NewIterVal(val.NewTupleVal(vars...))

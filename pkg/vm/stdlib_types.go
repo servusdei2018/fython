@@ -101,12 +101,14 @@ func initTypesModule() {
 				if !attr.FGet.IsNone() {
 					return ctx.Call(attr.FGet, []val.Value{val.TypeVal(owner)}, nil)
 				}
-				panic("AttributeError: unreadable attribute")
+				ctx.Raise(val.NewException(val.AttributeErrorType, "unreadable attribute"))
+				return val.NoneVal()
 			}
 			if !attr.FGet.IsNone() {
 				return ctx.Call(attr.FGet, []val.Value{obj}, nil)
 			}
-			panic("AttributeError: unreadable attribute")
+			ctx.Raise(val.NewException(val.AttributeErrorType, "unreadable attribute"))
+			return val.NoneVal()
 		}
 
 		DynamicClassAttributeType.Slots.TpDescrSet = func(ctx *val.ExecContext, descr, obj, value val.Value) {
@@ -115,7 +117,7 @@ func initTypesModule() {
 				ctx.Call(attr.FSet, []val.Value{obj, value}, nil)
 				return
 			}
-			panic("AttributeError: can't set attribute")
+			ctx.Raise(val.NewException(val.AttributeErrorType, "can't set attribute"))
 		}
 
 		DynamicClassAttributeType.Slots.TpGetAttr = func(ctx *val.ExecContext, obj, name val.Value) val.Value {
@@ -155,7 +157,8 @@ func initTypesModule() {
 				}
 				return descr
 			}
-			panic("val: AttributeError: '" + obj.Type().Name + "' object has no attribute '" + nameStr + "'")
+			ctx.Raise(val.NewException(val.AttributeErrorType, "'"+obj.Type().Name+"' object has no attribute '"+nameStr+"'"))
+			return val.NoneVal()
 		}
 
 		DynamicClassAttributeType.Slots.TpSetAttr = func(ctx *val.ExecContext, obj, name, value val.Value) val.Value {
@@ -184,7 +187,8 @@ func initTypesModule() {
 
 		dcaInit := val.NewBuiltinFuncVal("DynamicClassAttribute.__init__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: __init__ takes at least 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "__init__ takes at least 1 argument"))
+				return val.NoneVal()
 			}
 			self := args[0]
 			var fget, fset, fdel, doc val.Value
@@ -230,7 +234,8 @@ func initTypesModule() {
 
 		DynamicClassAttributeType.Dict.Set(val.InternString("getter"), val.NewBuiltinFuncVal("getter", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: getter() takes 2 arguments")
+				ctx.Raise(val.NewException(val.TypeErrorType, "getter() takes 2 arguments"))
+				return val.NoneVal()
 			}
 			attr := (*pyDynamicClassAttribute)(unsafe.Pointer(args[0].HeaderPtr()))
 			newAttr := &pyDynamicClassAttribute{
@@ -245,7 +250,8 @@ func initTypesModule() {
 
 		DynamicClassAttributeType.Dict.Set(val.InternString("setter"), val.NewBuiltinFuncVal("setter", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: setter() takes 2 arguments")
+				ctx.Raise(val.NewException(val.TypeErrorType, "setter() takes 2 arguments"))
+				return val.NoneVal()
 			}
 			attr := (*pyDynamicClassAttribute)(unsafe.Pointer(args[0].HeaderPtr()))
 			newAttr := &pyDynamicClassAttribute{
@@ -298,7 +304,8 @@ func (e *Engine) createTypesModule() val.Value {
 	// new_class(name, bases=(), kwds=None, exec_body=None)
 	mod.Dict.Set(val.InternString("new_class"), val.NewBuiltinFuncVal("new_class", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: new_class() requires at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "new_class() requires at least 1 argument"))
+			return val.NoneVal()
 		}
 		name := args[0].AsString()
 		var bases []*val.PyType

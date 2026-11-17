@@ -32,7 +32,8 @@ func initCodecInfoType() {
 				i += len(items)
 			}
 			if i < 0 || i >= len(items) {
-				panic("IndexError: tuple index out of range")
+				ctx.Raise(val.NewException(val.IndexErrorType, "tuple index out of range"))
+				return val.NoneVal()
 			}
 			return items[i]
 		}))
@@ -83,7 +84,8 @@ func (e *Engine) createCodecsModule() val.Value {
 
 	mod.Dict.Set(val.InternString("register"), val.NewModuleFuncVal("register", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: register() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "register() takes 1 argument"))
+			return val.NoneVal()
 		}
 		searchMu.Lock()
 		searchFuncs = append(searchFuncs, args[0])
@@ -93,7 +95,8 @@ func (e *Engine) createCodecsModule() val.Value {
 
 	mod.Dict.Set(val.InternString("lookup"), val.NewModuleFuncVal("lookup", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: lookup() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "lookup() takes 1 argument"))
+			return val.NoneVal()
 		}
 		enc := args[0].AsString()
 		norm := normalizeEncoding(enc)
@@ -129,12 +132,14 @@ func (e *Engine) createCodecsModule() val.Value {
 			return makeCodecInfo("raw-unicode-escape", rawEnc, rawDec)
 		}
 
-		panic("LookupError: unknown encoding: " + enc)
+		ctx.Raise(val.NewException(val.LookupErrorType, "unknown encoding:"+enc))
+		return val.NoneVal()
 	}))
 
 	mod.Dict.Set(val.InternString("register_error"), val.NewModuleFuncVal("register_error", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: register_error() takes 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "register_error() takes 2 arguments"))
+			return val.NoneVal()
 		}
 		name := args[0].AsString()
 		errorMu.Lock()
@@ -145,7 +150,8 @@ func (e *Engine) createCodecsModule() val.Value {
 
 	mod.Dict.Set(val.InternString("lookup_error"), val.NewModuleFuncVal("lookup_error", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: lookup_error() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "lookup_error() takes 1 argument"))
+			return val.NoneVal()
 		}
 		name := args[0].AsString()
 		errorMu.RLock()
@@ -172,7 +178,8 @@ func (e *Engine) createCodecsModule() val.Value {
 				if len(a) > 0 {
 					panic(a[0])
 				}
-				panic("LookupError: unknown error handler name '" + name + "'")
+				c.Raise(val.NewException(val.LookupErrorType, "unknown error handler name '"+name+"'"))
+				return val.NoneVal()
 			}
 		})
 	}))
@@ -180,7 +187,8 @@ func (e *Engine) createCodecsModule() val.Value {
 	// UTF-8
 	mod.Dict.Set(val.InternString("utf_8_encode"), val.NewModuleFuncVal("utf_8_encode", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: utf_8_encode() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "utf_8_encode() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		s := args[0].AsString()
 		b := []byte(s)
@@ -189,7 +197,8 @@ func (e *Engine) createCodecsModule() val.Value {
 
 	mod.Dict.Set(val.InternString("utf_8_decode"), val.NewModuleFuncVal("utf_8_decode", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: utf_8_decode() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "utf_8_decode() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		var b []byte
 		switch {
@@ -208,7 +217,8 @@ func (e *Engine) createCodecsModule() val.Value {
 	// Latin-1 (ISO-8859-1)
 	mod.Dict.Set(val.InternString("latin_1_encode"), val.NewModuleFuncVal("latin_1_encode", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: latin_1_encode() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "latin_1_encode() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		s := args[0].AsString()
 		b := make([]byte, len(s))
@@ -223,7 +233,8 @@ func (e *Engine) createCodecsModule() val.Value {
 
 	mod.Dict.Set(val.InternString("latin_1_decode"), val.NewModuleFuncVal("latin_1_decode", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: latin_1_decode() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "latin_1_decode() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		var b []byte
 		switch {
@@ -246,7 +257,8 @@ func (e *Engine) createCodecsModule() val.Value {
 	// ASCII
 	mod.Dict.Set(val.InternString("ascii_encode"), val.NewModuleFuncVal("ascii_encode", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: ascii_encode() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "ascii_encode() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		s := args[0].AsString()
 		b := make([]byte, len(s))
@@ -261,7 +273,8 @@ func (e *Engine) createCodecsModule() val.Value {
 
 	mod.Dict.Set(val.InternString("ascii_decode"), val.NewModuleFuncVal("ascii_decode", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: ascii_decode() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "ascii_decode() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		var b []byte
 		switch {
@@ -280,7 +293,8 @@ func (e *Engine) createCodecsModule() val.Value {
 	// Raw unicode escape & unicode escape
 	mod.Dict.Set(val.InternString("raw_unicode_escape_encode"), val.NewModuleFuncVal("raw_unicode_escape_encode", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: raw_unicode_escape_encode() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "raw_unicode_escape_encode() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		s := args[0].AsString()
 		return val.NewTupleVal(val.NewBytesVal([]byte(s)), val.Int64Val(int64(len(s))))
@@ -288,7 +302,8 @@ func (e *Engine) createCodecsModule() val.Value {
 
 	mod.Dict.Set(val.InternString("raw_unicode_escape_decode"), val.NewModuleFuncVal("raw_unicode_escape_decode", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: raw_unicode_escape_decode() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "raw_unicode_escape_decode() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		var b []byte
 		switch {
@@ -304,7 +319,8 @@ func (e *Engine) createCodecsModule() val.Value {
 
 	mod.Dict.Set(val.InternString("encode"), val.NewModuleFuncVal("encode", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: encode() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "encode() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		enc := "utf-8"
 		if len(args) > 1 && !args[1].IsNone() {
@@ -329,7 +345,8 @@ func (e *Engine) createCodecsModule() val.Value {
 
 	mod.Dict.Set(val.InternString("decode"), val.NewModuleFuncVal("decode", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: decode() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "decode() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		var b []byte
 		switch {

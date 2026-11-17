@@ -119,7 +119,8 @@ func intArg(ctx *val.ExecContext, v val.Value, def int64) int64 {
 	if n, ok := intOf(ctx, v); ok {
 		return n
 	}
-	panic("TypeError: '" + typeNameOf(v) + "' object cannot be interpreted as an integer")
+	ctx.Raise(val.NewException(val.TypeErrorType, "'"+typeNameOf(v)+"' object cannot be interpreted as an integer"))
+	return 0
 }
 
 func clampInt(n int64, lo, hi int) int {
@@ -212,7 +213,7 @@ func (p *pyPattern) fromRunes(rs []rune) val.Value {
 }
 
 func raiseReError(ctx *val.ExecContext, e *sre.Error, pattern val.Value) {
-	panic(newPatternError(e.Msg, pattern, e.Pos))
+	ctx.Raise(newPatternError(e.Msg, pattern, e.Pos))
 }
 
 func newPatternError(msg string, pattern val.Value, pos int) val.Value {
@@ -274,7 +275,8 @@ func compilePattern(ctx *val.ExecContext, pattern val.Value, flags int64) val.Va
 	initSRETypes()
 	if pattern.Kind() == val.KindNative && pattern.HeaderPtr().Type == PatternType {
 		if flags != 0 {
-			panic("ValueError: cannot process flags argument with a compiled pattern")
+			ctx.Raise(val.NewException(val.ValueErrorType, "cannot process flags argument with a compiled pattern"))
+			return val.NoneVal()
 		}
 		return pattern
 	}
@@ -296,7 +298,8 @@ func compilePattern(ctx *val.ExecContext, pattern val.Value, flags int64) val.Va
 			src[i] = rune(b)
 		}
 	default:
-		panic("TypeError: first argument must be string or compiled pattern")
+		ctx.Raise(val.NewException(val.TypeErrorType, "first argument must be string or compiled pattern"))
+		return val.NoneVal()
 	}
 	key := patKey{pat: string(src), flags: int(flags), isBytes: isBytes}
 	patCacheMu.Lock()
@@ -309,8 +312,10 @@ func compilePattern(ctx *val.ExecContext, pattern val.Value, flags int64) val.Va
 	if err != nil {
 		if se, ok := err.(*sre.Error); ok {
 			raiseReError(ctx, se, pattern)
+			return val.NoneVal()
 		}
-		panic("re.error: " + err.Error())
+		ctx.Raise(newPatternError(err.Error(), pattern, -1))
+		return val.NoneVal()
 	}
 	srcVal := pattern
 	if pattern.IsByteArray() {
@@ -367,7 +372,8 @@ func (m *pyMatch) group(ctx *val.ExecContext, g val.Value) int {
 		}
 	}
 	if idx < 0 || idx > m.Pat.Re.NumGroups {
-		panic(val.NewException(val.IndexErrorType, "no such group"))
+		ctx.Raise(val.NewException(val.IndexErrorType, "no such group"))
+		return 0
 	}
 	return idx
 }
@@ -462,7 +468,8 @@ func (p *pyPattern) split(ctx *val.ExecContext, strVal, maxV val.Value) val.Valu
 	in := p.subject(strVal)
 	maxsplit := intArg(ctx, maxV, 0)
 	if maxsplit < 0 {
-		panic("ValueError: maxsplit must be non-negative")
+		ctx.Raise(val.NewException(val.ValueErrorType, "maxsplit must be non-negative"))
+		return val.NoneVal()
 	}
 	var out []val.Value
 	last := 0
@@ -499,7 +506,8 @@ func (p *pyPattern) sub(ctx *val.ExecContext, patVal, repl, strVal, countV val.V
 	switch {
 	case repl.IsAnyString():
 		if p.IsBytes {
-			panic("TypeError: expected a bytes-like object, str found")
+			ctx.Raise(val.NewException(val.TypeErrorType, "expected a bytes-like object, str found"))
+			return val.NoneVal(), 0
 		}
 		rs := []rune(repl.AsString())
 		if !containsRune(rs, '\\') {
@@ -508,12 +516,14 @@ func (p *pyPattern) sub(ctx *val.ExecContext, patVal, repl, strVal, countV val.V
 			t, err := p.Re.ParseTemplate(rs)
 			if err != nil {
 				raiseReError(ctx, err.(*sre.Error), repl)
+				return val.NoneVal(), 0
 			}
 			tmpl = t
 		}
 	case repl.IsBytes() || repl.IsByteArray():
 		if !p.IsBytes {
-			panic("TypeError: expected str instance, bytes found")
+			ctx.Raise(val.NewException(val.TypeErrorType, "expected str instance, bytes found"))
+			return val.NoneVal(), 0
 		}
 		var data []byte
 		if repl.IsBytes() {
@@ -531,6 +541,7 @@ func (p *pyPattern) sub(ctx *val.ExecContext, patVal, repl, strVal, countV val.V
 			t, err := p.Re.ParseTemplate(rs)
 			if err != nil {
 				raiseReError(ctx, err.(*sre.Error), repl)
+				return val.NoneVal(), 0
 			}
 			tmpl = t
 		}
@@ -774,6 +785,7 @@ func initSRETypes() {
 			t, err := m.Pat.Re.ParseTemplate(rs)
 			if err != nil {
 				raiseReError(ctx, err.(*sre.Error), tv)
+				return val.NoneVal()
 			}
 			return m.Pat.fromRunes(t.Expand(nil, m.In, m.Caps))
 		})
@@ -1013,6 +1025,9 @@ func (e *Engine) createReModule() val.Value {
 
 	pat := func(ctx *val.ExecContext, pattern val.Value, flags val.Value) (val.Value, *pyPattern) {
 		pv := compilePattern(ctx, pattern, intArg(ctx, flags, 0))
+		if ctx != nil && ctx.HasException() {
+			return val.NoneVal(), nil
+		}
 		return pv, asPattern(pv)
 	}
 	fn := func(name string, f val.VectorcallFunc) {

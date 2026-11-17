@@ -2,6 +2,7 @@ package vm
 
 import (
 	"math/big"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -198,14 +199,16 @@ func astInitMethod(ctx *val.ExecContext, args []val.Value, kwnames []val.Value) 
 	self := args[0]
 	inst := instOf(self)
 	if inst == nil {
-		panic("TypeError: AST.__init__ requires an AST instance")
+		ctx.Raise(val.NewException(val.TypeErrorType, "AST.__init__ requires an AST instance"))
+		return val.NoneVal()
 	}
 	sp := st.specOf(self.Type())
 	npos := len(args) - len(kwnames) - 1
 	clsName := self.Type().Name
 	if sp == nil {
 		if npos > 0 {
-			panic("TypeError: " + clsName + " constructor takes 0 positional arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, clsName+" constructor takes 0 positional arguments"))
+			return val.NoneVal()
 		}
 		for i, kn := range kwnames {
 			inst.SetAttr(kn, args[len(args)-len(kwnames)+i])
@@ -213,7 +216,8 @@ func astInitMethod(ctx *val.ExecContext, args []val.Value, kwnames []val.Value) 
 		return val.NoneVal()
 	}
 	if npos > len(sp.Fields) {
-		panic("TypeError: " + clsName + " constructor takes at most " + strconv.Itoa(len(sp.Fields)) + " positional argument" + plural(len(sp.Fields)))
+		ctx.Raise(val.NewException(val.TypeErrorType, clsName+" constructor takes at most "+strconv.Itoa(len(sp.Fields))+" positional argument"+plural(len(sp.Fields))))
+		return val.NoneVal()
 	}
 	set := make([]bool, len(sp.Fields))
 	for i := range npos {
@@ -226,7 +230,8 @@ func astInitMethod(ctx *val.ExecContext, args []val.Value, kwnames []val.Value) 
 		idx := sp.FieldIndex(name)
 		if idx >= 0 {
 			if set[idx] {
-				panic("TypeError: ast." + clsName + " got multiple values for argument '" + name + "'")
+				ctx.Raise(val.NewException(val.TypeErrorType, "ast."+clsName+" got multiple values for argument '"+name+"'"))
+				return val.NoneVal()
 			}
 			set[idx] = true
 		} else {
@@ -239,7 +244,8 @@ func astInitMethod(ctx *val.ExecContext, args []val.Value, kwnames []val.Value) 
 			if !known {
 				// CPython also tolerates unknown keywords on subclasses; reject on builtins.
 				if self.Type().Name == sp.Name && st.classes[sp.ID] == self.Type() {
-					panic("TypeError: ast." + clsName + ".__init__ got an unexpected keyword argument '" + name + "'")
+					ctx.Raise(val.NewException(val.TypeErrorType, "ast."+clsName+".__init__ got an unexpected keyword argument '"+name+"'"))
+					return val.NoneVal()
 				}
 			}
 		}
@@ -262,7 +268,8 @@ func astInitMethod(ctx *val.ExecContext, args []val.Value, kwnames []val.Value) 
 		}
 	}
 	if len(missing) > 0 {
-		panic("TypeError: ast." + clsName + ".__init__ missing " + strconv.Itoa(len(missing)) + " required positional argument" + plural(len(missing)) + ": " + joinQuoted(missing))
+		ctx.Raise(val.NewException(val.TypeErrorType, "ast."+clsName+".__init__ missing "+strconv.Itoa(len(missing))+" required positional argument"+plural(len(missing))+": "+joinQuoted(missing)))
+		return val.NoneVal()
 	}
 	return val.NoneVal()
 }
@@ -292,11 +299,13 @@ func astReplace(ctx *val.ExecContext, args []val.Value, kwnames []val.Value) val
 	st := astInit()
 	self := args[0]
 	if len(args)-len(kwnames) > 1 {
-		panic("TypeError: __replace__() takes no positional arguments")
+		ctx.Raise(val.NewException(val.TypeErrorType, "__replace__() takes no positional arguments"))
+		return val.NoneVal()
 	}
 	sp := st.specOf(self.Type())
 	if sp == nil {
-		panic("TypeError: __replace__ requires an AST node")
+		ctx.Raise(val.NewException(val.TypeErrorType, "__replace__ requires an AST node"))
+		return val.NoneVal()
 	}
 	valid := map[string]bool{}
 	for _, f := range sp.Fields {
@@ -308,7 +317,8 @@ func astReplace(ctx *val.ExecContext, args []val.Value, kwnames []val.Value) val
 	kwStart := len(args) - len(kwnames)
 	for _, kn := range kwnames {
 		if !valid[kn.AsString()] {
-			panic("TypeError: " + self.Type().Name + ".__replace__ got an unexpected keyword argument '" + kn.AsString() + "'")
+			ctx.Raise(val.NewException(val.TypeErrorType, self.Type().Name+".__replace__ got an unexpected keyword argument '"+kn.AsString()+"'"))
+			return val.NoneVal()
 		}
 	}
 	out := val.NewInstanceOfType(self.Type())
@@ -336,7 +346,8 @@ func astReplace(ctx *val.ExecContext, args []val.Value, kwnames []val.Value) val
 		}
 	}
 	if len(missing) > 0 {
-		panic("TypeError: " + self.Type().Name + ".__replace__ missing " + strconv.Itoa(len(missing)) + " required field" + plural(len(missing)) + ": " + joinQuoted(missing))
+		ctx.Raise(val.NewException(val.TypeErrorType, self.Type().Name+".__replace__ missing "+strconv.Itoa(len(missing))+" required field"+plural(len(missing))+": "+joinQuoted(missing)))
+		return val.NoneVal()
 	}
 	return out
 }
@@ -646,7 +657,7 @@ func (e *Engine) createASTModule() val.Value {
 }
 
 // parseToAST parses src in the given compile mode and returns the `_ast` tree.
-func parseToAST(src []byte, filename, mode string) val.Value {
+func parseToAST(ctx *val.ExecContext, src []byte, filename, mode string) val.Value {
 	st := astInit()
 	var m pyast.Mode
 	switch mode {
@@ -659,11 +670,13 @@ func parseToAST(src []byte, filename, mode string) val.Value {
 	case "func_type":
 		m = pyast.ModeFuncType
 	default:
-		panic("ValueError: compile() mode must be 'exec', 'eval', 'single' or 'func_type'")
+		ctx.Raise(val.NewValueError("compile() mode must be 'exec', 'eval', 'single' or 'func_type'"))
+		return val.NoneVal()
 	}
 	tree, err := pyast.Parse(src, m)
 	if err != nil {
-		panic(newSyntaxErrorVal(err.(*pyast.SyntaxError), filename))
+		ctx.Raise(newSyntaxErrorVal(err.(*pyast.SyntaxError), filename))
+		return val.NoneVal()
 	}
 	return st.newNode(tree)
 }
@@ -728,21 +741,25 @@ func builtinCompile(ctx *val.ExecContext, callable val.Value, args []val.Value, 
 	a := bindArgs("compile", args, kwnames, "source", "filename", "mode", "flags", "dont_inherit", "optimize", "_feature_version", "module")
 	for i, name := range []string{"source", "filename", "mode"} {
 		if a[i].IsUnbound() {
-			panic("TypeError: compile() missing required argument '" + name + "' (pos " + strconv.Itoa(i+1) + ")")
+			ctx.Raise(val.NewException(val.TypeErrorType, "compile() missing required argument '"+name+"' (pos "+strconv.Itoa(i+1)+")"))
+			return val.NoneVal()
 		}
 	}
 	srcVal, fnVal, modeVal := a[0], a[1], a[2]
 	flags := int(intArg(ctx, a[3], 0))
 	optimize := int(intArg(ctx, a[5], -1))
 	if optimize < -1 || optimize > 2 {
-		panic("ValueError: compile(): invalid optimize value")
+		ctx.Raise(val.NewException(val.ValueErrorType, "compile(): invalid optimize value"))
+		return val.NoneVal()
 	}
 	if !modeVal.IsAnyString() {
-		panic("TypeError: compile() argument 'mode' must be str, not " + typeNameOf(modeVal))
+		ctx.Raise(val.NewException(val.TypeErrorType, "compile() argument 'mode' must be str, not"+typeNameOf(modeVal)))
+		return val.NoneVal()
 	}
 	mode := modeVal.AsString()
 	if astModForMode(mode) == "" {
-		panic("ValueError: compile() mode must be 'exec', 'eval', 'single' or 'func_type'")
+		ctx.Raise(val.NewException(val.ValueErrorType, "compile() mode must be 'exec', 'eval', 'single' or 'func_type'"))
+		return val.NoneVal()
 	}
 	filename := "<string>"
 	switch {
@@ -763,13 +780,15 @@ func builtinCompile(ctx *val.ExecContext, callable val.Value, args []val.Value, 
 		want := astModForMode(mode)
 		node := st.toNode(ctx, srcVal, "mod")
 		if node.Spec.Name != want {
-			panic("TypeError: expected " + want + " node, got " + srcVal.Type().Name)
+			ctx.Raise(val.NewException(val.TypeErrorType, "expected"+want+" node, got "+srcVal.Type().Name))
+			return val.NoneVal()
 		}
 		if flags&pyCFOnlyAST != 0 {
 			return srcVal
 		}
 		if mode == "func_type" {
-			panic("ValueError: compile() mode 'func_type' requires flag PyCF_ONLY_AST")
+			ctx.Raise(val.NewException(val.ValueErrorType, "compile() mode 'func_type' requires flag PyCF_ONLY_AST"))
+			return val.NoneVal()
 		}
 		text := pyast.Unparse(node, pyast.UnparseOptions{PadLines: true})
 		if mode == "single" {
@@ -786,25 +805,27 @@ func builtinCompile(ctx *val.ExecContext, callable val.Value, args []val.Value, 
 	}
 	src, ok := sourceBytes(srcVal)
 	if !ok {
-		panic("TypeError: compile() arg 1 must be a string, bytes or AST object")
+		ctx.Raise(val.NewException(val.TypeErrorType, "compile() arg 1 must be a string, bytes or AST object"))
+		return val.NoneVal()
 	}
-	for _, c := range src {
-		if c == 0 {
-			panic("ValueError: source code string cannot contain null bytes")
-		}
+	if slices.Contains(src, 0) {
+		ctx.Raise(val.NewException(val.ValueErrorType, "source code string cannot contain null bytes"))
+		return val.NoneVal()
 	}
 	if len(src) >= 3 && src[0] == 0xEF && src[1] == 0xBB && src[2] == 0xBF {
 		src = src[3:]
 	}
 	if flags&pyCFOnlyAST != 0 {
-		return parseToAST(src, filename, mode)
+		return parseToAST(ctx, src, filename, mode)
 	}
 	if mode == "func_type" {
-		panic("ValueError: compile() mode 'func_type' requires flag PyCF_ONLY_AST")
+		ctx.Raise(val.NewException(val.ValueErrorType, "compile() mode 'func_type' requires flag PyCF_ONLY_AST"))
+		return val.NoneVal()
 	}
 	if flags&0x4000 != 0 { // PyCF_ALLOW_INCOMPLETE_INPUT
 		if vmInstance := ctx.VM.(*VM); vmInstance.engine.IncompleteInput(src) {
-			panic(val.NewException(val.IncompleteInputErrorType, "incomplete input"))
+			ctx.Raise(val.NewException(val.IncompleteInputErrorType, "incomplete input"))
+			return val.NoneVal()
 		}
 	}
 	return compileSourceWithOptimize(ctx, src, filename, mode, optimize)
@@ -827,7 +848,8 @@ func compileSourceWithOptimize(ctx *val.ExecContext, src []byte, filename, mode 
 	if err != nil {
 		msg := err.Error()
 		msg = strings.TrimPrefix(msg, "SyntaxError: ")
-		panic("SyntaxError: " + msg)
+		ctx.Raise(val.NewException(val.SyntaxErrorType, msg))
+		return val.NoneVal()
 	}
 	return NewCodeVal(co)
 }

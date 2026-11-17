@@ -86,7 +86,8 @@ func initThreadModule() {
 
 		threadLockType.Dict.Set(val.InternString("acquire"), val.NewBuiltinFuncVal("acquire", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: acquire() requires at least 0 arguments")
+				ctx.Raise(val.NewException(val.TypeErrorType, "acquire() requires at least 0 arguments"))
+				return val.NoneVal()
 			}
 			st := getLockState(args[0])
 			blocking := true
@@ -141,20 +142,23 @@ func initThreadModule() {
 
 		threadLockType.Dict.Set(val.InternString("release"), val.NewBuiltinFuncVal("release", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: release() requires at least 0 arguments")
+				ctx.Raise(val.NewException(val.TypeErrorType, "release() requires at least 0 arguments"))
+				return val.NoneVal()
 			}
 			st := getLockState(args[0])
 			select {
 			case st.sem <- struct{}{}:
 				return val.NoneVal()
 			default:
-				panic("RuntimeError: release unlocked lock")
+				ctx.Raise(val.NewException(val.RuntimeErrorType, "release unlocked lock"))
+				return val.NoneVal()
 			}
 		}))
 
 		threadLockType.Dict.Set(val.InternString("locked"), val.NewBuiltinFuncVal("locked", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: locked() requires at least 0 arguments")
+				ctx.Raise(val.NewException(val.TypeErrorType, "locked() requires at least 0 arguments"))
+				return val.NoneVal()
 			}
 			st := getLockState(args[0])
 			return val.BoolVal(len(st.sem) == 0)
@@ -162,7 +166,8 @@ func initThreadModule() {
 
 		threadLockType.Dict.Set(val.InternString("__enter__"), val.NewBuiltinFuncVal("__enter__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: descriptor '__enter__' requires 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "descriptor '__enter__' requires 1 argument"))
+				return val.NoneVal()
 			}
 			self := args[0]
 			st := getLockState(self)
@@ -172,14 +177,16 @@ func initThreadModule() {
 
 		threadLockType.Dict.Set(val.InternString("__exit__"), val.NewBuiltinFuncVal("__exit__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: descriptor '__exit__' requires at least 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "descriptor '__exit__' requires at least 1 argument"))
+				return val.NoneVal()
 			}
 			st := getLockState(args[0])
 			select {
 			case st.sem <- struct{}{}:
 				return val.NoneVal()
 			default:
-				panic("RuntimeError: release unlocked lock")
+				ctx.Raise(val.NewException(val.RuntimeErrorType, "release unlocked lock"))
+				return val.NoneVal()
 			}
 		}))
 
@@ -209,7 +216,8 @@ func initThreadModule() {
 
 		threadRLockType.Dict.Set(val.InternString("acquire"), val.NewBuiltinFuncVal("RLock.acquire", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: acquire() requires at least 0 arguments")
+				ctx.Raise(val.NewException(val.TypeErrorType, "acquire() requires at least 0 arguments"))
+				return val.NoneVal()
 			}
 			st := getRLockState(args[0])
 			ident := getCurrentThreadIdent(ctx)
@@ -285,7 +293,8 @@ func initThreadModule() {
 
 		threadRLockType.Dict.Set(val.InternString("release"), val.NewBuiltinFuncVal("RLock.release", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: release() requires at least 0 arguments")
+				ctx.Raise(val.NewException(val.TypeErrorType, "release() requires at least 0 arguments"))
+				return val.NoneVal()
 			}
 			st := getRLockState(args[0])
 			ident := getCurrentThreadIdent(ctx)
@@ -294,7 +303,8 @@ func initThreadModule() {
 			defer st.mu.Unlock()
 
 			if st.owner != ident {
-				panic("RuntimeError: cannot release un-acquired lock")
+				ctx.Raise(val.NewException(val.RuntimeErrorType, "cannot release un-acquired lock"))
+				return val.NoneVal()
 			}
 			st.count--
 			if st.count == 0 {
@@ -306,7 +316,8 @@ func initThreadModule() {
 
 		threadRLockType.Dict.Set(val.InternString("__enter__"), val.NewBuiltinFuncVal("__enter__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: descriptor '__enter__' requires 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "descriptor '__enter__' requires 1 argument"))
+				return val.NoneVal()
 			}
 			self := args[0]
 			st := getRLockState(self)
@@ -328,14 +339,16 @@ func initThreadModule() {
 
 		threadRLockType.Dict.Set(val.InternString("__exit__"), val.NewBuiltinFuncVal("__exit__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: descriptor '__exit__' requires at least 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "descriptor '__exit__' requires at least 1 argument"))
+				return val.NoneVal()
 			}
 			st := getRLockState(args[0])
 			ident := getCurrentThreadIdent(ctx)
 			st.mu.Lock()
 			if st.owner != ident {
 				st.mu.Unlock()
-				panic("RuntimeError: cannot release un-acquired lock")
+				ctx.Raise(val.NewException(val.RuntimeErrorType, "cannot release un-acquired lock"))
+				return val.NoneVal()
 			}
 			st.count--
 			if st.count == 0 {
@@ -384,7 +397,8 @@ func initThreadModule() {
 
 		threadCondDict.Set(val.InternString("acquire"), val.NewBuiltinFuncVal("Condition.acquire", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: acquire() requires self")
+				ctx.Raise(val.NewException(val.TypeErrorType, "acquire() requires self"))
+				return val.NoneVal()
 			}
 			st := getCondState(args[0])
 			if fn, _, ok := st.lock.Type().LookupMRO(val.InternString("acquire")); ok {
@@ -398,7 +412,8 @@ func initThreadModule() {
 
 		threadCondDict.Set(val.InternString("release"), val.NewBuiltinFuncVal("Condition.release", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: release() requires self")
+				ctx.Raise(val.NewException(val.TypeErrorType, "release() requires self"))
+				return val.NoneVal()
 			}
 			st := getCondState(args[0])
 			if fn, _, ok := st.lock.Type().LookupMRO(val.InternString("release")); ok {
@@ -409,7 +424,8 @@ func initThreadModule() {
 
 		threadCondDict.Set(val.InternString("wait"), val.NewBuiltinFuncVal("Condition.wait", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: wait() requires self")
+				ctx.Raise(val.NewException(val.TypeErrorType, "wait() requires self"))
+				return val.NoneVal()
 			}
 			st := getCondState(args[0])
 			var timeout time.Duration = -1
@@ -458,7 +474,8 @@ func initThreadModule() {
 
 		threadCondDict.Set(val.InternString("notify"), val.NewBuiltinFuncVal("Condition.notify", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: notify() requires self")
+				ctx.Raise(val.NewException(val.TypeErrorType, "notify() requires self"))
+				return val.NoneVal()
 			}
 			st := getCondState(args[0])
 			st.mu.Lock()
@@ -472,7 +489,8 @@ func initThreadModule() {
 
 		threadCondDict.Set(val.InternString("__enter__"), val.NewBuiltinFuncVal("Condition.__enter__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: descriptor '__enter__' requires 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "descriptor '__enter__' requires 1 argument"))
+				return val.NoneVal()
 			}
 			self := args[0]
 			st := getCondState(self)
@@ -484,7 +502,8 @@ func initThreadModule() {
 
 		threadCondDict.Set(val.InternString("__exit__"), val.NewBuiltinFuncVal("Condition.__exit__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: descriptor '__exit__' requires at least 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "descriptor '__exit__' requires at least 1 argument"))
+				return val.NoneVal()
 			}
 			st := getCondState(args[0])
 			if fn, _, ok := st.lock.Type().LookupMRO(val.InternString("release")); ok {
@@ -517,7 +536,8 @@ func initThreadModule() {
 
 		threadTypeDict.Set(val.InternString("__init__"), val.NewBuiltinFuncVal("Thread.__init__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: Thread.__init__() takes at least 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "Thread.__init__() takes at least 1 argument"))
+				return val.NoneVal()
 			}
 			self := args[0]
 			st := &threadState{
@@ -579,7 +599,8 @@ func initThreadModule() {
 			st.mu.Lock()
 			if st.started {
 				st.mu.Unlock()
-				panic("RuntimeError: threads can only be started once")
+				ctx.Raise(val.NewException(val.RuntimeErrorType, "threads can only be started once"))
+				return val.NoneVal()
 			}
 			st.started = true
 			st.alive = true
@@ -619,7 +640,8 @@ func initThreadModule() {
 		threadTypeDict.Set(val.InternString("join"), val.NewBuiltinFuncVal("join", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			st := getThreadState(args[0])
 			if !st.started {
-				panic("RuntimeError: cannot join thread before it is started")
+				ctx.Raise(val.NewException(val.RuntimeErrorType, "cannot join thread before it is started"))
+				return val.NoneVal()
 			}
 			var timeout time.Duration = -1
 			if len(args) > 1 && !args[1].IsNone() {
@@ -705,7 +727,8 @@ func (e *Engine) createThreadModule() val.Value {
 
 	mod.Dict.Set(val.InternString("start_new_thread"), val.NewBuiltinFuncVal("start_new_thread", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: start_new_thread expected at least 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "start_new_thread expected at least 2 arguments"))
+			return val.NoneVal()
 		}
 		fn := args[0]
 		var callArgs []val.Value
@@ -866,7 +889,8 @@ func (e *Engine) createThreadingModule() val.Value {
 			v = args[0].AsInt64()
 		}
 		if v < 0 {
-			panic("ValueError: semaphore initial value must be >= 0")
+			ctx.Raise(val.NewException(val.ValueErrorType, "semaphore initial value must be >= 0"))
+			return val.NoneVal()
 		}
 		st := &semaphoreState{value: v}
 		st.cond = sync.NewCond(&st.mu)
@@ -946,7 +970,8 @@ func (e *Engine) createThreadingModule() val.Value {
 		st.mu.Lock()
 		if st.isBounded && st.value+n > st.maxValue {
 			st.mu.Unlock()
-			panic("ValueError: Semaphore released too many times")
+			ctx.Raise(val.NewException(val.ValueErrorType, "Semaphore released too many times"))
+			return val.NoneVal()
 		}
 		st.value += n
 		for range n {
@@ -985,7 +1010,8 @@ func (e *Engine) createThreadingModule() val.Value {
 			v = args[0].AsInt64()
 		}
 		if v < 0 {
-			panic("ValueError: semaphore initial value must be >= 0")
+			ctx.Raise(val.NewException(val.ValueErrorType, "semaphore initial value must be >= 0"))
+			return val.NoneVal()
 		}
 		st := &semaphoreState{value: v, maxValue: v, isBounded: true}
 		st.cond = sync.NewCond(&st.mu)

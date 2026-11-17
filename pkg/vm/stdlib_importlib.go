@@ -44,7 +44,8 @@ func initImportlibTypes() {
 		ModuleSpecType.Dict.Set(val.InternString("__init__"), val.NewBuiltinFuncVal("__init__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			a := bindArgs("ModuleSpec", args, kwnames, "self", "name", "loader", "origin", "loader_state", "is_package")
 			if a[0].IsUnbound() || a[1].IsUnbound() || a[2].IsUnbound() {
-				panic("TypeError: ModuleSpec() requires name and loader")
+				ctx.Raise(val.NewException(val.TypeErrorType, "ModuleSpec() requires name and loader"))
+				return val.NoneVal()
 			}
 			self := a[0].AsInstance()
 			nameVal := a[1]
@@ -148,14 +149,16 @@ func initImportlibTypes() {
 		}))
 		LoaderBasicsType.Dict.Set(val.InternString("exec_module"), val.NewBuiltinFuncVal("exec_module", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 || !args[1].IsModule() {
-				panic("TypeError: exec_module() requires a module")
+				ctx.Raise(val.NewException(val.TypeErrorType, "exec_module() requires a module"))
+				return val.NoneVal()
 			}
 			self := args[0]
 			mod := args[1].AsModule()
 			getCodeFn := val.GetAttrCtx(ctx, self, val.InternString("get_code"))
 			codeVal := ctx.Invoke1(getCodeFn, val.NewStringVal(mod.Name))
 			if codeVal.IsNone() {
-				panic(val.NewImportError(fmt.Sprintf("cannot load module %q when get_code() returns None", mod.Name)))
+				ctx.Raise(val.NewImportError(fmt.Sprintf("cannot load module %q when get_code() returns None", mod.Name)))
+				return val.NoneVal()
 			}
 			vmInstance := ctx.VM.(*VM)
 			vmInstance.RunCodeWithGlobals(AsCodeObject(codeVal), mod.Dict)
@@ -166,12 +169,14 @@ func initImportlibTypes() {
 		}))
 		LoaderBasicsType.Dict.Set(val.InternString("load_module"), val.NewBuiltinFuncVal("load_module", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 || !args[1].IsAnyString() {
-				panic("TypeError: load_module() requires fullname")
+				ctx.Raise(val.NewException(val.TypeErrorType, "load_module() requires fullname"))
+				return val.NoneVal()
 			}
 			vmInstance := ctx.VM.(*VM)
 			modVal, err := vmInstance.ImportModule(args[1].AsString(), 0, true, nil)
 			if err != nil {
-				panic(val.NewImportError(err.Error()))
+				ctx.Raise(val.NewImportError(err.Error()))
+				return val.NoneVal()
 			}
 			return modVal
 		}))
@@ -180,7 +185,8 @@ func initImportlibTypes() {
 		FileLoaderType = val.MustNewType("FileLoader", []*val.PyType{LoaderBasicsType}, nil)
 		FileLoaderType.Dict.Set(val.InternString("__init__"), val.NewBuiltinFuncVal("__init__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 3 {
-				panic("TypeError: FileLoader.__init__() requires fullname and path")
+				ctx.Raise(val.NewException(val.TypeErrorType, "FileLoader.__init__() requires fullname and path"))
+				return val.NoneVal()
 			}
 			inst := args[0].AsInstance()
 			inst.SetAttr(val.InternString("name"), args[1])
@@ -195,12 +201,14 @@ func initImportlibTypes() {
 		}))
 		FileLoaderType.Dict.Set(val.InternString("get_data"), val.NewBuiltinFuncVal("get_data", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: get_data() requires path")
+				ctx.Raise(val.NewException(val.TypeErrorType, "get_data() requires path"))
+				return val.NoneVal()
 			}
 			reqPath := pathArg(ctx, args[1])
 			data, err := readLoaderFileBytes(reqPath)
 			if err != nil {
-				panic(val.NewException(val.FileNotFoundErrorType, err.Error()))
+				ctx.Raise(val.NewException(val.FileNotFoundErrorType, err.Error()))
+				return val.NoneVal()
 			}
 			return val.NewBytesVal(data)
 		}))
@@ -226,7 +234,8 @@ func initImportlibTypes() {
 				start = 1
 			}
 			if len(args)-start < 1 {
-				panic("TypeError: source_to_code() requires data")
+				ctx.Raise(val.NewException(val.TypeErrorType, "source_to_code() requires data"))
+				return val.NoneVal()
 			}
 			dataVal := args[start]
 			pathStr := "<string>"
@@ -235,7 +244,8 @@ func initImportlibTypes() {
 			}
 			src, ok := sourceBytes(dataVal)
 			if !ok {
-				panic("TypeError: source_to_code() data must be str or bytes")
+				ctx.Raise(val.NewException(val.TypeErrorType, "source_to_code() data must be str or bytes"))
+				return val.NoneVal()
 			}
 			return compileSource(ctx, src, pathStr, "exec")
 		}))
@@ -244,14 +254,16 @@ func initImportlibTypes() {
 		SourceFileLoaderType = val.MustNewType("SourceFileLoader", []*val.PyType{FileLoaderType, SourceLoaderType}, nil)
 		SourceFileLoaderType.Dict.Set(val.InternString("path_stats"), val.NewBuiltinFuncVal("path_stats", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: path_stats() requires path")
+				ctx.Raise(val.NewException(val.TypeErrorType, "path_stats() requires path"))
+				return val.NoneVal()
 			}
 			reqPath := pathArg(ctx, args[1])
 			d := val.NewDictVal(2).AsDict()
 			if strings.HasPrefix(reqPath, "stdlib:") {
 				data, err := readLoaderFileBytes(reqPath)
 				if err != nil {
-					panic(val.NewException(val.FileNotFoundErrorType, err.Error()))
+					ctx.Raise(val.NewException(val.FileNotFoundErrorType, err.Error()))
+					return val.NoneVal()
 				}
 				d.Set(val.InternString("mtime"), val.Float64Val(0))
 				d.Set(val.InternString("size"), val.Int64Val(int64(len(data))))
@@ -259,7 +271,8 @@ func initImportlibTypes() {
 			}
 			info, err := os.Stat(reqPath)
 			if err != nil {
-				panic(val.NewException(val.FileNotFoundErrorType, err.Error()))
+				ctx.Raise(val.NewException(val.FileNotFoundErrorType, err.Error()))
+				return val.NoneVal()
 			}
 			d.Set(val.InternString("mtime"), val.Float64Val(float64(info.ModTime().UnixNano())/1e9))
 			d.Set(val.InternString("size"), val.Int64Val(info.Size()))
@@ -283,7 +296,8 @@ func initImportlibTypes() {
 			}
 			data, err := readLoaderFileBytes(p.AsString())
 			if err != nil {
-				panic(val.NewImportError(err.Error()))
+				ctx.Raise(val.NewImportError(err.Error()))
+				return val.NoneVal()
 			}
 			return val.NewStringVal(string(data))
 		}))
@@ -302,20 +316,23 @@ func initImportlibTypes() {
 			vmInstance := ctx.VM.(*VM)
 			co, err := vmInstance.engine.LoadOrCompileModule(p.AsString(), modName)
 			if err != nil {
-				panic(val.NewImportError(err.Error()))
+				ctx.Raise(val.NewImportError(err.Error()))
+				return val.NoneVal()
 			}
 			return NewCodeVal(co)
 		}))
 		SourceFileLoaderType.Dict.Set(val.InternString("exec_module"), val.NewBuiltinFuncVal("exec_module", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 || !args[1].IsModule() {
-				panic("TypeError: exec_module() requires a module")
+				ctx.Raise(val.NewException(val.TypeErrorType, "exec_module() requires a module"))
+				return val.NoneVal()
 			}
 			self := args[0]
 			inst := self.AsInstance()
 			mod := args[1].AsModule()
 			pVal, ok := inst.GetAttr(val.InternString("path"))
 			if !ok || !pVal.IsAnyString() {
-				panic(val.NewImportError("loader has no path"))
+				ctx.Raise(val.NewImportError("loader has no path"))
+				return val.NoneVal()
 			}
 			filePath := pVal.AsString()
 			mod.File = filePath
@@ -335,7 +352,8 @@ func initImportlibTypes() {
 			vmInstance := ctx.VM.(*VM)
 			co, err := vmInstance.engine.LoadOrCompileModule(filePath, mod.Name)
 			if err != nil {
-				panic(val.NewImportError(err.Error()))
+				ctx.Raise(val.NewImportError(err.Error()))
+				return val.NoneVal()
 			}
 			vmInstance.RunCodeWithGlobals(co, mod.Dict)
 			if vmHasException(vmInstance) {
@@ -354,17 +372,20 @@ func initImportlibTypes() {
 		}))
 		ExtensionFileLoaderType.Dict.Set(val.InternString("exec_module"), val.NewBuiltinFuncVal("exec_module", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 || !args[1].IsModule() {
-				panic("TypeError: exec_module() requires a module")
+				ctx.Raise(val.NewException(val.TypeErrorType, "exec_module() requires a module"))
+				return val.NoneVal()
 			}
 			self := args[0]
 			inst := self.AsInstance()
 			mod := args[1].AsModule()
 			if vmInstance, ok := ctx.VM.(*VM); ok && vmInstance != nil && vmInstance.sandboxBlocksNative() {
-				panic("PermissionError: native extensions and ctypes are disabled by sandbox policy")
+				ctx.Raise(val.NewException(val.PermissionErrorType, "native extensions and ctypes are disabled by sandbox policy"))
+				return val.NoneVal()
 			}
 			pVal, ok := inst.GetAttr(val.InternString("path"))
 			if !ok || !pVal.IsAnyString() {
-				panic(val.NewImportError("loader has no path"))
+				ctx.Raise(val.NewImportError("loader has no path"))
+				return val.NoneVal()
 			}
 			filePath := pVal.AsString()
 			mod.File = filePath
@@ -375,7 +396,8 @@ func initImportlibTypes() {
 				if ctx != nil && ctx.HasException() {
 					panic(ctx.ActiveException)
 				}
-				panic(val.NewImportError(err.Error()))
+				ctx.Raise(val.NewImportError(err.Error()))
+				return val.NoneVal()
 			}
 			return val.NoneVal()
 		}))
@@ -493,7 +515,8 @@ func initImportlibTypes() {
 		FileFinderType.Dict.Set(val.InternString("path_hook"), val.NewModuleFuncVal("path_hook", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			return val.NewModuleFuncVal("path_hook_for_FileFinder", func(ctx *val.ExecContext, callable val.Value, hArgs []val.Value, hKw []val.Value) val.Value {
 				if len(hArgs) < 1 {
-					panic(val.NewImportError("only directories are supported"))
+					ctx.Raise(val.NewImportError("only directories are supported"))
+					return val.NoneVal()
 				}
 				p := pathArg(ctx, hArgs[0])
 				if p == "" {
@@ -506,7 +529,8 @@ func initImportlibTypes() {
 				}
 				info, err := os.Stat(p)
 				if err != nil || !info.IsDir() {
-					panic(val.NewImportError("only directories are supported"))
+					ctx.Raise(val.NewImportError("only directories are supported"))
+					return val.NoneVal()
 				}
 				inst := val.NewInstanceOfType(FileFinderType)
 				inst.AsInstance().SetAttr(val.InternString("path"), val.NewStringVal(p))
@@ -854,11 +878,13 @@ func (e *Engine) createImpModule() val.Value {
 	mod.Dict.Set(val.InternString("check_hash_based_pycs"), val.InternString("default"))
 	mod.Dict.Set(val.InternString("source_hash"), val.NewBuiltinFuncVal("source_hash", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: source_hash() takes 2 positional arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "source_hash() takes 2 positional arguments"))
+			return val.NoneVal()
 		}
 		src, ok := sourceBytes(args[1])
 		if !ok {
-			panic("TypeError: source_hash() arg 2 must be bytes-like")
+			ctx.Raise(val.NewException(val.TypeErrorType, "source_hash() arg 2 must be bytes-like"))
+			return val.NoneVal()
 		}
 		h := ComputeSourceHash(src)
 		return val.NewBytesVal(h[:8])
@@ -921,13 +947,16 @@ func (e *Engine) createImpModule() val.Value {
 				pathStr = v.AsString()
 			}
 			if pathStr == "" {
-				panic("ImportError: exec_dynamic missing origin")
+				ctx.Raise(val.NewException(val.ImportErrorType, "exec_dynamic missing origin"))
+				return val.NoneVal()
 			}
 		} else {
-			panic("TypeError: exec_dynamic requires spec and module")
+			ctx.Raise(val.NewException(val.TypeErrorType, "exec_dynamic requires spec and module"))
+			return val.NoneVal()
 		}
 		if err := execExtensionModule(ctx, args[1], pathStr); err != nil {
-			panic(val.NewImportError(err.Error()))
+			ctx.Raise(val.NewImportError(err.Error()))
+			return val.NoneVal()
 		}
 		return val.Int64Val(0)
 	}))
@@ -958,7 +987,8 @@ func (e *Engine) createFrozenImportlibModule() val.Value {
 	mod.Dict.Set(val.InternString("spec_from_loader"), val.NewBuiltinFuncVal("spec_from_loader", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		a := bindArgs("spec_from_loader", args, kwnames, "name", "loader", "origin", "is_package")
 		if a[0].IsUnbound() || a[1].IsUnbound() {
-			panic("TypeError: spec_from_loader() requires name and loader")
+			ctx.Raise(val.NewException(val.TypeErrorType, "spec_from_loader() requires name and loader"))
+			return val.NoneVal()
 		}
 		nameStr := a[0].AsString()
 		loaderVal := a[1]
@@ -997,7 +1027,8 @@ func (e *Engine) createFrozenImportlibModule() val.Value {
 
 	mod.Dict.Set(val.InternString("module_from_spec"), val.NewBuiltinFuncVal("module_from_spec", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 || !args[0].IsInstance() {
-			panic("TypeError: module_from_spec() requires a ModuleSpec")
+			ctx.Raise(val.NewException(val.TypeErrorType, "module_from_spec() requires a ModuleSpec"))
+			return val.NoneVal()
 		}
 		spec := args[0]
 		inst := spec.AsInstance()
@@ -1026,7 +1057,8 @@ func (e *Engine) createFrozenImportlibModule() val.Value {
 
 	mod.Dict.Set(val.InternString("_resolve_name"), val.NewBuiltinFuncVal("_resolve_name", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 3 {
-			panic("TypeError: _resolve_name() takes 3 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "_resolve_name() takes 3 arguments"))
+			return val.NoneVal()
 		}
 		name := args[0].AsString()
 		pkg := args[1].AsString()
@@ -1034,7 +1066,8 @@ func (e *Engine) createFrozenImportlibModule() val.Value {
 		parts := strings.Split(pkg, ".")
 		steps := level - 1
 		if steps > len(parts) || steps < 0 {
-			panic(val.NewImportError("attempted relative import beyond top-level package"))
+			ctx.Raise(val.NewImportError("attempted relative import beyond top-level package"))
+			return val.NoneVal()
 		}
 		base := strings.Join(parts[:len(parts)-steps], ".")
 		if name != "" {
@@ -1079,7 +1112,8 @@ func (e *Engine) createFrozenImportlibModule() val.Value {
 
 	mod.Dict.Set(val.InternString("_exec"), val.NewBuiltinFuncVal("_exec", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: _exec() requires spec and module")
+			ctx.Raise(val.NewException(val.TypeErrorType, "_exec() requires spec and module"))
+			return val.NoneVal()
 		}
 		spec := args[0]
 		module := args[1]
@@ -1094,7 +1128,8 @@ func (e *Engine) createFrozenImportlibModule() val.Value {
 
 	mod.Dict.Set(val.InternString("_gcd_import"), val.NewBuiltinFuncVal("_gcd_import", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 || !args[0].IsAnyString() {
-			panic("TypeError: _gcd_import() requires name")
+			ctx.Raise(val.NewException(val.TypeErrorType, "_gcd_import() requires name"))
+			return val.NoneVal()
 		}
 		name := args[0].AsString()
 		pkg := ""
@@ -1179,7 +1214,8 @@ func (e *Engine) createFrozenImportlibExternalModule() val.Value {
 
 	mod.Dict.Set(val.InternString("_pack_uint32"), val.NewBuiltinFuncVal("_pack_uint32", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: _pack_uint32() requires 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "_pack_uint32() requires 1 argument"))
+			return val.NoneVal()
 		}
 		var b [4]byte
 		binary.LittleEndian.PutUint32(b[:], uint32(intArg(ctx, args[0], 0)))
@@ -1187,18 +1223,21 @@ func (e *Engine) createFrozenImportlibExternalModule() val.Value {
 	}))
 	mod.Dict.Set(val.InternString("_unpack_uint32"), val.NewBuiltinFuncVal("_unpack_uint32", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: _unpack_uint32() requires 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "_unpack_uint32() requires 1 argument"))
+			return val.NoneVal()
 		}
 		data, ok := sourceBytes(args[0])
 		if !ok || len(data) < 4 {
-			panic("ValueError: _unpack_uint32() requires 4 bytes")
+			ctx.Raise(val.NewException(val.ValueErrorType, "_unpack_uint32() requires 4 bytes"))
+			return val.NoneVal()
 		}
 		return val.Int64Val(int64(binary.LittleEndian.Uint32(data[:4])))
 	}))
 
 	mod.Dict.Set(val.InternString("cache_from_source"), val.NewBuiltinFuncVal("cache_from_source", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: cache_from_source() requires path")
+			ctx.Raise(val.NewException(val.TypeErrorType, "cache_from_source() requires path"))
+			return val.NoneVal()
 		}
 		p := pathArg(ctx, args[0])
 		dir := filepath.Dir(p)
@@ -1208,7 +1247,8 @@ func (e *Engine) createFrozenImportlibExternalModule() val.Value {
 
 	mod.Dict.Set(val.InternString("source_from_cache"), val.NewBuiltinFuncVal("source_from_cache", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: source_from_cache() requires path")
+			ctx.Raise(val.NewException(val.TypeErrorType, "source_from_cache() requires path"))
+			return val.NoneVal()
 		}
 		p := pathArg(ctx, args[0])
 		dir := filepath.Dir(filepath.Dir(p))
@@ -1221,11 +1261,13 @@ func (e *Engine) createFrozenImportlibExternalModule() val.Value {
 
 	mod.Dict.Set(val.InternString("decode_source"), val.NewBuiltinFuncVal("decode_source", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: decode_source() requires source_bytes")
+			ctx.Raise(val.NewException(val.TypeErrorType, "decode_source() requires source_bytes"))
+			return val.NoneVal()
 		}
 		b, ok := sourceBytes(args[0])
 		if !ok {
-			panic("TypeError: decode_source() requires bytes-like object")
+			ctx.Raise(val.NewException(val.TypeErrorType, "decode_source() requires bytes-like object"))
+			return val.NoneVal()
 		}
 		return val.NewStringVal(string(b))
 	}))
@@ -1233,7 +1275,8 @@ func (e *Engine) createFrozenImportlibExternalModule() val.Value {
 	mod.Dict.Set(val.InternString("spec_from_file_location"), val.NewBuiltinFuncVal("spec_from_file_location", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		a := bindArgs("spec_from_file_location", args, kwnames, "name", "location", "loader", "submodule_search_locations")
 		if a[0].IsUnbound() {
-			panic("TypeError: spec_from_file_location() missing required argument 'name'")
+			ctx.Raise(val.NewException(val.TypeErrorType, "spec_from_file_location() missing required argument 'name'"))
+			return val.NoneVal()
 		}
 		nameStr := a[0].AsString()
 		locStr := "<unknown>"

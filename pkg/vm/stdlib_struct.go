@@ -503,7 +503,8 @@ func initStructTypes() {
 
 		structType.Dict.Set(val.InternString("pack"), val.NewBuiltinFuncVal("pack", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: pack() missing self")
+				ctx.Raise(val.NewException(val.TypeErrorType, "pack() missing self"))
+				return val.NoneVal()
 			}
 			ps := (*pyStruct)(val.AsPointer(args[0]))
 			buf := make([]byte, ps.pf.size)
@@ -516,12 +517,14 @@ func initStructTypes() {
 
 		structType.Dict.Set(val.InternString("pack_into"), val.NewBuiltinFuncVal("pack_into", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 3 {
-				panic("TypeError: pack_into() takes at least 2 arguments")
+				ctx.Raise(val.NewException(val.TypeErrorType, "pack_into() takes at least 2 arguments"))
+				return val.NoneVal()
 			}
 			ps := (*pyStruct)(val.AsPointer(args[0]))
 			b, ok := getBytesFromValue(args[1])
 			if !ok {
-				panic("TypeError: pack_into() requires a buffer")
+				ctx.Raise(val.NewException(val.TypeErrorType, "pack_into() requires a buffer"))
+				return val.NoneVal()
 			}
 			offset := int(args[2].AsInt64())
 			if offset < 0 || offset+ps.pf.size > len(b) {
@@ -537,12 +540,14 @@ func initStructTypes() {
 
 		structType.Dict.Set(val.InternString("unpack"), val.NewBuiltinFuncVal("unpack", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: unpack() missing buffer")
+				ctx.Raise(val.NewException(val.TypeErrorType, "unpack() missing buffer"))
+				return val.NoneVal()
 			}
 			ps := (*pyStruct)(val.AsPointer(args[0]))
 			b, ok := getBytesFromValue(args[1])
 			if !ok {
-				panic("TypeError: unpack() requires bytes-like object")
+				ctx.Raise(val.NewException(val.TypeErrorType, "unpack() requires bytes-like object"))
+				return val.NoneVal()
 			}
 			vals, err := unpackValues(ps.pf, b)
 			if err != nil {
@@ -554,12 +559,14 @@ func initStructTypes() {
 
 		structType.Dict.Set(val.InternString("unpack_from"), val.NewBuiltinFuncVal("unpack_from", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: unpack_from() missing buffer")
+				ctx.Raise(val.NewException(val.TypeErrorType, "unpack_from() missing buffer"))
+				return val.NoneVal()
 			}
 			ps := (*pyStruct)(val.AsPointer(args[0]))
 			b, ok := getBytesFromValue(args[1])
 			if !ok {
-				panic("TypeError: unpack_from() requires bytes-like object")
+				ctx.Raise(val.NewException(val.TypeErrorType, "unpack_from() requires bytes-like object"))
+				return val.NoneVal()
 			}
 			offset := 0
 			if len(args) > 2 {
@@ -579,12 +586,14 @@ func initStructTypes() {
 
 		structType.Dict.Set(val.InternString("iter_unpack"), val.NewBuiltinFuncVal("iter_unpack", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: iter_unpack() missing buffer")
+				ctx.Raise(val.NewException(val.TypeErrorType, "iter_unpack() missing buffer"))
+				return val.NoneVal()
 			}
 			ps := (*pyStruct)(val.AsPointer(args[0]))
 			b, ok := getBytesFromValue(args[1])
 			if !ok {
-				panic("TypeError: iter_unpack() requires bytes-like object")
+				ctx.Raise(val.NewException(val.TypeErrorType, "iter_unpack() requires bytes-like object"))
+				return val.NoneVal()
 			}
 			if ps.pf.size == 0 {
 				exc := val.NewException(structErrorType, "cannot iter_unpack with zero size")
@@ -689,7 +698,8 @@ func (e *Engine) createStructModule() val.Value {
 		}
 		b, ok := getBytesFromValue(pa[1])
 		if !ok {
-			panic("TypeError: pack_into() requires a buffer")
+			ctx.Raise(val.NewException(val.TypeErrorType, "pack_into() requires a buffer"))
+			return val.NoneVal()
 		}
 		offset := int(pa[2].AsInt64())
 		if offset < 0 || offset+pf.size > len(b) {
@@ -722,7 +732,8 @@ func (e *Engine) createStructModule() val.Value {
 		}
 		b, ok := getBytesFromValue(pa[1])
 		if !ok {
-			panic("TypeError: unpack() requires bytes-like object")
+			ctx.Raise(val.NewException(val.TypeErrorType, "unpack() requires bytes-like object"))
+			return val.NoneVal()
 		}
 		vals, err := unpackValues(pf, b)
 		if err != nil {
@@ -751,7 +762,8 @@ func (e *Engine) createStructModule() val.Value {
 		}
 		b, ok := getBytesFromValue(pa[1])
 		if !ok {
-			panic("TypeError: unpack_from() requires bytes-like object")
+			ctx.Raise(val.NewException(val.TypeErrorType, "unpack_from() requires bytes-like object"))
+			return val.NoneVal()
 		}
 		offset := 0
 		if len(pa) > 2 {
@@ -788,7 +800,8 @@ func (e *Engine) createStructModule() val.Value {
 		}
 		b, ok := getBytesFromValue(pa[1])
 		if !ok {
-			panic("TypeError: iter_unpack() requires bytes-like object")
+			ctx.Raise(val.NewException(val.TypeErrorType, "iter_unpack() requires bytes-like object"))
+			return val.NoneVal()
 		}
 		if pf.size == 0 {
 			exc := val.NewException(structErrorType, "cannot iter_unpack with zero size")

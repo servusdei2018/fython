@@ -255,16 +255,19 @@ func initZipImportTypes() {
 
 		ZipImporterType.Dict.Set(val.InternString("__init__"), val.NewBuiltinFuncVal("__init__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: zipimporter() missing required argument 'path'")
+				ctx.Raise(val.NewException(val.TypeErrorType, "zipimporter() missing required argument 'path'"))
+				return val.NoneVal()
 			}
 			self := args[0]
 			p := pathArg(ctx, args[1])
 			if p == "" {
-				panic(val.NewException(ZipImportErrorType, "archive path is empty"))
+				ctx.Raise(val.NewException(ZipImportErrorType, "archive path is empty"))
+				return val.NoneVal()
 			}
 			archPath, prefix, arch, ok := splitZipArchivePath(p)
 			if !ok {
-				panic(val.NewException(ZipImportErrorType, fmt.Sprintf("not a Zip file: %q", p)))
+				ctx.Raise(val.NewException(ZipImportErrorType, fmt.Sprintf("not a Zip file: %q", p)))
+				return val.NoneVal()
 			}
 			if prefix != "" && !strings.HasSuffix(prefix, "/") {
 				prefix += "/"
@@ -346,12 +349,14 @@ func initZipImportTypes() {
 
 		ZipImporterType.Dict.Set(val.InternString("is_package"), val.NewBuiltinFuncVal("is_package", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 || !args[1].IsAnyString() {
-				panic("TypeError: is_package() requires module name")
+				ctx.Raise(val.NewException(val.TypeErrorType, "is_package() requires module name"))
+				return val.NoneVal()
 			}
 			fullname := args[1].AsString()
 			_, prefix, arch := getZipImporterState(args[0])
 			if arch == nil {
-				panic(val.NewException(ZipImportErrorType, fmt.Sprintf("can't find module %q", fullname)))
+				ctx.Raise(val.NewException(ZipImportErrorType, fmt.Sprintf("can't find module %q", fullname)))
+				return val.NoneVal()
 			}
 			leaf := fullname
 			if idx := strings.LastIndexByte(fullname, '.'); idx >= 0 {
@@ -359,19 +364,22 @@ func initZipImportTypes() {
 			}
 			_, isPkg, found := arch.findModule(strings.TrimSuffix(prefix, "/"), leaf)
 			if !found {
-				panic(val.NewException(ZipImportErrorType, fmt.Sprintf("can't find module %q", fullname)))
+				ctx.Raise(val.NewException(ZipImportErrorType, fmt.Sprintf("can't find module %q", fullname)))
+				return val.NoneVal()
 			}
 			return val.BoolVal(isPkg)
 		}))
 
 		ZipImporterType.Dict.Set(val.InternString("get_filename"), val.NewBuiltinFuncVal("get_filename", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 || !args[1].IsAnyString() {
-				panic("TypeError: get_filename() requires module name")
+				ctx.Raise(val.NewException(val.TypeErrorType, "get_filename() requires module name"))
+				return val.NoneVal()
 			}
 			fullname := args[1].AsString()
 			archPath, prefix, arch := getZipImporterState(args[0])
 			if arch == nil {
-				panic(val.NewException(ZipImportErrorType, fmt.Sprintf("can't find module %q", fullname)))
+				ctx.Raise(val.NewException(ZipImportErrorType, fmt.Sprintf("can't find module %q", fullname)))
+				return val.NoneVal()
 			}
 			leaf := fullname
 			if idx := strings.LastIndexByte(fullname, '.'); idx >= 0 {
@@ -379,19 +387,22 @@ func initZipImportTypes() {
 			}
 			entryPath, _, found := arch.findModule(strings.TrimSuffix(prefix, "/"), leaf)
 			if !found {
-				panic(val.NewException(ZipImportErrorType, fmt.Sprintf("can't find module %q", fullname)))
+				ctx.Raise(val.NewException(ZipImportErrorType, fmt.Sprintf("can't find module %q", fullname)))
+				return val.NoneVal()
 			}
 			return val.NewStringVal(archPath + "/" + entryPath)
 		}))
 
 		ZipImporterType.Dict.Set(val.InternString("get_source"), val.NewBuiltinFuncVal("get_source", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 || !args[1].IsAnyString() {
-				panic("TypeError: get_source() requires module name")
+				ctx.Raise(val.NewException(val.TypeErrorType, "get_source() requires module name"))
+				return val.NoneVal()
 			}
 			fullname := args[1].AsString()
 			_, prefix, arch := getZipImporterState(args[0])
 			if arch == nil {
-				panic(val.NewException(ZipImportErrorType, fmt.Sprintf("can't find module %q", fullname)))
+				ctx.Raise(val.NewException(ZipImportErrorType, fmt.Sprintf("can't find module %q", fullname)))
+				return val.NoneVal()
 			}
 			leaf := fullname
 			if idx := strings.LastIndexByte(fullname, '.'); idx >= 0 {
@@ -399,7 +410,8 @@ func initZipImportTypes() {
 			}
 			entryPath, _, found := arch.findModule(strings.TrimSuffix(prefix, "/"), leaf)
 			if !found {
-				panic(val.NewException(ZipImportErrorType, fmt.Sprintf("can't find module %q", fullname)))
+				ctx.Raise(val.NewException(ZipImportErrorType, fmt.Sprintf("can't find module %q", fullname)))
+				return val.NoneVal()
 			}
 			data, ok := arch.readEntry(entryPath)
 			if !ok {
@@ -410,12 +422,14 @@ func initZipImportTypes() {
 
 		ZipImporterType.Dict.Set(val.InternString("get_data"), val.NewBuiltinFuncVal("get_data", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: get_data() requires pathname")
+				ctx.Raise(val.NewException(val.TypeErrorType, "get_data() requires pathname"))
+				return val.NoneVal()
 			}
 			reqPath := pathArg(ctx, args[1])
 			archPath, _, arch := getZipImporterState(args[0])
 			if arch == nil {
-				panic(val.NewException(val.OSErrorType, fmt.Sprintf("can't find file %q", reqPath)))
+				ctx.Raise(val.NewException(val.OSErrorType, fmt.Sprintf("can't find file %q", reqPath)))
+				return val.NoneVal()
 			}
 			rel := filepath.ToSlash(reqPath)
 			slashArch := filepath.ToSlash(archPath)
@@ -426,19 +440,22 @@ func initZipImportTypes() {
 			}
 			data, ok := arch.readEntry(rel)
 			if !ok {
-				panic(val.NewException(val.FileNotFoundErrorType, fmt.Sprintf("No such file in zip archive: %q", reqPath)))
+				ctx.Raise(val.NewException(val.FileNotFoundErrorType, fmt.Sprintf("No such file in zip archive: %q", reqPath)))
+				return val.NoneVal()
 			}
 			return val.NewBytesVal(append([]byte(nil), data...))
 		}))
 
 		ZipImporterType.Dict.Set(val.InternString("get_code"), val.NewBuiltinFuncVal("get_code", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 || !args[1].IsAnyString() {
-				panic("TypeError: get_code() requires module name")
+				ctx.Raise(val.NewException(val.TypeErrorType, "get_code() requires module name"))
+				return val.NoneVal()
 			}
 			fullname := args[1].AsString()
 			archPath, prefix, arch := getZipImporterState(args[0])
 			if arch == nil {
-				panic(val.NewException(ZipImportErrorType, fmt.Sprintf("can't find module %q", fullname)))
+				ctx.Raise(val.NewException(ZipImportErrorType, fmt.Sprintf("can't find module %q", fullname)))
+				return val.NoneVal()
 			}
 			leaf := fullname
 			if idx := strings.LastIndexByte(fullname, '.'); idx >= 0 {
@@ -446,13 +463,15 @@ func initZipImportTypes() {
 			}
 			entryPath, _, found := arch.findModule(strings.TrimSuffix(prefix, "/"), leaf)
 			if !found {
-				panic(val.NewException(ZipImportErrorType, fmt.Sprintf("can't find module %q", fullname)))
+				ctx.Raise(val.NewException(ZipImportErrorType, fmt.Sprintf("can't find module %q", fullname)))
+				return val.NoneVal()
 			}
 			origin := archPath + "/" + entryPath
 			vmInstance := ctx.VM.(*VM)
 			co, err := vmInstance.engine.LoadOrCompileModule(origin, fullname)
 			if err != nil {
-				panic("SyntaxError: " + err.Error())
+				ctx.Raise(val.NewException(val.SyntaxErrorType, err.Error()))
+				return val.NoneVal()
 			}
 			return NewCodeVal(co)
 		}))
@@ -463,14 +482,16 @@ func initZipImportTypes() {
 
 		ZipImporterType.Dict.Set(val.InternString("exec_module"), val.NewBuiltinFuncVal("exec_module", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 || !args[1].IsModule() {
-				panic("TypeError: exec_module() requires a module object")
+				ctx.Raise(val.NewException(val.TypeErrorType, "exec_module() requires a module object"))
+				return val.NoneVal()
 			}
 			self := args[0]
 			modVal := args[1]
 			mod := modVal.AsModule()
 			archPath, prefix, arch := getZipImporterState(self)
 			if arch == nil {
-				panic(val.NewException(ZipImportErrorType, fmt.Sprintf("can't find module %q", mod.Name)))
+				ctx.Raise(val.NewException(ZipImportErrorType, fmt.Sprintf("can't find module %q", mod.Name)))
+				return val.NoneVal()
 			}
 			leaf := mod.Name
 			if idx := strings.LastIndexByte(mod.Name, '.'); idx >= 0 {
@@ -478,12 +499,14 @@ func initZipImportTypes() {
 			}
 			entryPath, isPkg, found := arch.findModule(strings.TrimSuffix(prefix, "/"), leaf)
 			if !found {
-				panic(val.NewException(ZipImportErrorType, fmt.Sprintf("can't find module %q", mod.Name)))
+				ctx.Raise(val.NewException(ZipImportErrorType, fmt.Sprintf("can't find module %q", mod.Name)))
+				return val.NoneVal()
 			}
 			origin := archPath + "/" + entryPath
 			if isExtensionFile(entryPath) {
 				if vmInstance, ok := ctx.VM.(*VM); ok && vmInstance != nil && vmInstance.sandboxBlocksNative() {
-					panic("PermissionError: native extensions and ctypes are disabled by sandbox policy")
+					ctx.Raise(val.NewException(val.PermissionErrorType, "native extensions and ctypes are disabled by sandbox policy"))
+					return val.NoneVal()
 				}
 				mod.File = origin
 				mod.Dict.Set(val.InternString("__file__"), val.NewStringVal(origin))
@@ -492,7 +515,8 @@ func initZipImportTypes() {
 					if ctx != nil && ctx.HasException() {
 						panic(ctx.ActiveException)
 					}
-					panic(val.NewImportError(err.Error()))
+					ctx.Raise(val.NewImportError(err.Error()))
+					return val.NoneVal()
 				}
 				return val.NoneVal()
 			}
@@ -514,7 +538,8 @@ func initZipImportTypes() {
 			vmInstance := ctx.VM.(*VM)
 			co, err := vmInstance.engine.LoadOrCompileModule(origin, mod.Name)
 			if err != nil {
-				panic("SyntaxError: " + err.Error())
+				ctx.Raise(val.NewException(val.SyntaxErrorType, err.Error()))
+				return val.NoneVal()
 			}
 			vmInstance.RunCodeWithGlobals(co, mod.Dict)
 			if vmHasException(vmInstance) {
@@ -525,13 +550,15 @@ func initZipImportTypes() {
 
 		ZipImporterType.Dict.Set(val.InternString("load_module"), val.NewBuiltinFuncVal("load_module", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 || !args[1].IsAnyString() {
-				panic("TypeError: load_module() requires module name")
+				ctx.Raise(val.NewException(val.TypeErrorType, "load_module() requires module name"))
+				return val.NoneVal()
 			}
 			fullname := args[1].AsString()
 			vmInstance := ctx.VM.(*VM)
 			modVal, err := vmInstance.ImportModule(fullname, 0, true, nil)
 			if err != nil {
-				panic(val.NewException(ZipImportErrorType, err.Error()))
+				ctx.Raise(val.NewException(ZipImportErrorType, err.Error()))
+				return val.NoneVal()
 			}
 			return modVal
 		}))

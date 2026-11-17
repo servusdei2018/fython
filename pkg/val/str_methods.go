@@ -181,7 +181,8 @@ func NativeRepr(ctx *ExecContext, v Value) string {
 func InstallNativeRepr(t *PyType) {
 	t.Dict.Set(InternString("__repr__"), NewBuiltinFuncVal(t.Name+".__repr__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) != 1 {
-			panic("TypeError: expected 0 arguments, got " + strconv.Itoa(len(args)-1))
+			ctx.Raise(NewException(TypeErrorType, "expected 0 arguments, got"+strconv.Itoa(len(args)-1)))
+			return NoneVal()
 		}
 		return NewStringVal(NativeRepr(ctx, args[0]))
 	}))
@@ -230,20 +231,22 @@ func PyFormat(ctx *ExecContext, v Value, spec string) string {
 			return res.String()
 		}
 		if s, ok := strMethodArg(v); ok {
-			return FormatValue(NewStringVal(s), spec, 0).AsString()
+			return FormatValueCtx(ctx, NewStringVal(s), spec, 0).AsString()
 		}
 		if spec != "" {
-			panic("TypeError: unsupported format string passed to " + v.Type().Name + ".__format__")
+			ctx.Raise(NewException(TypeErrorType, "unsupported format string passed to "+v.Type().Name+".__format__"))
+			return ""
 		}
 		return PyStr(ctx, v)
 	}
-	return FormatValue(v, spec, 0).AsString()
+	return FormatValueCtx(ctx, v, spec, 0).AsString()
 }
 
 // strFormatImpl implements str.format / str.format_map.
 func strFormatImpl(ctx *ExecContext, format string, pos []Value, kw func(string) (Value, bool), depth int) string {
 	if depth > 2 {
-		panic("ValueError: Max string recursion exceeded")
+		ctx.Raise(NewException(ValueErrorType, "Max string recursion exceeded"))
+		return ""
 	}
 	var sb strings.Builder
 	autoIdx := 0
@@ -256,7 +259,8 @@ func strFormatImpl(ctx *ExecContext, format string, pos []Value, kw func(string)
 				i += 2
 				continue
 			}
-			panic("ValueError: Single '}' encountered in format string")
+			ctx.Raise(NewException(ValueErrorType, "Single '}' encountered in format string"))
+			return ""
 		}
 		if c != '{' {
 			sb.WriteByte(c)
@@ -283,7 +287,8 @@ func strFormatImpl(ctx *ExecContext, format string, pos []Value, kw func(string)
 			j++
 		}
 		if j >= n {
-			panic("ValueError: expected '}' before end of string")
+			ctx.Raise(NewException(ValueErrorType, "expected '}' before end of string"))
+			return ""
 		}
 		field := format[i+1 : j]
 		i = j + 1
@@ -304,13 +309,15 @@ func strFormatImpl(ctx *ExecContext, format string, pos []Value, kw func(string)
 				rest := field[k:]
 				if ch == '!' {
 					if len(rest) < 2 {
-						panic("ValueError: end of string while looking for conversion specifier")
+						ctx.Raise(NewException(ValueErrorType, "end of string while looking for conversion specifier"))
+						return ""
 					}
 					conv = rest[1]
 					rest = rest[2:]
 					if len(rest) > 0 {
 						if rest[0] != ':' {
-							panic("ValueError: expected ':' after conversion specifier")
+							ctx.Raise(NewException(ValueErrorType, "expected ':' after conversion specifier"))
+							return ""
 						}
 						spec = rest[1:]
 					}
@@ -337,26 +344,31 @@ func strFormatImpl(ctx *ExecContext, format string, pos []Value, kw func(string)
 		var obj Value
 		if first == "" {
 			if autoIdx < 0 {
-				panic("ValueError: cannot switch from manual field specification to automatic field numbering")
+				ctx.Raise(NewException(ValueErrorType, "cannot switch from manual field specification to automatic field numbering"))
+				return ""
 			}
 			if autoIdx >= len(pos) {
-				panic("IndexError: Replacement index " + strconv.Itoa(autoIdx) + " out of range for positional args tuple")
+				ctx.Raise(NewException(IndexErrorType, "Replacement index"+strconv.Itoa(autoIdx)+" out of range for positional args tuple"))
+				return ""
 			}
 			obj = pos[autoIdx]
 			autoIdx++
 		} else if idx, err := strconv.Atoi(first); err == nil {
 			if autoIdx > 0 {
-				panic("ValueError: cannot switch from automatic field numbering to manual field specification")
+				ctx.Raise(NewException(ValueErrorType, "cannot switch from automatic field numbering to manual field specification"))
+				return ""
 			}
 			autoIdx = -1
 			if idx >= len(pos) {
-				panic("IndexError: Replacement index " + first + " out of range for positional args tuple")
+				ctx.Raise(NewException(IndexErrorType, "Replacement index"+first+" out of range for positional args tuple"))
+				return ""
 			}
 			obj = pos[idx]
 		} else {
 			v, ok := kw(first)
 			if !ok {
-				panic("KeyError: " + PyStrRepr(first))
+				ctx.Raise(NewException(KeyErrorType, PyStrRepr(first)))
+				return ""
 			}
 			obj = v
 		}
@@ -374,7 +386,8 @@ func strFormatImpl(ctx *ExecContext, format string, pos []Value, kw func(string)
 			case '[':
 				k := strings.IndexByte(rest, ']')
 				if k < 0 {
-					panic("ValueError: Missing ']' in format string")
+					ctx.Raise(NewException(ValueErrorType, "Missing ']' in format string"))
+					return ""
 				}
 				key := rest[1:k]
 				var keyVal Value
@@ -386,7 +399,8 @@ func strFormatImpl(ctx *ExecContext, format string, pos []Value, kw func(string)
 				obj = GetItemCtx(ctx, obj, keyVal)
 				rest = rest[k+1:]
 			default:
-				panic("ValueError: Only '.' or '[' may follow ']' in format field specifier")
+				ctx.Raise(NewException(ValueErrorType, "Only '.' or '[' may follow ']' in format field specifier"))
+				return ""
 			}
 		}
 		switch conv {
@@ -398,7 +412,8 @@ func strFormatImpl(ctx *ExecContext, format string, pos []Value, kw func(string)
 		case 'a':
 			obj = NewStringVal(asciiEscape(PyRepr(ctx, obj)))
 		default:
-			panic("ValueError: Unknown conversion specifier " + string(conv))
+			ctx.Raise(NewException(ValueErrorType, "Unknown conversion specifier"+string(conv)))
+			return ""
 		}
 		sb.WriteString(PyFormat(ctx, obj, spec))
 	}
@@ -744,28 +759,32 @@ func initStrExtraMethods() {
 	set("center", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		s := strSelf("center", args)
 		if len(args) < 2 {
-			panic("TypeError: center expected at least 1 argument, got 0")
+			ctx.Raise(NewException(TypeErrorType, "center expected at least 1 argument, got 0"))
+			return NoneVal()
 		}
 		return NewStringVal(strPad(s, strIntArg(args[1], 0), strFillArg(args, 2), '^'))
 	})
 	set("ljust", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		s := strSelf("ljust", args)
 		if len(args) < 2 {
-			panic("TypeError: ljust expected at least 1 argument, got 0")
+			ctx.Raise(NewException(TypeErrorType, "ljust expected at least 1 argument, got 0"))
+			return NoneVal()
 		}
 		return NewStringVal(strPad(s, strIntArg(args[1], 0), strFillArg(args, 2), '<'))
 	})
 	set("rjust", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		s := strSelf("rjust", args)
 		if len(args) < 2 {
-			panic("TypeError: rjust expected at least 1 argument, got 0")
+			ctx.Raise(NewException(TypeErrorType, "rjust expected at least 1 argument, got 0"))
+			return NoneVal()
 		}
 		return NewStringVal(strPad(s, strIntArg(args[1], 0), strFillArg(args, 2), '>'))
 	})
 	set("zfill", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		s := strSelf("zfill", args)
 		if len(args) < 2 {
-			panic("TypeError: zfill() takes exactly one argument (0 given)")
+			ctx.Raise(NewException(TypeErrorType, "zfill() takes exactly one argument (0 given)"))
+			return NoneVal()
 		}
 		width := strIntArg(args[1], 0)
 		ln := utf8.RuneCountInString(s)
@@ -812,31 +831,36 @@ func initStrExtraMethods() {
 	set("index", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		s := strSelf("index", args)
 		if len(args) < 2 {
-			panic("TypeError: index expected at least 1 argument, got 0")
+			ctx.Raise(NewException(TypeErrorType, "index expected at least 1 argument, got 0"))
+			return NoneVal()
 		}
 		sub, _ := strMethodArg(args[1])
 		idx := strFindImpl(s, sub, args[2:], false)
 		if idx < 0 {
-			panic("ValueError: substring not found")
+			ctx.Raise(NewException(ValueErrorType, "substring not found"))
+			return NoneVal()
 		}
 		return Int64Val(int64(idx))
 	})
 	set("rindex", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		s := strSelf("rindex", args)
 		if len(args) < 2 {
-			panic("TypeError: rindex expected at least 1 argument, got 0")
+			ctx.Raise(NewException(TypeErrorType, "rindex expected at least 1 argument, got 0"))
+			return NoneVal()
 		}
 		sub, _ := strMethodArg(args[1])
 		idx := strFindImpl(s, sub, args[2:], true)
 		if idx < 0 {
-			panic("ValueError: substring not found")
+			ctx.Raise(NewException(ValueErrorType, "substring not found"))
+			return NoneVal()
 		}
 		return Int64Val(int64(idx))
 	})
 	set("find", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		s := strSelf("find", args)
 		if len(args) < 2 {
-			panic("TypeError: find expected at least 1 argument, got 0")
+			ctx.Raise(NewException(TypeErrorType, "find expected at least 1 argument, got 0"))
+			return NoneVal()
 		}
 		sub, _ := strMethodArg(args[1])
 		return Int64Val(int64(strFindImpl(s, sub, args[2:], false)))
@@ -844,7 +868,8 @@ func initStrExtraMethods() {
 	set("rfind", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		s := strSelf("rfind", args)
 		if len(args) < 2 {
-			panic("TypeError: rfind expected at least 1 argument, got 0")
+			ctx.Raise(NewException(TypeErrorType, "rfind expected at least 1 argument, got 0"))
+			return NoneVal()
 		}
 		sub, _ := strMethodArg(args[1])
 		return Int64Val(int64(strFindImpl(s, sub, args[2:], true)))
@@ -852,7 +877,8 @@ func initStrExtraMethods() {
 	set("count", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		s := strSelf("count", args)
 		if len(args) < 2 {
-			panic("TypeError: count expected at least 1 argument, got 0")
+			ctx.Raise(NewException(TypeErrorType, "count expected at least 1 argument, got 0"))
+			return NoneVal()
 		}
 		sub, _ := strMethodArg(args[1])
 		if len(args) > 2 {
@@ -869,11 +895,13 @@ func initStrExtraMethods() {
 	set("partition", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		s := strSelf("partition", args)
 		if len(args) < 2 {
-			panic("TypeError: partition() takes exactly one argument (0 given)")
+			ctx.Raise(NewException(TypeErrorType, "partition() takes exactly one argument (0 given)"))
+			return NoneVal()
 		}
 		sep, _ := strMethodArg(args[1])
 		if sep == "" {
-			panic("ValueError: empty separator")
+			ctx.Raise(NewException(ValueErrorType, "empty separator"))
+			return NoneVal()
 		}
 		if before, after, ok := strings.Cut(s, sep); ok {
 			return NewTupleVal(NewStringVal(before), NewStringVal(sep), NewStringVal(after))
@@ -883,11 +911,13 @@ func initStrExtraMethods() {
 	set("rpartition", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		s := strSelf("rpartition", args)
 		if len(args) < 2 {
-			panic("TypeError: rpartition() takes exactly one argument (0 given)")
+			ctx.Raise(NewException(TypeErrorType, "rpartition() takes exactly one argument (0 given)"))
+			return NoneVal()
 		}
 		sep, _ := strMethodArg(args[1])
 		if sep == "" {
-			panic("ValueError: empty separator")
+			ctx.Raise(NewException(ValueErrorType, "empty separator"))
+			return NoneVal()
 		}
 		if idx := strings.LastIndex(s, sep); idx >= 0 {
 			return NewTupleVal(NewStringVal(s[:idx]), NewStringVal(sep), NewStringVal(s[idx+len(sep):]))
@@ -915,7 +945,8 @@ func initStrExtraMethods() {
 			}
 			sep, _ := strMethodArg(sepV)
 			if sep == "" {
-				panic("ValueError: empty separator")
+				ctx.Raise(NewException(ValueErrorType, "empty separator"))
+				return NoneVal()
 			}
 			if maxsplit < 0 {
 				return stringsToList(strings.Split(s, sep))
@@ -991,7 +1022,8 @@ func initStrExtraMethods() {
 			if len(args) > 1 && !args[1].IsNone() {
 				cut, ok := strMethodArg(args[1])
 				if !ok {
-					panic("TypeError: " + name + " arg must be None or str")
+					ctx.Raise(NewException(TypeErrorType, name+" arg must be None or str"))
+					return NoneVal()
 				}
 				switch mode {
 				case 0:
@@ -1019,7 +1051,8 @@ func initStrExtraMethods() {
 	set("removeprefix", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		s := strSelf("removeprefix", args)
 		if len(args) < 2 {
-			panic("TypeError: removeprefix() takes exactly one argument (0 given)")
+			ctx.Raise(NewException(TypeErrorType, "removeprefix() takes exactly one argument (0 given)"))
+			return NoneVal()
 		}
 		p, _ := strMethodArg(args[1])
 		return NewStringVal(strings.TrimPrefix(s, p))
@@ -1027,7 +1060,8 @@ func initStrExtraMethods() {
 	set("removesuffix", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		s := strSelf("removesuffix", args)
 		if len(args) < 2 {
-			panic("TypeError: removesuffix() takes exactly one argument (0 given)")
+			ctx.Raise(NewException(TypeErrorType, "removesuffix() takes exactly one argument (0 given)"))
+			return NoneVal()
 		}
 		p, _ := strMethodArg(args[1])
 		return NewStringVal(strings.TrimSuffix(s, p))
@@ -1036,7 +1070,8 @@ func initStrExtraMethods() {
 	set("translate", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		s := strSelf("translate", args)
 		if len(args) < 2 {
-			panic("TypeError: translate() takes exactly one argument (0 given)")
+			ctx.Raise(NewException(TypeErrorType, "translate() takes exactly one argument (0 given)"))
+			return NoneVal()
 		}
 		table := args[1]
 		var sb strings.Builder
@@ -1088,7 +1123,8 @@ func initStrExtraMethods() {
 	set("format_map", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		s := strSelf("format_map", args)
 		if len(args) < 2 {
-			panic("TypeError: format_map() takes exactly one argument (0 given)")
+			ctx.Raise(NewException(TypeErrorType, "format_map() takes exactly one argument (0 given)"))
+			return NoneVal()
 		}
 		mapping := args[1]
 		return NewStringVal(strFormatImpl(ctx, s, nil, func(name string) (Value, bool) {

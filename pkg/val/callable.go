@@ -344,7 +344,8 @@ func memberDescrTpDescrGet(ctx *ExecContext, descr, obj Value, owner *PyType) Va
 				return v
 			}
 		}
-		panic("val: AttributeError: '" + md.Owner.Name + "' object has no attribute '" + md.Name.AsString() + "'")
+		ctx.Raise(NewException(AttributeErrorType, "'"+md.Owner.Name+"' object has no attribute '"+md.Name.AsString()+"'"))
+		return NoneVal()
 	}
 	if obj.IsDict() && IsSubclass(obj.Type(), md.Owner) {
 		d := obj.AsDict()
@@ -353,7 +354,8 @@ func memberDescrTpDescrGet(ctx *ExecContext, descr, obj Value, owner *PyType) Va
 				return v
 			}
 		}
-		panic("val: AttributeError: '" + md.Owner.Name + "' object has no attribute '" + md.Name.AsString() + "'")
+		ctx.Raise(NewException(AttributeErrorType, "'"+md.Owner.Name+"' object has no attribute '"+md.Name.AsString()+"'"))
+		return NoneVal()
 	}
 	if obj.IsList() && IsSubclass(obj.Type(), md.Owner) {
 		l := obj.AsList()
@@ -362,7 +364,8 @@ func memberDescrTpDescrGet(ctx *ExecContext, descr, obj Value, owner *PyType) Va
 				return v
 			}
 		}
-		panic("val: AttributeError: '" + md.Owner.Name + "' object has no attribute '" + md.Name.AsString() + "'")
+		ctx.Raise(NewException(AttributeErrorType, "'"+md.Owner.Name+"' object has no attribute '"+md.Name.AsString()+"'"))
+		return NoneVal()
 	}
 	if obj.IsModule() && IsSubclass(obj.Type(), md.Owner) {
 		m := obj.AsModule()
@@ -371,18 +374,22 @@ func memberDescrTpDescrGet(ctx *ExecContext, descr, obj Value, owner *PyType) Va
 				return v
 			}
 		}
-		panic("val: AttributeError: '" + md.Owner.Name + "' object has no attribute '" + md.Name.AsString() + "'")
+		ctx.Raise(NewException(AttributeErrorType, "'"+md.Owner.Name+"' object has no attribute '"+md.Name.AsString()+"'"))
+		return NoneVal()
 	}
 	if !obj.IsInstance() {
-		panic("TypeError: descriptor '" + md.Name.AsString() + "' for '" + md.Owner.Name + "' objects doesn't apply to a '" + obj.Type().Name + "' object")
+		ctx.Raise(NewException(TypeErrorType, "descriptor '"+md.Name.AsString()+"' for '"+md.Owner.Name+"' objects doesn't apply to a '"+obj.Type().Name+"' object"))
+		return NoneVal()
 	}
 	inst := obj.AsInstance()
 	if md.SlotIndex < 0 || md.SlotIndex >= len(inst.Slots) {
-		panic("val: AttributeError: '" + md.Owner.Name + "' object has no attribute '" + md.Name.AsString() + "'")
+		ctx.Raise(NewException(AttributeErrorType, "'"+md.Owner.Name+"' object has no attribute '"+md.Name.AsString()+"'"))
+		return NoneVal()
 	}
 	val := inst.Slots[md.SlotIndex]
 	if val.IsUnbound() {
-		panic("val: AttributeError: '" + md.Owner.Name + "' object has no attribute '" + md.Name.AsString() + "'")
+		ctx.Raise(NewException(AttributeErrorType, "'"+md.Owner.Name+"' object has no attribute '"+md.Name.AsString()+"'"))
+		return NoneVal()
 	}
 	return val
 }
@@ -438,14 +445,17 @@ func memberDescrTpDescrSet(ctx *ExecContext, descr, obj, value Value) {
 		return
 	}
 	if !obj.IsInstance() {
-		panic("TypeError: descriptor '" + md.Name.AsString() + "' for '" + md.Owner.Name + "' objects doesn't apply to a '" + obj.Type().Name + "' object")
+		ctx.Raise(NewException(TypeErrorType, "descriptor '"+md.Name.AsString()+"' for '"+md.Owner.Name+"' objects doesn't apply to a '"+obj.Type().Name+"' object"))
+		return
 	}
 	inst := obj.AsInstance()
 	if md.SlotIndex < 0 || md.SlotIndex >= len(inst.Slots) {
-		panic("val: AttributeError: '" + md.Owner.Name + "' object has no attribute '" + md.Name.AsString() + "'")
+		ctx.Raise(NewException(AttributeErrorType, "'"+md.Owner.Name+"' object has no attribute '"+md.Name.AsString()+"'"))
+		return
 	}
 	if value.IsUnbound() && inst.Slots[md.SlotIndex].IsUnbound() {
-		panic("val: AttributeError: '" + md.Owner.Name + "' object has no attribute '" + md.Name.AsString() + "'")
+		ctx.Raise(NewException(AttributeErrorType, "'"+md.Owner.Name+"' object has no attribute '"+md.Name.AsString()+"'"))
+		return
 	}
 	inst.Slots[md.SlotIndex] = value
 }
@@ -491,7 +501,8 @@ func classMethodDescrGet(ctx *ExecContext, descr, obj Value, owner *PyType) Valu
 
 func classMethodTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 	if len(args) != 1 {
-		panic("TypeError: classmethod() takes exactly one argument")
+		ctx.Raise(NewException(TypeErrorType, "classmethod() takes exactly one argument"))
+		return NoneVal()
 	}
 	return NewClassMethodVal(args[0])
 }
@@ -529,7 +540,8 @@ func staticMethodDescrGet(ctx *ExecContext, descr, obj Value, owner *PyType) Val
 func staticMethodTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 	if callable.IsType() {
 		if len(args) != 1 {
-			panic("TypeError: staticmethod() takes exactly one argument")
+			ctx.Raise(NewException(TypeErrorType, "staticmethod() takes exactly one argument"))
+			return NoneVal()
 		}
 		return NewStaticMethodVal(args[0])
 	}
@@ -545,7 +557,8 @@ func staticMethodTpCall(ctx *ExecContext, callable Value, args []Value, kwnames 
 			return tpCall(ctx, inner, args, kwnames)
 		}
 	}
-	panic("TypeError: staticmethod object is not callable")
+	ctx.Raise(NewException(TypeErrorType, "staticmethod object is not callable"))
+	return NoneVal()
 }
 
 // Descriptor and Callable TypeSlot implementations.
@@ -778,6 +791,9 @@ func functionTpGetAttr(ctx *ExecContext, obj, name Value) Value {
 					base := ctx.SP
 					ctx.Stack[base] = Int64Val(1) // format 1 = inspect.VALUE
 					annDict = ctx.CallHook(ctx, annotateFn, base, 1, nil)
+					if ctx.HasException() {
+						return NoneVal()
+					}
 				}
 				if annDict.IsDict() {
 					fn.Dict.Set(name, annDict)
@@ -839,10 +855,12 @@ func builtinFuncTpCall(ctx *ExecContext, callable Value, args []Value, kwnames [
 func boundMethodTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 	if callable.IsType() {
 		if len(args) != 2 || len(kwnames) != 0 {
-			panic("TypeError: method expected 2 arguments, got " + strconv.Itoa(len(args)))
+			ctx.Raise(NewException(TypeErrorType, "method expected 2 arguments, got"+strconv.Itoa(len(args))))
+			return NoneVal()
 		}
 		if args[1].IsNone() {
-			panic("TypeError: method() arg 2 must not be None")
+			ctx.Raise(NewException(TypeErrorType, "method() arg 2 must not be None"))
+			return NoneVal()
 		}
 		return NewBoundMethodVal(args[1], args[0])
 	}
@@ -900,7 +918,8 @@ func propertyDescrGet(ctx *ExecContext, descr, obj Value, owner *PyType) Value {
 		return descr
 	}
 	if prop.FGet.ptr == nil || prop.FGet.IsNone() {
-		panic("val: AttributeError: unreadable attribute")
+		ctx.Raise(NewException(AttributeErrorType, "unreadable attribute"))
+		return NoneVal()
 	}
 	return ctx.Invoke1(prop.FGet, obj)
 }
@@ -909,18 +928,36 @@ func propertyDescrSet(ctx *ExecContext, descr, obj, value Value) {
 	prop := descr.AsProperty()
 	if value.IsUnbound() {
 		if prop.FDel.ptr == nil || prop.FDel.IsNone() {
-			panic("val: AttributeError: property has no deleter")
+			ctx.Raise(NewException(AttributeErrorType, "property has no deleter"))
+			return
 		}
 		ctx.Invoke1(prop.FDel, obj)
 		return
 	}
 	if prop.FSet.ptr == nil || prop.FSet.IsNone() {
-		panic("val: AttributeError: can't set attribute")
+		ctx.Raise(NewException(AttributeErrorType, "can't set attribute"))
+		return
 	}
 	ctx.Invoke2(prop.FSet, obj, value)
 }
 
 func superGetAttr(ctx *ExecContext, superObj, name Value) Value {
+	v, ok := superGetAttrOptional(ctx, superObj, name)
+	if !ok {
+		if ctx != nil {
+			if !ctx.HasException() {
+				ctx.Raise(NewLazyAttributeError(superObj.Type(), InternValue(name)))
+			}
+			return NoneVal()
+		}
+		interned := InternValue(name)
+		ctx.Raise(NewException(AttributeErrorType, "'super' object has no attribute '"+interned.AsString()+"'"))
+		return NoneVal()
+	}
+	return v
+}
+
+func superGetAttrOptional(ctx *ExecContext, superObj, name Value) (Value, bool) {
 	sup := superObj.AsSuper()
 	interned := InternValue(name)
 	var selfType *PyType
@@ -934,12 +971,12 @@ func superGetAttr(ctx *ExecContext, superObj, name Value) Value {
 	}
 	descr, _, ok := selfType.LookupMROAfter(sup.ThisClass, interned)
 	if !ok {
-		panic("AttributeError: 'super' object has no attribute '" + interned.AsString() + "'")
+		return NoneVal(), false
 	}
 	if descrGet := descr.Type().Slots.TpDescrGet; descrGet != nil {
-		return descrGet(ctx, descr, selfObj, selfType)
+		return descrGet(ctx, descr, selfObj, selfType), true
 	}
-	return descr
+	return descr, true
 }
 
 var (
@@ -1096,7 +1133,8 @@ func typeTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value)
 			}
 			t, err := NewType(name, bases, dict)
 			if err != nil {
-				panic("TypeError: " + err.Error())
+				ctx.Raise(NewException(TypeErrorType, err.Error()))
+				return NoneVal()
 			}
 			t.Flags |= FlagHeapType
 			if metacls != nil && metacls != TypeType {
@@ -1211,7 +1249,8 @@ func strSqItem(ctx *ExecContext, a, idxVal Value) Value {
 			ctx.Raise(NewTypeError("string indices must be integers, not '" + idxVal.Type().Name + "'"))
 			return NoneVal()
 		}
-		panic("TypeError: string indices must be integers, not '" + idxVal.Type().Name + "'")
+		ctx.Raise(NewException(TypeErrorType, "string indices must be integers, not '"+idxVal.Type().Name+"'"))
+		return NoneVal()
 	}
 	idx := int(idxVal.AsInt64())
 	s := a.AsString()
@@ -1224,7 +1263,8 @@ func strSqItem(ctx *ExecContext, a, idxVal Value) Value {
 				ctx.Raise(NewIndexError("string index out of range"))
 				return NoneVal()
 			}
-			panic("IndexError: string index out of range")
+			ctx.Raise(NewException(IndexErrorType, "string index out of range"))
+			return NoneVal()
 		}
 		return SmallStringVal(s[idx : idx+1])
 	}
@@ -1237,7 +1277,8 @@ func strSqItem(ctx *ExecContext, a, idxVal Value) Value {
 			ctx.Raise(NewIndexError("string index out of range"))
 			return NoneVal()
 		}
-		panic("IndexError: string index out of range")
+		ctx.Raise(NewException(IndexErrorType, "string index out of range"))
+		return NoneVal()
 	}
 	return NewStringVal(string(runes[idx]))
 }
@@ -1295,7 +1336,8 @@ func listSqLen(ctx *ExecContext, a Value) int64 {
 func listSqItem(ctx *ExecContext, a, idxVal Value) Value {
 	val, ok := a.AsList().Get(int(idxVal.AsInt64()))
 	if !ok {
-		panic("val: IndexError: list index out of range")
+		ctx.Raise(NewException(IndexErrorType, "list index out of range"))
+		return NoneVal()
 	}
 	return val
 }
@@ -1329,7 +1371,8 @@ func listMpSubscript(ctx *ExecContext, a, idxVal Value) Value {
 
 func listSqAssItem(ctx *ExecContext, a, idxVal, val Value) Value {
 	if !a.AsList().Set(int(idxVal.AsInt64()), val) {
-		panic("val: IndexError: list assignment index out of range")
+		ctx.Raise(NewException(IndexErrorType, "list assignment index out of range"))
+		return NoneVal()
 	}
 	return NoneVal()
 }
@@ -1352,7 +1395,8 @@ func listMpAssSubscript(ctx *ExecContext, a, idxVal, val Value) Value {
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
-						panic("TypeError: can only assign an iterable to a slice")
+						ctx.Raise(NewException(TypeErrorType, "can only assign an iterable to a slice"))
+						return
 					}
 				}()
 				rhsItems = ExtractIterableItems(ctx, val)
@@ -1367,7 +1411,8 @@ func listMpAssSubscript(ctx *ExecContext, a, idxVal, val Value) Value {
 			return NoneVal()
 		}
 		if len(rhsItems) != sliceLen {
-			panic("ValueError: attempt to assign sequence of size X to extended slice of size Y")
+			ctx.Raise(NewException(ValueErrorType, "attempt to assign sequence of size X to extended slice of size Y"))
+			return NoneVal()
 		}
 		cur := start
 		for i := range sliceLen {
@@ -1390,7 +1435,8 @@ func tupleSqItem(ctx *ExecContext, a, idxVal Value) Value {
 		idx += len(items)
 	}
 	if idx < 0 || idx >= len(items) {
-		panic("val: IndexError: tuple index out of range")
+		ctx.Raise(NewException(IndexErrorType, "tuple index out of range"))
+		return NoneVal()
 	}
 	return items[idx]
 }
@@ -1462,7 +1508,8 @@ func bytesMpSubscript(ctx *ExecContext, a, idxVal Value) Value {
 		idx += len(data)
 	}
 	if idx < 0 || idx >= len(data) {
-		panic("val: IndexError: index out of range")
+		ctx.Raise(NewException(IndexErrorType, "index out of range"))
+		return NoneVal()
 	}
 	return Int64Val(int64(data[idx]))
 }
@@ -1507,7 +1554,8 @@ func byteArrayMpSubscript(ctx *ExecContext, a, idxVal Value) Value {
 		idx += len(data)
 	}
 	if idx < 0 || idx >= len(data) {
-		panic("val: IndexError: bytearray index out of range")
+		ctx.Raise(NewException(IndexErrorType, "bytearray index out of range"))
+		return NoneVal()
 	}
 	return Int64Val(int64(data[idx]))
 }
@@ -1531,7 +1579,8 @@ func byteArrayMpAssSubscript(ctx *ExecContext, a, idxVal, val Value) Value {
 		case val.IsMemoryView():
 			rhsBytes = val.AsMemoryView().Buf
 		default:
-			panic("TypeError: can't set slice with non-bytes-like object")
+			ctx.Raise(NewException(TypeErrorType, "can't set slice with non-bytes-like object"))
+			return NoneVal()
 		}
 		if step == 1 {
 			capacity := len(ba.Data) - sliceLen + len(rhsBytes)
@@ -1554,7 +1603,8 @@ func byteArrayMpAssSubscript(ctx *ExecContext, a, idxVal, val Value) Value {
 			return NoneVal()
 		}
 		if len(rhsBytes) != sliceLen {
-			panic("ValueError: attempt to assign sequence of size X to extended slice of size Y")
+			ctx.Raise(NewException(ValueErrorType, "attempt to assign sequence of size X to extended slice of size Y"))
+			return NoneVal()
 		}
 		cur := start
 		for i := range sliceLen {
@@ -1568,11 +1618,13 @@ func byteArrayMpAssSubscript(ctx *ExecContext, a, idxVal, val Value) Value {
 		idx += len(ba.Data)
 	}
 	if idx < 0 || idx >= len(ba.Data) {
-		panic("val: IndexError: bytearray assignment index out of range")
+		ctx.Raise(NewException(IndexErrorType, "bytearray assignment index out of range"))
+		return NoneVal()
 	}
 	b := val.AsInt64()
 	if b < 0 || b > 255 {
-		panic("ValueError: byte must be in range(0, 256)")
+		ctx.Raise(NewException(ValueErrorType, "byte must be in range(0, 256)"))
+		return NoneVal()
 	}
 	ba.Data[idx] = byte(b)
 	return NoneVal()
@@ -1596,7 +1648,8 @@ func memoryViewTpAsBuffer(ctx *ExecContext, obj Value, view *PyBuffer, flags int
 func memoryViewMpSubscript(ctx *ExecContext, a, idxVal Value) Value {
 	mv := a.AsMemoryView()
 	if mv.released {
-		panic("ValueError: operation on released memoryview")
+		ctx.Raise(NewException(ValueErrorType, "operation on released memoryview"))
+		return NoneVal()
 	}
 	shape := mvEffectiveShape(mv)
 	strides := mvEffectiveStrides(mv)
@@ -1637,21 +1690,24 @@ func memoryViewMpSubscript(ctx *ExecContext, a, idxVal Value) Value {
 		tup := idxVal.AsTuple().Items
 		for _, it := range tup {
 			if !it.IsInt64() && !it.IsBool() {
-				panic("TypeError: memoryview indices must be integers or slices")
+				ctx.Raise(NewException(TypeErrorType, "memoryview indices must be integers or slices"))
+				return NoneVal()
 			}
 			indices = append(indices, int(it.AsInt64()))
 		}
 	case idxVal.IsInt64() || idxVal.IsBool():
 		indices = []int{int(idxVal.AsInt64())}
 	default:
-		panic("TypeError: memoryview indices must be integers, slices, or tuples of integers")
+		ctx.Raise(NewException(TypeErrorType, "memoryview indices must be integers, slices, or tuples of integers"))
+		return NoneVal()
 	}
 
 	if len(indices) == 0 {
 		return a
 	}
 	if len(indices) > ndim {
-		panic("IndexError: too many indices for memoryview")
+		ctx.Raise(NewException(IndexErrorType, "too many indices for memoryview"))
+		return NoneVal()
 	}
 	offset := 0
 	for dim, raw := range indices {
@@ -1661,7 +1717,8 @@ func memoryViewMpSubscript(ctx *ExecContext, a, idxVal Value) Value {
 			idx += dimLen
 		}
 		if idx < 0 || idx >= dimLen {
-			panic("IndexError: index out of bounds")
+			ctx.Raise(NewException(IndexErrorType, "index out of bounds"))
+			return NoneVal()
 		}
 		offset += idx * strides[dim]
 	}
@@ -1676,10 +1733,12 @@ func memoryViewMpSubscript(ctx *ExecContext, a, idxVal Value) Value {
 func memoryViewMpAssSubscript(ctx *ExecContext, a, idxVal, val Value) Value {
 	mv := a.AsMemoryView()
 	if mv.released {
-		panic("ValueError: operation on released memoryview")
+		ctx.Raise(NewException(ValueErrorType, "operation on released memoryview"))
+		return NoneVal()
 	}
 	if mv.ReadOnly {
-		panic("TypeError: cannot modify read-only memoryview")
+		ctx.Raise(NewException(TypeErrorType, "cannot modify read-only memoryview"))
+		return NoneVal()
 	}
 	shape := mvEffectiveShape(mv)
 	strides := mvEffectiveStrides(mv)
@@ -1698,7 +1757,8 @@ func memoryViewMpAssSubscript(ctx *ExecContext, a, idxVal, val Value) Value {
 			panic(err.Error())
 		}
 		if step != 1 {
-			panic("NotImplementedError: non-contiguous memoryview slice assignment")
+			ctx.Raise(NewException(NotImplementedErrorType, "non-contiguous memoryview slice assignment"))
+			return NoneVal()
 		}
 		_ = stop
 		var rhsBytes []byte
@@ -1710,7 +1770,8 @@ func memoryViewMpAssSubscript(ctx *ExecContext, a, idxVal, val Value) Value {
 		case val.IsMemoryView():
 			rhsBytes = val.AsMemoryView().Buf
 		default:
-			panic("TypeError: must assign bytes-like object")
+			ctx.Raise(NewException(TypeErrorType, "must assign bytes-like object"))
+			return NoneVal()
 		}
 		// For 1D byte views, length is in bytes; for typed views, count elements.
 		expected := sliceLen
@@ -1718,7 +1779,8 @@ func memoryViewMpAssSubscript(ctx *ExecContext, a, idxVal, val Value) Value {
 			expected = sliceLen * itemSize
 		}
 		if len(rhsBytes) != expected {
-			panic("ValueError: cannot resize memoryview")
+			ctx.Raise(NewException(ValueErrorType, "cannot resize memoryview"))
+			return NoneVal()
 		}
 		byteOff := start * strides[0]
 		// Fast path: contiguous 1D copy.
@@ -1740,18 +1802,21 @@ func memoryViewMpAssSubscript(ctx *ExecContext, a, idxVal, val Value) Value {
 	case idxVal.IsTuple():
 		for _, it := range idxVal.AsTuple().Items {
 			if !it.IsInt64() && !it.IsBool() {
-				panic("TypeError: memoryview indices must be integers")
+				ctx.Raise(NewException(TypeErrorType, "memoryview indices must be integers"))
+				return NoneVal()
 			}
 			indices = append(indices, int(it.AsInt64()))
 		}
 	case idxVal.IsInt64() || idxVal.IsBool():
 		indices = []int{int(idxVal.AsInt64())}
 	default:
-		panic("TypeError: memoryview indices must be integers")
+		ctx.Raise(NewException(TypeErrorType, "memoryview indices must be integers"))
+		return NoneVal()
 	}
 	if len(indices) != len(shape) {
 		// Assignment requires full index; slice assignment handled above.
-		panic("IndexError: too few indices for memoryview")
+		ctx.Raise(NewException(IndexErrorType, "too few indices for memoryview"))
+		return NoneVal()
 	}
 	offset := 0
 	for dim, raw := range indices {
@@ -1761,7 +1826,8 @@ func memoryViewMpAssSubscript(ctx *ExecContext, a, idxVal, val Value) Value {
 			idx += dimLen
 		}
 		if idx < 0 || idx >= dimLen {
-			panic("IndexError: index out of bounds")
+			ctx.Raise(NewException(IndexErrorType, "index out of bounds"))
+			return NoneVal()
 		}
 		offset += idx * strides[dim]
 	}
@@ -1780,7 +1846,8 @@ func sliceGetAttr(ctx *ExecContext, obj, name Value) Value {
 	case "step":
 		return sl.Step
 	default:
-		panic("AttributeError: 'slice' object has no attribute '" + attr + "'")
+		ctx.Raise(NewException(AttributeErrorType, "'slice' object has no attribute '"+attr+"'"))
+		return NoneVal()
 	}
 }
 
@@ -1794,7 +1861,8 @@ func dictMpSubscript(ctx *ExecContext, a, key Value) Value {
 		if a.Type() != DictType && a.Type().dunderMissing.ptr != nil {
 			return ctx.Invoke2(a.Type().dunderMissing, a, key)
 		}
-		panic("val: KeyError: " + key.String())
+		ctx.Raise(NewException(KeyErrorType, key.String()))
+		return NoneVal()
 	}
 	return v
 }
@@ -1809,7 +1877,8 @@ func dictMpAssSubscript(ctx *ExecContext, a, key, val Value) Value {
 // BuiltinLen implements the Python len(x) built-in with 0 heap allocations.
 func BuiltinLen(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 	if len(args) != 1 || len(kwnames) != 0 {
-		panic("val: TypeError: len() takes exactly one positional argument")
+		ctx.Raise(NewException(TypeErrorType, "len() takes exactly one positional argument"))
+		return NoneVal()
 	}
 	x := args[0]
 	if x.ptr == &tagInlineStr {
@@ -1835,7 +1904,8 @@ func BuiltinLen(ctx *ExecContext, callable Value, args []Value, kwnames []Value)
 	}
 	sqLen := x.Type().Slots.SqLen
 	if sqLen == nil {
-		panic("val: TypeError: object of type '" + x.Type().Name + "' has no len()")
+		ctx.Raise(NewException(TypeErrorType, "object of type '"+x.Type().Name+"' has no len()"))
+		return NoneVal()
 	}
 	return Int64Val(sqLen(ctx, x))
 }
@@ -1843,7 +1913,8 @@ func BuiltinLen(ctx *ExecContext, callable Value, args []Value, kwnames []Value)
 // BuiltinAbs implements the Python abs(x) built-in with 0 heap allocations.
 func BuiltinAbs(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 	if len(args) != 1 || len(kwnames) != 0 {
-		panic("val: TypeError: abs() takes exactly one positional argument")
+		ctx.Raise(NewException(TypeErrorType, "abs() takes exactly one positional argument"))
+		return NoneVal()
 	}
 	x := args[0]
 	if x.ptr == &tagInt64 {
@@ -1861,7 +1932,8 @@ func BuiltinAbs(ctx *ExecContext, callable Value, args []Value, kwnames []Value)
 	}
 	nbAbs := x.Type().Slots.NbAbs
 	if nbAbs == nil {
-		panic("val: TypeError: bad operand type for abs(): '" + x.Type().Name + "'")
+		ctx.Raise(NewException(TypeErrorType, "bad operand type for abs(): '"+x.Type().Name+"'"))
+		return NoneVal()
 	}
 	return nbAbs(ctx, x)
 }
@@ -1877,7 +1949,8 @@ func bytesNbAdd(ctx *ExecContext, a, b Value) Value {
 	if a.IsBytes() {
 		aBytes = a.AsBytes().Data
 	} else {
-		panic("TypeError: can't concat " + a.Type().Name + " to bytes")
+		ctx.Raise(NewException(TypeErrorType, "can't concat"+a.Type().Name+" to bytes"))
+		return NoneVal()
 	}
 	switch {
 	case b.IsBytes():
@@ -1885,7 +1958,8 @@ func bytesNbAdd(ctx *ExecContext, a, b Value) Value {
 	case b.IsByteArray():
 		bBytes = b.AsByteArray().Data
 	default:
-		panic("TypeError: can't concat " + b.Type().Name + " to bytes")
+		ctx.Raise(NewException(TypeErrorType, "can't concat"+b.Type().Name+" to bytes"))
+		return NoneVal()
 	}
 	return NewBytesFromConcat(aBytes, bBytes)
 }
@@ -1901,7 +1975,8 @@ func byteArrayNbAdd(ctx *ExecContext, a, b Value) Value {
 	case a.IsBytes():
 		aBytes = a.AsBytes().Data
 	default:
-		panic("TypeError: can't concat " + a.Type().Name + " to bytearray")
+		ctx.Raise(NewException(TypeErrorType, "can't concat"+a.Type().Name+" to bytearray"))
+		return NoneVal()
 	}
 
 	switch {
@@ -1915,7 +1990,8 @@ func byteArrayNbAdd(ctx *ExecContext, a, b Value) Value {
 	case b.IsMemoryView():
 		bBytes = b.AsMemoryView().Buf
 	default:
-		panic("TypeError: can't concat " + b.Type().Name + " to bytearray")
+		ctx.Raise(NewException(TypeErrorType, "can't concat"+b.Type().Name+" to bytearray"))
+		return NoneVal()
 	}
 
 	return NewByteArrayFromConcat(aBytes, bBytes)
@@ -1973,7 +2049,8 @@ func bytesTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value
 	if arg.IsInt64() {
 		n := int(arg.AsInt64())
 		if n < 0 {
-			panic("ValueError: negative count")
+			ctx.Raise(NewException(ValueErrorType, "negative count"))
+			return NoneVal()
 		}
 		return NewMappedBytesVal(n)
 	}
@@ -1997,7 +2074,8 @@ func bytesTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value
 		for i, it := range items {
 			b := it.AsInt64()
 			if b < 0 || b > 255 {
-				panic("ValueError: bytes must be in range(0, 256)")
+				ctx.Raise(NewException(ValueErrorType, "bytes must be in range(0, 256)"))
+				return NoneVal()
 			}
 			buf[i] = byte(b)
 		}
@@ -2014,7 +2092,8 @@ func bytesTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value
 		for i, it := range items {
 			b := it.AsInt64()
 			if b < 0 || b > 255 {
-				panic("ValueError: bytes must be in range(0, 256)")
+				ctx.Raise(NewException(ValueErrorType, "bytes must be in range(0, 256)"))
+				return NoneVal()
 			}
 			buf[i] = byte(b)
 		}
@@ -2032,13 +2111,15 @@ func bytesTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value
 		for i, it := range items {
 			b := it.AsInt64()
 			if b < 0 || b > 255 {
-				panic("ValueError: bytes must be in range(0, 256)")
+				ctx.Raise(NewException(ValueErrorType, "bytes must be in range(0, 256)"))
+				return NoneVal()
 			}
 			res[i] = byte(b)
 		}
 		return NewBytesVal(res)
 	}
-	panic("TypeError: cannot convert '" + arg.Type().Name + "' object to bytes")
+	ctx.Raise(NewException(TypeErrorType, "cannot convert '"+arg.Type().Name+"' object to bytes"))
+	return NoneVal()
 }
 
 func byteArrayTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
@@ -2049,7 +2130,8 @@ func byteArrayTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []V
 	if arg.IsInt64() {
 		n := int(arg.AsInt64())
 		if n < 0 {
-			panic("ValueError: negative count")
+			ctx.Raise(NewException(ValueErrorType, "negative count"))
+			return NoneVal()
 		}
 		return NewMappedByteArrayVal(n)
 	}
@@ -2073,7 +2155,8 @@ func byteArrayTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []V
 		for i, it := range items {
 			b := it.AsInt64()
 			if b < 0 || b > 255 {
-				panic("ValueError: byte must be in range(0, 256)")
+				ctx.Raise(NewException(ValueErrorType, "byte must be in range(0, 256)"))
+				return NoneVal()
 			}
 			buf[i] = byte(b)
 		}
@@ -2090,7 +2173,8 @@ func byteArrayTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []V
 		for i, it := range items {
 			b := it.AsInt64()
 			if b < 0 || b > 255 {
-				panic("ValueError: byte must be in range(0, 256)")
+				ctx.Raise(NewException(ValueErrorType, "byte must be in range(0, 256)"))
+				return NoneVal()
 			}
 			buf[i] = byte(b)
 		}
@@ -2108,18 +2192,21 @@ func byteArrayTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []V
 		for i, it := range items {
 			b := it.AsInt64()
 			if b < 0 || b > 255 {
-				panic("ValueError: byte must be in range(0, 256)")
+				ctx.Raise(NewException(ValueErrorType, "byte must be in range(0, 256)"))
+				return NoneVal()
 			}
 			res[i] = byte(b)
 		}
 		return NewByteArrayVal(res)
 	}
-	panic("TypeError: cannot convert '" + arg.Type().Name + "' object to bytearray")
+	ctx.Raise(NewException(TypeErrorType, "cannot convert '"+arg.Type().Name+"' object to bytearray"))
+	return NoneVal()
 }
 
 func memoryViewTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 	if len(args) < 1 {
-		panic("TypeError: memoryview() takes at least 1 argument")
+		ctx.Raise(NewException(TypeErrorType, "memoryview() takes at least 1 argument"))
+		return NoneVal()
 	}
 	return NewMemoryViewVal(args[0])
 }
@@ -2134,7 +2221,8 @@ func sliceTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value
 	if len(args) >= 3 {
 		return NewSliceVal(args[0], args[1], args[2])
 	}
-	panic("TypeError: slice() takes at least 1 argument")
+	ctx.Raise(NewException(TypeErrorType, "slice() takes at least 1 argument"))
+	return NoneVal()
 }
 
 func typeMpSubscript(ctx *ExecContext, a, b Value) Value {
@@ -2205,7 +2293,8 @@ func codeTpGetAttr(ctx *ExecContext, obj, name Value) Value {
 			})
 		}
 	}
-	panic("val: AttributeError: 'code' object has no attribute '" + nameStr + "'")
+	ctx.Raise(NewException(AttributeErrorType, "'code' object has no attribute '"+nameStr+"'"))
+	return NoneVal()
 }
 
 func frameTpGetAttr(ctx *ExecContext, obj, name Value) Value {
@@ -2243,7 +2332,8 @@ func frameTpGetAttr(ctx *ExecContext, obj, name Value) Value {
 	case "f_trace":
 		return NoneVal()
 	}
-	panic("val: AttributeError: 'frame' object has no attribute '" + nameStr + "'")
+	ctx.Raise(NewException(AttributeErrorType, "'frame' object has no attribute '"+nameStr+"'"))
+	return NoneVal()
 }
 
 func tracebackTpGetAttr(ctx *ExecContext, obj, name Value) Value {
@@ -2258,7 +2348,8 @@ func tracebackTpGetAttr(ctx *ExecContext, obj, name Value) Value {
 	case "tb_next":
 		return tb.Next
 	}
-	panic("val: AttributeError: 'traceback' object has no attribute '" + name.AsString() + "'")
+	ctx.Raise(NewException(AttributeErrorType, "'traceback' object has no attribute '"+name.AsString()+"'"))
+	return NoneVal()
 }
 
 func localsProxyCollectPairs(p *PyLocalsProxy) []DictEntry {
@@ -2388,7 +2479,8 @@ func localsProxyMpSubscript(ctx *ExecContext, obj, key Value) Value {
 			return v
 		}
 	}
-	panic("KeyError: '" + keyStr + "'")
+	ctx.Raise(NewException(KeyErrorType, "'"+keyStr+"'"))
+	return NoneVal()
 }
 
 func localsProxyMpAssSubscript(ctx *ExecContext, obj, key, val Value) Value {
@@ -2566,7 +2658,8 @@ func weakRefTpGetAttr(ctx *ExecContext, obj, name Value) Value {
 	if name.AsString() == "__callback__" {
 		return ref.Callback
 	}
-	panic("val: AttributeError: 'ReferenceType' object has no attribute '" + name.AsString() + "'")
+	ctx.Raise(NewException(AttributeErrorType, "'ReferenceType' object has no attribute '"+name.AsString()+"'"))
+	return NoneVal()
 }
 
 func weakProxyGetTarget(ctx *ExecContext, obj Value) (Value, bool) {
@@ -2576,7 +2669,8 @@ func weakProxyGetTarget(ctx *ExecContext, obj Value) (Value, bool) {
 		if ctx != nil {
 			ctx.Raise(NewException(ReferenceErrorType, "weakly-referenced object no longer exists"))
 		} else {
-			panic("ReferenceError: weakly-referenced object no longer exists")
+			ctx.Raise(NewException(ReferenceErrorType, "weakly-referenced object no longer exists"))
+			return NoneVal(), false
 		}
 		return Value{}, false
 	}
@@ -2614,7 +2708,8 @@ func weakProxyTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []V
 	if tpCall := target.Type().Slots.TpCall; tpCall != nil {
 		return tpCall(ctx, target, args, kwnames)
 	}
-	panic("TypeError: '" + target.Type().Name + "' object is not callable")
+	ctx.Raise(NewException(TypeErrorType, "'"+target.Type().Name+"' object is not callable"))
+	return NoneVal()
 }
 
 func tupleNbAdd(ctx *ExecContext, a, b Value) Value {
@@ -2626,7 +2721,8 @@ func tupleNbAdd(ctx *ExecContext, a, b Value) Value {
 		copy(merged[len(ta):], tb)
 		return NewTupleVal(merged...)
 	}
-	panic("TypeError: can only concatenate tuple (not \"" + b.Type().Name + "\") to tuple")
+	ctx.Raise(NewException(TypeErrorType, "can only concatenate tuple (not \\\""+b.Type().Name+"\") to tuple"))
+	return NoneVal()
 }
 
 func listNbMul(ctx *ExecContext, a, b Value) Value {
@@ -2749,7 +2845,8 @@ func ExtractIterableItems(ctx *ExecContext, arg Value) []Value {
 	if arg.IsIter() {
 		it := arg.AsIter()
 		if it.Kind == IterKindInvalid {
-			panic("TypeError: '" + it.Obj.Type().Name + "' object is not iterable")
+			ctx.Raise(NewException(TypeErrorType, "'"+it.Obj.Type().Name+"' object is not iterable"))
+			return nil
 		}
 		var res []Value
 		for {
@@ -2864,7 +2961,8 @@ func ExtractIterableItems(ctx *ExecContext, arg Value) []Value {
 	if tp != nil {
 		typeName = tp.Name
 	}
-	panic("TypeError: '" + typeName + "' object is not iterable")
+	ctx.Raise(NewException(TypeErrorType, "'"+typeName+"' object is not iterable"))
+	return nil
 }
 
 // NewFrozenDictVal wraps target dict into a frozendict Value.
@@ -3110,19 +3208,21 @@ func initTypes() {
 	IntType.Dict.Set(InternString("__str__"), intReprBuiltin)
 	IntType.Dict.Set(InternString("__format__"), NewBuiltinFuncVal("int.__format__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) != 2 || !args[1].IsAnyString() {
-			panic("TypeError: int.__format__() takes exactly one argument (str)")
+			ctx.Raise(NewException(TypeErrorType, "int.__format__() takes exactly one argument (str)"))
+			return NoneVal()
 		}
 		spec := args[1].AsString()
 		if args[0].IsBool() {
-			return NewStringVal(FormatBoolSpec(args[0].AsBool(), spec))
+			return NewStringVal(FormatBoolSpecCtx(ctx, args[0].AsBool(), spec))
 		}
 		if args[0].Kind() == KindBigInt {
-			return NewStringVal(FormatIntSpec(&args[0].AsBigInt().Val, spec))
+			return NewStringVal(FormatIntSpecCtx(ctx, &args[0].AsBigInt().Val, spec))
 		}
 		if n, ok := unwrapIntVal(args[0]); ok {
-			return NewStringVal(FormatInt64Spec(n, spec))
+			return NewStringVal(FormatInt64SpecCtx(ctx, n, spec))
 		}
-		panic("TypeError: descriptor '__format__' requires a 'int' object")
+		ctx.Raise(NewException(TypeErrorType, "descriptor '__format__' requires a 'int' object"))
+		return NoneVal()
 	}))
 	IntType.Dict.Set(DunderEq, NewBuiltinFuncVal("int.__eq__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
@@ -3408,7 +3508,8 @@ func initTypes() {
 			if _, ok := bi.SetString(s, base); ok {
 				return normBig(bi)
 			}
-			panic("ValueError: invalid literal for int() with base " + strconv.Itoa(base) + ": '" + s + "'")
+			ctx.Raise(NewException(ValueErrorType, "invalid literal for int() with base"+strconv.Itoa(base)+": '"+s+"'"))
+			return NoneVal()
 		}
 		if a.IsInstance() {
 			inst := a.AsInstance()
@@ -3422,7 +3523,8 @@ func initTypes() {
 				return ctx.Invoke1(fn, a)
 			}
 		}
-		panic("TypeError: int() argument must be a string or number")
+		ctx.Raise(NewException(TypeErrorType, "int() argument must be a string or number"))
+		return NoneVal()
 	}
 
 	IntType.Dict.Set(InternString("from_bytes"), NewBuiltinFuncVal("int.from_bytes", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
@@ -3431,7 +3533,8 @@ func initTypes() {
 			pa = pa[1:]
 		}
 		if len(pa) < 1 {
-			panic("TypeError: from_bytes() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "from_bytes() takes at least 1 argument"))
+			return NoneVal()
 		}
 		var rawBytes []byte
 		if b, ok := bytesMethodArg(pa[0]); ok {
@@ -3443,11 +3546,13 @@ func initTypes() {
 				if it.IsInt64() {
 					bVal := it.AsInt64()
 					if bVal < 0 || bVal > 255 {
-						panic("ValueError: byte must be in range(0, 256)")
+						ctx.Raise(NewException(ValueErrorType, "byte must be in range(0, 256)"))
+						return NoneVal()
 					}
 					rawBytes[i] = byte(bVal)
 				} else {
-					panic("TypeError: an integer is required")
+					ctx.Raise(NewException(TypeErrorType, "an integer is required"))
+					return NoneVal()
 				}
 			}
 		}
@@ -3473,7 +3578,8 @@ func initTypes() {
 				bCopy[i], bCopy[j] = bCopy[j], bCopy[i]
 			}
 		} else if byteorder != "big" {
-			panic("ValueError: byteorder must be either 'little' or 'big'")
+			ctx.Raise(NewException(ValueErrorType, "byteorder must be either 'little' or 'big'"))
+			return NoneVal()
 		}
 		bi := new(big.Int).SetBytes(bCopy)
 		if signed && (bCopy[0]&0x80) != 0 {
@@ -3487,7 +3593,8 @@ func initTypes() {
 	IntType.Dict.Set(InternString("to_bytes"), NewBuiltinFuncVal("int.to_bytes", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		pa, kw := splitStrKw(args, kwnames)
 		if len(pa) < 2 {
-			panic("TypeError: to_bytes() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "to_bytes() takes at least 1 argument"))
+			return NoneVal()
 		}
 		self := pa[0]
 		length := int(pa[1].AsInt64())
@@ -3503,7 +3610,8 @@ func initTypes() {
 		}
 		bi := toBigInt(self)
 		if !signed && bi.Sign() < 0 {
-			panic("OverflowError: can't convert negative int to unsigned")
+			ctx.Raise(NewException(OverflowErrorType, "can't convert negative int to unsigned"))
+			return NoneVal()
 		}
 		if signed && bi.Sign() < 0 {
 			shift := uint(length * 8)
@@ -3512,7 +3620,8 @@ func initTypes() {
 		}
 		b := bi.Bytes()
 		if len(b) > length {
-			panic("OverflowError: int too big to convert")
+			ctx.Raise(NewException(OverflowErrorType, "int too big to convert"))
+			return NoneVal()
 		}
 		res := make([]byte, length)
 		copy(res[length-len(b):], b)
@@ -3521,14 +3630,16 @@ func initTypes() {
 				res[i], res[j] = res[j], res[i]
 			}
 		} else if byteorder != "big" {
-			panic("ValueError: byteorder must be either 'little' or 'big'")
+			ctx.Raise(NewException(ValueErrorType, "byteorder must be either 'little' or 'big'"))
+			return NoneVal()
 		}
 		return NewBytesVal(res)
 	}))
 
 	IntType.Dict.Set(InternString("as_integer_ratio"), NewBuiltinFuncVal("int.as_integer_ratio", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: as_integer_ratio() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "as_integer_ratio() takes at least 1 argument"))
+			return NoneVal()
 		}
 		self := args[0]
 		return NewTupleVal(self, Int64Val(1))
@@ -3591,7 +3702,8 @@ func initTypes() {
 				if err == nil {
 					f = v
 				} else {
-					panic("ValueError: could not convert string to float: " + a.AsString())
+					ctx.Raise(NewException(ValueErrorType, "could not convert string to float:"+a.AsString()))
+					return NoneVal()
 				}
 			case a.IsInstance():
 				inst := a.AsInstance()
@@ -3618,7 +3730,8 @@ func initTypes() {
 	})
 	FloatType.Dict.Set(InternString("__format__"), NewBuiltinFuncVal("float.__format__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) != 2 || !args[1].IsAnyString() {
-			panic("TypeError: float.__format__() takes exactly one argument (str)")
+			ctx.Raise(NewException(TypeErrorType, "float.__format__() takes exactly one argument (str)"))
+			return NoneVal()
 		}
 		a := args[0]
 		if !a.IsFloat64() && a.IsInstance() {
@@ -3627,16 +3740,18 @@ func initTypes() {
 			}
 		}
 		if !a.IsFloat64() {
-			panic("TypeError: descriptor '__format__' requires a 'float' object")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__format__' requires a 'float' object"))
+			return NoneVal()
 		}
-		return NewStringVal(FormatFloatSpec(a.AsFloat64(), args[1].AsString()))
+		return NewStringVal(FormatFloatSpecCtx(ctx, a.AsFloat64(), args[1].AsString()))
 	}))
 	FloatType.Dict.Set(DunderNew, floatNewBuiltin)
 	FloatType.dunderNew = floatNewBuiltin
 
 	FloatType.Dict.Set(InternString("as_integer_ratio"), NewBuiltinFuncVal("float.as_integer_ratio", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: as_integer_ratio() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "as_integer_ratio() takes at least 1 argument"))
+			return NoneVal()
 		}
 		a := args[0]
 		if !a.IsFloat64() && a.IsInstance() {
@@ -3645,18 +3760,22 @@ func initTypes() {
 			}
 		}
 		if !a.IsFloat64() {
-			panic("TypeError: descriptor 'as_integer_ratio' requires a 'float' object")
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'as_integer_ratio' requires a 'float' object"))
+			return NoneVal()
 		}
 		f := a.AsFloat64()
 		if math.IsInf(f, 0) {
-			panic("OverflowError: cannot convert Infinity to integer ratio")
+			ctx.Raise(NewException(OverflowErrorType, "cannot convert Infinity to integer ratio"))
+			return NoneVal()
 		}
 		if math.IsNaN(f) {
-			panic("ValueError: cannot convert NaN to integer ratio")
+			ctx.Raise(NewException(ValueErrorType, "cannot convert NaN to integer ratio"))
+			return NoneVal()
 		}
 		rat := new(big.Rat).SetFloat64(f)
 		if rat == nil {
-			panic("ValueError: cannot convert float to integer ratio")
+			ctx.Raise(NewException(ValueErrorType, "cannot convert float to integer ratio"))
+			return NoneVal()
 		}
 		num := rat.Num()
 		denom := rat.Denom()
@@ -3676,7 +3795,8 @@ func initTypes() {
 
 	FloatType.Dict.Set(InternString("is_integer"), NewBuiltinFuncVal("float.is_integer", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: is_integer() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "is_integer() takes at least 1 argument"))
+			return NoneVal()
 		}
 		a := args[0]
 		if !a.IsFloat64() && a.IsInstance() {
@@ -3685,7 +3805,8 @@ func initTypes() {
 			}
 		}
 		if !a.IsFloat64() {
-			panic("TypeError: descriptor 'is_integer' requires a 'float' object")
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'is_integer' requires a 'float' object"))
+			return NoneVal()
 		}
 		f := a.AsFloat64()
 		return BoolVal(!math.IsNaN(f) && !math.IsInf(f, 0) && math.Trunc(f) == f)
@@ -3693,7 +3814,8 @@ func initTypes() {
 
 	FloatType.Dict.Set(InternString("hex"), NewBuiltinFuncVal("float.hex", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: hex() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "hex() takes at least 1 argument"))
+			return NoneVal()
 		}
 		a := args[0]
 		if !a.IsFloat64() && a.IsInstance() {
@@ -3702,7 +3824,8 @@ func initTypes() {
 			}
 		}
 		if !a.IsFloat64() {
-			panic("TypeError: descriptor 'hex' requires a 'float' object")
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'hex' requires a 'float' object"))
+			return NoneVal()
 		}
 		f := a.AsFloat64()
 		if math.IsNaN(f) {
@@ -3719,19 +3842,22 @@ func initTypes() {
 
 	fromhexBuiltin := NewBuiltinFuncVal("float.fromhex", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: fromhex() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "fromhex() takes at least 1 argument"))
+			return NoneVal()
 		}
 		target := args[0]
 		if target.IsType() && len(args) >= 2 {
 			target = args[1]
 		}
 		if !target.IsAnyString() {
-			panic("TypeError: fromhex() argument must be str")
+			ctx.Raise(NewException(TypeErrorType, "fromhex() argument must be str"))
+			return NoneVal()
 		}
 		s := strings.TrimSpace(target.AsString())
 		f, err := strconv.ParseFloat(s, 64)
 		if err != nil {
-			panic("ValueError: invalid hexadecimal floating-point string: " + s)
+			ctx.Raise(NewException(ValueErrorType, "invalid hexadecimal floating-point string:"+s))
+			return NoneVal()
 		}
 		return Float64Val(f)
 	})
@@ -3766,7 +3892,8 @@ func initTypes() {
 				return Float64Val(f)
 			}
 		}
-		panic("TypeError: float() argument must be a string or number")
+		ctx.Raise(NewException(TypeErrorType, "float() argument must be a string or number"))
+		return NoneVal()
 	}
 
 	initComplexType()
@@ -3830,11 +3957,13 @@ func initTypes() {
 			case encodingVal.ptr != nil && !encodingVal.IsNone():
 				b, ok := bytesMethodArg(a)
 				if !ok {
-					panic("TypeError: decoding to str need a bytes-like object, got '" + a.Type().Name + "'")
+					ctx.Raise(NewException(TypeErrorType, "decoding to str need a bytes-like object, got '"+a.Type().Name+"'"))
+					return NoneVal()
 				}
 				encStr, ok := unwrapStrVal(encodingVal)
 				if !ok {
-					panic("TypeError: str() argument 'encoding' must be str")
+					ctx.Raise(NewException(TypeErrorType, "str() argument 'encoding' must be str"))
+					return NoneVal()
 				}
 				decoded, err := DecodeBytesToString(b, encStr)
 				if err != nil {
@@ -3922,12 +4051,14 @@ func initTypes() {
 	}))
 	StrType.Dict.Set(InternString("__format__"), NewBuiltinFuncVal("str.__format__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) != 2 || !args[1].IsAnyString() {
-			panic("TypeError: str.__format__() takes exactly one argument (str)")
+			ctx.Raise(NewException(TypeErrorType, "str.__format__() takes exactly one argument (str)"))
+			return NoneVal()
 		}
 		if s, ok := unwrapStrVal(args[0]); ok {
-			return NewStringVal(FormatStrSpec(s, args[1].AsString()))
+			return NewStringVal(FormatStrSpecCtx(ctx, s, args[1].AsString()))
 		}
-		panic("TypeError: descriptor '__format__' requires a 'str' object")
+		ctx.Raise(NewException(TypeErrorType, "descriptor '__format__' requires a 'str' object"))
+		return NoneVal()
 	}))
 	StrType.Dict.Set(DunderEq, NewBuiltinFuncVal("str.__eq__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
@@ -4033,11 +4164,13 @@ func initTypes() {
 		if encodingVal.ptr != nil && !encodingVal.IsNone() {
 			b, ok := bytesMethodArg(a)
 			if !ok {
-				panic("TypeError: decoding to str need a bytes-like object, got '" + a.Type().Name + "'")
+				ctx.Raise(NewException(TypeErrorType, "decoding to str need a bytes-like object, got '"+a.Type().Name+"'"))
+				return NoneVal()
 			}
 			encStr, ok := unwrapStrVal(encodingVal)
 			if !ok {
-				panic("TypeError: str() argument 'encoding' must be str")
+				ctx.Raise(NewException(TypeErrorType, "str() argument 'encoding' must be str"))
+				return NoneVal()
 			}
 			decoded, err := DecodeBytesToString(b, encStr)
 			if err != nil {
@@ -4115,7 +4248,8 @@ func initTypes() {
 			fromStr := []rune(args[0].AsString())
 			toStr := []rune(args[1].AsString())
 			if len(fromStr) != len(toStr) {
-				panic("ValueError: the first two maketrans arguments must have equal length")
+				ctx.Raise(NewException(ValueErrorType, "the first two maketrans arguments must have equal length"))
+				return NoneVal()
 			}
 			for i := range fromStr {
 				resDict.Set(Int64Val(int64(fromStr[i])), Int64Val(int64(toStr[i])))
@@ -4131,7 +4265,8 @@ func initTypes() {
 
 	StrType.Dict.Set(InternString("lower"), NewBuiltinFuncVal("lower", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor 'lower' of 'str' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'lower' of 'str' object needs an argument"))
+			return NoneVal()
 		}
 		if s, ok := unwrapStrVal(args[0]); ok {
 			return NewStringVal(strings.ToLower(s))
@@ -4141,7 +4276,8 @@ func initTypes() {
 
 	StrType.Dict.Set(InternString("upper"), NewBuiltinFuncVal("upper", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor 'upper' of 'str' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'upper' of 'str' object needs an argument"))
+			return NoneVal()
 		}
 		if s, ok := unwrapStrVal(args[0]); ok {
 			return NewStringVal(strings.ToUpper(s))
@@ -4151,7 +4287,8 @@ func initTypes() {
 
 	StrType.Dict.Set(InternString("strip"), NewBuiltinFuncVal("strip", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor 'strip' of 'str' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'strip' of 'str' object needs an argument"))
+			return NoneVal()
 		}
 		cutset := " \t\r\n\v\f"
 		if len(args) > 1 && args[1].IsAnyString() {
@@ -4162,7 +4299,8 @@ func initTypes() {
 
 	StrType.Dict.Set(InternString("lstrip"), NewBuiltinFuncVal("lstrip", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor 'lstrip' of 'str' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'lstrip' of 'str' object needs an argument"))
+			return NoneVal()
 		}
 		cutset := " \t\r\n\v\f"
 		if len(args) > 1 && args[1].IsAnyString() {
@@ -4173,7 +4311,8 @@ func initTypes() {
 
 	StrType.Dict.Set(InternString("rstrip"), NewBuiltinFuncVal("rstrip", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor 'rstrip' of 'str' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'rstrip' of 'str' object needs an argument"))
+			return NoneVal()
 		}
 		cutset := " \t\r\n\v\f"
 		if len(args) > 1 && args[1].IsAnyString() {
@@ -4184,7 +4323,8 @@ func initTypes() {
 
 	StrType.Dict.Set(InternString("startswith"), NewBuiltinFuncVal("startswith", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: startswith() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "startswith() takes at least 1 argument"))
+			return NoneVal()
 		}
 		s := args[0].AsString()
 		sLen := len(s)
@@ -4234,7 +4374,8 @@ func initTypes() {
 
 	StrType.Dict.Set(InternString("endswith"), NewBuiltinFuncVal("endswith", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: endswith() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "endswith() takes at least 1 argument"))
+			return NoneVal()
 		}
 		s := args[0].AsString()
 		sLen := len(s)
@@ -4284,7 +4425,8 @@ func initTypes() {
 
 	StrType.Dict.Set(InternString("replace"), NewBuiltinFuncVal("replace", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 3 {
-			panic("TypeError: replace() takes at least 2 arguments")
+			ctx.Raise(NewException(TypeErrorType, "replace() takes at least 2 arguments"))
+			return NoneVal()
 		}
 		s := args[0].AsString()
 		oldStr := args[1].AsString()
@@ -4298,7 +4440,8 @@ func initTypes() {
 
 	StrType.Dict.Set(InternString("split"), NewBuiltinFuncVal("split", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor 'split' of 'str' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'split' of 'str' object needs an argument"))
+			return NoneVal()
 		}
 		s := args[0].AsString()
 		var parts []string
@@ -4325,7 +4468,8 @@ func initTypes() {
 
 	TypeType.Dict.Set(DunderCall, NewBuiltinFuncVal("type.__call__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 || !args[0].IsType() {
-			panic("TypeError: descriptor '__call__' of 'type' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__call__' of 'type' object needs an argument"))
+			return NoneVal()
 		}
 		cls := args[0]
 		return typeTpCall(ctx, cls, args[1:], kwnames)
@@ -4333,7 +4477,8 @@ func initTypes() {
 
 	StrType.Dict.Set(InternString("join"), NewBuiltinFuncVal("join", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: join() takes exactly one argument")
+			ctx.Raise(NewException(TypeErrorType, "join() takes exactly one argument"))
+			return NoneVal()
 		}
 		sep := args[0].AsString()
 		iterable := args[1]
@@ -4454,7 +4599,8 @@ func initTypes() {
 
 	StrType.Dict.Set(InternString("find"), NewBuiltinFuncVal("find", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: find() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "find() takes at least 1 argument"))
+			return NoneVal()
 		}
 		s := args[0].AsString()
 		sub := args[1].AsString()
@@ -4480,7 +4626,8 @@ func initTypes() {
 
 	StrType.Dict.Set(InternString("rfind"), NewBuiltinFuncVal("rfind", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: rfind() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "rfind() takes at least 1 argument"))
+			return NoneVal()
 		}
 		s := args[0].AsString()
 		sub := args[1].AsString()
@@ -4490,7 +4637,8 @@ func initTypes() {
 
 	StrType.Dict.Set(InternString("count"), NewBuiltinFuncVal("count", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: count() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "count() takes at least 1 argument"))
+			return NoneVal()
 		}
 		s := args[0].AsString()
 		sub := args[1].AsString()
@@ -4499,7 +4647,8 @@ func initTypes() {
 
 	StrType.Dict.Set(InternString("encode"), NewBuiltinFuncVal("encode", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor 'encode' of 'str' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'encode' of 'str' object needs an argument"))
+			return NoneVal()
 		}
 		return NewBytesVal([]byte(args[0].AsString()))
 	}))
@@ -4546,26 +4695,30 @@ func initTypes() {
 	ListType.dunderInit = listInitBuiltin
 	ListType.Dict.Set(DunderGetItem, NewBuiltinFuncVal("__getitem__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: descriptor '__getitem__' of 'list' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__getitem__' of 'list' object needs an argument"))
+			return NoneVal()
 		}
 		return listMpSubscript(ctx, args[0], args[1])
 	}))
 	ListType.Dict.Set(DunderSetItem, NewBuiltinFuncVal("__setitem__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 3 {
-			panic("TypeError: descriptor '__setitem__' of 'list' object needs 2 arguments")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__setitem__' of 'list' object needs 2 arguments"))
+			return NoneVal()
 		}
 		listMpAssSubscript(ctx, args[0], args[1], args[2])
 		return NoneVal()
 	}))
 	ListType.Dict.Set(DunderLen, NewBuiltinFuncVal("__len__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__len__' of 'list' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__len__' of 'list' object needs an argument"))
+			return NoneVal()
 		}
 		return Int64Val(int64(args[0].AsList().Len()))
 	}))
 	ListType.Dict.Set(DunderIter, NewBuiltinFuncVal("__iter__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__iter__' of 'list' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__iter__' of 'list' object needs an argument"))
+			return NoneVal()
 		}
 		return NewIterVal(args[0])
 	}))
@@ -4577,7 +4730,8 @@ func initTypes() {
 	}))
 	ListType.Dict.Set(InternString("index"), NewBuiltinFuncVal("index", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: index expected at least 1 argument, got 0")
+			ctx.Raise(NewException(TypeErrorType, "index expected at least 1 argument, got 0"))
+			return NoneVal()
 		}
 		items := args[0].AsList().Items
 		target := args[1]
@@ -4606,11 +4760,13 @@ func initTypes() {
 				return Int64Val(int64(i))
 			}
 		}
-		panic(NewException(ValueErrorType, fmt.Sprintf("%v is not in list", target)))
+		ctx.Raise(NewException(ValueErrorType, fmt.Sprintf("%v is not in list", target)))
+		return NoneVal()
 	}))
 	ListType.Dict.Set(InternString("count"), NewBuiltinFuncVal("count", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: count() takes exactly one argument")
+			ctx.Raise(NewException(TypeErrorType, "count() takes exactly one argument"))
+			return NoneVal()
 		}
 		items := args[0].AsList().Items
 		target := args[1]
@@ -4624,7 +4780,8 @@ func initTypes() {
 	}))
 	ListType.Dict.Set(InternString("sort"), NewBuiltinFuncVal("sort", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 || !args[0].IsList() {
-			panic("TypeError: descriptor 'sort' requires a list")
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'sort' requires a list"))
+			return NoneVal()
 		}
 		var keyFn Value
 		reverse := false
@@ -4638,7 +4795,8 @@ func initTypes() {
 				case "reverse":
 					reverse = v.IsTruthy()
 				default:
-					panic("TypeError: sort() got an unexpected keyword argument '" + kn.AsString() + "'")
+					ctx.Raise(NewException(TypeErrorType, "sort() got an unexpected keyword argument '"+kn.AsString()+"'"))
+					return NoneVal()
 				}
 			}
 		}
@@ -4664,7 +4822,8 @@ func initTypes() {
 	}))
 	ListType.Dict.Set(InternString("insert"), NewBuiltinFuncVal("insert", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 3 {
-			panic("TypeError: insert expected 2 arguments")
+			ctx.Raise(NewException(TypeErrorType, "insert expected 2 arguments"))
+			return NoneVal()
 		}
 		l := args[0].AsList()
 		idx := int(args[1].AsInt64())
@@ -4686,7 +4845,8 @@ func initTypes() {
 	}))
 	ListType.Dict.Set(InternString("remove"), NewBuiltinFuncVal("remove", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: list.remove() takes exactly one argument")
+			ctx.Raise(NewException(TypeErrorType, "list.remove() takes exactly one argument"))
+			return NoneVal()
 		}
 		l := args[0].AsList()
 		target := args[1]
@@ -4699,11 +4859,13 @@ func initTypes() {
 				return NoneVal()
 			}
 		}
-		panic(NewException(ValueErrorType, "list.remove(x): x not in list"))
+		ctx.Raise(NewException(ValueErrorType, "list.remove(x): x not in list"))
+		return NoneVal()
 	}))
 	ListType.Dict.Set(InternString("reverse"), NewBuiltinFuncVal("reverse", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor 'reverse' of 'list' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'reverse' of 'list' object needs an argument"))
+			return NoneVal()
 		}
 		l := args[0].AsList()
 		l.mu.Lock()
@@ -4715,13 +4877,15 @@ func initTypes() {
 	}))
 	ListType.Dict.Set(InternString("copy"), NewBuiltinFuncVal("copy", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor 'copy' of 'list' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'copy' of 'list' object needs an argument"))
+			return NoneVal()
 		}
 		return NewListVal(args[0].AsList().CopyItems()...)
 	}))
 	ListType.Dict.Set(InternString("append"), NewBuiltinFuncVal("append", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: append() takes exactly one argument")
+			ctx.Raise(NewException(TypeErrorType, "append() takes exactly one argument"))
+			return NoneVal()
 		}
 		list := args[0].AsList()
 		list.Append(args[1])
@@ -4730,7 +4894,8 @@ func initTypes() {
 
 	ListType.Dict.Set(InternString("extend"), NewBuiltinFuncVal("extend", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: extend() takes exactly one argument")
+			ctx.Raise(NewException(TypeErrorType, "extend() takes exactly one argument"))
+			return NoneVal()
 		}
 		list := args[0].AsList()
 		it := NewIterVal(args[1]).AsIter()
@@ -4746,13 +4911,15 @@ func initTypes() {
 
 	ListType.Dict.Set(InternString("pop"), NewBuiltinFuncVal("pop", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor 'pop' of 'list' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'pop' of 'list' object needs an argument"))
+			return NoneVal()
 		}
 		list := args[0].AsList()
 		list.mu.Lock()
 		defer list.mu.Unlock()
 		if len(list.Items) == 0 {
-			panic(NewException(IndexErrorType, "pop from empty list"))
+			ctx.Raise(NewException(IndexErrorType, "pop from empty list"))
+			return NoneVal()
 		}
 		idx := len(list.Items) - 1
 		if len(args) > 1 && args[1].IsInt64() {
@@ -4762,7 +4929,8 @@ func initTypes() {
 			}
 		}
 		if idx < 0 || idx >= len(list.Items) {
-			panic(NewException(IndexErrorType, "pop index out of range"))
+			ctx.Raise(NewException(IndexErrorType, "pop index out of range"))
+			return NoneVal()
 		}
 		res := list.Items[idx]
 		copy(list.Items[idx:], list.Items[idx+1:])
@@ -4771,7 +4939,8 @@ func initTypes() {
 	}))
 	ListType.Dict.Set(InternString("clear"), NewBuiltinFuncVal("clear", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor 'clear' of 'list' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'clear' of 'list' object needs an argument"))
+			return NoneVal()
 		}
 		list := args[0].AsList()
 		list.mu.Lock()
@@ -4782,11 +4951,13 @@ func initTypes() {
 
 	ListType.Dict.Set(InternString("__delitem__"), NewBuiltinFuncVal("__delitem__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: descriptor '__delitem__' of 'list' object needs 2 arguments")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__delitem__' of 'list' object needs 2 arguments"))
+			return NoneVal()
 		}
 		list := args[0].AsList()
 		if !args[1].IsInt64() {
-			panic("TypeError: list indices must be integers")
+			ctx.Raise(NewException(TypeErrorType, "list indices must be integers"))
+			return NoneVal()
 		}
 		idx := int(args[1].AsInt64())
 		list.mu.Lock()
@@ -4795,7 +4966,8 @@ func initTypes() {
 			idx += len(list.Items)
 		}
 		if idx < 0 || idx >= len(list.Items) {
-			panic(NewException(IndexErrorType, "list assignment index out of range"))
+			ctx.Raise(NewException(IndexErrorType, "list assignment index out of range"))
+			return NoneVal()
 		}
 		copy(list.Items[idx:], list.Items[idx+1:])
 		list.Items = list.Items[:len(list.Items)-1]
@@ -4816,7 +4988,8 @@ func initTypes() {
 	}))
 	listAddBuiltin := NewBuiltinFuncVal("list.__add__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: list.__add__ takes 2 arguments")
+			ctx.Raise(NewException(TypeErrorType, "list.__add__ takes 2 arguments"))
+			return NoneVal()
 		}
 		return listNbAdd(ctx, args[0], args[1])
 	})
@@ -4824,7 +4997,8 @@ func initTypes() {
 	ListType.dunderAdd = listAddBuiltin
 	listMulBuiltin := NewBuiltinFuncVal("list.__mul__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: list.__mul__ takes 2 arguments")
+			ctx.Raise(NewException(TypeErrorType, "list.__mul__ takes 2 arguments"))
+			return NoneVal()
 		}
 		return listNbMul(ctx, args[0], args[1])
 	})
@@ -4853,13 +5027,15 @@ func initTypes() {
 
 	DictType.Dict.Set(DunderGetItem, NewBuiltinFuncVal("__getitem__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: descriptor '__getitem__' of 'dict' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__getitem__' of 'dict' object needs an argument"))
+			return NoneVal()
 		}
 		return dictMpSubscript(ctx, args[0], args[1])
 	}))
 	DictType.Dict.Set(DunderSetItem, NewBuiltinFuncVal("__setitem__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 3 {
-			panic("TypeError: descriptor '__setitem__' of 'dict' object needs 2 arguments")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__setitem__' of 'dict' object needs 2 arguments"))
+			return NoneVal()
 		}
 		dictMpAssSubscript(ctx, args[0], args[1], args[2])
 		return NoneVal()
@@ -4867,18 +5043,21 @@ func initTypes() {
 
 	DictType.Dict.Set(InternString("__delitem__"), NewBuiltinFuncVal("__delitem__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: descriptor '__delitem__' of 'dict' object needs 2 arguments")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__delitem__' of 'dict' object needs 2 arguments"))
+			return NoneVal()
 		}
 		d := args[0].AsDict()
 		if !d.Delete(args[1]) {
-			panic(NewException(KeyErrorType, fmt.Sprintf("KeyError: %v", args[1])))
+			ctx.Raise(NewException(KeyErrorType, fmt.Sprintf("KeyError: %v", args[1])))
+			return NoneVal()
 		}
 		return NoneVal()
 	}))
 
 	DictType.Dict.Set(InternString("get"), NewBuiltinFuncVal("get", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: get expected at least 1 arguments, got 0")
+			ctx.Raise(NewException(TypeErrorType, "get expected at least 1 arguments, got 0"))
+			return NoneVal()
 		}
 		d := args[0].AsDict()
 		if val, ok := d.Get(args[1]); ok {
@@ -4922,67 +5101,78 @@ func initTypes() {
 	}
 	DictKeysType.Dict.Set(DunderSub, NewBuiltinFuncVal("__sub__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: __sub__() takes 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "__sub__() takes 1 argument"))
+			return NoneVal()
 		}
 		return dictKeysSub(ctx, args[0], args[1])
 	}))
 	DictKeysType.Dict.Set(InternString("__rsub__"), NewBuiltinFuncVal("__rsub__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: __rsub__() takes 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "__rsub__() takes 1 argument"))
+			return NoneVal()
 		}
 		return dictKeysSub(ctx, args[1], args[0])
 	}))
 	DictKeysType.Dict.Set(InternString("__or__"), NewBuiltinFuncVal("__or__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: __or__() takes 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "__or__() takes 1 argument"))
+			return NoneVal()
 		}
 		return dictKeysOr(ctx, args[0], args[1])
 	}))
 	DictKeysType.Dict.Set(InternString("__ror__"), NewBuiltinFuncVal("__ror__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: __ror__() takes 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "__ror__() takes 1 argument"))
+			return NoneVal()
 		}
 		return dictKeysOr(ctx, args[1], args[0])
 	}))
 	DictKeysType.Dict.Set(InternString("__and__"), NewBuiltinFuncVal("__and__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: __and__() takes 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "__and__() takes 1 argument"))
+			return NoneVal()
 		}
 		return dictKeysAnd(ctx, args[0], args[1])
 	}))
 	DictKeysType.Dict.Set(InternString("__rand__"), NewBuiltinFuncVal("__rand__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: __rand__() takes 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "__rand__() takes 1 argument"))
+			return NoneVal()
 		}
 		return dictKeysAnd(ctx, args[1], args[0])
 	}))
 	DictKeysType.Dict.Set(InternString("__xor__"), NewBuiltinFuncVal("__xor__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: __xor__() takes 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "__xor__() takes 1 argument"))
+			return NoneVal()
 		}
 		return dictKeysXor(ctx, args[0], args[1])
 	}))
 	DictKeysType.Dict.Set(InternString("__rxor__"), NewBuiltinFuncVal("__rxor__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: __rxor__() takes 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "__rxor__() takes 1 argument"))
+			return NoneVal()
 		}
 		return dictKeysXor(ctx, args[1], args[0])
 	}))
 	DictKeysType.Dict.Set(DunderIter, NewBuiltinFuncVal("__iter__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: __iter__() missing self")
+			ctx.Raise(NewException(TypeErrorType, "__iter__() missing self"))
+			return NoneVal()
 		}
 		return DictKeysType.Slots.TpIter(ctx, args[0])
 	}))
 	DictKeysType.Dict.Set(DunderLen, NewBuiltinFuncVal("__len__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: __len__() missing self")
+			ctx.Raise(NewException(TypeErrorType, "__len__() missing self"))
+			return NoneVal()
 		}
 		return Int64Val(DictKeysType.Slots.SqLen(ctx, args[0]))
 	}))
 	DictKeysType.Dict.Set(InternString("__contains__"), NewBuiltinFuncVal("__contains__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: __contains__() takes 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "__contains__() takes 1 argument"))
+			return NoneVal()
 		}
 		pk := (*PyDictKeys)(AsPointer(args[0]))
 		_, found := pk.Dict.Get(args[1])
@@ -4991,7 +5181,8 @@ func initTypes() {
 
 	DictType.Dict.Set(InternString("keys"), NewBuiltinFuncVal("keys", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor 'keys' of 'dict' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'keys' of 'dict' object needs an argument"))
+			return NoneVal()
 		}
 		d := args[0].AsDict()
 		return NewDictKeysVal(d)
@@ -4999,7 +5190,8 @@ func initTypes() {
 
 	DictType.Dict.Set(InternString("values"), NewBuiltinFuncVal("values", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor 'values' of 'dict' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'values' of 'dict' object needs an argument"))
+			return NoneVal()
 		}
 		d := args[0].AsDict()
 		return NewListVal(d.Values()...)
@@ -5007,7 +5199,8 @@ func initTypes() {
 
 	DictType.Dict.Set(InternString("items"), NewBuiltinFuncVal("items", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor 'items' of 'dict' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'items' of 'dict' object needs an argument"))
+			return NoneVal()
 		}
 		d := args[0].AsDict()
 		rawItems := d.Items()
@@ -5020,7 +5213,8 @@ func initTypes() {
 
 	DictType.Dict.Set(InternString("copy"), NewBuiltinFuncVal("copy", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor 'copy' of 'dict' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'copy' of 'dict' object needs an argument"))
+			return NoneVal()
 		}
 		d := args[0].AsDict()
 		newD := NewDictVal(d.Len()).AsDict()
@@ -5032,7 +5226,8 @@ func initTypes() {
 
 	DictType.Dict.Set(InternString("clear"), NewBuiltinFuncVal("clear", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor 'clear' of 'dict' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'clear' of 'dict' object needs an argument"))
+			return NoneVal()
 		}
 		d := args[0].AsDict()
 		d.Clear()
@@ -5041,7 +5236,8 @@ func initTypes() {
 
 	DictType.Dict.Set(InternString("pop"), NewBuiltinFuncVal("pop", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: pop expected at least 1 arguments, got 0")
+			ctx.Raise(NewException(TypeErrorType, "pop expected at least 1 arguments, got 0"))
+			return NoneVal()
 		}
 		d := args[0].AsDict()
 		if val, ok := d.Get(args[1]); ok {
@@ -5051,24 +5247,28 @@ func initTypes() {
 		if len(args) > 2 {
 			return args[2]
 		}
-		panic(NewException(KeyErrorType, "KeyError: "+args[1].String()))
+		ctx.Raise(NewException(KeyErrorType, "KeyError: "+args[1].String()))
+		return NoneVal()
 	}))
 
 	DictType.Dict.Set(InternString("popitem"), NewBuiltinFuncVal("popitem", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor 'popitem' of 'dict' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'popitem' of 'dict' object needs an argument"))
+			return NoneVal()
 		}
 		d := args[0].AsDict()
 		k, v, ok := d.PopItem()
 		if !ok {
-			panic(NewException(KeyErrorType, "popitem(): dictionary is empty"))
+			ctx.Raise(NewException(KeyErrorType, "popitem(): dictionary is empty"))
+			return NoneVal()
 		}
 		return NewTupleVal(k, v)
 	}))
 
 	DictType.Dict.Set(InternString("setdefault"), NewBuiltinFuncVal("setdefault", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: setdefault expected at least 1 arguments, got 0")
+			ctx.Raise(NewException(TypeErrorType, "setdefault expected at least 1 arguments, got 0"))
+			return NoneVal()
 		}
 		d := args[0].AsDict()
 		if val, ok := d.Get(args[1]); ok {
@@ -5084,7 +5284,8 @@ func initTypes() {
 
 	DictType.Dict.Set(InternString("update"), NewBuiltinFuncVal("update", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor 'update' of 'dict' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'update' of 'dict' object needs an argument"))
+			return NoneVal()
 		}
 		d := args[0].AsDict()
 		posCount := len(args) - len(kwnames)
@@ -5145,7 +5346,8 @@ func initTypes() {
 
 	DictType.Dict.Set(DunderContains, NewBuiltinFuncVal("__contains__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: descriptor '__contains__' of 'dict' object needs 2 arguments")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__contains__' of 'dict' object needs 2 arguments"))
+			return NoneVal()
 		}
 		d := args[0].AsDict()
 		_, ok := d.Get(args[1])
@@ -5154,14 +5356,16 @@ func initTypes() {
 
 	DictType.Dict.Set(DunderLen, NewBuiltinFuncVal("__len__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__len__' of 'dict' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__len__' of 'dict' object needs an argument"))
+			return NoneVal()
 		}
 		return Int64Val(int64(args[0].AsDict().Len()))
 	}))
 
 	DictType.Dict.Set(DunderIter, NewBuiltinFuncVal("__iter__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__iter__' of 'dict' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__iter__' of 'dict' object needs an argument"))
+			return NoneVal()
 		}
 		return NewIterVal(args[0])
 	}))
@@ -5223,19 +5427,22 @@ func initTypes() {
 	TupleType.dunderNew = tupleNewBuiltin
 	TupleType.Dict.Set(DunderGetItem, NewBuiltinFuncVal("__getitem__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: descriptor '__getitem__' of 'tuple' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__getitem__' of 'tuple' object needs an argument"))
+			return NoneVal()
 		}
 		return tupleMpSubscript(ctx, args[0], args[1])
 	}))
 	TupleType.Dict.Set(DunderLen, NewBuiltinFuncVal("__len__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__len__' of 'tuple' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__len__' of 'tuple' object needs an argument"))
+			return NoneVal()
 		}
 		return Int64Val(int64(len(args[0].AsTuple().Items)))
 	}))
 	TupleType.Dict.Set(DunderIter, NewBuiltinFuncVal("__iter__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__iter__' of 'tuple' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__iter__' of 'tuple' object needs an argument"))
+			return NoneVal()
 		}
 		return NewIterVal(args[0])
 	}))
@@ -5276,7 +5483,8 @@ func initTypes() {
 	}))
 	TupleType.Dict.Set(InternString("index"), NewBuiltinFuncVal("index", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: index expected at least 1 argument, got 0")
+			ctx.Raise(NewException(TypeErrorType, "index expected at least 1 argument, got 0"))
+			return NoneVal()
 		}
 		items := args[0].AsTuple().Items
 		target := args[1]
@@ -5305,11 +5513,13 @@ func initTypes() {
 				return Int64Val(int64(i))
 			}
 		}
-		panic(NewException(ValueErrorType, "tuple.index(x): x not in tuple"))
+		ctx.Raise(NewException(ValueErrorType, "tuple.index(x): x not in tuple"))
+		return NoneVal()
 	}))
 	TupleType.Dict.Set(InternString("count"), NewBuiltinFuncVal("count", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: count() takes exactly one argument")
+			ctx.Raise(NewException(TypeErrorType, "count() takes exactly one argument"))
+			return NoneVal()
 		}
 		var n int64
 		for _, it := range args[0].AsTuple().Items {
@@ -5321,7 +5531,8 @@ func initTypes() {
 	}))
 	tupleAddBuiltin := NewBuiltinFuncVal("tuple.__add__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: tuple.__add__ takes 2 arguments")
+			ctx.Raise(NewException(TypeErrorType, "tuple.__add__ takes 2 arguments"))
+			return NoneVal()
 		}
 		return tupleNbAdd(ctx, args[0], args[1])
 	})
@@ -5329,7 +5540,8 @@ func initTypes() {
 	TupleType.dunderAdd = tupleAddBuiltin
 	tupleMulBuiltin := NewBuiltinFuncVal("tuple.__mul__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: tuple.__mul__ takes 2 arguments")
+			ctx.Raise(NewException(TypeErrorType, "tuple.__mul__ takes 2 arguments"))
+			return NoneVal()
 		}
 		return tupleNbMul(ctx, args[0], args[1])
 	})
@@ -5365,25 +5577,29 @@ func initTypes() {
 	}
 	LocalsProxyType.Dict.Set(DunderContains, NewBuiltinFuncVal("__contains__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: descriptor '__contains__' of 'FrameLocalsProxy' object needs 2 arguments")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__contains__' of 'FrameLocalsProxy' object needs 2 arguments"))
+			return NoneVal()
 		}
 		return BoolVal(localsProxyContains(ctx, args[0], args[1]))
 	}))
 	LocalsProxyType.Dict.Set(InternString("__str__"), NewBuiltinFuncVal("__str__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__str__' of 'FrameLocalsProxy' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__str__' of 'FrameLocalsProxy' object needs an argument"))
+			return NoneVal()
 		}
 		return NewStringVal(localsProxyRepr(args[0]))
 	}))
 	LocalsProxyType.Dict.Set(InternString("__repr__"), NewBuiltinFuncVal("__repr__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__repr__' of 'FrameLocalsProxy' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__repr__' of 'FrameLocalsProxy' object needs an argument"))
+			return NoneVal()
 		}
 		return NewStringVal(localsProxyRepr(args[0]))
 	}))
 	LocalsProxyType.Dict.Set(InternString("keys"), NewBuiltinFuncVal("keys", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: keys() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "keys() takes at least 1 argument"))
+			return NoneVal()
 		}
 		entries := localsProxyCollectPairs(args[0].AsLocalsProxy())
 		keys := make([]Value, len(entries))
@@ -5394,7 +5610,8 @@ func initTypes() {
 	}))
 	LocalsProxyType.Dict.Set(InternString("values"), NewBuiltinFuncVal("values", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: values() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "values() takes at least 1 argument"))
+			return NoneVal()
 		}
 		entries := localsProxyCollectPairs(args[0].AsLocalsProxy())
 		vals := make([]Value, len(entries))
@@ -5405,7 +5622,8 @@ func initTypes() {
 	}))
 	LocalsProxyType.Dict.Set(InternString("items"), NewBuiltinFuncVal("items", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: items() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "items() takes at least 1 argument"))
+			return NoneVal()
 		}
 		entries := localsProxyCollectPairs(args[0].AsLocalsProxy())
 		items := make([]Value, len(entries))
@@ -5417,14 +5635,16 @@ func initTypes() {
 
 	TypeType.Dict.Set(DunderCall, NewBuiltinFuncVal("type.__call__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 || !args[0].IsType() {
-			panic("TypeError: descriptor '__call__' of 'type' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__call__' of 'type' object needs an argument"))
+			return NoneVal()
 		}
 		cls := args[0]
 		return typeTpCall(ctx, cls, args[1:], kwnames)
 	}))
 	LocalsProxyType.Dict.Set(InternString("get"), NewBuiltinFuncVal("get", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: get() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "get() takes at least 1 argument"))
+			return NoneVal()
 		}
 		defVal := NoneVal()
 		if len(args) >= 3 {
@@ -5442,7 +5662,8 @@ func initTypes() {
 	WeakRefType.Slots.TpGetAttr = weakRefTpGetAttr
 	WeakRefType.Dict.Set(DunderCall, NewBuiltinFuncVal("ReferenceType.__call__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__call__' of 'ReferenceType' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__call__' of 'ReferenceType' object needs an argument"))
+			return NoneVal()
 		}
 		return weakRefTpCall(ctx, args[0], args[1:], kwnames)
 	}))
@@ -5454,7 +5675,8 @@ func initTypes() {
 	}))
 	WeakRefType.Dict.Set(InternString("__hash__"), NewBuiltinFuncVal("__hash__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__hash__' of 'ReferenceType' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__hash__' of 'ReferenceType' object needs an argument"))
+			return NoneVal()
 		}
 		return Int64Val(weakRefTpHash(args[0]))
 	}))
@@ -5470,7 +5692,8 @@ func initTypes() {
 	CallableWeakProxyType.Slots.TpCall = weakProxyTpCall
 	CallableWeakProxyType.Dict.Set(DunderCall, NewBuiltinFuncVal("CallableProxyType.__call__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__call__' of 'CallableProxyType' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__call__' of 'CallableProxyType' object needs an argument"))
+			return NoneVal()
 		}
 		return weakProxyTpCall(ctx, args[0], args[1:], kwnames)
 	}))
@@ -5484,7 +5707,8 @@ func initTypes() {
 
 	funcGetBuiltin := NewBuiltinFuncVal("function.__get__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__get__' of 'function' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__get__' of 'function' object needs an argument"))
+			return NoneVal()
 		}
 		fn := args[0]
 		obj := NoneVal()
@@ -5506,7 +5730,8 @@ func initTypes() {
 
 	builtinFuncGetBuiltin := NewBuiltinFuncVal("builtin_function_or_method.__get__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__get__' of 'builtin_function_or_method' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__get__' of 'builtin_function_or_method' object needs an argument"))
+			return NoneVal()
 		}
 		fn := args[0]
 		obj := NoneVal()
@@ -5542,7 +5767,8 @@ func initTypes() {
 
 	funcCall := NewBuiltinFuncVal("function.__call__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__call__' requires at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__call__' requires at least 1 argument"))
+			return NoneVal()
 		}
 		target := args[0]
 		return ctx.Call(target, args[1:], kwnames)
@@ -5620,7 +5846,8 @@ func initTypes() {
 	}
 	PropertyType.Dict.Set(InternString("getter"), NewBuiltinFuncVal("getter", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: getter() takes exactly one argument")
+			ctx.Raise(NewException(TypeErrorType, "getter() takes exactly one argument"))
+			return NoneVal()
 		}
 		self := args[0].AsProperty()
 		p := NewPropertyVal(args[1], self.FSet, self.FDel)
@@ -5629,7 +5856,8 @@ func initTypes() {
 	}))
 	PropertyType.Dict.Set(InternString("setter"), NewBuiltinFuncVal("setter", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: setter() takes exactly one argument")
+			ctx.Raise(NewException(TypeErrorType, "setter() takes exactly one argument"))
+			return NoneVal()
 		}
 		self := args[0].AsProperty()
 		p := NewPropertyVal(self.FGet, args[1], self.FDel)
@@ -5638,7 +5866,8 @@ func initTypes() {
 	}))
 	PropertyType.Dict.Set(InternString("deleter"), NewBuiltinFuncVal("deleter", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: deleter() takes exactly one argument")
+			ctx.Raise(NewException(TypeErrorType, "deleter() takes exactly one argument"))
+			return NoneVal()
 		}
 		self := args[0].AsProperty()
 		p := NewPropertyVal(self.FGet, self.FSet, args[1])
@@ -5647,7 +5876,8 @@ func initTypes() {
 	}))
 	PropertyType.Dict.Set(DunderGet, NewBuiltinFuncVal("property.__get__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: descriptor '__get__' of 'property' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__get__' of 'property' object needs an argument"))
+			return NoneVal()
 		}
 		prop := args[0]
 		obj := args[1]
@@ -5659,7 +5889,8 @@ func initTypes() {
 	}))
 	PropertyType.Dict.Set(DunderSet, NewBuiltinFuncVal("property.__set__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 3 {
-			panic("TypeError: descriptor '__set__' of 'property' object needs 2 arguments")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__set__' of 'property' object needs 2 arguments"))
+			return NoneVal()
 		}
 		propertyDescrSet(ctx, args[0], args[1], args[2])
 		return NoneVal()
@@ -5667,29 +5898,35 @@ func initTypes() {
 
 	typeAnnotationsGetter := NewBuiltinFuncVal("type.__annotations__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__annotations__' of 'type' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__annotations__' of 'type' object needs an argument"))
+			return NoneVal()
 		}
 		if !args[0].IsType() {
-			panic("TypeError: descriptor '__annotations__' requires a 'type' object")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__annotations__' requires a 'type' object"))
+			return NoneVal()
 		}
 		return TypeAnnotations(ctx, args[0].AsType())
 	})
 	typeAnnotationsSetter := NewBuiltinFuncVal("type.__annotations__.setter", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: descriptor '__annotations__' setter needs 2 arguments")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__annotations__' setter needs 2 arguments"))
+			return NoneVal()
 		}
 		if !args[0].IsType() {
-			panic("TypeError: descriptor '__annotations__' requires a 'type' object")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__annotations__' requires a 'type' object"))
+			return NoneVal()
 		}
 		TypeSetAnnotations(args[0].AsType(), args[1])
 		return NoneVal()
 	})
 	typeAnnotationsDeleter := NewBuiltinFuncVal("type.__annotations__.deleter", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__annotations__' deleter needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__annotations__' deleter needs an argument"))
+			return NoneVal()
 		}
 		if !args[0].IsType() {
-			panic("TypeError: descriptor '__annotations__' requires a 'type' object")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__annotations__' requires a 'type' object"))
+			return NoneVal()
 		}
 		TypeDelAnnotations(args[0].AsType())
 		return NoneVal()
@@ -5699,19 +5936,22 @@ func initTypes() {
 
 	typeAnnotateGetter := NewBuiltinFuncVal("type.__annotate__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 || !args[0].IsType() {
-			panic("TypeError: descriptor '__annotate__' requires a 'type' object")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__annotate__' requires a 'type' object"))
+			return NoneVal()
 		}
-		return TypeAnnotate(args[0].AsType())
+		return TypeAnnotateCtx(ctx, args[0].AsType())
 	})
 	typeAnnotateSetter := NewBuiltinFuncVal("type.__annotate__.setter", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 || !args[0].IsType() {
-			panic("TypeError: descriptor '__annotate__' requires a 'type' object")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__annotate__' requires a 'type' object"))
+			return NoneVal()
 		}
-		TypeSetAnnotate(args[0].AsType(), args[1])
+		TypeSetAnnotateCtx(ctx, args[0].AsType(), args[1])
 		return NoneVal()
 	})
 	typeAnnotateDeleter := NewBuiltinFuncVal("type.__annotate__.deleter", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		panic("TypeError: cannot delete __annotate__ attribute")
+		ctx.Raise(NewException(TypeErrorType, "cannot delete __annotate__ attribute"))
+		return NoneVal()
 	})
 	TypeType.Dict.Set(InternString("__annotate__"), NewPropertyVal(typeAnnotateGetter, typeAnnotateSetter, typeAnnotateDeleter))
 
@@ -5725,7 +5965,8 @@ func initTypes() {
 		attrName := attr
 		fget := NewBuiltinFuncVal(attrName, func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 			if len(args) < 1 {
-				panic("TypeError: descriptor '" + attrName + "' of 'code' object needs an argument")
+				ctx.Raise(NewException(TypeErrorType, "descriptor '"+attrName+"' of 'code' object needs an argument"))
+				return NoneVal()
 			}
 			return codeTpGetAttr(ctx, args[0], InternString(attrName))
 		})
@@ -5735,7 +5976,8 @@ func initTypes() {
 	MappingProxyType = MustNewType("mappingproxy", []*PyType{ObjectType}, nil)
 	MappingProxyType.Slots.TpCall = func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) == 0 {
-			panic("TypeError: mappingproxy() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "mappingproxy() takes at least 1 argument"))
+			return NoneVal()
 		}
 		return NewMappingProxyVal(args[0])
 	}
@@ -5756,7 +5998,8 @@ func initTypes() {
 	}
 	MappingProxyType.Dict.Set(InternString("get"), NewBuiltinFuncVal("get", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: get() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "get() takes at least 1 argument"))
+			return NoneVal()
 		}
 		mp := args[0].AsMappingProxy()
 		defVal := NoneVal()
@@ -5876,7 +6119,8 @@ func initTypes() {
 	}
 	FrozenDictType.Dict.Set(InternString("copy"), NewBuiltinFuncVal("copy", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor 'copy' of 'frozendict' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'copy' of 'frozendict' object needs an argument"))
+			return NoneVal()
 		}
 		mp := args[0].AsMappingProxy()
 		if mp.Mapping.IsDict() {
@@ -5913,7 +6157,8 @@ func initTypes() {
 			}
 		}
 		if !nameVal.IsAnyString() {
-			panic("TypeError: sentinel() requires a string 'name' argument")
+			ctx.Raise(NewException(TypeErrorType, "sentinel() requires a string 'name' argument"))
+			return NoneVal()
 		}
 		inst := NewInstanceOfType(SentinelType)
 		inst.AsInstance().SetAttr(InternString("name"), nameVal)
@@ -5945,7 +6190,8 @@ func initTypes() {
 	ClassMethodType.Slots.TpCall = classMethodTpCall
 	ClassMethodType.Dict.Set(DunderGet, NewBuiltinFuncVal("classmethod.__get__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__get__' of 'classmethod' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__get__' of 'classmethod' object needs an argument"))
+			return NoneVal()
 		}
 		cm := args[0]
 		obj := NoneVal()
@@ -5964,7 +6210,8 @@ func initTypes() {
 	StaticMethodType.Slots.TpCall = staticMethodTpCall
 	StaticMethodType.Dict.Set(DunderGet, NewBuiltinFuncVal("staticmethod.__get__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__get__' of 'staticmethod' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__get__' of 'staticmethod' object needs an argument"))
+			return NoneVal()
 		}
 		sm := args[0]
 		obj := NoneVal()
@@ -5985,7 +6232,8 @@ func initTypes() {
 		if name.AsString() == "cell_contents" {
 			v := obj.AsCell().Value
 			if v.IsUnbound() {
-				panic(NewException(ValueErrorType, "Cell is empty"))
+				ctx.Raise(NewException(ValueErrorType, "Cell is empty"))
+				return NoneVal()
 			}
 			return v
 		}
@@ -5993,10 +6241,12 @@ func initTypes() {
 	}
 	CellType.Slots.TpCall = func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if !callable.IsType() || callable.AsType() != CellType {
-			panic("TypeError: 'cell' object is not callable")
+			ctx.Raise(NewException(TypeErrorType, "'cell' object is not callable"))
+			return NoneVal()
 		}
 		if len(kwnames) > 0 {
-			panic("TypeError: cell() takes no keyword arguments")
+			ctx.Raise(NewException(TypeErrorType, "cell() takes no keyword arguments"))
+			return NoneVal()
 		}
 		switch len(args) {
 		case 0:
@@ -6004,7 +6254,8 @@ func initTypes() {
 		case 1:
 			return NewCellVal(args[0])
 		}
-		panic("TypeError: cell expected at most 1 argument, got " + strconv.Itoa(len(args)))
+		ctx.Raise(NewException(TypeErrorType, "cell expected at most 1 argument, got"+strconv.Itoa(len(args))))
+		return NoneVal()
 	}
 	CellType.Slots.TpSetAttr = func(ctx *ExecContext, obj, name, value Value) Value {
 		if name.AsString() == "cell_contents" {
@@ -6025,17 +6276,20 @@ func initTypes() {
 	}
 	IterType.Dict.Set(InternString("__next__"), NewBuiltinFuncVal("iterator.__next__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__next__' of 'iterator' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__next__' of 'iterator' object needs an argument"))
+			return NoneVal()
 		}
 		v, status := IterType.Slots.TpIterNext(ctx, args[0])
 		if status == IterExhausted {
-			panic(NewException(StopIterationType, ""))
+			ctx.Raise(NewException(StopIterationType, ""))
+			return NoneVal()
 		}
 		return v
 	}))
 	IterType.Dict.Set(InternString("__iter__"), NewBuiltinFuncVal("iterator.__iter__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__iter__' of 'iterator' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__iter__' of 'iterator' object needs an argument"))
+			return NoneVal()
 		}
 		return args[0]
 	}))
@@ -6111,18 +6365,21 @@ func initTypes() {
 	}
 	GeneratorType.Dict.Set(DunderIter, NewBuiltinFuncVal("__iter__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__iter__' of 'generator' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__iter__' of 'generator' object needs an argument"))
+			return NoneVal()
 		}
 		return args[0]
 	}))
 	GeneratorType.Dict.Set(DunderNext, NewBuiltinFuncVal("__next__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__next__' of 'generator' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__next__' of 'generator' object needs an argument"))
+			return NoneVal()
 		}
 		gen := args[0].AsGenerator()
 		v, status := gen.Send(ctx, NoneVal())
 		if status == IterExhausted {
-			panic(NewStopIteration(v))
+			ctx.Raise(NewStopIteration(v))
+			return NoneVal()
 		}
 		if status == IterError {
 			if ctx != nil && ctx.HasException() {
@@ -6133,7 +6390,8 @@ func initTypes() {
 	}))
 	GeneratorType.Dict.Set(InternString("send"), NewBuiltinFuncVal("send", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: send() takes exactly one argument")
+			ctx.Raise(NewException(TypeErrorType, "send() takes exactly one argument"))
+			return NoneVal()
 		}
 		gen := args[0].AsGenerator()
 		v, status := gen.Send(ctx, args[1])
@@ -6144,7 +6402,8 @@ func initTypes() {
 	}))
 	GeneratorType.Dict.Set(InternString("close"), NewBuiltinFuncVal("close", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: close() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "close() takes at least 1 argument"))
+			return NoneVal()
 		}
 		gen := args[0].AsGenerator()
 		gen.Close(ctx)
@@ -6153,7 +6412,8 @@ func initTypes() {
 
 	GeneratorType.Dict.Set(InternString("throw"), NewBuiltinFuncVal("throw", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: throw() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "throw() takes at least 1 argument"))
+			return NoneVal()
 		}
 		gen := args[0].AsGenerator()
 		exc := args[1]
@@ -6187,7 +6447,8 @@ func initTypes() {
 	}
 	CoroutineType.Dict.Set(InternString("send"), NewBuiltinFuncVal("send", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: send() takes exactly one argument")
+			ctx.Raise(NewException(TypeErrorType, "send() takes exactly one argument"))
+			return NoneVal()
 		}
 		coro := args[0].AsCoroutine()
 		v, _ := coro.Send(ctx, args[1])
@@ -6195,7 +6456,8 @@ func initTypes() {
 	}))
 	CoroutineType.Dict.Set(InternString("close"), NewBuiltinFuncVal("close", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: close() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "close() takes at least 1 argument"))
+			return NoneVal()
 		}
 		coro := args[0].AsCoroutine()
 		coro.Close(ctx)
@@ -6204,7 +6466,8 @@ func initTypes() {
 
 	CoroutineType.Dict.Set(InternString("throw"), NewBuiltinFuncVal("throw", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: throw() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "throw() takes at least 1 argument"))
+			return NoneVal()
 		}
 		coro := args[0].AsCoroutine()
 		v, _ := coro.Throw(ctx, args[1])
@@ -6212,7 +6475,8 @@ func initTypes() {
 	}))
 	CoroutineType.Dict.Set(InternString("__await__"), NewBuiltinFuncVal("__await__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: __await__() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "__await__() takes at least 1 argument"))
+			return NoneVal()
 		}
 		return args[0]
 	}))
@@ -6220,13 +6484,15 @@ func initTypes() {
 	FutureType = MustNewType("Future", []*PyType{ObjectType}, nil)
 	FutureType.Dict.Set(InternString("done"), NewBuiltinFuncVal("done", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: done() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "done() takes at least 1 argument"))
+			return NoneVal()
 		}
 		return BoolVal(args[0].AsFuture().IsDone())
 	}))
 	FutureType.Dict.Set(InternString("result"), NewBuiltinFuncVal("result", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: result() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "result() takes at least 1 argument"))
+			return NoneVal()
 		}
 		fut := args[0].AsFuture()
 		res, exc := fut.Result()
@@ -6240,7 +6506,8 @@ func initTypes() {
 	}))
 	FutureType.Dict.Set(InternString("set_result"), NewBuiltinFuncVal("set_result", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: set_result() takes exactly one argument")
+			ctx.Raise(NewException(TypeErrorType, "set_result() takes exactly one argument"))
+			return NoneVal()
 		}
 		args[0].AsFuture().SetResult(args[1])
 		return NoneVal()
@@ -6248,7 +6515,8 @@ func initTypes() {
 
 	FutureType.Dict.Set(InternString("set_exception"), NewBuiltinFuncVal("set_exception", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: set_exception() takes exactly one argument")
+			ctx.Raise(NewException(TypeErrorType, "set_exception() takes exactly one argument"))
+			return NoneVal()
 		}
 		args[0].AsFuture().SetException(args[1])
 		return NoneVal()
@@ -6256,7 +6524,8 @@ func initTypes() {
 
 	FutureType.Dict.Set(InternString("__await__"), NewBuiltinFuncVal("__await__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: __await__() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "__await__() takes at least 1 argument"))
+			return NoneVal()
 		}
 		return args[0]
 	}))
@@ -6286,18 +6555,21 @@ func initTypes() {
 	}
 	ChanType.Dict.Set(InternString("send"), NewBuiltinFuncVal("send", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: chan.send() takes exactly 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "chan.send() takes exactly 1 argument"))
+			return NoneVal()
 		}
 		ch := args[0].AsChan()
 		if err := ch.Send(args[1]); err != nil {
-			panic("RuntimeError: " + err.Error())
+			ctx.Raise(NewException(RuntimeErrorType, err.Error()))
+			return NoneVal()
 		}
 		return NoneVal()
 	}))
 
 	ChanType.Dict.Set(InternString("recv"), NewBuiltinFuncVal("recv", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: chan.recv() takes at least 0 arguments")
+			ctx.Raise(NewException(TypeErrorType, "chan.recv() takes at least 0 arguments"))
+			return NoneVal()
 		}
 		ch := args[0].AsChan()
 		v, ok := ch.Recv()
@@ -6305,13 +6577,15 @@ func initTypes() {
 			if len(args) >= 2 {
 				return args[1]
 			}
-			panic("StopIteration")
+			ctx.Raise(NewStopIteration(NoneVal()))
+			return NoneVal()
 		}
 		return v
 	}))
 	ChanType.Dict.Set(InternString("close"), NewBuiltinFuncVal("close", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: chan.close() takes no arguments")
+			ctx.Raise(NewException(TypeErrorType, "chan.close() takes no arguments"))
+			return NoneVal()
 		}
 		ch := args[0].AsChan()
 		ch.Close()
@@ -6354,7 +6628,7 @@ func initTypes() {
 		}
 		self := args[0]
 		if self.IsInstance() {
-			if argsVal, ok := self.AsInstance().GetAttr(InternString("args")); ok && argsVal.IsTuple() {
+			if argsVal, ok := ExceptionArgs(self.AsInstance()); ok && argsVal.IsTuple() {
 				items := argsVal.AsTuple().Items
 				if len(items) == 1 {
 					return StrType.Slots.TpCall(ctx, TypeVal(StrType), []Value{items[0]}, nil)
@@ -6368,7 +6642,8 @@ func initTypes() {
 	}))
 	BaseExceptionType.Dict.Set(InternString("with_traceback"), NewBuiltinFuncVal("with_traceback", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: with_traceback() takes exactly one argument")
+			ctx.Raise(NewException(TypeErrorType, "with_traceback() takes exactly one argument"))
+			return NoneVal()
 		}
 		self := args[0]
 		tb := args[1]
@@ -6381,15 +6656,18 @@ func initTypes() {
 	// traceback and are reachable through the instance's __notes__ list.
 	BaseExceptionType.Dict.Set(InternString("add_note"), NewBuiltinFuncVal("add_note", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: add_note() takes exactly one argument")
+			ctx.Raise(NewException(TypeErrorType, "add_note() takes exactly one argument"))
+			return NoneVal()
 		}
 		self := args[0]
 		note := args[1]
 		if !note.IsAnyString() {
-			panic("TypeError: add_note() argument must be str, not " + note.Type().Name)
+			ctx.Raise(NewException(TypeErrorType, "add_note() argument must be str, not"+note.Type().Name))
+			return NoneVal()
 		}
 		if !self.IsInstance() {
-			panic("TypeError: add_note() called on a non-exception object")
+			ctx.Raise(NewException(TypeErrorType, "add_note() called on a non-exception object"))
+			return NoneVal()
 		}
 		inst := self.AsInstance()
 		notes, ok := inst.GetAttr(InternString("__notes__"))
@@ -6422,6 +6700,26 @@ func initTypes() {
 	UnboundLocalErrorType = MustNewType("UnboundLocalError", []*PyType{NameErrorType}, nil)
 
 	AttributeErrorType = MustNewType("AttributeError", []*PyType{ExceptionType}, nil)
+	lazyArgsGetter := NewBuiltinFuncVal("args", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 || !args[0].IsInstance() {
+			return NewTupleVal()
+		}
+		if argsVal, ok := ExceptionArgs(args[0].AsInstance()); ok {
+			return argsVal
+		}
+		return NewTupleVal()
+	})
+	lazyArgsSetter := NewBuiltinFuncVal("args", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) >= 2 && args[0].IsInstance() {
+			args[0].AsInstance().SetAttr(strArgs, args[1])
+		}
+		return NoneVal()
+	})
+	lazyArgsProp := NewPropertyVal(lazyArgsGetter, lazyArgsSetter, Value{})
+	AttributeErrorType.Dict.Set(strArgs, lazyArgsProp)
+	AttributeErrorType.InvalidateVersion()
+	KeyErrorType.Dict.Set(strArgs, lazyArgsProp)
+	KeyErrorType.InvalidateVersion()
 
 	RuntimeErrorType = MustNewType("RuntimeError", []*PyType{ExceptionType}, nil)
 	NotImplementedErrorType = MustNewType("NotImplementedError", []*PyType{RuntimeErrorType}, nil)
@@ -6604,7 +6902,8 @@ func initTypes() {
 
 	SetType.Dict.Set(InternString("add"), NewBuiltinFuncVal("add", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: add() takes exactly 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "add() takes exactly 1 argument"))
+			return NoneVal()
 		}
 		if args[0].IsSet() {
 			args[0].AsSet().Add(args[1])
@@ -6614,11 +6913,13 @@ func initTypes() {
 
 	SetType.Dict.Set(InternString("remove"), NewBuiltinFuncVal("remove", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: remove() takes exactly 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "remove() takes exactly 1 argument"))
+			return NoneVal()
 		}
 		if args[0].IsSet() {
 			if !args[0].AsSet().Remove(args[1]) {
-				panic(fmt.Sprintf("KeyError: %v", args[1]))
+				ctx.Raise(NewException(KeyErrorType, fmt.Sprintf("%v", args[1])))
+				return NoneVal()
 			}
 		}
 		return NoneVal()
@@ -6626,7 +6927,8 @@ func initTypes() {
 
 	SetType.Dict.Set(InternString("discard"), NewBuiltinFuncVal("discard", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: discard() takes exactly 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "discard() takes exactly 1 argument"))
+			return NoneVal()
 		}
 		if args[0].IsSet() {
 			args[0].AsSet().Discard(args[1])
@@ -6636,7 +6938,8 @@ func initTypes() {
 
 	SetType.Dict.Set(InternString("clear"), NewBuiltinFuncVal("clear", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor 'clear' of 'set' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'clear' of 'set' object needs an argument"))
+			return NoneVal()
 		}
 		if args[0].IsSet() {
 			args[0].AsSet().Clear()
@@ -6646,12 +6949,14 @@ func initTypes() {
 
 	SetType.Dict.Set(InternString("pop"), NewBuiltinFuncVal("pop", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor 'pop' of 'set' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'pop' of 'set' object needs an argument"))
+			return NoneVal()
 		}
 		if args[0].IsSet() {
 			val, ok := args[0].AsSet().Pop()
 			if !ok {
-				panic("KeyError: 'pop from an empty set'")
+				ctx.Raise(NewException(KeyErrorType, "'pop from an empty set'"))
+				return NoneVal()
 			}
 			return val
 		}
@@ -6660,7 +6965,8 @@ func initTypes() {
 
 	SetType.Dict.Set(InternString("copy"), NewBuiltinFuncVal("copy", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor 'copy' of 'set' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'copy' of 'set' object needs an argument"))
+			return NoneVal()
 		}
 		if args[0].IsSet() {
 			return NewSetVal(args[0].AsSet().Items()...)
@@ -6670,7 +6976,8 @@ func initTypes() {
 
 	SetType.Dict.Set(InternString("update"), NewBuiltinFuncVal("update", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor 'update' of 'set' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'update' of 'set' object needs an argument"))
+			return NoneVal()
 		}
 		if args[0].IsSet() {
 			s := args[0].AsSet()
@@ -6685,7 +6992,8 @@ func initTypes() {
 
 	SetType.Dict.Set(InternString("intersection_update"), NewBuiltinFuncVal("intersection_update", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor 'intersection_update' of 'set' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'intersection_update' of 'set' object needs an argument"))
+			return NoneVal()
 		}
 		if args[0].IsSet() {
 			s := args[0].AsSet()
@@ -6708,7 +7016,8 @@ func initTypes() {
 
 	SetType.Dict.Set(InternString("difference_update"), NewBuiltinFuncVal("difference_update", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor 'difference_update' of 'set' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'difference_update' of 'set' object needs an argument"))
+			return NoneVal()
 		}
 		if args[0].IsSet() {
 			s := args[0].AsSet()
@@ -6723,7 +7032,8 @@ func initTypes() {
 
 	SetType.Dict.Set(InternString("symmetric_difference_update"), NewBuiltinFuncVal("symmetric_difference_update", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: descriptor 'symmetric_difference_update' of 'set' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'symmetric_difference_update' of 'set' object needs an argument"))
+			return NoneVal()
 		}
 		if args[0].IsSet() {
 			s := args[0].AsSet()
@@ -6752,7 +7062,8 @@ func initTypes() {
 
 	SetType.Dict.Set(InternString("union"), NewBuiltinFuncVal("union", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor 'union' of 'set' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'union' of 'set' object needs an argument"))
+			return NoneVal()
 		}
 		res := NewSetVal()
 		if args[0].IsSet() {
@@ -6911,7 +7222,8 @@ func initTypes() {
 	BytesType.Slots.TpIter = func(ctx *ExecContext, o Value) Value { return NewIterVal(o) }
 	BytesType.Dict.Set(DunderIter, NewBuiltinFuncVal("__iter__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__iter__' of 'bytes' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__iter__' of 'bytes' object needs an argument"))
+			return NoneVal()
 		}
 		return NewIterVal(args[0])
 	}))
@@ -6937,7 +7249,8 @@ func initTypes() {
 	BytesType.dunderNew = bytesNewBuiltin
 	BytesType.Dict.Set(InternString("decode"), NewBuiltinFuncVal("decode", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: decode() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "decode() takes at least 1 argument"))
+			return NoneVal()
 		}
 		b := args[0].AsBytes()
 		npos := len(args) - len(kwnames)
@@ -6963,14 +7276,16 @@ func initTypes() {
 	}))
 	BytesType.Dict.Set(InternString("hex"), NewBuiltinFuncVal("hex", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: hex() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "hex() takes at least 1 argument"))
+			return NoneVal()
 		}
 		b := args[0].AsBytes()
 		return NewStringVal(hex.EncodeToString(b.Data))
 	}))
 	BytesType.Dict.Set(InternString("startswith"), NewBuiltinFuncVal("startswith", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: startswith() takes 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "startswith() takes 1 argument"))
+			return NoneVal()
 		}
 		b := args[0].AsBytes().Data
 		var prefix []byte
@@ -6980,13 +7295,15 @@ func initTypes() {
 		case args[1].IsByteArray():
 			prefix = args[1].AsByteArray().Data
 		default:
-			panic("TypeError: startswith first arg must be bytes or a tuple of bytes")
+			ctx.Raise(NewException(TypeErrorType, "startswith first arg must be bytes or a tuple of bytes"))
+			return NoneVal()
 		}
 		return BoolVal(bytes.HasPrefix(b, prefix))
 	}))
 	BytesType.Dict.Set(InternString("endswith"), NewBuiltinFuncVal("endswith", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: endswith() takes 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "endswith() takes 1 argument"))
+			return NoneVal()
 		}
 		b := args[0].AsBytes().Data
 		var suffix []byte
@@ -6996,13 +7313,15 @@ func initTypes() {
 		case args[1].IsByteArray():
 			suffix = args[1].AsByteArray().Data
 		default:
-			panic("TypeError: endswith first arg must be bytes or a tuple of bytes")
+			ctx.Raise(NewException(TypeErrorType, "endswith first arg must be bytes or a tuple of bytes"))
+			return NoneVal()
 		}
 		return BoolVal(bytes.HasSuffix(b, suffix))
 	}))
 	BytesType.Dict.Set(InternString("find"), NewBuiltinFuncVal("find", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: find() takes 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "find() takes 1 argument"))
+			return NoneVal()
 		}
 		b := args[0].AsBytes().Data
 		var sub []byte
@@ -7012,7 +7331,8 @@ func initTypes() {
 		case args[1].IsByteArray():
 			sub = args[1].AsByteArray().Data
 		default:
-			panic("TypeError: find argument must be bytes")
+			ctx.Raise(NewException(TypeErrorType, "find argument must be bytes"))
+			return NoneVal()
 		}
 		return Int64Val(int64(bytes.Index(b, sub)))
 	}))
@@ -7031,18 +7351,21 @@ func initTypes() {
 	ByteArrayType.Slots.TpIter = func(ctx *ExecContext, o Value) Value { return NewIterVal(o) }
 	ByteArrayType.Dict.Set(DunderIter, NewBuiltinFuncVal("__iter__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__iter__' of 'bytearray' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__iter__' of 'bytearray' object needs an argument"))
+			return NoneVal()
 		}
 		return NewIterVal(args[0])
 	}))
 	ByteArrayType.Dict.Set(InternString("append"), NewBuiltinFuncVal("append", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: append() takes exactly one argument")
+			ctx.Raise(NewException(TypeErrorType, "append() takes exactly one argument"))
+			return NoneVal()
 		}
 		ba := args[0].AsByteArray()
 		b := args[1].AsInt64()
 		if b < 0 || b > 255 {
-			panic("ValueError: byte must be in range(0, 256)")
+			ctx.Raise(NewException(ValueErrorType, "byte must be in range(0, 256)"))
+			return NoneVal()
 		}
 		ba.mu.Lock()
 		ba.Data = append(ba.Data, byte(b))
@@ -7052,7 +7375,8 @@ func initTypes() {
 
 	ByteArrayType.Dict.Set(InternString("extend"), NewBuiltinFuncVal("extend", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: extend() takes exactly one argument")
+			ctx.Raise(NewException(TypeErrorType, "extend() takes exactly one argument"))
+			return NoneVal()
 		}
 		ba := args[0].AsByteArray()
 		val := args[1]
@@ -7068,12 +7392,14 @@ func initTypes() {
 			for _, item := range val.AsList().Items {
 				b := item.AsInt64()
 				if b < 0 || b > 255 {
-					panic("ValueError: byte must be in range(0, 256)")
+					ctx.Raise(NewException(ValueErrorType, "byte must be in range(0, 256)"))
+					return NoneVal()
 				}
 				toAppend = append(toAppend, byte(b))
 			}
 		default:
-			panic("TypeError: 'extend' requires an iterable of ints or bytes-like object")
+			ctx.Raise(NewException(TypeErrorType, "'extend' requires an iterable of ints or bytes-like object"))
+			return NoneVal()
 		}
 		ba.mu.Lock()
 		ba.Data = append(ba.Data, toAppend...)
@@ -7083,20 +7409,23 @@ func initTypes() {
 
 	ByteArrayType.Dict.Set(DunderGetItem, NewBuiltinFuncVal("__getitem__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: descriptor '__getitem__' of 'bytearray' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__getitem__' of 'bytearray' object needs an argument"))
+			return NoneVal()
 		}
 		return byteArrayMpSubscript(ctx, args[0], args[1])
 	}))
 	ByteArrayType.Dict.Set(DunderSetItem, NewBuiltinFuncVal("__setitem__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 3 {
-			panic("TypeError: descriptor '__setitem__' of 'bytearray' object needs 2 arguments")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__setitem__' of 'bytearray' object needs 2 arguments"))
+			return NoneVal()
 		}
 		byteArrayMpAssSubscript(ctx, args[0], args[1], args[2])
 		return NoneVal()
 	}))
 	ByteArrayType.Dict.Set(InternString("decode"), NewBuiltinFuncVal("decode", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: decode() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "decode() takes at least 1 argument"))
+			return NoneVal()
 		}
 		ba := args[0].AsByteArray()
 		ba.mu.RLock()
@@ -7126,7 +7455,8 @@ func initTypes() {
 	}))
 	ByteArrayType.Dict.Set(InternString("hex"), NewBuiltinFuncVal("hex", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: hex() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "hex() takes at least 1 argument"))
+			return NoneVal()
 		}
 		ba := args[0].AsByteArray()
 		ba.mu.RLock()
@@ -7147,11 +7477,13 @@ func initTypes() {
 	MemoryViewType.Slots.TpCall = memoryViewTpCall
 	MemoryViewType.Dict.Set(InternString("tobytes"), NewBuiltinFuncVal("tobytes", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: tobytes() takes no arguments")
+			ctx.Raise(NewException(TypeErrorType, "tobytes() takes no arguments"))
+			return NoneVal()
 		}
 		mv := args[0].AsMemoryView()
 		if mv.released {
-			panic("ValueError: operation on released memoryview")
+			ctx.Raise(NewException(ValueErrorType, "operation on released memoryview"))
+			return NoneVal()
 		}
 		shape := mvEffectiveShape(mv)
 		strides := mvEffectiveStrides(mv)
@@ -7183,11 +7515,13 @@ func initTypes() {
 	}))
 	MemoryViewType.Dict.Set(InternString("tolist"), NewBuiltinFuncVal("tolist", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: tolist() takes no arguments")
+			ctx.Raise(NewException(TypeErrorType, "tolist() takes no arguments"))
+			return NoneVal()
 		}
 		mv := args[0].AsMemoryView()
 		if mv.released {
-			panic("ValueError: operation on released memoryview")
+			ctx.Raise(NewException(ValueErrorType, "operation on released memoryview"))
+			return NoneVal()
 		}
 		shape := mvEffectiveShape(mv)
 		strides := mvEffectiveStrides(mv)
@@ -7215,14 +7549,16 @@ func initTypes() {
 
 	TypeType.Dict.Set(DunderCall, NewBuiltinFuncVal("type.__call__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 || !args[0].IsType() {
-			panic("TypeError: descriptor '__call__' of 'type' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__call__' of 'type' object needs an argument"))
+			return NoneVal()
 		}
 		cls := args[0]
 		return typeTpCall(ctx, cls, args[1:], kwnames)
 	}))
 	MemoryViewType.Dict.Set(InternString("release"), NewBuiltinFuncVal("release", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: release() takes no arguments")
+			ctx.Raise(NewException(TypeErrorType, "release() takes no arguments"))
+			return NoneVal()
 		}
 		mv := args[0].AsMemoryView()
 		mv.released = true
@@ -7231,7 +7567,8 @@ func initTypes() {
 	}))
 	MemoryViewType.Dict.Set(InternString("__enter__"), NewBuiltinFuncVal("__enter__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: __enter__() missing self")
+			ctx.Raise(NewException(TypeErrorType, "__enter__() missing self"))
+			return NoneVal()
 		}
 		return args[0]
 	}))
@@ -7245,19 +7582,23 @@ func initTypes() {
 	}))
 	MemoryViewType.Dict.Set(InternString("cast"), NewBuiltinFuncVal("cast", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: cast() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "cast() takes at least 1 argument"))
+			return NoneVal()
 		}
 		mv := args[0].AsMemoryView()
 		if mv.released {
-			panic("ValueError: operation forbidden on released memoryview object")
+			ctx.Raise(NewException(ValueErrorType, "operation forbidden on released memoryview object"))
+			return NoneVal()
 		}
 		format := args[1].AsString()
 		newItemSize, err := FormatSize(format)
 		if err != nil {
-			panic("TypeError: " + err.Error())
+			ctx.Raise(NewException(TypeErrorType, err.Error()))
+			return NoneVal()
 		}
 		if newItemSize <= 0 {
-			panic("TypeError: invalid format for cast")
+			ctx.Raise(NewException(TypeErrorType, "invalid format for cast"))
+			return NoneVal()
 		}
 		oldShape := mvEffectiveShape(mv)
 		oldItemSize := mv.ItemSize
@@ -7269,7 +7610,8 @@ func initTypes() {
 		if len(oldShape) > 1 || (mv.NDim > 1 && !IsCContiguous(oldShape, mvEffectiveStrides(mv), oldItemSize)) {
 			// Allow only if underlying buffer gaps account for same nbytes; check C-contiguous.
 			if !IsCContiguous(oldShape, mvEffectiveStrides(mv), oldItemSize) {
-				panic("TypeError: cannot cast non-contiguous memoryview")
+				ctx.Raise(NewException(TypeErrorType, "cannot cast non-contiguous memoryview"))
+				return NoneVal()
 			}
 		}
 		var newShape []int
@@ -7286,14 +7628,17 @@ func initTypes() {
 			case args[2].IsInt64():
 				newShape = []int{int(args[2].AsInt64())}
 			default:
-				panic("TypeError: shape must be a tuple of ints")
+				ctx.Raise(NewException(TypeErrorType, "shape must be a tuple of ints"))
+				return NoneVal()
 			}
 			if ShapeNumElements(newShape)*newItemSize != nbytes {
-				panic("TypeError: cannot cast to shape; size mismatch")
+				ctx.Raise(NewException(TypeErrorType, "cannot cast to shape; size mismatch"))
+				return NoneVal()
 			}
 		} else {
 			if nbytes%newItemSize != 0 {
-				panic("TypeError: cannot cast; buffer size not divisible by item size")
+				ctx.Raise(NewException(TypeErrorType, "cannot cast; buffer size not divisible by item size"))
+				return NoneVal()
 			}
 			newShape = []int{nbytes / newItemSize}
 		}
@@ -7313,7 +7658,8 @@ func initTypes() {
 	MemoryViewType.Dict.Set(InternString("nbytes"), NewPropertyVal(
 		NewBuiltinFuncVal("nbytes", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 			if len(args) < 1 {
-				panic("TypeError: nbytes missing self")
+				ctx.Raise(NewException(TypeErrorType, "nbytes missing self"))
+				return NoneVal()
 			}
 			mv := args[0].AsMemoryView()
 			shape := mvEffectiveShape(mv)
@@ -7332,11 +7678,13 @@ func initTypes() {
 		MemoryViewType.Dict.Set(InternString(name), NewPropertyVal(
 			NewBuiltinFuncVal(name, func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 				if len(args) < 1 {
-					panic("TypeError: " + name + " missing self")
+					ctx.Raise(NewException(TypeErrorType, name+" missing self"))
+					return NoneVal()
 				}
 				mv := args[0].AsMemoryView()
 				if mv.released {
-					panic("ValueError: operation on released memoryview")
+					ctx.Raise(NewException(ValueErrorType, "operation on released memoryview"))
+					return NoneVal()
 				}
 				return getter(mv)
 			}),
@@ -7407,7 +7755,8 @@ func initTypes() {
 	SliceType.Slots.TpCall = sliceTpCall
 	SliceType.Dict.Set(InternString("indices"), NewBuiltinFuncVal("indices", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: slice.indices() takes 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "slice.indices() takes 1 argument"))
+			return NoneVal()
 		}
 		sl := args[0].AsSlice()
 		length := int(args[1].AsInt64())
@@ -7424,11 +7773,13 @@ func initTypes() {
 
 	moduleNewBuiltin := NewBuiltinFuncVal("module.__new__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: module.__new__(): not enough arguments")
+			ctx.Raise(NewException(TypeErrorType, "module.__new__(): not enough arguments"))
+			return NoneVal()
 		}
 		cls := args[0]
 		if !cls.IsType() {
-			panic("TypeError: module.__new__(X): X is not a type object")
+			ctx.Raise(NewException(TypeErrorType, "module.__new__(X): X is not a type object"))
+			return NoneVal()
 		}
 		return NewInstanceOfType(cls.AsType())
 	})
@@ -7437,11 +7788,13 @@ func initTypes() {
 
 	moduleInitBuiltin := NewBuiltinFuncVal("module.__init__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
-			panic("TypeError: module.__init__() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "module.__init__() takes at least 1 argument"))
+			return NoneVal()
 		}
 		self := args[0]
 		if !self.IsModule() {
-			panic("TypeError: module.__init__() target must be a module")
+			ctx.Raise(NewException(TypeErrorType, "module.__init__() target must be a module"))
+			return NoneVal()
 		}
 		mod := self.AsModule()
 		npos := len(args) - len(kwnames)
@@ -7449,7 +7802,8 @@ func initTypes() {
 		haveName := false
 		docV = NoneVal()
 		if npos > 3 {
-			panic("TypeError: module.__init__() takes at most 3 arguments")
+			ctx.Raise(NewException(TypeErrorType, "module.__init__() takes at most 3 arguments"))
+			return NoneVal()
 		}
 		if npos >= 2 {
 			nameV, haveName = args[1], true
@@ -7464,12 +7818,14 @@ func initTypes() {
 			case "doc":
 				docV = args[npos+i]
 			default:
-				panic("TypeError: module.__init__() got an unexpected keyword argument '" + kn.AsString() + "'")
+				ctx.Raise(NewException(TypeErrorType, "module.__init__() got an unexpected keyword argument '"+kn.AsString()+"'"))
+				return NoneVal()
 			}
 		}
 		if haveName {
 			if !nameV.IsAnyString() {
-				panic("TypeError: module.__init__() argument 'name' must be str, not " + nameV.Type().Name)
+				ctx.Raise(NewException(TypeErrorType, "module.__init__() argument 'name' must be str, not"+nameV.Type().Name))
+				return NoneVal()
 			}
 			mod.Name = nameV.AsString()
 			mod.Dict.Set(InternString("__name__"), nameV)
@@ -7485,7 +7841,8 @@ func initTypes() {
 
 	moduleGetAttributeBuiltin := NewBuiltinFuncVal("module.__getattribute__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: module.__getattribute__() takes 2 arguments")
+			ctx.Raise(NewException(TypeErrorType, "module.__getattribute__() takes 2 arguments"))
+			return NoneVal()
 		}
 		return defaultModuleGetAttr(ctx, args[0], InternValue(args[1]))
 	})
@@ -7493,7 +7850,8 @@ func initTypes() {
 
 	moduleSetAttrBuiltin := NewBuiltinFuncVal("module.__setattr__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 3 {
-			panic("TypeError: module.__setattr__() takes 3 arguments")
+			ctx.Raise(NewException(TypeErrorType, "module.__setattr__() takes 3 arguments"))
+			return NoneVal()
 		}
 		return moduleSetAttr(ctx, args[0], args[1], args[2])
 	})
@@ -7501,7 +7859,8 @@ func initTypes() {
 
 	moduleDelAttrBuiltin := NewBuiltinFuncVal("module.__delattr__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: module.__delattr__() takes 2 arguments")
+			ctx.Raise(NewException(TypeErrorType, "module.__delattr__() takes 2 arguments"))
+			return NoneVal()
 		}
 		objectDelAttr(ctx, args[0], args[1])
 		return NoneVal()
@@ -7610,7 +7969,8 @@ func initTypes() {
 			return TypeVal(args[1].Type())
 		}
 		if posCount < 4 {
-			panic("TypeError: type.__new__() takes 4 arguments")
+			ctx.Raise(NewException(TypeErrorType, "type.__new__() takes 4 arguments"))
+			return NoneVal()
 		}
 		mcls := args[0]
 		name := args[1].AsString()
@@ -7653,7 +8013,8 @@ func initTypes() {
 		}
 		t, err := NewTypeWithMeta(name, bases, dict, metaType)
 		if err != nil {
-			panic("TypeError: " + err.Error())
+			ctx.Raise(NewException(TypeErrorType, err.Error()))
+			return NoneVal()
 		}
 		t.Flags |= FlagHeapType
 		var kwArgs []Value
@@ -7668,7 +8029,8 @@ func initTypes() {
 	TypeType.dunderNew = typeNewBuiltin
 	TypeType.Dict.Set(DunderSetAttr, NewBuiltinFuncVal("type.__setattr__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 3 || !args[0].IsType() {
-			panic("TypeError: type.__setattr__() takes 3 arguments")
+			ctx.Raise(NewException(TypeErrorType, "type.__setattr__() takes 3 arguments"))
+			return NoneVal()
 		}
 		cls := args[0].AsType()
 		interned := InternValue(args[1])
@@ -7688,7 +8050,8 @@ func initTypes() {
 	}))
 	TypeType.Dict.Set(DunderDelAttr, NewBuiltinFuncVal("type.__delattr__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 || !args[0].IsType() {
-			panic("TypeError: type.__delattr__() takes 2 arguments")
+			ctx.Raise(NewException(TypeErrorType, "type.__delattr__() takes 2 arguments"))
+			return NoneVal()
 		}
 		cls := args[0].AsType()
 		interned := InternValue(args[1])
@@ -7706,12 +8069,14 @@ func initTypes() {
 			cls.InvalidateVersion()
 			return NoneVal()
 		}
-		panic(NewAttributeError("type object '" + cls.Name + "' has no attribute '" + interned.AsString() + "'"))
+		ctx.Raise(NewAttributeError("type object '" + cls.Name + "' has no attribute '" + interned.AsString() + "'"))
+		return NoneVal()
 	}))
 
 	TypeType.Dict.Set(InternString("mro"), NewBuiltinFuncVal("type.mro", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 || !args[0].IsType() {
-			panic("TypeError: descriptor 'mro' of 'type' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'mro' of 'type' object needs an argument"))
+			return NoneVal()
 		}
 		cls := args[0].AsType()
 		var items []Value
@@ -7723,7 +8088,8 @@ func initTypes() {
 
 	TypeType.Dict.Set(InternString("__subclasses__"), NewBuiltinFuncVal("type.__subclasses__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 || !args[0].IsType() {
-			panic("TypeError: descriptor '__subclasses__' of 'type' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__subclasses__' of 'type' object needs an argument"))
+			return NoneVal()
 		}
 		cls := args[0].AsType()
 		subclassesMu.RLock()
@@ -7737,7 +8103,8 @@ func initTypes() {
 
 	TypeType.Dict.Set(DunderCall, NewBuiltinFuncVal("type.__call__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 || !args[0].IsType() {
-			panic("TypeError: descriptor '__call__' of 'type' object needs an argument")
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__call__' of 'type' object needs an argument"))
+			return NoneVal()
 		}
 		cls := args[0]
 		return typeTpCall(ctx, cls, args[1:], kwnames)
@@ -7745,7 +8112,8 @@ func initTypes() {
 
 	objectInitSubclassBuiltin := NewBuiltinFuncVal("object.__init_subclass__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(kwnames) > 0 {
-			panic("TypeError: __init_subclass__() takes no keyword arguments")
+			ctx.Raise(NewException(TypeErrorType, "__init_subclass__() takes no keyword arguments"))
+			return NoneVal()
 		}
 		return NoneVal()
 	})
@@ -7753,7 +8121,8 @@ func initTypes() {
 
 	objectGetAttributeBuiltin := NewBuiltinFuncVal("object.__getattribute__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: object.__getattribute__() takes 2 arguments")
+			ctx.Raise(NewException(TypeErrorType, "object.__getattribute__() takes 2 arguments"))
+			return NoneVal()
 		}
 		return defaultObjectGetAttr(ctx, args[0], args[1])
 	})
@@ -7761,7 +8130,8 @@ func initTypes() {
 
 	objectSetAttrBuiltin := NewBuiltinFuncVal("object.__setattr__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 3 {
-			panic("TypeError: object.__setattr__() takes 3 arguments")
+			ctx.Raise(NewException(TypeErrorType, "object.__setattr__() takes 3 arguments"))
+			return NoneVal()
 		}
 		obj := args[0]
 		interned := InternValue(args[1])
@@ -7782,7 +8152,8 @@ func initTypes() {
 						goto allowDynamicSet
 					}
 				}
-				panic(NewAttributeError("'" + tp.Name + "' object has no attribute '" + interned.AsString() + "'"))
+				ctx.Raise(NewAttributeError("'" + tp.Name + "' object has no attribute '" + interned.AsString() + "'"))
+				return NoneVal()
 			}
 		allowDynamicSet:
 			obj.AsInstance().SetAttr(interned, value)
@@ -7824,13 +8195,15 @@ func initTypes() {
 			AsyncAttrs(obj, true).Set(interned, value)
 			return NoneVal()
 		}
-		panic(NewAttributeError("'" + tp.Name + "' object cannot set attribute '" + interned.AsString() + "'"))
+		ctx.Raise(NewAttributeError("'" + tp.Name + "' object cannot set attribute '" + interned.AsString() + "'"))
+		return NoneVal()
 	})
 	ObjectType.Dict.Set(DunderSetAttr, objectSetAttrBuiltin)
 
 	objectDelAttrBuiltin := NewBuiltinFuncVal("object.__delattr__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
-			panic("TypeError: object.__delattr__() takes 2 arguments")
+			ctx.Raise(NewException(TypeErrorType, "object.__delattr__() takes 2 arguments"))
+			return NoneVal()
 		}
 		obj := args[0]
 		interned := InternValue(args[1])
@@ -7844,7 +8217,8 @@ func initTypes() {
 		}
 		if obj.IsInstance() {
 			if !obj.AsInstance().DeleteAttr(interned) {
-				panic(NewAttributeError("'" + tp.Name + "' object has no attribute '" + interned.AsString() + "'"))
+				ctx.Raise(NewAttributeError("'" + tp.Name + "' object has no attribute '" + interned.AsString() + "'"))
+				return NoneVal()
 			}
 			return NoneVal()
 		}
@@ -7853,15 +8227,18 @@ func initTypes() {
 			if fn.Dict != nil && fn.Dict.Delete(interned) {
 				return NoneVal()
 			}
-			panic(NewAttributeError("'" + tp.Name + "' object has no attribute '" + interned.AsString() + "'"))
+			ctx.Raise(NewAttributeError("'" + tp.Name + "' object has no attribute '" + interned.AsString() + "'"))
+			return NoneVal()
 		}
 		if obj.IsModule() {
 			if !obj.AsModule().Dict.Delete(interned) {
-				panic(NewAttributeError("module '" + obj.AsModule().Name + "' has no attribute '" + interned.AsString() + "'"))
+				ctx.Raise(NewAttributeError("module '" + obj.AsModule().Name + "' has no attribute '" + interned.AsString() + "'"))
+				return NoneVal()
 			}
 			return NoneVal()
 		}
-		panic(NewAttributeError("'" + tp.Name + "' object cannot delete attribute '" + interned.AsString() + "'"))
+		ctx.Raise(NewAttributeError("'" + tp.Name + "' object cannot delete attribute '" + interned.AsString() + "'"))
+		return NoneVal()
 	})
 	ObjectType.Dict.Set(DunderDelAttr, objectDelAttrBuiltin)
 
@@ -7907,7 +8284,8 @@ func initTypes() {
 			return NewStringVal("")
 		}
 		if len(args) > 1 && args[1].IsAnyString() && args[1].AsString() != "" {
-			panic("TypeError: unsupported format string passed to " + args[0].Type().Name + ".__format__")
+			ctx.Raise(NewException(TypeErrorType, "unsupported format string passed to"+args[0].Type().Name+".__format__"))
+			return NoneVal()
 		}
 		return NewStringVal(PyStr(ctx, args[0]))
 	}))
@@ -7992,10 +8370,12 @@ func initTypes() {
 
 	ObjectNewBuiltin = NewBuiltinFuncVal("object.__new__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) == 0 {
-			panic("TypeError: object.__new__(): not enough arguments")
+			ctx.Raise(NewException(TypeErrorType, "object.__new__(): not enough arguments"))
+			return NoneVal()
 		}
 		if !args[0].IsType() {
-			panic("TypeError: object.__new__(X): X is not a type object")
+			ctx.Raise(NewException(TypeErrorType, "object.__new__(X): X is not a type object"))
+			return NoneVal()
 		}
 		cls := args[0].AsType()
 		return NewInstanceOfType(cls)

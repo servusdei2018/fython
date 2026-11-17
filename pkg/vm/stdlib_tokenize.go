@@ -44,7 +44,8 @@ func initTokenizeTypes() {
 
 	TokenizerIterType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic(val.NewTypeError("TokenizerIter() missing 1 required positional argument: 'source'"))
+			ctx.Raise(val.NewTypeError("TokenizerIter() missing 1 required positional argument: 'source'"))
+			return val.NoneVal()
 		}
 		source := args[0]
 		extraTokens := true
@@ -68,21 +69,24 @@ func initTokenizeTypes() {
 
 	TokenizerIterType.Dict.Set(val.InternString("__iter__"), val.NewBuiltinFuncVal("TokenizerIter.__iter__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic(val.NewTypeError("descriptor '__iter__' requires an argument"))
+			ctx.Raise(val.NewTypeError("descriptor '__iter__' requires an argument"))
+			return val.NoneVal()
 		}
 		return args[0]
 	}))
 
 	TokenizerIterType.Dict.Set(val.InternString("__next__"), val.NewBuiltinFuncVal("TokenizerIter.__next__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic(val.NewTypeError("descriptor '__next__' requires an argument"))
+			ctx.Raise(val.NewTypeError("descriptor '__next__' requires an argument"))
+			return val.NoneVal()
 		}
 		it := asTokenizerIter(args[0])
 		if it.idx >= len(it.tokens) {
 			if ctx != nil {
 				ctx.Raise(val.NewStopIteration(val.NoneVal()))
 			}
-			panic(val.NewStopIteration(val.NoneVal()))
+			ctx.Raise(val.NewStopIteration(val.NoneVal()))
+			return val.NoneVal()
 		}
 		tok := it.tokens[it.idx]
 		it.idx++

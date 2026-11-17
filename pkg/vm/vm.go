@@ -16,8 +16,20 @@ import (
 // Run executes the top-level bytecode slice with the given constant pool and local variable count.
 // Hot loop state (code, consts, ip, baseOffset, sp, stack) is kept in local variables so the Go
 // compiler allocates them to CPU registers across loop iterations.
-func (vm *VM) Run(code []uint32, consts []val.Value, numLocals int) val.Value {
+func (vm *VM) Run(code []uint32, consts []val.Value, numLocals int) (res val.Value) {
 	vm.unhandledException = val.NoneVal()
+	defer func() {
+		if r := recover(); r != nil {
+			if re, ok := r.(runtime.Error); ok {
+				panic(re)
+			}
+			if r == ErrTimeoutExceeded || r == ErrStepLimitExceeded || r == ErrMaxStackDepthExceeded {
+				panic(r)
+			}
+			vm.unhandledException = panicToPyException(r)
+			res = val.NoneVal()
+		}
+	}()
 	// The root code object is reused across calls, so that the Tier-2 state
 	// of an unchanged instruction stream survives. A different stream resets
 	// it, because the published instruction slice would not match.
@@ -57,8 +69,20 @@ func sameConstStream(a, b []val.Value) bool {
 }
 
 // RunCode executes a *CodeObject on the VM.
-func (vm *VM) RunCode(co *CodeObject) val.Value {
+func (vm *VM) RunCode(co *CodeObject) (res val.Value) {
 	vm.unhandledException = val.NoneVal()
+	defer func() {
+		if r := recover(); r != nil {
+			if re, ok := r.(runtime.Error); ok {
+				panic(re)
+			}
+			if r == ErrTimeoutExceeded || r == ErrStepLimitExceeded || r == ErrMaxStackDepthExceeded {
+				panic(r)
+			}
+			vm.unhandledException = panicToPyException(r)
+			res = val.NoneVal()
+		}
+	}()
 	return vm.runLoopWithGlobals(co, 0, co.NumLocals, 0, nil, vm.globals, val.NoneVal(), vm.stack, nil, nil)
 }
 
@@ -473,6 +497,9 @@ func (vm *VM) callFromHook(ctx *val.ExecContext, callable val.Value, argBase int
 			}
 		}
 		spAfterBind := vm.bindFunctionArgs(co, fn.Defaults, fn.KwDefaults, ctx.Stack, argBase, nargs, kwnames)
+		if ctx.HasException() {
+			return val.NoneVal()
+		}
 		savedSP := ctx.SP
 		savedFrameIdx := vm.activeFrameIdx
 		nextFrame := 0
@@ -488,7 +515,8 @@ func (vm *VM) callFromHook(ctx *val.ExecContext, callable val.Value, argBase int
 		if !vm.unhandledException.IsNone() && vm.unhandledException.HeaderPtr() != nil {
 			exc := vm.unhandledException
 			vm.unhandledException = val.NoneVal()
-			panic(exc)
+			ctx.Raise(exc)
+			return val.NoneVal()
 		}
 		return res
 
@@ -501,6 +529,9 @@ func (vm *VM) callFromHook(ctx *val.ExecContext, callable val.Value, argBase int
 			return vm.instantiateCoroutine(co, callable, nil, nil, ctx.Stack, argBase, nargs, kwnames, vm.globals)
 		}
 		spAfterBind := vm.bindFunctionArgs(co, nil, nil, ctx.Stack, argBase, nargs, kwnames)
+		if ctx.HasException() {
+			return val.NoneVal()
+		}
 		savedSP := ctx.SP
 		savedFrameIdx := vm.activeFrameIdx
 		nextFrame := 0
@@ -516,7 +547,8 @@ func (vm *VM) callFromHook(ctx *val.ExecContext, callable val.Value, argBase int
 		if !vm.unhandledException.IsNone() && vm.unhandledException.HeaderPtr() != nil {
 			exc := vm.unhandledException
 			vm.unhandledException = val.NoneVal()
-			panic(exc)
+			ctx.Raise(exc)
+			return val.NoneVal()
 		}
 		return res
 
@@ -575,7 +607,8 @@ func (vm *VM) callFromHook(ctx *val.ExecContext, callable val.Value, argBase int
 				line = vm.activeCO.LineAt(vm.frames[vm.activeFrameIdx].ip)
 			}
 		}
-		panic(fmt.Sprintf("vm: TypeError: '%s' object is not callable in %s (%s:%d)", callable.Type().Name, name, file, line))
+		ctx.Raise(val.NewException(val.TypeErrorType, fmt.Sprintf("'%s' object is not callable in %s (%s:%d)", callable.Type().Name, name, file, line)))
+		return val.NoneVal()
 	}
 }
 
@@ -916,7 +949,8 @@ func (vm *VM) initBuiltins() {
 
 	lenVal := val.NewBuiltinFuncVal("len", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) == 0 {
-			panic("vm: TypeError: len() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "len() takes 1 argument"))
+			return val.NoneVal()
 		}
 		a := args[0]
 		if a.IsList() {
@@ -950,7 +984,8 @@ func (vm *VM) initBuiltins() {
 		if sqLen := a.Type().Slots.SqLen; sqLen != nil {
 			return val.Int64Val(sqLen(ctx, a))
 		}
-		panic("vm: TypeError: object of type '" + a.Type().Name + "' has no len()")
+		ctx.Raise(val.NewException(val.TypeErrorType, "object of type '"+a.Type().Name+"' has no len()"))
+		return val.NoneVal()
 	})
 	vm.builtinLen = lenVal
 	vm.builtins.Set(val.InternString("len"), lenVal)
@@ -978,13 +1013,15 @@ func (vm *VM) initBuiltins() {
 	vm.builtins.Set(val.InternString("super"), val.NewBuiltinFuncVal("super", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) == 2 {
 			if !args[0].IsType() {
-				panic("TypeError: super() argument 1 must be type, not " + args[0].Type().Name)
+				ctx.Raise(val.NewException(val.TypeErrorType, "super() argument 1 must be type, not"+args[0].Type().Name))
+				return val.NoneVal()
 			}
 			return val.NewSuperVal(args[0].AsType(), args[1])
 		}
 		if len(args) == 1 {
 			if !args[0].IsType() {
-				panic("TypeError: super() argument 1 must be type, not " + args[0].Type().Name)
+				ctx.Raise(val.NewException(val.TypeErrorType, "super() argument 1 must be type, not"+args[0].Type().Name))
+				return val.NoneVal()
 			}
 			return val.NewSuperVal(args[0].AsType(), val.NoneVal())
 		}
@@ -992,7 +1029,8 @@ func (vm *VM) initBuiltins() {
 			vmInstance := ctx.VM.(*VM)
 			co := vmInstance.activeCO
 			if co == nil {
-				panic("RuntimeError: super(): no active code object")
+				ctx.Raise(val.NewException(val.RuntimeErrorType, "super(): no active code object"))
+				return val.NoneVal()
 			}
 			base := vmInstance.activeBaseOffset
 			activeCells := vmInstance.activeCells
@@ -1002,11 +1040,13 @@ func (vm *VM) initBuiltins() {
 				stack = vmInstance.stack
 			}
 			if base >= len(stack) {
-				panic("RuntimeError: super(): no arguments")
+				ctx.Raise(val.NewException(val.RuntimeErrorType, "super(): no arguments"))
+				return val.NoneVal()
 			}
 			self := stack[base]
 			if self.IsNone() && self.HeaderPtr() == nil {
-				panic("RuntimeError: super(): no arguments")
+				ctx.Raise(val.NewException(val.RuntimeErrorType, "super(): no arguments"))
+				return val.NoneVal()
 			}
 
 			var thisClass *val.PyType
@@ -1041,17 +1081,20 @@ func (vm *VM) initBuiltins() {
 			}
 
 			if !found || thisClass == nil {
-				panic("RuntimeError: super(): __class__ cell not found")
+				ctx.Raise(val.NewException(val.RuntimeErrorType, "super(): __class__ cell not found"))
+				return val.NoneVal()
 			}
 
 			return val.NewSuperVal(thisClass, self)
 		}
-		panic(fmt.Sprintf("TypeError: super() takes at most 2 arguments (%d given)", len(args)))
+		ctx.Raise(val.NewException(val.TypeErrorType, fmt.Sprintf("super() takes at most 2 arguments (%d given)", len(args))))
+		return val.NoneVal()
 	}))
 
 	vm.builtins.Set(val.InternString("__build_class__"), val.NewBuiltinFuncVal("__build_class__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: __build_class__: not enough arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "__build_class__: not enough arguments"))
+			return val.NoneVal()
 		}
 		classBody := args[0]
 		nameVal := args[1]
@@ -1075,7 +1118,8 @@ func (vm *VM) initBuiltins() {
 
 	vm.builtins.Set(val.InternString("__build_lazy_import__"), val.NewBuiltinFuncVal("__build_lazy_import__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 3 {
-			panic("TypeError: __build_lazy_import__ requires 3 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "__build_lazy_import__ requires 3 arguments"))
+			return val.NoneVal()
 		}
 		modName := args[0].AsString()
 		symName := args[1].AsString()
@@ -1236,7 +1280,8 @@ func (vm *VM) initBuiltins() {
 			if v, ok := kwArg(args, kwnames, "file"); ok {
 				pa = []val.Value{v}
 			} else {
-				panic("TypeError: open() missing required argument 'file' (pos 1)")
+				ctx.Raise(val.NewException(val.TypeErrorType, "open() missing required argument 'file' (pos 1)"))
+				return val.NoneVal()
 			}
 		}
 		file := pathArg(ctx, pa[0])
@@ -1246,7 +1291,7 @@ func (vm *VM) initBuiltins() {
 		} else if v, ok := kwArg(args, kwnames, "mode"); ok && v.IsAnyString() {
 			mode = v.AsString()
 		}
-		return openFileBuiltin(file, mode)
+		return openFileBuiltinCtx(ctx, file, mode)
 	}))
 
 	// Built-in exception types
@@ -1275,7 +1320,8 @@ func (vm *VM) initBuiltins() {
 
 	vm.builtins.Set(val.InternString("go"), val.NewBuiltinFuncVal("go", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: go() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "go() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		fn := args[0]
 		var taskArgs []val.Value
@@ -1839,7 +1885,8 @@ func (vm *VM) joinGenerator(ctx *val.ExecContext, sep string, gen *val.PyGenerat
 			if ctx != nil {
 				ctx.Raise(val.NewTypeError(vm.joinErrMsg))
 			} else {
-				panic(val.NewTypeError(vm.joinErrMsg))
+				ctx.Raise(val.NewTypeError(vm.joinErrMsg))
+				return val.NoneVal(), false
 			}
 			return val.NoneVal(), false
 		}
@@ -6270,20 +6317,29 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 						found = true
 					}
 				} else {
+					vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 					vm.execCtx.SP = sp
-					vm.activeFrameIdx = frameIdx
-					vm.activeCO = curCO
-					vm.activeBaseOffset = baseOffset
-					vm.activeCells = cells
-					deferCatch := func() (v val.Value, ok bool) {
-						defer func() {
-							if r := recover(); r != nil {
-								ok = false
+					v := val.GetItemCtx(&vm.execCtx, curLocals, nameVal)
+					if vm.execCtx.HasException() {
+						if val.IsInstance(vm.execCtx.ActiveException, val.KeyErrorType) {
+							vm.execCtx.ClearException()
+						} else {
+							exc := vm.execCtx.ActiveException
+							vm.execCtx.ClearException()
+							if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curCodeCache) {
+								if activeGen != nil {
+									activeGen.State = val.GenClosed
+								}
+								if activeCoro != nil {
+									activeCoro.State = val.CoroClosed
+								}
+								return val.NoneVal()
 							}
-						}()
-						return val.GetItemCtx(&vm.execCtx, curLocals, nameVal), true
-					}
-					if v, ok := deferCatch(); ok {
+							locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+							curCodeCache = vm.getCodeCache(curCO)
+							continue
+						}
+					} else {
 						res = v
 						found = true
 					}
@@ -9886,7 +9942,8 @@ func (vm *VM) loadMethodSlow(obj, attrName val.Value, ip, sp, frameIdx int, curI
 		return val.UnboundVal(), descr
 	}
 
-	panic("vm: AttributeError: '" + tp.Name + "' object has no attribute '" + attrName.AsString() + "'")
+	vm.execCtx.Raise(val.NewLazyAttributeError(tp, attrName))
+	return val.UnboundVal(), val.NoneVal()
 }
 
 func (vm *VM) callMethodPICSlow(receiver, attrName val.Value, ip, newBase, argc, frameIdx int, curMethodPIC [][4]val.MethodPICEntry) val.Value {
@@ -9897,6 +9954,9 @@ func (vm *VM) callMethodPICSlow(receiver, attrName val.Value, ip, newBase, argc,
 		vm.execCtx.SP = newBase + totalArgs
 		vm.activeFrameIdx = frameIdx
 		callable := val.GetAttrCtx(&vm.execCtx, receiver, attrName)
+		if vm.execCtx.HasException() {
+			return val.NoneVal()
+		}
 		if callable.IsBoundMethod() {
 			bm := callable.AsBoundMethod()
 			vm.execCtx.Stack[newBase] = bm.Self
@@ -9985,6 +10045,9 @@ func (vm *VM) callMethodPICSlow(receiver, attrName val.Value, ip, newBase, argc,
 	vm.execCtx.SP = newBase + totalArgs
 	vm.activeFrameIdx = frameIdx
 	callable := val.GetAttrCtx(&vm.execCtx, receiver, attrName)
+	if vm.execCtx.HasException() {
+		return val.NoneVal()
+	}
 	if callable.IsBoundMethod() {
 		bm := callable.AsBoundMethod()
 		vm.execCtx.Stack[newBase] = bm.Self
@@ -10059,11 +10122,12 @@ func (vm *VM) loadAttrInstanceSlow(instObj *val.PyInstance, obj, attrName val.Va
 			SlotIndex:       slotIdx,
 			ExpectedTypeVer: instType.VersionTag,
 		}
-		val, _ := instObj.GetSlot(slotIdx)
-		if val.IsUnbound() {
-			panic("AttributeError: '" + instType.Name + "' object has no attribute '" + attrName.AsString() + "'")
+		v, _ := instObj.GetSlot(slotIdx)
+		if v.IsUnbound() {
+			vm.execCtx.Raise(val.NewLazyAttributeError(instType, attrName))
+			return val.NoneVal()
 		}
-		return val
+		return v
 	}
 
 	if foundInClass {
@@ -10251,254 +10315,105 @@ loopClean:
 	return val.NewRuntimeError(clean)
 }
 
-//go:noinline
-func (vm *VM) dictGetSafe(d *val.PyDict, key val.Value) (v val.Value, ok bool) {
-	defer func() {
-		if r := recover(); r != nil {
-			if !vm.execCtx.HasException() {
-				vm.execCtx.Raise(panicToPyException(r))
-			}
-		}
-	}()
+func (vm *VM) dictGetSafe(d *val.PyDict, key val.Value) (val.Value, bool) {
 	return d.Get(key)
 }
 
-//go:noinline
 func (vm *VM) dictSetSafe(d *val.PyDict, key, v val.Value) {
-	defer func() {
-		if r := recover(); r != nil {
-			if !vm.execCtx.HasException() {
-				vm.execCtx.Raise(panicToPyException(r))
-			}
-		}
-	}()
 	d.Set(key, v)
 }
 
-//go:noinline
-func (vm *VM) getItemSafe(obj, key val.Value) (res val.Value) {
-	defer func() {
-		if r := recover(); r != nil {
-			if !vm.execCtx.HasException() {
-				vm.execCtx.Raise(panicToPyException(r))
-			}
-		}
-	}()
+func (vm *VM) getItemSafe(obj, key val.Value) val.Value {
 	return val.GetItemCtx(&vm.execCtx, obj, key)
 }
 
-//go:noinline
 func (vm *VM) setItemSafe(obj, key, v val.Value) {
-	defer func() {
-		if r := recover(); r != nil {
-			if !vm.execCtx.HasException() {
-				vm.execCtx.Raise(panicToPyException(r))
-			}
-		}
-	}()
 	val.SetItemCtx(&vm.execCtx, obj, key, v)
 }
 
-//go:noinline
-func (vm *VM) instantiateGeneratorSafe(co *CodeObject, callable val.Value, defaults []val.Value, kwDefaults *val.PyDict, callerStack []val.Value, argBase int, nargs int, kwnames []val.Value, globals *val.PyDict) (res val.Value, ok bool) {
-	defer func() {
-		if r := recover(); r != nil {
-			if !vm.execCtx.HasException() {
-				vm.execCtx.Raise(panicToPyException(r))
-			}
-			ok = false
-		}
-	}()
-	res = vm.instantiateGenerator(co, callable, defaults, kwDefaults, callerStack, argBase, nargs, kwnames, globals)
+func (vm *VM) instantiateGeneratorSafe(co *CodeObject, callable val.Value, defaults []val.Value, kwDefaults *val.PyDict, callerStack []val.Value, argBase int, nargs int, kwnames []val.Value, globals *val.PyDict) (val.Value, bool) {
+	res := vm.instantiateGenerator(co, callable, defaults, kwDefaults, callerStack, argBase, nargs, kwnames, globals)
 	return res, !vm.execCtx.HasException()
 }
 
-//go:noinline
-func (vm *VM) instantiateCoroutineSafe(co *CodeObject, callable val.Value, defaults []val.Value, kwDefaults *val.PyDict, callerStack []val.Value, argBase int, nargs int, kwnames []val.Value, globals *val.PyDict) (res val.Value, ok bool) {
-	defer func() {
-		if r := recover(); r != nil {
-			if !vm.execCtx.HasException() {
-				vm.execCtx.Raise(panicToPyException(r))
-			}
-			ok = false
-		}
-	}()
-	res = vm.instantiateCoroutine(co, callable, defaults, kwDefaults, callerStack, argBase, nargs, kwnames, globals)
+func (vm *VM) instantiateCoroutineSafe(co *CodeObject, callable val.Value, defaults []val.Value, kwDefaults *val.PyDict, callerStack []val.Value, argBase int, nargs int, kwnames []val.Value, globals *val.PyDict) (val.Value, bool) {
+	res := vm.instantiateCoroutine(co, callable, defaults, kwDefaults, callerStack, argBase, nargs, kwnames, globals)
 	return res, !vm.execCtx.HasException()
 }
 
-//go:noinline
-func (vm *VM) bindFunctionArgsSafe(co *CodeObject, defaults []val.Value, kwDefaults *val.PyDict, stack []val.Value, argBase int, nargs int, kwnames []val.Value) (nextSP int, ok bool) {
-	defer func() {
-		if r := recover(); r != nil {
-			if !vm.execCtx.HasException() {
-				vm.execCtx.Raise(panicToPyException(r))
-			}
-			ok = false
-		}
-	}()
-	nextSP = vm.bindFunctionArgs(co, defaults, kwDefaults, stack, argBase, nargs, kwnames)
+func (vm *VM) bindFunctionArgsSafe(co *CodeObject, defaults []val.Value, kwDefaults *val.PyDict, stack []val.Value, argBase int, nargs int, kwnames []val.Value) (int, bool) {
+	nextSP := vm.bindFunctionArgs(co, defaults, kwDefaults, stack, argBase, nargs, kwnames)
 	return nextSP, !vm.execCtx.HasException()
 }
 
-//go:noinline
-func (vm *VM) invokeBuiltinSafe(fn val.VectorcallFunc, callable val.Value, args []val.Value, kwnames []val.Value) (res val.Value) {
-	defer func() {
-		if r := recover(); r != nil {
-			if !vm.execCtx.HasException() {
-				vm.execCtx.Raise(panicToPyException(r))
-			}
-		}
-	}()
+func (vm *VM) invokeBuiltinSafe(fn val.VectorcallFunc, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 	return fn(&vm.execCtx, callable, args, kwnames)
 }
 
-//go:noinline
-func (vm *VM) callFromHookSafe(callable val.Value, argBase int, nargs int, kwnames []val.Value) (res val.Value) {
-	defer func() {
-		if r := recover(); r != nil {
-			if !vm.execCtx.HasException() {
-				vm.execCtx.Raise(panicToPyException(r))
-			}
-		}
-	}()
+func (vm *VM) callFromHookSafe(callable val.Value, argBase int, nargs int, kwnames []val.Value) val.Value {
 	return vm.callFromHook(&vm.execCtx, callable, argBase, nargs, kwnames)
 }
 
-//go:noinline
-func (vm *VM) loadMethodSlowSafe(obj, attrName val.Value, ip, sp, frameIdx int, curIC []ICSlot, curMethodPIC [][4]val.MethodPICEntry) (rec val.Value, meth val.Value) {
-	defer func() {
-		if r := recover(); r != nil {
-			if !vm.execCtx.HasException() {
-				vm.execCtx.Raise(panicToPyException(r))
-			}
-		}
-	}()
+func (vm *VM) loadMethodSlowSafe(obj, attrName val.Value, ip, sp, frameIdx int, curIC []ICSlot, curMethodPIC [][4]val.MethodPICEntry) (val.Value, val.Value) {
 	return vm.loadMethodSlow(obj, attrName, ip, sp, frameIdx, curIC, curMethodPIC)
 }
 
-//go:noinline
-func (vm *VM) callMethodPICSlowSafe(receiver, attrName val.Value, ip, newBase, argc, frameIdx int, curMethodPIC [][4]val.MethodPICEntry) (res val.Value) {
-	defer func() {
-		if r := recover(); r != nil {
-			if !vm.execCtx.HasException() {
-				vm.execCtx.Raise(panicToPyException(r))
-			}
-		}
-	}()
+func (vm *VM) callMethodPICSlowSafe(receiver, attrName val.Value, ip, newBase, argc, frameIdx int, curMethodPIC [][4]val.MethodPICEntry) val.Value {
 	return vm.callMethodPICSlow(receiver, attrName, ip, newBase, argc, frameIdx, curMethodPIC)
 }
 
-//go:noinline
-func (vm *VM) getAttrSafe(obj, attrName val.Value) (res val.Value) {
-	defer func() {
-		if r := recover(); r != nil {
-			if !vm.execCtx.HasException() {
-				vm.execCtx.Raise(panicToPyException(r))
-			}
-		}
-	}()
+func (vm *VM) getAttrSafe(obj, attrName val.Value) val.Value {
 	v, ok := val.LookupAttrOptional(&vm.execCtx, obj, attrName)
 	if !ok && !vm.execCtx.HasException() {
-		interned := val.InternValue(attrName)
-		vm.execCtx.Raise(val.NewAttributeError("'" + obj.Type().Name + "' object has no attribute '" + interned.AsString() + "'"))
+		vm.execCtx.Raise(val.NewLazyAttributeError(obj.Type(), val.InternValue(attrName)))
 		return val.NoneVal()
 	}
 	return v
 }
 
-//go:noinline
-func (vm *VM) descrGetSafe(descr, obj val.Value, owner *val.PyType) (res val.Value) {
-	defer func() {
-		if r := recover(); r != nil {
-			if !vm.execCtx.HasException() {
-				vm.execCtx.Raise(panicToPyException(r))
-			}
-		}
-	}()
+func (vm *VM) descrGetSafe(descr, obj val.Value, owner *val.PyType) val.Value {
 	if descr.Type() == nil || descr.Type().Slots.TpDescrGet == nil {
 		return descr
 	}
 	return descr.Type().Slots.TpDescrGet(&vm.execCtx, descr, obj, owner)
 }
 
-//go:noinline
-func (vm *VM) loadAttrInstanceSlowSafe(instObj *val.PyInstance, obj, attrName val.Value, ip, sp, frameIdx int, curIC []ICSlot, curAttrPIC [][4]AttrPICEntry) (res val.Value) {
-	defer func() {
-		if r := recover(); r != nil {
-			if !vm.execCtx.HasException() {
-				vm.execCtx.Raise(panicToPyException(r))
-			}
-		}
-	}()
+func (vm *VM) loadAttrInstanceSlowSafe(instObj *val.PyInstance, obj, attrName val.Value, ip, sp, frameIdx int, curIC []ICSlot, curAttrPIC [][4]AttrPICEntry) val.Value {
 	return vm.loadAttrInstanceSlow(instObj, obj, attrName, ip, sp, frameIdx, curIC, curAttrPIC)
 }
 
-//go:noinline
 func (vm *VM) setAttrSafe(obj, attrName, v val.Value) {
-	defer func() {
-		if r := recover(); r != nil {
-			if !vm.execCtx.HasException() {
-				vm.execCtx.Raise(panicToPyException(r))
-			}
-		}
-	}()
 	val.SetAttrCtx(&vm.execCtx, obj, attrName, v)
 }
 
-//go:noinline
 func (vm *VM) descrSetSafe(descr, obj, v val.Value) {
-	defer func() {
-		if r := recover(); r != nil {
-			if !vm.execCtx.HasException() {
-				vm.execCtx.Raise(panicToPyException(r))
-			}
-		}
-	}()
 	if descr.Type() != nil && descr.Type().Slots.TpDescrSet != nil {
 		descr.Type().Slots.TpDescrSet(&vm.execCtx, descr, obj, v)
 	}
 }
 
-//go:noinline
 func (vm *VM) storeAttrInstanceSlowSafe(instObj *val.PyInstance, obj, attrName, v val.Value, ip, sp, frameIdx int, curIC []ICSlot, curAttrPIC [][4]AttrPICEntry) {
-	defer func() {
-		if r := recover(); r != nil {
-			if !vm.execCtx.HasException() {
-				vm.execCtx.Raise(panicToPyException(r))
-			}
-		}
-	}()
 	vm.storeAttrInstanceSlow(instObj, obj, attrName, v, ip, sp, frameIdx, curIC, curAttrPIC)
 }
 
-//go:noinline
-func (vm *VM) getIterSafe(obj val.Value) (res val.Value) {
-	defer func() {
-		if r := recover(); r != nil {
-			if !vm.execCtx.HasException() {
-				vm.execCtx.Raise(panicToPyException(r))
-			}
-		}
-	}()
+func (vm *VM) getIterSafe(obj val.Value) val.Value {
 	tp := obj.Type()
 	if tpIter := tp.Slots.TpIter; tpIter != nil {
 		return tpIter(&vm.execCtx, obj)
 	}
-	return newIterChecked(obj)
+	return newIterCheckedCtx(&vm.execCtx, obj)
 }
 
-// newIterChecked builds an iterator for obj and fails immediately with
-// TypeError when obj supports no iteration protocol (PEP 234), instead of
-// deferring the error to the first next().
-func newIterChecked(obj val.Value) val.Value {
+// newIterCheckedCtx builds an iterator for obj and signals TypeError via ctx
+// when obj supports no iteration protocol (PEP 234).
+func newIterCheckedCtx(ctx *val.ExecContext, obj val.Value) val.Value {
 	tp := obj.Type()
 	it := val.NewIterVal(obj)
 	if it.IsIter() && it.AsIter().Kind == val.IterKindInvalid {
 		if tp.Slots.TpIterNext == nil && tp.Slots.SqItem == nil {
 			if _, _, ok := tp.LookupMRO(nameNext); !ok {
 				if _, _, ok := tp.LookupMRO(nameGetitem); !ok {
-					panic("TypeError: '" + tp.Name + "' object is not iterable")
+					return val.RaiseTypeError(ctx, "'"+tp.Name+"' object is not iterable")
 				}
 			}
 		}
@@ -10506,52 +10421,19 @@ func newIterChecked(obj val.Value) val.Value {
 	return it
 }
 
-//go:noinline
-func (vm *VM) iterNextSafe(tpIterNext func(*val.ExecContext, val.Value) (val.Value, val.IterStatus), it val.Value) (nextVal val.Value, status val.IterStatus) {
-	defer func() {
-		if r := recover(); r != nil {
-			if !vm.execCtx.HasException() {
-				vm.execCtx.Raise(panicToPyException(r))
-			}
-			status = val.IterError
-		}
-	}()
+func (vm *VM) iterNextSafe(tpIterNext func(*val.ExecContext, val.Value) (val.Value, val.IterStatus), it val.Value) (val.Value, val.IterStatus) {
 	return tpIterNext(&vm.execCtx, it)
 }
 
-//go:noinline
-func (vm *VM) buildClassSafe(classBody, nameVal val.Value, origBases []val.Value, kwdsVal val.Value, globals *val.PyDict) (res val.Value) {
-	defer func() {
-		if r := recover(); r != nil {
-			if !vm.execCtx.HasException() {
-				vm.execCtx.Raise(panicToPyException(r))
-			}
-		}
-	}()
+func (vm *VM) buildClassSafe(classBody, nameVal val.Value, origBases []val.Value, kwdsVal val.Value, globals *val.PyDict) val.Value {
 	return vm.buildClass(classBody, nameVal, origBases, kwdsVal, globals)
 }
 
-//go:noinline
-func (vm *VM) extractIterableSafe(seq val.Value) (items []val.Value) {
-	defer func() {
-		if r := recover(); r != nil {
-			if !vm.execCtx.HasException() {
-				vm.execCtx.Raise(panicToPyException(r))
-			}
-		}
-	}()
+func (vm *VM) extractIterableSafe(seq val.Value) []val.Value {
 	return val.ExtractIterableItems(&vm.execCtx, seq)
 }
 
-//go:noinline
-func (vm *VM) formatValueSafe(v val.Value, spec string, conversion uint8) (res val.Value) {
-	defer func() {
-		if r := recover(); r != nil {
-			if !vm.execCtx.HasException() {
-				vm.execCtx.Raise(panicToPyException(r))
-			}
-		}
-	}()
+func (vm *VM) formatValueSafe(v val.Value, spec string, conversion uint8) val.Value {
 	ctx := &vm.execCtx
 	switch conversion {
 	case 'r':
@@ -10564,39 +10446,15 @@ func (vm *VM) formatValueSafe(v val.Value, spec string, conversion uint8) (res v
 	return val.NewStringVal(val.PyFormat(ctx, v, spec))
 }
 
-//go:noinline
-func (vm *VM) compareOpSafe(a, b val.Value, cmpOp uint8) (res val.Value) {
-	defer func() {
-		if r := recover(); r != nil {
-			if !vm.execCtx.HasException() {
-				vm.execCtx.Raise(panicToPyException(r))
-			}
-		}
-	}()
+func (vm *VM) compareOpSafe(a, b val.Value, cmpOp uint8) val.Value {
 	return val.RichCompare(&vm.execCtx, a, b, cmpOp)
 }
 
-//go:noinline
 func (vm *VM) delAttrSafe(obj, attrName val.Value) {
-	defer func() {
-		if r := recover(); r != nil {
-			if !vm.execCtx.HasException() {
-				vm.execCtx.Raise(panicToPyException(r))
-			}
-		}
-	}()
 	val.DelAttrCtx(&vm.execCtx, obj, attrName)
 }
 
-//go:noinline
 func (vm *VM) delSubscrSafe(obj, key val.Value) {
-	defer func() {
-		if r := recover(); r != nil {
-			if !vm.execCtx.HasException() {
-				vm.execCtx.Raise(panicToPyException(r))
-			}
-		}
-	}()
 	if obj.IsDict() && obj.Type() == val.DictType {
 		if !obj.AsDict().Delete(key) {
 			vm.execCtx.Raise(val.NewKeyError(key))
@@ -10684,15 +10542,7 @@ func (vm *VM) delSubscrSafe(obj, key val.Value) {
 	vm.execCtx.Raise(val.NewTypeError("'" + obj.Type().Name + "' object does not support item deletion"))
 }
 
-//go:noinline
 func (vm *VM) unpackMapIntoSafe(resDict *val.PyDict, mapping val.Value) {
-	defer func() {
-		if r := recover(); r != nil {
-			if !vm.execCtx.HasException() {
-				vm.execCtx.Raise(panicToPyException(r))
-			}
-		}
-	}()
 	if mapping.IsDict() {
 		for _, item := range mapping.AsDict().Items() {
 			resDict.Set(item.Key, item.Value)
@@ -10728,15 +10578,7 @@ func (vm *VM) unpackMapIntoSafe(resDict *val.PyDict, mapping val.Value) {
 	}
 }
 
-//go:noinline
-func (vm *VM) callFunctionExSafe(callable, argsVal, kwDictVal val.Value, hasKW bool) (res val.Value) {
-	defer func() {
-		if r := recover(); r != nil {
-			if !vm.execCtx.HasException() {
-				vm.execCtx.Raise(panicToPyException(r))
-			}
-		}
-	}()
+func (vm *VM) callFunctionExSafe(callable, argsVal, kwDictVal val.Value, hasKW bool) val.Value {
 	var posArgs []val.Value
 	switch {
 	case argsVal.IsTuple():

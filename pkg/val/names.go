@@ -24,4 +24,8 @@ var (
 	strName            = InternString("__name__")
 	strMRO             = InternString("__mro__")
 	strFile            = InternString("__file__")
+	strValue           = InternString("value")
+	strLazyType        = InternString("__lazy_type__")
+	strLazyAttr        = InternString("__lazy_attr__")
+	strLazyKey         = InternString("__lazy_key__")
 )

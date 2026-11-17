@@ -63,11 +63,13 @@ func (e *Engine) createBinasciiModule() val.Value {
 	set("b2a_base64", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		pa := posArgs(args, kwnames)
 		if len(pa) < 1 {
-			panic("TypeError: b2a_base64() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "b2a_base64() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		data, ok := getBytesFromValue(pa[0])
 		if !ok {
-			panic("TypeError: a bytes-like object is required")
+			ctx.Raise(val.NewException(val.TypeErrorType, "a bytes-like object is required"))
+			return val.NoneVal()
 		}
 		newline := true
 		if v, ok := kwArg(args, kwnames, "newline"); ok {
@@ -112,11 +114,13 @@ func (e *Engine) createBinasciiModule() val.Value {
 	set("a2b_base64", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		pa := posArgs(args, kwnames)
 		if len(pa) < 1 {
-			panic("TypeError: a2b_base64() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "a2b_base64() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		data, ok := getBytesFromValue(pa[0])
 		if !ok {
-			panic("TypeError: a bytes-like object is required")
+			ctx.Raise(val.NewException(val.TypeErrorType, "a bytes-like object is required"))
+			return val.NoneVal()
 		}
 		padded := true
 		if v, ok := kwArg(args, kwnames, "padded"); ok {
@@ -164,11 +168,13 @@ func (e *Engine) createBinasciiModule() val.Value {
 	hexlifyFn := func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		pa := posArgs(args, kwnames)
 		if len(pa) < 1 {
-			panic("TypeError: hexlify() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "hexlify() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		data, ok := getBytesFromValue(pa[0])
 		if !ok {
-			panic("TypeError: a bytes-like object is required")
+			ctx.Raise(val.NewException(val.TypeErrorType, "a bytes-like object is required"))
+			return val.NoneVal()
 		}
 		encoded := make([]byte, hex.EncodedLen(len(data)))
 		hex.Encode(encoded, data)
@@ -181,11 +187,13 @@ func (e *Engine) createBinasciiModule() val.Value {
 	unhexlifyFn := func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		pa := posArgs(args, kwnames)
 		if len(pa) < 1 {
-			panic("TypeError: unhexlify() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "unhexlify() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		data, ok := getBytesFromValue(pa[0])
 		if !ok {
-			panic("TypeError: a bytes-like object is required")
+			ctx.Raise(val.NewException(val.TypeErrorType, "a bytes-like object is required"))
+			return val.NoneVal()
 		}
 		s := strings.TrimSpace(string(data))
 		if len(s)%2 != 0 {
@@ -206,11 +214,13 @@ func (e *Engine) createBinasciiModule() val.Value {
 	set("crc32", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		pa := posArgs(args, kwnames)
 		if len(pa) < 1 {
-			panic("TypeError: crc32() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "crc32() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		data, ok := getBytesFromValue(pa[0])
 		if !ok {
-			panic("TypeError: a bytes-like object is required")
+			ctx.Raise(val.NewException(val.TypeErrorType, "a bytes-like object is required"))
+			return val.NoneVal()
 		}
 		var crc uint32 = 0
 		if len(pa) > 1 && pa[1].IsInt64() {

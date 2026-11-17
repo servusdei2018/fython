@@ -92,7 +92,8 @@ func (e *Engine) createSqlite3Module() val.Value {
 	// Module functions
 	mod.Dict.Set(val.InternString("connect"), val.NewModuleFuncVal("connect", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: connect() missing required argument 'database'")
+			ctx.Raise(val.NewException(val.TypeErrorType, "connect() missing required argument 'database'"))
+			return val.NoneVal()
 		}
 		path := args[0].AsString()
 		db, err := sqlite.Open(path)
@@ -157,7 +158,8 @@ func initSqliteTypes() {
 
 	cursorFn := val.NewBuiltinFuncVal("cursor", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: cursor() missing self")
+			ctx.Raise(val.NewException(val.TypeErrorType, "cursor() missing self"))
+			return val.NoneVal()
 		}
 		self := args[0]
 		st, ok := getConnState(self)
@@ -180,7 +182,8 @@ func initSqliteTypes() {
 
 	sqliteConnType.Dict.Set(val.InternString("execute"), val.NewBuiltinFuncVal("execute", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: execute() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "execute() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		self := args[0]
 		curVal := cursorFn.AsBuiltinFunc().Fn(ctx, cursorFn, []val.Value{self}, nil)
@@ -190,7 +193,8 @@ func initSqliteTypes() {
 
 	sqliteConnType.Dict.Set(val.InternString("executemany"), val.NewBuiltinFuncVal("executemany", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 3 {
-			panic("TypeError: executemany() takes at least 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "executemany() takes at least 2 arguments"))
+			return val.NoneVal()
 		}
 		self := args[0]
 		curVal := cursorFn.AsBuiltinFunc().Fn(ctx, cursorFn, []val.Value{self}, nil)
@@ -200,7 +204,8 @@ func initSqliteTypes() {
 
 	sqliteConnType.Dict.Set(val.InternString("executescript"), val.NewBuiltinFuncVal("executescript", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: executescript() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "executescript() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		self := args[0]
 		curVal := cursorFn.AsBuiltinFunc().Fn(ctx, cursorFn, []val.Value{self}, nil)
@@ -303,7 +308,8 @@ func initSqliteTypes() {
 	// Cursor
 	cursorExecFn = val.NewBuiltinFuncVal("execute", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: execute() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "execute() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		self := args[0]
 		cst, ok := getCursorState(self)
@@ -383,7 +389,8 @@ func initSqliteTypes() {
 
 	cursorExecManyFn = val.NewBuiltinFuncVal("executemany", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 3 {
-			panic("TypeError: executemany() takes at least 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "executemany() takes at least 2 arguments"))
+			return val.NoneVal()
 		}
 		self := args[0]
 		cst, ok := getCursorState(self)
@@ -425,7 +432,8 @@ func initSqliteTypes() {
 
 	cursorExecScriptFn = val.NewBuiltinFuncVal("executescript", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: executescript() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "executescript() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		self := args[0]
 		cst, ok := getCursorState(self)
@@ -566,7 +574,8 @@ func initSqliteTypes() {
 	sqliteRowType.Slots.MpSubscript = func(ctx *val.ExecContext, o, key val.Value) val.Value {
 		rst, ok := getRowState(o)
 		if !ok {
-			panic("TypeError: descriptor requires a 'Row' object")
+			ctx.Raise(val.NewException(val.TypeErrorType, "descriptor requires a 'Row' object"))
+			return val.NoneVal()
 		}
 		if key.IsInt64() {
 			idx := int(key.AsInt64())
@@ -574,7 +583,8 @@ func initSqliteTypes() {
 				idx += len(rst.values)
 			}
 			if idx < 0 || idx >= len(rst.values) {
-				panic("IndexError: Row index out of range")
+				ctx.Raise(val.NewException(val.IndexErrorType, "Row index out of range"))
+				return val.NoneVal()
 			}
 			return rst.values[idx]
 		}
@@ -585,9 +595,11 @@ func initSqliteTypes() {
 					return rst.values[i]
 				}
 			}
-			panic("IndexError: No item with that key")
+			ctx.Raise(val.NewException(val.IndexErrorType, "No item with that key"))
+			return val.NoneVal()
 		}
-		panic("IndexError: Row index must be integer or string")
+		ctx.Raise(val.NewException(val.IndexErrorType, "Row index must be integer or string"))
+		return val.NoneVal()
 	}
 
 	sqliteRowType.Dict.Set(val.InternString("keys"), val.NewBuiltinFuncVal("keys", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -615,7 +627,8 @@ func initSqliteTypes() {
 
 	sqliteRowType.Dict.Set(val.InternString("__getitem__"), val.NewBuiltinFuncVal("__getitem__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: __getitem__() takes exactly 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "__getitem__() takes exactly 1 argument"))
+			return val.NoneVal()
 		}
 		return sqliteRowType.Slots.MpSubscript(ctx, args[0], args[1])
 	}))
@@ -630,7 +643,8 @@ func initSqliteTypes() {
 
 	sqliteRowType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: Row() takes at least 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "Row() takes at least 2 arguments"))
+			return val.NoneVal()
 		}
 		cur := args[0]
 		tup := args[1]

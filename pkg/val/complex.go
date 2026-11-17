@@ -255,7 +255,8 @@ func complexConstruct(ctx *ExecContext, args []Value, kwnames []Value) Value {
 	var realArg, imagArg Value
 	hasReal, hasImag := false, false
 	if npos > 2 {
-		panic("TypeError: complex() takes at most 2 arguments (" + strconv.Itoa(npos) + " given)")
+		ctx.Raise(NewException(TypeErrorType, "complex() takes at most 2 arguments ("+strconv.Itoa(npos)+" given)"))
+		return NoneVal()
 	}
 	if npos > 0 {
 		realArg, hasReal = pos[0], true
@@ -268,16 +269,19 @@ func complexConstruct(ctx *ExecContext, args []Value, kwnames []Value) Value {
 		switch k.AsString() {
 		case "real":
 			if hasReal {
-				panic("TypeError: argument for complex() given by name ('real') and position (1)")
+				ctx.Raise(NewException(TypeErrorType, "argument for complex() given by name ('real') and position (1)"))
+				return NoneVal()
 			}
 			realArg, hasReal = v, true
 		case "imag":
 			if hasImag {
-				panic("TypeError: argument for complex() given by name ('imag') and position (2)")
+				ctx.Raise(NewException(TypeErrorType, "argument for complex() given by name ('imag') and position (2)"))
+				return NoneVal()
 			}
 			imagArg, hasImag = v, true
 		default:
-			panic("TypeError: complex() got an unexpected keyword argument '" + k.AsString() + "'")
+			ctx.Raise(NewException(TypeErrorType, "complex() got an unexpected keyword argument '"+k.AsString()+"'"))
+			return NoneVal()
 		}
 	}
 	if !hasReal && !hasImag {
@@ -288,7 +292,8 @@ func complexConstruct(ctx *ExecContext, args []Value, kwnames []Value) Value {
 	if hasReal {
 		if realArg.IsAnyString() {
 			if hasImag {
-				panic("TypeError: complex() can't take second arg if first is a string")
+				ctx.Raise(NewException(TypeErrorType, "complex() can't take second arg if first is a string"))
+				return NoneVal()
 			}
 			re, im := parseComplexString(realArg.AsString())
 			return NewComplexVal(re, im)
@@ -300,7 +305,8 @@ func complexConstruct(ctx *ExecContext, args []Value, kwnames []Value) Value {
 			if fn, _, ok := realArg.Type().LookupMRO(InternString("__complex__")); ok {
 				res := ctx.Invoke1(fn, realArg)
 				if !res.IsComplex() {
-					panic("TypeError: __complex__ returned non-complex (type " + res.Type().Name + ")")
+					ctx.Raise(NewException(TypeErrorType, "__complex__ returned non-complex (type"+res.Type().Name+")"))
+					return NoneVal()
 				}
 				if !hasImag {
 					return res
@@ -318,7 +324,8 @@ func complexConstruct(ctx *ExecContext, args []Value, kwnames []Value) Value {
 	}
 	if hasImag {
 		if imagArg.IsAnyString() {
-			panic("TypeError: complex() second arg can't be a string")
+			ctx.Raise(NewException(TypeErrorType, "complex() second arg can't be a string"))
+			return NoneVal()
 		}
 		ir, ii = complexFromArg(imagArg, "second")
 		imagIsComplex = imagArg.IsComplex()
@@ -352,7 +359,8 @@ func initComplexType() {
 		c := a.AsComplex()
 		r := math.Hypot(c.Real, c.Imag)
 		if math.IsInf(r, 0) && !math.IsInf(c.Real, 0) && !math.IsInf(c.Imag, 0) {
-			panic("OverflowError: absolute value too large")
+			ctx.Raise(NewException(OverflowErrorType, "absolute value too large"))
+			return NoneVal()
 		}
 		return Float64Val(r)
 	}
@@ -401,7 +409,8 @@ func initComplexType() {
 			return NotImplementedVal()
 		}
 		if len(args) > 2 && !args[2].IsNone() {
-			panic("ValueError: complex modulo")
+			ctx.Raise(NewException(ValueErrorType, "complex modulo"))
+			return NoneVal()
 		}
 		if _, _, ok := toComplexParts(args[1]); !ok {
 			return NotImplementedVal()
@@ -470,7 +479,8 @@ func initComplexType() {
 	fn("__format__", func(ctx *ExecContext, args []Value) Value {
 		c := complexSelf(args)
 		if len(args) != 2 || !args[1].IsAnyString() {
-			panic("TypeError: complex.__format__() takes exactly one argument (str)")
+			ctx.Raise(NewException(TypeErrorType, "complex.__format__() takes exactly one argument (str)"))
+			return NoneVal()
 		}
 		return NewStringVal(FormatComplexSpec(c.Real, c.Imag, args[1].AsString()))
 	})

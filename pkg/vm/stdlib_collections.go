@@ -54,11 +54,11 @@ func (d *pyDeque) appendLeft(v val.Value) {
 	d.Items = newItems
 }
 
-func (d *pyDeque) popRight() val.Value {
+func (d *pyDeque) popRight(ctx *val.ExecContext) val.Value {
 	d.Mu.Lock()
 	defer d.Mu.Unlock()
 	if len(d.Items) == 0 {
-		panic("IndexError: pop from an empty deque")
+		return val.RaiseIndexError(ctx, "pop from an empty deque")
 	}
 	idx := len(d.Items) - 1
 	v := d.Items[idx]
@@ -66,11 +66,11 @@ func (d *pyDeque) popRight() val.Value {
 	return v
 }
 
-func (d *pyDeque) popLeft() val.Value {
+func (d *pyDeque) popLeft(ctx *val.ExecContext) val.Value {
 	d.Mu.Lock()
 	defer d.Mu.Unlock()
 	if len(d.Items) == 0 {
-		panic("IndexError: pop from an empty deque")
+		return val.RaiseIndexError(ctx, "pop from an empty deque")
 	}
 	v := d.Items[0]
 	d.Items = d.Items[1:]
@@ -128,7 +128,8 @@ func initCollectionsTypes() {
 				}
 			}
 			if maxLen < -1 {
-				panic("ValueError: maxlen must be non-negative")
+				ctx.Raise(val.NewException(val.ValueErrorType, "maxlen must be non-negative"))
+				return val.NoneVal()
 			}
 			deq := &pyDeque{
 				Header: val.ObjectHeader{Kind: val.KindNative, Type: DequeType},
@@ -161,7 +162,8 @@ func initCollectionsTypes() {
 
 		DequeType.Slots.MpSubscript = func(ctx *val.ExecContext, o, key val.Value) val.Value {
 			if !key.IsInt64() {
-				panic("TypeError: deque indices must be integers")
+				ctx.Raise(val.NewException(val.TypeErrorType, "deque indices must be integers"))
+				return val.NoneVal()
 			}
 			deq := (*pyDeque)(unsafe.Pointer(o.HeaderPtr()))
 			deq.Mu.RLock()
@@ -171,14 +173,16 @@ func initCollectionsTypes() {
 				idx += len(deq.Items)
 			}
 			if idx < 0 || idx >= len(deq.Items) {
-				panic("IndexError: deque index out of range")
+				ctx.Raise(val.NewException(val.IndexErrorType, "deque index out of range"))
+				return val.NoneVal()
 			}
 			return deq.Items[idx]
 		}
 
 		DequeType.Slots.MpAssSubscript = func(ctx *val.ExecContext, o, key, value val.Value) val.Value {
 			if !key.IsInt64() {
-				panic("TypeError: deque indices must be integers")
+				ctx.Raise(val.NewException(val.TypeErrorType, "deque indices must be integers"))
+				return val.NoneVal()
 			}
 			deq := (*pyDeque)(unsafe.Pointer(o.HeaderPtr()))
 			deq.Mu.Lock()
@@ -188,7 +192,8 @@ func initCollectionsTypes() {
 				idx += len(deq.Items)
 			}
 			if idx < 0 || idx >= len(deq.Items) {
-				panic("IndexError: deque index out of range")
+				ctx.Raise(val.NewException(val.IndexErrorType, "deque index out of range"))
+				return val.NoneVal()
 			}
 			deq.Items[idx] = value
 			return val.NoneVal()
@@ -198,7 +203,8 @@ func initCollectionsTypes() {
 		registerDequeMethod := func(name string, fn func(ctx *val.ExecContext, deq *pyDeque, args []val.Value) val.Value) {
 			DequeType.Dict.Set(val.InternString(name), val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 				if len(args) == 0 {
-					panic("TypeError: descriptor '" + name + "' of 'deque' object needs an argument")
+					ctx.Raise(val.NewException(val.TypeErrorType, "descriptor '"+name+"' of 'deque' object needs an argument"))
+					return val.NoneVal()
 				}
 				deq := (*pyDeque)(unsafe.Pointer(args[0].HeaderPtr()))
 				return fn(ctx, deq, args[1:])
@@ -207,7 +213,8 @@ func initCollectionsTypes() {
 
 		registerDequeMethod("append", func(ctx *val.ExecContext, deq *pyDeque, args []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: append() takes exactly one argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "append() takes exactly one argument"))
+				return val.NoneVal()
 			}
 			deq.appendRight(args[0])
 			return val.NoneVal()
@@ -215,18 +222,19 @@ func initCollectionsTypes() {
 
 		registerDequeMethod("appendleft", func(ctx *val.ExecContext, deq *pyDeque, args []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: appendleft() takes exactly one argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "appendleft() takes exactly one argument"))
+				return val.NoneVal()
 			}
 			deq.appendLeft(args[0])
 			return val.NoneVal()
 		})
 
 		registerDequeMethod("pop", func(ctx *val.ExecContext, deq *pyDeque, args []val.Value) val.Value {
-			return deq.popRight()
+			return deq.popRight(ctx)
 		})
 
 		registerDequeMethod("popleft", func(ctx *val.ExecContext, deq *pyDeque, args []val.Value) val.Value {
-			return deq.popLeft()
+			return deq.popLeft(ctx)
 		})
 
 		registerDequeMethod("rotate", func(ctx *val.ExecContext, deq *pyDeque, args []val.Value) val.Value {
@@ -247,7 +255,8 @@ func initCollectionsTypes() {
 
 		registerDequeMethod("extend", func(ctx *val.ExecContext, deq *pyDeque, args []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: extend() takes exactly one argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "extend() takes exactly one argument"))
+				return val.NoneVal()
 			}
 			for _, v := range val.ExtractIterableItems(ctx, args[0]) {
 				deq.appendRight(v)
@@ -257,7 +266,8 @@ func initCollectionsTypes() {
 
 		registerDequeMethod("extendleft", func(ctx *val.ExecContext, deq *pyDeque, args []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: extendleft() takes exactly one argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "extendleft() takes exactly one argument"))
+				return val.NoneVal()
 			}
 			for _, v := range val.ExtractIterableItems(ctx, args[0]) {
 				deq.appendLeft(v)
@@ -278,7 +288,8 @@ func initCollectionsTypes() {
 
 		registerDequeMethod("remove", func(ctx *val.ExecContext, deq *pyDeque, args []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: remove() takes exactly one argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "remove() takes exactly one argument"))
+				return val.NoneVal()
 			}
 			valTarget := args[0]
 			deq.Mu.Lock()
@@ -291,7 +302,8 @@ func initCollectionsTypes() {
 				}
 			}
 			if idx < 0 {
-				panic("ValueError: deque.remove(x): x not in deque")
+				ctx.Raise(val.NewException(val.ValueErrorType, "deque.remove(x): x not in deque"))
+				return val.NoneVal()
 			}
 			deq.Items = append(deq.Items[:idx], deq.Items[idx+1:]...)
 			return val.NoneVal()
@@ -299,7 +311,8 @@ func initCollectionsTypes() {
 
 		registerDequeMethod("count", func(ctx *val.ExecContext, deq *pyDeque, args []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: count() takes exactly one argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "count() takes exactly one argument"))
+				return val.NoneVal()
 			}
 			valTarget := args[0]
 			deq.Mu.RLock()
@@ -326,7 +339,8 @@ func initCollectionsTypes() {
 		TupleGetterType = val.MustNewType("_tuplegetter", []*val.PyType{val.ObjectType}, nil)
 		TupleGetterType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 || !args[0].IsInt64() {
-				panic("TypeError: _tuplegetter index must be an integer")
+				ctx.Raise(val.NewException(val.TypeErrorType, "_tuplegetter index must be an integer"))
+				return val.NoneVal()
 			}
 			idx := int(args[0].AsInt64())
 			doc := val.NoneVal()
@@ -353,14 +367,16 @@ func initCollectionsTypes() {
 			if obj.IsTuple() {
 				t := obj.AsTuple()
 				if getter.Index < 0 || getter.Index >= len(t.Items) {
-					panic("IndexError: tuple index out of range")
+					ctx.Raise(val.NewException(val.IndexErrorType, "tuple index out of range"))
+					return val.NoneVal()
 				}
 				return t.Items[getter.Index]
 			}
 			if sqItem := obj.Type().Slots.SqItem; sqItem != nil {
 				return sqItem(ctx, obj, val.Int64Val(int64(getter.Index)))
 			}
-			panic("TypeError: tuplegetter applied to non-tuple")
+			ctx.Raise(val.NewException(val.TypeErrorType, "tuplegetter applied to non-tuple"))
+			return val.NoneVal()
 		}
 
 		TupleGetterType.Slots.TpGetAttr = func(ctx *val.ExecContext, obj, name val.Value) val.Value {
@@ -377,7 +393,8 @@ func initCollectionsTypes() {
 				getter.Doc = value
 				return val.NoneVal()
 			}
-			panic(fmt.Sprintf("AttributeError: '_tuplegetter' object has no attribute '%s'", name.AsString()))
+			ctx.Raise(val.NewException(val.AttributeErrorType, fmt.Sprintf("'_tuplegetter' object has no attribute '%s'", name.AsString())))
+			return val.NoneVal()
 		}
 
 		DequeType.Dict.Set(val.InternString("__repr__"), val.NewBuiltinFuncVal("deque.__repr__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -453,7 +470,8 @@ func initCollectionsTypes() {
 		}
 		DefaultDictType.Dict.Set(val.DunderInit, val.NewBuiltinFuncVal("__init__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: descriptor '__init__' of 'defaultdict' object needs an argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "descriptor '__init__' of 'defaultdict' object needs an argument"))
+				return val.NoneVal()
 			}
 			defaultDictInit(ctx, args[0], args[1:], kwnames)
 			return val.NoneVal()
@@ -467,7 +485,8 @@ func initCollectionsTypes() {
 			if missingFn, _, ok := o.Type().LookupMRO(val.InternString("__missing__")); ok {
 				return ctx.Invoke2(missingFn, o, key)
 			}
-			panic("KeyError: " + key.String())
+			ctx.Raise(val.NewException(val.KeyErrorType, key.String()))
+			return val.NoneVal()
 		}
 
 		DefaultDictType.Dict.Set(val.InternString("__repr__"), val.NewBuiltinFuncVal("defaultdict.__repr__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -491,14 +510,16 @@ func initCollectionsTypes() {
 		}))
 		DefaultDictType.Dict.Set(val.InternString("__missing__"), val.NewBuiltinFuncVal("__missing__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: __missing__() takes 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "__missing__() takes 1 argument"))
+				return val.NoneVal()
 			}
 			self := args[0]
 			key := args[1]
 			d := self.AsDict()
 			factory, ok := getDefaultFactory(d)
 			if !ok || factory.IsNone() {
-				panic("KeyError: " + key.String())
+				ctx.Raise(val.NewException(val.KeyErrorType, key.String()))
+				return val.NoneVal()
 			}
 			newVal := ctx.Invoke0(factory)
 			d.Set(key, newVal)
@@ -521,7 +542,8 @@ func (e *Engine) createCollectionsModule() val.Value {
 	// _count_elements(mapping, iterable)
 	mod.Dict.Set(val.InternString("_count_elements"), val.NewBuiltinFuncVal("_count_elements", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: _count_elements() takes 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "_count_elements() takes 2 arguments"))
+			return val.NoneVal()
 		}
 		mapping := args[0]
 		iterable := args[1]

@@ -73,15 +73,18 @@ func initBytesMethods() {
 			pa = pa[1:]
 		}
 		if len(pa) != 2 {
-			panic("TypeError: maketrans() takes exactly 2 arguments")
+			ctx.Raise(NewException(TypeErrorType, "maketrans() takes exactly 2 arguments"))
+			return NoneVal()
 		}
 		f, ok1 := bytesMethodArg(pa[0])
 		t, ok2 := bytesMethodArg(pa[1])
 		if !ok1 || !ok2 {
-			panic("TypeError: maketrans() arguments must be bytes-like objects")
+			ctx.Raise(NewException(TypeErrorType, "maketrans() arguments must be bytes-like objects"))
+			return NoneVal()
 		}
 		if len(f) != len(t) {
-			panic("ValueError: maketrans arguments must have same length")
+			ctx.Raise(NewException(ValueErrorType, "maketrans arguments must have same length"))
+			return NoneVal()
 		}
 		table := make([]byte, 256)
 		for i := range 256 {
@@ -97,13 +100,15 @@ func initBytesMethods() {
 		self := bytesSelf("translate", args)
 		pa := args[1:]
 		if len(pa) < 1 {
-			panic("TypeError: translate() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "translate() takes at least 1 argument"))
+			return NoneVal()
 		}
 		var delMap [256]bool
 		if len(pa) > 1 && !pa[1].IsNone() {
 			delBytes, ok := bytesMethodArg(pa[1])
 			if !ok {
-				panic("TypeError: deletechars argument must be bytes-like")
+				ctx.Raise(NewException(TypeErrorType, "deletechars argument must be bytes-like"))
+				return NoneVal()
 			}
 			for _, b := range delBytes {
 				delMap[b] = true
@@ -113,7 +118,8 @@ func initBytesMethods() {
 		if !pa[0].IsNone() {
 			tb, ok := bytesMethodArg(pa[0])
 			if !ok || len(tb) != 256 {
-				panic("ValueError: translation table must be 256 characters long")
+				ctx.Raise(NewException(ValueErrorType, "translation table must be 256 characters long"))
+				return NoneVal()
 			}
 			tableBytes = tb
 		}
@@ -137,14 +143,16 @@ func initBytesMethods() {
 	ljustFn := func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		self := bytesSelf("ljust", args)
 		if len(args) < 2 {
-			panic("TypeError: ljust() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "ljust() takes at least 1 argument"))
+			return NoneVal()
 		}
 		w := int(args[1].AsInt64())
 		fill := byte(' ')
 		if len(args) > 2 {
 			fb, ok := bytesMethodArg(args[2])
 			if !ok || len(fb) != 1 {
-				panic("TypeError: fillchar must be a bytes object of length 1")
+				ctx.Raise(NewException(TypeErrorType, "fillchar must be a bytes object of length 1"))
+				return NoneVal()
 			}
 			fill = fb[0]
 		}
@@ -170,14 +178,16 @@ func initBytesMethods() {
 	rjustFn := func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		self := bytesSelf("rjust", args)
 		if len(args) < 2 {
-			panic("TypeError: rjust() takes at least 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "rjust() takes at least 1 argument"))
+			return NoneVal()
 		}
 		w := int(args[1].AsInt64())
 		fill := byte(' ')
 		if len(args) > 2 {
 			fb, ok := bytesMethodArg(args[2])
 			if !ok || len(fb) != 1 {
-				panic("TypeError: fillchar must be a bytes object of length 1")
+				ctx.Raise(NewException(TypeErrorType, "fillchar must be a bytes object of length 1"))
+				return NoneVal()
 			}
 			fill = fb[0]
 		}
@@ -204,7 +214,8 @@ func initBytesMethods() {
 	joinFn := func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		self := bytesSelf("join", args)
 		if len(args) < 2 {
-			panic("TypeError: join() takes 1 argument")
+			ctx.Raise(NewException(TypeErrorType, "join() takes 1 argument"))
+			return NoneVal()
 		}
 		items := ExtractIterableItems(ctx, args[1])
 		var totalLen int
@@ -212,7 +223,8 @@ func initBytesMethods() {
 		for i, item := range items {
 			b, ok := bytesMethodArg(item)
 			if !ok {
-				panic("TypeError: sequence item " + strconv.Itoa(i) + ": expected a bytes-like object")
+				ctx.Raise(NewException(TypeErrorType, "sequence item"+strconv.Itoa(i)+": expected a bytes-like object"))
+				return NoneVal()
 			}
 			rawItems[i] = b
 			totalLen += len(b)
@@ -236,12 +248,14 @@ func initBytesMethods() {
 	replaceFn := func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		self := bytesSelf("replace", args)
 		if len(args) < 3 {
-			panic("TypeError: replace() takes at least 2 arguments")
+			ctx.Raise(NewException(TypeErrorType, "replace() takes at least 2 arguments"))
+			return NoneVal()
 		}
 		oldBytes, ok1 := bytesMethodArg(args[1])
 		newBytes, ok2 := bytesMethodArg(args[2])
 		if !ok1 || !ok2 {
-			panic("TypeError: replace arguments must be bytes-like")
+			ctx.Raise(NewException(TypeErrorType, "replace arguments must be bytes-like"))
+			return NoneVal()
 		}
 		cnt := -1
 		if len(args) > 3 {
@@ -264,10 +278,12 @@ func initBytesMethods() {
 		if len(args) > 1 && !args[1].IsNone() {
 			sepBytes, ok := bytesMethodArg(args[1])
 			if !ok {
-				panic("TypeError: sep must be bytes-like or None")
+				ctx.Raise(NewException(TypeErrorType, "sep must be bytes-like or None"))
+				return NoneVal()
 			}
 			if len(sepBytes) == 0 {
-				panic("ValueError: empty separator")
+				ctx.Raise(NewException(ValueErrorType, "empty separator"))
+				return NoneVal()
 			}
 			if maxsplit >= 0 {
 				parts = bytes.SplitN(self, sepBytes, maxsplit+1)
@@ -370,7 +386,8 @@ func initBytesMethods() {
 			pa = pa[1:]
 		}
 		if len(pa) < 1 || !pa[0].IsAnyString() {
-			panic("TypeError: fromhex() argument must be str")
+			ctx.Raise(NewException(TypeErrorType, "fromhex() argument must be str"))
+			return NoneVal()
 		}
 		s := pa[0].AsString()
 		var hexChars []byte
@@ -382,11 +399,13 @@ func initBytesMethods() {
 			hexChars = append(hexChars, c)
 		}
 		if len(hexChars)%2 != 0 {
-			panic("ValueError: fromhex() arg length must be even")
+			ctx.Raise(NewException(ValueErrorType, "fromhex() arg length must be even"))
+			return NoneVal()
 		}
 		decoded, err := hex.DecodeString(string(hexChars))
 		if err != nil {
-			panic("ValueError: non-hexadecimal number found in fromhex() arg")
+			ctx.Raise(NewException(ValueErrorType, "non-hexadecimal number found in fromhex() arg"))
+			return NoneVal()
 		}
 		if isByteArray {
 			return NewByteArrayVal(decoded)
@@ -418,7 +437,8 @@ func initBytesMethods() {
 	findFn := func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		self := bytesSelf("find", args)
 		if len(args) < 2 {
-			panic("TypeError: find expected at least 1 argument, got 0")
+			ctx.Raise(NewException(TypeErrorType, "find expected at least 1 argument, got 0"))
+			return NoneVal()
 		}
 		sub := bytesArg(args[1])
 		start := 0
@@ -460,7 +480,8 @@ func initBytesMethods() {
 	rfindFn := func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		self := bytesSelf("rfind", args)
 		if len(args) < 2 {
-			panic("TypeError: rfind expected at least 1 argument, got 0")
+			ctx.Raise(NewException(TypeErrorType, "rfind expected at least 1 argument, got 0"))
+			return NoneVal()
 		}
 		sub := bytesArg(args[1])
 		start := 0
@@ -502,7 +523,8 @@ func initBytesMethods() {
 	startswithFn := func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		self := bytesSelf("startswith", args)
 		if len(args) < 2 {
-			panic("TypeError: startswith expected at least 1 argument, got 0")
+			ctx.Raise(NewException(TypeErrorType, "startswith expected at least 1 argument, got 0"))
+			return NoneVal()
 		}
 		sLen := len(self)
 		start := 0
@@ -553,7 +575,8 @@ func initBytesMethods() {
 	endswithFn := func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		self := bytesSelf("endswith", args)
 		if len(args) < 2 {
-			panic("TypeError: endswith expected at least 1 argument, got 0")
+			ctx.Raise(NewException(TypeErrorType, "endswith expected at least 1 argument, got 0"))
+			return NoneVal()
 		}
 		sLen := len(self)
 		start := 0
@@ -604,7 +627,8 @@ func initBytesMethods() {
 	countFn := func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		self := bytesSelf("count", args)
 		if len(args) < 2 {
-			panic("TypeError: count expected at least 1 argument, got 0")
+			ctx.Raise(NewException(TypeErrorType, "count expected at least 1 argument, got 0"))
+			return NoneVal()
 		}
 		sLen := len(self)
 		start := 0

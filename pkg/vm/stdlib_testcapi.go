@@ -108,7 +108,8 @@ func (e *Engine) createTestPackage() (val.Value, val.Value) {
 			res := ctx.Invoke2(runMethod, runnerVal, suiteVal)
 			wasSuccessful, _, _ := res.Type().LookupMRO(val.InternString("wasSuccessful"))
 			if !ctx.Invoke1(wasSuccessful, res).IsTruthy() {
-				panic("AssertionError: test suite failed")
+				ctx.Raise(val.NewException(val.AssertionErrorType, "test suite failed"))
+				return val.NoneVal()
 			}
 		}
 		return val.NoneVal()
@@ -119,7 +120,8 @@ func (e *Engine) createTestPackage() (val.Value, val.Value) {
 	ihDict := importHelperVal.AsModule().Dict
 	ihDict.Set(val.InternString("import_module"), val.NewBuiltinFuncVal("import_module", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: import_module takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "import_module takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		modName := args[0].AsString()
 		vmInstance := ctx.VM.(*VM)

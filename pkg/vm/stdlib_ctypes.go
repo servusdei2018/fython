@@ -339,13 +339,15 @@ func (e *Engine) createCtypesLowerModule() val.Value {
 	// --- sizeof / alignment ---
 	setF("sizeof", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: sizeof() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "sizeof() takes 1 argument"))
+			return val.NoneVal()
 		}
 		return val.Int64Val(int64(sizeofOfValue(args[0])))
 	})
 	setF("alignment", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: alignment() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "alignment() takes 1 argument"))
+			return val.NoneVal()
 		}
 		return val.Int64Val(int64(alignmentOfValue(args[0])))
 	})
@@ -378,7 +380,8 @@ func (e *Engine) createCtypesLowerModule() val.Value {
 	// dlopen / LoadLibrary
 	setF("dlopen", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if vmInstance, ok := ctx.VM.(*VM); ok && vmInstance != nil && vmInstance.sandboxBlocksNative() {
-			panic("PermissionError: native extensions and ctypes are disabled by sandbox policy")
+			ctx.Raise(val.NewException(val.PermissionErrorType, "native extensions and ctypes are disabled by sandbox policy"))
+			return val.NoneVal()
 		}
 		var name string
 		if len(args) >= 1 && !args[0].IsNone() {
@@ -399,7 +402,8 @@ func (e *Engine) createCtypesLowerModule() val.Value {
 	})
 	setF("LoadLibrary", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if vmInstance, ok := ctx.VM.(*VM); ok && vmInstance != nil && vmInstance.sandboxBlocksNative() {
-			panic("PermissionError: native extensions and ctypes are disabled by sandbox policy")
+			ctx.Raise(val.NewException(val.PermissionErrorType, "native extensions and ctypes are disabled by sandbox policy"))
+			return val.NoneVal()
 		}
 		var name string
 		if len(args) >= 1 && args[0].IsAnyString() {
@@ -433,13 +437,15 @@ func (e *Engine) createCtypesLowerModule() val.Value {
 	// addressof / byref / resize
 	setF("addressof", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: addressof() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "addressof() takes 1 argument"))
+			return val.NoneVal()
 		}
 		return val.Int64Val(addressOfValue(args[0]))
 	})
 	setF("byref", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: byref() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "byref() takes 1 argument"))
+			return val.NoneVal()
 		}
 		return makeByRefValue(args[0])
 	})

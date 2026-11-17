@@ -132,7 +132,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 	// len
 	d.Set(val.InternString("len"), val.NewBuiltinFuncVal("len", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) == 0 {
-			panic("TypeError: len() takes exactly one argument")
+			return val.RaiseTypeError(ctx, "len() takes exactly one argument")
 		}
 		a := args[0]
 		if a.IsList() {
@@ -168,7 +168,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		if sqLen := a.Type().Slots.SqLen; sqLen != nil {
 			return val.Int64Val(sqLen(ctx, a))
 		}
-		panic("TypeError: object of type '" + a.Type().Name + "' has no len()")
+		return val.RaiseTypeError(ctx, "object of type '"+a.Type().Name+"' has no len()")
 	}))
 
 	// print(*args, sep=" ", end="\n", file=None, flush=False)
@@ -185,19 +185,19 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 					if v.IsAnyString() {
 						sep = v.AsString()
 					} else if !v.IsNone() {
-						panic("TypeError: sep must be None or a string, not " + typeNameOf(v))
+						return val.RaiseTypeError(ctx, "sep must be None or a string, not "+typeNameOf(v))
 					}
 				case "end":
 					if v.IsAnyString() {
 						end = v.AsString()
 					} else if !v.IsNone() {
-						panic("TypeError: end must be None or a string, not " + typeNameOf(v))
+						return val.RaiseTypeError(ctx, "end must be None or a string, not "+typeNameOf(v))
 					}
 				case "file":
 					file = v
 				case "flush":
 				default:
-					panic("TypeError: print() got an unexpected keyword argument '" + kn.AsString() + "'")
+					return val.RaiseTypeError(ctx, "print() got an unexpected keyword argument '"+kn.AsString()+"'")
 				}
 			}
 			args = args[:kwStart]
@@ -238,13 +238,16 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 	val.DictType.Dict.Set(val.InternString("fromkeys"), val.NewClassMethodVal(val.NewBuiltinFuncVal("fromkeys", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		args = posArgs(args, kwnames)
 		if len(args) < 2 || len(args) > 3 {
-			panic("TypeError: fromkeys expected 1 or 2 arguments")
+			return val.RaiseTypeError(ctx, "fromkeys expected 1 or 2 arguments")
 		}
 		fill := val.NoneVal()
 		if len(args) == 3 {
 			fill = args[2]
 		}
 		it := iterFor(ctx, args[1])
+		if it == nil {
+			return val.NoneVal()
+		}
 		if args[0].IsType() && args[0].AsType() == val.DictType {
 			out := val.NewDictVal(8)
 			d := out.AsDict()
@@ -257,12 +260,18 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			}
 		}
 		out := ctx.Invoke0(args[0])
+		if ctx != nil && ctx.HasException() {
+			return val.NoneVal()
+		}
 		for {
 			k, ok := it.Next()
 			if !ok {
 				return out
 			}
 			val.SetItemCtx(ctx, out, k, fill)
+			if ctx != nil && ctx.HasException() {
+				return val.NoneVal()
+			}
 		}
 	})))
 	val.DictType.InvalidateVersion()
@@ -274,7 +283,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 	// callable
 	d.Set(val.InternString("callable"), val.NewBuiltinFuncVal("callable", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: callable() takes exactly one argument")
+			return val.RaiseTypeError(ctx, "callable() takes exactly one argument")
 		}
 		return val.BoolVal(val.IsCallable(args[0]))
 	}))
@@ -282,7 +291,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 	// iter(object[, sentinel])
 	d.Set(val.InternString("iter"), val.NewBuiltinFuncVal("iter", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: iter() expected at least 1 argument, got 0")
+			return val.RaiseTypeError(ctx, "iter() expected at least 1 argument, got 0")
 		}
 		if len(args) == 1 {
 			obj := args[0]
@@ -292,7 +301,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			if tpIter := obj.Type().Slots.TpIter; tpIter != nil {
 				return tpIter(ctx, obj)
 			}
-			return newIterChecked(obj)
+			return newIterCheckedCtx(ctx, obj)
 		}
 		fn := args[0]
 		sentinel := args[1]
@@ -313,7 +322,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 	// next(iterator[, default])
 	d.Set(val.InternString("next"), val.NewBuiltinFuncVal("next", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: next() expected at least 1 argument, got 0")
+			return val.RaiseTypeError(ctx, "next() expected at least 1 argument, got 0")
 		}
 		it := args[0]
 		hasDefault := len(args) > 1
@@ -326,10 +335,17 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			if nextVal, ok := it.AsIter().Next(); ok {
 				return nextVal
 			}
+			if ctx != nil && ctx.HasException() {
+				if val.IsInstance(ctx.ActiveException, val.StopIterationType) {
+					ctx.ClearException()
+				} else {
+					return val.NoneVal()
+				}
+			}
 			if hasDefault {
 				return defVal
 			}
-			panic(val.NewException(val.StopIterationType, "StopIteration"))
+			return val.RaiseStopIteration(ctx, val.NoneVal())
 		}
 
 		if tpIterNext := it.Type().Slots.TpIterNext; tpIterNext != nil {
@@ -341,40 +357,30 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 				if hasDefault {
 					return defVal
 				}
-				panic(val.NewException(val.StopIterationType, "StopIteration"))
+				return val.RaiseStopIteration(ctx, val.NoneVal())
 			}
 			if status == val.IterError {
 				if ctx != nil && ctx.HasException() {
-					panic(ctx.ActiveException)
+					if val.IsInstance(ctx.ActiveException, val.StopIterationType) && hasDefault {
+						ctx.ClearException()
+						return defVal
+					}
+					return val.NoneVal()
 				}
 			}
 			return nextVal
 		}
 
 		if nextMeth, _, ok := it.Type().LookupMRO(val.InternString("__next__")); ok {
-			var nextVal val.Value
-			var exhausted bool
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						if exc, ok := r.(val.Value); ok && val.IsInstance(exc, val.StopIterationType) {
-							exhausted = true
-							return
-						}
-						panic(r)
+			nextVal := ctx.Invoke1(nextMeth, it)
+			if ctx != nil && ctx.HasException() {
+				if val.IsInstance(ctx.ActiveException, val.StopIterationType) {
+					if hasDefault {
+						ctx.ClearException()
+						return defVal
 					}
-				}()
-				nextVal = ctx.Invoke1(nextMeth, it)
-				if ctx != nil && ctx.HasException() && val.IsInstance(ctx.ActiveException, val.StopIterationType) {
-					ctx.ClearException()
-					exhausted = true
 				}
-			}()
-			if exhausted {
-				if hasDefault {
-					return defVal
-				}
-				panic(val.NewException(val.StopIterationType, "StopIteration"))
+				return val.NoneVal()
 			}
 			return nextVal
 		}
@@ -382,13 +388,14 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		if hasDefault {
 			return defVal
 		}
-		panic(val.NewException(val.TypeErrorType, "'"+it.Type().Name+"' object is not an iterator"))
+		return val.RaiseTypeError(ctx, "'"+it.Type().Name+"' object is not an iterator")
 	}))
 
 	// hasattr, getattr, setattr, delattr
 	d.Set(val.InternString("getattr"), val.NewBuiltinFuncVal("getattr", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: getattr(): not enough arguments")
+			ctx.Raise(val.NewTypeError("getattr(): not enough arguments"))
+			return val.NoneVal()
 		}
 		obj := args[0]
 		hasDefault := len(args) > 2
@@ -396,54 +403,53 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		if hasDefault {
 			defVal = args[2]
 		}
-		res, ok := vmGetAttrSafeVal(ctx, obj, args[1])
+		interned := val.InternValue(args[1])
+		res, ok := val.LookupAttrOptional(ctx, obj, interned)
+		if ctx != nil && ctx.HasException() {
+			return val.NoneVal()
+		}
 		if ok {
 			return res
 		}
 		if hasDefault {
 			return defVal
 		}
-		panic("AttributeError: '" + obj.Type().Name + "' object has no attribute '" + args[1].AsString() + "'")
+		ctx.Raise(val.NewLazyAttributeError(obj.Type(), interned))
+		return val.NoneVal()
 	}))
 
 	d.Set(val.InternString("hasattr"), val.NewBuiltinFuncVal("hasattr", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: hasattr(): not enough arguments")
+			ctx.Raise(val.NewTypeError("hasattr(): not enough arguments"))
+			return val.NoneVal()
 		}
-		_, ok := vmGetAttrSafeVal(ctx, args[0], args[1])
+		_, ok := val.LookupAttrOptional(ctx, args[0], val.InternValue(args[1]))
+		if ctx != nil && ctx.HasException() {
+			return val.NoneVal()
+		}
 		return val.BoolVal(ok)
 	}))
 
 	d.Set(val.InternString("setattr"), val.NewBuiltinFuncVal("setattr", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 3 {
-			panic("TypeError: setattr(): not enough arguments")
+			return val.RaiseTypeError(ctx, "setattr(): not enough arguments")
 		}
 		val.SetAttrCtx(ctx, args[0], val.InternValue(args[1]), args[2])
-		if ctx != nil && ctx.HasException() {
-			exc := ctx.ActiveException
-			ctx.ClearException()
-			panic(exc)
-		}
 		return val.NoneVal()
 	}))
 
 	d.Set(val.InternString("delattr"), val.NewBuiltinFuncVal("delattr", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: delattr(): not enough arguments")
+			return val.RaiseTypeError(ctx, "delattr(): not enough arguments")
 		}
 		val.DelAttrCtx(ctx, args[0], val.InternValue(args[1]))
-		if ctx != nil && ctx.HasException() {
-			exc := ctx.ActiveException
-			ctx.ClearException()
-			panic(exc)
-		}
 		return val.NoneVal()
 	}))
 
 	// id & hash
 	d.Set(val.InternString("id"), val.NewBuiltinFuncVal("id", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: id() takes exactly one argument")
+			return val.RaiseTypeError(ctx, "id() takes exactly one argument")
 		}
 		obj := args[0]
 		ptrVal := int64(uintptr(unsafe.Pointer(obj.HeaderPtr())))
@@ -452,7 +458,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 
 	d.Set(val.InternString("hash"), val.NewBuiltinFuncVal("hash", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: hash() takes exactly one argument")
+			return val.RaiseTypeError(ctx, "hash() takes exactly one argument")
 		}
 		obj := args[0]
 		if obj.IsInt64() {
@@ -473,7 +479,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		tp := obj.Type()
 		if hashFn, owner, ok := tp.LookupMRO(val.InternString("__hash__")); ok {
 			if hashFn.IsNone() {
-				panic(val.NewTypeError("unhashable type: '" + tp.Name + "'"))
+				return val.RaiseTypeError(ctx, "unhashable type: '"+tp.Name+"'")
 			}
 			if owner != val.ObjectType {
 				return ctx.Invoke1(hashFn, obj)
@@ -483,7 +489,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			return val.Int64Val(int64(val.HashValue(obj)))
 		}
 		if obj.IsList() || obj.IsDict() || obj.IsSet() || obj.IsByteArray() {
-			panic(val.NewTypeError("unhashable type: '" + tp.Name + "'"))
+			return val.RaiseTypeError(ctx, "unhashable type: '"+tp.Name+"'")
 		}
 		ptrVal := int64(uintptr(unsafe.Pointer(obj.HeaderPtr())))
 		return val.Int64Val(ptrVal)
@@ -492,14 +498,14 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 	// repr & ascii
 	d.Set(val.InternString("repr"), val.NewBuiltinFuncVal("repr", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: repr() takes exactly one argument")
+			return val.RaiseTypeError(ctx, "repr() takes exactly one argument")
 		}
 		return val.NewStringVal(val.PyRepr(ctx, args[0]))
 	}))
 
 	d.Set(val.InternString("ascii"), val.NewBuiltinFuncVal("ascii", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: ascii() takes exactly one argument")
+			return val.RaiseTypeError(ctx, "ascii() takes exactly one argument")
 		}
 		r := args[0].String()
 		var sb strings.Builder
@@ -521,7 +527,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 	// format
 	d.Set(val.InternString("format"), val.NewBuiltinFuncVal("format", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: format() takes at least 1 argument")
+			return val.RaiseTypeError(ctx, "format() takes at least 1 argument")
 		}
 		obj := args[0]
 		if formatFn, _, ok := obj.Type().LookupMRO(val.InternString("__format__")); ok {
@@ -544,9 +550,12 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 	// all & any
 	d.Set(val.InternString("all"), val.NewBuiltinFuncVal("all", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: all() takes exactly one argument")
+			return val.RaiseTypeError(ctx, "all() takes exactly one argument")
 		}
 		it := getBuiltinIter(ctx, args[0])
+		if it == nil {
+			return val.NoneVal()
+		}
 		for {
 			item, ok := it.Next()
 			if !ok {
@@ -561,9 +570,12 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 
 	d.Set(val.InternString("any"), val.NewBuiltinFuncVal("any", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: any() takes exactly one argument")
+			return val.RaiseTypeError(ctx, "any() takes exactly one argument")
 		}
 		it := getBuiltinIter(ctx, args[0])
+		if it == nil {
+			return val.NoneVal()
+		}
 		for {
 			item, ok := it.Next()
 			if !ok {
@@ -579,7 +591,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 	// min, max, sum
 	d.Set(val.InternString("sum"), val.NewBuiltinFuncVal("sum", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: sum() takes at least 1 argument")
+			return val.RaiseTypeError(ctx, "sum() takes at least 1 argument")
 		}
 		start := val.Int64Val(0)
 		if len(args) > 1 {
@@ -587,12 +599,18 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		}
 		total := start
 		it := iterFor(ctx, args[0])
+		if it == nil {
+			return val.NoneVal()
+		}
 		for {
 			item, ok := it.Next()
 			if !ok {
 				break
 			}
 			total = val.AddCtx(ctx, total, item)
+			if ctx != nil && ctx.HasException() {
+				return val.NoneVal()
+			}
 		}
 		return total
 	}))
@@ -607,15 +625,18 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			defVal, hasDef := kwArg(args, kwnames, "default")
 			for _, kn := range kwnames {
 				if n := kn.AsString(); n != "key" && n != "default" {
-					panic("TypeError: " + name + "() got an unexpected keyword argument '" + n + "'")
+					return val.RaiseTypeError(ctx, name+"() got an unexpected keyword argument '"+n+"'")
 				}
 			}
 			if len(pos) == 0 {
-				panic("TypeError: " + name + " expected at least 1 argument, got 0")
+				return val.RaiseTypeError(ctx, name+" expected at least 1 argument, got 0")
 			}
 			var items []val.Value
 			if len(pos) == 1 {
 				it := iterFor(ctx, pos[0])
+				if it == nil {
+					return val.NoneVal()
+				}
 				for {
 					v, ok := it.Next()
 					if !ok {
@@ -625,7 +646,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 				}
 			} else {
 				if hasDef {
-					panic("TypeError: Cannot specify a default for " + name + "() with multiple positional arguments")
+					return val.RaiseTypeError(ctx, "Cannot specify a default for "+name+"() with multiple positional arguments")
 				}
 				items = pos
 			}
@@ -633,7 +654,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 				if hasDef {
 					return defVal
 				}
-				panic("ValueError: " + name + "() iterable argument is empty")
+				return val.RaiseValueError(ctx, name+"() iterable argument is empty")
 			}
 			keyOf := func(v val.Value) val.Value {
 				if hasKey {
@@ -658,13 +679,16 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 	// enumerate & zip & reversed & sorted
 	d.Set(val.InternString("enumerate"), val.NewBuiltinFuncVal("enumerate", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: enumerate() takes at least 1 argument")
+			return val.RaiseTypeError(ctx, "enumerate() takes at least 1 argument")
 		}
 		start := int64(0)
 		if len(args) > 1 && args[1].IsInt64() {
 			start = args[1].AsInt64()
 		}
 		it := iterFor(ctx, args[0])
+		if it == nil {
+			return val.NoneVal()
+		}
 		var tuples []val.Value
 		idx := start
 		for {
@@ -684,7 +708,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			kwStart := len(args) - len(kwnames)
 			for i, kn := range kwnames {
 				if kn.AsString() != "strict" {
-					panic("TypeError: zip() got an unexpected keyword argument '" + kn.AsString() + "'")
+					return val.RaiseTypeError(ctx, "zip() got an unexpected keyword argument '"+kn.AsString()+"'")
 				}
 				strict = args[kwStart+i].IsTruthy()
 			}
@@ -695,7 +719,11 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		}
 		iters := make([]*val.PyIter, len(args))
 		for i, a := range args {
-			iters[i] = iterFor(ctx, a)
+			it := iterFor(ctx, a)
+			if it == nil {
+				return val.NoneVal()
+			}
+			iters[i] = it
 		}
 		done := false
 		return val.NewIterValWithNext(func() (val.Value, bool) {
@@ -713,7 +741,8 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 							if i > 1 {
 								plural = "s 1-"
 							}
-							panic("ValueError: zip() argument " + strconv.Itoa(i+1) + " is shorter than argument" + plural + strconv.Itoa(i))
+							val.RaiseValueError(ctx, "zip() argument "+strconv.Itoa(i+1)+" is shorter than argument"+plural+strconv.Itoa(i))
+							return val.NoneVal(), false
 						}
 						for j := 1; j < len(iters); j++ {
 							if _, more := iters[j].Next(); more {
@@ -721,7 +750,8 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 								if j > 1 {
 									plural = "s 1-"
 								}
-								panic("ValueError: zip() argument " + strconv.Itoa(j+1) + " is longer than argument" + plural + strconv.Itoa(j))
+								val.RaiseValueError(ctx, "zip() argument "+strconv.Itoa(j+1)+" is longer than argument"+plural+strconv.Itoa(j))
+								return val.NoneVal(), false
 							}
 						}
 					}
@@ -735,7 +765,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 
 	d.Set(val.InternString("reversed"), val.NewBuiltinFuncVal("reversed", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: reversed() takes exactly one argument")
+			return val.RaiseTypeError(ctx, "reversed() takes exactly one argument")
 		}
 		a := args[0]
 		if a.IsList() {
@@ -754,14 +784,17 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			}
 			return val.NewIterVal(val.NewTupleVal(rev...))
 		}
-		panic("TypeError: object is not reversible")
+		return val.RaiseTypeError(ctx, "object is not reversible")
 	}))
 
 	d.Set(val.InternString("sorted"), val.NewBuiltinFuncVal("sorted", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: sorted() takes at least 1 argument")
+			return val.RaiseTypeError(ctx, "sorted() takes at least 1 argument")
 		}
 		it := iterFor(ctx, args[0])
+		if it == nil {
+			return val.NoneVal()
+		}
 		var items []val.Value
 		for {
 			v, ok := it.Next()
@@ -819,11 +852,14 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 	// map & filter
 	d.Set(val.InternString("map"), val.NewBuiltinFuncVal("map", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: map() must have at least two arguments")
+			return val.RaiseTypeError(ctx, "map() must have at least two arguments")
 		}
 		fn := args[0]
 		if len(args) == 2 {
 			it := iterFor(ctx, args[1])
+			if it == nil {
+				return val.NoneVal()
+			}
 			var results []val.Value
 			for {
 				item, ok := it.Next()
@@ -831,6 +867,9 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 					break
 				}
 				results = append(results, ctx.Invoke1(fn, item))
+				if ctx != nil && ctx.HasException() {
+					return val.NoneVal()
+				}
 			}
 			return val.NewIterVal(val.NewListVal(results...))
 		}
@@ -838,7 +877,11 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		// Multiple iterables
 		iters := make([]*val.PyIter, len(args)-1)
 		for i := 1; i < len(args); i++ {
-			iters[i-1] = iterFor(ctx, args[i])
+			it := iterFor(ctx, args[i])
+			if it == nil {
+				return val.NoneVal()
+			}
+			iters[i-1] = it
 		}
 		var results []val.Value
 		callArgs := make([]val.Value, len(iters))
@@ -856,16 +899,22 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 				break
 			}
 			results = append(results, ctx.Call(fn, callArgs, nil))
+			if ctx != nil && ctx.HasException() {
+				return val.NoneVal()
+			}
 		}
 		return val.NewIterVal(val.NewListVal(results...))
 	}))
 
 	d.Set(val.InternString("filter"), val.NewBuiltinFuncVal("filter", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: filter expected 2 arguments")
+			return val.RaiseTypeError(ctx, "filter expected 2 arguments")
 		}
 		fn := args[0]
 		it := iterFor(ctx, args[1])
+		if it == nil {
+			return val.NoneVal()
+		}
 		var results []val.Value
 		for {
 			item, ok := it.Next()
@@ -877,7 +926,11 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 					results = append(results, item)
 				}
 			} else {
-				if ctx.Invoke1(fn, item).IsTruthy() {
+				res := ctx.Invoke1(fn, item)
+				if ctx != nil && ctx.HasException() {
+					return val.NoneVal()
+				}
+				if res.IsTruthy() {
 					results = append(results, item)
 				}
 			}
@@ -888,7 +941,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 	// numbers: bin, hex, oct, ord, chr, divmod, round, pow
 	d.Set(val.InternString("bin"), val.NewBuiltinFuncVal("bin", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: bin() takes exactly one argument")
+			return val.RaiseTypeError(ctx, "bin() takes exactly one argument")
 		}
 		if val.IsAnyInt(args[0]) {
 			bi := val.ToBigInt(args[0])
@@ -902,7 +955,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 
 	d.Set(val.InternString("hex"), val.NewBuiltinFuncVal("hex", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: hex() takes exactly one argument")
+			return val.RaiseTypeError(ctx, "hex() takes exactly one argument")
 		}
 		if val.IsAnyInt(args[0]) {
 			bi := val.ToBigInt(args[0])
@@ -916,7 +969,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 
 	d.Set(val.InternString("oct"), val.NewBuiltinFuncVal("oct", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: oct() takes exactly one argument")
+			return val.RaiseTypeError(ctx, "oct() takes exactly one argument")
 		}
 		if val.IsAnyInt(args[0]) {
 			bi := val.ToBigInt(args[0])
@@ -930,43 +983,49 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 
 	d.Set(val.InternString("chr"), val.NewBuiltinFuncVal("chr", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: chr() takes exactly one argument")
+			return val.RaiseTypeError(ctx, "chr() takes exactly one argument")
 		}
 		return val.NewStringVal(string(rune(args[0].AsInt64())))
 	}))
 
 	d.Set(val.InternString("ord"), val.NewBuiltinFuncVal("ord", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: ord() takes exactly one argument")
+			return val.RaiseTypeError(ctx, "ord() takes exactly one argument")
 		}
 		s := args[0].AsString()
 		if len([]rune(s)) != 1 {
-			panic("TypeError: ord() expected a character, but string of length " + strconv.Itoa(len(s)) + " found")
+			return val.RaiseTypeError(ctx, "ord() expected a character, but string of length "+strconv.Itoa(len(s))+" found")
 		}
 		return val.Int64Val(int64([]rune(s)[0]))
 	}))
 
 	d.Set(val.InternString("divmod"), val.NewBuiltinFuncVal("divmod", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: divmod expected 2 arguments")
+			return val.RaiseTypeError(ctx, "divmod expected 2 arguments")
 		}
 		a := args[0]
 		b := args[1]
-		q := val.FloorDiv(a, b)
-		r := val.Mod(a, b)
+		q := val.FloorDivCtx(ctx, a, b)
+		if ctx != nil && ctx.HasException() {
+			return val.NoneVal()
+		}
+		r := val.ModCtx(ctx, a, b)
+		if ctx != nil && ctx.HasException() {
+			return val.NoneVal()
+		}
 		return val.NewTupleVal(q, r)
 	}))
 
 	d.Set(val.InternString("pow"), val.NewBuiltinFuncVal("pow", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: pow expected at least 2 arguments")
+			return val.RaiseTypeError(ctx, "pow expected at least 2 arguments")
 		}
 		if len(args) > 2 && !args[2].IsNone() {
 			base := val.ToBigInt(args[0])
 			exp := val.ToBigInt(args[1])
 			mod := val.ToBigInt(args[2])
 			if mod.Sign() == 0 {
-				panic("ValueError: pow() 3rd argument cannot be 0")
+				return val.RaiseValueError(ctx, "pow() 3rd argument cannot be 0")
 			}
 			res := new(big.Int).Exp(base, exp, mod)
 			if res.IsInt64() {
@@ -974,12 +1033,12 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			}
 			return val.NewBigIntVal(res)
 		}
-		return val.Pow(args[0], args[1])
+		return val.PowCtx(ctx, args[0], args[1])
 	}))
 
 	d.Set(val.InternString("round"), val.NewBuiltinFuncVal("round", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: round() takes at least 1 argument")
+			return val.RaiseTypeError(ctx, "round() takes at least 1 argument")
 		}
 		num := args[0]
 		digits := int64(0)
@@ -1036,7 +1095,8 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 					ctx.Raise(val.NewTypeError("vars() argument must have __dict__ attribute"))
 					return val.NoneVal()
 				}
-				panic("TypeError: vars() argument must have __dict__ attribute")
+				ctx.Raise(val.NewException(val.TypeErrorType, "vars() argument must have __dict__ attribute"))
+				return val.NoneVal()
 			}
 			if inst.Shape == nil {
 				return val.NewDictVal(0)
@@ -1052,7 +1112,8 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			ctx.Raise(val.NewTypeError("vars() argument must have __dict__ attribute"))
 			return val.NoneVal()
 		}
-		panic("TypeError: vars() argument must have __dict__ attribute")
+		ctx.Raise(val.NewException(val.TypeErrorType, "vars() argument must have __dict__ attribute"))
+		return val.NoneVal()
 	}))
 
 	// Dynamic compile, eval, exec
@@ -1061,7 +1122,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 	d.Set(val.InternString("eval"), val.NewBuiltinFuncVal("eval", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		npos := len(args) - len(kwnames)
 		if npos < 1 && len(args) < 1 {
-			panic("TypeError: eval() takes at least 1 argument")
+			return val.RaiseTypeError(ctx, "eval() takes at least 1 argument")
 		}
 		var expr val.Value
 		globalsVal := val.NoneVal()
@@ -1109,11 +1170,11 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			}
 			compiled, err := vmInstance.engine.CompileDynamic(srcBytes, "<string>", 1)
 			if err != nil {
-				panic("SyntaxError: " + err.Error())
+				return val.RaiseException(ctx, val.SyntaxErrorType, err.Error())
 			}
 			co = compiled
 		default:
-			panic("TypeError: eval() arg 1 must be a string, bytes or code object")
+			return val.RaiseTypeError(ctx, "eval() arg 1 must be a string, bytes or code object")
 		}
 
 		var globalsDict *val.PyDict
@@ -1129,7 +1190,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 				localsVal = globalsVal
 			}
 		default:
-			panic("TypeError: globals must be a dict")
+			return val.RaiseTypeError(ctx, "globals must be a dict")
 		}
 
 		if _, ok := globalsDict.Get(val.InternString("__builtins__")); !ok {
@@ -1149,7 +1210,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		if !vmInstance.unhandledException.IsNone() && vmInstance.unhandledException.HeaderPtr() != nil {
 			exc := vmInstance.unhandledException
 			vmInstance.unhandledException = val.NoneVal()
-			panic(exc)
+			return val.RaiseExceptionVal(ctx, exc)
 		}
 		return res
 	}))
@@ -1157,7 +1218,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 	d.Set(val.InternString("exec"), val.NewBuiltinFuncVal("exec", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		npos := len(args) - len(kwnames)
 		if npos < 1 && len(args) < 1 {
-			panic("TypeError: exec() takes at least 1 argument")
+			return val.RaiseTypeError(ctx, "exec() takes at least 1 argument")
 		}
 		var codeObj val.Value
 		globalsVal := val.NoneVal()
@@ -1205,11 +1266,11 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			}
 			compiled, err := vmInstance.engine.CompileDynamic(srcBytes, "<string>", 0)
 			if err != nil {
-				panic("SyntaxError: " + err.Error())
+				return val.RaiseException(ctx, val.SyntaxErrorType, err.Error())
 			}
 			co = compiled
 		default:
-			panic("TypeError: exec() arg 1 must be a string, bytes or code object")
+			return val.RaiseTypeError(ctx, "exec() arg 1 must be a string, bytes or code object")
 		}
 
 		var globalsDict *val.PyDict
@@ -1225,7 +1286,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 				localsVal = globalsVal
 			}
 		default:
-			panic("TypeError: globals must be a dict")
+			return val.RaiseTypeError(ctx, "globals must be a dict")
 		}
 
 		if _, ok := globalsDict.Get(val.InternString("__builtins__")); !ok {
@@ -1245,7 +1306,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		if !vmInstance.unhandledException.IsNone() && vmInstance.unhandledException.HeaderPtr() != nil {
 			exc := vmInstance.unhandledException
 			vmInstance.unhandledException = val.NoneVal()
-			panic(exc)
+			return val.RaiseExceptionVal(ctx, exc)
 		}
 		return val.NoneVal()
 	}))
@@ -1253,7 +1314,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 	// __import__
 	d.Set(val.InternString("__import__"), val.NewBuiltinFuncVal("__import__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: __import__() takes at least 1 argument")
+			return val.RaiseTypeError(ctx, "__import__() takes at least 1 argument")
 		}
 		name := args[0].AsString()
 		level := 0
@@ -1289,12 +1350,10 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		if !vmInstance.unhandledException.IsNone() && vmInstance.unhandledException.HeaderPtr() != nil {
 			exc := vmInstance.unhandledException
 			vmInstance.unhandledException = val.NoneVal()
-			panic(exc)
+			return val.RaiseExceptionVal(ctx, exc)
 		}
 		if err != nil {
-			// The error already carries its Python exception prefix; adding
-			// another one would duplicate it in the rendered message.
-			panic(err.Error())
+			return val.RaiseExceptionVal(ctx, panicToPyException(err.Error()))
 		}
 
 		if len(fromList) > 0 {
@@ -1303,7 +1362,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 				if !vmInstance.unhandledException.IsNone() && vmInstance.unhandledException.HeaderPtr() != nil {
 					exc := vmInstance.unhandledException
 					vmInstance.unhandledException = val.NoneVal()
-					panic(exc)
+					return val.RaiseExceptionVal(ctx, exc)
 				}
 			}
 		}
@@ -1334,7 +1393,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		if vmInstance, ok := ctx.VM.(*VM); ok && vmInstance.engine.inputHook != nil {
 			line, err := vmInstance.engine.inputHook(prompt)
 			if err != nil {
-				panic(val.NewException(val.EOFErrorType, "EOF when reading a line"))
+				return val.RaiseException(ctx, val.EOFErrorType, "EOF when reading a line")
 			}
 			return val.NewStringVal(line)
 		}
@@ -1349,7 +1408,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 
 func builtinIsInstance(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 	if len(args) < 2 {
-		panic("TypeError: isinstance expected 2 arguments")
+		return val.RaiseTypeError(ctx, "isinstance expected 2 arguments")
 	}
 	return val.BoolVal(checkIsInstance(ctx, args[0], args[1]))
 }
@@ -1385,7 +1444,7 @@ func checkIsInstance(ctx *val.ExecContext, obj, target val.Value) bool {
 
 func builtinIsSubclass(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 	if len(args) < 2 {
-		panic("TypeError: issubclass expected 2 arguments")
+		return val.RaiseTypeError(ctx, "issubclass expected 2 arguments")
 	}
 	return val.BoolVal(checkIsSubclass(ctx, args[0], args[1]))
 }
@@ -1405,7 +1464,8 @@ func checkIsSubclass(ctx *val.ExecContext, cls, target val.Value) bool {
 		return res.IsTruthy()
 	}
 	if !cls.IsType() {
-		panic("TypeError: issubclass() arg 1 must be a class")
+		val.RaiseTypeError(ctx, "issubclass() arg 1 must be a class")
+		return false
 	}
 	if target.IsType() {
 		return val.IsSubclass(cls.AsType(), target.AsType())
@@ -1417,30 +1477,18 @@ func vmGetAttrSafe(ctx *val.ExecContext, obj val.Value, name string) (res val.Va
 	return vmGetAttrSafeVal(ctx, obj, val.InternString(name))
 }
 
-func vmGetAttrSafeVal(ctx *val.ExecContext, obj, name val.Value) (res val.Value, ok bool) {
+func vmGetAttrSafeVal(ctx *val.ExecContext, obj, name val.Value) (val.Value, bool) {
 	interned := val.InternValue(name)
-	defer func() {
-		if r := recover(); r != nil {
-			exc := panicToPyException(r)
-			if val.IsInstance(exc, val.AttributeErrorType) {
-				res = val.NoneVal()
-				ok = false
-				return
-			}
-			panic(r)
-		}
-	}()
 	v, found := val.LookupAttrOptional(ctx, obj, interned)
 	if !found {
 		return val.NoneVal(), false
 	}
 	if ctx != nil && ctx.HasException() {
-		exc := ctx.ActiveException
-		ctx.ClearException()
-		if val.IsInstance(exc, val.AttributeErrorType) {
+		if val.IsInstance(ctx.ActiveException, val.AttributeErrorType) {
+			ctx.ClearException()
 			return val.NoneVal(), false
 		}
-		panic(exc)
+		return val.NoneVal(), false
 	}
 	return v, true
 }
@@ -1483,31 +1531,18 @@ func iterFor(ctx *val.ExecContext, o val.Value) *val.PyIter {
 	}
 	if nextFn, _, ok := tp.LookupMRO(val.InternString("__next__")); ok {
 		return val.NewIterValWithNext(func() (val.Value, bool) {
-			var v val.Value
-			var done bool
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						if exc, ok := r.(val.Value); ok && val.IsInstance(exc, val.StopIterationType) {
-							done = true
-							return
-						}
-						panic(r)
-					}
-				}()
-				v = ctx.Invoke1(nextFn, o)
-				if ctx.HasException() && val.IsInstance(ctx.ActiveException, val.StopIterationType) {
+			v := ctx.Invoke1(nextFn, o)
+			if ctx != nil && ctx.HasException() {
+				if val.IsInstance(ctx.ActiveException, val.StopIterationType) {
 					ctx.ClearException()
-					done = true
 				}
-			}()
-			if done {
 				return val.NoneVal(), false
 			}
 			return v, true
 		}).AsIter()
 	}
-	panic("TypeError: '" + tp.Name + "' object is not iterable")
+	val.RaiseTypeError(ctx, "'"+tp.Name+"' object is not iterable")
+	return nil
 }
 
 func isPrimitiveIterable(o val.Value) bool {

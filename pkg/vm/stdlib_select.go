@@ -37,7 +37,8 @@ func (e *Engine) createSelectModule() val.Value {
 
 	mod.Dict.Set(val.InternString("select"), val.NewModuleFuncVal("select", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 3 {
-			panic("TypeError: select() takes at least 3 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "select() takes at least 3 arguments"))
+			return val.NoneVal()
 		}
 
 		getList := func(v val.Value) []val.Value {
@@ -71,7 +72,8 @@ func (e *Engine) createSelectModule() val.Value {
 		for _, item := range rItems {
 			fd, ok := extractFD(ctx, item)
 			if !ok || fd < 0 {
-				panic("ValueError: invalid file object")
+				ctx.Raise(val.NewException(val.ValueErrorType, "invalid file object"))
+				return val.NoneVal()
 			}
 			rSet.Bits[fd/64] |= 1 << (uint(fd) % 64)
 			hasR = true
@@ -84,7 +86,8 @@ func (e *Engine) createSelectModule() val.Value {
 		for _, item := range wItems {
 			fd, ok := extractFD(ctx, item)
 			if !ok || fd < 0 {
-				panic("ValueError: invalid file object")
+				ctx.Raise(val.NewException(val.ValueErrorType, "invalid file object"))
+				return val.NoneVal()
 			}
 			wSet.Bits[fd/64] |= 1 << (uint(fd) % 64)
 			hasW = true
@@ -97,7 +100,8 @@ func (e *Engine) createSelectModule() val.Value {
 		for _, item := range xItems {
 			fd, ok := extractFD(ctx, item)
 			if !ok || fd < 0 {
-				panic("ValueError: invalid file object")
+				ctx.Raise(val.NewException(val.ValueErrorType, "invalid file object"))
+				return val.NoneVal()
 			}
 			xSet.Bits[fd/64] |= 1 << (uint(fd) % 64)
 			hasX = true
@@ -133,7 +137,7 @@ func (e *Engine) createSelectModule() val.Value {
 		n, err := syscall.Select(maxFd+1, rPtr, wPtr, xPtr, tv)
 		_ = n
 		if err != nil && err != syscall.EINTR {
-			raiseOSError(err, "")
+			return raiseOSError(ctx, err, "")
 		}
 
 		var readyR, readyW, readyX []val.Value

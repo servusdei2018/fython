@@ -26,7 +26,8 @@ func (e *Engine) createAtexitModule() val.Value {
 
 	mod.Dict.Set(val.InternString("register"), val.NewBuiltinFuncVal("register", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: register() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "register() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		fn := args[0]
 		cbArgs := make([]val.Value, len(args)-1)
@@ -45,7 +46,8 @@ func (e *Engine) createAtexitModule() val.Value {
 
 	mod.Dict.Set(val.InternString("unregister"), val.NewBuiltinFuncVal("unregister", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: unregister() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "unregister() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		fn := args[0]
 

@@ -39,7 +39,8 @@ func initOperatorTypes() {
 		itemgetterType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if callable.IsType() {
 				if len(args) == 0 {
-					panic("TypeError: itemgetter needs at least 1 item")
+					ctx.Raise(val.NewException(val.TypeErrorType, "itemgetter needs at least 1 item"))
+					return val.NoneVal()
 				}
 				ig := &pyItemGetter{
 					inst: val.PyInstance{
@@ -56,7 +57,8 @@ func initOperatorTypes() {
 				args = args[1:]
 			}
 			if len(args) < 1 {
-				panic("TypeError: expected 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "expected 1 argument"))
+				return val.NoneVal()
 			}
 			ig := (*pyItemGetter)(val.AsPointer(self))
 			if len(ig.items) == 1 {
@@ -75,7 +77,8 @@ func initOperatorTypes() {
 		attrgetterType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if callable.IsType() {
 				if len(args) == 0 {
-					panic("TypeError: attrgetter needs at least 1 attribute")
+					ctx.Raise(val.NewException(val.TypeErrorType, "attrgetter needs at least 1 attribute"))
+					return val.NoneVal()
 				}
 				attrs := make([]string, len(args))
 				for i, a := range args {
@@ -96,7 +99,8 @@ func initOperatorTypes() {
 				args = args[1:]
 			}
 			if len(args) < 1 {
-				panic("TypeError: expected 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "expected 1 argument"))
+				return val.NoneVal()
 			}
 			ag := (*pyAttrGetter)(val.AsPointer(self))
 			resolveAttr := func(subCtx *val.ExecContext, obj val.Value, attr string) val.Value {
@@ -108,7 +112,8 @@ func initOperatorTypes() {
 						if subCtx != nil && subCtx.HasException() {
 							return val.NoneVal()
 						}
-						panic("AttributeError: '" + curr.Type().Name + "' object has no attribute '" + p + "'")
+						subCtx.Raise(val.NewException(val.AttributeErrorType, "'"+curr.Type().Name+"' object has no attribute '"+p+"'"))
+						return val.NoneVal()
 					}
 					curr = v
 				}
@@ -130,7 +135,8 @@ func initOperatorTypes() {
 		methodcallerType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if callable.IsType() {
 				if len(args) == 0 {
-					panic("TypeError: methodcaller needs a method name")
+					ctx.Raise(val.NewException(val.TypeErrorType, "methodcaller needs a method name"))
+					return val.NoneVal()
 				}
 				mc := &pyMethodCaller{
 					inst: val.PyInstance{
@@ -149,7 +155,8 @@ func initOperatorTypes() {
 				args = args[1:]
 			}
 			if len(args) < 1 {
-				panic("TypeError: expected 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "expected 1 argument"))
+				return val.NoneVal()
 			}
 			mc := (*pyMethodCaller)(val.AsPointer(self))
 			method, ok := vmGetAttrSafe(ctx, args[0], mc.name)
@@ -157,7 +164,8 @@ func initOperatorTypes() {
 				if ctx != nil && ctx.HasException() {
 					return val.NoneVal()
 				}
-				panic("AttributeError: '" + args[0].Type().Name + "' object has no attribute '" + mc.name + "'")
+				ctx.Raise(val.NewException(val.AttributeErrorType, "'"+args[0].Type().Name+"' object has no attribute '"+mc.name+"'"))
+				return val.NoneVal()
 			}
 			return ctx.Call(method, mc.args, mc.kwnames)
 		}
@@ -280,7 +288,8 @@ func (e *Engine) createOperatorModule() val.Value {
 		if delFn, _, ok := args[0].Type().LookupMRO(val.InternString("__delitem__")); ok {
 			return ctx.Invoke2(delFn, args[0], args[1])
 		}
-		panic("TypeError: 'delitem' unsupported on type " + args[0].Type().Name)
+		ctx.Raise(val.NewException(val.TypeErrorType, "'delitem' unsupported on type"+args[0].Type().Name))
+		return val.NoneVal()
 	}))
 	mod.Dict.Set(val.InternString("concat"), val.NewBuiltinFuncVal("concat", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		return val.AddCtx(ctx, args[0], args[1])
@@ -325,7 +334,8 @@ func (e *Engine) createOperatorModule() val.Value {
 			}
 			idx++
 		}
-		panic("ValueError: sequence.index(x): x not in sequence")
+		ctx.Raise(val.NewException(val.ValueErrorType, "sequence.index(x): x not in sequence"))
+		return val.NoneVal()
 	}))
 
 	// In-place aliases
@@ -342,7 +352,8 @@ func (e *Engine) createOperatorModule() val.Value {
 		if idxFn, _, ok := args[0].Type().LookupMRO(val.InternString("__index__")); ok {
 			return ctx.Invoke1(idxFn, args[0])
 		}
-		panic("TypeError: 'index' expected integer")
+		ctx.Raise(val.NewException(val.TypeErrorType, "'index' expected integer"))
+		return val.NoneVal()
 	}))
 
 	mod.Dict.Set(val.InternString("length_hint"), val.NewBuiltinFuncVal("length_hint", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -381,7 +392,8 @@ func (e *Engine) createOperatorModule() val.Value {
 	// call(obj, *args, **kwargs)
 	mod.Dict.Set(val.InternString("call"), val.NewBuiltinFuncVal("call", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) == 0 {
-			panic("TypeError: call() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "call() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		return ctx.Call(args[0], args[1:], kwnames)
 	}))

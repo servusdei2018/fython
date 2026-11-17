@@ -238,7 +238,8 @@ func (e *Engine) createSSLModule() val.Value {
 	// _SSLContext.__init__(protocol)
 	sslContextTypeDict.Set(val.InternString("__init__"), val.NewBuiltinFuncVal("_SSLContext.__init__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: _SSLContext.__init__() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "_SSLContext.__init__() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		self := args[0]
 		proto := 2 // PROTOCOL_TLS
@@ -266,7 +267,8 @@ func (e *Engine) createSSLModule() val.Value {
 		if setter != nil {
 			setFn = val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 				if len(args) < 2 {
-					panic("TypeError: descriptor '" + name + "' setter requires value")
+					ctx.Raise(val.NewException(val.TypeErrorType, "descriptor '"+name+"' setter requires value"))
+					return val.NoneVal()
 				}
 				st := getContextState(args[0])
 				setter(st, args[1])
@@ -275,7 +277,8 @@ func (e *Engine) createSSLModule() val.Value {
 		}
 		getFn := val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: descriptor '" + name + "' getter requires self")
+				ctx.Raise(val.NewException(val.TypeErrorType, "descriptor '"+name+"' getter requires self"))
+				return val.NoneVal()
 			}
 			st := getContextState(args[0])
 			return getter(st)
@@ -336,7 +339,8 @@ func (e *Engine) createSSLModule() val.Value {
 	// _SSLContext methods
 	sslContextTypeDict.Set(val.InternString("load_cert_chain"), val.NewBuiltinFuncVal("load_cert_chain", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: load_cert_chain() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "load_cert_chain() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		st := getContextState(args[0])
 		certfile := args[1].AsString()
@@ -394,7 +398,8 @@ func (e *Engine) createSSLModule() val.Value {
 
 	sslContextTypeDict.Set(val.InternString("_set_alpn_protocols"), val.NewBuiltinFuncVal("_set_alpn_protocols", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: _set_alpn_protocols() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "_set_alpn_protocols() takes 1 argument"))
+			return val.NoneVal()
 		}
 		st := getContextState(args[0])
 		st.alpnProtocols = nil
@@ -439,7 +444,8 @@ func (e *Engine) createSSLModule() val.Value {
 	// _wrap_socket(sock, server_side, server_hostname=None, owner=None, session=None)
 	sslContextTypeDict.Set(val.InternString("_wrap_socket"), val.NewBuiltinFuncVal("_wrap_socket", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 3 {
-			panic("TypeError: _wrap_socket() takes at least 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "_wrap_socket() takes at least 2 arguments"))
+			return val.NoneVal()
 		}
 		ctxState := getContextState(args[0])
 		sock := args[1]
@@ -451,7 +457,8 @@ func (e *Engine) createSSLModule() val.Value {
 
 		fdVal, _, ok := sock.Type().LookupMRO(val.InternString("fileno"))
 		if !ok {
-			panic("TypeError: sock must have fileno()")
+			ctx.Raise(val.NewException(val.TypeErrorType, "sock must have fileno()"))
+			return val.NoneVal()
 		}
 		fdRes := ctx.Invoke1(fdVal, sock)
 		fd := int(fdRes.AsInt64())

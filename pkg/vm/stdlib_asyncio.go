@@ -54,7 +54,8 @@ func initAsyncIOTypes() {
 		// StreamReader.read(n=-1) -> returns awaitable Future
 		StreamReaderType.Dict.Set(val.InternString("read"), val.NewBuiltinFuncVal("read", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: read() takes at least 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "read() takes at least 1 argument"))
+				return val.NoneVal()
 			}
 			sr := (*pyStreamReader)(val.AsPointer(args[0]))
 			n := -1
@@ -99,7 +100,8 @@ func initAsyncIOTypes() {
 		// StreamReader.readline() -> returns awaitable Future
 		StreamReaderType.Dict.Set(val.InternString("readline"), val.NewBuiltinFuncVal("readline", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: readline() takes at least 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "readline() takes at least 1 argument"))
+				return val.NoneVal()
 			}
 			sr := (*pyStreamReader)(val.AsPointer(args[0]))
 			futVal := val.NewFutureVal()
@@ -123,7 +125,8 @@ func initAsyncIOTypes() {
 		// StreamReader.readexactly(n) -> returns awaitable Future
 		StreamReaderType.Dict.Set(val.InternString("readexactly"), val.NewBuiltinFuncVal("readexactly", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: readexactly() takes at least 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "readexactly() takes at least 1 argument"))
+				return val.NoneVal()
 			}
 			sr := (*pyStreamReader)(val.AsPointer(args[0]))
 			n := int(args[1].AsInt64())
@@ -151,7 +154,8 @@ func initAsyncIOTypes() {
 		// StreamWriter.write(data)
 		StreamWriterType.Dict.Set(val.InternString("write"), val.NewBuiltinFuncVal("write", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: write() takes exactly 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "write() takes exactly 1 argument"))
+				return val.NoneVal()
 			}
 			sw := (*pyStreamWriter)(val.AsPointer(args[0]))
 			sw.mu.Lock()
@@ -166,7 +170,8 @@ func initAsyncIOTypes() {
 			case args[1].IsMemoryView():
 				data = args[1].AsMemoryView().Buf
 			default:
-				panic("TypeError: a bytes-like object is required")
+				ctx.Raise(val.NewException(val.TypeErrorType, "a bytes-like object is required"))
+				return val.NoneVal()
 			}
 
 			sw.buf = append(sw.buf, data...)
@@ -176,7 +181,8 @@ func initAsyncIOTypes() {
 		// StreamWriter.drain() -> flushes buffer to net.Conn
 		StreamWriterType.Dict.Set(val.InternString("drain"), val.NewBuiltinFuncVal("drain", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: drain() takes at least 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "drain() takes at least 1 argument"))
+				return val.NoneVal()
 			}
 			sw := (*pyStreamWriter)(val.AsPointer(args[0]))
 			sw.mu.Lock()
@@ -211,7 +217,8 @@ func initAsyncIOTypes() {
 		// StreamWriter.close()
 		StreamWriterType.Dict.Set(val.InternString("close"), val.NewBuiltinFuncVal("close", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: close() takes at least 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "close() takes at least 1 argument"))
+				return val.NoneVal()
 			}
 			sw := (*pyStreamWriter)(val.AsPointer(args[0]))
 			sw.mu.Lock()
@@ -257,7 +264,8 @@ func initAsyncIOTypes() {
 
 		ServerType.Dict.Set(val.InternString("close"), val.NewBuiltinFuncVal("close", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: close() takes at least 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "close() takes at least 1 argument"))
+				return val.NoneVal()
 			}
 			srv := (*pyServer)(val.AsPointer(args[0]))
 			srv.mu.Lock()
@@ -274,7 +282,8 @@ func initAsyncIOTypes() {
 
 		ServerType.Dict.Set(val.InternString("wait_closed"), val.NewBuiltinFuncVal("wait_closed", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: wait_closed() takes at least 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "wait_closed() takes at least 1 argument"))
+				return val.NoneVal()
 			}
 			srv := (*pyServer)(val.AsPointer(args[0]))
 			futVal := val.NewFutureVal()
@@ -288,7 +297,8 @@ func initAsyncIOTypes() {
 
 		ServerType.Dict.Set(val.InternString("serve_forever"), val.NewBuiltinFuncVal("serve_forever", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: serve_forever() takes at least 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "serve_forever() takes at least 1 argument"))
+				return val.NoneVal()
 			}
 			srv := (*pyServer)(val.AsPointer(args[0]))
 			futVal := val.NewFutureVal()
@@ -375,7 +385,8 @@ func (e *Engine) createAsyncioModule() val.Value {
 	// asyncio.run(coro)
 	mod.Dict.Set(val.InternString("run"), val.NewBuiltinFuncVal("run", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: run() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "run() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		target := args[0]
 		var parent *val.PyContext
@@ -395,7 +406,8 @@ func (e *Engine) createAsyncioModule() val.Value {
 	// asyncio.sleep(delay, result=None)
 	mod.Dict.Set(val.InternString("sleep"), val.NewBuiltinFuncVal("sleep", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: sleep() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "sleep() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		var secs float64
 		if args[0].IsFloat64() {
@@ -429,7 +441,8 @@ func (e *Engine) createAsyncioModule() val.Value {
 				ctx.Raise(val.NewTypeError("create_task() takes at least 1 argument"))
 				return val.NoneVal()
 			}
-			panic("TypeError: create_task() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "create_task() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		loop := GetCurrentEventLoopCtx(ctx)
 		if loop == nil {
@@ -451,7 +464,8 @@ func (e *Engine) createAsyncioModule() val.Value {
 				ctx.Raise(val.NewTypeError("ensure_future() takes at least 1 argument"))
 				return val.NoneVal()
 			}
-			panic("TypeError: ensure_future() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "ensure_future() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		target := args[0]
 		if target.IsFuture() || target.IsTask() {
@@ -501,7 +515,8 @@ func (e *Engine) createAsyncioModule() val.Value {
 			ctx.Raise(val.NewTypeError("An asyncio.Future, a coroutine, or an awaitable is required"))
 			return val.NoneVal()
 		}
-		panic("TypeError: An asyncio.Future, a coroutine, or an awaitable is required")
+		ctx.Raise(val.NewException(val.TypeErrorType, "An asyncio.Future, a coroutine, or an awaitable is required"))
+		return val.NoneVal()
 	}))
 
 	// asyncio.gather(*aws, return_exceptions=False)
@@ -597,7 +612,8 @@ func (e *Engine) createAsyncioModule() val.Value {
 	// asyncio.open_connection(host, port)
 	mod.Dict.Set(val.InternString("open_connection"), val.NewBuiltinFuncVal("open_connection", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: open_connection() takes at least 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "open_connection() takes at least 2 arguments"))
+			return val.NoneVal()
 		}
 		host := args[0].AsString()
 		port := int(args[1].AsInt64())
@@ -623,7 +639,8 @@ func (e *Engine) createAsyncioModule() val.Value {
 	// asyncio.start_server(client_connected_cb, host, port)
 	mod.Dict.Set(val.InternString("start_server"), val.NewBuiltinFuncVal("start_server", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 3 {
-			panic("TypeError: start_server() takes at least 3 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "start_server() takes at least 3 arguments"))
+			return val.NoneVal()
 		}
 		cb := args[0]
 		host := args[1].AsString()
@@ -695,7 +712,8 @@ func (e *Engine) createAsyncioModule() val.Value {
 	// Helper to set execution mode from Python
 	mod.Dict.Set(val.InternString("set_mode"), val.NewBuiltinFuncVal("set_mode", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: set_mode() takes exactly 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "set_mode() takes exactly 1 argument"))
+			return val.NoneVal()
 		}
 		modeStr := args[0].AsString()
 		if modeStr == "multicore" {

@@ -28,25 +28,26 @@ func unicodedataChar(fn string, args []val.Value, i int) rune {
 func (e *Engine) createUnicodedataModule() val.Value {
 	modVal := val.NewModuleVal("unicodedata", "")
 	mod := modVal.AsModule()
-	def := func(name string, fn func(args []val.Value) val.Value) {
+	def := func(name string, fn func(ctx *val.ExecContext, args []val.Value) val.Value) {
 		mod.Dict.Set(val.InternString(name), val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-			return fn(args)
+			return fn(ctx, args)
 		}))
 	}
 	mod.Dict.Set(val.InternString("unidata_version"), val.InternString("16.0.0"))
 
-	def("lookup", func(args []val.Value) val.Value {
+	def("lookup", func(ctx *val.ExecContext, args []val.Value) val.Value {
 		if len(args) != 1 || !args[0].IsAnyString() {
-			panic("TypeError: lookup() argument must be str")
+			return val.RaiseTypeError(ctx, "lookup() argument must be str")
 		}
 		name := args[0].AsString()
 		r, ok := unicodedata.Lookup(name)
 		if !ok {
-			panic("KeyError: \"undefined character name '" + name + "'\"")
+			ctx.Raise(val.NewKeyError(val.NewStringVal("undefined character name '" + name + "'")))
+			return val.NoneVal()
 		}
 		return val.InternString(string(r))
 	})
-	def("name", func(args []val.Value) val.Value {
+	def("name", func(ctx *val.ExecContext, args []val.Value) val.Value {
 		r := unicodedataChar("name", args, 0)
 		if n, ok := unicodedata.Name(r); ok {
 			return val.InternString(n)
@@ -54,13 +55,13 @@ func (e *Engine) createUnicodedataModule() val.Value {
 		if len(args) > 1 {
 			return args[1]
 		}
-		panic("ValueError: no such name")
+		return val.RaiseValueError(ctx, "no such name")
 	})
-	def("category", func(args []val.Value) val.Value {
+	def("category", func(ctx *val.ExecContext, args []val.Value) val.Value {
 		return val.InternString(unicodedata.Category(unicodedataChar("category", args, 0)))
 	})
-	numeric := func(fn string) func(args []val.Value) val.Value {
-		return func(args []val.Value) val.Value {
+	numeric := func(fn string) func(ctx *val.ExecContext, args []val.Value) val.Value {
+		return func(ctx *val.ExecContext, args []val.Value) val.Value {
 			r := unicodedataChar(fn, args, 0)
 			if d, ok := unicodedata.Decimal(r); ok {
 				if fn == "numeric" {
@@ -72,31 +73,31 @@ func (e *Engine) createUnicodedataModule() val.Value {
 				return args[1]
 			}
 			if fn == "numeric" {
-				panic("ValueError: not a numeric character")
+				return val.RaiseValueError(ctx, "not a numeric character")
 			}
-			panic("ValueError: not a " + fn + " digit")
+			return val.RaiseValueError(ctx, "not a "+fn+" digit")
 		}
 	}
 	def("decimal", numeric("decimal"))
 	def("digit", numeric("digit"))
 	def("numeric", numeric("numeric"))
-	def("normalize", func(args []val.Value) val.Value {
+	def("normalize", func(ctx *val.ExecContext, args []val.Value) val.Value {
 		if len(args) != 2 || !args[0].IsAnyString() || !args[1].IsAnyString() {
-			panic("TypeError: normalize() argument must be str")
+			return val.RaiseTypeError(ctx, "normalize() argument must be str")
 		}
 		out, ok := unicodedata.Normalize(args[0].AsString(), args[1].AsString())
 		if !ok {
-			panic("ValueError: invalid normalization form")
+			return val.RaiseValueError(ctx, "invalid normalization form")
 		}
 		return val.InternString(out)
 	})
-	def("is_normalized", func(args []val.Value) val.Value {
+	def("is_normalized", func(ctx *val.ExecContext, args []val.Value) val.Value {
 		if len(args) != 2 || !args[0].IsAnyString() || !args[1].IsAnyString() {
-			panic("TypeError: is_normalized() argument must be str")
+			return val.RaiseTypeError(ctx, "is_normalized() argument must be str")
 		}
 		out, ok := unicodedata.Normalize(args[0].AsString(), args[1].AsString())
 		if !ok {
-			panic("ValueError: invalid normalization form")
+			return val.RaiseValueError(ctx, "invalid normalization form")
 		}
 		return val.BoolVal(out == args[1].AsString())
 	})

@@ -13,7 +13,8 @@ func (e *Engine) createStringModule() val.Value {
 
 	mod.Dict.Set(val.InternString("formatter_parser"), val.NewModuleFuncVal("formatter_parser", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: formatter_parser() takes exactly 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "formatter_parser() takes exactly 1 argument"))
+			return val.NoneVal()
 		}
 		s := args[0].AsString()
 		var results []val.Value
@@ -64,7 +65,8 @@ func (e *Engine) createStringModule() val.Value {
 			}
 
 			if s[i] == '}' {
-				panic("ValueError: Single '}' encountered in format string")
+				ctx.Raise(val.NewException(val.ValueErrorType, "Single '}' encountered in format string"))
+				return val.NoneVal()
 			}
 
 			// We found a replacement field '{'
@@ -85,7 +87,8 @@ func (e *Engine) createStringModule() val.Value {
 			}
 
 			if fieldEnd == -1 {
-				panic("ValueError: Expected '}' before end of string")
+				ctx.Raise(val.NewException(val.ValueErrorType, "Expected '}' before end of string"))
+				return val.NoneVal()
 			}
 
 			fieldContent := s[fieldStart:fieldEnd]
@@ -146,7 +149,8 @@ func (e *Engine) createStringModule() val.Value {
 
 	mod.Dict.Set(val.InternString("formatter_field_name_split"), val.NewModuleFuncVal("formatter_field_name_split", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: formatter_field_name_split() takes exactly 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "formatter_field_name_split() takes exactly 1 argument"))
+			return val.NoneVal()
 		}
 		fieldName := args[0].AsString()
 		if fieldName == "" {
@@ -190,7 +194,8 @@ func (e *Engine) createStringModule() val.Value {
 					idx++
 				}
 				if idx >= n {
-					panic("ValueError: unclosed '[' in format field name")
+					ctx.Raise(val.NewException(val.ValueErrorType, "unclosed '[' in format field name"))
+					return val.NoneVal()
 				}
 				itemStr := fieldName[itemStart:idx]
 				idx++ // skip ']'

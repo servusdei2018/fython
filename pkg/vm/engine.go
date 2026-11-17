@@ -342,7 +342,8 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 	}))
 	sysMod.Dict.Set(val.InternString("intern"), val.NewBuiltinFuncVal("intern", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: intern() requires 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "intern() requires 1 argument"))
+			return val.NoneVal()
 		}
 		return val.InternString(args[0].AsString())
 	}))
@@ -359,7 +360,8 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 		inst := exc.AsInstance()
 		inst.SetAttr(val.InternString("args"), val.NewTupleVal(items...))
 		inst.SetAttr(val.InternString("code"), code)
-		panic(exc)
+		ctx.Raise(exc)
+		return val.NoneVal()
 	}))
 
 	// sys.stdout, stderr, stdin
@@ -380,16 +382,19 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 			depth = int(args[0].AsInt64())
 		}
 		if depth < 0 {
-			panic("ValueError: call stack is not deep enough")
+			ctx.Raise(val.NewException(val.ValueErrorType, "call stack is not deep enough"))
+			return val.NoneVal()
 		}
 		vmInstance := ctx.VM.(*VM)
 		targetIdx := vmInstance.activeFrameIdx - depth
 		if targetIdx < 0 {
-			panic("ValueError: call stack is not deep enough")
+			ctx.Raise(val.NewException(val.ValueErrorType, "call stack is not deep enough"))
+			return val.NoneVal()
 		}
 		fVal := vmInstance.materializeFrame(targetIdx)
 		if fVal.IsNone() {
-			panic("ValueError: call stack is not deep enough")
+			ctx.Raise(val.NewException(val.ValueErrorType, "call stack is not deep enough"))
+			return val.NoneVal()
 		}
 		return fVal
 	}))

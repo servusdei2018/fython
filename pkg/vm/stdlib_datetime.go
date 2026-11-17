@@ -187,7 +187,8 @@ func initTimezoneType() {
 	timezoneType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if callable.IsType() {
 			if len(args) < 1 {
-				panic("TypeError: timezone() takes at least 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "timezone() takes at least 1 argument"))
+				return val.NoneVal()
 			}
 			offsetArg := args[0]
 			var offsetSec int64
@@ -203,7 +204,8 @@ func initTimezoneType() {
 			}
 			return newTimezoneVal(offsetSec, name)
 		}
-		panic("TypeError: timezone objects are not callable")
+		ctx.Raise(val.NewException(val.TypeErrorType, "timezone objects are not callable"))
+		return val.NoneVal()
 	}
 
 	timezoneType.Dict.Set(val.InternString("utcoffset"), val.NewBuiltinFuncVal("utcoffset", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -306,7 +308,8 @@ func initTimeDeltaType() {
 			us += ms * 1000
 			return newTimeDeltaVal(d, s, us)
 		}
-		panic("TypeError: timedelta objects are not callable")
+		ctx.Raise(val.NewException(val.TypeErrorType, "timedelta objects are not callable"))
+		return val.NoneVal()
 	}
 
 	timedeltaType.Slots.TpGetAttr = func(ctx *val.ExecContext, obj, name val.Value) val.Value {
@@ -415,7 +418,8 @@ func initTimeDeltaType() {
 
 	timedeltaType.Dict.Set(val.InternString("__lt__"), val.NewBuiltinFuncVal("__lt__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if args[1].Type() != timedeltaType {
-			panic("TypeError: '<' not supported between instances of 'timedelta' and '" + args[1].Type().Name + "'")
+			ctx.Raise(val.NewException(val.TypeErrorType, "'<' not supported between instances of 'timedelta' and '"+args[1].Type().Name+"'"))
+			return val.NoneVal()
 		}
 		t1 := (*pyTimeDelta)(val.AsPointer(args[0]))
 		t2 := (*pyTimeDelta)(val.AsPointer(args[1]))
@@ -426,7 +430,8 @@ func initTimeDeltaType() {
 
 	timedeltaType.Dict.Set(val.InternString("__le__"), val.NewBuiltinFuncVal("__le__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if args[1].Type() != timedeltaType {
-			panic("TypeError: '<=' not supported between instances of 'timedelta' and '" + args[1].Type().Name + "'")
+			ctx.Raise(val.NewException(val.TypeErrorType, "'<=' not supported between instances of 'timedelta' and '"+args[1].Type().Name+"'"))
+			return val.NoneVal()
 		}
 		t1 := (*pyTimeDelta)(val.AsPointer(args[0]))
 		t2 := (*pyTimeDelta)(val.AsPointer(args[1]))
@@ -437,7 +442,8 @@ func initTimeDeltaType() {
 
 	timedeltaType.Dict.Set(val.InternString("__gt__"), val.NewBuiltinFuncVal("__gt__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if args[1].Type() != timedeltaType {
-			panic("TypeError: '>' not supported between instances of 'timedelta' and '" + args[1].Type().Name + "'")
+			ctx.Raise(val.NewException(val.TypeErrorType, "'>' not supported between instances of 'timedelta' and '"+args[1].Type().Name+"'"))
+			return val.NoneVal()
 		}
 		t1 := (*pyTimeDelta)(val.AsPointer(args[0]))
 		t2 := (*pyTimeDelta)(val.AsPointer(args[1]))
@@ -448,7 +454,8 @@ func initTimeDeltaType() {
 
 	timedeltaType.Dict.Set(val.InternString("__ge__"), val.NewBuiltinFuncVal("__ge__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if args[1].Type() != timedeltaType {
-			panic("TypeError: '>=' not supported between instances of 'timedelta' and '" + args[1].Type().Name + "'")
+			ctx.Raise(val.NewException(val.TypeErrorType, "'>=' not supported between instances of 'timedelta' and '"+args[1].Type().Name+"'"))
+			return val.NoneVal()
 		}
 		t1 := (*pyTimeDelta)(val.AsPointer(args[0]))
 		t2 := (*pyTimeDelta)(val.AsPointer(args[1]))
@@ -473,17 +480,20 @@ func initDateType() {
 	dateType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if callable.IsType() {
 			if len(args) < 3 {
-				panic("TypeError: date() takes 3 arguments (year, month, day)")
+				ctx.Raise(val.NewException(val.TypeErrorType, "date() takes 3 arguments (year, month, day)"))
+				return val.NoneVal()
 			}
 			y := int(args[0].AsInt64())
 			m := int(args[1].AsInt64())
 			d := int(args[2].AsInt64())
 			if y < 1 || y > 9999 || m < 1 || m > 12 || d < 1 || d > 31 {
-				panic("ValueError: date component out of range")
+				ctx.Raise(val.NewException(val.ValueErrorType, "date component out of range"))
+				return val.NoneVal()
 			}
 			return newDateVal(y, m, d)
 		}
-		panic("TypeError: date objects are not callable")
+		ctx.Raise(val.NewException(val.TypeErrorType, "date objects are not callable"))
+		return val.NoneVal()
 	}
 
 	dateType.Slots.TpGetAttr = func(ctx *val.ExecContext, obj, name val.Value) val.Value {
@@ -533,7 +543,8 @@ func initDateType() {
 				return newDateVal(y, m, d)
 			}
 		}
-		panic("ValueError: Invalid isoformat string: " + s)
+		ctx.Raise(val.NewException(val.ValueErrorType, "Invalid isoformat string:"+s))
+		return val.NoneVal()
 	}))
 
 	dateType.Dict.Set(val.InternString("isoformat"), val.NewBuiltinFuncVal("isoformat", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -589,7 +600,8 @@ func initDateType() {
 
 	dateType.Dict.Set(val.InternString("strftime"), val.NewBuiltinFuncVal("strftime", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: strftime() requires a format string")
+			ctx.Raise(val.NewException(val.TypeErrorType, "strftime() requires a format string"))
+			return val.NoneVal()
 		}
 		d := (*pyDate)(val.AsPointer(args[0]))
 		t := time.Date(d.year, time.Month(d.month), d.day, 0, 0, 0, 0, time.UTC)
@@ -645,7 +657,8 @@ func initDateType() {
 
 	dateType.Dict.Set(val.InternString("__lt__"), val.NewBuiltinFuncVal("__lt__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if args[1].Type() != dateType {
-			panic("TypeError: '<' not supported between instances of 'date' and '" + args[1].Type().Name + "'")
+			ctx.Raise(val.NewException(val.TypeErrorType, "'<' not supported between instances of 'date' and '"+args[1].Type().Name+"'"))
+			return val.NoneVal()
 		}
 		d1 := (*pyDate)(val.AsPointer(args[0]))
 		d2 := (*pyDate)(val.AsPointer(args[1]))
@@ -710,7 +723,8 @@ func initTimeType() {
 			}
 			return newTimeVal(h, m, s, us, tz, fold)
 		}
-		panic("TypeError: time objects are not callable")
+		ctx.Raise(val.NewException(val.TypeErrorType, "time objects are not callable"))
+		return val.NoneVal()
 	}
 
 	timeType.Slots.TpGetAttr = func(ctx *val.ExecContext, obj, name val.Value) val.Value {
@@ -836,7 +850,8 @@ func initDateTimeType() {
 			}
 			return newDateTimeVal(y, m, d, h, min, s, us, tz, fold)
 		}
-		panic("TypeError: datetime objects are not callable")
+		ctx.Raise(val.NewException(val.TypeErrorType, "datetime objects are not callable"))
+		return val.NoneVal()
 	}
 
 	datetimeType.Slots.TpGetAttr = func(ctx *val.ExecContext, obj, name val.Value) val.Value {
@@ -929,7 +944,8 @@ func initDateTimeType() {
 		}
 		dt, err := parseIsoFormat(s)
 		if err != nil {
-			panic("ValueError: Invalid isoformat string: " + s)
+			ctx.Raise(val.NewException(val.ValueErrorType, "Invalid isoformat string:"+s))
+			return val.NoneVal()
 		}
 		return dt
 	}))
@@ -937,7 +953,8 @@ func initDateTimeType() {
 	datetimeType.Dict.Set(val.InternString("combine"), val.NewBuiltinFuncVal("combine", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		pa := posArgs(args, kwnames)
 		if len(pa) < 2 {
-			panic("TypeError: combine() requires date and time arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "combine() requires date and time arguments"))
+			return val.NoneVal()
 		}
 		dVal := pa[0]
 		tVal := pa[1]
@@ -1008,7 +1025,8 @@ func initDateTimeType() {
 
 	datetimeType.Dict.Set(val.InternString("strftime"), val.NewBuiltinFuncVal("strftime", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: strftime() requires a format string")
+			ctx.Raise(val.NewException(val.TypeErrorType, "strftime() requires a format string"))
+			return val.NoneVal()
 		}
 		dt := (*pyDateTime)(val.AsPointer(args[0]))
 		t := time.Date(dt.year, time.Month(dt.month), dt.day, dt.hour, dt.minute, dt.second, dt.microsecond*1000, time.UTC)
@@ -1145,7 +1163,8 @@ func initDateTimeType() {
 
 	datetimeType.Dict.Set(val.InternString("__lt__"), val.NewBuiltinFuncVal("__lt__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if args[1].Type() != datetimeType {
-			panic("TypeError: '<' not supported between instances of 'datetime' and '" + args[1].Type().Name + "'")
+			ctx.Raise(val.NewException(val.TypeErrorType, "'<' not supported between instances of 'datetime' and '"+args[1].Type().Name+"'"))
+			return val.NoneVal()
 		}
 		dt1 := (*pyDateTime)(val.AsPointer(args[0]))
 		dt2 := (*pyDateTime)(val.AsPointer(args[1]))

@@ -3,7 +3,6 @@ package val
 import (
 	"errors"
 	"slices"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -40,9 +39,10 @@ var ResolveLazyImportHook func(vm any, mod *PyModule, name Value, lazyVal Value)
 var JoinGeneratorHook func(ctx *ExecContext, sep string, gen *PyGenerator) (Value, bool)
 
 func (ctx *ExecContext) Raise(exc Value) {
-	if ctx != nil {
-		ctx.ActiveException = exc
+	if ctx == nil {
+		panic(exc)
 	}
+	ctx.ActiveException = exc
 }
 
 func (ctx *ExecContext) HasException() bool {
@@ -75,7 +75,7 @@ func (ctx *ExecContext) Invoke0(callable Value) Value {
 	if tpCall := callable.Type().Slots.TpCall; tpCall != nil {
 		return tpCall(ctx, callable, nil, nil)
 	}
-	panic("val: object is not callable")
+	return RaiseTypeError(ctx, "'"+callable.Type().Name+"' object is not callable")
 }
 
 // Invoke1 invokes callable with 1 positional argument (a) with 0 heap allocations.
@@ -103,7 +103,7 @@ func (ctx *ExecContext) Invoke1(callable, a Value) Value {
 	if tpCall := callable.Type().Slots.TpCall; tpCall != nil {
 		return tpCall(ctx, callable, buf[:], nil)
 	}
-	panic("val: object is not callable")
+	return RaiseTypeError(ctx, "'"+callable.Type().Name+"' object is not callable")
 }
 
 // Invoke2 invokes callable with 2 positional arguments (a, b) with 0 heap allocations.
@@ -133,7 +133,7 @@ func (ctx *ExecContext) Invoke2(callable, a, b Value) Value {
 	if tpCall := callable.Type().Slots.TpCall; tpCall != nil {
 		return tpCall(ctx, callable, buf[:], nil)
 	}
-	panic("val: object is not callable")
+	return RaiseTypeError(ctx, "'"+callable.Type().Name+"' object is not callable")
 }
 
 // Invoke3 invokes callable with 3 positional arguments (a, b, c) with 0 heap allocations.
@@ -165,7 +165,7 @@ func (ctx *ExecContext) Invoke3(callable, a, b, c Value) Value {
 	if tpCall := callable.Type().Slots.TpCall; tpCall != nil {
 		return tpCall(ctx, callable, buf[:], nil)
 	}
-	panic("val: object is not callable")
+	return RaiseTypeError(ctx, "'"+callable.Type().Name+"' object is not callable")
 }
 
 // Call invokes callable with arbitrary positional arguments and keyword names.
@@ -186,7 +186,7 @@ func (ctx *ExecContext) Call(callable Value, args []Value, kwnames []Value) Valu
 	if tpCall := callable.Type().Slots.TpCall; tpCall != nil {
 		return tpCall(ctx, callable, args, kwnames)
 	}
-	panic("val: object is not callable")
+	return RaiseTypeError(ctx, "'"+callable.Type().Name+"' object is not callable")
 }
 
 // IterStatus indicates the result of an iterator step in TpIterNext.
@@ -1109,10 +1109,12 @@ func dunderTpDescrSetSlot(ctx *ExecContext, descr, obj, value Value) {
 			ctx.Invoke2(delFn, descr, obj)
 			return
 		}
-		panic("val: AttributeError: __delete__")
+		ctx.Raise(NewException(AttributeErrorType, "__delete__"))
+		return
 	}
 	if descr.Type().dunderSet.ptr == nil {
-		panic("val: AttributeError: __set__")
+		ctx.Raise(NewException(AttributeErrorType, "__set__"))
+		return
 	}
 	ctx.Invoke3(descr.Type().dunderSet, descr, obj, value)
 }
@@ -1209,33 +1211,9 @@ func (t *PyType) syncDunderSlots() {
 	if fn, _, ok := t.LookupMRO(DunderNext); ok {
 		t.dunderNext = fn
 		t.Slots.TpIterNext = func(ctx *ExecContext, o Value) (Value, IterStatus) {
-			var res Value
-			var exc Value
-			hasExc := false
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						if v, ok := r.(Value); ok {
-							exc = v
-							hasExc = true
-							return
-						}
-						panic(r)
-					}
-				}()
-				res = ctx.Invoke1(t.dunderNext, o)
-			}()
-			if hasExc {
-				if IsInstance(exc, StopIterationType) {
-					return NoneVal(), IterExhausted
-				}
-				if ctx != nil {
-					ctx.Raise(exc)
-				}
-				return NoneVal(), IterError
-			}
+			res := ctx.Invoke1(t.dunderNext, o)
 			if ctx != nil && ctx.HasException() {
-				exc = ctx.ActiveException
+				exc := ctx.ActiveException
 				ctx.ClearException()
 				if IsInstance(exc, StopIterationType) {
 					return NoneVal(), IterExhausted
@@ -1567,96 +1545,90 @@ func objectGetAttr(ctx *ExecContext, obj, name Value) Value {
 	return defaultObjectGetAttr(ctx, obj, name)
 }
 
-func isAttrErr(r any) bool {
-	if r == nil {
-		return false
-	}
-	if s, ok := r.(string); ok {
-		return strings.Contains(s, "AttributeError")
-	}
-	if v, ok := r.(Value); ok {
-		return IsInstance(v, AttributeErrorType)
-	}
-	return false
-}
-
 // LookupAttrOptional resolves obj.name without panicking or allocating an AttributeError
 // when the attribute does not exist on standard objects/modules/types.
-func LookupAttrOptional(ctx *ExecContext, obj, name Value) (res Value, okRes bool) {
+func LookupAttrOptional(ctx *ExecContext, obj, name Value) (Value, bool) {
 	if obj.IsType() {
-		v := typeGetAttr(ctx, obj, name)
+		v, ok := typeGetAttrOptional(ctx, obj, name)
+		if !ok {
+			if ctx != nil && ctx.HasException() && IsInstance(ctx.ActiveException, AttributeErrorType) {
+				ctx.ClearException()
+			}
+			return NoneVal(), false
+		}
+		if ctx != nil && ctx.HasException() {
+			if IsInstance(ctx.ActiveException, AttributeErrorType) {
+				ctx.ClearException()
+			}
+			return NoneVal(), false
+		}
 		return v, true
 	}
 	if obj.IsSuper() {
-		v := superGetAttr(ctx, obj, name)
+		v, ok := superGetAttrOptional(ctx, obj, name)
+		if !ok {
+			if ctx != nil && ctx.HasException() && IsInstance(ctx.ActiveException, AttributeErrorType) {
+				ctx.ClearException()
+			}
+			return NoneVal(), false
+		}
+		if ctx != nil && ctx.HasException() {
+			if IsInstance(ctx.ActiveException, AttributeErrorType) {
+				ctx.ClearException()
+			}
+			return NoneVal(), false
+		}
 		return v, true
 	}
 	tp := obj.Type()
 	if (tp.Flags&FlagCustomGetAttribute) != 0 || tp.dunderGetAttribute.ptr != nil {
-		defer func() {
-			if r := recover(); r != nil {
-				if isAttrErr(r) {
-					res = NoneVal()
-					okRes = false
-					return
-				}
-				panic(r)
-			}
-		}()
 		v := GetAttrCtx(ctx, obj, name)
 		if ctx != nil && ctx.HasException() {
 			if IsInstance(ctx.ActiveException, AttributeErrorType) {
 				ctx.ClearException()
-				return NoneVal(), false
 			}
+			return NoneVal(), false
 		}
 		return v, true
 	}
-
-	interned := InternValue(name)
-
-	// Fast path for standard Python instances: probe shape first without panics
-	if obj.IsInstance() {
-		inst := obj.AsInstance()
-		if inst.Shape != nil {
-			if val, ok := inst.GetAttr(interned); ok {
-				return val, true
+	if obj.IsModule() && tp == ModuleType {
+		v, ok := defaultModuleGetAttrOptional(ctx, obj, InternValue(name))
+		if !ok {
+			if ctx != nil && ctx.HasException() && IsInstance(ctx.ActiveException, AttributeErrorType) {
+				ctx.ClearException()
 			}
+			return NoneVal(), false
 		}
-	} else if obj.IsModule() {
-		mod := obj.AsModule()
-		if val, ok := mod.Dict.Get(interned); ok {
-			return val, true
-		}
-	}
-
-	// Descriptors / class MRO lookup
-	descr, _, foundInClass := tp.LookupMRO(interned)
-	if foundInClass {
-		descrType := descr.Type()
-		if descrType.Slots.TpDescrGet != nil {
-			return descrType.Slots.TpDescrGet(ctx, descr, obj, tp), true
-		}
-		return descr, true
-	}
-
-	// Fallback to GetAttrCtx with recover for custom TpGetAttr types (e.g. date, datetime, Decompress)
-	defer func() {
-		if r := recover(); r != nil {
-			if isAttrErr(r) {
-				res = NoneVal()
-				okRes = false
-				return
+		if ctx != nil && ctx.HasException() {
+			if IsInstance(ctx.ActiveException, AttributeErrorType) {
+				ctx.ClearException()
 			}
-			panic(r)
+			return NoneVal(), false
 		}
-	}()
-	v := GetAttrCtx(ctx, obj, interned)
+		return v, true
+	}
+	if tp.Slots.TpGetAttr == nil || (obj.IsInstance() && (tp.Flags&FlagHeapType) != 0) {
+		v, ok := defaultObjectGetAttrOptional(ctx, obj, name)
+		if !ok {
+			if ctx != nil && ctx.HasException() && IsInstance(ctx.ActiveException, AttributeErrorType) {
+				ctx.ClearException()
+			}
+			return NoneVal(), false
+		}
+		if ctx != nil && ctx.HasException() {
+			if IsInstance(ctx.ActiveException, AttributeErrorType) {
+				ctx.ClearException()
+			}
+			return NoneVal(), false
+		}
+		return v, true
+	}
+	v := GetAttrCtx(ctx, obj, name)
 	if ctx != nil && ctx.HasException() {
 		if IsInstance(ctx.ActiveException, AttributeErrorType) {
 			ctx.ClearException()
-			return NoneVal(), false
 		}
+		return NoneVal(), false
 	}
 	return v, true
 }
@@ -1664,8 +1636,15 @@ func LookupAttrOptional(ctx *ExecContext, obj, name Value) (res Value, okRes boo
 func defaultObjectGetAttr(ctx *ExecContext, obj, name Value) Value {
 	v, ok := defaultObjectGetAttrOptional(ctx, obj, name)
 	if !ok {
+		if ctx != nil {
+			if !ctx.HasException() {
+				ctx.Raise(NewLazyAttributeError(obj.Type(), InternValue(name)))
+			}
+			return NoneVal()
+		}
 		interned := InternValue(name)
-		panic("val: AttributeError: '" + obj.Type().Name + "' object has no attribute '" + interned.AsString() + "'")
+		ctx.Raise(NewException(AttributeErrorType, "'"+obj.Type().Name+"' object has no attribute '"+interned.AsString()+"'"))
+		return NoneVal()
 	}
 	return v
 }
@@ -1717,7 +1696,12 @@ func defaultObjectGetAttrOptional(ctx *ExecContext, obj, name Value) (Value, boo
 				}
 				resolved, err := ResolveLazyImportHook(vm, mod, interned, v)
 				if err != nil {
-					panic("ImportError: " + err.Error())
+					if ctx != nil {
+						ctx.Raise(NewImportError(err.Error()))
+						return NoneVal(), false
+					}
+					ctx.Raise(NewException(ImportErrorType, err.Error()))
+					return NoneVal(), false
 				}
 				return resolved, true
 			}
@@ -1913,7 +1897,7 @@ func objectSetAttr(ctx *ExecContext, obj, name, value Value) Value {
 		ci := obj.AsCInstance()
 		if interned == strDict {
 			if !value.IsDict() {
-				panic("TypeError: __dict__ must be set to a dictionary, not a '" + value.Type().Name + "'")
+				return RaiseTypeError(ctx, "__dict__ must be set to a dictionary, not a '"+value.Type().Name+"'")
 			}
 			ci.Dict = value.AsDict()
 			return NoneVal()
@@ -1933,7 +1917,7 @@ func objectSetAttr(ctx *ExecContext, obj, name, value Value) Value {
 		mod := obj.AsModule()
 		if interned == strDict {
 			if !value.IsDict() {
-				panic("TypeError: __dict__ must be set to a dictionary, not a '" + value.Type().Name + "'")
+				return RaiseTypeError(ctx, "__dict__ must be set to a dictionary, not a '"+value.Type().Name+"'")
 			}
 			mod.Dict = value.AsDict()
 			return NoneVal()
@@ -1984,11 +1968,28 @@ func objectSetAttr(ctx *ExecContext, obj, name, value Value) Value {
 		return NoneVal()
 	}
 
-	panic("val: AttributeError: '" + tp.Name + "' object cannot set attribute '" + interned.AsString() + "'")
+	return RaiseAttributeErrorMsg(ctx, "'"+tp.Name+"' object cannot set attribute '"+interned.AsString()+"'")
 }
 
 // typeGetAttr implements attribute lookup on a *PyType object itself.
 func typeGetAttr(ctx *ExecContext, typeObj, name Value) Value {
+	v, ok := typeGetAttrOptional(ctx, typeObj, name)
+	if !ok {
+		if ctx != nil {
+			if !ctx.HasException() {
+				ctx.Raise(NewLazyAttributeError(typeObj.AsType(), InternValue(name)))
+			}
+			return NoneVal()
+		}
+		interned := InternValue(name)
+		ctx.Raise(NewException(AttributeErrorType, "type object '"+typeObj.AsType().Name+"' has no attribute '"+interned.AsString()+"'"))
+		return NoneVal()
+	}
+	return v
+}
+
+// typeGetAttrOptional resolves attribute lookup on a *PyType object without panicking on miss.
+func typeGetAttrOptional(ctx *ExecContext, typeObj, name Value) (Value, bool) {
 	cls := typeObj.AsType()
 	interned := InternValue(name)
 	meta := cls.Header.Type
@@ -2001,7 +2002,7 @@ func typeGetAttr(ctx *ExecContext, typeObj, name Value) Value {
 		descrType := descr.Type()
 		if descr.IsDataDescriptor() || (descrType.Slots.TpDescrGet != nil && descrType.Slots.TpDescrSet != nil) {
 			if descrType.Slots.TpDescrGet != nil {
-				return descrType.Slots.TpDescrGet(ctx, descr, typeObj, meta)
+				return descrType.Slots.TpDescrGet(ctx, descr, typeObj, meta), true
 			}
 		}
 	}
@@ -2011,73 +2012,73 @@ func typeGetAttr(ctx *ExecContext, typeObj, name Value) Value {
 		if cls.Dict != nil {
 			if descr, ok := cls.Dict.Get(interned); ok {
 				if descrGet := descr.Type().Slots.TpDescrGet; descrGet != nil {
-					return descrGet(ctx, descr, NoneVal(), cls)
+					return descrGet(ctx, descr, NoneVal(), cls), true
 				}
-				return descr
+				return descr, true
 			}
 		}
-		return NoneVal()
+		return NoneVal(), true
 	}
 
 	// 2. Check class MRO
 	if descr, _, ok := cls.LookupMRO(interned); ok {
 		if descrGet := descr.Type().Slots.TpDescrGet; descrGet != nil {
-			return descrGet(ctx, descr, NoneVal(), cls)
+			return descrGet(ctx, descr, NoneVal(), cls), true
 		}
-		return descr
+		return descr, true
 	}
 
 	// 3. Check metaclass MRO for non-data descriptors and class attributes
 	if descr, _, ok := meta.LookupMRO(interned); ok {
 		if descrGet := descr.Type().Slots.TpDescrGet; descrGet != nil {
-			return descrGet(ctx, descr, typeObj, meta)
+			return descrGet(ctx, descr, typeObj, meta), true
 		}
-		return descr
+		return descr, true
 	}
 
 	// 4. Builtin type reflection attributes
 	switch interned {
 	case strClass:
-		return TypeVal(meta)
+		return TypeVal(meta), true
 	case strBases:
 		basesItems := make([]Value, len(cls.Bases))
 		for i, b := range cls.Bases {
 			basesItems[i] = TypeVal(b)
 		}
-		return NewTupleVal(basesItems...)
+		return NewTupleVal(basesItems...), true
 	case strName:
-		return InternString(cls.Name)
+		return InternString(cls.Name), true
 	case strQualname:
 		if qn, ok := cls.Dict.Get(strQualname); ok {
-			return qn
+			return qn, true
 		}
-		return InternString(cls.Name)
+		return InternString(cls.Name), true
 	case strTypeParams:
 		if tp, ok := cls.Dict.Get(strTypeParams); ok {
-			return tp
+			return tp, true
 		}
-		return NewTupleVal()
+		return NewTupleVal(), true
 	case strModule:
 		if modVal, ok := cls.Dict.Get(strModule); ok {
-			return modVal
+			return modVal, true
 		}
-		return strBuiltins
+		return strBuiltins, true
 	case strDict:
-		return NewMappingProxyVal(ObjectVal(&cls.Dict.Header))
+		return NewMappingProxyVal(ObjectVal(&cls.Dict.Header)), true
 	case strMRO:
 		mroItems := make([]Value, len(cls.MRO))
 		for i, m := range cls.MRO {
 			mroItems[i] = TypeVal(m)
 		}
-		return NewTupleVal(mroItems...)
+		return NewTupleVal(mroItems...), true
 	}
 
 	// 5. Fallback to metaclass __getattr__ if defined
 	if meta.dunderGetAttr.ptr != nil {
-		return ctx.Invoke2(meta.dunderGetAttr, typeObj, interned)
+		return ctx.Invoke2(meta.dunderGetAttr, typeObj, interned), true
 	}
 
-	panic("val: AttributeError: type object '" + cls.Name + "' has no attribute '" + interned.AsString() + "'")
+	return NoneVal(), false
 }
 
 // typeSetAttr implements attribute assignment on a *PyType object, invalidating VersionTag.
@@ -2129,7 +2130,8 @@ func objectDelAttr(ctx *ExecContext, obj, name Value) {
 			cls.InvalidateVersion()
 			return
 		}
-		panic(NewAttributeError("type object '" + cls.Name + "' has no attribute '" + interned.AsString() + "'"))
+		RaiseAttributeError(ctx, cls, interned)
+		return
 	}
 
 	if tp.dunderDelAttr.ptr != nil {
@@ -2147,7 +2149,7 @@ func objectDelAttr(ctx *ExecContext, obj, name Value) {
 
 	if obj.IsInstance() {
 		if !obj.AsInstance().DeleteAttr(interned) {
-			panic(NewAttributeError("'" + tp.Name + "' object has no attribute '" + interned.AsString() + "'"))
+			RaiseAttributeError(ctx, tp, interned)
 		}
 		return
 	}
@@ -2157,12 +2159,13 @@ func objectDelAttr(ctx *ExecContext, obj, name Value) {
 		if fn.Dict != nil && fn.Dict.Delete(interned) {
 			return
 		}
-		panic(NewAttributeError("'" + tp.Name + "' object has no attribute '" + interned.AsString() + "'"))
+		RaiseAttributeError(ctx, tp, interned)
+		return
 	}
 
 	if obj.IsModule() {
 		if !obj.AsModule().Dict.Delete(interned) {
-			panic(NewAttributeError("module '" + obj.AsModule().Name + "' has no attribute '" + interned.AsString() + "'"))
+			RaiseAttributeError(ctx, tp, interned)
 		}
 		return
 	}
@@ -2179,7 +2182,7 @@ func objectDelAttr(ctx *ExecContext, obj, name Value) {
 		return
 	}
 
-	panic(NewAttributeError("'" + tp.Name + "' object has no attribute '" + interned.AsString() + "'"))
+	RaiseAttributeError(ctx, tp, interned)
 }
 
 // moduleGetAttr implements attribute lookup on a *PyModule object.
@@ -2196,10 +2199,25 @@ func moduleGetAttr(ctx *ExecContext, obj, name Value) Value {
 }
 
 func defaultModuleGetAttr(ctx *ExecContext, obj, interned Value) Value {
+	v, ok := defaultModuleGetAttrOptional(ctx, obj, interned)
+	if !ok {
+		if ctx != nil {
+			if !ctx.HasException() {
+				ctx.Raise(NewLazyAttributeError(obj.Type(), interned))
+			}
+			return NoneVal()
+		}
+		ctx.Raise(NewException(AttributeErrorType, "module '"+obj.AsModule().Name+"' has no attribute '"+interned.AsString()+"'"))
+		return NoneVal()
+	}
+	return v
+}
+
+func defaultModuleGetAttrOptional(ctx *ExecContext, obj, interned Value) (Value, bool) {
 	mod := obj.AsModule()
 	tp := obj.Type()
 	if interned == strClass {
-		return TypeVal(tp)
+		return TypeVal(tp), true
 	}
 
 	// 1. Data descriptors on class MRO
@@ -2208,7 +2226,7 @@ func defaultModuleGetAttr(ctx *ExecContext, obj, interned Value) Value {
 		descrType := descr.Type()
 		if descr.IsDataDescriptor() || (descrType.Slots.TpDescrGet != nil && descrType.Slots.TpDescrSet != nil) {
 			if descrType.Slots.TpDescrGet != nil {
-				return descrType.Slots.TpDescrGet(ctx, descr, obj, tp)
+				return descrType.Slots.TpDescrGet(ctx, descr, obj, tp), true
 			}
 		}
 	}
@@ -2222,55 +2240,60 @@ func defaultModuleGetAttr(ctx *ExecContext, obj, interned Value) Value {
 			}
 			resolved, err := ResolveLazyImportHook(vm, mod, interned, v)
 			if err != nil {
-				panic("ImportError: " + err.Error())
+				if ctx != nil {
+					ctx.Raise(NewImportError(err.Error()))
+					return NoneVal(), false
+				}
+				ctx.Raise(NewException(ImportErrorType, err.Error()))
+				return NoneVal(), false
 			}
-			return resolved
+			return resolved, true
 		}
-		return v
+		return v, true
 	}
 
 	if interned == strDict {
-		return DictVal(mod.Dict)
+		return DictVal(mod.Dict), true
 	}
 
 	// 3. Non-data descriptors on class MRO
 	if foundInClass {
 		descrType := descr.Type()
 		if descrType.Slots.TpDescrGet != nil {
-			return descrType.Slots.TpDescrGet(ctx, descr, obj, tp)
+			return descrType.Slots.TpDescrGet(ctx, descr, obj, tp), true
 		}
-		return descr
+		return descr, true
 	}
 
 	// 4. Built-in module reflection attributes
 	switch interned {
 	case strName:
-		return InternString(mod.Name)
+		return InternString(mod.Name), true
 	case strDoc:
-		return NoneVal()
+		return NoneVal(), true
 	case strFile:
 		if mod.File != "" {
-			return NewStringVal(mod.File)
+			return NewStringVal(mod.File), true
 		}
 	case strAnnotations:
-		return ModuleAnnotations(ctx, mod)
+		return ModuleAnnotations(ctx, mod), true
 	case strAnnotate:
-		return NoneVal()
+		return NoneVal(), true
 	}
 
 	// 5. Class-level __getattr__
 	if tp.dunderGetAttr.ptr != nil {
-		return ctx.Invoke2(tp.dunderGetAttr, obj, interned)
+		return ctx.Invoke2(tp.dunderGetAttr, obj, interned), true
 	}
 
 	// 6. PEP 562 module-level __getattr__
 	if interned != DunderGetAttr {
 		if getattrFn, ok := mod.Dict.Get(DunderGetAttr); ok && !getattrFn.IsNone() && !getattrFn.IsUnbound() {
-			return ctx.Invoke1(getattrFn, interned)
+			return ctx.Invoke1(getattrFn, interned), true
 		}
 	}
 
-	panic("val: AttributeError: module '" + mod.Name + "' has no attribute '" + interned.AsString() + "'")
+	return NoneVal(), false
 }
 
 // moduleSetAttr implements attribute assignment on a *PyModule object.
@@ -2297,7 +2320,7 @@ func moduleSetAttr(ctx *ExecContext, obj, name, value Value) Value {
 	}
 	if interned.AsString() == "__dict__" {
 		if !value.IsDict() {
-			panic("TypeError: __dict__ must be set to a dictionary, not a '" + value.Type().Name + "'")
+			return RaiseTypeError(ctx, "__dict__ must be set to a dictionary, not a '"+value.Type().Name+"'")
 		}
 		obj.AsModule().Dict = value.AsDict()
 		return NoneVal()
@@ -2311,7 +2334,8 @@ func moduleSetAttr(ctx *ExecContext, obj, name, value Value) Value {
 // regular Shape transitions, keeping the instance Shape-backed.
 func ReplaceInstanceDict(ctx *ExecContext, inst *PyInstance, mapping Value) {
 	if !mapping.IsDict() {
-		panic("TypeError: __dict__ must be set to a dictionary, not a '" + mapping.Type().Name + "'")
+		RaiseTypeError(ctx, "__dict__ must be set to a dictionary, not a '"+mapping.Type().Name+"'")
+		return
 	}
 	entries := mapping.AsDict().ActiveEntries()
 	tp := inst.Header.Type

@@ -45,7 +45,8 @@ func initFunctoolsTypes() {
 		PartialType = val.MustNewType("partial", []*val.PyType{val.ObjectType}, nil)
 		PartialType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: partial expected at least 1 argument, got 0")
+				ctx.Raise(val.NewException(val.TypeErrorType, "partial expected at least 1 argument, got 0"))
+				return val.NoneVal()
 			}
 			fn := args[0]
 			kwStart := len(args) - len(kwnames)
@@ -98,7 +99,8 @@ func initFunctoolsTypes() {
 
 		PartialType.Dict.Set(val.DunderCall, val.NewBuiltinFuncVal("__call__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) == 0 {
-				panic("TypeError: descriptor '__call__' of 'partial' object needs an argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "descriptor '__call__' of 'partial' object needs an argument"))
+				return val.NoneVal()
 			}
 			part := (*pyPartial)(unsafe.Pointer(args[0].HeaderPtr()))
 			kwStart := len(args) - len(kwnames)
@@ -144,7 +146,8 @@ func initFunctoolsTypes() {
 		CacheWrapper = val.MustNewType("_lru_cache_wrapper", []*val.PyType{val.ObjectType}, nil)
 		cacheCall := func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: _lru_cache_wrapper expected an instance")
+				ctx.Raise(val.NewException(val.TypeErrorType, "_lru_cache_wrapper expected an instance"))
+				return val.NoneVal()
 			}
 			cache := (*pyLRUCache)(unsafe.Pointer(args[0].HeaderPtr()))
 			args = args[1:]
@@ -204,7 +207,8 @@ func initFunctoolsTypes() {
 		CacheWrapper.Slots.TpDescrGet = cacheGet
 		CacheWrapper.Dict.Set(val.DunderGet, val.NewBuiltinFuncVal("__get__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: descriptor '__get__' of '_lru_cache_wrapper' object needs an argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "descriptor '__get__' of '_lru_cache_wrapper' object needs an argument"))
+				return val.NoneVal()
 			}
 			obj := val.NoneVal()
 			if len(args) > 1 {
@@ -242,7 +246,8 @@ func initFunctoolsTypes() {
 
 		CacheWrapper.Dict.Set(val.InternString("cache_info"), val.NewBuiltinFuncVal("cache_info", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) == 0 {
-				panic("TypeError: cache_info() requires 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "cache_info() requires 1 argument"))
+				return val.NoneVal()
 			}
 			cache := (*pyLRUCache)(unsafe.Pointer(args[0].HeaderPtr()))
 			cache.Mu.Lock()
@@ -264,7 +269,8 @@ func initFunctoolsTypes() {
 
 		CacheWrapper.Dict.Set(val.InternString("cache_clear"), val.NewBuiltinFuncVal("cache_clear", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) == 0 {
-				panic("TypeError: cache_clear() requires 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "cache_clear() requires 1 argument"))
+				return val.NoneVal()
 			}
 			cache := (*pyLRUCache)(unsafe.Pointer(args[0].HeaderPtr()))
 			cache.Mu.Lock()
@@ -290,7 +296,8 @@ func (e *Engine) createFunctoolsModule() val.Value {
 	// reduce(function, iterable[, initializer])
 	mod.Dict.Set(val.InternString("reduce"), val.NewBuiltinFuncVal("reduce", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: reduce() takes at least 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "reduce() takes at least 2 arguments"))
+			return val.NoneVal()
 		}
 		fn := args[0]
 		it := iterFor(ctx, args[1])
@@ -302,7 +309,8 @@ func (e *Engine) createFunctoolsModule() val.Value {
 		} else {
 			first, ok := it.Next()
 			if !ok {
-				panic("TypeError: reduce() of empty iterable with no initial value")
+				ctx.Raise(val.NewException(val.TypeErrorType, "reduce() of empty iterable with no initial value"))
+				return val.NoneVal()
 			}
 			acc = first
 		}
@@ -321,7 +329,8 @@ func (e *Engine) createFunctoolsModule() val.Value {
 	// _lru_cache_wrapper(user_function, maxsize, typed, _CacheInfo)
 	mod.Dict.Set(val.InternString("_lru_cache_wrapper"), val.NewBuiltinFuncVal("_lru_cache_wrapper", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 4 {
-			panic("TypeError: _lru_cache_wrapper expected 4 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "_lru_cache_wrapper expected 4 arguments"))
+			return val.NoneVal()
 		}
 		userFn := args[0]
 		maxsize := -1
@@ -346,7 +355,8 @@ func (e *Engine) createFunctoolsModule() val.Value {
 	// cmp_to_key(mycmp)
 	mod.Dict.Set(val.InternString("cmp_to_key"), val.NewBuiltinFuncVal("cmp_to_key", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: cmp_to_key() takes exactly 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "cmp_to_key() takes exactly 1 argument"))
+			return val.NoneVal()
 		}
 		mycmp := args[0]
 		KeyCls := val.MustNewType("K", []*val.PyType{val.ObjectType}, nil)

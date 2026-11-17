@@ -20,7 +20,8 @@ func initFrameSummaryType() {
 		d := val.NewDictVal(8).AsDict()
 		d.Set(val.InternString("__init__"), val.NewBuiltinFuncVal("__init__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 4 {
-				panic("TypeError: FrameSummary.__init__() missing required arguments")
+				ctx.Raise(val.NewException(val.TypeErrorType, "FrameSummary.__init__() missing required arguments"))
+				return val.NoneVal()
 			}
 			self := args[0]
 			fn := args[1]
@@ -45,7 +46,8 @@ func initFrameSummaryType() {
 		}))
 		d.Set(val.InternString("__getitem__"), val.NewBuiltinFuncVal("__getitem__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: __getitem__ requires 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "__getitem__ requires 1 argument"))
+				return val.NoneVal()
 			}
 			self := args[0]
 			fn := val.GetAttrCtx(ctx, self, val.InternString("filename"))
@@ -57,7 +59,8 @@ func initFrameSummaryType() {
 		}))
 		d.Set(val.InternString("__iter__"), val.NewBuiltinFuncVal("__iter__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: __iter__ requires self")
+				ctx.Raise(val.NewException(val.TypeErrorType, "__iter__ requires self"))
+				return val.NoneVal()
 			}
 			self := args[0]
 			fn := val.GetAttrCtx(ctx, self, val.InternString("filename"))
@@ -347,7 +350,7 @@ func formatExceptionMessage(ctx *val.ExecContext, exc val.Value) string {
 	}
 	msg := ""
 	if exc.IsInstance() {
-		if argsVal, ok := exc.AsInstance().GetAttr(val.InternString("args")); ok && argsVal.IsTuple() {
+		if argsVal, ok := val.ExceptionArgs(exc.AsInstance()); ok && argsVal.IsTuple() {
 			items := argsVal.AsTuple().Items
 			if len(items) == 1 {
 				msg = items[0].String()

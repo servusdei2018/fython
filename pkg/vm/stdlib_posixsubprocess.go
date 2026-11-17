@@ -16,7 +16,8 @@ func (e *Engine) createPosixSubprocessModule() val.Value {
 
 	mod.Dict.Set(val.InternString("fork_exec"), val.NewModuleFuncVal("fork_exec", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 14 {
-			panic("TypeError: fork_exec() takes at least 14 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "fork_exec() takes at least 14 arguments"))
+			return val.NoneVal()
 		}
 
 		toStr := func(v val.Value) string {

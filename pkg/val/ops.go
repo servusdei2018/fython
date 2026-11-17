@@ -11,36 +11,140 @@ import (
 	"strings"
 )
 
-func raiseTypeError(ctx *ExecContext, msg string) Value {
+func RaiseTypeError(ctx *ExecContext, msg string) Value {
 	if ctx != nil {
 		ctx.Raise(NewTypeError(msg))
 		return NoneVal()
 	}
-	panic("TypeError: " + msg)
+	ctx.Raise(NewException(TypeErrorType, msg))
+	return NoneVal()
 }
 
-func raiseZeroDivisionError(ctx *ExecContext, msg string) Value {
-	if ctx != nil {
-		ctx.Raise(NewZeroDivisionError(msg))
-		return NoneVal()
-	}
-	panic("ZeroDivisionError: " + msg)
-}
-
-func raiseOverflowError(ctx *ExecContext, msg string) Value {
-	if ctx != nil {
-		ctx.Raise(NewOverflowError(msg))
-		return NoneVal()
-	}
-	panic("OverflowError: " + msg)
-}
-
-func raiseValueError(ctx *ExecContext, msg string) Value {
+func RaiseValueError(ctx *ExecContext, msg string) Value {
 	if ctx != nil {
 		ctx.Raise(NewValueError(msg))
 		return NoneVal()
 	}
-	panic("ValueError: " + msg)
+	ctx.Raise(NewException(ValueErrorType, msg))
+	return NoneVal()
+}
+
+func RaiseKeyError(ctx *ExecContext, key Value) Value {
+	if ctx != nil {
+		ctx.Raise(NewKeyError(key))
+		return NoneVal()
+	}
+	ctx.Raise(NewKeyError(key))
+	return NoneVal()
+}
+
+func RaiseIndexError(ctx *ExecContext, msg string) Value {
+	if ctx != nil {
+		ctx.Raise(NewIndexError(msg))
+		return NoneVal()
+	}
+	ctx.Raise(NewException(IndexErrorType, msg))
+	return NoneVal()
+}
+
+func RaiseAttributeError(ctx *ExecContext, targetType *PyType, name Value) Value {
+	if ctx != nil {
+		ctx.Raise(NewLazyAttributeError(targetType, InternValue(name)))
+		return NoneVal()
+	}
+	tpName := "object"
+	if targetType != nil {
+		tpName = targetType.Name
+	}
+	ctx.Raise(NewException(AttributeErrorType, "'"+tpName+"' object has no attribute '"+InternValue(name).AsString()+"'"))
+	return NoneVal()
+}
+
+func RaiseAttributeErrorMsg(ctx *ExecContext, msg string) Value {
+	if ctx != nil {
+		ctx.Raise(NewAttributeError(msg))
+		return NoneVal()
+	}
+	ctx.Raise(NewException(AttributeErrorType, msg))
+	return NoneVal()
+}
+
+func RaiseStopIteration(ctx *ExecContext, val Value) Value {
+	if ctx != nil {
+		ctx.Raise(NewStopIteration(val))
+		return NoneVal()
+	}
+	ctx.Raise(NewStopIteration(val))
+	return NoneVal()
+}
+
+func RaiseRuntimeError(ctx *ExecContext, msg string) Value {
+	if ctx != nil {
+		ctx.Raise(NewRuntimeError(msg))
+		return NoneVal()
+	}
+	ctx.Raise(NewException(RuntimeErrorType, msg))
+	return NoneVal()
+}
+
+func RaiseZeroDivisionError(ctx *ExecContext, msg string) Value {
+	if ctx != nil {
+		ctx.Raise(NewZeroDivisionError(msg))
+		return NoneVal()
+	}
+	ctx.Raise(NewException(ZeroDivisionErrorType, msg))
+	return NoneVal()
+}
+
+func RaiseOverflowError(ctx *ExecContext, msg string) Value {
+	if ctx != nil {
+		ctx.Raise(NewOverflowError(msg))
+		return NoneVal()
+	}
+	ctx.Raise(NewException(OverflowErrorType, msg))
+	return NoneVal()
+}
+
+func RaiseImportError(ctx *ExecContext, msg string) Value {
+	if ctx != nil {
+		ctx.Raise(NewImportError(msg))
+		return NoneVal()
+	}
+	ctx.Raise(NewException(ImportErrorType, msg))
+	return NoneVal()
+}
+
+func RaiseException(ctx *ExecContext, cls *PyType, msg string) Value {
+	if ctx != nil {
+		ctx.Raise(NewException(cls, msg))
+		return NoneVal()
+	}
+	ctx.Raise(NewException(cls, msg))
+	return NoneVal()
+}
+
+func RaiseExceptionVal(ctx *ExecContext, exc Value) Value {
+	if ctx != nil {
+		ctx.Raise(exc)
+		return NoneVal()
+	}
+	panic(exc)
+}
+
+func raiseTypeError(ctx *ExecContext, msg string) Value {
+	return RaiseTypeError(ctx, msg)
+}
+
+func raiseZeroDivisionError(ctx *ExecContext, msg string) Value {
+	return RaiseZeroDivisionError(ctx, msg)
+}
+
+func raiseOverflowError(ctx *ExecContext, msg string) Value {
+	return RaiseOverflowError(ctx, msg)
+}
+
+func raiseValueError(ctx *ExecContext, msg string) Value {
+	return RaiseValueError(ctx, msg)
 }
 
 // Add performs overflow-safe Python addition (a + b) without an explicit VM context.
@@ -1858,10 +1962,11 @@ func formatStringModCtx(ctx *ExecContext, fmtStr string, arg Value) Value {
 			val, ok = argDict.Get(InternString(mapKey))
 			if !ok {
 				if ctx != nil {
-					ctx.Raise(NewException(KeyErrorType, "KeyError: "+mapKey))
+					ctx.Raise(NewKeyError(NewStringVal(mapKey)))
 					return NoneVal()
 				}
-				panic(NewException(KeyErrorType, "KeyError: "+mapKey))
+				ctx.Raise(NewKeyError(NewStringVal(mapKey)))
+				return NoneVal()
 			}
 		} else {
 			if itemIdx >= len(items) {

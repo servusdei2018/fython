@@ -48,21 +48,26 @@ func initTemplateTypes() {
 func interpolationTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 	value, expression, conversion, formatSpec, ok := bindInterpolationArgs(args, kwnames)
 	if !ok {
-		panic(NewTypeError("Interpolation() missing required argument: 'value'"))
+		ctx.Raise(NewTypeError("Interpolation() missing required argument: 'value'"))
+		return NoneVal()
 	}
 	if !expression.IsAnyString() {
-		panic(NewTypeError("Interpolation() argument 'expression' must be str"))
+		ctx.Raise(NewTypeError("Interpolation() argument 'expression' must be str"))
+		return NoneVal()
 	}
 	if !formatSpec.IsAnyString() {
-		panic(NewTypeError("Interpolation() argument 'format_spec' must be str"))
+		ctx.Raise(NewTypeError("Interpolation() argument 'format_spec' must be str"))
+		return NoneVal()
 	}
 	if !conversion.IsNone() {
 		if !conversion.IsAnyString() {
-			panic(NewTypeError("Interpolation() argument 'conversion' must be str or None"))
+			ctx.Raise(NewTypeError("Interpolation() argument 'conversion' must be str or None"))
+			return NoneVal()
 		}
 		conv := conversion.AsString()
 		if conv != "r" && conv != "s" && conv != "a" {
-			panic(NewException(ValueErrorType, "Interpolation() conversion must be None, 's', 'r', or 'a'"))
+			ctx.Raise(NewException(ValueErrorType, "Interpolation() conversion must be None, 's', 'r', or 'a'"))
+			return NoneVal()
 		}
 	}
 	return MakeInterpolation(value, expression, conversion, formatSpec)
@@ -152,7 +157,8 @@ func interpolationRepr(ctx *ExecContext, callable Value, args []Value, kwnames [
 
 func templateTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 	if len(kwnames) > 0 {
-		panic(NewTypeError("Template() takes no keyword arguments"))
+		ctx.Raise(NewTypeError("Template() takes no keyword arguments"))
+		return NoneVal()
 	}
 	return TemplateFromArgs(args)
 }
@@ -245,7 +251,8 @@ func templateRepr(ctx *ExecContext, callable Value, args []Value, kwnames []Valu
 
 func templateIter(ctx *ExecContext, o Value) Value {
 	if !o.IsInstance() {
-		panic(NewTypeError("Template.__iter__ expected a Template"))
+		ctx.Raise(NewTypeError("Template.__iter__ expected a Template"))
+		return NoneVal()
 	}
 	inst := o.AsInstance()
 	s, _ := inst.GetAttr(attrStrings)

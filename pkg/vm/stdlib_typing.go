@@ -141,7 +141,8 @@ func (e *Engine) createTypingModule() val.Value {
 	d := mod.Dict
 	d.Set(val.InternString("_idfunc"), val.NewBuiltinFuncVal("_idfunc", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: _idfunc() missing 1 required positional argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "_idfunc() missing 1 required positional argument"))
+			return val.NoneVal()
 		}
 		return args[0]
 	}))
@@ -271,19 +272,22 @@ func installTypeVarMethods() {
 	val.TypeVarType.Slots.TpGetAttr = typeVarGetAttr
 	val.TypeVarType.Dict.Set(val.InternString("__repr__"), val.NewBuiltinFuncVal("TypeVar.__repr__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__repr__' requires an argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "descriptor '__repr__' requires an argument"))
+			return val.NoneVal()
 		}
 		return val.InternString(typeVarRepr(asTypeVar(args[0])))
 	}))
 	val.TypeVarType.Dict.Set(val.InternString("has_default"), val.NewBuiltinFuncVal("TypeVar.has_default", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: has_default() missing self")
+			ctx.Raise(val.NewException(val.TypeErrorType, "has_default() missing self"))
+			return val.NoneVal()
 		}
 		return val.BoolVal(hasTypingDefault(asTypeVar(args[0]).Default))
 	}))
 	val.TypeVarType.Dict.Set(val.InternString("__typing_subst__"), val.NewBuiltinFuncVal("TypeVar.__typing_subst__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: __typing_subst__() missing argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "__typing_subst__() missing argument"))
+			return val.NoneVal()
 		}
 		if v, ok := callTyping(ctx, "_typevar_subst", args[:2], nil); ok {
 			return v
@@ -291,7 +295,8 @@ func installTypeVarMethods() {
 		return args[1]
 	}))
 	val.TypeVarType.Dict.Set(val.InternString("__mro_entries__"), val.NewBuiltinFuncVal("TypeVar.__mro_entries__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		panic("TypeError: type variables cannot be used as a base class")
+		ctx.Raise(val.NewException(val.TypeErrorType, "type variables cannot be used as a base class"))
+		return val.NoneVal()
 	}))
 	val.TypeVarType.InvalidateVersion()
 }
@@ -299,22 +304,26 @@ func installTypeVarMethods() {
 func typeVarTpCall(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 	pos, kw := splitKeywords(args, kwnames)
 	if len(pos) < 1 || !pos[0].IsAnyString() {
-		panic("TypeError: TypeVar() requires a string name")
+		ctx.Raise(val.NewException(val.TypeErrorType, "TypeVar() requires a string name"))
+		return val.NoneVal()
 	}
 	name := pos[0].AsString()
 	constraints := append([]val.Value(nil), pos[1:]...)
 	bound := valueOrNone(kwOr(kw, "bound", val.NoneVal()))
 	if len(constraints) > 0 && bound.HeaderPtr() != nil && !bound.IsNone() {
-		panic("TypeError: TypeVar cannot have both constraints and a bound")
+		ctx.Raise(val.NewException(val.TypeErrorType, "TypeVar cannot have both constraints and a bound"))
+		return val.NoneVal()
 	}
 	covariant := kwOr(kw, "covariant", val.BoolVal(false)).IsTruthy()
 	contravariant := kwOr(kw, "contravariant", val.BoolVal(false)).IsTruthy()
 	infer := kwOr(kw, "infer_variance", val.BoolVal(false)).IsTruthy()
 	if covariant && contravariant {
-		panic("TypeError: TypeVar cannot be both covariant and contravariant")
+		ctx.Raise(val.NewException(val.TypeErrorType, "TypeVar cannot be both covariant and contravariant"))
+		return val.NoneVal()
 	}
 	if infer && (covariant || contravariant) {
-		panic("TypeError: TypeVar cannot combine infer_variance with explicit variance")
+		ctx.Raise(val.NewException(val.TypeErrorType, "TypeVar cannot combine infer_variance with explicit variance"))
+		return val.NoneVal()
 	}
 	def := kwOr(kw, "default", NoDefaultVal)
 	tv := &val.PyTypeVar{
@@ -388,7 +397,8 @@ func installParamSpecMethods() {
 	val.ParamSpecType.Slots.TpGetAttr = paramSpecGetAttr
 	val.ParamSpecType.Dict.Set(val.InternString("__repr__"), val.NewBuiltinFuncVal("ParamSpec.__repr__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__repr__' requires an argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "descriptor '__repr__' requires an argument"))
+			return val.NoneVal()
 		}
 		ps := asParamSpec(args[0])
 		prefix := ""
@@ -404,13 +414,15 @@ func installParamSpecMethods() {
 	}))
 	val.ParamSpecType.Dict.Set(val.InternString("has_default"), val.NewBuiltinFuncVal("ParamSpec.has_default", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: has_default() missing self")
+			ctx.Raise(val.NewException(val.TypeErrorType, "has_default() missing self"))
+			return val.NoneVal()
 		}
 		return val.BoolVal(hasTypingDefault(asParamSpec(args[0]).Default))
 	}))
 	val.ParamSpecType.Dict.Set(val.InternString("__typing_subst__"), val.NewBuiltinFuncVal("ParamSpec.__typing_subst__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: __typing_subst__() missing argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "__typing_subst__() missing argument"))
+			return val.NoneVal()
 		}
 		if v, ok := callTyping(ctx, "_paramspec_subst", args[:2], nil); ok {
 			return v
@@ -419,7 +431,8 @@ func installParamSpecMethods() {
 	}))
 	val.ParamSpecType.Dict.Set(val.InternString("__typing_prepare_subst__"), val.NewBuiltinFuncVal("ParamSpec.__typing_prepare_subst__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 3 {
-			panic("TypeError: __typing_prepare_subst__() missing arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "__typing_prepare_subst__() missing arguments"))
+			return val.NoneVal()
 		}
 		if v, ok := callTyping(ctx, "_paramspec_prepare_subst", args[:3], nil); ok {
 			return v
@@ -427,7 +440,8 @@ func installParamSpecMethods() {
 		return args[2]
 	}))
 	val.ParamSpecType.Dict.Set(val.InternString("__mro_entries__"), val.NewBuiltinFuncVal("ParamSpec.__mro_entries__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		panic("TypeError: parameter specifications cannot be used as a base class")
+		ctx.Raise(val.NewException(val.TypeErrorType, "parameter specifications cannot be used as a base class"))
+		return val.NoneVal()
 	}))
 	val.ParamSpecType.InvalidateVersion()
 }
@@ -435,16 +449,19 @@ func installParamSpecMethods() {
 func paramSpecTpCall(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 	pos, kw := splitKeywords(args, kwnames)
 	if len(pos) < 1 || !pos[0].IsAnyString() {
-		panic("TypeError: ParamSpec() requires a string name")
+		ctx.Raise(val.NewException(val.TypeErrorType, "ParamSpec() requires a string name"))
+		return val.NoneVal()
 	}
 	if len(pos) > 1 {
-		panic("TypeError: ParamSpec() takes exactly 1 positional argument")
+		ctx.Raise(val.NewException(val.TypeErrorType, "ParamSpec() takes exactly 1 positional argument"))
+		return val.NoneVal()
 	}
 	covariant := kwOr(kw, "covariant", val.BoolVal(false)).IsTruthy()
 	contravariant := kwOr(kw, "contravariant", val.BoolVal(false)).IsTruthy()
 	infer := kwOr(kw, "infer_variance", val.BoolVal(false)).IsTruthy()
 	if covariant && contravariant {
-		panic("TypeError: ParamSpec cannot be both covariant and contravariant")
+		ctx.Raise(val.NewException(val.TypeErrorType, "ParamSpec cannot be both covariant and contravariant"))
+		return val.NoneVal()
 	}
 	ps := &val.PyParamSpec{
 		Header:        val.ObjectHeader{Kind: val.KindNative, Type: val.ParamSpecType},
@@ -508,7 +525,8 @@ func installTypeVarTupleMethods() {
 	val.TypeVarTupleType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		pos, kw := splitKeywords(args, kwnames)
 		if len(pos) < 1 || !pos[0].IsAnyString() {
-			panic("TypeError: TypeVarTuple() requires a string name")
+			ctx.Raise(val.NewException(val.TypeErrorType, "TypeVarTuple() requires a string name"))
+			return val.NoneVal()
 		}
 		tvt := &val.PyTypeVarTuple{
 			Header:  val.ObjectHeader{Kind: val.KindNative, Type: val.TypeVarTupleType},
@@ -539,19 +557,22 @@ func installTypeVarTupleMethods() {
 	}
 	val.TypeVarTupleType.Dict.Set(val.InternString("__repr__"), val.NewBuiltinFuncVal("TypeVarTuple.__repr__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__repr__' requires an argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "descriptor '__repr__' requires an argument"))
+			return val.NoneVal()
 		}
 		return val.InternString("*" + asTypeVarTuple(args[0]).Name)
 	}))
 	val.TypeVarTupleType.Dict.Set(val.InternString("has_default"), val.NewBuiltinFuncVal("TypeVarTuple.has_default", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: has_default() missing self")
+			ctx.Raise(val.NewException(val.TypeErrorType, "has_default() missing self"))
+			return val.NoneVal()
 		}
 		return val.BoolVal(hasTypingDefault(asTypeVarTuple(args[0]).Default))
 	}))
 	val.TypeVarTupleType.Dict.Set(val.InternString("__typing_prepare_subst__"), val.NewBuiltinFuncVal("TypeVarTuple.__typing_prepare_subst__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 3 {
-			panic("TypeError: __typing_prepare_subst__() missing arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "__typing_prepare_subst__() missing arguments"))
+			return val.NoneVal()
 		}
 		if v, ok := callTyping(ctx, "_typevartuple_prepare_subst", args[:3], nil); ok {
 			return v
@@ -559,7 +580,8 @@ func installTypeVarTupleMethods() {
 		return args[2]
 	}))
 	val.TypeVarTupleType.Dict.Set(val.InternString("__typing_subst__"), val.NewBuiltinFuncVal("TypeVarTuple.__typing_subst__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		panic("TypeError: substitution of bare TypeVarTuple is not supported")
+		ctx.Raise(val.NewException(val.TypeErrorType, "substitution of bare TypeVarTuple is not supported"))
+		return val.NoneVal()
 	}))
 	val.TypeVarTupleType.InvalidateVersion()
 }
@@ -582,7 +604,8 @@ func installTypeAliasMethods() {
 	}
 	val.TypeAliasTypeType.Dict.Set(val.InternString("__repr__"), val.NewBuiltinFuncVal("TypeAliasType.__repr__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__repr__' requires an argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "descriptor '__repr__' requires an argument"))
+			return val.NoneVal()
 		}
 		return val.InternString(asTypeAliasType(args[0]).Name)
 	}))
@@ -703,7 +726,8 @@ func installUnionMethods() {
 	}
 	UnionType.Dict.Set(val.InternString("__class_getitem__"), val.NewBuiltinFuncVal("Union.__class_getitem__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: Union[...] expected a type argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "Union[...] expected a type argument"))
+			return val.NoneVal()
 		}
 		item := args[1]
 		var parts []val.Value
@@ -713,13 +737,15 @@ func installUnionMethods() {
 			parts = []val.Value{item}
 		}
 		if len(parts) == 0 {
-			panic("TypeError: Cannot take a union of no types")
+			ctx.Raise(val.NewException(val.TypeErrorType, "Cannot take a union of no types"))
+			return val.NoneVal()
 		}
 		return makeUnion(parts)
 	}))
 	UnionType.Dict.Set(val.InternString("__repr__"), val.NewBuiltinFuncVal("UnionType.__repr__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__repr__' requires an argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "descriptor '__repr__' requires an argument"))
+			return val.NoneVal()
 		}
 		return val.InternString(unionRepr(ctx, asUnion(args[0]).Args))
 	}))
@@ -731,7 +757,8 @@ func installUnionMethods() {
 	}))
 	UnionType.Dict.Set(val.InternString("__hash__"), val.NewBuiltinFuncVal("UnionType.__hash__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: __hash__() missing self")
+			ctx.Raise(val.NewException(val.TypeErrorType, "__hash__() missing self"))
+			return val.NoneVal()
 		}
 		var acc uint64 = 0x9e3779b9
 		for _, a := range asUnion(args[0]).Args {
@@ -741,7 +768,8 @@ func installUnionMethods() {
 	}))
 	UnionType.Dict.Set(val.InternString("__instancecheck__"), val.NewBuiltinFuncVal("UnionType.__instancecheck__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: __instancecheck__() missing arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "__instancecheck__() missing arguments"))
+			return val.NoneVal()
 		}
 		obj := args[1]
 		for _, a := range asUnion(args[0]).Args {
@@ -753,11 +781,13 @@ func installUnionMethods() {
 	}))
 	UnionType.Dict.Set(val.InternString("__subclasscheck__"), val.NewBuiltinFuncVal("UnionType.__subclasscheck__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: __subclasscheck__() missing arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "__subclasscheck__() missing arguments"))
+			return val.NoneVal()
 		}
 		cls := args[1]
 		if !cls.IsType() {
-			panic("TypeError: issubclass() arg 1 must be a class")
+			ctx.Raise(val.NewException(val.TypeErrorType, "issubclass() arg 1 must be a class"))
+			return val.NoneVal()
 		}
 		for _, a := range asUnion(args[0]).Args {
 			if unionSubclassMatch(cls, a) {
@@ -767,11 +797,13 @@ func installUnionMethods() {
 		return val.BoolVal(false)
 	}))
 	UnionType.Dict.Set(val.InternString("__mro_entries__"), val.NewBuiltinFuncVal("UnionType.__mro_entries__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		panic("TypeError: Cannot subclass a union")
+		ctx.Raise(val.NewException(val.TypeErrorType, "Cannot subclass a union"))
+		return val.NoneVal()
 	}))
 	UnionType.Dict.Set(val.InternString("__or__"), val.NewBuiltinFuncVal("UnionType.__or__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: descriptor '__or__' requires 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "descriptor '__or__' requires 2 arguments"))
+			return val.NoneVal()
 		}
 		if !isUnionable(args[0]) || !isUnionable(args[1]) {
 			return val.NotImplementedVal()
@@ -780,7 +812,8 @@ func installUnionMethods() {
 	}))
 	UnionType.Dict.Set(val.InternString("__ror__"), val.NewBuiltinFuncVal("UnionType.__ror__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: descriptor '__ror__' requires 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "descriptor '__ror__' requires 2 arguments"))
+			return val.NoneVal()
 		}
 		if !isUnionable(args[0]) || !isUnionable(args[1]) {
 			return val.NotImplementedVal()
@@ -894,7 +927,8 @@ func installGenericAliasMethods() {
 	GenericAliasType.Dict.Set(val.InternString("__new__"), val.NewBuiltinFuncVal("GenericAlias.__new__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		pos, _ := splitKeywords(args, kwnames)
 		if len(pos) < 3 {
-			panic("TypeError: GenericAlias.__new__() takes at least 2 arguments (cls, origin, args)")
+			ctx.Raise(val.NewException(val.TypeErrorType, "GenericAlias.__new__() takes at least 2 arguments (cls, origin, args)"))
+			return val.NoneVal()
 		}
 		cls := pos[0]
 		origin := pos[1]
@@ -916,7 +950,8 @@ func installGenericAliasMethods() {
 
 	originGetter := val.NewBuiltinFuncVal("GenericAlias.__origin__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__origin__' requires an argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "descriptor '__origin__' requires an argument"))
+			return val.NoneVal()
 		}
 		self := args[0]
 		if self.HeaderPtr() != nil {
@@ -933,7 +968,8 @@ func installGenericAliasMethods() {
 	})
 	argsGetter := val.NewBuiltinFuncVal("GenericAlias.__args__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__args__' requires an argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "descriptor '__args__' requires an argument"))
+			return val.NoneVal()
 		}
 		self := args[0]
 		if self.HeaderPtr() != nil {
@@ -950,7 +986,8 @@ func installGenericAliasMethods() {
 	})
 	paramsGetter := val.NewBuiltinFuncVal("GenericAlias.__parameters__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__parameters__' requires an argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "descriptor '__parameters__' requires an argument"))
+			return val.NoneVal()
 		}
 		self := args[0]
 		if self.HeaderPtr() != nil {
@@ -976,7 +1013,8 @@ func installGenericAliasMethods() {
 	GenericAliasType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		pos, _ := splitKeywords(args, kwnames)
 		if len(pos) < 2 {
-			panic("TypeError: GenericAlias expected 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "GenericAlias expected 2 arguments"))
+			return val.NoneVal()
 		}
 		var items []val.Value
 		if pos[1].IsTuple() {
@@ -1003,13 +1041,15 @@ func installGenericAliasMethods() {
 	}
 	GenericAliasType.Dict.Set(val.InternString("__repr__"), val.NewBuiltinFuncVal("GenericAlias.__repr__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor '__repr__' requires an argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "descriptor '__repr__' requires an argument"))
+			return val.NoneVal()
 		}
 		return val.InternString(genericAliasRepr(ctx, asGenericAlias(args[0])))
 	}))
 	GenericAliasType.Dict.Set(val.InternString("__mro_entries__"), val.NewBuiltinFuncVal("GenericAlias.__mro_entries__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: __mro_entries__() missing self")
+			ctx.Raise(val.NewException(val.TypeErrorType, "__mro_entries__() missing self"))
+			return val.NoneVal()
 		}
 		origin := asGenericAlias(args[0]).Origin
 		if origin.IsType() {
@@ -1035,7 +1075,8 @@ func installGenericAliasMethods() {
 	}))
 	GenericAliasType.Dict.Set(val.InternString("__hash__"), val.NewBuiltinFuncVal("GenericAlias.__hash__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: __hash__() missing self")
+			ctx.Raise(val.NewException(val.TypeErrorType, "__hash__() missing self"))
+			return val.NoneVal()
 		}
 		ga := asGenericAlias(args[0])
 		acc := uint64(val.HashValue(ga.Origin))
@@ -1046,7 +1087,8 @@ func installGenericAliasMethods() {
 	}))
 	GenericAliasType.Dict.Set(val.InternString("__or__"), val.NewBuiltinFuncVal("GenericAlias.__or__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: descriptor '__or__' requires 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "descriptor '__or__' requires 2 arguments"))
+			return val.NoneVal()
 		}
 		if !isUnionable(args[0]) || !isUnionable(args[1]) {
 			return val.NotImplementedVal()
@@ -1055,7 +1097,8 @@ func installGenericAliasMethods() {
 	}))
 	GenericAliasType.Dict.Set(val.InternString("__ror__"), val.NewBuiltinFuncVal("GenericAlias.__ror__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: descriptor '__ror__' requires 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "descriptor '__ror__' requires 2 arguments"))
+			return val.NoneVal()
 		}
 		if !isUnionable(args[0]) || !isUnionable(args[1]) {
 			return val.NotImplementedVal()
@@ -1070,7 +1113,8 @@ func installParamSpecArgsMethods() {
 		return func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			pos, _ := splitKeywords(args, kwnames)
 			if len(pos) < 1 {
-				panic("TypeError: missing origin argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "missing origin argument"))
+				return val.NoneVal()
 			}
 			if kwargs {
 				k := &pyParamSpecKwargs{Header: val.ObjectHeader{Kind: val.KindNative, Type: tp}, Origin: pos[0]}
@@ -1099,7 +1143,8 @@ func installParamSpecArgsMethods() {
 	reprFn := func(suffix string) val.Value {
 		return val.NewBuiltinFuncVal("ParamSpecEnd.__repr__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: descriptor '__repr__' requires an argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "descriptor '__repr__' requires an argument"))
+				return val.NoneVal()
 			}
 			origin := getOrigin(args[0])
 			name := "?"
@@ -1112,7 +1157,8 @@ func installParamSpecArgsMethods() {
 	ParamSpecArgsType.Dict.Set(val.InternString("__repr__"), reprFn(".args"))
 	ParamSpecKwargsType.Dict.Set(val.InternString("__repr__"), reprFn(".kwargs"))
 	refuse := val.NewBuiltinFuncVal("ParamSpecEnd.__mro_entries__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		panic("TypeError: ParamSpec args and kwargs cannot be used as a base class")
+		ctx.Raise(val.NewException(val.TypeErrorType, "ParamSpec args and kwargs cannot be used as a base class"))
+		return val.NoneVal()
 	})
 	ParamSpecArgsType.Dict.Set(val.InternString("__mro_entries__"), refuse)
 	ParamSpecKwargsType.Dict.Set(val.InternString("__mro_entries__"), refuse)
@@ -1123,7 +1169,8 @@ func installParamSpecArgsMethods() {
 func installGenericMethods() {
 	GenericType.Dict.Set(val.InternString("__class_getitem__"), val.NewClassMethodVal(val.NewBuiltinFuncVal("Generic.__class_getitem__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: __class_getitem__() missing arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "__class_getitem__() missing arguments"))
+			return val.NoneVal()
 		}
 		if v, ok := callTyping(ctx, "_generic_class_getitem", args[:2], nil); ok {
 			return v

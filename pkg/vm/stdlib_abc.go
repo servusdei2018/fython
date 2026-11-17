@@ -114,7 +114,8 @@ func (e *Engine) createABCModule() val.Value {
 	// _abc_init(cls)
 	mod.Dict.Set(val.InternString("_abc_init"), val.NewBuiltinFuncVal("_abc_init", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 || !args[0].IsType() {
-			panic("TypeError: _abc_init() expected a class")
+			ctx.Raise(val.NewException(val.TypeErrorType, "_abc_init() expected a class"))
+			return val.NoneVal()
 		}
 		cls := args[0].AsType()
 		meta := getABCMeta(cls)
@@ -125,7 +126,8 @@ func (e *Engine) createABCModule() val.Value {
 	// _abc_register(cls, subclass) -> subclass
 	mod.Dict.Set(val.InternString("_abc_register"), val.NewBuiltinFuncVal("_abc_register", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 || !args[0].IsType() || !args[1].IsType() {
-			panic(fmt.Sprintf("TypeError: _abc_register() expected 2 classes, got len=%d args[0]=%v (isType=%v) args[1]=%v (isType=%v)", len(args), args[0], args[0].IsType(), args[1], args[1].IsType()))
+			ctx.Raise(val.NewException(val.TypeErrorType, fmt.Sprintf("_abc_register() expected 2 classes, got len=%d args[0]=%v (isType=%v) args[1]=%v (isType=%v)", len(args), args[0], args[0].IsType(), args[1], args[1].IsType())))
+			return val.NoneVal()
 		}
 		cls := args[0].AsType()
 		sub := args[1].AsType()
@@ -134,7 +136,8 @@ func (e *Engine) createABCModule() val.Value {
 			return args[1]
 		}
 		if val.IsSubclass(cls, sub) {
-			panic("RuntimeError: Refusing to create an ABC cycle")
+			ctx.Raise(val.NewException(val.RuntimeErrorType, "Refusing to create an ABC cycle"))
+			return val.NoneVal()
 		}
 
 		meta := getABCMeta(cls)
@@ -150,7 +153,8 @@ func (e *Engine) createABCModule() val.Value {
 	// _abc_instancecheck(cls, instance) -> bool
 	mod.Dict.Set(val.InternString("_abc_instancecheck"), val.NewBuiltinFuncVal("_abc_instancecheck", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 || !args[0].IsType() {
-			panic("TypeError: _abc_instancecheck() arg 1 must be a class")
+			ctx.Raise(val.NewException(val.TypeErrorType, "_abc_instancecheck() arg 1 must be a class"))
+			return val.NoneVal()
 		}
 		cls := args[0].AsType()
 		inst := args[1]
@@ -166,7 +170,8 @@ func (e *Engine) createABCModule() val.Value {
 	// _abc_subclasscheck(cls, subclass) -> bool
 	mod.Dict.Set(val.InternString("_abc_subclasscheck"), val.NewBuiltinFuncVal("_abc_subclasscheck", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 || !args[0].IsType() || !args[1].IsType() {
-			panic("TypeError: _abc_subclasscheck() expected 2 classes")
+			ctx.Raise(val.NewException(val.TypeErrorType, "_abc_subclasscheck() expected 2 classes"))
+			return val.NoneVal()
 		}
 		cls := args[0].AsType()
 		sub := args[1].AsType()
@@ -176,7 +181,8 @@ func (e *Engine) createABCModule() val.Value {
 	// _get_dump(cls) -> (registry, cache, negative_cache, negative_cache_version)
 	mod.Dict.Set(val.InternString("_get_dump"), val.NewBuiltinFuncVal("_get_dump", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 || !args[0].IsType() {
-			panic("TypeError: _get_dump() expected a class")
+			ctx.Raise(val.NewException(val.TypeErrorType, "_get_dump() expected a class"))
+			return val.NoneVal()
 		}
 		cls := args[0].AsType()
 		meta := getABCMeta(cls)
@@ -191,7 +197,8 @@ func (e *Engine) createABCModule() val.Value {
 	// _reset_registry(cls)
 	mod.Dict.Set(val.InternString("_reset_registry"), val.NewBuiltinFuncVal("_reset_registry", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 || !args[0].IsType() {
-			panic("TypeError: _reset_registry() expected a class")
+			ctx.Raise(val.NewException(val.TypeErrorType, "_reset_registry() expected a class"))
+			return val.NoneVal()
 		}
 		cls := args[0].AsType()
 		meta := getABCMeta(cls)
@@ -202,7 +209,8 @@ func (e *Engine) createABCModule() val.Value {
 	// _reset_caches(cls)
 	mod.Dict.Set(val.InternString("_reset_caches"), val.NewBuiltinFuncVal("_reset_caches", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 || !args[0].IsType() {
-			panic("TypeError: _reset_caches() expected a class")
+			ctx.Raise(val.NewException(val.TypeErrorType, "_reset_caches() expected a class"))
+			return val.NoneVal()
 		}
 		cls := args[0].AsType()
 		meta := getABCMeta(cls)

@@ -164,14 +164,17 @@ func initArrayType() {
 
 	arrayType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: array() must have at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "array() must have at least 1 argument"))
+			return val.NoneVal()
 		}
 		if !args[0].IsAnyString() || len(args[0].AsString()) != 1 {
-			panic("TypeError: array() argument 1 must be a unicode character, not str")
+			ctx.Raise(val.NewException(val.TypeErrorType, "array() argument 1 must be a unicode character, not str"))
+			return val.NoneVal()
 		}
 		code := args[0].AsString()[0]
 		if _, ok := arrayItemSize(code); !ok {
-			panic("ValueError: bad typecode (must be b, B, u, h, H, i, I, l, L, q, Q, f, d or w)")
+			ctx.Raise(val.NewException(val.ValueErrorType, "bad typecode (must be b, B, u, h, H, i, I, l, L, q, Q, f, d or w)"))
+			return val.NoneVal()
 		}
 		var initial []val.Value
 		if len(args) > 1 {
@@ -214,7 +217,8 @@ func initArrayType() {
 
 	setMethod("append", func(ctx *val.ExecContext, a *pyArray, args []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: append() takes exactly one argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "append() takes exactly one argument"))
+			return val.NoneVal()
 		}
 		size, _ := arrayItemSize(a.typecode)
 		off := len(a.data)
@@ -225,7 +229,8 @@ func initArrayType() {
 
 	setMethod("extend", func(ctx *val.ExecContext, a *pyArray, args []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: extend() takes exactly one argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "extend() takes exactly one argument"))
+			return val.NoneVal()
 		}
 		size, _ := arrayItemSize(a.typecode)
 		it := iterFor(ctx, args[1])
@@ -243,7 +248,8 @@ func initArrayType() {
 
 	setMethod("frombytes", func(ctx *val.ExecContext, a *pyArray, args []val.Value) val.Value {
 		if len(args) < 2 || !args[1].IsBytes() {
-			panic("TypeError: frombytes() argument must be bytes-like")
+			ctx.Raise(val.NewException(val.TypeErrorType, "frombytes() argument must be bytes-like"))
+			return val.NoneVal()
 		}
 		a.data = append(a.data, args[1].AsBytes().Data...)
 		return val.NoneVal()
@@ -251,12 +257,14 @@ func initArrayType() {
 
 	setMethod("fromlist", func(ctx *val.ExecContext, a *pyArray, args []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: fromlist() takes exactly one argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "fromlist() takes exactly one argument"))
+			return val.NoneVal()
 		}
 		size, _ := arrayItemSize(a.typecode)
 		items := pySeqItems(args[1])
 		if items == nil {
-			panic("TypeError: fromlist() argument must be a list")
+			ctx.Raise(val.NewException(val.TypeErrorType, "fromlist() argument must be a list"))
+			return val.NoneVal()
 		}
 		for _, item := range items {
 			off := len(a.data)
@@ -286,7 +294,8 @@ func initArrayType() {
 
 	setMethod("count", func(ctx *val.ExecContext, a *pyArray, args []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: count() takes exactly one argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "count() takes exactly one argument"))
+			return val.NoneVal()
 		}
 		size, _ := arrayItemSize(a.typecode)
 		n := 0
@@ -300,7 +309,8 @@ func initArrayType() {
 
 	setMethod("index", func(ctx *val.ExecContext, a *pyArray, args []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: index() takes at least one argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "index() takes at least one argument"))
+			return val.NoneVal()
 		}
 		size, _ := arrayItemSize(a.typecode)
 		for off := 0; off+size <= len(a.data); off += size {
@@ -308,7 +318,8 @@ func initArrayType() {
 				return val.Int64Val(int64(off / size))
 			}
 		}
-		panic("ValueError: array.index(x): x not in array")
+		ctx.Raise(val.NewException(val.ValueErrorType, "array.index(x): x not in array"))
+		return val.NoneVal()
 	})
 
 	arrayType.Dict.Set(val.InternString("__len__"), val.NewBuiltinFuncVal("array.__len__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -320,7 +331,8 @@ func initArrayType() {
 		arrayType.Dict.Set(val.InternString(name), val.NewPropertyVal(
 			val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 				if len(args) < 1 {
-					panic("TypeError: " + name + " missing self")
+					ctx.Raise(val.NewException(val.TypeErrorType, name+" missing self"))
+					return val.NoneVal()
 				}
 				return getter((*pyArray)(val.AsPointer(args[0])))
 			}),
@@ -342,13 +354,15 @@ func initArrayType() {
 		defer a.mu.RUnlock()
 		size, _ := arrayItemSize(a.typecode)
 		if len(args) < 2 {
-			panic("TypeError: array indices must be integers")
+			ctx.Raise(val.NewException(val.TypeErrorType, "array indices must be integers"))
+			return val.NoneVal()
 		}
 		if args[1].IsSlice() {
 			sl := args[1].AsSlice()
 			start, _, _, length, err := val.NormalizeSliceIndices(sl.Start, sl.Stop, sl.Step, a.count())
 			if err != nil {
-				panic("ValueError: " + err.Error())
+				ctx.Raise(val.NewException(val.ValueErrorType, err.Error()))
+				return val.NoneVal()
 			}
 			items := make([]val.Value, 0, length)
 			for i := range length {
@@ -357,14 +371,16 @@ func initArrayType() {
 			return val.NewListVal(items...)
 		}
 		if !args[1].IsInt64() {
-			panic("TypeError: array indices must be integers")
+			ctx.Raise(val.NewException(val.TypeErrorType, "array indices must be integers"))
+			return val.NoneVal()
 		}
 		idx := int(args[1].AsInt64())
 		if idx < 0 {
 			idx += a.count()
 		}
 		if idx < 0 || idx >= a.count() {
-			panic("IndexError: array index out of range")
+			ctx.Raise(val.NewException(val.IndexErrorType, "array index out of range"))
+			return val.NoneVal()
 		}
 		return arrayGetElement(a.data, idx*size, a.typecode)
 	}))
@@ -375,14 +391,16 @@ func initArrayType() {
 		defer a.mu.Unlock()
 		size, _ := arrayItemSize(a.typecode)
 		if len(args) < 3 || !args[1].IsInt64() {
-			panic("TypeError: array indices must be integers")
+			ctx.Raise(val.NewException(val.TypeErrorType, "array indices must be integers"))
+			return val.NoneVal()
 		}
 		idx := int(args[1].AsInt64())
 		if idx < 0 {
 			idx += a.count()
 		}
 		if idx < 0 || idx >= a.count() {
-			panic("IndexError: array index out of range")
+			ctx.Raise(val.NewException(val.IndexErrorType, "array index out of range"))
+			return val.NoneVal()
 		}
 		arraySetElement(a.data, idx*size, a.typecode, args[2])
 		return val.NoneVal()
@@ -445,20 +463,24 @@ func (e *Engine) createArrayModule() val.Value {
 	mod.Dict.Set(val.InternString("typecodes"), val.NewStringVal("bBuhHiIlLqQfdw"))
 	mod.Dict.Set(val.InternString("itemsize"), val.NewBuiltinFuncVal("itemsize", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 || !args[0].IsAnyString() || len(args[0].AsString()) != 1 {
-			panic("TypeError: itemsize() argument must be a unicode character")
+			ctx.Raise(val.NewException(val.TypeErrorType, "itemsize() argument must be a unicode character"))
+			return val.NoneVal()
 		}
 		size, ok := arrayItemSize(args[0].AsString()[0])
 		if !ok {
-			panic("ValueError: bad typecode")
+			ctx.Raise(val.NewException(val.ValueErrorType, "bad typecode"))
+			return val.NoneVal()
 		}
 		return val.Int64Val(int64(size))
 	}))
 	mod.Dict.Set(val.InternString("typecode"), val.NewBuiltinFuncVal("typecode", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 || !args[0].IsAnyString() || len(args[0].AsString()) != 1 {
-			panic("TypeError: typecode() argument must be a unicode character")
+			ctx.Raise(val.NewException(val.TypeErrorType, "typecode() argument must be a unicode character"))
+			return val.NoneVal()
 		}
 		if _, ok := arrayItemSize(args[0].AsString()[0]); !ok {
-			panic("ValueError: bad typecode")
+			ctx.Raise(val.NewException(val.ValueErrorType, "bad typecode"))
+			return val.NoneVal()
 		}
 		return val.NewStringVal(args[0].AsString())
 	}))

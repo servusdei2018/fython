@@ -340,7 +340,8 @@ func (e *Engine) createMarshalModule() val.Value {
 
 	mod.Dict.Set(val.InternString("dumps"), val.NewBuiltinFuncVal("dumps", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: dumps() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "dumps() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		var buf bytes.Buffer
 		if err := marshalValue(&buf, args[0]); err != nil {
@@ -351,7 +352,8 @@ func (e *Engine) createMarshalModule() val.Value {
 
 	mod.Dict.Set(val.InternString("loads"), val.NewBuiltinFuncVal("loads", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: loads() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "loads() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		var b []byte
 		switch {
@@ -360,7 +362,8 @@ func (e *Engine) createMarshalModule() val.Value {
 		case args[0].IsByteArray():
 			b = args[0].AsByteArray().Data
 		default:
-			panic("TypeError: a bytes-like object is required")
+			ctx.Raise(val.NewException(val.TypeErrorType, "a bytes-like object is required"))
+			return val.NoneVal()
 		}
 		r := bytes.NewReader(b)
 		v, err := unmarshalValue(r)
@@ -372,7 +375,8 @@ func (e *Engine) createMarshalModule() val.Value {
 
 	mod.Dict.Set(val.InternString("dump"), val.NewBuiltinFuncVal("dump", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: dump() takes at least 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "dump() takes at least 2 arguments"))
+			return val.NoneVal()
 		}
 		var buf bytes.Buffer
 		if err := marshalValue(&buf, args[0]); err != nil {
@@ -381,7 +385,8 @@ func (e *Engine) createMarshalModule() val.Value {
 		bytesVal := val.NewBytesVal(buf.Bytes())
 		writeMeth, ok := getAttrOrNone(ctx, args[1], val.InternString("write"))
 		if !ok {
-			panic("AttributeError: file object has no 'write' attribute")
+			ctx.Raise(val.NewException(val.AttributeErrorType, "file object has no 'write' attribute"))
+			return val.NoneVal()
 		}
 		ctx.Invoke1(writeMeth, bytesVal)
 		return val.NoneVal()
@@ -389,11 +394,13 @@ func (e *Engine) createMarshalModule() val.Value {
 
 	mod.Dict.Set(val.InternString("load"), val.NewBuiltinFuncVal("load", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: load() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "load() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		readMeth, ok := getAttrOrNone(ctx, args[0], val.InternString("read"))
 		if !ok {
-			panic("AttributeError: file object has no 'read' attribute")
+			ctx.Raise(val.NewException(val.AttributeErrorType, "file object has no 'read' attribute"))
+			return val.NoneVal()
 		}
 		content := ctx.Invoke0(readMeth)
 		var b []byte
@@ -403,7 +410,8 @@ func (e *Engine) createMarshalModule() val.Value {
 		case content.IsByteArray():
 			b = content.AsByteArray().Data
 		default:
-			panic("TypeError: a bytes-like object is required")
+			ctx.Raise(val.NewException(val.TypeErrorType, "a bytes-like object is required"))
+			return val.NoneVal()
 		}
 		r := bytes.NewReader(b)
 		v, err := unmarshalValue(r)

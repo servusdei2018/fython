@@ -234,7 +234,8 @@ func initZoneInfoType() {
 
 	zoneInfoType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: ZoneInfo() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "ZoneInfo() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		key := args[0].AsString()
 		data, err := lookupZone(key)
@@ -312,7 +313,8 @@ func initZoneInfoType() {
 
 	zoneInfoType.Dict.Set(val.InternString("from_file"), val.NewBuiltinFuncVal("ZoneInfo.from_file", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: from_file() takes at least 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "from_file() takes at least 2 arguments"))
+			return val.NoneVal()
 		}
 		key := args[1].AsString()
 		data, err := lookupZone(key)

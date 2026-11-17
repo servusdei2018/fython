@@ -78,7 +78,8 @@ func initIOTypes() {
 		BytesIOType = val.MustNewType("BytesIO", []*val.PyType{val.ObjectType}, nil)
 		BytesIOType.Dict.Set(val.InternString("read"), val.NewBuiltinFuncVal("read", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: read() takes at least 0 arguments")
+				ctx.Raise(val.NewException(val.TypeErrorType, "read() takes at least 0 arguments"))
+				return val.NoneVal()
 			}
 			bio := (*pyBytesIO)(val.AsPointer(args[0]))
 			bio.mu.Lock()
@@ -101,7 +102,8 @@ func initIOTypes() {
 
 		BytesIOType.Dict.Set(val.InternString("write"), val.NewBuiltinFuncVal("write", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: write() takes exactly one argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "write() takes exactly one argument"))
+				return val.NoneVal()
 			}
 			bio := (*pyBytesIO)(val.AsPointer(args[0]))
 			bio.mu.Lock()
@@ -115,7 +117,8 @@ func initIOTypes() {
 			case args[1].IsMemoryView():
 				data = args[1].AsMemoryView().Buf
 			default:
-				panic("TypeError: a bytes-like object is required")
+				ctx.Raise(val.NewException(val.TypeErrorType, "a bytes-like object is required"))
+				return val.NoneVal()
 			}
 			if bio.pos+len(data) > len(bio.buf) {
 				newBuf := make([]byte, bio.pos+len(data))
@@ -138,7 +141,8 @@ func initIOTypes() {
 
 		BytesIOType.Dict.Set(val.InternString("seek"), val.NewBuiltinFuncVal("seek", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: seek() takes at least 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "seek() takes at least 1 argument"))
+				return val.NoneVal()
 			}
 			bio := (*pyBytesIO)(val.AsPointer(args[0]))
 			bio.mu.Lock()
@@ -243,7 +247,8 @@ func initIOTypes() {
 				size = int(args[1].AsInt64())
 			}
 			if size < 0 {
-				panic("ValueError: Negative size not allowed")
+				ctx.Raise(val.NewException(val.ValueErrorType, "Negative size not allowed"))
+				return val.NoneVal()
 			}
 			if size < len(bio.buf) {
 				bio.buf = bio.buf[:size]
@@ -321,7 +326,8 @@ func initIOTypes() {
 
 		StringIOType.Dict.Set(val.InternString("write"), val.NewBuiltinFuncVal("write", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: write() takes exactly one argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "write() takes exactly one argument"))
+				return val.NoneVal()
 			}
 			sio := (*pyStringIO)(val.AsPointer(args[0]))
 			isMT := val.IsMultiThreaded()
@@ -396,7 +402,8 @@ func initIOTypes() {
 
 		StringIOType.Dict.Set(val.InternString("seek"), val.NewBuiltinFuncVal("seek", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: seek() takes at least 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "seek() takes at least 1 argument"))
+				return val.NoneVal()
 			}
 			sio := (*pyStringIO)(val.AsPointer(args[0]))
 			sio.mu.Lock()
@@ -439,7 +446,8 @@ func initIOTypes() {
 			})
 			enter := val.NewBuiltinFuncVal("__enter__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 				if len(args) < 1 {
-					panic("TypeError: __enter__() missing self")
+					ctx.Raise(val.NewException(val.TypeErrorType, "__enter__() missing self"))
+					return val.NoneVal()
 				}
 				return args[0]
 			})
@@ -514,7 +522,8 @@ func initIOTypes() {
 				size = int(args[1].AsInt64())
 			}
 			if size < 0 {
-				panic("ValueError: Negative size not allowed")
+				ctx.Raise(val.NewException(val.ValueErrorType, "Negative size not allowed"))
+				return val.NoneVal()
 			}
 			if size < len(sio.buf) {
 				sio.buf = sio.buf[:size]
@@ -550,7 +559,8 @@ func initIOTypes() {
 		}
 		StringIOType.Dict.Set(val.InternString("__iter__"), val.NewBuiltinFuncVal("__iter__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: __iter__() missing self")
+				ctx.Raise(val.NewException(val.TypeErrorType, "__iter__() missing self"))
+				return val.NoneVal()
 			}
 			return StringIOType.Slots.TpIter(ctx, args[0])
 		}))
@@ -614,14 +624,16 @@ func initIOTypes() {
 		// Context Manager protocol: __enter__, __exit__
 		FileType.Dict.Set(val.InternString("__enter__"), val.NewBuiltinFuncVal("__enter__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: __enter__() takes 0 arguments")
+				ctx.Raise(val.NewException(val.TypeErrorType, "__enter__() takes 0 arguments"))
+				return val.NoneVal()
 			}
 			return args[0]
 		}))
 
 		FileType.Dict.Set(val.InternString("__exit__"), val.NewBuiltinFuncVal("__exit__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: __exit__() takes arguments")
+				ctx.Raise(val.NewException(val.TypeErrorType, "__exit__() takes arguments"))
+				return val.NoneVal()
 			}
 			pf := (*pyFile)(val.AsPointer(args[0]))
 			pf.mu.Lock()
@@ -651,7 +663,8 @@ func initIOTypes() {
 				if isMT {
 					pf.mu.Unlock()
 				}
-				panic("ValueError: I/O operation on closed file.")
+				ctx.Raise(val.NewException(val.ValueErrorType, "I/O operation on closed file."))
+				return val.NoneVal()
 			}
 			n := -1
 			if len(args) >= 2 && args[1].IsInt64() {
@@ -765,7 +778,8 @@ func initIOTypes() {
 			pf.mu.Lock()
 			defer pf.mu.Unlock()
 			if pf.isClosed {
-				panic("ValueError: I/O operation on closed file.")
+				ctx.Raise(val.NewException(val.ValueErrorType, "I/O operation on closed file."))
+				return val.NoneVal()
 			}
 			line, err := pf.reader.ReadBytes('\n')
 			if err != nil && len(line) == 0 {
@@ -785,7 +799,8 @@ func initIOTypes() {
 			pf.mu.Lock()
 			defer pf.mu.Unlock()
 			if pf.isClosed {
-				panic("ValueError: I/O operation on closed file.")
+				ctx.Raise(val.NewException(val.ValueErrorType, "I/O operation on closed file."))
+				return val.NoneVal()
 			}
 			var lines []val.Value
 			for {
@@ -806,13 +821,15 @@ func initIOTypes() {
 
 		FileType.Dict.Set(val.InternString("seek"), val.NewBuiltinFuncVal("seek", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: seek() takes at least 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "seek() takes at least 1 argument"))
+				return val.NoneVal()
 			}
 			pf := (*pyFile)(val.AsPointer(args[0]))
 			pf.mu.Lock()
 			defer pf.mu.Unlock()
 			if pf.isClosed {
-				panic("ValueError: I/O operation on closed file.")
+				ctx.Raise(val.NewException(val.ValueErrorType, "I/O operation on closed file."))
+				return val.NoneVal()
 			}
 			pf.flushLocked()
 			offset := args[1].AsInt64()
@@ -825,7 +842,8 @@ func initIOTypes() {
 			}
 			pos, err := pf.f.Seek(offset, whence)
 			if err != nil {
-				panic("OSError: " + err.Error())
+				ctx.Raise(val.NewException(val.OSErrorType, err.Error()))
+				return val.NoneVal()
 			}
 			if pf.reader != nil {
 				pf.reader.Reset(pf.f)
@@ -838,12 +856,14 @@ func initIOTypes() {
 			pf.mu.Lock()
 			defer pf.mu.Unlock()
 			if pf.isClosed {
-				panic("ValueError: I/O operation on closed file.")
+				ctx.Raise(val.NewException(val.ValueErrorType, "I/O operation on closed file."))
+				return val.NoneVal()
 			}
 			pf.flushLocked()
 			pos, err := pf.f.Seek(0, io.SeekCurrent)
 			if err != nil {
-				panic("OSError: " + err.Error())
+				ctx.Raise(val.NewException(val.OSErrorType, err.Error()))
+				return val.NoneVal()
 			}
 			if pf.reader != nil && pf.reader.Buffered() > 0 {
 				pos -= int64(pf.reader.Buffered())
@@ -863,7 +883,8 @@ func initIOTypes() {
 
 		FileType.Dict.Set(val.InternString("write"), val.NewBuiltinFuncVal("write", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: write() takes exactly one argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "write() takes exactly one argument"))
+				return val.NoneVal()
 			}
 			pf := (*pyFile)(val.AsPointer(args[0]))
 			isMT := val.IsMultiThreaded()
@@ -874,7 +895,8 @@ func initIOTypes() {
 				if isMT {
 					pf.mu.Unlock()
 				}
-				panic("ValueError: I/O operation on closed file.")
+				ctx.Raise(val.NewException(val.ValueErrorType, "I/O operation on closed file."))
+				return val.NoneVal()
 			}
 			oldLen := len(pf.writeBuf)
 			if pf.binary {
@@ -889,7 +911,8 @@ func initIOTypes() {
 					if isMT {
 						pf.mu.Unlock()
 					}
-					panic("TypeError: a bytes-like object is required, not 'str'")
+					ctx.Raise(val.NewException(val.TypeErrorType, "a bytes-like object is required, not 'str'"))
+					return val.NoneVal()
 				}
 			} else {
 				v := args[1]
@@ -900,7 +923,8 @@ func initIOTypes() {
 						if isMT {
 							pf.mu.Unlock()
 						}
-						panic("TypeError: write() argument must be str, not " + v.Type().Name)
+						ctx.Raise(val.NewException(val.TypeErrorType, "write() argument must be str, not"+v.Type().Name))
+						return val.NoneVal()
 					}
 					s := v.AsString()
 					view := unsafe.Slice(unsafe.StringData(s), len(s))
@@ -935,7 +959,8 @@ func initIOTypes() {
 		FileType.Dict.Set(val.InternString("name"), val.NewStringVal(""))
 		FileType.Dict.Set(val.InternString("reconfigure"), val.NewBuiltinFuncVal("reconfigure", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: reconfigure() missing self")
+				ctx.Raise(val.NewException(val.TypeErrorType, "reconfigure() missing self"))
+				return val.NoneVal()
 			}
 			inst := args[0].AsInstance()
 			if v, ok := kwArg(args, kwnames, "encoding"); ok && !v.IsNone() {
@@ -958,7 +983,8 @@ func initIOTypes() {
 		FileType.Dict.Set(val.InternString("fileno"), val.NewBuiltinFuncVal("fileno", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			pf := (*pyFile)(val.AsPointer(args[0]))
 			if pf.f == nil {
-				panic("OSError: file has no descriptor")
+				ctx.Raise(val.NewException(val.OSErrorType, "file has no descriptor"))
+				return val.NoneVal()
 			}
 			return val.Int64Val(int64(pf.f.Fd()))
 		}))
@@ -982,7 +1008,8 @@ func initIOTypes() {
 		}
 		FileType.Dict.Set(val.InternString("__iter__"), val.NewBuiltinFuncVal("__iter__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: __iter__() missing self")
+				ctx.Raise(val.NewException(val.TypeErrorType, "__iter__() missing self"))
+				return val.NoneVal()
 			}
 			return FileType.Slots.TpIter(ctx, args[0])
 		}))
@@ -1007,7 +1034,8 @@ func initIOTypes() {
 
 		FileType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) == 0 {
-				panic("TypeError: TextIOWrapper() missing required argument 'buffer'")
+				ctx.Raise(val.NewException(val.TypeErrorType, "TextIOWrapper() missing required argument 'buffer'"))
+				return val.NoneVal()
 			}
 			bufVal := args[0]
 			if bufVal.Type() == FileType {
@@ -1034,12 +1062,12 @@ func getAttrOrNone(ctx *val.ExecContext, obj, name val.Value) (v val.Value, ok b
 	return v, true
 }
 
-// openFileBuiltin opens a file and returns a Python File Value.
-func openFileBuiltin(file string, mode string) val.Value {
-	return openFileBuiltinVal(val.NewStringVal(file), mode)
+// openFileBuiltinCtx opens a file and returns a Python File Value.
+func openFileBuiltinCtx(ctx *val.ExecContext, file string, mode string) val.Value {
+	return openFileBuiltinValCtx(ctx, val.NewStringVal(file), mode)
 }
 
-func openFileBuiltinVal(fileVal val.Value, mode string) val.Value {
+func openFileBuiltinValCtx(ctx *val.ExecContext, fileVal val.Value, mode string) val.Value {
 	initIOTypes()
 	if mode == "" {
 		mode = "r"
@@ -1080,7 +1108,8 @@ func openFileBuiltinVal(fileVal val.Value, mode string) val.Value {
 		pathStr := fileVal.AsString()
 		f, err = os.OpenFile(pathStr, flag, 0666)
 		if err != nil {
-			panic("FileNotFoundError: " + err.Error())
+			ctx.Raise(val.NewException(val.FileNotFoundErrorType, err.Error()))
+			return val.NoneVal()
 		}
 	}
 
@@ -1206,7 +1235,8 @@ func (e *Engine) createIOModule() val.Value {
 	}))
 	ioBaseType.Dict.Set(val.InternString("tell"), val.NewBuiltinFuncVal("tell", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: descriptor 'tell' of 'IOBase' object needs an argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "descriptor 'tell' of 'IOBase' object needs an argument"))
+			return val.NoneVal()
 		}
 		if seekFn, _, ok := args[0].Type().LookupMRO(val.InternString("seek")); ok {
 			return ctx.Invoke3(seekFn, args[0], val.Int64Val(0), val.Int64Val(1))
@@ -1226,7 +1256,8 @@ func (e *Engine) createIOModule() val.Value {
 		if len(args) > 0 {
 			clVal := val.GetAttrCtx(ctx, args[0], val.InternString("closed"))
 			if clVal.IsTruthy() {
-				panic("ValueError: I/O operation on closed file.")
+				ctx.Raise(val.NewException(val.ValueErrorType, "I/O operation on closed file."))
+				return val.NoneVal()
 			}
 		}
 		return val.NoneVal()
@@ -1236,7 +1267,8 @@ func (e *Engine) createIOModule() val.Value {
 			if fn, _, ok := args[0].Type().LookupMRO(val.InternString("readable")); ok {
 				res := ctx.Invoke1(fn, args[0])
 				if !res.IsTruthy() {
-					panic("OSError: File or stream is not readable.")
+					ctx.Raise(val.NewException(val.OSErrorType, "File or stream is not readable."))
+					return val.NoneVal()
 				}
 			}
 		}
@@ -1247,7 +1279,8 @@ func (e *Engine) createIOModule() val.Value {
 			if fn, _, ok := args[0].Type().LookupMRO(val.InternString("writable")); ok {
 				res := ctx.Invoke1(fn, args[0])
 				if !res.IsTruthy() {
-					panic("OSError: File or stream is not writable.")
+					ctx.Raise(val.NewException(val.OSErrorType, "File or stream is not writable."))
+					return val.NoneVal()
 				}
 			}
 		}
@@ -1258,7 +1291,8 @@ func (e *Engine) createIOModule() val.Value {
 			if fn, _, ok := args[0].Type().LookupMRO(val.InternString("seekable")); ok {
 				res := ctx.Invoke1(fn, args[0])
 				if !res.IsTruthy() {
-					panic("OSError: File or stream is not seekable.")
+					ctx.Raise(val.NewException(val.OSErrorType, "File or stream is not seekable."))
+					return val.NoneVal()
 				}
 			}
 		}
@@ -1315,7 +1349,8 @@ func (e *Engine) createIOModule() val.Value {
 	bufferedReaderType := val.MustNewType("BufferedReader", []*val.PyType{bufferedIOBaseType}, nil)
 	bufferedReaderType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) == 0 {
-			panic("TypeError: BufferedReader() missing required argument 'raw'")
+			ctx.Raise(val.NewException(val.TypeErrorType, "BufferedReader() missing required argument 'raw'"))
+			return val.NoneVal()
 		}
 		inst := val.NewInstanceOfType(bufferedReaderType)
 		inst.AsInstance().SetAttr(val.InternString("raw"), args[0])
@@ -1323,7 +1358,8 @@ func (e *Engine) createIOModule() val.Value {
 	}
 	bufferedReaderType.Dict.Set(val.InternString("read"), val.NewBuiltinFuncVal("read", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) == 0 {
-			panic("TypeError: read() missing self")
+			ctx.Raise(val.NewException(val.TypeErrorType, "read() missing self"))
+			return val.NoneVal()
 		}
 		rawVal, _ := args[0].AsInstance().GetAttr(val.InternString("raw"))
 		size := -1
@@ -1356,11 +1392,13 @@ func (e *Engine) createIOModule() val.Value {
 			}
 			return ctx.Invoke1(readFn, rawVal)
 		}
-		panic("AttributeError: raw object has no read or readinto")
+		ctx.Raise(val.NewException(val.AttributeErrorType, "raw object has no read or readinto"))
+		return val.NoneVal()
 	}))
 	bufferedReaderType.Dict.Set(val.InternString("readline"), val.NewBuiltinFuncVal("readline", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) == 0 {
-			panic("TypeError: readline() missing self")
+			ctx.Raise(val.NewException(val.TypeErrorType, "readline() missing self"))
+			return val.NoneVal()
 		}
 		rawVal, _ := args[0].AsInstance().GetAttr(val.InternString("raw"))
 		readintoFn, _, hasReadinto := rawVal.Type().LookupMRO(val.InternString("readinto"))
@@ -1383,13 +1421,15 @@ func (e *Engine) createIOModule() val.Value {
 	}))
 	bufferedReaderType.Dict.Set(val.InternString("readinto"), val.NewBuiltinFuncVal("readinto", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: readinto() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "readinto() takes 1 argument"))
+			return val.NoneVal()
 		}
 		rawVal, _ := args[0].AsInstance().GetAttr(val.InternString("raw"))
 		if fn, _, ok := rawVal.Type().LookupMRO(val.InternString("readinto")); ok {
 			return ctx.Invoke2(fn, rawVal, args[1])
 		}
-		panic("AttributeError: raw object has no readinto")
+		ctx.Raise(val.NewException(val.AttributeErrorType, "raw object has no readinto"))
+		return val.NoneVal()
 	}))
 	bufferedReaderType.Dict.Set(val.InternString("flush"), val.NewBuiltinFuncVal("flush", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) > 0 {
@@ -1441,14 +1481,16 @@ func (e *Engine) createIOModule() val.Value {
 	))
 	bufferedReaderType.Dict.Set(val.InternString("seek"), val.NewBuiltinFuncVal("seek", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) == 0 {
-			panic("TypeError: seek() missing self")
+			ctx.Raise(val.NewException(val.TypeErrorType, "seek() missing self"))
+			return val.NoneVal()
 		}
 		rawVal, _ := args[0].AsInstance().GetAttr(val.InternString("raw"))
 		return invokeIOSeek(ctx, rawVal, args)
 	}))
 	bufferedReaderType.Dict.Set(val.InternString("tell"), val.NewBuiltinFuncVal("tell", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) == 0 {
-			panic("TypeError: tell() missing self")
+			ctx.Raise(val.NewException(val.TypeErrorType, "tell() missing self"))
+			return val.NoneVal()
 		}
 		rawVal, _ := args[0].AsInstance().GetAttr(val.InternString("raw"))
 		return invokeIOTell(ctx, rawVal)
@@ -1458,7 +1500,8 @@ func (e *Engine) createIOModule() val.Value {
 	bufferedWriterType := val.MustNewType("BufferedWriter", []*val.PyType{bufferedIOBaseType}, nil)
 	bufferedWriterType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) == 0 {
-			panic("TypeError: BufferedWriter() missing required argument 'raw'")
+			ctx.Raise(val.NewException(val.TypeErrorType, "BufferedWriter() missing required argument 'raw'"))
+			return val.NoneVal()
 		}
 		inst := val.NewInstanceOfType(bufferedWriterType)
 		inst.AsInstance().SetAttr(val.InternString("raw"), args[0])
@@ -1466,13 +1509,15 @@ func (e *Engine) createIOModule() val.Value {
 	}
 	bufferedWriterType.Dict.Set(val.InternString("write"), val.NewBuiltinFuncVal("write", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: write() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "write() takes 1 argument"))
+			return val.NoneVal()
 		}
 		rawVal, _ := args[0].AsInstance().GetAttr(val.InternString("raw"))
 		if fn, _, ok := rawVal.Type().LookupMRO(val.InternString("write")); ok {
 			return ctx.Invoke2(fn, rawVal, args[1])
 		}
-		panic("AttributeError: raw object has no write")
+		ctx.Raise(val.NewException(val.AttributeErrorType, "raw object has no write"))
+		return val.NoneVal()
 	}))
 	bufferedWriterType.Dict.Set(val.InternString("flush"), val.NewBuiltinFuncVal("flush", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) > 0 {
@@ -1524,14 +1569,16 @@ func (e *Engine) createIOModule() val.Value {
 	))
 	bufferedWriterType.Dict.Set(val.InternString("seek"), val.NewBuiltinFuncVal("seek", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) == 0 {
-			panic("TypeError: seek() missing self")
+			ctx.Raise(val.NewException(val.TypeErrorType, "seek() missing self"))
+			return val.NoneVal()
 		}
 		rawVal, _ := args[0].AsInstance().GetAttr(val.InternString("raw"))
 		return invokeIOSeek(ctx, rawVal, args)
 	}))
 	bufferedWriterType.Dict.Set(val.InternString("tell"), val.NewBuiltinFuncVal("tell", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) == 0 {
-			panic("TypeError: tell() missing self")
+			ctx.Raise(val.NewException(val.TypeErrorType, "tell() missing self"))
+			return val.NoneVal()
 		}
 		rawVal, _ := args[0].AsInstance().GetAttr(val.InternString("raw"))
 		return invokeIOTell(ctx, rawVal)
@@ -1541,7 +1588,8 @@ func (e *Engine) createIOModule() val.Value {
 	bufferedRWPairType := val.MustNewType("BufferedRWPair", []*val.PyType{bufferedIOBaseType}, nil)
 	bufferedRWPairType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: BufferedRWPair() takes at least 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "BufferedRWPair() takes at least 2 arguments"))
+			return val.NoneVal()
 		}
 		inst := val.NewInstanceOfType(bufferedRWPairType)
 		inst.AsInstance().SetAttr(val.InternString("reader"), args[0])
@@ -1556,7 +1604,8 @@ func (e *Engine) createIOModule() val.Value {
 			}
 			return ctx.Invoke1(fn, rVal)
 		}
-		panic("AttributeError: reader has no read")
+		ctx.Raise(val.NewException(val.AttributeErrorType, "reader has no read"))
+		return val.NoneVal()
 	}))
 	bufferedRWPairType.Dict.Set(val.InternString("readline"), val.NewBuiltinFuncVal("readline", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		rVal, _ := args[0].AsInstance().GetAttr(val.InternString("reader"))
@@ -1566,14 +1615,16 @@ func (e *Engine) createIOModule() val.Value {
 			}
 			return ctx.Invoke1(fn, rVal)
 		}
-		panic("AttributeError: reader has no readline")
+		ctx.Raise(val.NewException(val.AttributeErrorType, "reader has no readline"))
+		return val.NoneVal()
 	}))
 	bufferedRWPairType.Dict.Set(val.InternString("write"), val.NewBuiltinFuncVal("write", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		wVal, _ := args[0].AsInstance().GetAttr(val.InternString("writer"))
 		if fn, _, ok := wVal.Type().LookupMRO(val.InternString("write")); ok {
 			return ctx.Invoke2(fn, wVal, args[1])
 		}
-		panic("AttributeError: writer has no write")
+		ctx.Raise(val.NewException(val.AttributeErrorType, "writer has no write"))
+		return val.NoneVal()
 	}))
 	bufferedRWPairType.Dict.Set(val.InternString("flush"), val.NewBuiltinFuncVal("flush", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		wVal, _ := args[0].AsInstance().GetAttr(val.InternString("writer"))
@@ -1635,7 +1686,8 @@ func (e *Engine) createIOModule() val.Value {
 	}))
 	textIOWrapperType.Dict.Set(val.DunderInit, val.NewBuiltinFuncVal("__init__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: TextIOWrapper.__init__() missing required argument 'buffer'")
+			ctx.Raise(val.NewException(val.TypeErrorType, "TextIOWrapper.__init__() missing required argument 'buffer'"))
+			return val.NoneVal()
 		}
 		self := args[0].AsInstance()
 		bufVal := args[1]
@@ -1672,7 +1724,8 @@ func (e *Engine) createIOModule() val.Value {
 	}))
 	textIOWrapperType.Dict.Set(val.InternString("reconfigure"), val.NewBuiltinFuncVal("reconfigure", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: reconfigure() missing self")
+			ctx.Raise(val.NewException(val.TypeErrorType, "reconfigure() missing self"))
+			return val.NoneVal()
 		}
 		inst := args[0].AsInstance()
 		if v, ok := kwArg(args, kwnames, "encoding"); ok && !v.IsNone() {
@@ -1686,7 +1739,8 @@ func (e *Engine) createIOModule() val.Value {
 	textIOWrapperType.InvalidateVersion()
 	textIOWrapperType.Dict.Set(val.InternString("read"), val.NewBuiltinFuncVal("read", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: read() missing self")
+			ctx.Raise(val.NewException(val.TypeErrorType, "read() missing self"))
+			return val.NoneVal()
 		}
 		bufVal, ok := getAttrOrNone(ctx, args[0], val.InternString("buffer"))
 		var res val.Value
@@ -1706,7 +1760,8 @@ func (e *Engine) createIOModule() val.Value {
 	}))
 	textIOWrapperType.Dict.Set(val.InternString("readline"), val.NewBuiltinFuncVal("readline", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: readline() missing self")
+			ctx.Raise(val.NewException(val.TypeErrorType, "readline() missing self"))
+			return val.NoneVal()
 		}
 		bufVal, ok := getAttrOrNone(ctx, args[0], val.InternString("buffer"))
 		var res val.Value
@@ -1726,10 +1781,12 @@ func (e *Engine) createIOModule() val.Value {
 	}))
 	textIOWrapperType.Dict.Set(val.InternString("write"), val.NewBuiltinFuncVal("write", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: write() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "write() takes 1 argument"))
+			return val.NoneVal()
 		}
 		if !args[1].IsAnyString() {
-			panic("TypeError: write() argument must be str, not " + args[1].Type().Name)
+			ctx.Raise(val.NewException(val.TypeErrorType, "write() argument must be str, not"+args[1].Type().Name))
+			return val.NoneVal()
 		}
 		bufVal, ok := getAttrOrNone(ctx, args[0], val.InternString("buffer"))
 		strData := args[1].AsString()
@@ -1803,7 +1860,8 @@ func (e *Engine) createIOModule() val.Value {
 			if v, ok := kwArg(args, kwnames, "file"); ok {
 				pa = []val.Value{v}
 			} else {
-				panic("TypeError: open() missing required argument 'file' (pos 1)")
+				ctx.Raise(val.NewException(val.TypeErrorType, "open() missing required argument 'file' (pos 1)"))
+				return val.NoneVal()
 			}
 		}
 		var targetVal val.Value
@@ -1818,15 +1876,16 @@ func (e *Engine) createIOModule() val.Value {
 		} else if v, ok := kwArg(args, kwnames, "mode"); ok && v.IsAnyString() {
 			mode = v.AsString()
 		}
-		return openFileBuiltinVal(targetVal, mode)
+		return openFileBuiltinValCtx(ctx, targetVal, mode)
 	})
 
 	ioMod.Dict.Set(val.InternString("open"), openFn)
 	ioMod.Dict.Set(val.InternString("open_code"), val.NewBuiltinFuncVal("open_code", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: open_code() missing required argument 'path'")
+			ctx.Raise(val.NewException(val.TypeErrorType, "open_code() missing required argument 'path'"))
+			return val.NoneVal()
 		}
-		return openFileBuiltinVal(val.NewStringVal(pathArg(ctx, args[0])), "rb")
+		return openFileBuiltinValCtx(ctx, val.NewStringVal(pathArg(ctx, args[0])), "rb")
 	}))
 	ioMod.Dict.Set(val.InternString("DEFAULT_BUFFER_SIZE"), val.Int64Val(8192))
 	ioMod.Dict.Set(val.InternString("SEEK_SET"), val.Int64Val(0))

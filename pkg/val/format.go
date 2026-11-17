@@ -32,11 +32,13 @@ type fmtSpec struct {
 
 func isAlignChar(r rune) bool { return r == '<' || r == '>' || r == '^' || r == '=' }
 
-func fmtValueError(msg string) { panic("ValueError: " + msg) }
+func fmtValueErrorCtx(ctx *ExecContext, msg string) {
+	RaiseValueError(ctx, msg)
+}
 
-// parseFormatSpec parses spec. tname is the Python type name used in errors.
+// parseFormatSpecCtx parses spec. tname is the Python type name used in errors.
 // defaultAlign is '<' for strings and '>' for numbers.
-func parseFormatSpec(spec, tname string, defaultAlign byte) fmtSpec {
+func parseFormatSpecCtx(ctx *ExecContext, spec, tname string, defaultAlign byte) (fmtSpec, bool) {
 	fs := fmtSpec{fill: ' ', width: -1, prec: -1}
 	rs := []rune(spec)
 	i := 0
@@ -68,22 +70,27 @@ func parseFormatSpec(spec, tname string, defaultAlign byte) fmtSpec {
 		}
 		i++
 	}
-	readInt := func(what string) int {
+	readInt := func(what string) (int, bool) {
 		start := i
 		v := 0
 		for i < n && rs[i] >= '0' && rs[i] <= '9' {
 			v = v*10 + int(rs[i]-'0')
 			if v > math.MaxInt32 {
-				fmtValueError("Too many decimal digits in format string")
+				fmtValueErrorCtx(ctx, "Too many decimal digits in format string")
+				return 0, false
 			}
 			i++
 		}
 		if i == start {
-			return -1
+			return -1, true
 		}
-		return v
+		return v, true
 	}
-	if w := readInt("width"); w >= 0 {
+	w, ok := readInt("width")
+	if !ok {
+		return fs, false
+	}
+	if w >= 0 {
 		fs.width = w
 	}
 	if i < n && (rs[i] == ',' || rs[i] == '_') {
@@ -92,27 +99,36 @@ func parseFormatSpec(spec, tname string, defaultAlign byte) fmtSpec {
 		i++
 		if i < n && (rs[i] == ',' || rs[i] == '_') {
 			if byte(rs[i]) != fs.group {
-				fmtValueError("Cannot specify both ',' and '_'.")
+				fmtValueErrorCtx(ctx, "Cannot specify both ',' and '_'.")
+				return fs, false
 			}
-			fmtValueError("Cannot specify '" + string(rs[i]) + "' more than once")
+			fmtValueErrorCtx(ctx, "Cannot specify '"+string(rs[i])+"' more than once")
+			return fs, false
 		}
 	}
 	if i < n && rs[i] == '.' {
 		i++
-		p := readInt("precision")
+		p, ok := readInt("precision")
+		if !ok {
+			return fs, false
+		}
 		if p < 0 {
-			fmtValueError("Format specifier missing precision")
+			fmtValueErrorCtx(ctx, "Format specifier missing precision")
+			return fs, false
 		}
 		fs.prec = p
 	}
 	if i < n && (rs[i] == ',' || rs[i] == '_') {
 		if fs.groupAfter {
-			fmtValueError("Cannot specify both ',' and '_'.")
+			fmtValueErrorCtx(ctx, "Cannot specify both ',' and '_'.")
+			return fs, false
 		}
-		fmtValueError("Invalid format specifier '" + spec + "' for object of type '" + tname + "'")
+		fmtValueErrorCtx(ctx, "Invalid format specifier '"+spec+"' for object of type '"+tname+"'")
+		return fs, false
 	}
 	if n-i > 1 {
-		fmtValueError("Invalid format specifier '" + spec + "' for object of type '" + tname + "'")
+		fmtValueErrorCtx(ctx, "Invalid format specifier '"+spec+"' for object of type '"+tname+"'")
+		return fs, false
 	}
 	if n-i == 1 {
 		fs.typ = byte(rs[i])
@@ -125,27 +141,31 @@ func parseFormatSpec(spec, tname string, defaultAlign byte) fmtSpec {
 		case 0, 'd', 'e', 'f', 'g', 'E', 'G', '%', 'F':
 		case 'b', 'o', 'x', 'X':
 			if fs.group == ',' {
-				fmtValueError("Cannot specify ',' with '" + string(fs.typ) + "'.")
+				fmtValueErrorCtx(ctx, "Cannot specify ',' with '"+string(fs.typ)+"'.")
+				return fs, false
 			}
 		default:
 			if fs.typ > 32 && fs.typ < 128 {
-				fmtValueError("Cannot specify '" + string(fs.group) + "' with '" + string(fs.typ) + "'.")
+				fmtValueErrorCtx(ctx, "Cannot specify '"+string(fs.group)+"' with '"+string(fs.typ)+"'.")
+				return fs, false
 			}
-			fmtValueError("Cannot specify '" + string(fs.group) + "' with '\\x" + strconv.FormatInt(int64(fs.typ), 16) + "'.")
+			fmtValueErrorCtx(ctx, "Cannot specify '"+string(fs.group)+"' with '\\x"+strconv.FormatInt(int64(fs.typ), 16)+"'.")
+			return fs, false
 		}
 	}
 	if fs.align == 0 {
 		fs.align = defaultAlign
 	}
-	return fs
+	return fs, true
 }
 
-func unknownFormatCode(fs fmtSpec, spec rune, tname string) {
+func unknownFormatCodeCtx(ctx *ExecContext, spec rune, tname string) {
 	c := string(spec)
 	if spec > 0x7e || spec < 0x20 {
-		fmtValueError("Unknown format code '\\x" + strconv.FormatInt(int64(spec), 16) + "' for object of type '" + tname + "'")
+		fmtValueErrorCtx(ctx, "Unknown format code '\\x"+strconv.FormatInt(int64(spec), 16)+"' for object of type '"+tname+"'")
+		return
 	}
-	fmtValueError("Unknown format code '" + c + "' for object of type '" + tname + "'")
+	fmtValueErrorCtx(ctx, "Unknown format code '"+c+"' for object of type '"+tname+"'")
 }
 
 // padFormatted pads s (rune-counted) to width using the fill/alignment of fs.
@@ -243,30 +263,44 @@ func assembleNumber(fs fmtSpec, neg bool, prefix, digits, tail string, groupSize
 
 // FormatStrSpec implements str.__format__.
 func FormatStrSpec(s string, spec string) string {
+	return FormatStrSpecCtx(nil, s, spec)
+}
+
+func FormatStrSpecCtx(ctx *ExecContext, s string, spec string) string {
 	if spec == "" {
 		return s
 	}
-	fs := parseFormatSpec(spec, "str", '<')
+	fs, ok := parseFormatSpecCtx(ctx, spec, "str", '<')
+	if !ok {
+		return ""
+	}
 	if fs.typ != 0 && fs.typ != 's' {
-		unknownFormatCode(fs, rune(fs.typ), "str")
+		unknownFormatCodeCtx(ctx, rune(fs.typ), "str")
+		return ""
 	}
 	if fs.groupAfter {
-		fmtValueError("Cannot specify '" + string(fs.group) + "' with 's'.")
+		fmtValueErrorCtx(ctx, "Cannot specify '"+string(fs.group)+"' with 's'.")
+		return ""
 	}
 	if fs.sign == ' ' {
-		fmtValueError("Space not allowed in string format specifier")
+		fmtValueErrorCtx(ctx, "Space not allowed in string format specifier")
+		return ""
 	}
 	if fs.sign != 0 {
-		fmtValueError("Sign not allowed in string format specifier")
+		fmtValueErrorCtx(ctx, "Sign not allowed in string format specifier")
+		return ""
 	}
 	if fs.z {
-		fmtValueError("Negative zero coercion (z) not allowed in string format specifier")
+		fmtValueErrorCtx(ctx, "Negative zero coercion (z) not allowed in string format specifier")
+		return ""
 	}
 	if fs.alt {
-		fmtValueError("Alternate form (#) not allowed in string format specifier")
+		fmtValueErrorCtx(ctx, "Alternate form (#) not allowed in string format specifier")
+		return ""
 	}
 	if fs.align == '=' {
-		fmtValueError("'=' alignment not allowed in string format specifier")
+		fmtValueErrorCtx(ctx, "'=' alignment not allowed in string format specifier")
+		return ""
 	}
 	if fs.prec >= 0 && utf8.RuneCountInString(s) > fs.prec {
 		r := []rune(s)
@@ -288,50 +322,69 @@ func intTypeDefaultGroup(typ byte) int {
 
 // FormatIntSpec implements int.__format__ for an arbitrary-precision integer.
 func FormatIntSpec(n *big.Int, spec string) string {
-	return formatIntSpecT(n, spec, "int")
+	return formatIntSpecT(nil, n, spec, "int")
+}
+
+func FormatIntSpecCtx(ctx *ExecContext, n *big.Int, spec string) string {
+	return formatIntSpecT(ctx, n, spec, "int")
 }
 
 // FormatBoolSpec implements the integer formatting of bool values.
 func FormatBoolSpec(b bool, spec string) string {
+	return FormatBoolSpecCtx(nil, b, spec)
+}
+
+func FormatBoolSpecCtx(ctx *ExecContext, b bool, spec string) string {
 	n := int64(0)
 	if b {
 		n = 1
 	}
-	return formatIntSpecT(big.NewInt(n), spec, "bool")
+	return formatIntSpecT(ctx, big.NewInt(n), spec, "bool")
 }
 
-func formatIntSpecT(n *big.Int, spec, tname string) string {
-	fs := parseFormatSpec(spec, tname, '>')
+func formatIntSpecT(ctx *ExecContext, n *big.Int, spec, tname string) string {
+	fs, ok := parseFormatSpecCtx(ctx, spec, tname, '>')
+	if !ok {
+		return ""
+	}
 	typ := fs.typ
 	switch typ {
 	case 0, 'd', 'b', 'o', 'x', 'X', 'c', 'n':
 	case 'e', 'E', 'f', 'F', 'g', 'G', '%':
 		f, _ := new(big.Float).SetInt(n).Float64()
 		if math.IsInf(f, 0) {
-			panic("OverflowError: int too large to convert to float")
+			RaiseOverflowError(ctx, "int too large to convert to float")
+			return ""
 		}
-		return formatFloatSpec(f, fs, tname)
+		return formatFloatSpec(ctx, f, fs, tname)
 	default:
-		unknownFormatCode(fs, rune(typ), tname)
+		unknownFormatCodeCtx(ctx, rune(typ), tname)
+		return ""
 	}
 	if fs.prec >= 0 {
-		fmtValueError("Precision not allowed in integer format specifier")
+		fmtValueErrorCtx(ctx, "Precision not allowed in integer format specifier")
+		return ""
 	}
 	if fs.z {
-		fmtValueError("Negative zero coercion (z) not allowed in integer format specifier")
+		fmtValueErrorCtx(ctx, "Negative zero coercion (z) not allowed in integer format specifier")
+		return ""
 	}
 	if typ == 'c' {
 		if fs.sign != 0 {
-			fmtValueError("Sign not allowed with integer format specifier 'c'")
+			fmtValueErrorCtx(ctx, "Sign not allowed with integer format specifier 'c'")
+			return ""
 		}
 		if fs.alt {
-			fmtValueError("Alternate form (#) not allowed with integer format specifier 'c'")
+			fmtValueErrorCtx(ctx, "Alternate form (#) not allowed with integer format specifier 'c'")
+			return ""
 		}
 		if !n.IsInt64() {
-			panic("OverflowError: Python int too large to convert to C long")
+			RaiseOverflowError(ctx, "Python int too large to convert to C long")
+			return ""
 		}
 		if n.Int64() < 0 || n.Int64() > 0x10ffff {
-			panic("OverflowError: %c arg not in range(0x110000)")
+			RaiseOverflowError(ctx, "%c arg not in range(0x110000)")
+			return ""
 		}
 		return padFormatted(string(rune(n.Int64())), fs)
 	}
@@ -369,10 +422,14 @@ func formatIntSpecT(n *big.Int, spec, tname string) string {
 
 // FormatInt64Spec is FormatIntSpec for machine integers.
 func FormatInt64Spec(n int64, spec string) string {
+	return FormatInt64SpecCtx(nil, n, spec)
+}
+
+func FormatInt64SpecCtx(ctx *ExecContext, n int64, spec string) string {
 	if spec == "" || spec == "d" {
 		return strconv.FormatInt(n, 10)
 	}
-	return FormatIntSpec(big.NewInt(n), spec)
+	return FormatIntSpecCtx(ctx, big.NewInt(n), spec)
 }
 
 // ---------------------------------------------------------------------------
@@ -526,11 +583,18 @@ func hasNonZeroDigit(body string) bool {
 
 // FormatFloatSpec implements float.__format__.
 func FormatFloatSpec(f float64, spec string) string {
+	return FormatFloatSpecCtx(nil, f, spec)
+}
+
+func FormatFloatSpecCtx(ctx *ExecContext, f float64, spec string) string {
 	if spec == "" {
 		return FloatRepr(f)
 	}
-	fs := parseFormatSpec(spec, "float", '>')
-	return formatFloatSpec(f, fs, "float")
+	fs, ok := parseFormatSpecCtx(ctx, spec, "float", '>')
+	if !ok {
+		return ""
+	}
+	return formatFloatSpec(ctx, f, fs, "float")
 }
 
 // formatFloatParts renders f per fs and returns (negative, integer digits, tail)
@@ -588,14 +652,16 @@ func formatFloatParts(f float64, fs fmtSpec, noDot0 bool) (neg bool, digits, tai
 	return neg, body[:i], body[i:]
 }
 
-func formatFloatSpec(f float64, fs fmtSpec, tname string) string {
+func formatFloatSpec(ctx *ExecContext, f float64, fs fmtSpec, tname string) string {
 	switch fs.typ {
 	case 0, 'e', 'E', 'f', 'F', 'g', 'G', '%', 'n':
 	default:
-		unknownFormatCode(fs, rune(fs.typ), tname)
+		unknownFormatCodeCtx(ctx, rune(fs.typ), tname)
+		return ""
 	}
 	if fs.typ == 'n' && fs.groupAfter {
-		fmtValueError("Cannot specify '" + string(fs.group) + "' with 'n'.")
+		fmtValueErrorCtx(ctx, "Cannot specify '"+string(fs.group)+"' with 'n'.")
+		return ""
 	}
 	neg, digits, tail := formatFloatParts(f, fs, false)
 	if fs.align == '=' && fs.fill == '0' && digits == "" {
@@ -610,20 +676,30 @@ func formatFloatSpec(f float64, fs fmtSpec, tname string) string {
 
 // FormatComplexSpec implements complex.__format__.
 func FormatComplexSpec(re, im float64, spec string) string {
+	return FormatComplexSpecCtx(nil, re, im, spec)
+}
+
+func FormatComplexSpecCtx(ctx *ExecContext, re, im float64, spec string) string {
 	if spec == "" {
 		return ComplexRepr(re, im)
 	}
-	fs := parseFormatSpec(spec, "complex", '>')
+	fs, ok := parseFormatSpecCtx(ctx, spec, "complex", '>')
+	if !ok {
+		return ""
+	}
 	switch fs.typ {
 	case 0, 'e', 'E', 'f', 'F', 'g', 'G', 'n':
 	default:
-		unknownFormatCode(fs, rune(fs.typ), "complex")
+		unknownFormatCodeCtx(ctx, rune(fs.typ), "complex")
+		return ""
 	}
 	if fs.zero || (fs.fillSet && fs.fill == '0' && fs.align == '=') {
-		fmtValueError("Zero padding is not allowed in complex format specifier")
+		fmtValueErrorCtx(ctx, "Zero padding is not allowed in complex format specifier")
+		return ""
 	}
 	if fs.align == '=' {
-		fmtValueError("'=' alignment flag is not allowed in complex format specifier")
+		fmtValueErrorCtx(ctx, "'=' alignment flag is not allowed in complex format specifier")
+		return ""
 	}
 	// Render each part without width/alignment.
 	part := fs

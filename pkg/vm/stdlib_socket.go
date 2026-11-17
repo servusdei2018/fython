@@ -126,7 +126,8 @@ func (e *Engine) createSocketModule() val.Value {
 
 	mod.Dict.Set(val.InternString("setdefaulttimeout"), val.NewModuleFuncVal("setdefaulttimeout", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: setdefaulttimeout() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "setdefaulttimeout() takes 1 argument"))
+			return val.NoneVal()
 		}
 		globalTimeoutMu.Lock()
 		defer globalTimeoutMu.Unlock()
@@ -154,24 +155,28 @@ func (e *Engine) createSocketModule() val.Value {
 
 	mod.Dict.Set(val.InternString("gethostbyname"), val.NewModuleFuncVal("gethostbyname", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: gethostbyname() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "gethostbyname() takes 1 argument"))
+			return val.NoneVal()
 		}
 		host := args[0].AsString()
 		ips, err := net.LookupIP(host)
 		if err != nil {
-			panic("OSError: [Errno -2] Name or service not known")
+			ctx.Raise(val.NewException(val.OSErrorType, "[Errno -2] Name or service not known"))
+			return val.NoneVal()
 		}
 		for _, ip := range ips {
 			if ip4 := ip.To4(); ip4 != nil {
 				return val.NewStringVal(ip4.String())
 			}
 		}
-		panic("OSError: [Errno -2] Name or service not known")
+		ctx.Raise(val.NewException(val.OSErrorType, "[Errno -2] Name or service not known"))
+		return val.NoneVal()
 	}))
 
 	mod.Dict.Set(val.InternString("gethostbyaddr"), val.NewModuleFuncVal("gethostbyaddr", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: gethostbyaddr() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "gethostbyaddr() takes 1 argument"))
+			return val.NoneVal()
 		}
 		ipStr := args[0].AsString()
 		names, err := net.LookupAddr(ipStr)
@@ -209,23 +214,27 @@ func (e *Engine) createSocketModule() val.Value {
 	// inet_aton, inet_ntoa, inet_pton, inet_ntop
 	mod.Dict.Set(val.InternString("inet_aton"), val.NewModuleFuncVal("inet_aton", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: inet_aton() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "inet_aton() takes 1 argument"))
+			return val.NoneVal()
 		}
 		ipStr := args[0].AsString()
 		ip := net.ParseIP(ipStr)
 		if ip == nil {
-			panic("OSError: illegal IP address string passed to inet_aton")
+			ctx.Raise(val.NewException(val.OSErrorType, "illegal IP address string passed to inet_aton"))
+			return val.NoneVal()
 		}
 		ip4 := ip.To4()
 		if ip4 == nil {
-			panic("OSError: illegal IP address string passed to inet_aton")
+			ctx.Raise(val.NewException(val.OSErrorType, "illegal IP address string passed to inet_aton"))
+			return val.NoneVal()
 		}
 		return val.NewBytesVal(ip4)
 	}))
 
 	mod.Dict.Set(val.InternString("inet_ntoa"), val.NewModuleFuncVal("inet_ntoa", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 || !args[0].IsBytes() || len(args[0].AsBytes().Data) != 4 {
-			panic("OSError: packed IP wrong length for inet_ntoa")
+			ctx.Raise(val.NewException(val.OSErrorType, "packed IP wrong length for inet_ntoa"))
+			return val.NoneVal()
 		}
 		b := args[0].AsBytes().Data
 		ip := net.IPv4(b[0], b[1], b[2], b[3])
@@ -234,60 +243,70 @@ func (e *Engine) createSocketModule() val.Value {
 
 	mod.Dict.Set(val.InternString("inet_pton"), val.NewModuleFuncVal("inet_pton", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: inet_pton() takes 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "inet_pton() takes 2 arguments"))
+			return val.NoneVal()
 		}
 		af := int(args[0].AsInt64())
 		ipStr := args[1].AsString()
 		ip := net.ParseIP(ipStr)
 		if ip == nil {
-			panic("OSError: illegal IP address string passed to inet_pton")
+			ctx.Raise(val.NewException(val.OSErrorType, "illegal IP address string passed to inet_pton"))
+			return val.NoneVal()
 		}
 		switch af {
 		case syscall.AF_INET:
 			ip4 := ip.To4()
 			if ip4 == nil {
-				panic("OSError: illegal IP address string passed to inet_pton")
+				ctx.Raise(val.NewException(val.OSErrorType, "illegal IP address string passed to inet_pton"))
+				return val.NoneVal()
 			}
 			return val.NewBytesVal(ip4)
 		case syscall.AF_INET6:
 			ip16 := ip.To16()
 			if ip16 == nil {
-				panic("OSError: illegal IP address string passed to inet_pton")
+				ctx.Raise(val.NewException(val.OSErrorType, "illegal IP address string passed to inet_pton"))
+				return val.NoneVal()
 			}
 			return val.NewBytesVal(ip16)
 		default:
-			panic("OSError: unknown address family")
+			ctx.Raise(val.NewException(val.OSErrorType, "unknown address family"))
+			return val.NoneVal()
 		}
 	}))
 
 	mod.Dict.Set(val.InternString("inet_ntop"), val.NewModuleFuncVal("inet_ntop", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 || !args[1].IsBytes() {
-			panic("TypeError: inet_ntop() takes 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "inet_ntop() takes 2 arguments"))
+			return val.NoneVal()
 		}
 		af := int(args[0].AsInt64())
 		b := args[1].AsBytes().Data
 		switch af {
 		case syscall.AF_INET:
 			if len(b) != 4 {
-				panic("ValueError: invalid length of packed IP address string")
+				ctx.Raise(val.NewException(val.ValueErrorType, "invalid length of packed IP address string"))
+				return val.NoneVal()
 			}
 			ip := net.IPv4(b[0], b[1], b[2], b[3])
 			return val.NewStringVal(ip.String())
 		case syscall.AF_INET6:
 			if len(b) != 16 {
-				panic("ValueError: invalid length of packed IP address string")
+				ctx.Raise(val.NewException(val.ValueErrorType, "invalid length of packed IP address string"))
+				return val.NoneVal()
 			}
 			ip := net.IP(b)
 			return val.NewStringVal(ip.String())
 		default:
-			panic("ValueError: unknown address family")
+			ctx.Raise(val.NewException(val.ValueErrorType, "unknown address family"))
+			return val.NoneVal()
 		}
 	}))
 
 	// getaddrinfo
 	mod.Dict.Set(val.InternString("getaddrinfo"), val.NewModuleFuncVal("getaddrinfo", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: getaddrinfo() takes at least 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "getaddrinfo() takes at least 2 arguments"))
+			return val.NoneVal()
 		}
 		host := ""
 		if !args[0].IsNone() {
@@ -417,7 +436,8 @@ func (e *Engine) createSocketModule() val.Value {
 		// Hostname resolution
 		ips, err := net.LookupIP(host)
 		if err != nil {
-			panic("OSError: [Errno -2] Name or service not known")
+			ctx.Raise(val.NewException(val.OSErrorType, "[Errno -2] Name or service not known"))
+			return val.NoneVal()
 		}
 
 		for _, ip := range ips {
@@ -593,7 +613,8 @@ func (e *Engine) createSocketModule() val.Value {
 		socketTypeDict.Set(val.InternString(name), val.NewPropertyVal(
 			val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 				if len(args) < 1 {
-					panic("TypeError: descriptor '" + name + "' of 'socket' object needs an argument")
+					ctx.Raise(val.NewException(val.TypeErrorType, "descriptor '"+name+"' of 'socket' object needs an argument"))
+					return val.NoneVal()
 				}
 				st := getSockState(args[0])
 				return getter(st)
@@ -616,7 +637,8 @@ func (e *Engine) createSocketModule() val.Value {
 	// socket.__init__(family=AF_INET, type=SOCK_STREAM, proto=0, fileno=None)
 	socketTypeDict.Set(val.InternString("__init__"), val.NewBuiltinFuncVal("socket.__init__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: socket.__init__() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "socket.__init__() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		self := args[0]
 
@@ -645,7 +667,7 @@ func (e *Engine) createSocketModule() val.Value {
 		} else {
 			newFd, err := syscall.Socket(family, typ, proto)
 			if err != nil {
-				raiseOSError(err, "")
+				return raiseOSError(ctx, err, "")
 			}
 			fd = newFd
 		}
@@ -687,13 +709,14 @@ func (e *Engine) createSocketModule() val.Value {
 	// bind
 	socketTypeDict.Set(val.InternString("bind"), val.NewBuiltinFuncVal("bind", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: bind() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "bind() takes 1 argument"))
+			return val.NoneVal()
 		}
 		st := getSockState(args[0])
 		sa := pyToSockaddr(st.family, args[1])
 		err := syscall.Bind(st.fd, sa)
 		if err != nil {
-			raiseOSError(err, "")
+			return raiseOSError(ctx, err, "")
 		}
 		return val.NoneVal()
 	}))
@@ -707,7 +730,7 @@ func (e *Engine) createSocketModule() val.Value {
 		}
 		err := syscall.Listen(st.fd, backlog)
 		if err != nil {
-			raiseOSError(err, "")
+			return raiseOSError(ctx, err, "")
 		}
 		return val.NoneVal()
 	}))
@@ -726,22 +749,24 @@ func (e *Engine) createSocketModule() val.Value {
 				} else if st.timeout > 0 {
 					waitErr := waitReady(st.fd, false, st.timeout)
 					if waitErr == syscall.ETIMEDOUT {
-						panic("TimeoutError: timed out")
+						ctx.Raise(val.NewException(val.TimeoutErrorType, "timed out"))
+						return val.NoneVal()
 					}
 					if waitErr != nil {
-						raiseOSError(waitErr, "")
+						return raiseOSError(ctx, waitErr, "")
 					}
 					continue
 				}
 			}
-			raiseOSError(err, "")
+			return raiseOSError(ctx, err, "")
 		}
 	}))
 
 	// connect
 	socketTypeDict.Set(val.InternString("connect"), val.NewBuiltinFuncVal("connect", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: connect() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "connect() takes 1 argument"))
+			return val.NoneVal()
 		}
 		st := getSockState(args[0])
 		sa := pyToSockaddr(st.family, args[1])
@@ -760,29 +785,31 @@ func (e *Engine) createSocketModule() val.Value {
 			}
 			waitErr := waitReady(st.fd, true, timeoutVal)
 			if waitErr == syscall.ETIMEDOUT {
-				panic("TimeoutError: timed out")
+				ctx.Raise(val.NewException(val.TimeoutErrorType, "timed out"))
+				return val.NoneVal()
 			}
 			if waitErr != nil {
-				raiseOSError(waitErr, "")
+				return raiseOSError(ctx, waitErr, "")
 			}
 			// Check socket error
 			soErr, getsockErr := syscall.GetsockoptInt(st.fd, syscall.SOL_SOCKET, syscall.SO_ERROR)
 			if getsockErr != nil {
-				raiseOSError(getsockErr, "")
+				return raiseOSError(ctx, getsockErr, "")
 			}
 			if soErr != 0 {
-				raiseOSError(syscall.Errno(soErr), "")
+				return raiseOSError(ctx, syscall.Errno(soErr), "")
 			}
 			return val.NoneVal()
 		}
-		raiseOSError(err, "")
+		raiseOSError(ctx, err, "")
 		return val.NoneVal()
 	}))
 
 	// connect_ex
 	socketTypeDict.Set(val.InternString("connect_ex"), val.NewBuiltinFuncVal("connect_ex", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: connect_ex() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "connect_ex() takes 1 argument"))
+			return val.NoneVal()
 		}
 		st := getSockState(args[0])
 		sa := pyToSockaddr(st.family, args[1])
@@ -812,7 +839,8 @@ func (e *Engine) createSocketModule() val.Value {
 	// send
 	socketTypeDict.Set(val.InternString("send"), val.NewBuiltinFuncVal("send", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: send() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "send() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		st := getSockState(args[0])
 		var data []byte
@@ -838,22 +866,24 @@ func (e *Engine) createSocketModule() val.Value {
 				} else if st.timeout > 0 {
 					waitErr := waitReady(st.fd, true, st.timeout)
 					if waitErr == syscall.ETIMEDOUT {
-						panic("TimeoutError: timed out")
+						ctx.Raise(val.NewException(val.TimeoutErrorType, "timed out"))
+						return val.NoneVal()
 					}
 					if waitErr != nil {
-						raiseOSError(waitErr, "")
+						return raiseOSError(ctx, waitErr, "")
 					}
 					continue
 				}
 			}
-			raiseOSError(err, "")
+			return raiseOSError(ctx, err, "")
 		}
 	}))
 
 	// sendall
 	socketTypeDict.Set(val.InternString("sendall"), val.NewBuiltinFuncVal("sendall", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: sendall() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "sendall() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		st := getSockState(args[0])
 		var data []byte
@@ -880,15 +910,16 @@ func (e *Engine) createSocketModule() val.Value {
 				} else if st.timeout > 0 {
 					waitErr := waitReady(st.fd, true, st.timeout)
 					if waitErr == syscall.ETIMEDOUT {
-						panic("TimeoutError: timed out")
+						ctx.Raise(val.NewException(val.TimeoutErrorType, "timed out"))
+						return val.NoneVal()
 					}
 					if waitErr != nil {
-						raiseOSError(waitErr, "")
+						return raiseOSError(ctx, waitErr, "")
 					}
 					continue
 				}
 			}
-			raiseOSError(err, "")
+			return raiseOSError(ctx, err, "")
 		}
 		return val.NoneVal()
 	}))
@@ -896,12 +927,14 @@ func (e *Engine) createSocketModule() val.Value {
 	// recv
 	socketTypeDict.Set(val.InternString("recv"), val.NewBuiltinFuncVal("recv", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: recv() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "recv() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		st := getSockState(args[0])
 		bufSize := int(toInt64(args[1]))
 		if bufSize < 0 {
-			panic("ValueError: negative buffersize in recv")
+			ctx.Raise(val.NewException(val.ValueErrorType, "negative buffersize in recv"))
+			return val.NoneVal()
 		}
 		buf := make([]byte, bufSize)
 
@@ -916,22 +949,24 @@ func (e *Engine) createSocketModule() val.Value {
 				} else if st.timeout > 0 {
 					waitErr := waitReady(st.fd, false, st.timeout)
 					if waitErr == syscall.ETIMEDOUT {
-						panic("TimeoutError: timed out")
+						ctx.Raise(val.NewException(val.TimeoutErrorType, "timed out"))
+						return val.NoneVal()
 					}
 					if waitErr != nil {
-						raiseOSError(waitErr, "")
+						return raiseOSError(ctx, waitErr, "")
 					}
 					continue
 				}
 			}
-			raiseOSError(err, "")
+			return raiseOSError(ctx, err, "")
 		}
 	}))
 
 	// recv_into(buffer, [nbytes, [flags]])
 	socketTypeDict.Set(val.InternString("recv_into"), val.NewBuiltinFuncVal("recv_into", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: recv_into() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "recv_into() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		st := getSockState(args[0])
 		var target []byte
@@ -941,7 +976,8 @@ func (e *Engine) createSocketModule() val.Value {
 		case args[1].IsMemoryView():
 			target = args[1].AsMemoryView().Buf
 		default:
-			panic("TypeError: a bytes-like object is required")
+			ctx.Raise(val.NewException(val.TypeErrorType, "a bytes-like object is required"))
+			return val.NoneVal()
 		}
 
 		if len(args) > 2 && !args[2].IsNone() {
@@ -962,22 +998,24 @@ func (e *Engine) createSocketModule() val.Value {
 				} else if st.timeout > 0 {
 					waitErr := waitReady(st.fd, false, st.timeout)
 					if waitErr == syscall.ETIMEDOUT {
-						panic("TimeoutError: timed out")
+						ctx.Raise(val.NewException(val.TimeoutErrorType, "timed out"))
+						return val.NoneVal()
 					}
 					if waitErr != nil {
-						raiseOSError(waitErr, "")
+						return raiseOSError(ctx, waitErr, "")
 					}
 					continue
 				}
 			}
-			raiseOSError(err, "")
+			return raiseOSError(ctx, err, "")
 		}
 	}))
 
 	// sendto(data, [flags,] address)
 	socketTypeDict.Set(val.InternString("sendto"), val.NewBuiltinFuncVal("sendto", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 3 {
-			panic("TypeError: sendto() takes at least 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "sendto() takes at least 2 arguments"))
+			return val.NoneVal()
 		}
 		st := getSockState(args[0])
 		var data []byte
@@ -993,7 +1031,7 @@ func (e *Engine) createSocketModule() val.Value {
 		sa := pyToSockaddr(st.family, addrArg)
 		err := syscall.Sendto(st.fd, data, 0, sa)
 		if err != nil {
-			raiseOSError(err, "")
+			return raiseOSError(ctx, err, "")
 		}
 		return val.Int64Val(int64(len(data)))
 	}))
@@ -1001,14 +1039,15 @@ func (e *Engine) createSocketModule() val.Value {
 	// recvfrom(bufsize, [flags])
 	socketTypeDict.Set(val.InternString("recvfrom"), val.NewBuiltinFuncVal("recvfrom", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: recvfrom() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "recvfrom() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		st := getSockState(args[0])
 		bufSize := int(toInt64(args[1]))
 		buf := make([]byte, bufSize)
 		n, sa, err := syscall.Recvfrom(st.fd, buf, 0)
 		if err != nil {
-			raiseOSError(err, "")
+			return raiseOSError(ctx, err, "")
 		}
 		return val.NewTupleVal(val.NewBytesVal(buf[:n]), sockaddrToPy(sa))
 	}))
@@ -1044,7 +1083,8 @@ func (e *Engine) createSocketModule() val.Value {
 	// setblocking
 	socketTypeDict.Set(val.InternString("setblocking"), val.NewBuiltinFuncVal("setblocking", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: setblocking() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "setblocking() takes 1 argument"))
+			return val.NoneVal()
 		}
 		st := getSockState(args[0])
 		if args[1].IsTruthy() {
@@ -1066,7 +1106,8 @@ func (e *Engine) createSocketModule() val.Value {
 	// setsockopt
 	socketTypeDict.Set(val.InternString("setsockopt"), val.NewBuiltinFuncVal("setsockopt", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 4 {
-			panic("TypeError: setsockopt() takes 3 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "setsockopt() takes 3 arguments"))
+			return val.NoneVal()
 		}
 		st := getSockState(args[0])
 		level := int(toInt64(args[1]))
@@ -1075,13 +1116,13 @@ func (e *Engine) createSocketModule() val.Value {
 			val := int(toInt64(args[3]))
 			err := syscall.SetsockoptInt(st.fd, level, opt, val)
 			if err != nil {
-				raiseOSError(err, "")
+				return raiseOSError(ctx, err, "")
 			}
 		} else if args[3].IsBytes() {
 			b := args[3].AsBytes().Data
 			err := syscall.SetsockoptString(st.fd, level, opt, string(b))
 			if err != nil {
-				raiseOSError(err, "")
+				return raiseOSError(ctx, err, "")
 			}
 		}
 		return val.NoneVal()
@@ -1090,14 +1131,15 @@ func (e *Engine) createSocketModule() val.Value {
 	// getsockopt
 	socketTypeDict.Set(val.InternString("getsockopt"), val.NewBuiltinFuncVal("getsockopt", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 3 {
-			panic("TypeError: getsockopt() takes at least 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "getsockopt() takes at least 2 arguments"))
+			return val.NoneVal()
 		}
 		st := getSockState(args[0])
 		level := int(toInt64(args[1]))
 		opt := int(toInt64(args[2]))
 		v, err := syscall.GetsockoptInt(st.fd, level, opt)
 		if err != nil {
-			raiseOSError(err, "")
+			return raiseOSError(ctx, err, "")
 		}
 		return val.Int64Val(int64(v))
 	}))
@@ -1107,7 +1149,7 @@ func (e *Engine) createSocketModule() val.Value {
 		st := getSockState(args[0])
 		sa, err := syscall.Getsockname(st.fd)
 		if err != nil {
-			raiseOSError(err, "")
+			return raiseOSError(ctx, err, "")
 		}
 		return sockaddrToPy(sa)
 	}))
@@ -1117,7 +1159,7 @@ func (e *Engine) createSocketModule() val.Value {
 		st := getSockState(args[0])
 		sa, err := syscall.Getpeername(st.fd)
 		if err != nil {
-			raiseOSError(err, "")
+			return raiseOSError(ctx, err, "")
 		}
 		return sockaddrToPy(sa)
 	}))
@@ -1125,13 +1167,14 @@ func (e *Engine) createSocketModule() val.Value {
 	// shutdown
 	socketTypeDict.Set(val.InternString("shutdown"), val.NewBuiltinFuncVal("shutdown", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: shutdown() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "shutdown() takes 1 argument"))
+			return val.NoneVal()
 		}
 		st := getSockState(args[0])
 		how := int(toInt64(args[1]))
 		err := syscall.Shutdown(st.fd, how)
 		if err != nil {
-			raiseOSError(err, "")
+			return raiseOSError(ctx, err, "")
 		}
 		return val.NoneVal()
 	}))
@@ -1178,7 +1221,7 @@ func (e *Engine) createSocketModule() val.Value {
 		}
 		fds, err := syscall.Socketpair(family, typ, proto)
 		if err != nil {
-			raiseOSError(err, "")
+			return raiseOSError(ctx, err, "")
 		}
 
 		makeSock := func(fd int) val.Value {
@@ -1201,12 +1244,13 @@ func (e *Engine) createSocketModule() val.Value {
 	// dup
 	mod.Dict.Set(val.InternString("dup"), val.NewModuleFuncVal("dup", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: dup() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "dup() takes 1 argument"))
+			return val.NoneVal()
 		}
 		fd := int(toInt64(args[0]))
 		nfd, err := syscall.Dup(fd)
 		if err != nil {
-			raiseOSError(err, "")
+			return raiseOSError(ctx, err, "")
 		}
 		return val.Int64Val(int64(nfd))
 	}))

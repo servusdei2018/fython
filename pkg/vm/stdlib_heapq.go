@@ -87,7 +87,8 @@ func (e *Engine) createHeapQModule() val.Value {
 
 	mod.Dict.Set(val.InternString("heappush"), val.NewBuiltinFuncVal("heappush", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: heappush() takes at least 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "heappush() takes at least 2 arguments"))
+			return val.NoneVal()
 		}
 		lst := getHeapList(args, "heappush")
 		item := args[1]
@@ -99,7 +100,8 @@ func (e *Engine) createHeapQModule() val.Value {
 	mod.Dict.Set(val.InternString("heappop"), val.NewBuiltinFuncVal("heappop", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		lst := getHeapList(args, "heappop")
 		if len(lst.Items) == 0 {
-			panic(val.NewException(val.IndexErrorType, "index out of range"))
+			ctx.Raise(val.NewException(val.IndexErrorType, "index out of range"))
+			return val.NoneVal()
 		}
 		lastelt := lst.Items[len(lst.Items)-1]
 		lst.Items = lst.Items[:len(lst.Items)-1]
@@ -114,11 +116,13 @@ func (e *Engine) createHeapQModule() val.Value {
 
 	mod.Dict.Set(val.InternString("heapreplace"), val.NewBuiltinFuncVal("heapreplace", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: heapreplace() takes at least 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "heapreplace() takes at least 2 arguments"))
+			return val.NoneVal()
 		}
 		lst := getHeapList(args, "heapreplace")
 		if len(lst.Items) == 0 {
-			panic(val.NewException(val.IndexErrorType, "index out of range"))
+			ctx.Raise(val.NewException(val.IndexErrorType, "index out of range"))
+			return val.NoneVal()
 		}
 		item := args[1]
 		returnitem := lst.Items[0]
@@ -129,7 +133,8 @@ func (e *Engine) createHeapQModule() val.Value {
 
 	mod.Dict.Set(val.InternString("heappushpop"), val.NewBuiltinFuncVal("heappushpop", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: heappushpop() takes at least 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "heappushpop() takes at least 2 arguments"))
+			return val.NoneVal()
 		}
 		lst := getHeapList(args, "heappushpop")
 		item := args[1]
@@ -161,7 +166,8 @@ func (e *Engine) createHeapQModule() val.Value {
 	mod.Dict.Set(val.InternString("_heappop_max"), val.NewBuiltinFuncVal("_heappop_max", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		lst := getHeapList(args, "_heappop_max")
 		if len(lst.Items) == 0 {
-			panic(val.NewException(val.IndexErrorType, "index out of range"))
+			ctx.Raise(val.NewException(val.IndexErrorType, "index out of range"))
+			return val.NoneVal()
 		}
 		lastelt := lst.Items[len(lst.Items)-1]
 		lst.Items = lst.Items[:len(lst.Items)-1]
@@ -176,11 +182,13 @@ func (e *Engine) createHeapQModule() val.Value {
 
 	mod.Dict.Set(val.InternString("_heapreplace_max"), val.NewBuiltinFuncVal("_heapreplace_max", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: _heapreplace_max() takes at least 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "_heapreplace_max() takes at least 2 arguments"))
+			return val.NoneVal()
 		}
 		lst := getHeapList(args, "_heapreplace_max")
 		if len(lst.Items) == 0 {
-			panic(val.NewException(val.IndexErrorType, "index out of range"))
+			ctx.Raise(val.NewException(val.IndexErrorType, "index out of range"))
+			return val.NoneVal()
 		}
 		item := args[1]
 		returnitem := lst.Items[0]

@@ -31,7 +31,8 @@ func (e *Engine) createItertoolsModule() val.Value {
 	// 2. repeat(object[, times])
 	mod.Dict.Set(val.InternString("repeat"), val.NewBuiltinFuncVal("repeat", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: repeat() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "repeat() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		obj := args[0]
 		hasTimes := len(args) > 1 && args[1].IsInt64()
@@ -52,7 +53,8 @@ func (e *Engine) createItertoolsModule() val.Value {
 	// 3. cycle(iterable)
 	mod.Dict.Set(val.InternString("cycle"), val.NewBuiltinFuncVal("cycle", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: cycle() takes exactly one argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "cycle() takes exactly one argument"))
+			return val.NoneVal()
 		}
 		it := iterFor(ctx, args[0])
 		var saved []val.Value
@@ -98,7 +100,8 @@ func (e *Engine) createItertoolsModule() val.Value {
 	}
 	chainType.Dict.Set(val.InternString("from_iterable"), val.NewBuiltinFuncVal("from_iterable", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: from_iterable() takes exactly one argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "from_iterable() takes exactly one argument"))
+			return val.NoneVal()
 		}
 		outerIt := iterFor(ctx, args[0])
 		var curSubIt *val.PyIter
@@ -124,7 +127,8 @@ func (e *Engine) createItertoolsModule() val.Value {
 	// 5. islice(iterable, [start,] stop [, step])
 	mod.Dict.Set(val.InternString("islice"), val.NewBuiltinFuncVal("islice", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: islice expected at least 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "islice expected at least 2 arguments"))
+			return val.NoneVal()
 		}
 		it := iterFor(ctx, args[0])
 		start := int64(0)
@@ -145,7 +149,8 @@ func (e *Engine) createItertoolsModule() val.Value {
 			if len(args) > 3 && !args[3].IsNone() && args[3].IsInt64() {
 				step = args[3].AsInt64()
 				if step <= 0 {
-					panic("ValueError: Step for islice() must be a positive integer or None")
+					ctx.Raise(val.NewException(val.ValueErrorType, "Step for islice() must be a positive integer or None"))
+					return val.NoneVal()
 				}
 			}
 		}
@@ -255,7 +260,8 @@ func (e *Engine) createItertoolsModule() val.Value {
 	// 7. permutations(iterable, r=None)
 	mod.Dict.Set(val.InternString("permutations"), val.NewBuiltinFuncVal("permutations", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: permutations() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "permutations() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		it := iterFor(ctx, args[0])
 		var pool []val.Value
@@ -319,7 +325,8 @@ func (e *Engine) createItertoolsModule() val.Value {
 	// 8. combinations(iterable, r)
 	mod.Dict.Set(val.InternString("combinations"), val.NewBuiltinFuncVal("combinations", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: combinations() takes exactly 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "combinations() takes exactly 2 arguments"))
+			return val.NoneVal()
 		}
 		it := iterFor(ctx, args[0])
 		var pool []val.Value
@@ -375,7 +382,8 @@ func (e *Engine) createItertoolsModule() val.Value {
 	// 9. groupby(iterable, key=None)
 	mod.Dict.Set(val.InternString("groupby"), val.NewBuiltinFuncVal("groupby", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: groupby() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "groupby() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		it := iterFor(ctx, args[0])
 		keyFn := val.NoneVal()
@@ -437,7 +445,8 @@ func (e *Engine) createItertoolsModule() val.Value {
 	// 10. accumulate, compress, dropwhile, takewhile, filterfalse, starmap, pairwise, zip_longest
 	mod.Dict.Set(val.InternString("accumulate"), val.NewBuiltinFuncVal("accumulate", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: accumulate() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "accumulate() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		it := iterFor(ctx, args[0])
 		fn := val.NoneVal()
@@ -467,7 +476,8 @@ func (e *Engine) createItertoolsModule() val.Value {
 
 	mod.Dict.Set(val.InternString("compress"), val.NewBuiltinFuncVal("compress", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: compress() takes exactly 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "compress() takes exactly 2 arguments"))
+			return val.NoneVal()
 		}
 		dataIt := iterFor(ctx, args[0])
 		selIt := iterFor(ctx, args[1])
@@ -487,7 +497,8 @@ func (e *Engine) createItertoolsModule() val.Value {
 
 	mod.Dict.Set(val.InternString("dropwhile"), val.NewBuiltinFuncVal("dropwhile", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: dropwhile() takes exactly 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "dropwhile() takes exactly 2 arguments"))
+			return val.NoneVal()
 		}
 		pred := args[0]
 		it := iterFor(ctx, args[1])
@@ -512,7 +523,8 @@ func (e *Engine) createItertoolsModule() val.Value {
 
 	mod.Dict.Set(val.InternString("takewhile"), val.NewBuiltinFuncVal("takewhile", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: takewhile() takes exactly 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "takewhile() takes exactly 2 arguments"))
+			return val.NoneVal()
 		}
 		pred := args[0]
 		it := iterFor(ctx, args[1])
@@ -535,7 +547,8 @@ func (e *Engine) createItertoolsModule() val.Value {
 
 	mod.Dict.Set(val.InternString("filterfalse"), val.NewBuiltinFuncVal("filterfalse", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: filterfalse() takes exactly 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "filterfalse() takes exactly 2 arguments"))
+			return val.NoneVal()
 		}
 		pred := args[0]
 		it := iterFor(ctx, args[1])
@@ -560,7 +573,8 @@ func (e *Engine) createItertoolsModule() val.Value {
 
 	mod.Dict.Set(val.InternString("starmap"), val.NewBuiltinFuncVal("starmap", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: starmap() takes exactly 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "starmap() takes exactly 2 arguments"))
+			return val.NoneVal()
 		}
 		fn := args[0]
 		it := iterFor(ctx, args[1])
@@ -591,7 +605,8 @@ func (e *Engine) createItertoolsModule() val.Value {
 
 	mod.Dict.Set(val.InternString("pairwise"), val.NewBuiltinFuncVal("pairwise", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: pairwise() takes exactly 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "pairwise() takes exactly 1 argument"))
+			return val.NoneVal()
 		}
 		it := iterFor(ctx, args[0])
 		prev, ok := it.Next()
@@ -612,12 +627,14 @@ func (e *Engine) createItertoolsModule() val.Value {
 	// batched(iterable, n, *, strict=False)
 	mod.Dict.Set(val.InternString("batched"), val.NewBuiltinFuncVal("batched", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: batched() missing required arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "batched() missing required arguments"))
+			return val.NoneVal()
 		}
 		it := iterFor(ctx, args[0])
 		n := int(args[1].AsInt64())
 		if n < 1 {
-			panic("ValueError: n must be at least one")
+			ctx.Raise(val.NewException(val.ValueErrorType, "n must be at least one"))
+			return val.NoneVal()
 		}
 		strict := false
 		if v, ok := kwArg(args, kwnames, "strict"); ok {
@@ -636,7 +653,8 @@ func (e *Engine) createItertoolsModule() val.Value {
 				return val.NoneVal(), false
 			}
 			if strict && len(batch) < n {
-				panic("ValueError: batched(): incomplete batch")
+				ctx.Raise(val.NewException(val.ValueErrorType, "batched(): incomplete batch"))
+				return val.NoneVal(), false
 			}
 			return val.NewTupleVal(batch...), true
 		})
@@ -695,13 +713,15 @@ func (e *Engine) createItertoolsModule() val.Value {
 	// tee(iterable, n=2)
 	mod.Dict.Set(val.InternString("tee"), val.NewBuiltinFuncVal("tee", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: tee() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "tee() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		n := int64(2)
 		if len(args) > 1 && args[1].IsInt64() {
 			n = args[1].AsInt64()
 			if n < 0 {
-				panic("ValueError: n must be >= 0")
+				ctx.Raise(val.NewException(val.ValueErrorType, "n must be >= 0"))
+				return val.NoneVal()
 			}
 		}
 		if n == 0 {

@@ -130,12 +130,14 @@ func (e *Engine) createWeakrefCModule() val.Value {
 	// _weakref.ref(ob, callback=None)
 	refFn := val.NewBuiltinFuncVal("ref", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: ref() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "ref() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		ob := args[0]
 		hdr := ob.HeaderPtr()
 		if hdr == nil {
-			panic("TypeError: cannot create weak reference to '" + ob.Type().Name + "' object")
+			ctx.Raise(val.NewException(val.TypeErrorType, "cannot create weak reference to '"+ob.Type().Name+"' object"))
+			return val.NoneVal()
 		}
 		callback := val.NoneVal()
 		if len(args) > 1 {
@@ -168,12 +170,14 @@ func (e *Engine) createWeakrefCModule() val.Value {
 	// _weakref.proxy(ob, callback=None)
 	proxyFn := val.NewBuiltinFuncVal("proxy", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: proxy() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "proxy() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		ob := args[0]
 		hdr := ob.HeaderPtr()
 		if hdr == nil {
-			panic("TypeError: cannot create weak reference to '" + ob.Type().Name + "' object")
+			ctx.Raise(val.NewException(val.TypeErrorType, "cannot create weak reference to '"+ob.Type().Name+"' object"))
+			return val.NoneVal()
 		}
 		callback := val.NoneVal()
 		if len(args) > 1 {
@@ -207,7 +211,8 @@ func (e *Engine) createWeakrefCModule() val.Value {
 	// getweakrefcount(ob)
 	mod.Dict.Set(val.InternString("getweakrefcount"), val.NewBuiltinFuncVal("getweakrefcount", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: getweakrefcount() takes exactly 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "getweakrefcount() takes exactly 1 argument"))
+			return val.NoneVal()
 		}
 		hdr := args[0].HeaderPtr()
 		if hdr == nil {
@@ -220,7 +225,8 @@ func (e *Engine) createWeakrefCModule() val.Value {
 	// getweakrefs(ob)
 	mod.Dict.Set(val.InternString("getweakrefs"), val.NewBuiltinFuncVal("getweakrefs", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: getweakrefs() takes exactly 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "getweakrefs() takes exactly 1 argument"))
+			return val.NoneVal()
 		}
 		hdr := args[0].HeaderPtr()
 		if hdr == nil {
@@ -237,7 +243,8 @@ func (e *Engine) createWeakrefCModule() val.Value {
 	// _remove_dead_weakref(dict, key)
 	mod.Dict.Set(val.InternString("_remove_dead_weakref"), val.NewBuiltinFuncVal("_remove_dead_weakref", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: _remove_dead_weakref() takes exactly 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "_remove_dead_weakref() takes exactly 2 arguments"))
+			return val.NoneVal()
 		}
 		d := args[0]
 		key := args[1]
@@ -260,7 +267,8 @@ func initWeakrefTypes(e *Engine) {
 
 		WeakKeyDictionaryType.Dict.Set(val.InternString("__init__"), val.NewBuiltinFuncVal("__init__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: __init__() missing 1 required positional argument: 'self'")
+				ctx.Raise(val.NewException(val.TypeErrorType, "__init__() missing 1 required positional argument: 'self'"))
+				return val.NoneVal()
 			}
 			self := args[0]
 			dataDict := val.NewDictVal(16)
@@ -277,7 +285,8 @@ func initWeakrefTypes(e *Engine) {
 
 		WeakKeyDictionaryType.Dict.Set(val.InternString("__getitem__"), val.NewBuiltinFuncVal("__getitem__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: __getitem__() requires self and key")
+				ctx.Raise(val.NewException(val.TypeErrorType, "__getitem__() requires self and key"))
+				return val.NoneVal()
 			}
 			self := args[0]
 			key := args[1]
@@ -285,27 +294,31 @@ func initWeakrefTypes(e *Engine) {
 
 			hdr := key.HeaderPtr()
 			if hdr == nil {
-				panic("KeyError: " + key.String())
+				ctx.Raise(val.NewException(val.KeyErrorType, key.String()))
+				return val.NoneVal()
 			}
 			addr := uintptr(unsafe.Pointer(hdr))
 			valKey := val.Int64Val(int64(addr))
 			res, ok := data.Get(valKey)
 			if !ok {
-				panic("KeyError: " + key.String())
+				ctx.Raise(val.NewException(val.KeyErrorType, key.String()))
+				return val.NoneVal()
 			}
 			return res
 		}))
 
 		WeakKeyDictionaryType.Dict.Set(val.InternString("__setitem__"), val.NewBuiltinFuncVal("__setitem__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 3 {
-				panic("TypeError: __setitem__() requires self, key, and value")
+				ctx.Raise(val.NewException(val.TypeErrorType, "__setitem__() requires self, key, and value"))
+				return val.NoneVal()
 			}
 			self := args[0]
 			key := args[1]
 			valToSet := args[2]
 			hdr := key.HeaderPtr()
 			if hdr == nil {
-				panic("TypeError: cannot create weak reference to '" + key.Type().Name + "' object")
+				ctx.Raise(val.NewException(val.TypeErrorType, "cannot create weak reference to '"+key.Type().Name+"' object"))
+				return val.NoneVal()
 			}
 			data := val.GetAttrCtx(ctx, self, dataKey).AsDict()
 			addr := uintptr(unsafe.Pointer(hdr))
@@ -319,19 +332,22 @@ func initWeakrefTypes(e *Engine) {
 
 		WeakKeyDictionaryType.Dict.Set(val.InternString("__delitem__"), val.NewBuiltinFuncVal("__delitem__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: __delitem__() requires self and key")
+				ctx.Raise(val.NewException(val.TypeErrorType, "__delitem__() requires self and key"))
+				return val.NoneVal()
 			}
 			self := args[0]
 			key := args[1]
 			hdr := key.HeaderPtr()
 			if hdr == nil {
-				panic("KeyError: " + key.String())
+				ctx.Raise(val.NewException(val.KeyErrorType, key.String()))
+				return val.NoneVal()
 			}
 			data := val.GetAttrCtx(ctx, self, dataKey).AsDict()
 			addr := uintptr(unsafe.Pointer(hdr))
 			valKey := val.Int64Val(int64(addr))
 			if !data.Delete(valKey) {
-				panic("KeyError: " + key.String())
+				ctx.Raise(val.NewException(val.KeyErrorType, key.String()))
+				return val.NoneVal()
 			}
 			return val.NoneVal()
 		}))
@@ -362,7 +378,8 @@ func initWeakrefTypes(e *Engine) {
 
 		WeakKeyDictionaryType.Dict.Set(val.InternString("get"), val.NewBuiltinFuncVal("get", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: get() requires at least key argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "get() requires at least key argument"))
+				return val.NoneVal()
 			}
 			self := args[0]
 			key := args[1]
@@ -399,7 +416,8 @@ func initWeakrefTypes(e *Engine) {
 
 		WeakValueDictionaryType.Dict.Set(val.InternString("__init__"), val.NewBuiltinFuncVal("__init__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: __init__() missing 1 required positional argument: 'self'")
+				ctx.Raise(val.NewException(val.TypeErrorType, "__init__() missing 1 required positional argument: 'self'"))
+				return val.NoneVal()
 			}
 			self := args[0]
 			dataDict := val.NewDictVal(16)
@@ -416,14 +434,16 @@ func initWeakrefTypes(e *Engine) {
 
 		WeakValueDictionaryType.Dict.Set(val.InternString("__getitem__"), val.NewBuiltinFuncVal("__getitem__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: __getitem__() requires self and key")
+				ctx.Raise(val.NewException(val.TypeErrorType, "__getitem__() requires self and key"))
+				return val.NoneVal()
 			}
 			self := args[0]
 			key := args[1]
 			data := val.GetAttrCtx(ctx, self, dataKey).AsDict()
 			wrVal, ok := data.Get(key)
 			if !ok {
-				panic("KeyError: " + key.String())
+				ctx.Raise(val.NewException(val.KeyErrorType, key.String()))
+				return val.NoneVal()
 			}
 			if !wrVal.IsWeakRef() {
 				return wrVal
@@ -431,7 +451,8 @@ func initWeakrefTypes(e *Engine) {
 			res := wrVal.AsWeakRef().WP.Value()
 			if res == nil {
 				data.Delete(key)
-				panic("KeyError: " + key.String())
+				ctx.Raise(val.NewException(val.KeyErrorType, key.String()))
+				return val.NoneVal()
 			}
 			return val.ObjectVal(res)
 		}))
@@ -449,14 +470,16 @@ func initWeakrefTypes(e *Engine) {
 
 		WeakValueDictionaryType.Dict.Set(val.InternString("__setitem__"), val.NewBuiltinFuncVal("__setitem__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 3 {
-				panic("TypeError: __setitem__() requires self, key, and value")
+				ctx.Raise(val.NewException(val.TypeErrorType, "__setitem__() requires self, key, and value"))
+				return val.NoneVal()
 			}
 			self := args[0]
 			key := args[1]
 			targetVal := args[2]
 			hdr := targetVal.HeaderPtr()
 			if hdr == nil {
-				panic("TypeError: cannot create weak reference to '" + targetVal.Type().Name + "' object")
+				ctx.Raise(val.NewException(val.TypeErrorType, "cannot create weak reference to '"+targetVal.Type().Name+"' object"))
+				return val.NoneVal()
 			}
 			data := val.GetAttrCtx(ctx, self, dataKey).AsDict()
 			pyRef := &val.PyWeakRef{
@@ -472,13 +495,15 @@ func initWeakrefTypes(e *Engine) {
 
 		WeakValueDictionaryType.Dict.Set(val.InternString("__delitem__"), val.NewBuiltinFuncVal("__delitem__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: __delitem__() requires self and key")
+				ctx.Raise(val.NewException(val.TypeErrorType, "__delitem__() requires self and key"))
+				return val.NoneVal()
 			}
 			self := args[0]
 			key := args[1]
 			data := val.GetAttrCtx(ctx, self, dataKey).AsDict()
 			if !data.Delete(key) {
-				panic("KeyError: " + key.String())
+				ctx.Raise(val.NewException(val.KeyErrorType, key.String()))
+				return val.NoneVal()
 			}
 			return val.NoneVal()
 		}))
@@ -510,7 +535,8 @@ func initWeakrefTypes(e *Engine) {
 
 		WeakValueDictionaryType.Dict.Set(val.InternString("get"), val.NewBuiltinFuncVal("get", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: get() requires at least key argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "get() requires at least key argument"))
+				return val.NoneVal()
 			}
 			self := args[0]
 			key := args[1]
@@ -551,7 +577,8 @@ func initWeakrefTypes(e *Engine) {
 
 		WeakSetType.Dict.Set(val.InternString("__init__"), val.NewBuiltinFuncVal("__init__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: __init__() missing 1 required positional argument: 'self'")
+				ctx.Raise(val.NewException(val.TypeErrorType, "__init__() missing 1 required positional argument: 'self'"))
+				return val.NoneVal()
 			}
 			self := args[0]
 			dataDict := val.NewDictVal(16)
@@ -569,13 +596,15 @@ func initWeakrefTypes(e *Engine) {
 
 		WeakSetType.Dict.Set(val.InternString("add"), val.NewBuiltinFuncVal("add", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: add() requires self and item")
+				ctx.Raise(val.NewException(val.TypeErrorType, "add() requires self and item"))
+				return val.NoneVal()
 			}
 			self := args[0]
 			item := args[1]
 			hdr := item.HeaderPtr()
 			if hdr == nil {
-				panic("TypeError: cannot create weak reference to '" + item.Type().Name + "' object")
+				ctx.Raise(val.NewException(val.TypeErrorType, "cannot create weak reference to '"+item.Type().Name+"' object"))
+				return val.NoneVal()
 			}
 			data := val.GetAttrCtx(ctx, self, dataKey).AsDict()
 			addr := uintptr(unsafe.Pointer(hdr))
@@ -636,14 +665,16 @@ func initWeakrefTypes(e *Engine) {
 
 		FinalizeType.Dict.Set(val.InternString("__init__"), val.NewBuiltinFuncVal("__init__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 3 {
-				panic("TypeError: finalize() requires self, obj, and func")
+				ctx.Raise(val.NewException(val.TypeErrorType, "finalize() requires self, obj, and func"))
+				return val.NoneVal()
 			}
 			self := args[0]
 			obj := args[1]
 			fn := args[2]
 			hdr := obj.HeaderPtr()
 			if hdr == nil {
-				panic("TypeError: cannot create weak reference to '" + obj.Type().Name + "' object")
+				ctx.Raise(val.NewException(val.TypeErrorType, "cannot create weak reference to '"+obj.Type().Name+"' object"))
+				return val.NoneVal()
 			}
 
 			val.SetAttrCtx(ctx, self, aliveKey, val.BoolVal(true))

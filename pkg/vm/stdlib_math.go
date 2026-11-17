@@ -61,7 +61,8 @@ func (e *Engine) createMathModule() val.Value {
 	registerUnary := func(name string, fn func(float64) float64) {
 		mod.Dict.Set(val.InternString(name), val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: " + name + "() takes exactly one argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, name+"() takes exactly one argument"))
+				return val.NoneVal()
 			}
 			x := toFloat(args[0])
 			return val.Float64Val(fn(x))
@@ -82,21 +83,24 @@ func (e *Engine) createMathModule() val.Value {
 
 	mod.Dict.Set(val.InternString("floor"), val.NewBuiltinFuncVal("floor", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: floor() takes exactly one argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "floor() takes exactly one argument"))
+			return val.NoneVal()
 		}
 		x := toFloat(args[0])
 		return val.Int64Val(int64(math.Floor(x)))
 	}))
 	mod.Dict.Set(val.InternString("ceil"), val.NewBuiltinFuncVal("ceil", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: ceil() takes exactly one argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "ceil() takes exactly one argument"))
+			return val.NoneVal()
 		}
 		x := toFloat(args[0])
 		return val.Int64Val(int64(math.Ceil(x)))
 	}))
 	mod.Dict.Set(val.InternString("trunc"), val.NewBuiltinFuncVal("trunc", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: trunc() takes exactly one argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "trunc() takes exactly one argument"))
+			return val.NoneVal()
 		}
 		x := toFloat(args[0])
 		return val.Int64Val(int64(math.Trunc(x)))
@@ -112,7 +116,8 @@ func (e *Engine) createMathModule() val.Value {
 	registerBinary := func(name string, fn func(float64, float64) float64) {
 		mod.Dict.Set(val.InternString(name), val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic("TypeError: " + name + "() takes exactly 2 arguments")
+				ctx.Raise(val.NewException(val.TypeErrorType, name+"() takes exactly 2 arguments"))
+				return val.NoneVal()
 			}
 			return val.Float64Val(fn(toFloat(args[0]), toFloat(args[1])))
 		}))
@@ -132,7 +137,8 @@ func (e *Engine) createMathModule() val.Value {
 	// is accurate even for a long series of inexact values.
 	mod.Dict.Set(val.InternString("fsum"), val.NewBuiltinFuncVal("fsum", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: fsum() takes at least one argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "fsum() takes at least one argument"))
+			return val.NoneVal()
 		}
 		return val.Float64Val(mathFsum(ctx, args[0]))
 	}))
@@ -140,7 +146,8 @@ func (e *Engine) createMathModule() val.Value {
 	// sumprod sums the products of the values taken from the iterables.
 	mod.Dict.Set(val.InternString("sumprod"), val.NewBuiltinFuncVal("sumprod", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: sumprod() takes at least one argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "sumprod() takes at least one argument"))
+			return val.NoneVal()
 		}
 		return val.Float64Val(mathSumprod(ctx, args))
 	}))
@@ -148,7 +155,8 @@ func (e *Engine) createMathModule() val.Value {
 	// log(x[, base])
 	mod.Dict.Set(val.InternString("log"), val.NewBuiltinFuncVal("log", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: log() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "log() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		x := toFloat(args[0])
 		if len(args) == 1 {
@@ -161,7 +169,8 @@ func (e *Engine) createMathModule() val.Value {
 	// pow(x, y)
 	mod.Dict.Set(val.InternString("pow"), val.NewBuiltinFuncVal("pow", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: pow() takes exactly 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "pow() takes exactly 2 arguments"))
+			return val.NoneVal()
 		}
 		x := toFloat(args[0])
 		y := toFloat(args[1])
@@ -171,7 +180,8 @@ func (e *Engine) createMathModule() val.Value {
 	// atan2(y, x)
 	mod.Dict.Set(val.InternString("atan2"), val.NewBuiltinFuncVal("atan2", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: atan2() takes exactly 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "atan2() takes exactly 2 arguments"))
+			return val.NoneVal()
 		}
 		y := toFloat(args[0])
 		x := toFloat(args[1])
@@ -181,7 +191,8 @@ func (e *Engine) createMathModule() val.Value {
 	// copysign(x, y)
 	mod.Dict.Set(val.InternString("copysign"), val.NewBuiltinFuncVal("copysign", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: copysign() takes exactly 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "copysign() takes exactly 2 arguments"))
+			return val.NoneVal()
 		}
 		x := toFloat(args[0])
 		y := toFloat(args[1])
@@ -191,7 +202,8 @@ func (e *Engine) createMathModule() val.Value {
 	// fmod(x, y)
 	mod.Dict.Set(val.InternString("fmod"), val.NewBuiltinFuncVal("fmod", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: fmod() takes exactly 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "fmod() takes exactly 2 arguments"))
+			return val.NoneVal()
 		}
 		x := toFloat(args[0])
 		y := toFloat(args[1])
@@ -201,7 +213,8 @@ func (e *Engine) createMathModule() val.Value {
 	// hypot(x, y)
 	mod.Dict.Set(val.InternString("hypot"), val.NewBuiltinFuncVal("hypot", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: hypot() takes at least 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "hypot() takes at least 2 arguments"))
+			return val.NoneVal()
 		}
 		x := toFloat(args[0])
 		y := toFloat(args[1])
@@ -211,7 +224,8 @@ func (e *Engine) createMathModule() val.Value {
 	// radians / degrees
 	mod.Dict.Set(val.InternString("radians"), val.NewBuiltinFuncVal("radians", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: radians() takes exactly one argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "radians() takes exactly one argument"))
+			return val.NoneVal()
 		}
 		deg := toFloat(args[0])
 		return val.Float64Val(deg * (math.Pi / 180.0))
@@ -219,7 +233,8 @@ func (e *Engine) createMathModule() val.Value {
 
 	mod.Dict.Set(val.InternString("degrees"), val.NewBuiltinFuncVal("degrees", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: degrees() takes exactly one argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "degrees() takes exactly one argument"))
+			return val.NoneVal()
 		}
 		rad := toFloat(args[0])
 		return val.Float64Val(rad * (180.0 / math.Pi))
@@ -228,21 +243,24 @@ func (e *Engine) createMathModule() val.Value {
 	// isinf, isnan, isfinite
 	mod.Dict.Set(val.InternString("isinf"), val.NewBuiltinFuncVal("isinf", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: isinf() takes exactly one argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "isinf() takes exactly one argument"))
+			return val.NoneVal()
 		}
 		return val.BoolVal(math.IsInf(toFloat(args[0]), 0))
 	}))
 
 	mod.Dict.Set(val.InternString("isnan"), val.NewBuiltinFuncVal("isnan", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: isnan() takes exactly one argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "isnan() takes exactly one argument"))
+			return val.NoneVal()
 		}
 		return val.BoolVal(math.IsNaN(toFloat(args[0])))
 	}))
 
 	mod.Dict.Set(val.InternString("isfinite"), val.NewBuiltinFuncVal("isfinite", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: isfinite() takes exactly one argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "isfinite() takes exactly one argument"))
+			return val.NoneVal()
 		}
 		f := toFloat(args[0])
 		return val.BoolVal(!math.IsNaN(f) && !math.IsInf(f, 0))
@@ -287,11 +305,13 @@ func (e *Engine) createMathModule() val.Value {
 	// isqrt(n)
 	mod.Dict.Set(val.InternString("isqrt"), val.NewBuiltinFuncVal("isqrt", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: isqrt() takes exactly one argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "isqrt() takes exactly one argument"))
+			return val.NoneVal()
 		}
 		n := toBigInt(args[0])
 		if n.Sign() < 0 {
-			panic("ValueError: isqrt() argument must be nonnegative")
+			ctx.Raise(val.NewException(val.ValueErrorType, "isqrt() argument must be nonnegative"))
+			return val.NoneVal()
 		}
 		res := new(big.Int).Sqrt(n)
 		return bigIntToVal(res)
@@ -300,7 +320,8 @@ func (e *Engine) createMathModule() val.Value {
 	// frexp(x)
 	mod.Dict.Set(val.InternString("frexp"), val.NewBuiltinFuncVal("frexp", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: frexp() takes exactly one argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "frexp() takes exactly one argument"))
+			return val.NoneVal()
 		}
 		x := toFloat(args[0])
 		m, e := math.Frexp(x)
@@ -310,7 +331,8 @@ func (e *Engine) createMathModule() val.Value {
 	// ldexp(m, e)
 	mod.Dict.Set(val.InternString("ldexp"), val.NewBuiltinFuncVal("ldexp", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: ldexp() takes exactly 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "ldexp() takes exactly 2 arguments"))
+			return val.NoneVal()
 		}
 		x := toFloat(args[0])
 		e := args[1].AsInt64()
@@ -320,7 +342,8 @@ func (e *Engine) createMathModule() val.Value {
 	// modf(x)
 	mod.Dict.Set(val.InternString("modf"), val.NewBuiltinFuncVal("modf", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: modf() takes exactly one argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "modf() takes exactly one argument"))
+			return val.NoneVal()
 		}
 		x := toFloat(args[0])
 		intPart, fracPart := math.Modf(x)
@@ -330,7 +353,8 @@ func (e *Engine) createMathModule() val.Value {
 	// nextafter(x, y)
 	mod.Dict.Set(val.InternString("nextafter"), val.NewBuiltinFuncVal("nextafter", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: nextafter() takes exactly 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "nextafter() takes exactly 2 arguments"))
+			return val.NoneVal()
 		}
 		x := toFloat(args[0])
 		y := toFloat(args[1])
@@ -340,7 +364,8 @@ func (e *Engine) createMathModule() val.Value {
 	// ulp(x)
 	mod.Dict.Set(val.InternString("ulp"), val.NewBuiltinFuncVal("ulp", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: ulp() takes exactly one argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "ulp() takes exactly one argument"))
+			return val.NoneVal()
 		}
 		x := toFloat(args[0])
 		if math.IsNaN(x) {
@@ -363,11 +388,13 @@ func (e *Engine) createMathModule() val.Value {
 	// factorial(n)
 	mod.Dict.Set(val.InternString("factorial"), val.NewBuiltinFuncVal("factorial", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: factorial() takes exactly one argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "factorial() takes exactly one argument"))
+			return val.NoneVal()
 		}
 		n := args[0].AsInt64()
 		if n < 0 {
-			panic("ValueError: factorial() not defined for negative values")
+			ctx.Raise(val.NewException(val.ValueErrorType, "factorial() not defined for negative values"))
+			return val.NoneVal()
 		}
 		res := int64(1)
 		for i := int64(2); i <= n; i++ {

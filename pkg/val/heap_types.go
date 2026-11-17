@@ -1576,11 +1576,52 @@ func NewValueError(msg string) Value {
 	return NewException(ValueErrorType, msg)
 }
 
-// NewKeyError constructs a KeyError instance.
+var (
+	excShapesOnce    sync.Once
+	lazyAttrErrShape *Shape
+	keyErrShape      *Shape
+	stopIterShape    *Shape
+	emptyTupleVal    Value
+)
+
+func typeRootShapeOrDefault(tp *PyType) *Shape {
+	if tp != nil && tp.RootShape != nil {
+		return tp.RootShape
+	}
+	return defaultRootShape
+}
+
+func initExcShapes() {
+	excShapesOnce.Do(func() {
+		lazyAttrErrShape = typeRootShapeOrDefault(AttributeErrorType).
+			Transition(strArgs).
+			Transition(strTraceback).
+			Transition(strLazyType).
+			Transition(strLazyAttr)
+		keyErrShape = typeRootShapeOrDefault(KeyErrorType).
+			Transition(strArgs).
+			Transition(strTraceback).
+			Transition(strLazyKey)
+		stopIterShape = typeRootShapeOrDefault(StopIterationType).
+			Transition(strArgs).
+			Transition(strTraceback).
+			Transition(strValue)
+		emptyTupleVal = NewTupleVal()
+	})
+}
+
+// NewKeyError constructs a KeyError instance lazily without allocating an args tuple until accessed.
 func NewKeyError(key Value) Value {
-	inst := NewInstanceOfType(KeyErrorType)
-	inst.AsInstance().SetAttr(strArgs, NewTupleVal(key))
-	return inst
+	initExcShapes()
+	obj := &PyInstance{
+		Header: ObjectHeader{Kind: KindInstance, Type: KeyErrorType},
+		Shape:  keyErrShape,
+	}
+	obj.Slots = obj.bootstrap[:3]
+	obj.Slots[0] = UnboundVal()
+	obj.Slots[1] = NoneVal()
+	obj.Slots[2] = key
+	return Value{num: 0, ptr: &obj.Header}
 }
 
 // NewIndexError constructs an IndexError instance.
@@ -1608,6 +1649,94 @@ func NewAttributeError(msg string) Value {
 	return NewException(AttributeErrorType, msg)
 }
 
+// NewLazyAttributeError constructs an AttributeError instance without eagerly
+// formatting or interning the error message string. The message is materialized
+// lazily only if .args or __str__() is accessed.
+func NewLazyAttributeError(targetType *PyType, attrName Value) Value {
+	initExcShapes()
+	obj := &PyInstance{
+		Header: ObjectHeader{Kind: KindInstance, Type: AttributeErrorType},
+		Shape:  lazyAttrErrShape,
+	}
+	obj.Slots = obj.bootstrap[:4]
+	obj.Slots[0] = UnboundVal()
+	obj.Slots[1] = NoneVal()
+	if targetType != nil {
+		obj.Slots[2] = TypeVal(targetType)
+	} else {
+		obj.Slots[2] = NoneVal()
+	}
+	obj.Slots[3] = attrName
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+// ExceptionArgs returns the exception's args tuple, lazily materializing it
+// for lazy AttributeError and KeyError instances.
+func ExceptionArgs(inst *PyInstance) (Value, bool) {
+	if inst == nil {
+		return Value{}, false
+	}
+	initExcShapes()
+	if inst.Shape == lazyAttrErrShape {
+		if !inst.Slots[0].IsUnbound() {
+			return inst.Slots[0], true
+		}
+		tpName := "object"
+		if inst.Slots[2].IsType() {
+			tpName = inst.Slots[2].AsType().Name
+		}
+		attrStr := ""
+		if inst.Slots[3].IsAnyString() {
+			attrStr = inst.Slots[3].AsString()
+		} else if !inst.Slots[3].IsNone() && !inst.Slots[3].IsUnbound() {
+			attrStr = inst.Slots[3].String()
+		}
+		msg := "'" + tpName + "' object has no attribute '" + attrStr + "'"
+		tup := NewTupleVal(NewStringVal(msg))
+		inst.Slots[0] = tup
+		return tup, true
+	}
+	if inst.Shape == keyErrShape {
+		if !inst.Slots[0].IsUnbound() {
+			return inst.Slots[0], true
+		}
+		tup := NewTupleVal(inst.Slots[2])
+		inst.Slots[0] = tup
+		return tup, true
+	}
+	if argsVal, ok := inst.GetAttr(strArgs); ok {
+		if argsVal.IsUnbound() {
+			// Check if lazy attributes were preserved across a shape transition (e.g. __traceback__ set).
+			if tpVal, ok1 := inst.GetAttr(strLazyType); ok1 {
+				if attrVal, ok2 := inst.GetAttr(strLazyAttr); ok2 {
+					tpName := "object"
+					if tpVal.IsType() {
+						tpName = tpVal.AsType().Name
+					}
+					attrStr := ""
+					if attrVal.IsAnyString() {
+						attrStr = attrVal.AsString()
+					} else if !attrVal.IsNone() && !attrVal.IsUnbound() {
+						attrStr = attrVal.String()
+					}
+					msg := "'" + tpName + "' object has no attribute '" + attrStr + "'"
+					tup := NewTupleVal(NewStringVal(msg))
+					inst.SetAttr(strArgs, tup)
+					return tup, true
+				}
+			}
+			if keyVal, ok1 := inst.GetAttr(strLazyKey); ok1 {
+				tup := NewTupleVal(keyVal)
+				inst.SetAttr(strArgs, tup)
+				return tup, true
+			}
+			return Value{}, false
+		}
+		return argsVal, true
+	}
+	return Value{}, false
+}
+
 // NewRuntimeError constructs a RuntimeError instance.
 func NewRuntimeError(msg string) Value {
 	return NewException(RuntimeErrorType, msg)
@@ -1625,15 +1754,21 @@ func NewModuleNotFoundError(msg string) Value {
 
 // NewStopIteration constructs a StopIteration instance.
 func NewStopIteration(retVal Value) Value {
-	inst := NewInstanceOfType(StopIterationType)
-	if !retVal.IsNone() && retVal.ptr != nil && retVal.ptr != &tagNone {
-		inst.AsInstance().SetAttr(InternString("args"), NewTupleVal(retVal))
-		inst.AsInstance().SetAttr(InternString("value"), retVal)
-	} else {
-		inst.AsInstance().SetAttr(InternString("args"), NewTupleVal())
-		inst.AsInstance().SetAttr(InternString("value"), NoneVal())
+	initExcShapes()
+	obj := &PyInstance{
+		Header: ObjectHeader{Kind: KindInstance, Type: StopIterationType},
+		Shape:  stopIterShape,
 	}
-	return inst
+	obj.Slots = obj.bootstrap[:3]
+	obj.Slots[1] = NoneVal()
+	if !retVal.IsNone() && retVal.ptr != nil && retVal.ptr != &tagNone {
+		obj.Slots[0] = NewTupleVal(retVal)
+		obj.Slots[2] = retVal
+	} else {
+		obj.Slots[0] = emptyTupleVal
+		obj.Slots[2] = NoneVal()
+	}
+	return Value{num: 0, ptr: &obj.Header}
 }
 
 func (d *PyDict) initTable(minEntries int) {
@@ -2482,6 +2617,10 @@ func NewTypeAliasTypeVal(name string, val Value, typeParams []Value) Value {
 // FormatValue formats a Value according to format specifier spec and optional conversion ('s', 'r', 'a').
 // Zero-allocation fast path for Int64, Float64, and strings.
 func FormatValue(v Value, spec string, conversion uint8) Value {
+	return FormatValueCtx(nil, v, spec, conversion)
+}
+
+func FormatValueCtx(ctx *ExecContext, v Value, spec string, conversion uint8) Value {
 	if conversion == 's' || conversion == 'r' || conversion == 'a' {
 		v = NewStringVal(v.String())
 	}
@@ -2513,17 +2652,17 @@ func FormatValue(v Value, spec string, conversion uint8) Value {
 
 	switch {
 	case v.IsInt64():
-		return NewStringVal(FormatInt64Spec(v.AsInt64(), spec))
+		return NewStringVal(FormatInt64SpecCtx(ctx, v.AsInt64(), spec))
 	case v.Kind() == KindBigInt:
-		return NewStringVal(FormatIntSpec(&v.AsBigInt().Val, spec))
+		return NewStringVal(FormatIntSpecCtx(ctx, &v.AsBigInt().Val, spec))
 	case v.IsBool():
-		return NewStringVal(FormatBoolSpec(v.AsBool(), spec))
+		return NewStringVal(FormatBoolSpecCtx(ctx, v.AsBool(), spec))
 	case v.IsFloat64():
-		return NewStringVal(FormatFloatSpec(v.AsFloat64(), spec))
+		return NewStringVal(FormatFloatSpecCtx(ctx, v.AsFloat64(), spec))
 	case v.IsAnyString():
-		return NewStringVal(FormatStrSpec(v.AsString(), spec))
+		return NewStringVal(FormatStrSpecCtx(ctx, v.AsString(), spec))
 	}
-	panic("TypeError: unsupported format string passed to " + v.Type().Name + ".__format__")
+	return RaiseTypeError(ctx, "unsupported format string passed to "+v.Type().Name+".__format__")
 }
 
 // FrameVM abstracts VM execution stack access for PyFrame and PyLocalsProxy.

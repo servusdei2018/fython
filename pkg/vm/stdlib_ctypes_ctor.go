@@ -84,7 +84,8 @@ func installSimpleCDataConstructor() {
 		// We reuse Slots.TpCall by calling it with (cls, args) as callable.
 		simpleCDataTyp.Dict.Set(val.InternString("__new__"), val.NewBuiltinFuncVal("_SimpleCData.__new__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 || !args[0].IsType() {
-				panic("TypeError: __new__() missing type")
+				ctx.Raise(val.NewException(val.TypeErrorType, "__new__() missing type"))
+				return val.NoneVal()
 			}
 			clsVal := args[0]
 			// Delegate to current TpCall implementation with cls as callable.
@@ -99,7 +100,8 @@ func installSimpleCDataConstructor() {
 	getter := val.NewBuiltinFuncVal("value.get", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		self := args[0]
 		if !isSimpleCData(self) {
-			panic("TypeError: value descriptor on wrong type")
+			ctx.Raise(val.NewException(val.TypeErrorType, "value descriptor on wrong type"))
+			return val.NoneVal()
 		}
 		sc := asSimpleCData(self)
 		code := typeCodeOf(val.TypeVal(self.Type()))
@@ -289,7 +291,8 @@ func installSimpleCDataConstructor() {
 					return val.NotImplementedVal()
 				}
 				if !n.IsInt64() {
-					panic("TypeError: array size must be int")
+					ctx.Raise(val.NewException(val.TypeErrorType, "array size must be int"))
+					return val.NoneVal()
 				}
 				return makeArrayType(clsVal, int(n.AsInt64()))
 			}))
@@ -310,7 +313,8 @@ func installStructureConstructor() {
 	// Set __new__ to delegate to TpCall so heap subclasses (via dunderNew) work.
 	structTyp.Dict.Set(val.InternString("__new__"), val.NewBuiltinFuncVal("Structure.__new__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 || !args[0].IsType() {
-			panic("TypeError: __new__() missing type")
+			ctx.Raise(val.NewException(val.TypeErrorType, "__new__() missing type"))
+			return val.NoneVal()
 		}
 		return structTyp.Slots.TpCall(ctx, args[0], args[1:], kwnames)
 	}))
@@ -369,7 +373,8 @@ func installStructureConstructor() {
 			}
 			return v
 		}
-		panic("AttributeError: '" + obj.Type().Name + "' object has no attribute '" + name.AsString() + "'")
+		ctx.Raise(val.NewException(val.AttributeErrorType, "'"+obj.Type().Name+"' object has no attribute '"+name.AsString()+"'"))
+		return val.NoneVal()
 	}))
 	structTyp.Dict.Set(val.InternString("__setattr__"), val.NewBuiltinFuncVal("Structure.__setattr__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		obj := args[0]
@@ -385,7 +390,8 @@ func installStructureConstructor() {
 				}
 			}
 		}
-		panic("AttributeError: '" + obj.Type().Name + "' object cannot set attribute '" + name.AsString() + "'")
+		ctx.Raise(val.NewException(val.AttributeErrorType, "'"+obj.Type().Name+"' object cannot set attribute '"+name.AsString()+"'"))
+		return val.NoneVal()
 	}))
 	structTyp.InvalidateVersion()
 }
@@ -516,7 +522,8 @@ func makeArrayType(itemType val.Value, count int) val.Value {
 			idx += arr.Count
 		}
 		if idx < 0 || idx >= arr.Count {
-			panic("IndexError: array index out of range")
+			ctx.Raise(val.NewException(val.IndexErrorType, "array index out of range"))
+			return val.NoneVal()
 		}
 		code := typeCodeOf(arr.ItemType)
 		elemSize := sizeofOfValue(arr.ItemType)
@@ -534,7 +541,8 @@ func makeArrayType(itemType val.Value, count int) val.Value {
 			idx += arr.Count
 		}
 		if idx < 0 || idx >= arr.Count {
-			panic("IndexError: array index out of range")
+			ctx.Raise(val.NewException(val.IndexErrorType, "array index out of range"))
+			return val.NoneVal()
 		}
 		elemSize := sizeofOfValue(arr.ItemType)
 		code := typeCodeOf(arr.ItemType)
@@ -582,7 +590,8 @@ func installCFuncPtrConstructor() {
 	cfuncPtrTyp.Dict.Set(val.InternString("__call__"), val.NewBuiltinFuncVal("CFuncPtr.__call__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		// args[0] is self (the funcptr instance) when called via __call__ dispatch.
 		if len(args) < 1 {
-			panic("TypeError: __call__() missing self")
+			ctx.Raise(val.NewException(val.TypeErrorType, "__call__() missing self"))
+			return val.NoneVal()
 		}
 		self := args[0]
 		callArgs := args[1:]
@@ -591,7 +600,8 @@ func installCFuncPtrConstructor() {
 	// __new__ for construction via type call (delegates to Slots.TpCall construction logic).
 	cfuncPtrTyp.Dict.Set(val.InternString("__new__"), val.NewBuiltinFuncVal("CFuncPtr.__new__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 || !args[0].IsType() {
-			panic("TypeError: __new__() missing type")
+			ctx.Raise(val.NewException(val.TypeErrorType, "__new__() missing type"))
+			return val.NoneVal()
 		}
 		clsVal := args[0]
 		// Direct construction (do NOT delegate to Slots.TpCall — it is dunderTpCallSlot for __call__ and would recurse).
@@ -742,7 +752,8 @@ func installCFuncPtrConstructor() {
 		if name.AsString() == "__class__" {
 			return val.TypeVal(obj.Type())
 		}
-		panic("AttributeError: '" + obj.Type().Name + "' object has no attribute '" + name.AsString() + "'")
+		ctx.Raise(val.NewException(val.AttributeErrorType, "'"+obj.Type().Name+"' object has no attribute '"+name.AsString()+"'"))
+		return val.NoneVal()
 	}))
 	cfuncPtrTyp.Dict.Set(val.InternString("__setattr__"), val.NewBuiltinFuncVal("CFuncPtr.__setattr__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		obj := args[0]
@@ -771,7 +782,8 @@ func installCFuncPtrConstructor() {
 				return val.NoneVal()
 			}
 		}
-		panic("AttributeError: '" + obj.Type().Name + "' object cannot set attribute '" + name.AsString() + "'")
+		ctx.Raise(val.NewException(val.AttributeErrorType, "'"+obj.Type().Name+"' object cannot set attribute '"+name.AsString()+"'"))
+		return val.NoneVal()
 	}))
 	cfuncPtrTyp.InvalidateVersion()
 	_ = cfuncPtrTyp
@@ -938,7 +950,8 @@ func installPointerConstructor() {
 	// __new__(cls, *args): LP_*() with 0 args -> null pointer; LP_*(obj) -> pointer to obj.
 	pointerTyp.Dict.Set(val.InternString("__new__"), val.NewBuiltinFuncVal("_Pointer.__new__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 || !args[0].IsType() {
-			panic("TypeError: __new__() missing type")
+			ctx.Raise(val.NewException(val.TypeErrorType, "__new__() missing type"))
+			return val.NoneVal()
 		}
 		cls := args[0].AsType()
 		obj := &pyCPointer{Type: cls}
@@ -963,7 +976,8 @@ func installPointerConstructor() {
 	getter := val.NewBuiltinFuncVal("contents.get", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		self := args[0]
 		if !isCPointer(self) {
-			panic("TypeError: contents descriptor on wrong type")
+			ctx.Raise(val.NewException(val.TypeErrorType, "contents descriptor on wrong type"))
+			return val.NoneVal()
 		}
 		fp := asCPointer(self)
 		// Determine pointed-to type from cls._type_.

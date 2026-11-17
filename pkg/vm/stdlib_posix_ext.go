@@ -25,7 +25,8 @@ func pyFD(ctx *val.ExecContext, v val.Value) int {
 			}
 		}
 	}
-	panic("TypeError: argument should be an integer, or have a fileno() method")
+	ctx.Raise(val.NewException(val.TypeErrorType, "argument should be an integer, or have a fileno() method"))
+	return 0
 }
 
 // pyInt extracts a Python integer argument.
@@ -186,7 +187,8 @@ func (e *Engine) createTermiosModule() val.Value {
 		fd := pyFD(ctx, args[0])
 		t, err := unix.IoctlGetTermios(fd, unix.TCGETS)
 		if err != nil {
-			panic("OSError: " + err.Error())
+			ctx.Raise(val.NewException(val.OSErrorType, err.Error()))
+			return val.NoneVal()
 		}
 		cc := make([]val.Value, len(t.Cc))
 		for i, b := range t.Cc {
@@ -205,16 +207,19 @@ func (e *Engine) createTermiosModule() val.Value {
 
 	mod.Dict.Set(val.InternString("tcsetattr"), val.NewBuiltinFuncVal("tcsetattr", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 3 {
-			panic("TypeError: tcsetattr() takes 3 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "tcsetattr() takes 3 arguments"))
+			return val.NoneVal()
 		}
 		fd := pyFD(ctx, args[0])
 		when := pyInt(args, 1, "tcsetattr")
 		items := pySeqItems(args[2])
 		if items == nil {
-			panic("TypeError: tcsetattr() attribute list must be a list or a tuple")
+			ctx.Raise(val.NewException(val.TypeErrorType, "tcsetattr() attribute list must be a list or a tuple"))
+			return val.NoneVal()
 		}
 		if len(items) != 7 {
-			panic("ValueError: tcsetattr() attribute list must have 7 elements")
+			ctx.Raise(val.NewException(val.ValueErrorType, "tcsetattr() attribute list must have 7 elements"))
+			return val.NoneVal()
 		}
 		t := &unix.Termios{}
 		t.Iflag = uint32(items[0].AsInt64())
@@ -238,10 +243,12 @@ func (e *Engine) createTermiosModule() val.Value {
 		case 2:
 			err = unix.IoctlSetTermios(fd, unix.TCSETSF, t)
 		default:
-			panic("ValueError: tcsetattr() when must be TCSANOW, TCSADRAIN or TCSAFLUSH")
+			ctx.Raise(val.NewException(val.ValueErrorType, "tcsetattr() when must be TCSANOW, TCSADRAIN or TCSAFLUSH"))
+			return val.NoneVal()
 		}
 		if err != nil {
-			panic("OSError: " + err.Error())
+			ctx.Raise(val.NewException(val.OSErrorType, err.Error()))
+			return val.NoneVal()
 		}
 		return val.NoneVal()
 	}))
@@ -250,20 +257,23 @@ func (e *Engine) createTermiosModule() val.Value {
 		fd := pyFD(ctx, args[0])
 		ws, err := unix.IoctlGetWinsize(fd, unix.TIOCGWINSZ)
 		if err != nil {
-			panic("OSError: " + err.Error())
+			ctx.Raise(val.NewException(val.OSErrorType, err.Error()))
+			return val.NoneVal()
 		}
 		return val.NewTupleVal(val.Int64Val(int64(ws.Row)), val.Int64Val(int64(ws.Col)))
 	}))
 
 	mod.Dict.Set(val.InternString("tcsetwinsize"), val.NewBuiltinFuncVal("tcsetwinsize", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 3 {
-			panic("TypeError: tcsetwinsize() takes 3 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "tcsetwinsize() takes 3 arguments"))
+			return val.NoneVal()
 		}
 		fd := pyFD(ctx, args[0])
 		rows := uint16(pyInt(args, 1, "tcsetwinsize"))
 		cols := uint16(pyInt(args, 2, "tcsetwinsize"))
 		if err := unix.IoctlSetWinsize(fd, unix.TIOCSWINSZ, &unix.Winsize{Row: rows, Col: cols}); err != nil {
-			panic("OSError: " + err.Error())
+			ctx.Raise(val.NewException(val.OSErrorType, err.Error()))
+			return val.NoneVal()
 		}
 		return val.NoneVal()
 	}))
@@ -299,7 +309,8 @@ func (e *Engine) createFcntlModule() val.Value {
 
 	mod.Dict.Set(val.InternString("fcntl"), val.NewBuiltinFuncVal("fcntl", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: fcntl() takes at least 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "fcntl() takes at least 2 arguments"))
+			return val.NoneVal()
 		}
 		fd := pyFD(ctx, args[0])
 		op := pyInt(args, 1, "fcntl")
@@ -307,47 +318,57 @@ func (e *Engine) createFcntlModule() val.Value {
 		case unix.F_GETFD:
 			res, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
 			if err != nil {
-				panic("OSError: " + err.Error())
+				ctx.Raise(val.NewException(val.OSErrorType, err.Error()))
+				return val.NoneVal()
 			}
 			return val.Int64Val(int64(res))
 		case unix.F_SETFD:
 			if len(args) < 3 {
-				panic("TypeError: fcntl() missing argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "fcntl() missing argument"))
+				return val.NoneVal()
 			}
 			if _, err := unix.FcntlInt(uintptr(fd), unix.F_SETFD, pyInt(args, 2, "fcntl")); err != nil {
-				panic("OSError: " + err.Error())
+				ctx.Raise(val.NewException(val.OSErrorType, err.Error()))
+				return val.NoneVal()
 			}
 			return val.Int64Val(0)
 		case unix.F_GETFL:
 			res, err := unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0)
 			if err != nil {
-				panic("OSError: " + err.Error())
+				ctx.Raise(val.NewException(val.OSErrorType, err.Error()))
+				return val.NoneVal()
 			}
 			return val.Int64Val(int64(res))
 		case unix.F_SETFL:
 			if len(args) < 3 {
-				panic("TypeError: fcntl() missing argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "fcntl() missing argument"))
+				return val.NoneVal()
 			}
 			if _, err := unix.FcntlInt(uintptr(fd), unix.F_SETFL, pyInt(args, 2, "fcntl")); err != nil {
-				panic("OSError: " + err.Error())
+				ctx.Raise(val.NewException(val.OSErrorType, err.Error()))
+				return val.NoneVal()
 			}
 			return val.Int64Val(0)
 		case unix.F_DUPFD:
 			if len(args) < 3 {
-				panic("TypeError: fcntl() missing argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "fcntl() missing argument"))
+				return val.NoneVal()
 			}
 			res, err := unix.FcntlInt(uintptr(fd), unix.F_DUPFD, pyInt(args, 2, "fcntl"))
 			if err != nil {
-				panic("OSError: " + err.Error())
+				ctx.Raise(val.NewException(val.OSErrorType, err.Error()))
+				return val.NoneVal()
 			}
 			return val.Int64Val(int64(res))
 		case unix.F_GETLK, unix.F_SETLK, unix.F_SETLKW:
 			if len(args) < 3 {
-				panic("TypeError: fcntl() missing argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "fcntl() missing argument"))
+				return val.NoneVal()
 			}
 			items := pySeqItems(args[2])
 			if len(items) < 3 {
-				panic("ValueError: fcntl() lock must have at least 3 elements")
+				ctx.Raise(val.NewException(val.ValueErrorType, "fcntl() lock must have at least 3 elements"))
+				return val.NoneVal()
 			}
 			lk := unix.Flock_t{
 				Type:   int16(items[0].AsInt64()),
@@ -359,7 +380,8 @@ func (e *Engine) createFcntlModule() val.Value {
 			}
 			if op == unix.F_GETLK {
 				if err := unix.FcntlFlock(uintptr(fd), unix.F_GETLK, &lk); err != nil {
-					panic("OSError: " + err.Error())
+					ctx.Raise(val.NewException(val.OSErrorType, err.Error()))
+					return val.NoneVal()
 				}
 				return val.NewListVal(
 					val.Int64Val(int64(lk.Type)),
@@ -370,11 +392,13 @@ func (e *Engine) createFcntlModule() val.Value {
 				)
 			}
 			if err := unix.FcntlFlock(uintptr(fd), op, &lk); err != nil {
-				panic("OSError: " + err.Error())
+				ctx.Raise(val.NewException(val.OSErrorType, err.Error()))
+				return val.NoneVal()
 			}
 			return val.Int64Val(0)
 		default:
-			panic("ValueError: fcntl() unsupported command")
+			ctx.Raise(val.NewException(val.ValueErrorType, "fcntl() unsupported command"))
+			return val.NoneVal()
 		}
 	}))
 
@@ -402,26 +426,31 @@ func (e *Engine) createResourceModule() val.Value {
 
 	mod.Dict.Set(val.InternString("getrlimit"), val.NewBuiltinFuncVal("getrlimit", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: getrlimit() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "getrlimit() takes 1 argument"))
+			return val.NoneVal()
 		}
 		var res unix.Rlimit
 		if err := unix.Getrlimit(pyInt(args, 0, "getrlimit"), &res); err != nil {
-			panic("OSError: " + err.Error())
+			ctx.Raise(val.NewException(val.OSErrorType, err.Error()))
+			return val.NoneVal()
 		}
 		return val.NewTupleVal(val.Int64Val(int64(res.Cur)), val.Int64Val(int64(res.Max)))
 	}))
 
 	mod.Dict.Set(val.InternString("setrlimit"), val.NewBuiltinFuncVal("setrlimit", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: setrlimit() takes 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "setrlimit() takes 2 arguments"))
+			return val.NoneVal()
 		}
 		items := pySeqItems(args[1])
 		if len(items) != 2 {
-			panic("ValueError: setrlimit() limit must be a 2-tuple")
+			ctx.Raise(val.NewException(val.ValueErrorType, "setrlimit() limit must be a 2-tuple"))
+			return val.NoneVal()
 		}
 		lim := unix.Rlimit{Cur: uint64(items[0].AsInt64()), Max: uint64(items[1].AsInt64())}
 		if err := unix.Setrlimit(pyInt(args, 0, "setrlimit"), &lim); err != nil {
-			panic("OSError: " + err.Error())
+			ctx.Raise(val.NewException(val.OSErrorType, err.Error()))
+			return val.NoneVal()
 		}
 		return val.NoneVal()
 	}))
@@ -433,7 +462,8 @@ func (e *Engine) createResourceModule() val.Value {
 		}
 		var ru unix.Rusage
 		if err := unix.Getrusage(who, &ru); err != nil {
-			panic("OSError: " + err.Error())
+			ctx.Raise(val.NewException(val.OSErrorType, err.Error()))
+			return val.NoneVal()
 		}
 		return val.NewTupleVal(
 			val.Float64Val(float64(ru.Utime.Sec)+float64(ru.Utime.Usec)/1e6),
@@ -517,7 +547,8 @@ func (e *Engine) createSyslogModule() val.Value {
 
 	mod.Dict.Set(val.InternString("syslog"), val.NewBuiltinFuncVal("syslog", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: syslog() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "syslog() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		priority := pyInt(args, 0, "syslog")
 		message := ""
@@ -580,14 +611,16 @@ func (e *Engine) createGrpModule() val.Value {
 	mod.Dict.Set(val.InternString("getgrall"), val.NewBuiltinFuncVal("getgrall", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		entries := readGroups()
 		if entries == nil {
-			panic("OSError: cannot read the group database")
+			ctx.Raise(val.NewException(val.OSErrorType, "cannot read the group database"))
+			return val.NoneVal()
 		}
 		return val.NewListVal(entries...)
 	}))
 
 	mod.Dict.Set(val.InternString("getgrgid"), val.NewBuiltinFuncVal("getgrgid", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: getgrgid() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "getgrgid() takes 1 argument"))
+			return val.NoneVal()
 		}
 		gid := pyInt(args, 0, "getgrgid")
 		for _, e := range readGroups() {
@@ -596,12 +629,14 @@ func (e *Engine) createGrpModule() val.Value {
 				return e
 			}
 		}
-		panic("KeyError: gid " + strconv.Itoa(gid) + ": no such group")
+		ctx.Raise(val.NewException(val.KeyErrorType, "gid"+strconv.Itoa(gid)+": no such group"))
+		return val.NoneVal()
 	}))
 
 	mod.Dict.Set(val.InternString("getgrnam"), val.NewBuiltinFuncVal("getgrnam", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: getgrnam() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "getgrnam() takes 1 argument"))
+			return val.NoneVal()
 		}
 		name := args[0].AsString()
 		for _, e := range readGroups() {
@@ -610,7 +645,8 @@ func (e *Engine) createGrpModule() val.Value {
 				return e
 			}
 		}
-		panic("KeyError: name " + name + ": no such group")
+		ctx.Raise(val.NewException(val.KeyErrorType, "name"+name+": no such group"))
+		return val.NoneVal()
 	}))
 
 	return modVal
@@ -655,14 +691,16 @@ func (e *Engine) createPwdModule() val.Value {
 	mod.Dict.Set(val.InternString("getpwall"), val.NewBuiltinFuncVal("getpwall", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		entries := readEntries()
 		if entries == nil {
-			panic("OSError: cannot read the password database")
+			ctx.Raise(val.NewException(val.OSErrorType, "cannot read the password database"))
+			return val.NoneVal()
 		}
 		return val.NewListVal(entries...)
 	}))
 
 	mod.Dict.Set(val.InternString("getpwuid"), val.NewBuiltinFuncVal("getpwuid", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: getpwuid() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "getpwuid() takes 1 argument"))
+			return val.NoneVal()
 		}
 		uid := pyInt(args, 0, "getpwuid")
 		for _, e := range readEntries() {
@@ -671,12 +709,14 @@ func (e *Engine) createPwdModule() val.Value {
 				return e
 			}
 		}
-		panic("KeyError: uid " + strconv.Itoa(uid) + ": no such user")
+		ctx.Raise(val.NewException(val.KeyErrorType, "uid"+strconv.Itoa(uid)+": no such user"))
+		return val.NoneVal()
 	}))
 
 	mod.Dict.Set(val.InternString("getpwnam"), val.NewBuiltinFuncVal("getpwnam", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: getpwnam() takes 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "getpwnam() takes 1 argument"))
+			return val.NoneVal()
 		}
 		name := args[0].AsString()
 		for _, e := range readEntries() {
@@ -685,7 +725,8 @@ func (e *Engine) createPwdModule() val.Value {
 				return e
 			}
 		}
-		panic("KeyError: name " + name + ": no such user")
+		ctx.Raise(val.NewException(val.KeyErrorType, "name"+name+": no such user"))
+		return val.NoneVal()
 	}))
 
 	return modVal

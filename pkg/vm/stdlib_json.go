@@ -40,7 +40,8 @@ func initJSONDecodeErrorType() *val.PyType {
 		jsonDecodeErrorType.Dict.Set(val.InternString("colno"), val.NoneVal())
 		jsonDecodeErrorType.Dict.Set(val.InternString("__init__"), val.NewBuiltinFuncVal("__init__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 4 {
-				panic("TypeError: JSONDecodeError() takes exactly 3 arguments")
+				ctx.Raise(val.NewException(val.TypeErrorType, "JSONDecodeError() takes exactly 3 arguments"))
+				return val.NoneVal()
 			}
 			self := args[0]
 			msg := args[1].AsString()
@@ -957,7 +958,8 @@ func (e *Engine) createJSONModule() val.Value {
 			if v, ok := kwArg(args, kwnames, "s"); ok {
 				pa = []val.Value{v}
 			} else {
-				panic("TypeError: loads() takes at least 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "loads() takes at least 1 argument"))
+				return val.NoneVal()
 			}
 		}
 		var rawBytes []byte
@@ -973,7 +975,8 @@ func (e *Engine) createJSONModule() val.Value {
 		case a.IsMemoryView():
 			rawBytes = a.AsMemoryView().Buf
 		default:
-			panic("TypeError: the JSON object must be str, bytes or bytearray, not " + a.Type().Name)
+			ctx.Raise(val.NewException(val.TypeErrorType, "the JSON object must be str, bytes or bytearray, not"+a.Type().Name))
+			return val.NoneVal()
 		}
 
 		p := newJSONParser(rawBytes, e.internPool)
@@ -993,7 +996,8 @@ func (e *Engine) createJSONModule() val.Value {
 			if v, ok := kwArg(args, kwnames, "obj"); ok {
 				pa = []val.Value{v}
 			} else {
-				panic("TypeError: dumps() takes at least 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "dumps() takes at least 1 argument"))
+				return val.NoneVal()
 			}
 		}
 		opts := extractJSONDumpOpts(pa, args, kwnames, 1)
@@ -1010,7 +1014,8 @@ func (e *Engine) createJSONModule() val.Value {
 			if v, ok := kwArg(args, kwnames, "fp"); ok {
 				pa = []val.Value{v}
 			} else {
-				panic("TypeError: load() takes at least 1 argument")
+				ctx.Raise(val.NewException(val.TypeErrorType, "load() takes at least 1 argument"))
+				return val.NoneVal()
 			}
 		}
 		fp := pa[0]
@@ -1023,7 +1028,8 @@ func (e *Engine) createJSONModule() val.Value {
 		case content.IsBytes():
 			rawBytes = content.AsBytes().Data
 		default:
-			panic("TypeError: fp.read() must return str or bytes")
+			ctx.Raise(val.NewException(val.TypeErrorType, "fp.read() must return str or bytes"))
+			return val.NoneVal()
 		}
 		p := newJSONParser(rawBytes, e.internPool)
 		res, err := p.parseValue()
@@ -1039,7 +1045,8 @@ func (e *Engine) createJSONModule() val.Value {
 	mod.Dict.Set(val.InternString("dump"), val.NewBuiltinFuncVal("dump", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		pa := posArgs(args, kwnames)
 		if len(pa) < 2 {
-			panic("TypeError: dump() takes at least 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "dump() takes at least 2 arguments"))
+			return val.NoneVal()
 		}
 		opts := extractJSONDumpOpts(pa, args, kwnames, 2)
 		resStr, err := jsonDumpsWithOpts(pa[0], opts)

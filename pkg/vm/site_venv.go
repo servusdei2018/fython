@@ -365,7 +365,8 @@ func (e *Engine) createSiteModule() val.Value {
 
 	mod.Dict.Set(val.InternString("addsitedir"), val.NewBuiltinFuncVal("addsitedir", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: addsitedir() requires sitedir")
+			ctx.Raise(val.NewException(val.TypeErrorType, "addsitedir() requires sitedir"))
+			return val.NoneVal()
 		}
 		sitedir := pathArg(ctx, args[0])
 		vmInstance := ctx.VM.(*VM)

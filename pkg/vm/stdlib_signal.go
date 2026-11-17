@@ -73,7 +73,8 @@ func (e *Engine) sig() *sigState {
 // KeyboardInterrupt.
 func defaultSIGINTHandler() val.Value {
 	return val.NewBuiltinFuncVal("default_int_handler", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		panic(val.NewException(val.KeyboardInterruptType, ""))
+		ctx.Raise(val.NewException(val.KeyboardInterruptType, ""))
+		return val.NoneVal()
 	})
 }
 
@@ -169,11 +170,13 @@ func (vm *VM) sleepInterruptibly(d time.Duration) {
 func signalNumber(ctx *val.ExecContext, v val.Value) int {
 	i, ok := intOf(ctx, v)
 	if !ok {
-		panic("TypeError: 'signalnum' must be an integer, not " + typeNameOf(v))
+		ctx.Raise(val.NewException(val.TypeErrorType, "'signalnum' must be an integer, not"+typeNameOf(v)))
+		return 0
 	}
 	n := int(i)
 	if n < 1 || n >= sigNSIG {
-		panic("ValueError: signal number out of range")
+		ctx.Raise(val.NewException(val.ValueErrorType, "signal number out of range"))
+		return 0
 	}
 	return n
 }
@@ -209,16 +212,19 @@ func (e *Engine) createSignalModule() val.Value {
 
 	set("signal", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) != 2 {
-			panic("TypeError: signal expected 2 arguments, got " + itoa(len(args)))
+			ctx.Raise(val.NewException(val.TypeErrorType, "signal expected 2 arguments, got"+itoa(len(args))))
+			return val.NoneVal()
 		}
 		n := signalNumber(ctx, args[0])
 		h := args[1]
 		if h.IsInt64() {
 			if k := h.AsInt64(); k != sigDfl && k != sigIgn {
-				panic("TypeError: signal handler must be signal.SIG_IGN, signal.SIG_DFL, or a callable object")
+				ctx.Raise(val.NewException(val.TypeErrorType, "signal handler must be signal.SIG_IGN, signal.SIG_DFL, or a callable object"))
+				return val.NoneVal()
 			}
 		} else if !isCallableValue(h) {
-			panic("TypeError: signal handler must be signal.SIG_IGN, signal.SIG_DFL, or a callable object")
+			ctx.Raise(val.NewException(val.TypeErrorType, "signal handler must be signal.SIG_IGN, signal.SIG_DFL, or a callable object"))
+			return val.NoneVal()
 		}
 		sg := syscall.Signal(n)
 		if sg == syscall.SIGKILL || sg == extraSigStop {
@@ -248,7 +254,8 @@ func (e *Engine) createSignalModule() val.Value {
 
 	set("getsignal", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) != 1 {
-			panic("TypeError: getsignal expected 1 argument, got " + itoa(len(args)))
+			ctx.Raise(val.NewException(val.TypeErrorType, "getsignal expected 1 argument, got"+itoa(len(args))))
+			return val.NoneVal()
 		}
 		n := signalNumber(ctx, args[0])
 		s.mu.Lock()
@@ -258,7 +265,8 @@ func (e *Engine) createSignalModule() val.Value {
 
 	set("raise_signal", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) != 1 {
-			panic("TypeError: raise_signal expected 1 argument, got " + itoa(len(args)))
+			ctx.Raise(val.NewException(val.TypeErrorType, "raise_signal expected 1 argument, got"+itoa(len(args))))
+			return val.NoneVal()
 		}
 		n := signalNumber(ctx, args[0])
 		s.mu.Lock()
@@ -268,7 +276,7 @@ func (e *Engine) createSignalModule() val.Value {
 		case h.IsInt64() && h.AsInt64() == sigIgn:
 		case h.IsInt64():
 			if err := killProcess(os.Getpid(), syscall.Signal(n)); err != nil {
-				raiseOSError(err, "")
+				return raiseOSError(ctx, err, "")
 			}
 		default:
 			s.raise(n)
@@ -282,7 +290,8 @@ func (e *Engine) createSignalModule() val.Value {
 
 	set("strsignal", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) != 1 {
-			panic("TypeError: strsignal expected 1 argument, got " + itoa(len(args)))
+			ctx.Raise(val.NewException(val.TypeErrorType, "strsignal expected 1 argument, got"+itoa(len(args))))
+			return val.NoneVal()
 		}
 		n := signalNumber(ctx, args[0])
 		text := syscall.Signal(n).String()

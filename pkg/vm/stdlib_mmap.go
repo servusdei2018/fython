@@ -33,12 +33,14 @@ func initMmapType() {
 
 	mmapType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: mmap() takes at least 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "mmap() takes at least 2 arguments"))
+			return val.NoneVal()
 		}
 		fileno := pyInt(args, 0, "mmap")
 		length := pyInt(args, 1, "mmap")
 		if length < 0 {
-			panic("ValueError: mmap() length must be non-negative")
+			ctx.Raise(val.NewException(val.ValueErrorType, "mmap() length must be non-negative"))
+			return val.NoneVal()
 		}
 		access := val.ACCESS_WRITE
 		for i, k := range kwnames {
@@ -60,7 +62,8 @@ func initMmapType() {
 		}
 		data, err := unix.Mmap(fileno, 0, length, prot, flags)
 		if err != nil {
-			panic("OSError: " + err.Error())
+			ctx.Raise(val.NewException(val.OSErrorType, err.Error()))
+			return val.NoneVal()
 		}
 		m := &pyMmap{
 			inst:     val.PyInstance{Header: val.ObjectHeader{Kind: val.KindInstance, Type: mmapType}, Shape: mmapType.RootShape},
@@ -94,7 +97,8 @@ func initMmapType() {
 
 	setMethod("read", func(ctx *val.ExecContext, m *pyMmap, args []val.Value) val.Value {
 		if m.closed {
-			panic("ValueError: mmap closed or invalid")
+			ctx.Raise(val.NewException(val.ValueErrorType, "mmap closed or invalid"))
+			return val.NoneVal()
 		}
 		n := len(m.data) - m.pos
 		if len(args) > 1 && args[1].IsInt64() {
@@ -114,17 +118,21 @@ func initMmapType() {
 
 	setMethod("write", func(ctx *val.ExecContext, m *pyMmap, args []val.Value) val.Value {
 		if m.closed {
-			panic("ValueError: mmap closed or invalid")
+			ctx.Raise(val.NewException(val.ValueErrorType, "mmap closed or invalid"))
+			return val.NoneVal()
 		}
 		if m.readOnly {
-			panic("TypeError: mmap object is read-only")
+			ctx.Raise(val.NewException(val.TypeErrorType, "mmap object is read-only"))
+			return val.NoneVal()
 		}
 		if len(args) < 2 || !args[1].IsBytes() {
-			panic("TypeError: write() argument must be bytes-like")
+			ctx.Raise(val.NewException(val.TypeErrorType, "write() argument must be bytes-like"))
+			return val.NoneVal()
 		}
 		data := args[1].AsBytes().Data
 		if m.pos+len(data) > len(m.data) {
-			panic("ValueError: data out of range")
+			ctx.Raise(val.NewException(val.ValueErrorType, "data out of range"))
+			return val.NoneVal()
 		}
 		copy(m.data[m.pos:], data)
 		m.pos += len(data)
@@ -133,7 +141,8 @@ func initMmapType() {
 
 	setMethod("seek", func(ctx *val.ExecContext, m *pyMmap, args []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: seek() takes at least 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "seek() takes at least 2 arguments"))
+			return val.NoneVal()
 		}
 		pos := pyInt(args, 1, "seek")
 		whence := 0
@@ -148,7 +157,8 @@ func initMmapType() {
 		case 2:
 			m.pos = len(m.data) + pos
 		default:
-			panic("ValueError: invalid whence")
+			ctx.Raise(val.NewException(val.ValueErrorType, "invalid whence"))
+			return val.NoneVal()
 		}
 		return val.Int64Val(int64(m.pos))
 	})
@@ -199,13 +209,15 @@ func initMmapType() {
 	mmapType.Dict.Set(val.InternString("__getitem__"), val.NewBuiltinFuncVal("mmap.__getitem__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		m := (*pyMmap)(val.AsPointer(args[0]))
 		if len(args) < 2 {
-			panic("TypeError: mmap indices must be integers")
+			ctx.Raise(val.NewException(val.TypeErrorType, "mmap indices must be integers"))
+			return val.NoneVal()
 		}
 		if args[1].IsSlice() {
 			sl := args[1].AsSlice()
 			start, _, _, length, err := val.NormalizeSliceIndices(sl.Start, sl.Stop, sl.Step, len(m.data))
 			if err != nil {
-				panic("ValueError: " + err.Error())
+				ctx.Raise(val.NewException(val.ValueErrorType, err.Error()))
+				return val.NoneVal()
 			}
 			out := make([]byte, length)
 			for i := range length {
@@ -214,14 +226,16 @@ func initMmapType() {
 			return val.NewBytesVal(out)
 		}
 		if !args[1].IsInt64() {
-			panic("TypeError: mmap indices must be integers")
+			ctx.Raise(val.NewException(val.TypeErrorType, "mmap indices must be integers"))
+			return val.NoneVal()
 		}
 		idx := int(args[1].AsInt64())
 		if idx < 0 {
 			idx += len(m.data)
 		}
 		if idx < 0 || idx >= len(m.data) {
-			panic("IndexError: mmap index out of range")
+			ctx.Raise(val.NewException(val.IndexErrorType, "mmap index out of range"))
+			return val.NoneVal()
 		}
 		return val.Int64Val(int64(m.data[idx]))
 	}))
@@ -229,14 +243,16 @@ func initMmapType() {
 	mmapType.Dict.Set(val.InternString("__setitem__"), val.NewBuiltinFuncVal("mmap.__setitem__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		m := (*pyMmap)(val.AsPointer(args[0]))
 		if len(args) < 3 || !args[1].IsInt64() {
-			panic("TypeError: mmap indices must be integers")
+			ctx.Raise(val.NewException(val.TypeErrorType, "mmap indices must be integers"))
+			return val.NoneVal()
 		}
 		idx := int(args[1].AsInt64())
 		if idx < 0 {
 			idx += len(m.data)
 		}
 		if idx < 0 || idx >= len(m.data) {
-			panic("IndexError: mmap index out of range")
+			ctx.Raise(val.NewException(val.IndexErrorType, "mmap index out of range"))
+			return val.NoneVal()
 		}
 		m.data[idx] = byte(args[2].AsInt64())
 		return val.NoneVal()

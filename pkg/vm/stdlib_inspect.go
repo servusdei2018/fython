@@ -40,7 +40,8 @@ func initInspectTypes() {
 
 		ParameterType.Dict.Set(val.InternString("__init__"), val.NewBuiltinFuncVal("__init__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 3 {
-				panic("TypeError: Parameter() takes at least name and kind")
+				ctx.Raise(val.NewException(val.TypeErrorType, "Parameter() takes at least name and kind"))
+				return val.NoneVal()
 			}
 			self := args[0]
 			name := args[1]
@@ -91,7 +92,8 @@ func initInspectTypes() {
 
 		SignatureType.Dict.Set(val.InternString("__init__"), val.NewBuiltinFuncVal("__init__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic("TypeError: Signature() requires self")
+				ctx.Raise(val.NewException(val.TypeErrorType, "Signature() requires self"))
+				return val.NoneVal()
 			}
 			self := args[0]
 			paramsDict := val.NewDictVal(8)
@@ -178,7 +180,8 @@ func initInspectTypes() {
 				i += len(items)
 			}
 			if i < 0 || i >= len(items) {
-				panic("IndexError: tuple index out of range")
+				ctx.Raise(val.NewException(val.IndexErrorType, "tuple index out of range"))
+				return val.NoneVal()
 			}
 			return items[i]
 		}))
@@ -230,7 +233,8 @@ func (e *Engine) createInspectModule() val.Value {
 
 	mod.Dict.Set(val.InternString("getmodulename"), val.NewBuiltinFuncVal("getmodulename", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: getmodulename() missing required argument 'path'")
+			ctx.Raise(val.NewException(val.TypeErrorType, "getmodulename() missing required argument 'path'"))
+			return val.NoneVal()
 		}
 		p := pathArg(ctx, args[0])
 		fname := filepath.Base(p)
@@ -244,7 +248,8 @@ func (e *Engine) createInspectModule() val.Value {
 
 	mod.Dict.Set(val.InternString("cleandoc"), val.NewBuiltinFuncVal("cleandoc", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) != 1 || !args[0].IsAnyString() {
-			panic("TypeError: cleandoc() argument must be a str")
+			ctx.Raise(val.NewException(val.TypeErrorType, "cleandoc() argument must be a str"))
+			return val.NoneVal()
 		}
 		return val.NewStringVal(cleanDoc(args[0].AsString()))
 	}))
@@ -406,7 +411,8 @@ func (e *Engine) createInspectModule() val.Value {
 	mod.Dict.Set(val.InternString("_sentinel"), sentinelVal)
 	mod.Dict.Set(val.InternString("getattr_static"), val.NewBuiltinFuncVal("getattr_static", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: getattr_static() takes at least 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "getattr_static() takes at least 2 arguments"))
+			return val.NoneVal()
 		}
 		obj := args[0]
 		attrName := val.InternValue(args[1])
@@ -491,13 +497,15 @@ func (e *Engine) createInspectModule() val.Value {
 		if hasDefault {
 			return defVal
 		}
-		panic("AttributeError: " + attrName.AsString())
+		ctx.Raise(val.NewException(val.AttributeErrorType, attrName.AsString()))
+		return val.NoneVal()
 	}))
 
 	// _descriptor_get(descriptor, obj, obj_type=None)
 	mod.Dict.Set(val.InternString("_descriptor_get"), val.NewBuiltinFuncVal("_descriptor_get", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
-			panic("TypeError: _descriptor_get() takes at least 2 arguments")
+			ctx.Raise(val.NewException(val.TypeErrorType, "_descriptor_get() takes at least 2 arguments"))
+			return val.NoneVal()
 		}
 		descr := args[0]
 		obj := args[1]
@@ -565,7 +573,8 @@ func (e *Engine) createInspectModule() val.Value {
 	// unwrap(func, stop=None)
 	mod.Dict.Set(val.InternString("unwrap"), val.NewBuiltinFuncVal("unwrap", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: unwrap() takes at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "unwrap() takes at least 1 argument"))
+			return val.NoneVal()
 		}
 		curr := args[0]
 		stop := val.NoneVal()
@@ -624,7 +633,8 @@ func (e *Engine) createInspectModule() val.Value {
 	// getfile(obj)
 	mod.Dict.Set(val.InternString("getfile"), val.NewBuiltinFuncVal("getfile", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: getfile() requires 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "getfile() requires 1 argument"))
+			return val.NoneVal()
 		}
 		ob := args[0]
 		if ob.IsFunction() {
@@ -641,7 +651,8 @@ func (e *Engine) createInspectModule() val.Value {
 		if ob.IsModule() {
 			return val.NewStringVal(ob.AsModule().File)
 		}
-		panic("TypeError: could not determine file for " + ob.String())
+		ctx.Raise(val.NewException(val.TypeErrorType, "could not determine file for"+ob.String()))
+		return val.NoneVal()
 	}))
 
 	getFileFn, _ := mod.Dict.Get(val.InternString("getfile"))
@@ -650,14 +661,16 @@ func (e *Engine) createInspectModule() val.Value {
 	// getargs(co) -> (args, varargs, varkw)
 	mod.Dict.Set(val.InternString("getargs"), val.NewBuiltinFuncVal("getargs", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: getargs() requires 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "getargs() requires 1 argument"))
+			return val.NoneVal()
 		}
 		co := args[0]
 		if co.IsFunction() {
 			co = co.AsFunction().Code
 		}
 		if !co.IsCode() || val.CodeInspectorHook == nil {
-			panic("TypeError: expected code object")
+			ctx.Raise(val.NewException(val.TypeErrorType, "expected code object"))
+			return val.NoneVal()
 		}
 		hook := val.CodeInspectorHook
 		vnames := hook.VarNames(co)
@@ -688,7 +701,8 @@ func (e *Engine) createInspectModule() val.Value {
 	// signature(fn) -> Signature
 	mod.Dict.Set(val.InternString("signature"), val.NewBuiltinFuncVal("signature", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			panic("TypeError: signature() requires at least 1 argument")
+			ctx.Raise(val.NewException(val.TypeErrorType, "signature() requires at least 1 argument"))
+			return val.NoneVal()
 		}
 		target := args[0]
 		var co val.Value
@@ -729,13 +743,16 @@ func (e *Engine) createInspectModule() val.Value {
 				}
 			}
 			if isCallable {
-				panic("ValueError: no signature found for " + target.String())
+				ctx.Raise(val.NewException(val.ValueErrorType, "no signature found for"+target.String()))
+				return val.NoneVal()
 			}
-			panic("TypeError: " + target.String() + " is not a callable object")
+			ctx.Raise(val.NewException(val.TypeErrorType, target.String()+" is not a callable object"))
+			return val.NoneVal()
 		}
 
 		if val.CodeInspectorHook == nil || co.HeaderPtr() == nil {
-			panic("ValueError: no code object available for signature")
+			ctx.Raise(val.NewException(val.ValueErrorType, "no code object available for signature"))
+			return val.NoneVal()
 		}
 
 		hook := val.CodeInspectorHook

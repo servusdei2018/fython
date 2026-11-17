@@ -80,7 +80,8 @@ func initZlibTypes() {
 
 		zlibCompressType.Dict.Set(val.InternString("compress"), val.NewBuiltinFuncVal("compress", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic(val.NewException(val.TypeErrorType, "compress() requires data argument"))
+				ctx.Raise(val.NewException(val.TypeErrorType, "compress() requires data argument"))
+				return val.NoneVal()
 			}
 			c := (*pyZlibCompress)(val.AsPointer(args[0]))
 			data := getBytesFromVal(args[1])
@@ -90,7 +91,8 @@ func initZlibTypes() {
 
 		zlibCompressType.Dict.Set(val.InternString("flush"), val.NewBuiltinFuncVal("flush", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic(val.NewException(val.TypeErrorType, "flush() requires self"))
+				ctx.Raise(val.NewException(val.TypeErrorType, "flush() requires self"))
+				return val.NoneVal()
 			}
 			c := (*pyZlibCompress)(val.AsPointer(args[0]))
 			mode := 4 // Z_FINISH
@@ -103,7 +105,8 @@ func initZlibTypes() {
 
 		zlibCompressType.Dict.Set(val.InternString("copy"), val.NewBuiltinFuncVal("copy", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic(val.NewException(val.TypeErrorType, "copy() requires self"))
+				ctx.Raise(val.NewException(val.TypeErrorType, "copy() requires self"))
+				return val.NoneVal()
 			}
 			c := (*pyZlibCompress)(val.AsPointer(args[0]))
 			c2 := &pyZlibCompress{
@@ -139,7 +142,8 @@ func initZlibTypes() {
 
 		zlibDecompressType.Dict.Set(val.InternString("decompress"), val.NewBuiltinFuncVal("decompress", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 2 {
-				panic(val.NewException(val.TypeErrorType, "decompress() requires data argument"))
+				ctx.Raise(val.NewException(val.TypeErrorType, "decompress() requires data argument"))
+				return val.NoneVal()
 			}
 			d := (*pyZlibDecompress)(val.AsPointer(args[0]))
 			data := getBytesFromVal(args[1])
@@ -153,7 +157,8 @@ func initZlibTypes() {
 
 		zlibDecompressType.Dict.Set(val.InternString("flush"), val.NewBuiltinFuncVal("flush", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic(val.NewException(val.TypeErrorType, "flush() requires self"))
+				ctx.Raise(val.NewException(val.TypeErrorType, "flush() requires self"))
+				return val.NoneVal()
 			}
 			d := (*pyZlibDecompress)(val.AsPointer(args[0]))
 			maxLen := 0
@@ -166,7 +171,8 @@ func initZlibTypes() {
 
 		zlibDecompressType.Dict.Set(val.InternString("copy"), val.NewBuiltinFuncVal("copy", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
-				panic(val.NewException(val.TypeErrorType, "copy() requires self"))
+				ctx.Raise(val.NewException(val.TypeErrorType, "copy() requires self"))
+				return val.NoneVal()
 			}
 			d := (*pyZlibDecompress)(val.AsPointer(args[0]))
 			d2 := &pyZlibDecompress{
@@ -507,7 +513,8 @@ func (e *Engine) createZlibModule() val.Value {
 	set("crc32", val.NewBuiltinFuncVal("crc32", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		pa := posArgs(args, kwnames)
 		if len(pa) < 1 {
-			panic(val.NewException(val.TypeErrorType, "crc32() requires data argument"))
+			ctx.Raise(val.NewException(val.TypeErrorType, "crc32() requires data argument"))
+			return val.NoneVal()
 		}
 		data := getBytesFromVal(pa[0])
 		initial := uint32(0)
@@ -522,7 +529,8 @@ func (e *Engine) createZlibModule() val.Value {
 	set("adler32", val.NewBuiltinFuncVal("adler32", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		pa := posArgs(args, kwnames)
 		if len(pa) < 1 {
-			panic(val.NewException(val.TypeErrorType, "adler32() requires data argument"))
+			ctx.Raise(val.NewException(val.TypeErrorType, "adler32() requires data argument"))
+			return val.NoneVal()
 		}
 		data := getBytesFromVal(pa[0])
 		initial := uint32(1)
@@ -538,7 +546,8 @@ func (e *Engine) createZlibModule() val.Value {
 		pa := posArgs(args, kwnames)
 		kw := extractKwArgs(args, kwnames)
 		if len(pa) < 1 {
-			panic(val.NewException(val.TypeErrorType, "compress() requires data argument"))
+			ctx.Raise(val.NewException(val.TypeErrorType, "compress() requires data argument"))
+			return val.NoneVal()
 		}
 		b := getBytesFromVal(pa[0])
 		level := -1
@@ -563,35 +572,44 @@ func (e *Engine) createZlibModule() val.Value {
 		case wbits < 0:
 			fw, err := flate.NewWriter(&buf, lvl)
 			if err != nil {
-				panic(val.NewException(zlibErrorType, err.Error()))
+				ctx.Raise(val.NewException(zlibErrorType, err.Error()))
+				return val.NoneVal()
 			}
 			if _, err := fw.Write(b); err != nil {
-				panic(val.NewException(zlibErrorType, err.Error()))
+				ctx.Raise(val.NewException(zlibErrorType, err.Error()))
+				return val.NoneVal()
 			}
 			if err := fw.Close(); err != nil {
-				panic(val.NewException(zlibErrorType, err.Error()))
+				ctx.Raise(val.NewException(zlibErrorType, err.Error()))
+				return val.NoneVal()
 			}
 		case wbits > 15:
 			gw, err := gzip.NewWriterLevel(&buf, lvl)
 			if err != nil {
-				panic(val.NewException(zlibErrorType, err.Error()))
+				ctx.Raise(val.NewException(zlibErrorType, err.Error()))
+				return val.NoneVal()
 			}
 			if _, err := gw.Write(b); err != nil {
-				panic(val.NewException(zlibErrorType, err.Error()))
+				ctx.Raise(val.NewException(zlibErrorType, err.Error()))
+				return val.NoneVal()
 			}
 			if err := gw.Close(); err != nil {
-				panic(val.NewException(zlibErrorType, err.Error()))
+				ctx.Raise(val.NewException(zlibErrorType, err.Error()))
+				return val.NoneVal()
 			}
 		default:
 			zw, err := zlib.NewWriterLevel(&buf, lvl)
 			if err != nil {
-				panic(val.NewException(zlibErrorType, err.Error()))
+				ctx.Raise(val.NewException(zlibErrorType, err.Error()))
+				return val.NoneVal()
 			}
 			if _, err := zw.Write(b); err != nil {
-				panic(val.NewException(zlibErrorType, err.Error()))
+				ctx.Raise(val.NewException(zlibErrorType, err.Error()))
+				return val.NoneVal()
 			}
 			if err := zw.Close(); err != nil {
-				panic(val.NewException(zlibErrorType, err.Error()))
+				ctx.Raise(val.NewException(zlibErrorType, err.Error()))
+				return val.NoneVal()
 			}
 		}
 		return val.NewBytesVal(buf.Bytes())
@@ -602,7 +620,8 @@ func (e *Engine) createZlibModule() val.Value {
 		pa := posArgs(args, kwnames)
 		kw := extractKwArgs(args, kwnames)
 		if len(pa) < 1 {
-			panic(val.NewException(val.TypeErrorType, "decompress() requires data argument"))
+			ctx.Raise(val.NewException(val.TypeErrorType, "decompress() requires data argument"))
+			return val.NoneVal()
 		}
 		b := getBytesFromVal(pa[0])
 		wbits := 15
@@ -623,7 +642,8 @@ func (e *Engine) createZlibModule() val.Value {
 		case wbits > 15 && wbits <= 31:
 			gzr, err := gzip.NewReader(br)
 			if err != nil {
-				panic(val.NewException(zlibErrorType, err.Error()))
+				ctx.Raise(val.NewException(zlibErrorType, err.Error()))
+				return val.NoneVal()
 			}
 			r = gzr
 			closeReader = gzr
@@ -632,14 +652,16 @@ func (e *Engine) createZlibModule() val.Value {
 			case len(b) >= 2 && b[0] == 0x1f && b[1] == 0x8b:
 				gzr, err := gzip.NewReader(br)
 				if err != nil {
-					panic(val.NewException(zlibErrorType, err.Error()))
+					ctx.Raise(val.NewException(zlibErrorType, err.Error()))
+					return val.NoneVal()
 				}
 				r = gzr
 				closeReader = gzr
 			case len(b) >= 1 && (b[0] == 0x78 || b[0] == 0x58):
 				zr, err := zlib.NewReader(br)
 				if err != nil {
-					panic(val.NewException(zlibErrorType, err.Error()))
+					ctx.Raise(val.NewException(zlibErrorType, err.Error()))
+					return val.NoneVal()
 				}
 				r = zr
 				closeReader = zr
@@ -651,7 +673,8 @@ func (e *Engine) createZlibModule() val.Value {
 		default:
 			zr, err := zlib.NewReader(br)
 			if err != nil {
-				panic(val.NewException(zlibErrorType, err.Error()))
+				ctx.Raise(val.NewException(zlibErrorType, err.Error()))
+				return val.NoneVal()
 			}
 			r = zr
 			closeReader = zr
@@ -662,7 +685,8 @@ func (e *Engine) createZlibModule() val.Value {
 			_ = closeReader.Close()
 		}
 		if err != nil && err != io.EOF {
-			panic(val.NewException(zlibErrorType, err.Error()))
+			ctx.Raise(val.NewException(zlibErrorType, err.Error()))
+			return val.NoneVal()
 		}
 		return val.NewBytesVal(out)
 	}))
