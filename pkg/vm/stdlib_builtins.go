@@ -391,27 +391,26 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			panic("TypeError: getattr(): not enough arguments")
 		}
 		obj := args[0]
-		name := args[1].AsString()
 		hasDefault := len(args) > 2
 		defVal := val.NoneVal()
 		if hasDefault {
 			defVal = args[2]
 		}
-		res, ok := vmGetAttrSafe(ctx, obj, name)
+		res, ok := vmGetAttrSafeVal(ctx, obj, args[1])
 		if ok {
 			return res
 		}
 		if hasDefault {
 			return defVal
 		}
-		panic("AttributeError: '" + obj.Type().Name + "' object has no attribute '" + name + "'")
+		panic("AttributeError: '" + obj.Type().Name + "' object has no attribute '" + args[1].AsString() + "'")
 	}))
 
 	d.Set(val.InternString("hasattr"), val.NewBuiltinFuncVal("hasattr", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
 			panic("TypeError: hasattr(): not enough arguments")
 		}
-		_, ok := vmGetAttrSafe(ctx, args[0], args[1].AsString())
+		_, ok := vmGetAttrSafeVal(ctx, args[0], args[1])
 		return val.BoolVal(ok)
 	}))
 
@@ -419,7 +418,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		if len(args) < 3 {
 			panic("TypeError: setattr(): not enough arguments")
 		}
-		val.SetAttrCtx(ctx, args[0], val.InternString(args[1].AsString()), args[2])
+		val.SetAttrCtx(ctx, args[0], val.InternValue(args[1]), args[2])
 		if ctx != nil && ctx.HasException() {
 			exc := ctx.ActiveException
 			ctx.ClearException()
@@ -432,7 +431,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		if len(args) < 2 {
 			panic("TypeError: delattr(): not enough arguments")
 		}
-		val.DelAttrCtx(ctx, args[0], val.InternString(args[1].AsString()))
+		val.DelAttrCtx(ctx, args[0], val.InternValue(args[1]))
 		if ctx != nil && ctx.HasException() {
 			exc := ctx.ActiveException
 			ctx.ClearException()
@@ -1365,7 +1364,7 @@ func checkIsInstance(ctx *val.ExecContext, obj, target val.Value) bool {
 		return false
 	}
 	targetType := target.Type()
-	if fn, _, ok := targetType.LookupMRO(val.InternString("__instancecheck__")); ok {
+	if fn, _, ok := targetType.LookupMRO(nameInstanceCheck); ok {
 		res := ctx.Invoke2(fn, target, obj)
 		return res.IsTruthy()
 	}
@@ -1375,7 +1374,7 @@ func checkIsInstance(ctx *val.ExecContext, obj, target val.Value) bool {
 		}
 		// Support __class__ spoofing (e.g. unittest.mock.Mock)
 		if obj.IsInstance() {
-			if spoofedCls, ok := obj.AsInstance().GetAttr(val.InternString("__class__")); ok && spoofedCls.IsType() {
+			if spoofedCls, ok := obj.AsInstance().GetAttr(nameClass); ok && spoofedCls.IsType() {
 				return val.IsSubclass(spoofedCls.AsType(), target.AsType())
 			}
 		}
@@ -1401,7 +1400,7 @@ func checkIsSubclass(ctx *val.ExecContext, cls, target val.Value) bool {
 		return false
 	}
 	targetType := target.Type()
-	if fn, _, ok := targetType.LookupMRO(val.InternString("__subclasscheck__")); ok {
+	if fn, _, ok := targetType.LookupMRO(nameSubclassCheck); ok {
 		res := ctx.Invoke2(fn, target, cls)
 		return res.IsTruthy()
 	}
@@ -1415,7 +1414,11 @@ func checkIsSubclass(ctx *val.ExecContext, cls, target val.Value) bool {
 }
 
 func vmGetAttrSafe(ctx *val.ExecContext, obj val.Value, name string) (res val.Value, ok bool) {
-	interned := val.InternString(name)
+	return vmGetAttrSafeVal(ctx, obj, val.InternString(name))
+}
+
+func vmGetAttrSafeVal(ctx *val.ExecContext, obj, name val.Value) (res val.Value, ok bool) {
+	interned := val.InternValue(name)
 	defer func() {
 		if r := recover(); r != nil {
 			exc := panicToPyException(r)

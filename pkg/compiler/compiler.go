@@ -92,6 +92,7 @@ type Compiler struct {
 	isExec         bool
 	isSingle       bool
 	optimize       int
+	hasSliceOps    bool
 }
 
 func buildLineStarts(src []byte) []int {
@@ -231,7 +232,7 @@ func CompileWithFilenameAndOptimize(src []byte, arena *ASTArena, filename string
 		QualName:       "<module>",
 		FileName:       filename,
 		FirstLineNo:    1,
-		Code:           c.code,
+		Code:           c.finalizedCode(),
 		Consts:         c.constPool.Slice(),
 		VarNames:       varNames,
 		NumLocals:      frameLocalCount(c.scope),
@@ -321,7 +322,7 @@ func CompileSourceModeWithOptimize(src []byte, filename string, mode CompileMode
 			QualName:       "<module>",
 			FileName:       filename,
 			FirstLineNo:    1,
-			Code:           c.code,
+			Code:           c.finalizedCode(),
 			Consts:         c.constPool.Slice(),
 			VarNames:       varNames,
 			NumLocals:      frameLocalCount(c.scope),
@@ -387,7 +388,7 @@ func CompileSourceModeWithOptimize(src []byte, filename string, mode CompileMode
 		QualName:       "<module>",
 		FileName:       filename,
 		FirstLineNo:    1,
-		Code:           c.code,
+		Code:           c.finalizedCode(),
 		Consts:         c.constPool.Slice(),
 		VarNames:       varNames,
 		NumLocals:      frameLocalCount(c.scope),
@@ -477,7 +478,24 @@ func (c *Compiler) emit(inst uint32) int {
 }
 
 func (c *Compiler) emitOp(op vm.Opcode, argA uint8, argBx uint16) int {
+	if op == vm.OP_BINARY_SLICE {
+		c.hasSliceOps = true
+	}
 	return c.emit(vm.Encode(op, argA, argBx))
+}
+
+// finalizedCode rewrites OP_STORE_FAST to OP_STORE_FAST_VIEW only when the
+// function contains slice operations that may produce a trackable memoryview.
+func (c *Compiler) finalizedCode() []uint32 {
+	if !c.hasSliceOps {
+		return c.code
+	}
+	for i, inst := range c.code {
+		if vm.DecodeOpcode(inst) == vm.OP_STORE_FAST {
+			c.code[i] = vm.Encode(vm.OP_STORE_FAST_VIEW, vm.DecodeArgA(inst), vm.DecodeArgBx(inst))
+		}
+	}
+	return c.code
 }
 
 func (c *Compiler) patchJump(jumpIdx int, target int) {
@@ -707,8 +725,8 @@ func (c *Compiler) compileStmt(stmtID StmtID) error {
 					if err := c.compileNameLoad("__build_lazy_import__"); err != nil {
 						return err
 					}
-					c.emitOp(vm.OP_LOAD_CONST, 0, c.constPool.Add(val.NewStringVal(alias.Name)))
-					c.emitOp(vm.OP_LOAD_CONST, 0, c.constPool.Add(val.NewStringVal("")))
+					c.emitOp(vm.OP_LOAD_CONST, 0, c.constPool.Add(val.InternString(alias.Name)))
+					c.emitOp(vm.OP_LOAD_CONST, 0, c.constPool.Add(val.InternString("")))
 					c.emitOp(vm.OP_LOAD_CONST, 0, c.constPool.Add(val.Int64Val(0)))
 					c.emitOp(vm.OP_CALL, 3, 0)
 					targetName := alias.AsName
@@ -746,8 +764,8 @@ func (c *Compiler) compileStmt(stmtID StmtID) error {
 					if err := c.compileNameLoad("__build_lazy_import__"); err != nil {
 						return err
 					}
-					c.emitOp(vm.OP_LOAD_CONST, 0, c.constPool.Add(val.NewStringVal(impFrom.Module)))
-					c.emitOp(vm.OP_LOAD_CONST, 0, c.constPool.Add(val.NewStringVal(alias.Name)))
+					c.emitOp(vm.OP_LOAD_CONST, 0, c.constPool.Add(val.InternString(impFrom.Module)))
+					c.emitOp(vm.OP_LOAD_CONST, 0, c.constPool.Add(val.InternString(alias.Name)))
 					c.emitOp(vm.OP_LOAD_CONST, 0, c.constPool.Add(val.Int64Val(int64(impFrom.Level))))
 					c.emitOp(vm.OP_CALL, 3, 0)
 					targetName := alias.Name
@@ -2035,7 +2053,7 @@ func (c *Compiler) compileFuncDef(stmt *ASTStmt) error {
 		FirstLineNo:     int(firstLine),
 		PosOnlyArgCount: int(fnDef.PosOnlyCount),
 		KWOnlyArgCount:  int(fnDef.KWOnlyCount),
-		Code:            subCompiler.code,
+		Code:            subCompiler.finalizedCode(),
 		Consts:          subCompiler.constPool.Slice(),
 		ParamNames:      paramValSlice,
 		VarNames:        varNames,
@@ -2142,7 +2160,7 @@ func (c *Compiler) compileFuncDef(stmt *ASTStmt) error {
 
 		annCodeObj := &vm.CodeObject{
 			Name:         "__annotate__",
-			Code:         annCompiler.code,
+			Code:         annCompiler.finalizedCode(),
 			Consts:       annCompiler.constPool.Slice(),
 			NumParams:    1,
 			NumLocals:    frameLocalCount(annScope),
@@ -2301,7 +2319,7 @@ func (c *Compiler) compileClassDef(stmt *ASTStmt) error {
 		QualName:     clsQualName,
 		FileName:     c.filename,
 		FirstLineNo:  int(firstLine),
-		Code:         subCompiler.code,
+		Code:         subCompiler.finalizedCode(),
 		Consts:       subCompiler.constPool.Slice(),
 		NumLocals:    frameLocalCount(subCompiler.scope),
 		NumParams:    0,
@@ -4040,7 +4058,7 @@ func (c *Compiler) compileGenExp(expr *ASTExpr) error {
 
 	genCodeObj := &vm.CodeObject{
 		Name:         "<genexpr>",
-		Code:         subCompiler.code,
+		Code:         subCompiler.finalizedCode(),
 		Consts:       subCompiler.constPool.Slice(),
 		ParamNames:   paramNames,
 		CellVars:     cellValSlice,
@@ -4170,7 +4188,7 @@ func (c *Compiler) compileLambda(expr *ASTExpr) error {
 		QualName:     lambdaQualName,
 		FileName:     c.filename,
 		FirstLineNo:  int(firstLine),
-		Code:         subCompiler.code,
+		Code:         subCompiler.finalizedCode(),
 		Consts:       subCompiler.constPool.Slice(),
 		ParamNames:   paramValSlice,
 		VarNames:     varNames,
@@ -4305,7 +4323,7 @@ func (c *Compiler) emitAnnotateFunction() error {
 		FileName:        c.filename,
 		FirstLineNo:     int(c.curLine),
 		PosOnlyArgCount: 1,
-		Code:            sub.code,
+		Code:            sub.finalizedCode(),
 		Consts:          sub.constPool.Slice(),
 		ParamNames:      []val.Value{formatName},
 		VarNames:        varNames,

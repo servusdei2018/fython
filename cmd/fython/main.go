@@ -4,14 +4,51 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"runtime/debug"
+	"runtime/pprof"
 
 	"github.com/servusdei2018/fython/internal/cli"
 )
 
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	if os.Getenv("GOGC") == "" {
 		debug.SetGCPercent(500)
+	}
+	if os.Getenv("GOMEMLIMIT") == "" {
+		debug.SetMemoryLimit(256 << 20)
+	}
+	if path := os.Getenv("FYTHON_CPUPROFILE"); path != "" {
+		f, err := os.Create(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "fython: cpuprofile: %v\n", err)
+			return 1
+		}
+		if err := pprof.StartCPUProfile(f); err != nil {
+			_ = f.Close()
+			fmt.Fprintf(os.Stderr, "fython: cpuprofile: %v\n", err)
+			return 1
+		}
+		defer func() {
+			pprof.StopCPUProfile()
+			_ = f.Close()
+		}()
+	}
+	if path := os.Getenv("FYTHON_MEMPROFILE"); path != "" {
+		defer func() {
+			runtime.GC()
+			f, err := os.Create(path)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "fython: memprofile: %v\n", err)
+				return
+			}
+			_ = pprof.WriteHeapProfile(f)
+			_ = f.Close()
+		}()
 	}
 	if cli.IsBundledExecutable() {
 		err := cli.RunBundledExecutable()
@@ -20,30 +57,30 @@ func main() {
 				if exit.Message != "" {
 					fmt.Fprintln(os.Stderr, exit.Message)
 				}
-				os.Exit(exit.Code)
+				return exit.Code
 			}
 			fmt.Fprintln(os.Stderr, err.Error())
-			os.Exit(1)
+			return 1
 		}
-		os.Exit(0)
+		return 0
 	}
 
 	if len(os.Args) > 1 && os.Args[1] == "build" {
 		err := cli.RunBuild(os.Args[2:])
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err.Error())
-			os.Exit(1)
+			return 1
 		}
-		os.Exit(0)
+		return 0
 	}
 
 	if len(os.Args) > 1 && os.Args[1] == "serve" {
 		err := cli.RunServe(os.Args[2:])
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err.Error())
-			os.Exit(1)
+			return 1
 		}
-		os.Exit(0)
+		return 0
 	}
 
 	var c cli.CLI
@@ -59,16 +96,17 @@ func main() {
 			if exit.Message != "" {
 				fmt.Fprintln(os.Stderr, exit.Message)
 			}
-			os.Exit(exit.Code)
+			return exit.Code
 		}
 		if uncaught, ok := errors.AsType[*cli.ErrUncaughtException](err); ok {
 			// A user-installed sys.excepthook already reported the failure.
 			if !uncaught.Reported {
 				fmt.Fprintln(os.Stderr, uncaught.Error())
 			}
-			os.Exit(1)
+			return 1
 		}
 		fmt.Fprintln(os.Stderr, err.Error())
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }

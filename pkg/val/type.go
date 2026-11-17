@@ -764,7 +764,7 @@ func NewTypeWithMeta(name string, bases []*PyType, dict *PyDict, meta *PyType) (
 	// Python data model: defining __eq__ without __hash__ implicitly sets __hash__ = None.
 	if DunderEq.ptr != nil {
 		if _, hasEq := dict.Get(DunderEq); hasEq {
-			hashKey := InternString("__hash__")
+			hashKey := strHash
 			if _, hasHash := dict.Get(hashKey); !hasHash {
 				dict.Set(hashKey, NoneVal())
 			}
@@ -1105,7 +1105,7 @@ func dunderTpDescrGetSlot(ctx *ExecContext, descr, obj Value, owner *PyType) Val
 
 func dunderTpDescrSetSlot(ctx *ExecContext, descr, obj, value Value) {
 	if value.IsUnbound() {
-		if delFn, _, ok := descr.Type().LookupMRO(InternString("__delete__")); ok {
+		if delFn, _, ok := descr.Type().LookupMRO(strDelete); ok {
 			ctx.Invoke2(delFn, descr, obj)
 			return
 		}
@@ -1170,7 +1170,7 @@ func (t *PyType) syncDunderSlots() {
 	if fn, _, ok := t.LookupMRO(DunderSet); ok {
 		t.dunderSet = fn
 		t.Slots.TpDescrSet = dunderTpDescrSetSlot
-	} else if _, _, ok := t.LookupMRO(InternString("__delete__")); ok {
+	} else if _, _, ok := t.LookupMRO(strDelete); ok {
 		t.dunderSet = Value{}
 		t.Slots.TpDescrSet = dunderTpDescrSetSlot
 	} else {
@@ -1438,7 +1438,7 @@ func (t *PyType) syncDunderSlots() {
 	} else {
 		t.dunderDelAttr = Value{}
 	}
-	if fn, owner, ok := t.LookupMRO(InternString("__hash__")); ok && owner != ObjectType {
+	if fn, owner, ok := t.LookupMRO(strHash); ok && owner != ObjectType {
 		t.dunderHash = fn
 	} else {
 		t.dunderHash = Value{}
@@ -1674,7 +1674,7 @@ func defaultObjectGetAttrOptional(ctx *ExecContext, obj, name Value) (Value, boo
 	interned := InternValue(name)
 	tp := obj.Type()
 
-	if interned.StringEquals("__class__") {
+	if interned == strClass {
 		return TypeVal(tp), true
 	}
 
@@ -1706,7 +1706,7 @@ func defaultObjectGetAttrOptional(ctx *ExecContext, obj, name Value) (Value, boo
 
 	if obj.IsModule() {
 		mod := obj.AsModule()
-		if interned.StringEquals("__dict__") {
+		if interned == strDict {
 			return DictVal(mod.Dict), true
 		}
 		if v, ok := mod.Dict.Get(interned); ok {
@@ -1821,7 +1821,7 @@ func defaultObjectGetAttrOptional(ctx *ExecContext, obj, name Value) (Value, boo
 		}
 	}
 
-	if interned.StringEquals("__dict__") {
+	if interned == strDict {
 		if obj.IsDict() && tp != DictType {
 			d := obj.AsDict()
 			if d.Attrs == nil {
@@ -1851,7 +1851,7 @@ func defaultObjectGetAttrOptional(ctx *ExecContext, obj, name Value) (Value, boo
 		}
 		if obj.IsInstance() {
 			inst := obj.AsInstance()
-			if annotateFn, ok := inst.GetAttr(InternString("__annotate__")); ok {
+			if annotateFn, ok := inst.GetAttr(strAnnotate); ok {
 				var annDict Value
 				if ctx != nil && ctx.CallHook != nil {
 					base := ctx.SP
@@ -1887,7 +1887,7 @@ func objectSetAttr(ctx *ExecContext, obj, name, value Value) Value {
 		return NoneVal()
 	}
 
-	if obj.IsInstance() && obj.AsInstance().Shape != nil && interned.AsString() == "__class__" {
+	if obj.IsInstance() && obj.AsInstance().Shape != nil && interned == strClass {
 		AssignInstanceClass(obj, value)
 		return NoneVal()
 	}
@@ -1901,7 +1901,7 @@ func objectSetAttr(ctx *ExecContext, obj, name, value Value) Value {
 	}
 
 	if obj.IsInstance() && obj.AsInstance().Shape != nil {
-		if interned.AsString() == "__dict__" && (tp.Flags&FlagForbidDynamicAttrs) == 0 {
+		if interned == strDict && (tp.Flags&FlagForbidDynamicAttrs) == 0 {
 			ReplaceInstanceDict(ctx, obj.AsInstance(), value)
 			return NoneVal()
 		}
@@ -1911,7 +1911,7 @@ func objectSetAttr(ctx *ExecContext, obj, name, value Value) Value {
 
 	if obj.IsCInstance() {
 		ci := obj.AsCInstance()
-		if interned.AsString() == "__dict__" {
+		if interned == strDict {
 			if !value.IsDict() {
 				panic("TypeError: __dict__ must be set to a dictionary, not a '" + value.Type().Name + "'")
 			}
@@ -1926,12 +1926,12 @@ func objectSetAttr(ctx *ExecContext, obj, name, value Value) Value {
 	}
 
 	if obj.IsModule() {
-		if interned.AsString() == "__class__" {
+		if interned == strClass {
 			AssignInstanceClass(obj, value)
 			return NoneVal()
 		}
 		mod := obj.AsModule()
-		if interned.AsString() == "__dict__" {
+		if interned == strDict {
 			if !value.IsDict() {
 				panic("TypeError: __dict__ must be set to a dictionary, not a '" + value.Type().Name + "'")
 			}
@@ -2007,7 +2007,7 @@ func typeGetAttr(ctx *ExecContext, typeObj, name Value) Value {
 	}
 
 	// __doc__ on a class is never inherited from parent classes via MRO.
-	if interned.AsString() == "__doc__" {
+	if interned == strDoc {
 		if cls.Dict != nil {
 			if descr, ok := cls.Dict.Get(interned); ok {
 				if descrGet := descr.Type().Slots.TpDescrGet; descrGet != nil {
@@ -2036,35 +2036,35 @@ func typeGetAttr(ctx *ExecContext, typeObj, name Value) Value {
 	}
 
 	// 4. Builtin type reflection attributes
-	switch interned.AsString() {
-	case "__class__":
+	switch interned {
+	case strClass:
 		return TypeVal(meta)
-	case "__bases__":
+	case strBases:
 		basesItems := make([]Value, len(cls.Bases))
 		for i, b := range cls.Bases {
 			basesItems[i] = TypeVal(b)
 		}
 		return NewTupleVal(basesItems...)
-	case "__name__":
+	case strName:
 		return InternString(cls.Name)
-	case "__qualname__":
-		if qn, ok := cls.Dict.Get(InternString("__qualname__")); ok {
+	case strQualname:
+		if qn, ok := cls.Dict.Get(strQualname); ok {
 			return qn
 		}
 		return InternString(cls.Name)
-	case "__type_params__":
-		if tp, ok := cls.Dict.Get(InternString("__type_params__")); ok {
+	case strTypeParams:
+		if tp, ok := cls.Dict.Get(strTypeParams); ok {
 			return tp
 		}
 		return NewTupleVal()
-	case "__module__":
-		if modVal, ok := cls.Dict.Get(InternString("__module__")); ok {
+	case strModule:
+		if modVal, ok := cls.Dict.Get(strModule); ok {
 			return modVal
 		}
-		return InternString("builtins")
-	case "__dict__":
+		return strBuiltins
+	case strDict:
 		return NewMappingProxyVal(ObjectVal(&cls.Dict.Header))
-	case "__mro__":
+	case strMRO:
 		mroItems := make([]Value, len(cls.MRO))
 		for i, m := range cls.MRO {
 			mroItems[i] = TypeVal(m)
@@ -2198,7 +2198,7 @@ func moduleGetAttr(ctx *ExecContext, obj, name Value) Value {
 func defaultModuleGetAttr(ctx *ExecContext, obj, interned Value) Value {
 	mod := obj.AsModule()
 	tp := obj.Type()
-	if interned.AsString() == "__class__" {
+	if interned == strClass {
 		return TypeVal(tp)
 	}
 
@@ -2229,7 +2229,7 @@ func defaultModuleGetAttr(ctx *ExecContext, obj, interned Value) Value {
 		return v
 	}
 
-	if interned.AsString() == "__dict__" {
+	if interned == strDict {
 		return DictVal(mod.Dict)
 	}
 
@@ -2243,18 +2243,18 @@ func defaultModuleGetAttr(ctx *ExecContext, obj, interned Value) Value {
 	}
 
 	// 4. Built-in module reflection attributes
-	switch interned.AsString() {
-	case "__name__":
+	switch interned {
+	case strName:
 		return InternString(mod.Name)
-	case "__doc__":
+	case strDoc:
 		return NoneVal()
-	case "__file__":
+	case strFile:
 		if mod.File != "" {
 			return NewStringVal(mod.File)
 		}
-	case "__annotations__":
+	case strAnnotations:
 		return ModuleAnnotations(ctx, mod)
-	case "__annotate__":
+	case strAnnotate:
 		return NoneVal()
 	}
 

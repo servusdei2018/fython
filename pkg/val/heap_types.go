@@ -1557,11 +1557,12 @@ func NewException(cls *PyType, msg string) Value {
 		strVal := InternString(msg)
 		argsTuple = NewTupleVal(strVal)
 	}
-	inst.AsInstance().SetAttr(InternString("args"), argsTuple)
-	inst.AsInstance().SetAttr(InternString("__traceback__"), NoneVal())
-	inst.AsInstance().SetAttr(InternString("__cause__"), NoneVal())
-	inst.AsInstance().SetAttr(InternString("__context__"), NoneVal())
-	inst.AsInstance().SetAttr(InternString("__suppress_context__"), BoolVal(false))
+	instObj := inst.AsInstance()
+	instObj.SetAttr(strArgs, argsTuple)
+	instObj.SetAttr(strTraceback, NoneVal())
+	instObj.SetAttr(strCause, NoneVal())
+	instObj.SetAttr(strContext, NoneVal())
+	instObj.SetAttr(strSuppressContext, BoolVal(false))
 	return inst
 }
 
@@ -1578,7 +1579,7 @@ func NewValueError(msg string) Value {
 // NewKeyError constructs a KeyError instance.
 func NewKeyError(key Value) Value {
 	inst := NewInstanceOfType(KeyErrorType)
-	inst.AsInstance().SetAttr(InternString("args"), NewTupleVal(key))
+	inst.AsInstance().SetAttr(strArgs, NewTupleVal(key))
 	return inst
 }
 
@@ -1777,6 +1778,21 @@ func (d *PyDict) Set(key, value Value) {
 	d.setLocked(key, value)
 }
 
+// dictKeyEqual compares a dict entry key against a lookup key using O(1)
+// pointer/inline-string fast paths before falling back to generic Equals.
+func dictKeyEqual(a, b Value) bool {
+	if a == b {
+		return true
+	}
+	if a.ptr == &tagInlineStr && b.ptr == &tagInlineStr {
+		return false
+	}
+	if a.ptr != nil && b.ptr != nil && (a.ptr.Flags&b.ptr.Flags&FlagInterned) != 0 {
+		return false
+	}
+	return Equals(a, b)
+}
+
 func (d *PyDict) setLocked(key, value Value) {
 	if len(d.indices) == 0 {
 		d.initTable(8)
@@ -1802,7 +1818,7 @@ func (d *PyDict) setLocked(key, value Value) {
 				}
 			} else {
 				e := &d.Entries[int(raw)-dictIndexOffset]
-				if e.Key == key || (e.Hash == h && e.Active && Equals(e.Key, key)) {
+				if e.Key == key || (e.Hash == h && e.Active && dictKeyEqual(e.Key, key)) {
 					e.Value = value
 					atomic.AddUint64(&d.VersionTag, 1)
 					return
@@ -1825,7 +1841,7 @@ func (d *PyDict) setLocked(key, value Value) {
 				}
 			} else {
 				e := &d.Entries[int(raw)-dictIndexOffset]
-				if e.Key == key || (e.Hash == h && e.Active && Equals(e.Key, key)) {
+				if e.Key == key || (e.Hash == h && e.Active && dictKeyEqual(e.Key, key)) {
 					e.Value = value
 					atomic.AddUint64(&d.VersionTag, 1)
 					return
@@ -1936,7 +1952,7 @@ func (d *PyDict) GetWithSlotHint(key Value, slotHint int) (Value, int, bool) {
 	defer d.mu.RUnlock()
 	if slotHint >= 0 && slotHint < len(d.Entries) {
 		e := &d.Entries[slotHint]
-		if e.Active && Equals(e.Key, key) {
+		if e.Active && dictKeyEqual(e.Key, key) {
 			return e.Value, slotHint, true
 		}
 	}
@@ -1961,7 +1977,7 @@ func (d *PyDict) getWithSlotLocked(key Value) (Value, int, bool) {
 			if raw >= dictIndexOffset {
 				idx := int(raw) - dictIndexOffset
 				e := &d.Entries[idx]
-				if e.Hash == h && e.Active && Equals(e.Key, key) {
+				if e.Key == key || (e.Hash == h && e.Active && dictKeyEqual(e.Key, key)) {
 					return e.Value, idx, true
 				}
 			}
@@ -1977,7 +1993,7 @@ func (d *PyDict) getWithSlotLocked(key Value) (Value, int, bool) {
 		if raw >= dictIndexOffset {
 			idx := int(raw) - dictIndexOffset
 			e := &d.Entries[idx]
-			if e.Hash == h && e.Active && Equals(e.Key, key) {
+			if e.Key == key || (e.Hash == h && e.Active && dictKeyEqual(e.Key, key)) {
 				return e.Value, idx, true
 			}
 		}
@@ -2002,7 +2018,7 @@ func (d *PyDict) getLocked(key Value) (Value, bool) {
 			}
 			if raw >= dictIndexOffset {
 				e := &d.Entries[int(raw)-dictIndexOffset]
-				if e.Hash == h && e.Active && Equals(e.Key, key) {
+				if e.Key == key || (e.Hash == h && e.Active && dictKeyEqual(e.Key, key)) {
 					return e.Value, true
 				}
 			}
@@ -2017,7 +2033,7 @@ func (d *PyDict) getLocked(key Value) (Value, bool) {
 		}
 		if raw >= dictIndexOffset {
 			e := &d.Entries[int(raw)-dictIndexOffset]
-			if e.Hash == h && e.Active && Equals(e.Key, key) {
+			if e.Key == key || (e.Hash == h && e.Active && dictKeyEqual(e.Key, key)) {
 				return e.Value, true
 			}
 		}
@@ -2052,7 +2068,7 @@ func (d *PyDict) deleteLocked(key Value) bool {
 		}
 		if raw >= dictIndexOffset {
 			e := &d.Entries[int(raw)-dictIndexOffset]
-			if e.Hash == h && e.Active && Equals(e.Key, key) {
+			if e.Key == key || (e.Hash == h && e.Active && dictKeyEqual(e.Key, key)) {
 				e.Active = false
 				e.Key = NoneVal()
 				e.Value = NoneVal()

@@ -446,13 +446,14 @@ type VM struct {
 	joinErrMsg    string
 	// mvFree holds the memory views that are no longer referenced and can
 	// be handed out again by the next slice.
-	mvFree       []*val.PyMemoryView
-	rootCO       CodeObject
-	rootCache    VMCodeCache
-	limits       RuntimeLimits
-	limitsActive bool
-	stepCount    uint64
-	eventLoop    *EventLoop
+	mvFree          []*val.PyMemoryView
+	hasTrackedViews bool
+	rootCO          CodeObject
+	rootCache       VMCodeCache
+	limits          RuntimeLimits
+	limitsActive    bool
+	stepCount       uint64
+	eventLoop       *EventLoop
 }
 
 // loadWindow returns the instruction window of co as a base pointer and a

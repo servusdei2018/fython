@@ -683,7 +683,7 @@ func objectTruthy(v Value) bool {
 	if t == nil {
 		return true
 	}
-	if fn, _, ok := t.LookupMRO(InternString("__bool__")); ok {
+	if fn, _, ok := t.LookupMRO(strBool); ok {
 		var ctx *ExecContext
 		return (*ExecContext).Invoke1(ctx, fn, v).IsTruthy()
 	}
@@ -942,15 +942,7 @@ func HashValue(v Value) uint32 {
 		if v.ptr.Hash != 0 {
 			return v.ptr.Hash
 		}
-		data := v.AsBytes().Data
-		h := fnvOffset32
-		for i := range data {
-			h ^= uint32(data[i])
-			h *= fnvPrime32
-		}
-		if h == 0 {
-			h = 1
-		}
+		h := HashBytes(v.AsBytes().Data)
 		v.ptr.Hash = h
 		return h
 	}

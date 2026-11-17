@@ -230,9 +230,9 @@ func (vm *VM) buildClass(classBody, nameVal val.Value, origBases []val.Value, kw
 	var kwdsDict *val.PyDict
 	if kwdsVal.IsDict() {
 		kwdsDict = kwdsVal.AsDict()
-		if metaV, ok := kwdsDict.Get(val.InternString("metaclass")); ok {
+		if metaV, ok := kwdsDict.Get(nameMetaclass); ok {
 			explicitMeta = metaV
-			kwdsDict.Delete(val.InternString("metaclass"))
+			kwdsDict.Delete(nameMetaclass)
 		}
 	}
 
@@ -333,7 +333,7 @@ func (vm *VM) buildClass(classBody, nameVal val.Value, origBases []val.Value, kw
 
 	if classCellIdx >= 0 {
 		if namespace.IsDict() {
-			namespace.AsDict().Set(val.InternString("__classcell__"), classCell)
+			namespace.AsDict().Set(nameClassCell, classCell)
 		}
 	}
 
@@ -341,11 +341,11 @@ func (vm *VM) buildClass(classBody, nameVal val.Value, origBases []val.Value, kw
 		globals = vm.globals
 	}
 	if globals != nil {
-		if modName, ok := globals.Get(val.InternString("__name__")); ok {
+		if modName, ok := globals.Get(nameDunderName); ok {
 			if namespace.IsDict() {
-				namespace.AsDict().Set(val.InternString("__module__"), modName)
+				namespace.AsDict().Set(nameModule, modName)
 			} else {
-				val.SetItemCtx(&vm.execCtx, namespace, val.InternString("__module__"), modName)
+				val.SetItemCtx(&vm.execCtx, namespace, nameModule, modName)
 			}
 		}
 	}
@@ -355,9 +355,9 @@ func (vm *VM) buildClass(classBody, nameVal val.Value, origBases []val.Value, kw
 	}
 	if qualName != "" {
 		if namespace.IsDict() {
-			namespace.AsDict().Set(val.InternString("__qualname__"), val.InternString(qualName))
+			namespace.AsDict().Set(nameQualname, val.InternString(qualName))
 		} else {
-			val.SetItemCtx(&vm.execCtx, namespace, val.InternString("__qualname__"), val.InternString(qualName))
+			val.SetItemCtx(&vm.execCtx, namespace, nameQualname, val.InternString(qualName))
 		}
 	}
 	vm.runClassBodyWithLocals(co, globals, namespace, bodyCells)
@@ -393,7 +393,7 @@ func (vm *VM) buildClass(classBody, nameVal val.Value, origBases []val.Value, kw
 		bodyCells[classCellIdx].AsCell().Value = newClsVal
 	}
 	if namespace.IsDict() {
-		if cc, ok := namespace.AsDict().Get(val.InternString("__classcell__")); ok {
+		if cc, ok := namespace.AsDict().Get(nameClassCell); ok {
 			if cc.IsCell() {
 				cc.AsCell().Value = newClsVal
 			}
@@ -599,12 +599,12 @@ func (vm *VM) bindFunctionArgs(co *CodeObject, defaults []val.Value, kwDefaults 
 	posParamCount := 0
 	kwOnlyCount := co.KWOnlyArgCount
 	for p := range paramNames {
-		pnStr := paramNames[p].AsString()
+		pn := paramNames[p]
 		switch {
-		case strings.HasPrefix(pnStr, "**"):
+		case pn.StringStartsWithTwoBytes('*', '*'):
 			varKWIdx = p
-		case strings.HasPrefix(pnStr, "*"):
-			if pnStr != "*" {
+		case pn.StringHasBytePrefix('*'):
+			if !pn.StringEquals("*") {
 				varArgsIdx = p
 			}
 		default:
@@ -836,7 +836,8 @@ func (vm *VM) reclaimViewSlot(old, incoming val.Value) {
 // when the slice result is stored into a local slot right away.
 func reusableViewFor(codePtr unsafe.Pointer, ip int, locals []val.Value) *val.PyMemoryView {
 	next := *(*uint32)(unsafe.Add(codePtr, uintptr(ip+1)*4))
-	if DecodeOpcode(next) != OP_STORE_FAST {
+	nextOp := DecodeOpcode(next)
+	if nextOp != OP_STORE_FAST && nextOp != OP_STORE_FAST_VIEW {
 		return nil
 	}
 	slot := int(DecodeArgBx(next))
@@ -1417,23 +1418,23 @@ func (vm *VM) CallUserExcepthook(exc val.Value) bool {
 	if vm.engine == nil || vm.modules == nil {
 		return false
 	}
-	sysVal, ok := vm.modules.Get(val.InternString("sys"))
+	sysVal, ok := vm.modules.Get(nameSys)
 	if !ok || !sysVal.IsModule() {
 		return false
 	}
-	hook, ok := sysVal.AsModule().Dict.Get(val.InternString("excepthook"))
+	hook, ok := sysVal.AsModule().Dict.Get(nameExcepthook)
 	if !ok || hook.IsNone() || hook.HeaderPtr() == nil {
 		return false
 	}
 	// The default hook is also published as sys.__excepthook__, so a user
 	// override can be detected by comparing the two.
-	if def, ok := sysVal.AsModule().Dict.Get(val.InternString("__excepthook__")); ok &&
+	if def, ok := sysVal.AsModule().Dict.Get(nameDunderExcepthook); ok &&
 		def.HeaderPtr() != nil && hook.HeaderPtr() == def.HeaderPtr() {
 		return false
 	}
 	tb := val.NoneVal()
 	if exc.IsInstance() {
-		tb, _ = exc.AsInstance().GetAttr(val.InternString("__traceback__"))
+		tb, _ = exc.AsInstance().GetAttr(nameTraceback)
 	}
 	vm.execCtx.SP = 0
 	vm.Vectorcall(hook, []val.Value{val.TypeVal(exc.Type()), exc, tb}, nil)
@@ -1467,12 +1468,12 @@ func (vm *VM) bindFunctionArgsToSlice(co *CodeObject, defaults []val.Value, kwDe
 	posParamCount := 0
 	kwOnlyCount := co.KWOnlyArgCount
 	for p := range paramNames {
-		pnStr := paramNames[p].AsString()
+		pn := paramNames[p]
 		switch {
-		case strings.HasPrefix(pnStr, "**"):
+		case pn.StringStartsWithTwoBytes('*', '*'):
 			varKWIdx = p
-		case strings.HasPrefix(pnStr, "*"):
-			if pnStr != "*" {
+		case pn.StringHasBytePrefix('*'):
+			if !pn.StringEquals("*") {
 				varArgsIdx = p
 			}
 		default:
@@ -2019,7 +2020,7 @@ func (vm *VM) syncActiveFrame(frameIdx int, co *CodeObject, codePtr unsafe.Point
 func (vm *VM) unwindException(exc val.Value, curCO **CodeObject, ip *int, frameIdx *int, startFrameIdx int, baseOffset *int, sp *int, codePtr *unsafe.Pointer, codeLen *int, consts *[]val.Value, cells *[]val.Value, globals **val.PyDict, curLocals *val.Value, stack []val.Value, curCodeCache **VMCodeCache) bool {
 	curTB := val.NoneVal()
 	if exc.IsInstance() {
-		curTB, _ = exc.AsInstance().GetAttr(val.InternString("__traceback__"))
+		curTB, _ = exc.AsInstance().GetAttr(nameTraceback)
 	}
 
 	faultIP := *ip
@@ -2094,7 +2095,7 @@ func (vm *VM) unwindException(exc val.Value, curCO **CodeObject, ip *int, frameI
 			frameVal := vm.materializeFrame(faultFrameIdx)
 			curTB = val.NewTracebackVal(frameVal, line, faultIP, val.NoneVal())
 			if exc.IsInstance() {
-				exc.AsInstance().SetAttr(val.InternString("__traceback__"), curTB)
+				exc.AsInstance().SetAttr(nameTraceback, curTB)
 			}
 		}
 
@@ -2129,7 +2130,7 @@ func (vm *VM) unwindException(exc val.Value, curCO **CodeObject, ip *int, frameI
 				frameVal := vm.materializeFrame(*frameIdx)
 				curTB = val.NewTracebackVal(frameVal, line, callerIP, curTB)
 				if exc.IsInstance() {
-					exc.AsInstance().SetAttr(val.InternString("__traceback__"), curTB)
+					exc.AsInstance().SetAttr(nameTraceback, curTB)
 				}
 			}
 			continue
@@ -2371,12 +2372,28 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			bx := uint16(inst)
 			sp--
 			valToStore := stack[sp]
-			key := viewSlotKey(frameIdx, int(bx))
 			if bx < 256 {
-				vm.storeFastValue(locals[uint8(bx)], valToStore, key)
 				locals[uint8(bx)] = valToStore
 			} else {
-				vm.storeFastValue(stack[baseOffset+int(bx)], valToStore, key)
+				stack[baseOffset+int(bx)] = valToStore
+			}
+			ip++
+
+		case OP_STORE_FAST_VIEW:
+			bx := uint16(inst)
+			sp--
+			valToStore := stack[sp]
+			if vm.hasTrackedViews {
+				key := viewSlotKey(frameIdx, int(bx))
+				if bx < 256 {
+					vm.storeFastValue(locals[uint8(bx)], valToStore, key)
+				} else {
+					vm.storeFastValue(stack[baseOffset+int(bx)], valToStore, key)
+				}
+			}
+			if bx < 256 {
+				locals[uint8(bx)] = valToStore
+			} else {
 				stack[baseOffset+int(bx)] = valToStore
 			}
 			ip++
@@ -3153,7 +3170,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				}
 			}
 
-			if argc > 0 {
+			if vm.hasTrackedViews && argc > 0 {
 				markViewsEscaped(stack[newBase : newBase+argc])
 			}
 			switch target.Kind() {
@@ -3714,7 +3731,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			newBase := sp - totalArgs
 			retSP := sp - totalArgs - 1
 
-			if totalArgs > 0 {
+			if vm.hasTrackedViews && totalArgs > 0 {
 				markViewsEscaped(stack[newBase : newBase+totalArgs])
 			}
 			switch target.Kind() {
@@ -4357,7 +4374,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				}
 			}
 
-			if totalArgs > 0 {
+			if vm.hasTrackedViews && totalArgs > 0 {
 				markViewsEscaped(stack[newBase : newBase+totalArgs])
 			}
 			switch callable.Kind() {
@@ -4885,7 +4902,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 						}
 					}
 				}
-			case argc == 3 && receiver.IsInstance() && methIdx < uint16(len(consts)) && consts[methIdx].AsString() == "__exit__":
+			case argc == 3 && receiver.IsInstance() && methIdx < uint16(len(consts)) && consts[methIdx] == nameExit:
 				tp := receiver.Type()
 				if tp == FileType {
 					pf := (*pyFile)(val.AsPointer(receiver))
@@ -4931,7 +4948,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					}
 				}
 			}
-			if totalArgs > 0 {
+			if vm.hasTrackedViews && totalArgs > 0 {
 				markViewsEscaped(stack[newBase : newBase+totalArgs])
 			}
 
@@ -6005,7 +6022,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 
 		case OP_POP_TOP:
 			sp--
-			vm.reclaimViewSlot(stack[sp], val.NoneVal())
+			if vm.hasTrackedViews {
+				vm.reclaimViewSlot(stack[sp], val.NoneVal())
+			}
 			ip++
 
 		case OP_PRINT_EXPR:
@@ -6600,7 +6619,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				if fn.Dict == nil {
 					fn.Dict = val.NewDictVal(4).AsDict()
 				}
-				fn.Dict.Set(val.InternString("__annotate__"), annotateVal)
+				fn.Dict.Set(nameAnnotate, annotateVal)
 			}
 			stack[sp] = fnVal
 			sp++
@@ -6899,6 +6918,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			container := stack[sp-3]
 
 			if container.Kind() == val.KindMemoryView {
+				vm.hasTrackedViews = true
 				mv := container.AsMemoryView()
 				// The sub-view shares the payload of its parent, so the parent
 				// must never be recycled while the sub-view exists.
@@ -7619,8 +7639,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					exc = val.NewInstanceOfType(exc.AsType())
 				}
 				if exc.IsInstance() {
-					exc.AsInstance().SetAttr(val.InternString("__cause__"), cause)
-					exc.AsInstance().SetAttr(val.InternString("__suppress_context__"), val.BoolVal(true))
+					exc.AsInstance().SetAttr(nameCause, cause)
+					exc.AsInstance().SetAttr(nameSuppressContext, val.BoolVal(true))
 				}
 			}
 			if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curCodeCache) {
@@ -7789,7 +7809,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			}
 			if top.IsInstance() {
 				inst := top.AsInstance()
-				if m, ok := inst.GetAttr(val.InternString("__await__")); ok {
+				if m, ok := inst.GetAttr(nameAwait); ok {
 					stack[sp-1] = vm.Vectorcall(m, nil, nil)
 					ip++
 					continue
@@ -8356,7 +8376,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				var vals []val.Value
 				ok := true
 				if nargs > 0 {
-					if matchArgs, hasMA := clsType.AsType().Dict.Get(val.InternString("__match_args__")); hasMA && matchArgs.IsTuple() {
+					if matchArgs, hasMA := clsType.AsType().Dict.Get(nameMatchArgs); hasMA && matchArgs.IsTuple() {
 						maItems := matchArgs.AsTuple().Items
 						for i := range nargs {
 							if i < len(maItems) {
@@ -9223,7 +9243,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				}
 			}
 			vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
-			methVal := vm.getAttrSafe(receiver, val.InternString("write"))
+			methVal := vm.getAttrSafe(receiver, nameWrite)
 			if !methVal.IsNone() {
 				vm.Vectorcall(methVal, []val.Value{arg}, nil)
 			}
@@ -9391,10 +9411,14 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 		case OP_DELETE_FAST:
 			reg := uint16(inst)
 			if reg < 256 {
-				vm.reclaimViewSlot(locals[uint8(reg)], val.UnboundVal())
+				if vm.hasTrackedViews {
+					vm.reclaimViewSlot(locals[uint8(reg)], val.UnboundVal())
+				}
 				locals[uint8(reg)] = val.UnboundVal()
 			} else {
-				vm.reclaimViewSlot(stack[baseOffset+int(reg)], val.UnboundVal())
+				if vm.hasTrackedViews {
+					vm.reclaimViewSlot(stack[baseOffset+int(reg)], val.UnboundVal())
+				}
 				stack[baseOffset+int(reg)] = val.UnboundVal()
 			}
 			ip++
@@ -9418,7 +9442,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					vm.activeCO = curCO
 					vm.activeBaseOffset = baseOffset
 					vm.activeCells = cells
-					if delItemFn, _, ok := curLocals.Type().LookupMRO(val.InternString("__delitem__")); ok {
+					if delItemFn, _, ok := curLocals.Type().LookupMRO(nameDelitem); ok {
 						vm.Vectorcall(delItemFn, []val.Value{curLocals, nameVal}, nil)
 						deleted = true
 					}
@@ -10472,8 +10496,8 @@ func newIterChecked(obj val.Value) val.Value {
 	it := val.NewIterVal(obj)
 	if it.IsIter() && it.AsIter().Kind == val.IterKindInvalid {
 		if tp.Slots.TpIterNext == nil && tp.Slots.SqItem == nil {
-			if _, _, ok := tp.LookupMRO(val.InternString("__next__")); !ok {
-				if _, _, ok := tp.LookupMRO(val.InternString("__getitem__")); !ok {
+			if _, _, ok := tp.LookupMRO(nameNext); !ok {
+				if _, _, ok := tp.LookupMRO(nameGetitem); !ok {
 					panic("TypeError: '" + tp.Name + "' object is not iterable")
 				}
 			}
@@ -10653,7 +10677,7 @@ func (vm *VM) delSubscrSafe(obj, key val.Value) {
 			return
 		}
 	}
-	if delFn, _, ok := obj.Type().LookupMRO(val.InternString("__delitem__")); ok {
+	if delFn, _, ok := obj.Type().LookupMRO(nameDelitem); ok {
 		vm.execCtx.Invoke2(delFn, obj, key)
 		return
 	}

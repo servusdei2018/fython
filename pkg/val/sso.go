@@ -1,6 +1,7 @@
 package val
 
 import (
+	"hash/maphash"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -8,39 +9,31 @@ import (
 	"unsafe"
 )
 
-const (
-	fnvOffset32 uint32 = 2166136261
-	fnvPrime32  uint32 = 16777619
-)
+var strHashSeed = maphash.MakeSeed()
 
-// HashString computes the 32-bit FNV-1a hash of a string.
-// Guarantees a non-zero hash value so 0 can represent "uncomputed" in ObjectHeader.Hash.
-func HashString(s string) uint32 {
-	h := fnvOffset32
-	for i := range len(s) {
-		h ^= uint32(s[i])
-		h *= fnvPrime32
-	}
-	if h == 0 {
+func finishHash64(h uint64) uint32 {
+	r := uint32(h ^ (h >> 32))
+	if r == 0 {
 		return 1
 	}
-	return h
+	return r
 }
 
-// InlineStrHash computes the 32-bit FNV-1a hash directly from a KindInlineStr Value (0 allocations).
+// HashString computes a 32-bit hash of a string using Go's hardware-accelerated maphash.
+// Guarantees a non-zero hash value so 0 can represent "uncomputed" in ObjectHeader.Hash.
+func HashString(s string) uint32 {
+	return finishHash64(maphash.String(strHashSeed, s))
+}
+
+// InlineStrHash computes the 32-bit hash directly from a KindInlineStr Value (0 allocations).
 func InlineStrHash(v Value) uint32 {
 	num := v.num
 	n := int(num & 0xFF)
-	h := fnvOffset32
+	var buf [7]byte
 	for i := range n {
-		b := uint8(num >> ((i + 1) * 8))
-		h ^= uint32(b)
-		h *= fnvPrime32
+		buf[i] = byte(num >> ((i + 1) * 8))
 	}
-	if h == 0 {
-		return 1
-	}
-	return h
+	return finishHash64(maphash.Bytes(strHashSeed, buf[:n]))
 }
 
 // SmallStringVal packs a string of length 0 <= len(s) <= 7 into Value.num (0 allocations).
@@ -79,17 +72,9 @@ func SmallStringFromBytes(b []byte) Value {
 	}
 }
 
-// HashBytes computes the 32-bit FNV-1a hash of a byte slice.
+// HashBytes computes a 32-bit hash of a byte slice using Go's hardware-accelerated maphash.
 func HashBytes(b []byte) uint32 {
-	h := fnvOffset32
-	for i := range b {
-		h ^= uint32(b[i])
-		h *= fnvPrime32
-	}
-	if h == 0 {
-		return 1
-	}
-	return h
+	return finishHash64(maphash.Bytes(strHashSeed, b))
 }
 
 // AppendValueBytes appends the UTF-8 bytes of string-like Value v into dst without heap allocations.
@@ -482,7 +467,7 @@ func (p *InternPool) InternValue(v Value) Value {
 	if v.ptr == &tagInlineStr {
 		return v
 	}
-	if v.ptr.Kind == KindString {
+	if v.ptr != nil && v.ptr.Kind == KindString {
 		if (v.ptr.Flags & FlagInterned) != 0 {
 			return v
 		}
@@ -701,6 +686,30 @@ func (v Value) StringEquals(s string) bool {
 	}
 	if v.ptr.Kind == KindString {
 		return (*PyString)(unsafe.Pointer(v.ptr)).Data == s
+	}
+	return false
+}
+
+// StringHasBytePrefix reports whether string Value v begins with byte b (0 allocations).
+func (v Value) StringHasBytePrefix(b byte) bool {
+	if v.ptr == &tagInlineStr {
+		return (v.num&0xFF) > 0 && byte(v.num>>8) == b
+	}
+	if v.ptr != nil && v.ptr.Kind == KindString {
+		s := (*PyString)(unsafe.Pointer(v.ptr)).Data
+		return len(s) > 0 && s[0] == b
+	}
+	return false
+}
+
+// StringStartsWithTwoBytes reports whether string Value v begins with bytes b0, b1 (0 allocations).
+func (v Value) StringStartsWithTwoBytes(b0, b1 byte) bool {
+	if v.ptr == &tagInlineStr {
+		return (v.num&0xFF) >= 2 && byte(v.num>>8) == b0 && byte(v.num>>16) == b1
+	}
+	if v.ptr != nil && v.ptr.Kind == KindString {
+		s := (*PyString)(unsafe.Pointer(v.ptr)).Data
+		return len(s) >= 2 && s[0] == b0 && s[1] == b1
 	}
 	return false
 }

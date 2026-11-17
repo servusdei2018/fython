@@ -193,6 +193,9 @@ const (
 	OP_LOAD_FAST_ATTR
 	OP_STORE_FAST_ATTR
 	OP_LOAD_FAST_ATTR_MUL_SELF
+
+	// Memoryview-aware local store (emitted only in functions with slice ops)
+	OP_STORE_FAST_VIEW
 )
 
 // Comparison operation codes for OP_COMPARE_OP (passed in ArgA field).
@@ -481,6 +484,8 @@ func (op Opcode) String() string {
 		return "OP_STORE_FAST_ATTR"
 	case OP_LOAD_FAST_ATTR_MUL_SELF:
 		return "OP_LOAD_FAST_ATTR_MUL_SELF"
+	case OP_STORE_FAST_VIEW:
+		return "OP_STORE_FAST_VIEW"
 	default:
 		return "OP_UNKNOWN"
 	}
