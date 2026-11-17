@@ -45,3 +45,20 @@ func TestCategoryNormalize(t *testing.T) {
 		}
 	}
 }
+
+func TestNameLookupRoundTrip(t *testing.T) {
+	n := 0
+	for r := rune(0); r <= 0x10FFFF; r++ {
+		name, ok := Name(r)
+		if !ok {
+			continue
+		}
+		n++
+		if got, ok := Lookup(name); !ok || got != r {
+			t.Fatalf("Lookup(Name(%U)=%q) = %U,%v", r, name, got, ok)
+		}
+	}
+	if n < 6000 {
+		t.Fatalf("only %d named characters", n)
+	}
+}

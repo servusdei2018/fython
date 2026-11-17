@@ -9,15 +9,16 @@ package unicodedata
 //go:generate python3 gen.py
 
 import (
-	"bufio"
 	"bytes"
 	"compress/gzip"
 	_ "embed"
+	"io"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"unicode"
+	"unsafe"
 )
 
 //go:embed names.txt.gz
@@ -27,54 +28,123 @@ var namesGz []byte
 var decompGz []byte
 
 var (
-	loadOnce sync.Once
-	byName   map[string]rune
-	byRune   map[rune]string
-	decomp   map[rune]decomposition
-	compose  map[[2]rune]rune
-	catList  []string
+	namesOnce  sync.Once
+	decompOnce sync.Once
+	catOnce    sync.Once
+
+	// nameBlob holds every character name back to back; entries index it.
+	nameBlob string
+	// official lists the non-alias names sorted by code point.
+	official []nameEntry
+	// byNameIdx indexes every name and alias (into allNames), sorted by name.
+	allNames  []nameEntry
+	byNameIdx []uint32
+
+	decomp  map[rune]decomposition
+	compose map[[2]rune]rune
+	catList []string
 )
+
+type nameEntry struct {
+	cp  rune
+	off uint32
+	n   uint16
+}
+
+func (e nameEntry) name() string { return nameBlob[e.off : e.off+uint32(e.n)] }
 
 type decomposition struct {
 	compat bool
 	runes  []rune
 }
 
+// gunzipLines decompresses b once and calls fn for every line; the lines are
+// substrings of a single buffer, so no per-line allocation happens.
 func gunzipLines(b []byte, fn func(line string)) {
 	zr, err := gzip.NewReader(bytes.NewReader(b))
 	if err != nil {
 		return
 	}
 	defer func() { _ = zr.Close() }()
-	sc := bufio.NewScanner(zr)
-	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
-	for sc.Scan() {
-		fn(sc.Text())
+	raw, err := io.ReadAll(zr)
+	if err != nil && len(raw) == 0 {
+		return
+	}
+	text := unsafe.String(unsafe.SliceData(raw), len(raw))
+	for len(text) > 0 {
+		line, rest, _ := strings.Cut(text, "\n")
+		text = rest
+		line = strings.TrimSuffix(line, "\r")
+		fn(line)
 	}
 }
 
-func load() {
-	loadOnce.Do(func() {
-		byName = make(map[string]rune, 7000)
-		byRune = make(map[rune]string, 7000)
+// loadNames builds the compact name tables (Name, Lookup).
+func loadNames() {
+	namesOnce.Do(func() {
+		blob := make([]byte, 0, 208<<10)
+		allNames = make([]nameEntry, 0, 6600)
+		official = make([]nameEntry, 0, 6600)
+		var isAlias []bool
 		gunzipLines(namesGz, func(line string) {
 			alias := strings.HasPrefix(line, "@")
 			if alias {
 				line = line[1:]
 			}
 			hexCP, name, ok := strings.Cut(line, "\t")
-			if !ok {
+			if !ok || len(name) > 0xFFFF {
 				return
 			}
 			cp, err := strconv.ParseUint(hexCP, 16, 32)
 			if err != nil {
 				return
 			}
-			byName[name] = rune(cp)
-			if !alias {
-				byRune[rune(cp)] = name
-			}
+			allNames = append(allNames, nameEntry{rune(cp), uint32(len(blob)), uint16(len(name))})
+			isAlias = append(isAlias, alias)
+			blob = append(blob, name...)
 		})
+		nameBlob = unsafe.String(unsafe.SliceData(blob), len(blob))
+		for i, e := range allNames {
+			if !isAlias[i] {
+				official = append(official, e)
+			}
+		}
+		sort.SliceStable(official, func(i, j int) bool { return official[i].cp < official[j].cp })
+		byNameIdx = make([]uint32, len(allNames))
+		for i := range byNameIdx {
+			byNameIdx[i] = uint32(i)
+		}
+		// Stable so that, as with the former map, a later duplicate wins.
+		sort.SliceStable(byNameIdx, func(i, j int) bool {
+			return allNames[byNameIdx[i]].name() < allNames[byNameIdx[j]].name()
+		})
+	})
+}
+
+// lookupName finds a name or alias; later entries win over earlier duplicates.
+func lookupName(name string) (rune, bool) {
+	i := sort.Search(len(byNameIdx), func(i int) bool { return allNames[byNameIdx[i]].name() > name })
+	if i > 0 {
+		if e := allNames[byNameIdx[i-1]]; e.name() == name {
+			return e.cp, true
+		}
+	}
+	return 0, false
+}
+
+// officialName finds the official name of r.
+func officialName(r rune) (string, bool) {
+	i := sort.Search(len(official), func(i int) bool { return official[i].cp > r })
+	if i > 0 && official[i-1].cp == r {
+		// Later duplicates win, matching the former map semantics.
+		return official[i-1].name(), true
+	}
+	return "", false
+}
+
+// loadDecomp builds the decomposition and composition tables (Normalize).
+func loadDecomp() {
+	decompOnce.Do(func() {
 		decomp = make(map[rune]decomposition, 1200)
 		compose = make(map[[2]rune]rune, 1000)
 		gunzipLines(decompGz, func(line string) {
@@ -103,6 +173,12 @@ func load() {
 				compose[[2]rune{d.runes[0], d.runes[1]}] = rune(cp)
 			}
 		})
+	})
+}
+
+// loadCats builds the sorted category list (Category).
+func loadCats() {
+	catOnce.Do(func() {
 		for k := range unicode.Categories {
 			if len(k) == 2 && k != "LC" && k != "Cn" {
 				catList = append(catList, k)
@@ -140,8 +216,8 @@ func isCJK(r rune) bool {
 
 // Name returns the official Unicode name of r. Aliases are not returned.
 func Name(r rune) (string, bool) {
-	load()
-	if n, ok := byRune[r]; ok {
+	loadNames()
+	if n, ok := officialName(r); ok {
 		return n, true
 	}
 	if isCJK(r) {
@@ -157,9 +233,9 @@ func Name(r rune) (string, bool) {
 // Lookup resolves a character name or alias (case-insensitively), as accepted
 // by \N{...} and unicodedata.lookup.
 func Lookup(name string) (rune, bool) {
-	load()
+	loadNames()
 	name = strings.ToUpper(name)
-	if r, ok := byName[name]; ok {
+	if r, ok := lookupName(name); ok {
 		return r, true
 	}
 	if rest, ok := strings.CutPrefix(name, cjkPrefix); ok {
@@ -179,7 +255,7 @@ func Lookup(name string) (rune, bool) {
 
 // Category returns the two-letter general category of r ("Lu", "Nd", ...).
 func Category(r rune) string {
-	load()
+	loadCats()
 	for _, c := range catList {
 		if unicode.Is(unicode.Categories[c], r) {
 			return c
@@ -228,7 +304,7 @@ func decompose(dst []rune, r rune, compat bool) []rune {
 // decomposition tables (Latin, Greek, Cyrillic, ligatures, compatibility
 // forms and Hangul). ok is false for an unknown form.
 func Normalize(form, s string) (string, bool) {
-	load()
+	loadDecomp()
 	var compat, comp bool
 	switch form {
 	case "NFC":

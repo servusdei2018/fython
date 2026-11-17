@@ -209,20 +209,39 @@ func (v Value) StringLen() int {
 	return utf8.RuneCountInString(s)
 }
 
+// ascii1Backing holds every single-byte string; ascii2Backing holds every
+// two-byte ASCII string. Lookups slice these immutable strings, so no
+// per-string allocation or header table is needed.
 var (
-	ascii1Table [256]string
-	ascii2Table [128][128]string
+	ascii1Backing = buildAscii1()
+	ascii2Backing = buildAscii2()
 )
 
-func init() {
-	for i := range 256 {
-		ascii1Table[i] = string([]byte{byte(i)})
+func buildAscii1() string {
+	b := make([]byte, 256)
+	for i := range b {
+		b[i] = byte(i)
 	}
+	return unsafe.String(unsafe.SliceData(b), len(b))
+}
+
+func buildAscii2() string {
+	b := make([]byte, 0, 128*128*2)
 	for i := range 128 {
 		for j := range 128 {
-			ascii2Table[i][j] = string([]byte{byte(i), byte(j)})
+			b = append(b, byte(i), byte(j))
 		}
 	}
+	return unsafe.String(unsafe.SliceData(b), len(b))
+}
+
+func ascii1(b byte) string {
+	return unsafe.String((*byte)(unsafe.Add(unsafe.Pointer(unsafe.StringData(ascii1Backing)), int(b))), 1)
+}
+
+func ascii2(b0, b1 byte) string {
+	o := (int(b0)<<7 | int(b1)) << 1
+	return unsafe.String((*byte)(unsafe.Add(unsafe.Pointer(unsafe.StringData(ascii2Backing)), o)), 2)
 }
 
 // AsString returns a Go string for a KindInlineStr or KindString Value.
@@ -236,13 +255,13 @@ func (v Value) AsString() string {
 			return ""
 		}
 		if n == 1 {
-			return ascii1Table[byte(v.num>>8)]
+			return ascii1(byte(v.num >> 8))
 		}
 		if n == 2 {
 			b0 := byte(v.num >> 8)
 			b1 := byte(v.num >> 16)
 			if b0 < 128 && b1 < 128 {
-				return ascii2Table[b0][b1]
+				return ascii2(b0, b1)
 			}
 		}
 		var buf [7]byte

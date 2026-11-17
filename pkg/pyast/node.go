@@ -37,6 +37,8 @@ var (
 )
 
 func init() {
+	specByName = make(map[string]*Spec, len(specTable))
+	Specs = make([]*Spec, 0, len(specTable))
 	for i := range specTable {
 		s := &specTable[i]
 		s.ID = i
@@ -49,9 +51,6 @@ func init() {
 	}
 	for _, s := range Specs {
 		s.Concrete = s.Base != "" || len(s.Fields) > 0
-	}
-	for _, n := range []string{"expr_context", "boolop", "operator", "unaryop", "cmpop"} {
-		_ = n
 	}
 }
 
