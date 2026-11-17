@@ -29,6 +29,7 @@ const (
 	ICKindInstanceSlot          // Hit in PyInstance.Slots[SlotIndex]
 	ICKindClassMethod           // Hit on PyType MRO method (CachedVal holds raw callable)
 	ICKindDataDescriptor        // Hit on PyType MRO data descriptor (CachedVal holds descriptor)
+	ICKindProperty              // Hit on a @property whose fget is cached for in-loop dispatch
 	ICKindClassAttr             // Hit on PyType MRO non-descriptor class attribute
 	ICKindGlobal                // Hit on module globals dict
 	ICKindBuiltin               // Hit on builtins dict fallback
@@ -82,6 +83,17 @@ type CallFrame struct {
 	shadowFrame *val.PyFrame
 	excStackLen int
 	stackIsVM   bool
+	// initInstance holds the freshly allocated receiver for an in-loop
+	// __init__ call. When set, OP_RETURN substitutes it for a None
+	// return and raises TypeError otherwise.
+	initInstance val.Value
+	// cmpLeft/cmpRight/cmpOp record an in-loop dunder comparison so
+	// OP_RETURN can fall back to the generic comparison when the dunder
+	// answers NotImplemented. cmpActive marks the record live.
+	cmpLeft   val.Value
+	cmpRight  val.Value
+	cmpOp     uint8
+	cmpActive bool
 }
 
 // LineSpanEntry maps an instruction pointer range [StartIP, EndIP) to source line and column.
@@ -421,6 +433,17 @@ type VM struct {
 	context            *val.PyContext
 	bindingOSPath      bool
 	coroFreeList       []*val.PyCoroutine
+	// Continuous join drain state. While activeJoinGen is set, a generator
+	// drained by joinGenerator runs inside a single runLoopWithGlobals
+	// invocation: yields append directly into joinSink instead of
+	// suspending. The pointer check against the loop's activeGen keeps
+	// nested invocations isolated.
+	activeJoinGen *val.PyGenerator
+	joinSink      *strings.Builder
+	joinSep       string
+	joinFirst     bool
+	joinCount     int
+	joinErrMsg    string
 	// mvFree holds the memory views that are no longer referenced and can
 	// be handed out again by the next slice.
 	mvFree       []*val.PyMemoryView
@@ -788,6 +811,16 @@ var standaloneVMPool = sync.Pool{
 
 func init() {
 	val.CodeInspectorHook = defaultCodeInspector{}
+	val.JoinGeneratorHook = func(ctx *val.ExecContext, sep string, gen *val.PyGenerator) (val.Value, bool) {
+		if ctx == nil || ctx.VM == nil {
+			return val.Value{}, false
+		}
+		vm, ok := ctx.VM.(*VM)
+		if !ok {
+			return val.Value{}, false
+		}
+		return vm.joinGenerator(ctx, sep, gen)
+	}
 	val.AcquireExecContextHook = func() (*val.ExecContext, func()) {
 		v := standaloneVMPool.Get().(*VM)
 		v.Reset()

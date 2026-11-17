@@ -1,6 +1,9 @@
 package sre
 
-import "unicode"
+import (
+	"sync"
+	"unicode"
+)
 
 type opcode uint8
 
@@ -42,6 +45,13 @@ type inst struct {
 	min   int
 	max   int
 	set   *charSet
+	// xMask guards the preferred branch of opSplit: when set, the branch
+	// starting at x can only match subjects whose first byte is in the
+	// bitmap, so the matcher may jump straight to y.
+	xMask    [4]uint64
+	yMask    [4]uint64
+	xHasMask bool
+	yHasMask bool
 }
 
 // Regexp is a compiled Python regular expression.
@@ -53,11 +63,15 @@ type Regexp struct {
 	GroupIndex map[string]int
 	GroupNames []string // indexed by group number, "" when unnamed
 
-	prog     []inst
-	nregs    int
-	hasFirst bool
-	firstLit rune
-	bosOnly  bool
+	prog         []inst
+	nregs        int
+	hasFirst     bool
+	firstLit     rune
+	firstFold    bool
+	hasFirstMask bool
+	firstMask    [4]uint64
+	bosOnly      bool
+	matcherPool  sync.Pool
 }
 
 // Compile parses and compiles a pattern. For bytes patterns every rune must
@@ -90,15 +104,150 @@ func Compile(pattern []rune, flags int, isBytes bool) (*Regexp, error) {
 	re.nregs = c.nregs
 	if len(re.prog) > 0 {
 		first := &re.prog[0]
-		if first.op == opChar {
+		switch {
+		case first.op == opChar:
 			re.hasFirst = true
 			re.firstLit = first.r
+		case first.op == opCharFold:
+			re.hasFirst = true
+			re.firstLit = first.r
+			re.firstFold = true
+		case first.op == opSet && first.set != nil:
+			re.hasFirstMask = true
+			for b := range 256 {
+				if first.set.has(rune(b)) {
+					re.firstMask[b>>6] |= 1 << (uint(b) & 63)
+				}
+			}
 		}
 		if first.op == opAt && (atKind(first.x) == atBOS || atKind(first.x) == atBOL) {
 			re.bosOnly = true
 		}
 	}
+	for i := range re.prog {
+		if re.prog[i].op == opSplit {
+			if m, ok := branchMask(re.prog, re.prog[i].x, 0); ok {
+				re.prog[i].xMask = m
+				re.prog[i].xHasMask = true
+			}
+			if m, ok := branchMask(re.prog, re.prog[i].y, 0); ok {
+				re.prog[i].yMask = m
+				re.prog[i].yHasMask = true
+			}
+		}
+	}
+	re.matcherPool.New = func() any {
+		return &matcher{
+			re:   re,
+			prog: re.prog,
+			caps: make([]int, 2*(re.NumGroups+1)),
+			regs: make([]int, re.nregs),
+		}
+	}
 	return re, nil
+}
+
+// branchMask computes the set of ASCII first bytes for the code at pc as a
+// 256-bit bitmap. It reports false when the branch may match without
+// consuming a byte (empty match) or starts with a construct whose first set
+// cannot be bounded cheaply; callers then skip filtering for that branch.
+// The result is always a superset-safe guard: filtering only skips branches
+// that provably fail on the current subject byte.
+func branchMask(prog []inst, pc, depth int) ([4]uint64, bool) {
+	var out [4]uint64
+	if depth > 16 || pc < 0 || pc >= len(prog) {
+		return out, false
+	}
+	in := &prog[pc]
+	switch in.op {
+	case opChar:
+		if in.r >= 0 && in.r < 256 {
+			out[in.r>>6] |= 1 << (uint(in.r) & 63)
+		}
+		return out, true
+	case opCharFold:
+		for r := in.r; ; {
+			if r >= 0 && r < 256 {
+				out[r>>6] |= 1 << (uint(r) & 63)
+			}
+			f := unicode.SimpleFold(r)
+			if f == r || f == in.r {
+				break
+			}
+			r = f
+		}
+		return out, true
+	case opSet:
+		if in.set == nil {
+			return out, false
+		}
+		for b := range 256 {
+			if in.set.has(rune(b)) {
+				out[b>>6] |= 1 << (uint(b) & 63)
+			}
+		}
+		return out, true
+	case opAny:
+		out = [4]uint64{^uint64(0), ^uint64(0), ^uint64(0), ^uint64(0)}
+		out['\n'>>6] &^= 1 << (uint('\n') & 63)
+		return out, true
+	case opAnyNL:
+		out = [4]uint64{^uint64(0), ^uint64(0), ^uint64(0), ^uint64(0)}
+		return out, true
+	case opSave:
+		return branchMask(prog, pc+1, depth+1)
+	case opJmp:
+		return branchMask(prog, in.x, depth+1)
+	case opSplit:
+		xm, ok := branchMask(prog, in.x, depth+1)
+		if !ok {
+			return out, false
+		}
+		ym, ok := branchMask(prog, in.y, depth+1)
+		if !ok {
+			return out, false
+		}
+		for i := range 4 {
+			out[i] = xm[i] | ym[i]
+		}
+		return out, true
+	case opRepeat:
+		if in.min <= 0 {
+			return out, false
+		}
+		switch in.sub {
+		case opChar:
+			if in.r >= 0 && in.r < 256 {
+				out[in.r>>6] |= 1 << (uint(in.r) & 63)
+			}
+			return out, true
+		case opCharFold:
+			for r := in.r; ; {
+				if r >= 0 && r < 256 {
+					out[r>>6] |= 1 << (uint(r) & 63)
+				}
+				f := unicode.SimpleFold(r)
+				if f == r || f == in.r {
+					break
+				}
+				r = f
+			}
+			return out, true
+		case opSet:
+			if in.set == nil {
+				return out, false
+			}
+			for b := range 256 {
+				if in.set.has(rune(b)) {
+					out[b>>6] |= 1 << (uint(b) & 63)
+				}
+			}
+			return out, true
+		}
+		return out, false
+	default:
+		return out, false
+	}
 }
 
 type compiler struct {

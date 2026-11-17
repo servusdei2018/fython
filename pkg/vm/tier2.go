@@ -298,6 +298,57 @@ func OptimizeCodeObject(co *CodeObject) {
 			}
 		}
 
+		// Pattern 15: OP_LOAD_FAST + OP_LOAD_ATTR -> OP_LOAD_FAST_ATTR
+		if op0 == OP_LOAD_FAST && op1 == OP_LOAD_ATTR {
+			reg := DecodeArgBx(w0)
+			attrIdx := DecodeArgBx(w1)
+			if reg < 256 {
+				// Check for self.x * self.x (OP_LOAD_FAST r + OP_LOAD_ATTR a + OP_LOAD_FAST r + OP_LOAD_ATTR a + OP_BINARY_MUL)
+				if i+4 < len(code) {
+					w2 := code[i+2]
+					w3 := code[i+3]
+					w4 := code[i+4]
+					if DecodeOpcode(w2) == OP_LOAD_FAST && DecodeArgBx(w2) == reg &&
+						DecodeOpcode(w3) == OP_LOAD_ATTR && DecodeArgBx(w3) == attrIdx &&
+						DecodeOpcode(w4) == OP_BINARY_MUL {
+						code = fusionCopy(co, code)
+						code[i] = Encode(OP_LOAD_FAST_ATTR_MUL_SELF, uint8(reg), attrIdx)
+						code = fusionCopy(co, code)
+						code[i+1] = Encode(OP_NOP, 0, 0)
+						code = fusionCopy(co, code)
+						code[i+2] = Encode(OP_NOP, 0, 0)
+						code = fusionCopy(co, code)
+						code[i+3] = Encode(OP_NOP, 0, 0)
+						code = fusionCopy(co, code)
+						code[i+4] = Encode(OP_NOP, 0, 0)
+						i += 5
+						continue
+					}
+				}
+
+				code = fusionCopy(co, code)
+				code[i] = Encode(OP_LOAD_FAST_ATTR, uint8(reg), attrIdx)
+				code = fusionCopy(co, code)
+				code[i+1] = Encode(OP_NOP, 0, 0)
+				i += 2
+				continue
+			}
+		}
+
+		// Pattern 16: OP_LOAD_FAST + OP_STORE_ATTR -> OP_STORE_FAST_ATTR
+		if op0 == OP_LOAD_FAST && op1 == OP_STORE_ATTR {
+			reg := DecodeArgBx(w0)
+			attrIdx := DecodeArgBx(w1)
+			if reg < 256 {
+				code = fusionCopy(co, code)
+				code[i] = Encode(OP_STORE_FAST_ATTR, uint8(reg), attrIdx)
+				code = fusionCopy(co, code)
+				code[i+1] = Encode(OP_NOP, 0, 0)
+				i += 2
+				continue
+			}
+		}
+
 		// Pattern 5: OP_LOAD_FAST + OP_LOAD_FAST + (OP_BINARY_SUB | OP_BINARY_SUB_INT) + OP_STORE_FAST
 		// -> OP_FAST_SUB_INT_LOCAL_TO_LOCAL
 		if op0 == OP_LOAD_FAST && op1 == OP_LOAD_FAST &&

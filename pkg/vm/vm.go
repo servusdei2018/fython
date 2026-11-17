@@ -1736,6 +1736,207 @@ func (vm *VM) resumeGenerator(ctx *val.ExecContext, gen *val.PyGenerator, sentVa
 	return res, val.IterExhausted
 }
 
+func (vm *VM) appendJoinItem(v val.Value) {
+	idx := vm.joinCount
+	vm.joinCount++
+	if !v.IsAnyString() {
+		if vm.joinErrMsg == "" {
+			vm.joinErrMsg = fmt.Sprintf("sequence item %d: expected str instance, %s found", idx, v.Type().Name)
+		}
+		return
+	}
+	if vm.joinErrMsg != "" {
+		return
+	}
+	if !vm.joinFirst {
+		vm.joinSink.WriteString(vm.joinSep)
+	}
+	vm.joinFirst = false
+	vm.joinSink.WriteString(v.AsString())
+}
+
+// joinGenerator drains gen in a single runLoopWithGlobals invocation,
+// appending each yielded string into a separator-joined result. Plain
+// yields and OP_YIELD_FROM delegation never leave the loop: they append
+// straight into the sink. It returns the joined string and true on success.
+// On failure it returns false with the exception set on ctx.
+func (vm *VM) joinGenerator(ctx *val.ExecContext, sep string, gen *val.PyGenerator) (val.Value, bool) {
+	if gen.State == val.GenClosed {
+		return val.NewStringVal(""), true
+	}
+	if gen.State == val.GenRunning {
+		if ctx != nil {
+			ctx.Raise(val.NewValueError("generator already executing"))
+		}
+		return val.NoneVal(), false
+	}
+	if vm.activeJoinGen != nil {
+		return val.Value{}, false
+	}
+	var thrownExc val.Value
+	if ctx != nil && ctx.HasException() {
+		thrownExc = ctx.ActiveException
+		ctx.ClearException()
+		if gen.State == val.GenCreated {
+			gen.State = val.GenClosed
+			ctx.Raise(thrownExc)
+			return val.NoneVal(), false
+		}
+	}
+	var b strings.Builder
+	b.Grow(8192)
+	savedGen, savedSink, savedSep, savedFirst, savedCount, savedErr := vm.activeJoinGen, vm.joinSink, vm.joinSep, vm.joinFirst, vm.joinCount, vm.joinErrMsg
+	vm.activeJoinGen = gen
+	vm.joinSink = &b
+	vm.joinSep = sep
+	vm.joinFirst = true
+	vm.joinCount = 0
+	vm.joinErrMsg = ""
+	defer func() {
+		vm.activeJoinGen, vm.joinSink, vm.joinSep, vm.joinFirst, vm.joinCount, vm.joinErrMsg = savedGen, savedSink, savedSep, savedFirst, savedCount, savedErr
+	}()
+	co := AsCodeObject(gen.Code)
+	nextFrame := 0
+	if vm.activeCO != nil {
+		nextFrame = vm.activeFrameIdx + 1
+	}
+	vm.ensureFrameCapacity(nextFrame + 4)
+	vm.unhandledException = val.NoneVal()
+	switch {
+	case !thrownExc.IsNone() && thrownExc.HeaderPtr() != nil:
+		vm.execCtx.Raise(thrownExc)
+	case gen.State == val.GenSuspended:
+		if gen.IP < len(co.Code) && Opcode(co.Code[gen.IP]>>24) != OP_YIELD_FROM {
+			gen.Stack[gen.SP] = val.NoneVal()
+			gen.SP++
+		}
+	case gen.State != val.GenCreated:
+		return val.Value{}, false
+	}
+	gen.State = val.GenRunning
+	res := vm.runLoopWithGlobals(co, gen.Base, gen.SP, nextFrame, gen.Cells, gen.Globals, val.NoneVal(), gen.Stack, gen, nil)
+	_ = res
+	if gen.State == val.GenSuspended {
+		if !vm.unhandledException.IsNone() && vm.unhandledException.HeaderPtr() != nil {
+			exc := vm.unhandledException
+			vm.unhandledException = val.NoneVal()
+			if ctx != nil {
+				ctx.Raise(exc)
+			} else {
+				panic(exc)
+			}
+			return val.NoneVal(), false
+		}
+		gen.State = val.GenClosed
+		if ctx != nil {
+			ctx.Raise(val.NewRuntimeError("join left generator suspended"))
+		}
+		return val.NoneVal(), false
+	}
+	if gen.State == val.GenClosed && (vm.unhandledException.IsNone() || vm.unhandledException.HeaderPtr() == nil) {
+		if vm.joinErrMsg != "" {
+			if ctx != nil {
+				ctx.Raise(val.NewTypeError(vm.joinErrMsg))
+			} else {
+				panic(val.NewTypeError(vm.joinErrMsg))
+			}
+			return val.NoneVal(), false
+		}
+		return val.NewStringVal(b.String()), true
+	}
+	if !vm.unhandledException.IsNone() && vm.unhandledException.HeaderPtr() != nil {
+		exc := vm.unhandledException
+		vm.unhandledException = val.NoneVal()
+		if ctx != nil {
+			ctx.Raise(exc)
+		} else {
+			panic(exc)
+		}
+		return val.NoneVal(), false
+	}
+	return val.NewStringVal(b.String()), true
+}
+
+// inlineDunderCompare pushes an in-loop frame for dunder, a simple
+// two-argument Python function whose receiver and argument already occupy
+// stack[newBase:newBase+2]. Pending-comparison state is recorded on the
+// caller frame so OP_RETURN can fall back to the generic comparison when
+// the dunder answers NotImplemented.
+func (vm *VM) inlineDunderCompare(dunder val.Value, newBase, retSP int, cmpLeft, cmpRight val.Value, cmpOp uint8, activeGen *val.PyGenerator, activeCoro *val.PyCoroutine, stackIsVM bool, sp, ip, frameIdx, baseOffset *int, curCO **CodeObject, codePtr *unsafe.Pointer, codeLen *int, consts *[]val.Value, cells *[]val.Value, cellPtrs *[]*val.PyCell, globals **val.PyDict, curLocals *val.Value, curCodeCache **VMCodeCache, stack *[]val.Value, locals *[]val.Value) {
+	dfn := dunder.AsFunction()
+	dcallee := AsCodeObject(dfn.Code)
+	st := *stack
+	minCap := max(newBase+256, newBase+dcallee.NumLocals+64)
+	if minCap > len(st) {
+		st = ensureStack(st, minCap)
+		vm.execCtx.Stack = st
+		switch {
+		case activeCoro != nil:
+			activeCoro.Stack = st
+		case activeGen != nil:
+			activeGen.Stack = st
+		default:
+			vm.stack = st
+		}
+	}
+	if *frameIdx+2 > len(vm.frames) {
+		vm.ensureFrameCapacity(*frameIdx + 2)
+	}
+	saved := &vm.frames[*frameIdx]
+	saved.co = *curCO
+	saved.codePtr = *codePtr
+	saved.codeLen = *codeLen
+	saved.consts = *consts
+	saved.ip = *ip + 1
+	saved.baseOffset = *baseOffset
+	saved.retSP = retSP
+	saved.cells = *cells
+	saved.cellPtrs = *cellPtrs
+	saved.globals = *globals
+	saved.locals = *curLocals
+	saved.cache = *curCodeCache
+	saved.excStackLen = len(vm.excStack)
+	saved.stackIsVM = stackIsVM
+	saved.initInstance = val.Value{}
+	saved.cmpLeft = cmpLeft
+	saved.cmpRight = cmpRight
+	saved.cmpOp = cmpOp
+	saved.cmpActive = true
+	*curLocals = val.NoneVal()
+	*frameIdx++
+	*curCO = dcallee
+	*curCodeCache = vm.getCodeCache(dcallee)
+	*codePtr, *codeLen = vm.loadWindow(dcallee, *curCodeCache)
+	*consts = dcallee.Consts
+	*baseOffset = newBase
+	*locals = st[*baseOffset : *baseOffset+256 : *baseOffset+256]
+	_ = (*locals)[255]
+	switch {
+	case len(dcallee.CellVars) == 0 && dfn.Closure != nil:
+		*cells = dfn.Closure
+		*cellPtrs = dfn.CellPtrs
+	case len(dcallee.CellVars) == 0 && len(dcallee.FreeVars) == 0:
+		*cells = nil
+		*cellPtrs = nil
+	default:
+		nc, np := vm.setupCalleeCellsAndPtrs(dcallee, dunder, st, newBase, 2)
+		*cells, *cellPtrs = nc, np
+	}
+	if dfn.Globals != nil {
+		*globals = dfn.Globals
+	}
+	vm.activeCO = *curCO
+	vm.activeBaseOffset = *baseOffset
+	if vm.activeCellPtrs != nil || *cellPtrs != nil {
+		vm.activeCells = *cells
+		vm.activeCellPtrs = *cellPtrs
+	}
+	vm.activeFrameIdx = *frameIdx
+	*stack = st
+	*sp = newBase + max(dcallee.NumLocals, 2)
+	*ip = 0
+}
+
 func (vm *VM) resumeCoroutine(ctx *val.ExecContext, coro *val.PyCoroutine, sentVal val.Value) (val.Value, val.IterStatus) {
 	if coro.State == val.CoroClosed {
 		return coro.RetVal, val.IterExhausted
@@ -1806,6 +2007,8 @@ func (vm *VM) syncActiveFrame(frameIdx int, co *CodeObject, codePtr unsafe.Point
 		saved.cache = cache
 		saved.excStackLen = len(vm.excStack)
 		saved.stackIsVM = len(vm.execCtx.Stack) > 0 && len(vm.stack) > 0 && &vm.execCtx.Stack[0] == &vm.stack[0]
+		saved.initInstance = val.Value{}
+		saved.cmpActive = false
 		vm.activeFrameIdx = frameIdx
 		vm.activeCO = co
 		vm.activeBaseOffset = baseOffset
@@ -1847,15 +2050,6 @@ func (vm *VM) unwindException(exc val.Value, curCO **CodeObject, ip *int, frameI
 		vm.activeFrameIdx = faultFrameIdx
 	}
 
-	if curTB.IsNone() && faultCO != nil {
-		line := faultCO.LineAt(faultIP)
-		frameVal := vm.materializeFrame(faultFrameIdx)
-		curTB = val.NewTracebackVal(frameVal, line, faultIP, val.NoneVal())
-		if exc.IsInstance() {
-			exc.AsInstance().SetAttr(val.InternString("__traceback__"), curTB)
-		}
-	}
-
 	for {
 		co := *curCO
 		if co != nil && len(co.ExceptionTable) > 0 {
@@ -1889,7 +2083,18 @@ func (vm *VM) unwindException(exc val.Value, curCO **CodeObject, ip *int, frameI
 					vm.activeCells = *cells
 				}
 				vm.activeFrameIdx = *frameIdx
+				vm.frames[*frameIdx].initInstance = val.Value{}
+				vm.frames[*frameIdx].cmpActive = false
 				return true
+			}
+		}
+
+		if curTB.IsNone() && faultCO != nil {
+			line := faultCO.LineAt(faultIP)
+			frameVal := vm.materializeFrame(faultFrameIdx)
+			curTB = val.NewTracebackVal(frameVal, line, faultIP, val.NoneVal())
+			if exc.IsInstance() {
+				exc.AsInstance().SetAttr(val.InternString("__traceback__"), curTB)
 			}
 		}
 
@@ -2142,7 +2347,7 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 	}
 
 	for {
-		inst := atomic.LoadUint32((*uint32)(unsafe.Add(codePtr, uintptr(ip)*4)))
+		inst := *(*uint32)(unsafe.Add(codePtr, uintptr(ip)*4))
 		op := Opcode(inst >> 24)
 
 		switch op {
@@ -2387,6 +2592,12 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			if a.IsInt64() && b.IsInt64() {
 				ai := a.AsInt64()
 				bi := b.AsInt64()
+				if int64(int32(ai)) == ai && int64(int32(bi)) == bi {
+					stack[sp-2] = val.Int64Val(ai * bi)
+					sp--
+					ip++
+					continue
+				}
 				prod := ai * bi
 				if ai == 0 || (bi != 0 && prod/bi == ai) {
 					stack[sp-2] = val.Int64Val(prod)
@@ -2643,30 +2854,49 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			if a.IsInt64() && b.IsInt64() {
 				stack[sp-2] = val.BoolVal(a.AsInt64() < b.AsInt64())
 			} else {
-				vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
-				vm.execCtx.SP = sp
-				res := vm.compareOpSafe(a, b, CMP_LT)
-				if stackIsVM && &stack[0] != &vm.stack[0] {
-					stack = vm.stack
-					locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
-				}
-				if vm.execCtx.HasException() {
-					exc := vm.execCtx.ActiveException
-					vm.execCtx.ClearException()
-					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curCodeCache) {
-						if activeGen != nil {
-							activeGen.State = val.GenClosed
+				hit := false
+				if a.IsInstance() && b.IsInstance() {
+					ta := a.Type()
+					if ta != nil && ta == b.Type() {
+						if dunder := ta.DunderLtVal(); dunder.IsFunction() {
+							dfn := dunder.AsFunction()
+							dcallee := AsCodeObject(dfn.Code)
+							if !dcallee.IsGenerator && !dcallee.IsCoroutine && dcallee.SimplePositionalOnly && dcallee.PositionalParamCount == 2 && dcallee.NumParams == 2 && len(dfn.Defaults) == 0 && dfn.KwDefaults == nil && dcallee.KWOnlyArgCount == 0 && (dcallee.Flags&(CO_VARARGS|CO_VARKEYWORDS)) == 0 {
+								vm.inlineDunderCompare(dunder, sp-2, sp-2, a, b, CMP_LT, activeGen, activeCoro, stackIsVM, &sp, &ip, &frameIdx, &baseOffset, &curCO, &codePtr, &codeLen, &consts, &cells, &cellPtrs, &globals, &curLocals, &curCodeCache, &stack, &locals)
+								hit = true
+							}
 						}
-						if activeCoro != nil {
-							activeCoro.State = val.CoroClosed
-						}
-						return val.NoneVal()
 					}
-					locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
-					curCodeCache = vm.getCodeCache(curCO)
+				}
+				if hit {
 					continue
 				}
-				stack[sp-2] = res
+				{
+					vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+					vm.execCtx.SP = sp
+					res := vm.compareOpSafe(a, b, CMP_LT)
+					if stackIsVM && &stack[0] != &vm.stack[0] {
+						stack = vm.stack
+						locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+					}
+					if vm.execCtx.HasException() {
+						exc := vm.execCtx.ActiveException
+						vm.execCtx.ClearException()
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curCodeCache) {
+							if activeGen != nil {
+								activeGen.State = val.GenClosed
+							}
+							if activeCoro != nil {
+								activeCoro.State = val.CoroClosed
+							}
+							return val.NoneVal()
+						}
+						locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+						curCodeCache = vm.getCodeCache(curCO)
+						continue
+					}
+					stack[sp-2] = res
+				}
 			}
 			sp--
 			ip++
@@ -3005,6 +3235,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.cache = curCodeCache
 				saved.excStackLen = len(vm.excStack)
 				saved.stackIsVM = stackIsVM
+				saved.initInstance = val.Value{}
+				saved.cmpActive = false
 				curLocals = val.NoneVal()
 				frameIdx++
 				curCO = callee
@@ -3108,6 +3340,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					saved.cache = curCodeCache
 					saved.excStackLen = len(vm.excStack)
 					saved.stackIsVM = stackIsVM
+					saved.initInstance = val.Value{}
+					saved.cmpActive = false
 					curLocals = val.NoneVal()
 					frameIdx++
 					baseOffset = newBase
@@ -3235,6 +3469,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.cache = curCodeCache
 				saved.excStackLen = len(vm.excStack)
 				saved.stackIsVM = stackIsVM
+				saved.initInstance = val.Value{}
+				saved.cmpActive = false
 				curLocals = val.NoneVal()
 				frameIdx++
 				curCO = callee
@@ -3245,6 +3481,10 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				baseOffset = newBase
 				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
 				_ = locals[255]
+				if len(callee.ExceptionTable) == 0 && !callee.IsGenerator && !callee.IsCoroutine && atomic.LoadInt32(&callee.IsTier2Optimized) == 0 {
+					maybeOptimizeCodeObject(vm, callee, curCodeCache)
+					codePtr, codeLen = vm.loadWindow(callee, curCodeCache)
+				}
 				switch {
 				case len(callee.CellVars) == 0 && fn.Closure != nil:
 					cells = fn.Closure
@@ -3297,6 +3537,142 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				sp = retSP + 1
 				ip++
 
+			case val.KindType:
+				tp := target.AsType()
+				meta := tp.Header.Type
+				if tp.UsesDefaultNew && (tp.Flags&val.FlagHeapType) != 0 && (meta == nil || meta == val.TypeType) && !val.IsSubclass(tp, val.TypeType) {
+					if !tp.HasInit() {
+						stack[retSP] = val.NewInstanceOfType(tp)
+						sp = retSP + 1
+						ip++
+						continue
+					}
+					initFn := tp.DunderInitVal()
+					if initFn.IsFunction() {
+						initFunc := initFn.AsFunction()
+						callee := AsCodeObject(initFunc.Code)
+						if !callee.IsGenerator && !callee.IsCoroutine {
+							minCap := max(newBase+1+argc+256, newBase+1+callee.NumLocals+64)
+							if minCap > len(stack) {
+								stack = ensureStack(stack, minCap)
+								vm.execCtx.Stack = stack
+								switch {
+								case activeCoro != nil:
+									activeCoro.Stack = stack
+								case activeGen != nil:
+									activeGen.Stack = stack
+								default:
+									vm.stack = stack
+								}
+							}
+							copy(stack[newBase+1:newBase+1+argc], stack[newBase:newBase+argc])
+							inst := val.NewInstanceOfType(tp)
+							stack[newBase] = inst
+							totalInitArgs := argc + 1
+							var nextSP int
+							if totalInitArgs == callee.NumParams && len(initFunc.Defaults) == 0 && initFunc.KwDefaults == nil && callee.KWOnlyArgCount == 0 && (callee.Flags&(CO_VARARGS|CO_VARKEYWORDS)) == 0 && len(callee.CellVars) == 0 {
+								nextSP = newBase + max(callee.NumLocals, totalInitArgs)
+							} else {
+								var ok bool
+								nextSP, ok = vm.bindFunctionArgsSafe(callee, initFunc.Defaults, initFunc.KwDefaults, stack, newBase, totalInitArgs, nil)
+								if !ok {
+									exc := vm.execCtx.ActiveException
+									vm.execCtx.ClearException()
+									if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curCodeCache) {
+										if activeGen != nil {
+											activeGen.State = val.GenClosed
+										}
+										if activeCoro != nil {
+											activeCoro.State = val.CoroClosed
+										}
+										return val.NoneVal()
+									}
+									locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+									curCodeCache = vm.getCodeCache(curCO)
+									continue
+								}
+							}
+							if frameIdx+2 > len(vm.frames) {
+								vm.ensureFrameCapacity(frameIdx + 2)
+							}
+							saved := &vm.frames[frameIdx]
+							saved.co = curCO
+							saved.codePtr = codePtr
+							saved.codeLen = codeLen
+							saved.consts = consts
+							saved.ip = ip + 1
+							saved.baseOffset = baseOffset
+							saved.retSP = retSP
+							saved.cells = cells
+							saved.cellPtrs = cellPtrs
+							saved.globals = globals
+							saved.locals = curLocals
+							saved.cache = curCodeCache
+							saved.excStackLen = len(vm.excStack)
+							saved.stackIsVM = stackIsVM
+							saved.initInstance = inst
+							saved.cmpActive = false
+							curLocals = val.NoneVal()
+							frameIdx++
+							curCO = callee
+							curCodeCache = vm.getCodeCache(callee)
+							codePtr, codeLen = vm.loadWindow(callee, curCodeCache)
+							consts = callee.Consts
+							baseOffset = newBase
+							locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+							_ = locals[255]
+							switch {
+							case len(callee.CellVars) == 0 && initFunc.Closure != nil:
+								cells = initFunc.Closure
+								cellPtrs = initFunc.CellPtrs
+							case len(callee.CellVars) == 0 && len(callee.FreeVars) == 0:
+								cells = nil
+								cellPtrs = nil
+							default:
+								cells, cellPtrs = vm.setupCalleeCellsAndPtrs(callee, initFn, stack, newBase, totalInitArgs)
+							}
+							if initFunc.Globals != nil {
+								globals = initFunc.Globals
+							}
+							vm.activeCO = curCO
+							vm.activeBaseOffset = baseOffset
+							if vm.activeCellPtrs != nil || cellPtrs != nil {
+								vm.activeCells = cells
+								vm.activeCellPtrs = cellPtrs
+							}
+							vm.activeFrameIdx = frameIdx
+							sp = nextSP
+							ip = 0
+							continue
+						}
+					}
+				}
+				vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+				vm.execCtx.SP = newBase + argc
+				res := vm.callFromHookSafe(target, newBase, argc, nil)
+				if stackIsVM && &stack[0] != &vm.stack[0] {
+					stack = vm.stack
+					locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+				}
+				if vm.execCtx.HasException() {
+					exc := vm.execCtx.ActiveException
+					vm.execCtx.ClearException()
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curCodeCache) {
+						if activeGen != nil {
+							activeGen.State = val.GenClosed
+						}
+						if activeCoro != nil {
+							activeCoro.State = val.CoroClosed
+						}
+						return val.NoneVal()
+					}
+					locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+					curCodeCache = vm.getCodeCache(curCO)
+					continue
+				}
+				stack[retSP] = res
+				sp = retSP + 1
+				ip++
 			default:
 				vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 				vm.execCtx.SP = newBase + argc
@@ -3447,6 +3823,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.cache = curCodeCache
 				saved.excStackLen = len(vm.excStack)
 				saved.stackIsVM = stackIsVM
+				saved.initInstance = val.Value{}
+				saved.cmpActive = false
 				curLocals = val.NoneVal()
 				frameIdx++
 				curCO = callee
@@ -3574,6 +3952,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.cache = curCodeCache
 				saved.excStackLen = len(vm.excStack)
 				saved.stackIsVM = stackIsVM
+				saved.initInstance = val.Value{}
+				saved.cmpActive = false
 				curLocals = val.NoneVal()
 				frameIdx++
 				curCO = callee
@@ -3627,6 +4007,142 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				sp = retSP + 1
 				ip++
 
+			case val.KindType:
+				tp := target.AsType()
+				meta := tp.Header.Type
+				if tp.UsesDefaultNew && (tp.Flags&val.FlagHeapType) != 0 && (meta == nil || meta == val.TypeType) && !val.IsSubclass(tp, val.TypeType) && len(kwnames) == 0 {
+					if !tp.HasInit() {
+						stack[retSP] = val.NewInstanceOfType(tp)
+						sp = retSP + 1
+						ip++
+						continue
+					}
+					initFn := tp.DunderInitVal()
+					if initFn.IsFunction() {
+						initFunc := initFn.AsFunction()
+						callee := AsCodeObject(initFunc.Code)
+						if !callee.IsGenerator && !callee.IsCoroutine {
+							minCap := max(newBase+1+totalArgs+256, newBase+1+callee.NumLocals+64)
+							if minCap > len(stack) {
+								stack = ensureStack(stack, minCap)
+								vm.execCtx.Stack = stack
+								switch {
+								case activeCoro != nil:
+									activeCoro.Stack = stack
+								case activeGen != nil:
+									activeGen.Stack = stack
+								default:
+									vm.stack = stack
+								}
+							}
+							copy(stack[newBase+1:newBase+1+totalArgs], stack[newBase:newBase+totalArgs])
+							inst := val.NewInstanceOfType(tp)
+							stack[newBase] = inst
+							totalInitArgs := totalArgs + 1
+							var nextSP int
+							if totalInitArgs == callee.NumParams && len(initFunc.Defaults) == 0 && initFunc.KwDefaults == nil && callee.KWOnlyArgCount == 0 && (callee.Flags&(CO_VARARGS|CO_VARKEYWORDS)) == 0 && len(callee.CellVars) == 0 {
+								nextSP = newBase + max(callee.NumLocals, totalInitArgs)
+							} else {
+								var ok bool
+								nextSP, ok = vm.bindFunctionArgsSafe(callee, initFunc.Defaults, initFunc.KwDefaults, stack, newBase, totalInitArgs, nil)
+								if !ok {
+									exc := vm.execCtx.ActiveException
+									vm.execCtx.ClearException()
+									if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curCodeCache) {
+										if activeGen != nil {
+											activeGen.State = val.GenClosed
+										}
+										if activeCoro != nil {
+											activeCoro.State = val.CoroClosed
+										}
+										return val.NoneVal()
+									}
+									locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+									curCodeCache = vm.getCodeCache(curCO)
+									continue
+								}
+							}
+							if frameIdx+2 > len(vm.frames) {
+								vm.ensureFrameCapacity(frameIdx + 2)
+							}
+							saved := &vm.frames[frameIdx]
+							saved.co = curCO
+							saved.codePtr = codePtr
+							saved.codeLen = codeLen
+							saved.consts = consts
+							saved.ip = ip + 1
+							saved.baseOffset = baseOffset
+							saved.retSP = retSP
+							saved.cells = cells
+							saved.cellPtrs = cellPtrs
+							saved.globals = globals
+							saved.locals = curLocals
+							saved.cache = curCodeCache
+							saved.excStackLen = len(vm.excStack)
+							saved.stackIsVM = stackIsVM
+							saved.initInstance = inst
+							saved.cmpActive = false
+							curLocals = val.NoneVal()
+							frameIdx++
+							curCO = callee
+							curCodeCache = vm.getCodeCache(callee)
+							codePtr, codeLen = vm.loadWindow(callee, curCodeCache)
+							consts = callee.Consts
+							baseOffset = newBase
+							locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+							_ = locals[255]
+							switch {
+							case len(callee.CellVars) == 0 && initFunc.Closure != nil:
+								cells = initFunc.Closure
+								cellPtrs = initFunc.CellPtrs
+							case len(callee.CellVars) == 0 && len(callee.FreeVars) == 0:
+								cells = nil
+								cellPtrs = nil
+							default:
+								cells, cellPtrs = vm.setupCalleeCellsAndPtrs(callee, initFn, stack, newBase, totalInitArgs)
+							}
+							if initFunc.Globals != nil {
+								globals = initFunc.Globals
+							}
+							vm.activeCO = curCO
+							vm.activeBaseOffset = baseOffset
+							if vm.activeCellPtrs != nil || cellPtrs != nil {
+								vm.activeCells = cells
+								vm.activeCellPtrs = cellPtrs
+							}
+							vm.activeFrameIdx = frameIdx
+							sp = nextSP
+							ip = 0
+							continue
+						}
+					}
+				}
+				vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+				vm.execCtx.SP = newBase + totalArgs
+				res := vm.callFromHookSafe(target, newBase, totalArgs, kwnames)
+				if stackIsVM && &stack[0] != &vm.stack[0] {
+					stack = vm.stack
+					locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+				}
+				if vm.execCtx.HasException() {
+					exc := vm.execCtx.ActiveException
+					vm.execCtx.ClearException()
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curCodeCache) {
+						if activeGen != nil {
+							activeGen.State = val.GenClosed
+						}
+						if activeCoro != nil {
+							activeCoro.State = val.CoroClosed
+						}
+						return val.NoneVal()
+					}
+					locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+					curCodeCache = vm.getCodeCache(curCO)
+					continue
+				}
+				stack[retSP] = res
+				sp = retSP + 1
+				ip++
 			default:
 				vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 				vm.execCtx.SP = newBase + totalArgs
@@ -3879,6 +4395,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					saved.cache = curCodeCache
 					saved.excStackLen = len(vm.excStack)
 					saved.stackIsVM = stackIsVM
+					saved.initInstance = val.Value{}
+					saved.cmpActive = false
 					curLocals = val.NoneVal()
 					frameIdx++
 					baseOffset = newBase
@@ -4002,6 +4520,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.cache = curCodeCache
 				saved.excStackLen = len(vm.excStack)
 				saved.stackIsVM = stackIsVM
+				saved.initInstance = val.Value{}
+				saved.cmpActive = false
 				curLocals = val.NoneVal()
 				frameIdx++
 				curCO = callee
@@ -4012,6 +4532,10 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				baseOffset = newBase
 				locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
 				_ = locals[255]
+				if len(callee.ExceptionTable) == 0 && !callee.IsGenerator && !callee.IsCoroutine && atomic.LoadInt32(&callee.IsTier2Optimized) == 0 {
+					maybeOptimizeCodeObject(vm, callee, curCodeCache)
+					codePtr, codeLen = vm.loadWindow(callee, curCodeCache)
+				}
 				switch {
 				case len(callee.CellVars) == 0 && fn.Closure != nil:
 					cells = fn.Closure
@@ -4105,6 +4629,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				saved.cache = curCodeCache
 				saved.excStackLen = len(vm.excStack)
 				saved.stackIsVM = stackIsVM
+				saved.initInstance = val.Value{}
+				saved.cmpActive = false
 				curLocals = val.NoneVal()
 				frameIdx++
 				curCO = callee
@@ -4409,6 +4935,101 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				markViewsEscaped(stack[newBase : newBase+totalArgs])
 			}
 
+			if !receiver.IsInstance() && !receiver.IsSuper() && !receiver.IsModule() && !receiver.IsType() {
+				tp := receiver.Type()
+				attrName := consts[methIdx]
+				pic := &curCodeCache.methodPIC[ip]
+				var nativeFn val.VectorcallFunc
+				var targetVal val.Value
+				found := false
+				for k := range 4 {
+					if pic[k].ReceiverType == tp && pic[k].NativeFn != nil {
+						nativeFn = pic[k].NativeFn
+						targetVal = pic[k].TargetVal
+						found = true
+						break
+					}
+				}
+				if !found {
+					descr, _, ok := tp.LookupMRO(attrName)
+					if ok && descr.IsBuiltinFunc() {
+						bf := descr.AsBuiltinFunc()
+						nativeFn = bf.Fn
+						targetVal = descr
+					} else {
+						vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+						vm.execCtx.SP = newBase + totalArgs
+						res := vm.callMethodPICSlowSafe(receiver, consts[methIdx], ip, newBase, argc, frameIdx, curCodeCache.methodPIC)
+						if &stack[0] != &vm.execCtx.Stack[0] {
+							stack = vm.execCtx.Stack
+							locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+						}
+						if vm.execCtx.HasException() {
+							exc := vm.execCtx.ActiveException
+							vm.execCtx.ClearException()
+							if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curCodeCache) {
+								if activeGen != nil {
+									activeGen.State = val.GenClosed
+								}
+								if activeCoro != nil {
+									activeCoro.State = val.CoroClosed
+								}
+								return val.NoneVal()
+							}
+							locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+							curCodeCache = vm.getCodeCache(curCO)
+							continue
+						}
+						stack[retSP] = res
+						sp = retSP + 1
+						ip++
+						continue
+					}
+					inserted := false
+					for k := range 4 {
+						if pic[k].ReceiverType == nil || pic[k].ReceiverType == tp {
+							pic[k] = val.MethodPICEntry{ReceiverType: tp, NativeFn: nativeFn, TargetVal: targetVal}
+							inserted = true
+							break
+						}
+					}
+					if !inserted {
+						pic[0] = pic[1]
+						pic[1] = pic[2]
+						pic[2] = pic[3]
+						pic[3] = val.MethodPICEntry{ReceiverType: tp, NativeFn: nativeFn, TargetVal: targetVal}
+					}
+				}
+				if nativeFn != nil {
+					vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+					vm.execCtx.SP = newBase + totalArgs
+					res := vm.invokeBuiltinSafe(nativeFn, targetVal, stack[newBase:newBase+totalArgs], nil)
+					if &stack[0] != &vm.execCtx.Stack[0] {
+						stack = vm.execCtx.Stack
+						locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+					}
+					if vm.execCtx.HasException() {
+						exc := vm.execCtx.ActiveException
+						vm.execCtx.ClearException()
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curCodeCache) {
+							if activeGen != nil {
+								activeGen.State = val.GenClosed
+							}
+							if activeCoro != nil {
+								activeCoro.State = val.CoroClosed
+							}
+							return val.NoneVal()
+						}
+						locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+						curCodeCache = vm.getCodeCache(curCO)
+						continue
+					}
+					stack[retSP] = res
+					sp = retSP + 1
+					ip++
+					continue
+				}
+			}
 			if receiver.IsInstance() {
 				instObj := receiver.AsInstance()
 				instShape := instObj.Shape
@@ -4500,6 +5121,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 						saved.cache = curCodeCache
 						saved.excStackLen = len(vm.excStack)
 						saved.stackIsVM = stackIsVM
+						saved.initInstance = val.Value{}
+						saved.cmpActive = false
 						curLocals = val.NoneVal()
 						frameIdx++
 						curCO = callee
@@ -4508,6 +5131,9 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 							curCodeCache = pc
 						} else {
 							curCodeCache = vm.getCodeCache(callee)
+						}
+						if len(callee.ExceptionTable) == 0 && !callee.IsGenerator && !callee.IsCoroutine && atomic.LoadInt32(&callee.IsTier2Optimized) == 0 {
+							maybeOptimizeCodeObject(vm, callee, curCodeCache)
 						}
 						if gen := atomic.LoadInt32(&callee.StreamGen); gen != curCodeCache.streamGen {
 							curCodeCache.streamGen = gen
@@ -4634,6 +5260,102 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			}
 			frameIdx--
 			caller := &vm.frames[frameIdx]
+			if caller.initInstance.HeaderPtr() != nil {
+				inst := caller.initInstance
+				caller.initInstance = val.Value{}
+				if !retVal.IsNone() {
+					exc := val.NewTypeError("__init__() should return None, not '" + retVal.Type().Name + "'")
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curCodeCache) {
+						if activeGen != nil {
+							activeGen.State = val.GenClosed
+						}
+						if activeCoro != nil {
+							activeCoro.State = val.CoroClosed
+						}
+						return val.NoneVal()
+					}
+					locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+					curCodeCache = vm.getCodeCache(curCO)
+					continue
+				}
+				retVal = inst
+			}
+			if caller.cmpActive {
+				cmpLeft, cmpRight, cmpOp := caller.cmpLeft, caller.cmpRight, caller.cmpOp
+				caller.cmpActive = false
+				caller.cmpLeft = val.Value{}
+				caller.cmpRight = val.Value{}
+				if retVal.IsNotImplemented() {
+					if len(vm.excStack) > caller.excStackLen {
+						vm.excStack = vm.excStack[:caller.excStackLen]
+					}
+					curCO = caller.co
+					codePtr = caller.codePtr
+					codeLen = caller.codeLen
+					consts = caller.consts
+					ip = caller.ip
+					baseOffset = caller.baseOffset
+					locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+					_ = locals[255]
+					cells = caller.cells
+					cellPtrs = caller.cellPtrs
+					globals = caller.globals
+					curLocals = caller.locals
+					vm.activeCO = curCO
+					vm.activeBaseOffset = baseOffset
+					if vm.activeCellPtrs != nil || cellPtrs != nil {
+						vm.activeCells = cells
+						vm.activeCellPtrs = cellPtrs
+					}
+					vm.activeFrameIdx = frameIdx
+					if caller.cache != nil {
+						curCodeCache = caller.cache
+					} else {
+						curCodeCache = vm.getCodeCache(curCO)
+					}
+					vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+					vm.execCtx.SP = sp
+					res := vm.compareOpSafe(cmpLeft, cmpRight, cmpOp)
+					if &stack[0] != &vm.execCtx.Stack[0] {
+						stack = vm.execCtx.Stack
+						switch {
+						case activeCoro != nil:
+							activeCoro.Stack = stack
+						case activeGen != nil:
+							activeGen.Stack = stack
+						default:
+							vm.stack = stack
+						}
+						locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+					}
+					if vm.execCtx.HasException() {
+						exc := vm.execCtx.ActiveException
+						vm.execCtx.ClearException()
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curCodeCache) {
+							if activeGen != nil {
+								activeGen.State = val.GenClosed
+							}
+							if activeCoro != nil {
+								activeCoro.State = val.CoroClosed
+							}
+							return val.NoneVal()
+						}
+						locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+						curCodeCache = vm.getCodeCache(curCO)
+						continue
+					}
+					stack[caller.retSP] = res
+					sp = caller.retSP + 1
+					continue
+				}
+				if cmpOp == CMP_IN || cmpOp == CMP_NOT_IN {
+					if cmpOp == CMP_NOT_IN {
+						retVal = val.BoolVal(!retVal.IsTruthy())
+					} else {
+						retVal = val.BoolVal(retVal.IsTruthy())
+					}
+				}
+			}
 			if len(vm.excStack) > caller.excStackLen {
 				vm.excStack = vm.excStack[:caller.excStackLen]
 			}
@@ -4674,6 +5396,148 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			} else {
 				curCodeCache = vm.getCodeCache(curCO)
 			}
+			continue
+
+		case OP_LOAD_FAST_ATTR_MUL_SELF:
+			_ = locals[255]
+			reg := uint8(inst >> 16)
+			obj := locals[reg]
+			if instObj := obj.AsInstanceChecked(); instObj != nil {
+				instShape := instObj.Shape
+				instType := instObj.Header.Type
+				if instShape != nil && instType != nil && (instType.Flags&val.FlagCustomGetAttribute) == 0 {
+					pic := &curCodeCache.attrPIC[ip+1]
+					if pic[0].Shape == instShape && !val.MultiThreadedFlag.Load() {
+						slotIdx := pic[0].SlotIndex
+						if uint(slotIdx) < uint(len(instObj.Slots)) {
+							v := instObj.Slots[slotIdx]
+							if v.IsInt64() {
+								vi := v.AsInt64()
+								if int64(int32(vi)) == vi {
+									stack[sp] = val.Int64Val(vi * vi)
+									sp++
+									ip += 5
+									continue
+								}
+							}
+						}
+					}
+					if slotIdx, ok := instShape.Lookup(consts[uint16(inst)]); ok && !val.MultiThreadedFlag.Load() {
+						if _, _, foundInClass := instType.LookupMRO(consts[uint16(inst)]); !foundInClass {
+							if uint(slotIdx) < uint(len(instObj.Slots)) {
+								v := instObj.Slots[slotIdx]
+								if v.IsInt64() {
+									vi := v.AsInt64()
+									if int64(int32(vi)) == vi {
+										if pic[0].Shape == nil {
+											pic[0] = AttrPICEntry{Shape: instShape, SlotIndex: slotIdx}
+										}
+										stack[sp] = val.Int64Val(vi * vi)
+										sp++
+										ip += 5
+										continue
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+			codePtr, codeLen = deoptimizeAt(curCO, ip, func(c []uint32) {
+				attrIdx := uint16(inst)
+				c[ip] = Encode(OP_LOAD_FAST, 0, uint16(reg))
+				c[ip+1] = Encode(OP_LOAD_ATTR, 0, attrIdx)
+				c[ip+2] = Encode(OP_LOAD_FAST, 0, uint16(reg))
+				c[ip+3] = Encode(OP_LOAD_ATTR, 0, attrIdx)
+				c[ip+4] = Encode(OP_BINARY_MUL, 0, 0)
+			})
+			continue
+
+		case OP_LOAD_FAST_ATTR:
+			_ = locals[255]
+			reg := uint8(inst >> 16)
+			obj := locals[reg]
+			if instObj := obj.AsInstanceChecked(); instObj != nil {
+				instShape := instObj.Shape
+				instType := instObj.Header.Type
+				if instShape != nil && instType != nil && (instType.Flags&val.FlagCustomGetAttribute) == 0 {
+					pic := &curCodeCache.attrPIC[ip+1]
+					if pic[0].Shape == instShape && !val.MultiThreadedFlag.Load() {
+						slotIdx := pic[0].SlotIndex
+						if uint(slotIdx) < uint(len(instObj.Slots)) {
+							v := instObj.Slots[slotIdx]
+							if !v.IsUnbound() {
+								stack[sp] = v
+								sp++
+								ip += 2
+								continue
+							}
+						}
+					}
+					if slotIdx, ok := instShape.Lookup(consts[uint16(inst)]); ok && !val.MultiThreadedFlag.Load() {
+						if _, _, foundInClass := instType.LookupMRO(consts[uint16(inst)]); !foundInClass {
+							if uint(slotIdx) < uint(len(instObj.Slots)) {
+								v := instObj.Slots[slotIdx]
+								if !v.IsUnbound() {
+									if pic[0].Shape == nil {
+										pic[0] = AttrPICEntry{Shape: instShape, SlotIndex: slotIdx}
+									}
+									stack[sp] = v
+									sp++
+									ip += 2
+									continue
+								}
+							}
+						}
+					}
+				}
+			}
+			codePtr, codeLen = deoptimizeAt(curCO, ip, func(c []uint32) {
+				c[ip] = Encode(OP_LOAD_FAST, 0, uint16(reg))
+				c[ip+1] = Encode(OP_LOAD_ATTR, 0, uint16(inst))
+			})
+			continue
+
+		case OP_STORE_FAST_ATTR:
+			_ = locals[255]
+			reg := uint8(inst >> 16)
+			obj := locals[reg]
+			v := stack[sp-1]
+			if !v.IsString() && v.Kind() != val.KindMemoryView {
+				if instObj := obj.AsInstanceChecked(); instObj != nil {
+					instShape := instObj.Shape
+					instType := instObj.Header.Type
+					if instShape != nil && instType != nil && (instType.Flags&val.FlagCustomSetAttr) == 0 {
+						pic := &curCodeCache.attrPIC[ip+1]
+						if pic[0].Shape == instShape && !val.MultiThreadedFlag.Load() {
+							slotIdx := pic[0].SlotIndex
+							if uint(slotIdx) < uint(len(instObj.Slots)) {
+								instObj.Slots[slotIdx] = v
+								sp--
+								ip += 2
+								continue
+							}
+						}
+						if slotIdx, ok := instShape.Lookup(consts[uint16(inst)]); ok && !val.MultiThreadedFlag.Load() {
+							if _, _, foundInClass := instType.LookupMRO(consts[uint16(inst)]); !foundInClass {
+								if uint(slotIdx) < uint(len(instObj.Slots)) {
+									instObj.Slots[slotIdx] = v
+									if pic[0].Shape == nil {
+										pic[0] = AttrPICEntry{Shape: instShape, SlotIndex: slotIdx}
+									}
+									sp--
+									ip += 2
+									continue
+								}
+							}
+						}
+					}
+				}
+			}
+			codePtr, codeLen = deoptimizeAt(curCO, ip, func(c []uint32) {
+				c[ip] = Encode(OP_LOAD_FAST, 0, uint16(reg))
+				c[ip+1] = Encode(OP_STORE_ATTR, 0, uint16(inst))
+			})
 			continue
 
 		case OP_LOAD_ATTR:
@@ -4804,6 +5668,120 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 							vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 							vm.execCtx.SP = sp
 							attrRes = vm.descrGetSafe(entry.CachedVal, obj, instType)
+							goto loadAttrDone
+						}
+						if entry.Kind == ICKindProperty {
+							fget := entry.CachedVal
+							if fget.IsBuiltinFunc() {
+								vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+								vm.execCtx.SP = sp
+								attrRes = fget.AsBuiltinFunc().Fn(&vm.execCtx, fget, stack[sp-1:sp], nil)
+								goto loadAttrDone
+							}
+							if fget.IsFunction() {
+								fgetFn := fget.AsFunction()
+								callee := AsCodeObject(fgetFn.Code)
+								if !callee.IsGenerator && !callee.IsCoroutine {
+									newBase := sp - 1
+									retSP := sp - 1
+									minCap := max(newBase+256, newBase+callee.NumLocals+64)
+									if minCap > len(stack) {
+										stack = ensureStack(stack, minCap)
+										vm.execCtx.Stack = stack
+										switch {
+										case activeCoro != nil:
+											activeCoro.Stack = stack
+										case activeGen != nil:
+											activeGen.Stack = stack
+										default:
+											vm.stack = stack
+										}
+									}
+									var nextSP int
+									if callee.NumParams == 1 && len(fgetFn.Defaults) == 0 && fgetFn.KwDefaults == nil && callee.KWOnlyArgCount == 0 && (callee.Flags&(CO_VARARGS|CO_VARKEYWORDS)) == 0 && len(callee.CellVars) == 0 {
+										nextSP = newBase + max(callee.NumLocals, 1)
+									} else {
+										vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+										var ok bool
+										nextSP, ok = vm.bindFunctionArgsSafe(callee, fgetFn.Defaults, fgetFn.KwDefaults, stack, newBase, 1, nil)
+										if !ok {
+											exc := vm.execCtx.ActiveException
+											vm.execCtx.ClearException()
+											if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curCodeCache) {
+												if activeGen != nil {
+													activeGen.State = val.GenClosed
+												}
+												if activeCoro != nil {
+													activeCoro.State = val.CoroClosed
+												}
+												return val.NoneVal()
+											}
+											locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+											curCodeCache = vm.getCodeCache(curCO)
+											continue
+										}
+									}
+									if frameIdx+2 > len(vm.frames) {
+										vm.ensureFrameCapacity(frameIdx + 2)
+									}
+									saved := &vm.frames[frameIdx]
+									saved.co = curCO
+									saved.codePtr = codePtr
+									saved.codeLen = codeLen
+									saved.consts = consts
+									saved.ip = ip + 1
+									saved.baseOffset = baseOffset
+									saved.retSP = retSP
+									saved.cells = cells
+									saved.cellPtrs = cellPtrs
+									saved.globals = globals
+									saved.locals = curLocals
+									saved.cache = curCodeCache
+									saved.excStackLen = len(vm.excStack)
+									saved.stackIsVM = stackIsVM
+									saved.initInstance = val.Value{}
+									saved.cmpActive = false
+									curLocals = val.NoneVal()
+									frameIdx++
+									curCO = callee
+									curCodeCache = vm.getCodeCache(callee)
+									codePtr, codeLen = vm.loadWindow(callee, curCodeCache)
+									consts = callee.Consts
+									baseOffset = newBase
+									locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+									_ = locals[255]
+									var fgetCells []val.Value
+									var fgetCellPtrs []*val.PyCell
+									switch {
+									case len(callee.CellVars) == 0 && fgetFn.Closure != nil:
+										fgetCells = fgetFn.Closure
+										fgetCellPtrs = fgetFn.CellPtrs
+									case len(callee.CellVars) == 0 && len(callee.FreeVars) == 0:
+										fgetCells = nil
+										fgetCellPtrs = nil
+									default:
+										fgetCells, fgetCellPtrs = vm.setupCalleeCellsAndPtrs(callee, fget, stack, newBase, 1)
+									}
+									cells = fgetCells
+									cellPtrs = fgetCellPtrs
+									if fgetFn.Globals != nil {
+										globals = fgetFn.Globals
+									}
+									vm.activeCO = curCO
+									vm.activeBaseOffset = baseOffset
+									if vm.activeCellPtrs != nil || cellPtrs != nil {
+										vm.activeCells = cells
+										vm.activeCellPtrs = cellPtrs
+									}
+									vm.activeFrameIdx = frameIdx
+									sp = nextSP
+									ip = 0
+									continue
+								}
+							}
+							vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+							vm.execCtx.SP = sp
+							attrRes = vm.getAttrSafe(obj, consts[uint16(inst)])
 							goto loadAttrDone
 						}
 					}
@@ -5745,6 +6723,45 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 				ip = jumpTarget
 				continue
 			}
+			if it.IsGenerator() {
+				vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
+				vm.execCtx.SP = sp
+				nextVal, status := vm.resumeGenerator(&vm.execCtx, it.AsGenerator(), val.NoneVal())
+				if stackIsVM && &stack[0] != &vm.stack[0] {
+					stack = vm.stack
+					locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+				}
+				if status == val.IterYielded {
+					stack[sp] = nextVal
+					sp++
+					ip++
+					continue
+				}
+				if status == val.IterExhausted {
+					sp--
+					ip = jumpTarget
+					continue
+				}
+				if vm.execCtx.HasException() {
+					exc := vm.execCtx.ActiveException
+					vm.execCtx.ClearException()
+					if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curCodeCache) {
+						if activeGen != nil {
+							activeGen.State = val.GenClosed
+						}
+						if activeCoro != nil {
+							activeCoro.State = val.CoroClosed
+						}
+						return val.NoneVal()
+					}
+					locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+					curCodeCache = vm.getCodeCache(curCO)
+					continue
+				}
+				sp--
+				ip = jumpTarget
+				continue
+			}
 			if tpIterNext := it.Type().Slots.TpIterNext; tpIterNext != nil {
 				vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 				vm.execCtx.SP = sp
@@ -6281,6 +7298,49 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 					continue
 				}
 			}
+
+			if cmpOp <= CMP_GTE && a.IsInstance() && b.IsInstance() {
+				ta := a.Type()
+				if ta != nil && ta == b.Type() {
+					var dunder val.Value
+					switch cmpOp {
+					case CMP_EQ:
+						dunder = ta.DunderEqVal()
+					case CMP_NEQ:
+						dunder = ta.DunderNeVal()
+					case CMP_LT:
+						dunder = ta.DunderLtVal()
+					case CMP_LTE:
+						dunder = ta.DunderLeVal()
+					case CMP_GT:
+						dunder = ta.DunderGtVal()
+					case CMP_GTE:
+						dunder = ta.DunderGeVal()
+					}
+					if dunder.IsFunction() {
+						dfn := dunder.AsFunction()
+						dcallee := AsCodeObject(dfn.Code)
+						if !dcallee.IsGenerator && !dcallee.IsCoroutine && dcallee.SimplePositionalOnly && dcallee.PositionalParamCount == 2 && dcallee.NumParams == 2 && len(dfn.Defaults) == 0 && dfn.KwDefaults == nil && dcallee.KWOnlyArgCount == 0 && (dcallee.Flags&(CO_VARARGS|CO_VARKEYWORDS)) == 0 {
+							vm.inlineDunderCompare(dunder, sp-2, sp-2, a, b, cmpOp, activeGen, activeCoro, stackIsVM, &sp, &ip, &frameIdx, &baseOffset, &curCO, &codePtr, &codeLen, &consts, &cells, &cellPtrs, &globals, &curLocals, &curCodeCache, &stack, &locals)
+							continue
+						}
+					}
+				}
+			}
+			if (cmpOp == CMP_IN || cmpOp == CMP_NOT_IN) && b.IsInstance() {
+				if bt := b.Type(); bt != nil {
+					if dunder := bt.DunderContainsVal(); dunder.IsFunction() {
+						dfn := dunder.AsFunction()
+						dcallee := AsCodeObject(dfn.Code)
+						if !dcallee.IsGenerator && !dcallee.IsCoroutine && dcallee.SimplePositionalOnly && dcallee.PositionalParamCount == 2 && dcallee.NumParams == 2 && len(dfn.Defaults) == 0 && dfn.KwDefaults == nil && dcallee.KWOnlyArgCount == 0 && (dcallee.Flags&(CO_VARARGS|CO_VARKEYWORDS)) == 0 {
+							stack[sp-2] = b
+							stack[sp-1] = a
+							vm.inlineDunderCompare(dunder, sp-2, sp-2, a, b, cmpOp, activeGen, activeCoro, stackIsVM, &sp, &ip, &frameIdx, &baseOffset, &curCO, &codePtr, &codeLen, &consts, &cells, &cellPtrs, &globals, &curLocals, &curCodeCache, &stack, &locals)
+							continue
+						}
+					}
+				}
+			}
 			vm.syncActiveFrame(frameIdx, curCO, codePtr, codeLen, consts, ip, baseOffset, cells, globals, curLocals, curCodeCache)
 			vm.execCtx.SP = sp
 			res := vm.compareOpSafe(a, b, cmpOp)
@@ -6580,6 +7640,13 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			sp--
 			yieldVal := stack[sp]
 			if activeGen != nil {
+				if vm.activeJoinGen == activeGen && frameIdx == startFrameIdx {
+					vm.appendJoinItem(yieldVal)
+					stack[sp] = val.NoneVal()
+					sp++
+					ip++
+					continue
+				}
 				activeGen.YieldVal = yieldVal
 				activeGen.State = val.GenSuspended
 				activeGen.SP = sp
@@ -6603,6 +7670,60 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 			} else if activeCoro != nil {
 				sentVal = activeCoro.LastSent
 				activeCoro.LastSent = val.NoneVal()
+			}
+			if activeGen != nil && vm.activeJoinGen == activeGen && frameIdx == startFrameIdx {
+				unwound := false
+				for {
+					var nextVal val.Value
+					var status val.IterStatus
+					if subiter.IsGenerator() {
+						nextVal, status = subiter.AsGenerator().Send(&vm.execCtx, val.NoneVal())
+					} else if subiter.IsCoroutine() {
+						nextVal, status = vm.resumeCoroutine(&vm.execCtx, subiter.AsCoroutine(), val.NoneVal())
+					} else if tpIterNext := subiter.Type().Slots.TpIterNext; tpIterNext != nil {
+						nextVal, status = tpIterNext(&vm.execCtx, subiter)
+					} else {
+						break
+					}
+					if status == val.IterYielded {
+						vm.appendJoinItem(nextVal)
+						continue
+					}
+					if status == val.IterExhausted {
+						retVal := val.NoneVal()
+						if subiter.IsGenerator() {
+							retVal = subiter.AsGenerator().RetVal
+						} else if subiter.IsCoroutine() {
+							retVal = subiter.AsCoroutine().RetVal
+							vm.releaseCoroutine(subiter.AsCoroutine())
+						}
+						stack[sp-1] = retVal
+						break
+					}
+					if vm.execCtx.HasException() {
+						exc := vm.execCtx.ActiveException
+						vm.execCtx.ClearException()
+						if !vm.unwindException(exc, &curCO, &ip, &frameIdx, startFrameIdx, &baseOffset, &sp, &codePtr, &codeLen, &consts, &cells, &globals, &curLocals, stack, &curCodeCache) {
+							if activeGen != nil {
+								activeGen.State = val.GenClosed
+							}
+							if activeCoro != nil {
+								activeCoro.State = val.CoroClosed
+							}
+							return val.NoneVal()
+						}
+						locals = stack[baseOffset : baseOffset+256 : baseOffset+256]
+						curCodeCache = vm.getCodeCache(curCO)
+						unwound = true
+						break
+					}
+					break
+				}
+				if unwound {
+					continue
+				}
+				ip++
+				continue
 			}
 			var nextVal val.Value
 			var status val.IterStatus
@@ -8221,6 +9342,8 @@ func (vm *VM) runLoopWithGlobals(co *CodeObject, startBase int, startSP int, sta
 						saved.cache = curCodeCache
 						saved.excStackLen = len(vm.excStack)
 						saved.stackIsVM = stackIsVM
+						saved.initInstance = val.Value{}
+						saved.cmpActive = false
 						curLocals = val.NoneVal()
 						frameIdx++
 						baseOffset = newBase
@@ -8853,6 +9976,26 @@ func (vm *VM) loadAttrInstanceSlow(instObj *val.PyInstance, obj, attrName val.Va
 
 	descr, _, foundInClass := instType.LookupMRO(attrName)
 	if foundInClass {
+		if descr.IsProperty() {
+			prop := descr.AsProperty()
+			if prop.FGet.IsFunction() || prop.FGet.IsBuiltinFunc() {
+				curIC[ip] = ICSlot{
+					ExpectedShapeID: instObj.Shape.ID,
+					Kind:            ICKindProperty,
+					ExpectedTypeVer: instType.VersionTag,
+					CachedVal:       prop.FGet,
+				}
+				vm.execCtx.SP = sp
+				vm.activeFrameIdx = frameIdx
+				if descrGet := descr.Type().Slots.TpDescrGet; descrGet != nil {
+					return descrGet(&vm.execCtx, descr, obj, instType)
+				}
+				if prop.FGet.IsBuiltinFunc() {
+					return prop.FGet.AsBuiltinFunc().Fn(&vm.execCtx, prop.FGet, []val.Value{obj}, nil)
+				}
+				return val.GetAttrCtx(&vm.execCtx, obj, attrName)
+			}
+		}
 		descrType := descr.Type()
 		if descr.IsDataDescriptor() || (descrType.Slots.TpDescrGet != nil && descrType.Slots.TpDescrSet != nil) {
 			curIC[ip] = ICSlot{
@@ -9231,7 +10374,13 @@ func (vm *VM) getAttrSafe(obj, attrName val.Value) (res val.Value) {
 			}
 		}
 	}()
-	return val.GetAttrCtx(&vm.execCtx, obj, attrName)
+	v, ok := val.LookupAttrOptional(&vm.execCtx, obj, attrName)
+	if !ok && !vm.execCtx.HasException() {
+		interned := val.InternValue(attrName)
+		vm.execCtx.Raise(val.NewAttributeError("'" + obj.Type().Name + "' object has no attribute '" + interned.AsString() + "'"))
+		return val.NoneVal()
+	}
+	return v
 }
 
 //go:noinline

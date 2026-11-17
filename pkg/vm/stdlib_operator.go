@@ -105,6 +105,9 @@ func initOperatorTypes() {
 				for _, p := range parts {
 					v, ok := vmGetAttrSafe(subCtx, curr, p)
 					if !ok {
+						if subCtx != nil && subCtx.HasException() {
+							return val.NoneVal()
+						}
 						panic("AttributeError: '" + curr.Type().Name + "' object has no attribute '" + p + "'")
 					}
 					curr = v
@@ -151,6 +154,9 @@ func initOperatorTypes() {
 			mc := (*pyMethodCaller)(val.AsPointer(self))
 			method, ok := vmGetAttrSafe(ctx, args[0], mc.name)
 			if !ok {
+				if ctx != nil && ctx.HasException() {
+					return val.NoneVal()
+				}
 				panic("AttributeError: '" + args[0].Type().Name + "' object has no attribute '" + mc.name + "'")
 			}
 			return ctx.Call(method, mc.args, mc.kwnames)

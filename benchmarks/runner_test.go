@@ -10,12 +10,17 @@ import (
 )
 
 var benchmarkFiles = []string{
-	"bench_oop.py",
-	"bench_io.py",
+	"bench_jinja.py",
+	"bench_web_asgi.py",
+	"bench_etl_validation.py",
+	"bench_rich_lex.py",
+	"bench_packaging_resolve.py",
 	"bench_nqueens.py",
-	"bench_async.py",
 	"bench_binary.py",
+	"bench_async.py",
+	"bench_io.py",
 	"bench_json.py",
+	"bench_oop.py",
 }
 
 func TestBenchmarkScriptsInEngine(t *testing.T) {

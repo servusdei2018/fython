@@ -181,6 +181,7 @@ func CompileWithFilenameAndOptimize(src []byte, arena *ASTArena, filename string
 
 	c := &Compiler{
 		src:            src,
+		lineStarts:     buildLineStarts(src),
 		arena:          arena,
 		scope:          topScope,
 		constPool:      NewConstPool(),

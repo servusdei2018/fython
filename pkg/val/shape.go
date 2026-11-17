@@ -168,10 +168,11 @@ func (s *Shape) Transition(name Value) *Shape {
 // and a flat contiguous slice of attribute Values (never backed by a PyDict or Go map).
 // Header MUST be at offset 0.
 type PyInstance struct {
-	Header ObjectHeader
-	Shape  *Shape
-	Slots  []Value
-	mu     sync.RWMutex
+	Header    ObjectHeader
+	Shape     *Shape
+	Slots     []Value
+	bootstrap [5]Value
+	mu        sync.RWMutex
 }
 
 // Compile-time assertion that PyInstance.Header is at byte offset 0.
@@ -184,11 +185,14 @@ func NewInstanceVal(shape *Shape) Value {
 		shape = defaultRootShape
 	}
 	n := len(shape.Attrs)
-	slotCap := max(8, n)
 	obj := &PyInstance{
 		Header: ObjectHeader{Kind: KindInstance, Type: ObjectType},
 		Shape:  shape,
-		Slots:  make([]Value, n, slotCap),
+	}
+	if n <= len(obj.bootstrap) {
+		obj.Slots = obj.bootstrap[:n]
+	} else {
+		obj.Slots = make([]Value, n, max(8, n))
 	}
 	return Value{num: 0, ptr: &obj.Header}
 }
@@ -236,11 +240,14 @@ func NewInstanceOfType(cls *PyType) Value {
 		shape = defaultRootShape
 	}
 	n := len(shape.Attrs)
-	slotCap := max(8, n)
 	obj := &PyInstance{
 		Header: ObjectHeader{Kind: KindInstance, Type: cls},
 		Shape:  shape,
-		Slots:  make([]Value, n, slotCap),
+	}
+	if n <= len(obj.bootstrap) {
+		obj.Slots = obj.bootstrap[:n]
+	} else {
+		obj.Slots = make([]Value, n, max(8, n))
 	}
 	return Value{num: 0, ptr: &obj.Header}
 }
@@ -347,13 +354,20 @@ func (inst *PyInstance) DeleteAttr(name Value) bool {
 // SetAttr sets or adds an attribute on the instance, transitioning its Shape if the attribute is new in a thread-safe manner.
 // Returns the resolved slot index.
 func (inst *PyInstance) SetAttr(name, value Value) int {
+	if !MultiThreadedFlag.Load() {
+		return inst.setAttrUnlocked(name, value)
+	}
 	inst.mu.Lock()
 	defer inst.mu.Unlock()
+	return inst.setAttrUnlocked(name, value)
+}
+
+func (inst *PyInstance) setAttrUnlocked(name, value Value) int {
 	if idx, ok := inst.Shape.Lookup(name); ok {
 		if idx < len(inst.Slots) {
 			inst.Slots[idx] = value
 		} else {
-			inst.Slots = append(inst.Slots, value)
+			inst.Slots = inst.appendSlot(value)
 		}
 		return idx
 	}
@@ -372,8 +386,23 @@ allowDynamic:
 	if slotIdx < len(inst.Slots) {
 		inst.Slots[slotIdx] = value
 	} else {
-		inst.Slots = append(inst.Slots, value)
+		inst.Slots = inst.appendSlot(value)
 	}
 	inst.Shape = newShape
 	return slotIdx
+}
+
+func (inst *PyInstance) appendSlot(value Value) []Value {
+	n := len(inst.Slots)
+	if n < len(inst.bootstrap) && (n == 0 || &inst.Slots[0] == &inst.bootstrap[0]) {
+		inst.bootstrap[n] = value
+		return inst.bootstrap[:n+1]
+	}
+	if n == len(inst.bootstrap) && n > 0 && &inst.Slots[0] == &inst.bootstrap[0] {
+		newSlots := make([]Value, n+1, n+4)
+		copy(newSlots, inst.bootstrap[:])
+		newSlots[n] = value
+		return newSlots
+	}
+	return append(inst.Slots, value)
 }

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"unicode/utf16"
+	"unsafe"
 
 	"github.com/servusdei2018/fython/pkg/val"
 )
@@ -97,19 +98,98 @@ func newJSONDecodeError(err error, doc []byte) val.Value {
 
 // jsonParser provides direct, allocation-optimized JSON parsing into fython Values.
 type jsonParser struct {
-	src     []byte
-	pos     int
-	pool    *val.InternPool
-	scratch []byte
+	src         []byte
+	pos         int
+	pool        *val.InternPool
+	scratch     []byte
+	dictCapHint int
+	entrySlab   []val.DictEntry
+	dictSlab    []val.PyDict
+	listSlab    []val.PyList
+	valSlab     []val.Value
+	strSlab     []val.PyString
+	byteSlab    []byte
 }
 
 func newJSONParser(src []byte, pool *val.InternPool) *jsonParser {
 	return &jsonParser{
-		src:     src,
-		pos:     0,
-		pool:    pool,
-		scratch: make([]byte, 0, 64),
+		src:         src,
+		pos:         0,
+		pool:        pool,
+		scratch:     make([]byte, 0, 64),
+		dictCapHint: 8,
 	}
+}
+
+func (p *jsonParser) allocString(raw []byte) val.Value {
+	if len(p.strSlab) >= cap(p.strSlab) {
+		p.strSlab = make([]val.PyString, 0, 256)
+	}
+	idx := len(p.strSlab)
+	p.strSlab = p.strSlab[:idx+1]
+	ps := &p.strSlab[idx]
+	if len(p.byteSlab)+len(raw) > cap(p.byteSlab) {
+		p.byteSlab = make([]byte, 0, max(4096, len(raw)*16))
+	}
+	bStart := len(p.byteSlab)
+	p.byteSlab = append(p.byteSlab, raw...)
+	s := unsafe.String(&p.byteSlab[bStart], len(raw))
+	ps.Header = val.ObjectHeader{
+		Kind: val.KindString,
+		Hash: val.HashString(s),
+		Type: val.StrType,
+	}
+	ps.Data = s
+	return val.ObjectVal(&ps.Header)
+}
+
+func (p *jsonParser) allocDict(capHint int) *val.PyDict {
+	if len(p.dictSlab) >= cap(p.dictSlab) {
+		p.dictSlab = make([]val.PyDict, 0, 256)
+	}
+	idx := len(p.dictSlab)
+	p.dictSlab = p.dictSlab[:idx+1]
+	d := &p.dictSlab[idx]
+	tableCap := 8
+	for tableCap*2 < capHint*3 {
+		tableCap <<= 1
+	}
+	maxDense := tableCap * 2 / 3
+	val.InitArenaDict(d, capHint, p.allocEntries(maxDense))
+	return d
+}
+
+func (p *jsonParser) allocList(items []val.Value) val.Value {
+	if len(p.listSlab) >= cap(p.listSlab) {
+		p.listSlab = make([]val.PyList, 0, 256)
+	}
+	idx := len(p.listSlab)
+	p.listSlab = p.listSlab[:idx+1]
+	l := &p.listSlab[idx]
+	l.Header = val.ObjectHeader{Kind: val.KindList, Type: val.ListType}
+	l.Items = items
+	return val.ObjectVal(&l.Header)
+}
+
+func (p *jsonParser) allocValSlice(capNeeded int) []val.Value {
+	if len(p.valSlab)+capNeeded > cap(p.valSlab) {
+		p.valSlab = make([]val.Value, 0, max(1024, capNeeded*16))
+	}
+	start := len(p.valSlab)
+	end := start + capNeeded
+	p.valSlab = p.valSlab[:end]
+	return p.valSlab[start:start:end]
+}
+
+func (p *jsonParser) allocEntries(capNeeded int) []val.DictEntry {
+	if len(p.entrySlab)+capNeeded > cap(p.entrySlab) {
+		slabCap := max(1024, capNeeded*16)
+		p.entrySlab = make([]val.DictEntry, 0, slabCap)
+	}
+	start := len(p.entrySlab)
+	end := start + capNeeded
+	p.entrySlab = p.entrySlab[:end]
+	return p.entrySlab[start:start:end]
 }
 
 func (p *jsonParser) skipWhitespace() {
@@ -153,10 +233,22 @@ func (p *jsonParser) parseValue() (val.Value, error) {
 	case '"':
 		return p.parseString(false)
 	case 't':
+		if p.pos+4 <= len(p.src) && p.src[p.pos+1] == 'r' && p.src[p.pos+2] == 'u' && p.src[p.pos+3] == 'e' {
+			p.pos += 4
+			return val.BoolVal(true), nil
+		}
 		return p.parseLiteral("true", val.BoolVal(true))
 	case 'f':
+		if p.pos+5 <= len(p.src) && p.src[p.pos+1] == 'a' && p.src[p.pos+2] == 'l' && p.src[p.pos+3] == 's' && p.src[p.pos+4] == 'e' {
+			p.pos += 5
+			return val.BoolVal(false), nil
+		}
 		return p.parseLiteral("false", val.BoolVal(false))
 	case 'n':
+		if p.pos+4 <= len(p.src) && p.src[p.pos+1] == 'u' && p.src[p.pos+2] == 'l' && p.src[p.pos+3] == 'l' {
+			p.pos += 4
+			return val.NoneVal(), nil
+		}
 		return p.parseLiteral("null", val.NoneVal())
 	case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
 		return p.parseNumber()
@@ -167,8 +259,8 @@ func (p *jsonParser) parseValue() (val.Value, error) {
 
 func (p *jsonParser) parseObject() (val.Value, error) {
 	p.pos++ // consume '{'
-	dictVal := val.NewDictVal(8)
-	dict := dictVal.AsDict()
+	dict := p.allocDict(p.dictCapHint)
+	dictVal := val.DictVal(dict)
 
 	p.skipWhitespace()
 	if p.pos < len(p.src) && p.src[p.pos] == '}' {
@@ -198,7 +290,7 @@ func (p *jsonParser) parseObject() (val.Value, error) {
 			return val.NoneVal(), err
 		}
 
-		dict.Set(keyVal, valElem)
+		dict.PutNew(keyVal, valElem)
 
 		p.skipWhitespace()
 		if p.pos >= len(p.src) {
@@ -207,6 +299,9 @@ func (p *jsonParser) parseObject() (val.Value, error) {
 
 		if p.src[p.pos] == '}' {
 			p.pos++
+			if n := len(dict.Entries); n > p.dictCapHint && n <= 10 {
+				p.dictCapHint = n + 1
+			}
 			return dictVal, nil
 		}
 		if p.src[p.pos] == ',' {
@@ -224,12 +319,12 @@ func (p *jsonParser) parseObject() (val.Value, error) {
 
 func (p *jsonParser) parseArray() (val.Value, error) {
 	p.pos++ // consume '['
-	items := make([]val.Value, 0, 8)
+	items := p.allocValSlice(4)
 
 	p.skipWhitespace()
 	if p.pos < len(p.src) && p.src[p.pos] == ']' {
 		p.pos++
-		return val.NewListVal(items...), nil
+		return p.allocList(items), nil
 	}
 
 	for {
@@ -246,7 +341,7 @@ func (p *jsonParser) parseArray() (val.Value, error) {
 
 		if p.src[p.pos] == ']' {
 			p.pos++
-			return val.NewListVal(items...), nil
+			return p.allocList(items), nil
 		}
 		if p.src[p.pos] == ',' {
 			commaPos := p.pos
@@ -273,18 +368,14 @@ func (p *jsonParser) parseString(isKey bool) (val.Value, error) {
 			p.pos++ // consume closing '"'
 
 			if !hasEscapes {
-				if isKey || len(raw) <= 7 {
-					if len(raw) <= 7 {
-						// Small String Optimization: 0 heap allocations, 0 string allocations!
-						return val.SmallStringFromBytes(raw), nil
-					}
-					if p.pool != nil {
-						// String interning path: 0 duplicate heap strings!
-						return p.pool.InternBytes(raw), nil
-					}
-					return val.InternString(string(raw)), nil
+				if len(raw) <= 7 {
+					// Small String Optimization: 0 heap allocations, 0 string allocations!
+					return val.SmallStringFromBytes(raw), nil
 				}
-				return val.NewStringVal(string(raw)), nil
+				if isKey {
+					return val.InternBytes(raw), nil
+				}
+				return p.allocString(raw), nil
 			}
 
 			// Has escapes: decode via scratch buffer
@@ -408,20 +499,39 @@ func encodeRune(r rune, p []byte) int {
 func (p *jsonParser) parseNumber() (val.Value, error) {
 	start := p.pos
 	isFloat := false
+	neg := false
 
 	if p.src[p.pos] == '-' {
+		neg = true
 		p.pos++
 	}
 
+	var uval uint64
+	digitStart := p.pos
 	for p.pos < len(p.src) && p.src[p.pos] >= '0' && p.src[p.pos] <= '9' {
+		uval = uval*10 + uint64(p.src[p.pos]-'0')
 		p.pos++
 	}
+	digits := p.pos - digitStart
 
 	if p.pos < len(p.src) && p.src[p.pos] == '.' {
 		isFloat = true
 		p.pos++
+		fracStart := p.pos
+		var fracVal uint64
 		for p.pos < len(p.src) && p.src[p.pos] >= '0' && p.src[p.pos] <= '9' {
+			fracVal = fracVal*10 + uint64(p.src[p.pos]-'0')
 			p.pos++
+		}
+		fracDigits := p.pos - fracStart
+		if (p.pos >= len(p.src) || (p.src[p.pos] != 'e' && p.src[p.pos] != 'E')) &&
+			digits > 0 && fracDigits > 0 && digits+fracDigits <= 15 && fracDigits <= 6 {
+			pow10 := [7]float64{1, 10, 100, 1000, 10000, 100000, 1000000}[fracDigits]
+			f := float64(uval) + float64(fracVal)/pow10
+			if neg {
+				f = -f
+			}
+			return val.Float64Val(f), nil
 		}
 	}
 
@@ -436,7 +546,15 @@ func (p *jsonParser) parseNumber() (val.Value, error) {
 		}
 	}
 
-	numStr := string(p.src[start:p.pos])
+	if !isFloat && digits > 0 && digits <= 18 {
+		if neg {
+			return val.Int64Val(-int64(uval)), nil
+		}
+		return val.Int64Val(int64(uval)), nil
+	}
+
+	raw := p.src[start:p.pos]
+	numStr := unsafe.String(unsafe.SliceData(raw), len(raw))
 	if isFloat {
 		f, err := strconv.ParseFloat(numStr, 64)
 		if err != nil {
@@ -846,7 +964,8 @@ func (e *Engine) createJSONModule() val.Value {
 		a := pa[0]
 		switch {
 		case a.IsAnyString():
-			rawBytes = []byte(a.AsString())
+			s := a.AsString()
+			rawBytes = unsafe.Slice(unsafe.StringData(s), len(s))
 		case a.IsBytes():
 			rawBytes = a.AsBytes().Data
 		case a.IsByteArray():

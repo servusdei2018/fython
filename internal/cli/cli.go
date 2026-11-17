@@ -247,14 +247,34 @@ func (c *CLI) Run() error {
 				v.RunCode(co)
 				execErr = unhandledError(v)
 			} else {
-				src, err := os.ReadFile(inv.Script)
-				if err != nil {
-					return err
+				var co *vm.CodeObject
+				dir := filepath.Dir(inv.Script)
+				base := filepath.Base(inv.Script)
+				fycName := strings.TrimSuffix(base, ".py") + ".fyc"
+				fycPath := filepath.Join(dir, "__pycache__", fycName)
+
+				if fycCO, fycHdr, err := vm.LoadFyc(fycPath); err == nil {
+					if vm.ValidateFyc(fycHdr, uint64(info.Size()), info.ModTime().UnixNano(), [32]byte{}) {
+						co = fycCO
+					}
 				}
-				co, err := compiler.CompileSourceModeWithOptimize(src, inv.Script, compiler.ModeExec, eff.Optimize)
-				if err != nil {
-					return err
+
+				if co == nil {
+					src, err := os.ReadFile(inv.Script)
+					if err != nil {
+						return err
+					}
+					compiledCO, err := compiler.CompileSourceModeWithOptimize(src, inv.Script, compiler.ModeExec, eff.Optimize)
+					if err != nil {
+						return err
+					}
+					co = compiledCO
+					if !eff.DontWriteBytecode {
+						srcHash := vm.ComputeSourceHash(src)
+						_ = vm.SaveFyc(fycPath, co, uint64(info.Size()), info.ModTime().UnixNano(), srcHash)
+					}
 				}
+
 				v = eng.NewVM()
 				if !eff.Isolated {
 					scriptDir := filepath.Dir(inv.Script)

@@ -132,6 +132,20 @@ func clampInt(n int64, lo, hi int) int {
 	return int(n)
 }
 
+// stringRunes returns a cached []rune view for a string Value when possible.
+func stringRunes(v val.Value) []rune {
+	if v.Kind() == val.KindString {
+		return (*val.PyString)(unsafe.Pointer(v.HeaderPtr())).Runes()
+	}
+	if v.IsInstance() {
+		inst := v.AsInstance()
+		if len(inst.Slots) > 0 && inst.Slots[0].IsAnyString() {
+			return stringRunes(inst.Slots[0])
+		}
+	}
+	return []rune(v.AsString())
+}
+
 // subject converts a str / bytes-like object to runes, enforcing that its type
 // agrees with the pattern.
 func (p *pyPattern) subject(v val.Value) []rune {
@@ -140,24 +154,25 @@ func (p *pyPattern) subject(v val.Value) []rune {
 		if p.IsBytes {
 			panic("TypeError: cannot use a bytes pattern on a string-like object")
 		}
-		return []rune(v.AsString())
+		return stringRunes(v)
 	case v.IsInstance() && val.IsSubclass(v.Type(), val.StrType):
 		if p.IsBytes {
 			panic("TypeError: cannot use a bytes pattern on a string-like object")
 		}
 		inst := v.AsInstance()
 		if len(inst.Slots) > 0 && inst.Slots[0].IsAnyString() {
-			return []rune(inst.Slots[0].AsString())
+			return stringRunes(inst.Slots[0])
 		}
 		return []rune(v.String())
 	case v.IsBytes() || v.IsByteArray() || v.IsMemoryView():
 		if !p.IsBytes {
 			panic("TypeError: cannot use a string pattern on a bytes-like object")
 		}
+		if v.IsBytes() {
+			return v.AsBytes().Runes()
+		}
 		var data []byte
 		switch {
-		case v.IsBytes():
-			data = v.AsBytes().Data
 		case v.IsByteArray():
 			data = v.AsByteArray().Data
 		default:
@@ -173,15 +188,10 @@ func (p *pyPattern) subject(v val.Value) []rune {
 			panic("TypeError: cannot use a string pattern on a bytes-like object")
 		}
 		inst := v.AsInstance()
-		var data []byte
 		if len(inst.Slots) > 0 && inst.Slots[0].IsBytes() {
-			data = inst.Slots[0].AsBytes().Data
+			return inst.Slots[0].AsBytes().Runes()
 		}
-		rs := make([]rune, len(data))
-		for i, b := range data {
-			rs[i] = rune(b)
-		}
-		return rs
+		return []rune{}
 	}
 	panic("TypeError: expected string or bytes-like object, got '" + typeNameOf(v) + "'")
 }

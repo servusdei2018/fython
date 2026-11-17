@@ -30,6 +30,9 @@ type PyString struct {
 	// two VMs concatenating the very same string can never both mutate the
 	// shared backing bytes.
 	BufClaimed uint32
+	// RuneCache holds a lazily computed []rune view of Data. It is immutable
+	// once published, so concurrent readers may use it without locking.
+	RuneCache atomic.Pointer[[]rune]
 }
 
 // PyList represents a dynamic array of Value on the heap.
@@ -112,6 +115,8 @@ type PyModule struct {
 type PyBytes struct {
 	Header ObjectHeader
 	Data   []byte
+	// RuneCache holds a lazily computed []rune view of Data.
+	RuneCache atomic.Pointer[[]rune]
 }
 
 // PyByteArray represents a mutable sequence of bytes on the heap.
@@ -1797,7 +1802,7 @@ func (d *PyDict) setLocked(key, value Value) {
 				}
 			} else {
 				e := &d.Entries[int(raw)-dictIndexOffset]
-				if e.Hash == h && e.Active && Equals(e.Key, key) {
+				if e.Key == key || (e.Hash == h && e.Active && Equals(e.Key, key)) {
 					e.Value = value
 					atomic.AddUint64(&d.VersionTag, 1)
 					return
@@ -1820,7 +1825,7 @@ func (d *PyDict) setLocked(key, value Value) {
 				}
 			} else {
 				e := &d.Entries[int(raw)-dictIndexOffset]
-				if e.Hash == h && e.Active && Equals(e.Key, key) {
+				if e.Key == key || (e.Hash == h && e.Active && Equals(e.Key, key)) {
 					e.Value = value
 					atomic.AddUint64(&d.VersionTag, 1)
 					return
@@ -1854,6 +1859,49 @@ func (d *PyDict) setLocked(key, value Value) {
 	d.writeIndex(uint32(insertSlot), uint32(entryIdx+dictIndexOffset))
 	d.used++
 	atomic.AddUint64(&d.VersionTag, 1)
+}
+
+// PutNew inserts a key-value pair known to not exist in d (e.g. fresh parser output).
+func (d *PyDict) PutNew(key, value Value) {
+	if len(d.indices) == 0 {
+		d.initTable(8)
+	}
+	h := HashValue(key)
+	mask := d.mask
+	slot := h & mask
+	if (d.filled+1)*3 > int(mask+1)*2 || len(d.Entries)+dictIndexOffset >= d.maxIndexValue() {
+		d.resize(d.used + 1)
+		mask = d.mask
+		slot = h & mask
+	}
+	for d.readIndex(slot) != dictIndexEmpty {
+		slot = (slot + 1) & mask
+	}
+	entryIdx := len(d.Entries)
+	d.Entries = append(d.Entries, DictEntry{
+		Key:    key,
+		Value:  value,
+		Hash:   h,
+		Active: true,
+	})
+	d.writeIndex(slot, uint32(entryIdx+dictIndexOffset))
+	d.used++
+	d.filled++
+	atomic.AddUint64(&d.VersionTag, 1)
+}
+
+// InitArenaDict initializes a PyDict allocated from a slab or arena.
+func InitArenaDict(d *PyDict, capHint int, entries []DictEntry) {
+	d.Header = ObjectHeader{Kind: KindDict, Type: DictType}
+	tableCap := uint32(8)
+	for int(tableCap)*2 < capHint*3 {
+		tableCap <<= 1
+	}
+	d.indices = make([]byte, int(tableCap))
+	d.mask = tableCap - 1
+	d.indexShift = 0
+	d.Entries = entries[:0]
+	d.VersionTag = 1
 }
 
 // Get retrieves a value by key from PyDict in a thread-safe manner with 0 heap allocations.
@@ -2886,4 +2934,32 @@ func (v Value) AsLazyImport() *PyLazyImport {
 
 func (v Value) IsLazyImport() bool {
 	return v.Kind() == KindLazyImport
+}
+
+// Runes returns a cached []rune view of ps.Data, computing it at most once.
+func (ps *PyString) Runes() []rune {
+	if p := ps.RuneCache.Load(); p != nil {
+		return *p
+	}
+	rs := []rune(ps.Data)
+	ps.RuneCache.Store(&rs)
+	return rs
+}
+
+// Runes returns a cached []rune view of pb.Data, computing it at most once.
+func (pb *PyBytes) Runes() []rune {
+	if p := pb.RuneCache.Load(); p != nil {
+		return *p
+	}
+	rs := make([]rune, len(pb.Data))
+	for i, b := range pb.Data {
+		rs[i] = rune(b)
+	}
+	pb.RuneCache.Store(&rs)
+	return rs
+}
+
+// IsASCII reports whether ps.Data contains only ASCII runes.
+func (ps *PyString) IsASCII() bool {
+	return len(ps.Data) == utf8.RuneCountInString(ps.Data)
 }

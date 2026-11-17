@@ -1427,7 +1427,10 @@ func vmGetAttrSafe(ctx *val.ExecContext, obj val.Value, name string) (res val.Va
 			panic(r)
 		}
 	}()
-	v := val.GetAttrCtx(ctx, obj, interned)
+	v, found := val.LookupAttrOptional(ctx, obj, interned)
+	if !found {
+		return val.NoneVal(), false
+	}
 	if ctx != nil && ctx.HasException() {
 		exc := ctx.ActiveException
 		ctx.ClearException()

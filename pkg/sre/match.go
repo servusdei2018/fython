@@ -70,26 +70,67 @@ func (re *Regexp) ExecFrom(input []rune, pos, endpos int, mode Mode, mustAdvance
 	if pos > endpos {
 		return nil
 	}
-	m := &matcher{
-		re:      re,
-		prog:    re.prog,
-		in:      input,
-		end:     endpos,
-		caps:    make([]int, 2*(re.NumGroups+1)),
-		regs:    make([]int, re.nregs),
-		last:    -1,
-		full:    -1,
-		mustAdv: -1,
+	// Prefix reject for anchored matches: avoid matcher setup entirely.
+	if (mode == ModeMatch || mode == ModeFullMatch) && pos < endpos {
+		r := input[pos]
+		if re.hasFirst {
+			ascii := re.Flags&FlagASCII != 0
+			if re.firstFold {
+				if canon(r, ascii) != canon(re.firstLit, ascii) {
+					return nil
+				}
+			} else if r != re.firstLit {
+				return nil
+			}
+		} else if re.hasFirstMask {
+			if r < 256 {
+				if (re.firstMask[r>>6]>>(uint(r)&63))&1 == 0 {
+					return nil
+				}
+			}
+		}
+	}
+
+	mm, _ := re.matcherPool.Get().(*matcher)
+	m := mm
+	if m == nil {
+		m = &matcher{
+			re:   re,
+			prog: re.prog,
+			caps: make([]int, 2*(re.NumGroups+1)),
+			regs: make([]int, re.nregs),
+		}
+	}
+	m.re = re
+	m.prog = re.prog
+	m.in = input
+	m.end = endpos
+	m.last = -1
+	m.full = -1
+	m.mustAdv = -1
+	if len(m.caps) != 2*(re.NumGroups+1) {
+		m.caps = make([]int, 2*(re.NumGroups+1))
 	}
 	for i := range m.caps {
 		m.caps[i] = -1
 	}
+	if len(m.regs) != re.nregs {
+		m.regs = make([]int, re.nregs)
+	}
+	for i := range m.regs {
+		m.regs[i] = 0
+	}
+	m.stack = m.stack[:0]
 	if mode == ModeFullMatch {
 		m.full = endpos
 	}
 	if mustAdvance {
 		m.mustAdv = pos
 	}
+	defer func() {
+		m.in = nil
+		re.matcherPool.Put(m)
+	}()
 	try := func(start int) bool {
 		m.stack = m.stack[:0]
 		m.last = -1
@@ -116,7 +157,30 @@ func (re *Regexp) ExecFrom(input []rune, pos, endpos int, mode Mode, mustAdvance
 		found := false
 		for s := pos; s <= endpos; s++ {
 			if re.hasFirst {
-				for s < endpos && input[s] != re.firstLit {
+				ascii := re.Flags&FlagASCII != 0
+				for s < endpos {
+					r := input[s]
+					if re.firstFold {
+						if canon(r, ascii) == canon(re.firstLit, ascii) {
+							break
+						}
+					} else if r == re.firstLit {
+						break
+					}
+					s++
+				}
+				if s >= endpos {
+					break
+				}
+			} else if re.hasFirstMask {
+				for s < endpos {
+					r := input[s]
+					if r >= 256 {
+						break
+					}
+					if (re.firstMask[r>>6]>>(uint(r)&63))&1 != 0 {
+						break
+					}
 					s++
 				}
 				if s >= endpos {
@@ -304,6 +368,18 @@ func (m *matcher) run(pc, pos int) (int, bool) {
 				ok = false
 			}
 		case opSplit:
+			if pos < m.end {
+				if r := m.in[pos]; r < 256 {
+					if in.xHasMask && (in.xMask[r>>6]>>(uint(r)&63))&1 == 0 {
+						pc = in.y
+						break
+					}
+					if in.yHasMask && (in.yMask[r>>6]>>(uint(r)&63))&1 == 0 {
+						pc = in.x
+						break
+					}
+				}
+			}
 			m.stack = append(m.stack, entry{kind: ekChoice, pc: in.y, pos: pos})
 			pc = in.x
 		case opJmp:

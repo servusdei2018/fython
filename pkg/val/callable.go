@@ -48,11 +48,12 @@ type PyFunction struct {
 
 // MethodPICEntry represents a single slot in a 4-way Polymorphic Inline Cache for method calls.
 type MethodPICEntry struct {
-	Shape       *Shape         // Verifies both concrete PyType and that no instance attr shadows the method
-	TypeVersion uint64         // Verifies the class MRO / method dict hasn't been mutated
-	TargetFn    *PyFunction    // Direct concrete pointer to target bytecode function (NO interface{})
-	NativeFn    VectorcallFunc // Direct function pointer if builtin/native method
-	TargetVal   Value          // Cached Value wrapper
+	Shape        *Shape         // Verifies both concrete PyType and that no instance attr shadows the method
+	TypeVersion  uint64         // Verifies the class MRO / method dict hasn't been mutated
+	ReceiverType *PyType        // For non-instance (builtin) receivers
+	TargetFn     *PyFunction    // Direct concrete pointer to target bytecode function (NO interface{})
+	NativeFn     VectorcallFunc // Direct function pointer if builtin/native method
+	TargetVal    Value          // Cached Value wrapper
 }
 
 // PyBoundMethod represents a first-class bound method object allocated on the heap ONLY when
@@ -4335,12 +4336,120 @@ func initTypes() {
 			panic("TypeError: join() takes exactly one argument")
 		}
 		sep := args[0].AsString()
-		items := ExtractIterableItems(ctx, args[1])
-		parts := make([]string, len(items))
-		for i, it := range items {
-			parts[i] = it.AsString()
+		iterable := args[1]
+		// Streaming container paths avoid building an intermediate []Value
+		// slice of every item.
+		var b strings.Builder
+		switch {
+		case iterable.IsList():
+			items := iterable.AsList().Items
+			if len(items) == 0 {
+				return NewStringVal("")
+			}
+			total := len(sep) * (len(items) - 1)
+			for _, it := range items {
+				if it.IsAnyString() {
+					total += len(it.AsString())
+				} else {
+					total += 16
+				}
+			}
+			b.Grow(total)
+			for i, it := range items {
+				if i > 0 && len(sep) > 0 {
+					b.WriteString(sep)
+				}
+				if it.IsAnyString() {
+					b.WriteString(it.AsString())
+				} else {
+					b.WriteString(it.String())
+				}
+			}
+		case iterable.IsTuple():
+			items := iterable.AsTuple().Items
+			if len(items) == 0 {
+				return NewStringVal("")
+			}
+			total := len(sep) * (len(items) - 1)
+			for _, it := range items {
+				if it.IsAnyString() {
+					total += len(it.AsString())
+				} else {
+					total += 16
+				}
+			}
+			b.Grow(total)
+			for i, it := range items {
+				if i > 0 && len(sep) > 0 {
+					b.WriteString(sep)
+				}
+				if it.IsAnyString() {
+					b.WriteString(it.AsString())
+				} else {
+					b.WriteString(it.String())
+				}
+			}
+		case iterable.IsGenerator():
+			gen := iterable.AsGenerator()
+			if JoinGeneratorHook != nil {
+				if res, ok := JoinGeneratorHook(ctx, sep, gen); ok {
+					if ctx.HasException() {
+						panic(ctx.ActiveException)
+					}
+					return res
+				}
+			}
+			b.Grow(8192)
+			first := true
+			for {
+				v, status := gen.Send(ctx, NoneVal())
+				if status == IterExhausted {
+					break
+				}
+				if status == IterError {
+					if ctx.HasException() {
+						panic(ctx.ActiveException)
+					}
+					break
+				}
+				if !first {
+					if len(sep) > 0 {
+						b.WriteString(sep)
+					}
+				}
+				first = false
+				if v.IsAnyString() {
+					b.WriteString(v.AsString())
+				} else {
+					b.WriteString(v.String())
+				}
+			}
+		default:
+			items := ExtractIterableItems(ctx, iterable)
+			if len(items) == 0 {
+				return NewStringVal("")
+			}
+			total := len(sep) * (len(items) - 1)
+			for _, it := range items {
+				if it.IsAnyString() {
+					total += len(it.AsString())
+				} else {
+					total += 16
+				}
+			}
+			b.Grow(total)
+			for i, it := range items {
+				if i > 0 && len(sep) > 0 {
+					b.WriteString(sep)
+				}
+				if it.IsAnyString() {
+					b.WriteString(it.AsString())
+				} else {
+					b.WriteString(it.String())
+				}
+			}
 		}
-		return NewStringVal(strings.Join(parts, sep))
+		return NewStringVal(b.String())
 	}))
 
 	StrType.Dict.Set(InternString("find"), NewBuiltinFuncVal("find", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
@@ -6569,6 +6678,73 @@ func initTypes() {
 				for _, it := range ExtractIterableItems(ctx, other) {
 					s.Add(it)
 				}
+			}
+		}
+		return NoneVal()
+	}))
+
+	SetType.Dict.Set(InternString("intersection_update"), NewBuiltinFuncVal("intersection_update", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: descriptor 'intersection_update' of 'set' object needs an argument")
+		}
+		if args[0].IsSet() {
+			s := args[0].AsSet()
+			for _, other := range args[1:] {
+				otherSet := NewSetVal(ExtractIterableItems(ctx, other)...).AsSet()
+				// keep only items in otherSet
+				var toRemove []Value
+				for _, it := range s.Items() {
+					if !otherSet.Contains(it) {
+						toRemove = append(toRemove, it)
+					}
+				}
+				for _, it := range toRemove {
+					s.Discard(it)
+				}
+			}
+		}
+		return NoneVal()
+	}))
+
+	SetType.Dict.Set(InternString("difference_update"), NewBuiltinFuncVal("difference_update", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			panic("TypeError: descriptor 'difference_update' of 'set' object needs an argument")
+		}
+		if args[0].IsSet() {
+			s := args[0].AsSet()
+			for _, other := range args[1:] {
+				for _, it := range ExtractIterableItems(ctx, other) {
+					s.Discard(it)
+				}
+			}
+		}
+		return NoneVal()
+	}))
+
+	SetType.Dict.Set(InternString("symmetric_difference_update"), NewBuiltinFuncVal("symmetric_difference_update", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			panic("TypeError: descriptor 'symmetric_difference_update' of 'set' object needs an argument")
+		}
+		if args[0].IsSet() {
+			s := args[0].AsSet()
+			otherSet := NewSetVal(ExtractIterableItems(ctx, args[1])...).AsSet()
+			var toAdd []Value
+			var toRemove []Value
+			for _, it := range s.Items() {
+				if otherSet.Contains(it) {
+					toRemove = append(toRemove, it)
+				}
+			}
+			for _, it := range otherSet.Items() {
+				if !s.Contains(it) {
+					toAdd = append(toAdd, it)
+				}
+			}
+			for _, it := range toRemove {
+				s.Discard(it)
+			}
+			for _, it := range toAdd {
+				s.Add(it)
 			}
 		}
 		return NoneVal()

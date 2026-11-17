@@ -209,6 +209,22 @@ func (v Value) StringLen() int {
 	return utf8.RuneCountInString(s)
 }
 
+var (
+	ascii1Table [256]string
+	ascii2Table [128][128]string
+)
+
+func init() {
+	for i := range 256 {
+		ascii1Table[i] = string([]byte{byte(i)})
+	}
+	for i := range 128 {
+		for j := range 128 {
+			ascii2Table[i][j] = string([]byte{byte(i), byte(j)})
+		}
+	}
+}
+
 // AsString returns a Go string for a KindInlineStr or KindString Value.
 func (v Value) AsString() string {
 	if v.ptr == nil {
@@ -218,6 +234,16 @@ func (v Value) AsString() string {
 		n := int(v.num & 0xFF)
 		if n == 0 {
 			return ""
+		}
+		if n == 1 {
+			return ascii1Table[byte(v.num>>8)]
+		}
+		if n == 2 {
+			b0 := byte(v.num >> 8)
+			b1 := byte(v.num >> 16)
+			if b0 < 128 && b1 < 128 {
+				return ascii2Table[b0][b1]
+			}
 		}
 		var buf [7]byte
 		for i := range n {
@@ -451,6 +477,11 @@ var defaultInternPool = NewInternPool(256)
 // InternString interns s in the process-wide default InternPool.
 func InternString(s string) Value {
 	return defaultInternPool.Intern(s)
+}
+
+// InternBytes interns byte slice b in the process-wide default InternPool.
+func InternBytes(b []byte) Value {
+	return defaultInternPool.InternBytes(b)
 }
 
 // InternValue canonicalizes a string Value in the process-wide default InternPool.

@@ -232,6 +232,11 @@ func NotImplementedVal() Value {
 	return Value{num: 0, ptr: &tagNotImplemented}
 }
 
+// RawNum returns the unboxed 64-bit payload of v.
+func (v Value) RawNum() uint64 {
+	return v.num
+}
+
 // IsNotImplemented reports whether v is the NotImplemented singleton via pointer equality.
 func (v Value) IsNotImplemented() bool {
 	return v.ptr == &tagNotImplemented

@@ -1,0 +1,17 @@
+[project]
+name = "fython-benchmarks"
+version = "0.1.0"
+description = "Real-world ecosystem benchmark suite for fython vs CPython"
+requires-python = ">=3.15"
+dependencies = [
+    "jinja2>=3.1",
+    "markupsafe>=3.0",
+    "rich>=14.0",
+    "pygments>=2.18",
+    "attrs>=24.0",
+    "click>=8.0",
+    "packaging>=24.0",
+]
+
+[tool.uv]
+package = false

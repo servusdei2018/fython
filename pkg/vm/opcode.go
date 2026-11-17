@@ -188,6 +188,11 @@ const (
 
 	// REPL single-statement echo (CPython single-mode print-expr).
 	OP_PRINT_EXPR
+
+	// Fused Local-Object Attribute Access Superinstructions
+	OP_LOAD_FAST_ATTR
+	OP_STORE_FAST_ATTR
+	OP_LOAD_FAST_ATTR_MUL_SELF
 )
 
 // Comparison operation codes for OP_COMPARE_OP (passed in ArgA field).
@@ -470,6 +475,12 @@ func (op Opcode) String() string {
 		return "OP_FAST_SELF_RECURSE_INC_LOCAL"
 	case OP_PRINT_EXPR:
 		return "OP_PRINT_EXPR"
+	case OP_LOAD_FAST_ATTR:
+		return "OP_LOAD_FAST_ATTR"
+	case OP_STORE_FAST_ATTR:
+		return "OP_STORE_FAST_ATTR"
+	case OP_LOAD_FAST_ATTR_MUL_SELF:
+		return "OP_LOAD_FAST_ATTR_MUL_SELF"
 	default:
 		return "OP_UNKNOWN"
 	}

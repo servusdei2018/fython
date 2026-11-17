@@ -3,6 +3,7 @@ package val
 import (
 	"errors"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -31,6 +32,12 @@ var AcquireExecContextHook func() (*ExecContext, func())
 
 // ResolveLazyImportHook allows resolving a PyLazyImport placeholder through the VM.
 var ResolveLazyImportHook func(vm any, mod *PyModule, name Value, lazyVal Value) (Value, error)
+
+// JoinGeneratorHook drains a generator directly into a separator-joined
+// string without per-yield call overhead. It returns (result, true) when
+// handled (including when an exception was set on ctx), or (Value{}, false)
+// to fall back to the default send loop.
+var JoinGeneratorHook func(ctx *ExecContext, sep string, gen *PyGenerator) (Value, bool)
 
 func (ctx *ExecContext) Raise(exc Value) {
 	if ctx != nil {
@@ -293,6 +300,11 @@ type PyType struct {
 	VersionTag uint64
 	Flags      uint32
 	Slots      TypeSlots
+	// UsesDefaultNew reports whether instantiation may skip a custom
+	// __new__: the resolved __new__ is absent or object.__new__. The
+	// metaclass gate is checked live at call sites, so this flag only
+	// tracks __new__ and stays fresh via syncDunderSlots.
+	UsesDefaultNew bool
 
 	// Resolved dunder callables cached at class creation/mutation time
 	// so slot trampolines execute with 0 dictionary lookups.
@@ -1455,6 +1467,7 @@ func (t *PyType) syncDunderSlots() {
 	} else {
 		t.dunderNew = Value{}
 	}
+	t.UsesDefaultNew = t.dunderNew.ptr == nil || t.dunderNew.ptr == ObjectNewBuiltin.ptr
 	if fn, _, ok := t.LookupMRO(DunderInitSubclass); ok {
 		t.dunderInitSubclass = fn
 	} else {
@@ -1554,12 +1567,115 @@ func objectGetAttr(ctx *ExecContext, obj, name Value) Value {
 	return defaultObjectGetAttr(ctx, obj, name)
 }
 
+func isAttrErr(r any) bool {
+	if r == nil {
+		return false
+	}
+	if s, ok := r.(string); ok {
+		return strings.Contains(s, "AttributeError")
+	}
+	if v, ok := r.(Value); ok {
+		return IsInstance(v, AttributeErrorType)
+	}
+	return false
+}
+
+// LookupAttrOptional resolves obj.name without panicking or allocating an AttributeError
+// when the attribute does not exist on standard objects/modules/types.
+func LookupAttrOptional(ctx *ExecContext, obj, name Value) (res Value, okRes bool) {
+	if obj.IsType() {
+		v := typeGetAttr(ctx, obj, name)
+		return v, true
+	}
+	if obj.IsSuper() {
+		v := superGetAttr(ctx, obj, name)
+		return v, true
+	}
+	tp := obj.Type()
+	if (tp.Flags&FlagCustomGetAttribute) != 0 || tp.dunderGetAttribute.ptr != nil {
+		defer func() {
+			if r := recover(); r != nil {
+				if isAttrErr(r) {
+					res = NoneVal()
+					okRes = false
+					return
+				}
+				panic(r)
+			}
+		}()
+		v := GetAttrCtx(ctx, obj, name)
+		if ctx != nil && ctx.HasException() {
+			if IsInstance(ctx.ActiveException, AttributeErrorType) {
+				ctx.ClearException()
+				return NoneVal(), false
+			}
+		}
+		return v, true
+	}
+
+	interned := InternValue(name)
+
+	// Fast path for standard Python instances: probe shape first without panics
+	if obj.IsInstance() {
+		inst := obj.AsInstance()
+		if inst.Shape != nil {
+			if val, ok := inst.GetAttr(interned); ok {
+				return val, true
+			}
+		}
+	} else if obj.IsModule() {
+		mod := obj.AsModule()
+		if val, ok := mod.Dict.Get(interned); ok {
+			return val, true
+		}
+	}
+
+	// Descriptors / class MRO lookup
+	descr, _, foundInClass := tp.LookupMRO(interned)
+	if foundInClass {
+		descrType := descr.Type()
+		if descrType.Slots.TpDescrGet != nil {
+			return descrType.Slots.TpDescrGet(ctx, descr, obj, tp), true
+		}
+		return descr, true
+	}
+
+	// Fallback to GetAttrCtx with recover for custom TpGetAttr types (e.g. date, datetime, Decompress)
+	defer func() {
+		if r := recover(); r != nil {
+			if isAttrErr(r) {
+				res = NoneVal()
+				okRes = false
+				return
+			}
+			panic(r)
+		}
+	}()
+	v := GetAttrCtx(ctx, obj, interned)
+	if ctx != nil && ctx.HasException() {
+		if IsInstance(ctx.ActiveException, AttributeErrorType) {
+			ctx.ClearException()
+			return NoneVal(), false
+		}
+	}
+	return v, true
+}
+
 func defaultObjectGetAttr(ctx *ExecContext, obj, name Value) Value {
+	v, ok := defaultObjectGetAttrOptional(ctx, obj, name)
+	if !ok {
+		interned := InternValue(name)
+		panic("val: AttributeError: '" + obj.Type().Name + "' object has no attribute '" + interned.AsString() + "'")
+	}
+	return v
+}
+
+func defaultObjectGetAttrOptional(ctx *ExecContext, obj, name Value) (Value, bool) {
 	interned := InternValue(name)
 	tp := obj.Type()
 
-	if interned.AsString() == "__class__" {
-		return TypeVal(tp)
+	if interned.StringEquals("__class__") {
+		return TypeVal(tp), true
 	}
 
 	descr, _, foundInClass := tp.LookupMRO(interned)
@@ -1567,7 +1683,7 @@ func defaultObjectGetAttr(ctx *ExecContext, obj, name Value) Value {
 		descrType := descr.Type()
 		if descr.IsDataDescriptor() || (descrType.Slots.TpDescrGet != nil && descrType.Slots.TpDescrSet != nil) {
 			if descrType.Slots.TpDescrGet != nil {
-				return descrType.Slots.TpDescrGet(ctx, descr, obj, tp)
+				return descrType.Slots.TpDescrGet(ctx, descr, obj, tp), true
 			}
 		}
 	}
@@ -1575,7 +1691,7 @@ func defaultObjectGetAttr(ctx *ExecContext, obj, name Value) Value {
 	if obj.IsInstance() {
 		if inst := obj.AsInstance(); inst.Shape != nil {
 			if val, ok := inst.GetAttr(interned); ok {
-				return val
+				return val, true
 			}
 		}
 	}
@@ -1583,15 +1699,15 @@ func defaultObjectGetAttr(ctx *ExecContext, obj, name Value) Value {
 	if obj.IsCInstance() {
 		if ci := obj.AsCInstance(); ci != nil && ci.Dict != nil {
 			if val, ok := ci.Dict.Get(interned); ok {
-				return val
+				return val, true
 			}
 		}
 	}
 
 	if obj.IsModule() {
 		mod := obj.AsModule()
-		if interned.AsString() == "__dict__" {
-			return DictVal(mod.Dict)
+		if interned.StringEquals("__dict__") {
+			return DictVal(mod.Dict), true
 		}
 		if v, ok := mod.Dict.Get(interned); ok {
 			if v.IsLazyImport() && ResolveLazyImportHook != nil {
@@ -1603,30 +1719,30 @@ func defaultObjectGetAttr(ctx *ExecContext, obj, name Value) Value {
 				if err != nil {
 					panic("ImportError: " + err.Error())
 				}
-				return resolved
+				return resolved, true
 			}
-			return v
+			return v, true
 		}
-		switch interned.AsString() {
-		case "__name__":
-			return InternString(mod.Name)
-		case "__doc__":
-			return NoneVal()
-		case "__file__":
+		switch {
+		case interned.StringEquals("__name__"):
+			return InternString(mod.Name), true
+		case interned.StringEquals("__doc__"):
+			return NoneVal(), true
+		case interned.StringEquals("__file__"):
 			if mod.File != "" {
-				return NewStringVal(mod.File)
+				return NewStringVal(mod.File), true
 			}
-		case "__annotations__":
-			return ModuleAnnotations(ctx, mod)
-		case "__annotate__":
-			return NoneVal()
+		case interned.StringEquals("__annotations__"):
+			return ModuleAnnotations(ctx, mod), true
+		case interned.StringEquals("__annotate__"):
+			return NoneVal(), true
 		}
 	}
 
 	if obj.IsDict() && tp != DictType {
 		if d := obj.AsDict(); d.Attrs != nil {
 			if val, ok := d.Attrs.Get(interned); ok {
-				return val
+				return val, true
 			}
 		}
 	}
@@ -1634,7 +1750,7 @@ func defaultObjectGetAttr(ctx *ExecContext, obj, name Value) Value {
 	if obj.IsList() && tp != ListType {
 		if l := obj.AsList(); l.Attrs != nil {
 			if val, ok := l.Attrs.Get(interned); ok {
-				return val
+				return val, true
 			}
 		}
 	}
@@ -1642,7 +1758,7 @@ func defaultObjectGetAttr(ctx *ExecContext, obj, name Value) Value {
 	if obj.IsTuple() && tp != TupleType {
 		if t := obj.AsTuple(); t.Attrs != nil {
 			if val, ok := t.Attrs.Get(interned); ok {
-				return val
+				return val, true
 			}
 		}
 	}
@@ -1650,7 +1766,7 @@ func defaultObjectGetAttr(ctx *ExecContext, obj, name Value) Value {
 	if k := obj.Kind(); k == KindFuture || k == KindTask {
 		if d := AsyncAttrs(obj, false); d != nil {
 			if val, ok := d.Get(interned); ok {
-				return val
+				return val, true
 			}
 		}
 	}
@@ -1658,80 +1774,80 @@ func defaultObjectGetAttr(ctx *ExecContext, obj, name Value) Value {
 	if foundInClass {
 		descrType := descr.Type()
 		if descrType.Slots.TpDescrGet != nil {
-			return descrType.Slots.TpDescrGet(ctx, descr, obj, tp)
+			return descrType.Slots.TpDescrGet(ctx, descr, obj, tp), true
 		}
-		return descr
+		return descr, true
 	}
 
-	if interned.AsString() == "__dict__" && obj.IsInstance() && (tp.Flags&FlagForbidDynamicAttrs) == 0 {
+	if interned.StringEquals("__dict__") && obj.IsInstance() && (tp.Flags&FlagForbidDynamicAttrs) == 0 {
 		inst := obj.AsInstance()
 		if inst.Shape != nil {
-			return NewInstanceDictProxy(inst)
+			return NewInstanceDictProxy(inst), true
 		}
 	}
-	if interned.AsString() == "__dict__" && obj.IsCInstance() && (tp.Flags&FlagForbidDynamicAttrs) == 0 {
+	if interned.StringEquals("__dict__") && obj.IsCInstance() && (tp.Flags&FlagForbidDynamicAttrs) == 0 {
 		ci := obj.AsCInstance()
 		if ci != nil {
 			if ci.Dict == nil {
 				ci.Dict = NewDictVal(8).AsDict()
 			}
-			return DictVal(ci.Dict)
+			return DictVal(ci.Dict), true
 		}
 	}
 
 	if tp.dunderGetAttr.ptr != nil {
-		return ctx.Invoke2(tp.dunderGetAttr, obj, interned)
+		return ctx.Invoke2(tp.dunderGetAttr, obj, interned), true
 	}
 
-	if interned.AsString() == "__func__" || interned.AsString() == "__wrapped__" {
+	if interned.StringEquals("__func__") || interned.StringEquals("__wrapped__") {
 		if obj.Kind() == KindStaticMethod {
-			return obj.AsStaticMethod().Callable
+			return obj.AsStaticMethod().Callable, true
 		}
 		if obj.Kind() == KindClassMethod {
-			return obj.AsClassMethod().Callable
+			return obj.AsClassMethod().Callable, true
 		}
 		if obj.Kind() == KindBoundMethod {
-			return obj.AsBoundMethod().Func
+			return obj.AsBoundMethod().Func, true
 		}
 	}
 
 	if obj.Kind() == KindBoundMethod {
-		if interned.AsString() == "__self__" {
-			return obj.AsBoundMethod().Self
+		if interned.StringEquals("__self__") {
+			return obj.AsBoundMethod().Self, true
 		}
 		bm := obj.AsBoundMethod()
 		if bm.Func.HeaderPtr() != nil {
-			return defaultObjectGetAttr(ctx, bm.Func, name)
+			return defaultObjectGetAttrOptional(ctx, bm.Func, name)
 		}
 	}
 
-	if interned.AsString() == "__dict__" {
+	if interned.StringEquals("__dict__") {
 		if obj.IsDict() && tp != DictType {
 			d := obj.AsDict()
 			if d.Attrs == nil {
 				d.Attrs = NewDictVal(8).AsDict()
 			}
-			return Value{num: uint64(KindDict), ptr: &d.Attrs.Header}
+			return Value{num: uint64(KindDict), ptr: &d.Attrs.Header}, true
 		}
 		if obj.IsList() && tp != ListType {
 			l := obj.AsList()
 			if l.Attrs == nil {
 				l.Attrs = NewDictVal(8).AsDict()
 			}
-			return Value{num: uint64(KindDict), ptr: &l.Attrs.Header}
+			return Value{num: uint64(KindDict), ptr: &l.Attrs.Header}, true
 		}
 		if obj.IsTuple() && tp != TupleType {
 			t := obj.AsTuple()
 			if t.Attrs == nil {
 				t.Attrs = NewDictVal(8).AsDict()
 			}
-			return Value{num: uint64(KindDict), ptr: &t.Attrs.Header}
+			return Value{num: uint64(KindDict), ptr: &t.Attrs.Header}, true
 		}
 	}
 
-	if interned.AsString() == "__annotations__" {
+	if interned.StringEquals("__annotations__") {
 		if obj.IsType() {
-			return TypeAnnotations(ctx, obj.AsType())
+			return TypeAnnotations(ctx, obj.AsType()), true
 		}
 		if obj.IsInstance() {
 			inst := obj.AsInstance()
@@ -1744,20 +1860,20 @@ func defaultObjectGetAttr(ctx *ExecContext, obj, name Value) Value {
 				}
 				if annDict.IsDict() {
 					inst.SetAttr(interned, annDict)
-					return annDict
+					return annDict, true
 				}
 			}
 			emptyDict := NewDictVal(4)
 			inst.SetAttr(interned, emptyDict)
-			return emptyDict
+			return emptyDict, true
 		}
 	}
 
-	if interned.AsString() == "__doc__" {
-		return NoneVal()
+	if interned.StringEquals("__doc__") {
+		return NoneVal(), true
 	}
 
-	panic("val: AttributeError: '" + tp.Name + "' object has no attribute '" + interned.AsString() + "'")
+	return NoneVal(), false
 }
 
 // objectSetAttr implements the standard Python object.__setattr__ protocol,

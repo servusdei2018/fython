@@ -6,9 +6,16 @@ import (
 	"github.com/servusdei2018/fython/pkg/val"
 )
 
+type constKey struct {
+	kind val.Kind
+	num  uint64
+	str  string
+}
+
 // ConstPool manages type- and value-sensitive constant deduplication within a single CodeObject.
 type ConstPool struct {
 	consts []val.Value
+	index  map[constKey]uint16
 }
 
 // NewConstPool constructs an empty ConstPool.
@@ -21,13 +28,46 @@ func NewConstPool() *ConstPool {
 // Add deduplicates v with strict type+value sensitivity and returns its 16-bit constant pool index.
 // Guaranteed: 1 (int), 1.0 (float), and True (bool) will NEVER share a constant slot.
 func (cp *ConstPool) Add(v val.Value) uint16 {
-	for i, existing := range cp.consts {
-		if exactTypeAndValueEqual(v, existing) {
-			return uint16(i)
+	k := v.Kind()
+	if cp.index == nil && len(cp.consts) >= 8 {
+		cp.index = make(map[constKey]uint16, 32)
+		for i, existing := range cp.consts {
+			ek := existing.Kind()
+			key := constKey{kind: ek, num: existing.RawNum()}
+			if ek == val.KindString {
+				key.str = existing.AsString()
+			}
+			cp.index[key] = uint16(i)
 		}
 	}
+
+	if cp.index != nil {
+		key := constKey{kind: k, num: v.RawNum()}
+		if k == val.KindString {
+			key.str = v.AsString()
+		}
+		if idx, ok := cp.index[key]; ok {
+			if exactTypeAndValueEqual(v, cp.consts[idx]) {
+				return idx
+			}
+		}
+	} else {
+		for i, existing := range cp.consts {
+			if exactTypeAndValueEqual(v, existing) {
+				return uint16(i)
+			}
+		}
+	}
+
 	idx := uint16(len(cp.consts))
 	cp.consts = append(cp.consts, v)
+	if cp.index != nil {
+		key := constKey{kind: k, num: v.RawNum()}
+		if k == val.KindString {
+			key.str = v.AsString()
+		}
+		cp.index[key] = idx
+	}
 	return idx
 }
 
@@ -70,7 +110,7 @@ func exactTypeAndValueEqual(a, b val.Value) bool {
 			math.Float64bits(a.AsComplex().Imag) == math.Float64bits(b.AsComplex().Imag)
 
 	case val.KindInlineStr, val.KindString:
-		return a.AsString() == b.AsString()
+		return val.StringEquals(a, b)
 
 	case val.KindTuple:
 		ta := a.AsTuple().Items

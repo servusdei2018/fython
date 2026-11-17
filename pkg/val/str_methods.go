@@ -425,10 +425,14 @@ func asciiEscape(s string) string {
 			sb.WriteString(h)
 		case r <= 0xffff:
 			h := strconv.FormatInt(int64(r), 16)
-			sb.WriteString("\\u" + strings.Repeat("0", 4-len(h)) + h)
+			sb.WriteString("\\u")
+			sb.WriteString(strings.Repeat("0", 4-len(h)))
+			sb.WriteString(h)
 		default:
 			h := strconv.FormatInt(int64(r), 16)
-			sb.WriteString("\\U" + strings.Repeat("0", 8-len(h)) + h)
+			sb.WriteString("\\U")
+			sb.WriteString(strings.Repeat("0", 8-len(h)))
+			sb.WriteString(h)
 		}
 	}
 	return sb.String()

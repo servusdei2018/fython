@@ -90,8 +90,9 @@ func shimCandidates() []string {
 		out = append(out, n)
 		if cwd != "" {
 			out = append(out, cwd+"/"+n, cwd+"/shim/"+n)
+			out = append(out, cwd+"/../shim/"+n, cwd+"/../../shim/"+n)
 		}
-		out = append(out, "shim/"+n)
+		out = append(out, "shim/"+n, "../shim/"+n)
 	}
 	_ = goarch
 	return out
