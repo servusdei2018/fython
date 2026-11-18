@@ -76,7 +76,7 @@ func OptimizeCodeObject(co *CodeObject) {
 		inst := co.Code[i]
 		op := DecodeOpcode(inst)
 		switch op {
-		case OP_JUMP, OP_JUMP_IF_FALSE, OP_JUMP_IF_TRUE, OP_JUMP_IF_FALSE_OR_POP, OP_JUMP_IF_TRUE_OR_POP, OP_FOR_ITER:
+		case OP_JUMP, OP_JUMP_IF_FALSE, OP_JUMP_IF_TRUE, OP_JUMP_IF_FALSE_OR_POP, OP_JUMP_IF_TRUE_OR_POP, OP_FOR_ITER, OP_FOR_ITER_GEN:
 			target := int(DecodeArgBx(inst))
 			if target >= 0 && target < len(isJumpTarget) {
 				isJumpTarget[target] = true
@@ -632,6 +632,45 @@ func OptimizeCodeObject(co *CodeObject) {
 		i++
 	}
 
+	// Step 3: Ahead-of-time call-site quickening for common builtin calls
+	// (len(x), isinstance(x, T)) so their very first execution skips OP_CALL.
+	view := co.Code
+	if code != nil {
+		view = code
+	}
+	for i := 0; i+2 < len(view); i++ {
+		w0 := view[i]
+		if DecodeOpcode(w0) != OP_LOAD_GLOBAL {
+			continue
+		}
+		nameIdx := int(DecodeArgBx(w0))
+		if nameIdx >= len(co.Consts) {
+			continue
+		}
+		gName := co.Consts[nameIdx]
+		if gName == nameLen && !isJumpTarget[i+1] && !isJumpTarget[i+2] {
+			op1 := DecodeOpcode(view[i+1])
+			w2 := view[i+2]
+			if isSimpleLoadOp(op1) && DecodeOpcode(w2) == OP_CALL &&
+				DecodeArgA(w2) == 1 && DecodeArgBx(w2) == CallFromStack {
+				code = fusionCopy(co, code)
+				code[i+2] = ReplaceOpcode(w2, OP_CALL_LEN)
+				view = code
+			}
+		} else if i+3 < len(view) && gName == nameIsInstance &&
+			!isJumpTarget[i+1] && !isJumpTarget[i+2] && !isJumpTarget[i+3] {
+			op1 := DecodeOpcode(view[i+1])
+			op2 := DecodeOpcode(view[i+2])
+			w3 := view[i+3]
+			if isSimpleLoadOp(op1) && isSimpleLoadOp(op2) && DecodeOpcode(w3) == OP_CALL &&
+				DecodeArgA(w3) == 2 && DecodeArgBx(w3) == CallFromStack {
+				code = fusionCopy(co, code)
+				code[i+3] = ReplaceOpcode(w3, OP_CALL_ISINSTANCE)
+				view = code
+			}
+		}
+	}
+
 	if code == nil {
 		// Nothing could be fused: the original stream stays in place.
 		return
@@ -639,6 +678,10 @@ func OptimizeCodeObject(co *CodeObject) {
 	// Publish the fused instruction stream atomically: every VM picks it up
 	// the next time it reloads the active slice.
 	co.publish(code)
+}
+
+func isSimpleLoadOp(op Opcode) bool {
+	return op == OP_LOAD_FAST || op == OP_LOAD_CONST || op == OP_LOAD_DEREF || op == OP_LOAD_GLOBAL
 }
 
 // fusionCopy returns a private copy of the instruction stream of co, so that

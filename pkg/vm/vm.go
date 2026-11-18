@@ -39,6 +39,16 @@ func (vm *VM) Run(code []uint32, consts []val.Value, numLocals int) (res val.Val
 		vm.rootCO.IsTier2Optimized = 0
 		vm.rootCO.Hotness = 0
 		vm.rootCO.stream = nil
+		vm.rootCO.ParamShapeComputed = false
+		vm.rootCO.computeParamShape()
+		vm.rootCache.active = nil
+		vm.rootCache.privateActive = false
+		if len(vm.rootCache.ic) > 0 {
+			clear(vm.rootCache.ic)
+			clear(vm.rootCache.methodPIC)
+			clear(vm.rootCache.attrPIC)
+			clear(vm.rootCache.kwPIC)
+		}
 	}
 	vm.rootCO.initStream()
 	return vm.runFrame(&vm.rootCO, 0, numLocals, 0, nil, vm.globals, val.NoneVal(), vm.stack, nil, nil)
@@ -526,6 +536,15 @@ func (vm *VM) callFromHook(ctx *val.ExecContext, callable val.Value, argBase int
 		if co.IsCoroutine {
 			return vm.instantiateCoroutine(co, callable, nil, nil, ctx.Stack, argBase, nargs, kwnames, vm.globals)
 		}
+		need := argBase + co.NumLocals + co.MaxStackSize + 256
+		if need > len(ctx.Stack) {
+			if len(ctx.Stack) > 0 && len(vm.stack) > 0 && &ctx.Stack[0] == &vm.stack[0] {
+				vm.stack = ensureStack(vm.stack, need)
+				ctx.Stack = vm.stack
+			} else {
+				ctx.Stack = ensureStack(ctx.Stack, need)
+			}
+		}
 		spAfterBind := vm.bindFunctionArgs(co, nil, nil, ctx.Stack, argBase, nargs, kwnames)
 		if ctx.HasException() {
 			return val.NoneVal()
@@ -622,30 +641,16 @@ func (vm *VM) bindFunctionArgs(co *CodeObject, defaults []val.Value, kwDefaults 
 		}
 		return argBase + numLocals
 	}
+	if !co.ParamShapeComputed {
+		co.computeParamShape()
+	}
 	numLocals := max(co.NumLocals, numParams)
 
 	paramNames := co.ParamNames
-	varKWIdx := -1
-	varArgsIdx := -1
-	posParamCount := 0
+	varKWIdx := co.VarKWIdx
+	varArgsIdx := co.VarArgsIdx
+	posParamCount := co.PosParamCount
 	kwOnlyCount := co.KWOnlyArgCount
-	for p := range paramNames {
-		pn := paramNames[p]
-		switch {
-		case pn.StringStartsWithTwoBytes('*', '*'):
-			varKWIdx = p
-		case pn.StringHasBytePrefix('*'):
-			if !pn.StringEquals("*") {
-				varArgsIdx = p
-			}
-		default:
-			posParamCount++
-		}
-	}
-	if len(paramNames) == 0 && numParams > 0 {
-		posParamCount = numParams
-	}
-	posParamCount -= kwOnlyCount
 
 	if len(kwnames) == 0 && kwOnlyCount == 0 && kwDefaults == nil {
 		minPos := posParamCount - len(defaults)
@@ -792,32 +797,17 @@ func (vm *VM) setupCalleeCellsAndPtrs(callee *CodeObject, target val.Value, stac
 	}
 	res := make([]val.Value, nCells+nFree)
 	ptrs := make([]*val.PyCell, nCells+nFree)
+	if len(callee.CellParamIndices) != nCells {
+		callee.InitCellParamIndices()
+	}
 	boundLimit := len(callee.ParamNames)
 	if !target.IsFunction() && argc < boundLimit {
 		boundLimit = argc
 	}
-	var nameStr string
 	for i := range nCells {
-		name := callee.CellVars[i]
-		nameStr = name.AsString()
 		initVal := val.NoneVal()
-		for p := range boundLimit {
-			pn := callee.ParamNames[p]
-			if val.StringEquals(pn, name) {
-				initVal = stack[newBase+p]
-				break
-			}
-			pnStr := pn.AsString()
-			if len(pnStr) > 1 && pnStr[0] == '*' {
-				clean := pnStr[1:]
-				if len(clean) > 0 && clean[0] == '*' {
-					clean = clean[1:]
-				}
-				if clean == nameStr {
-					initVal = stack[newBase+p]
-					break
-				}
-			}
+		if p := callee.CellParamIndices[i]; p >= 0 && p < boundLimit {
+			initVal = stack[newBase+p]
 		}
 		cVal := val.NewCellVal(initVal)
 		res[i] = cVal
@@ -940,6 +930,9 @@ func (vm *VM) recycleMemoryView(mv *val.PyMemoryView) {
 
 func (vm *VM) initBuiltins() {
 	vm.populateAllBuiltins(vm.builtins)
+	if isInstVal, ok := vm.builtins.Get(nameIsInstance); ok {
+		vm.builtinIsInstance = isInstVal
+	}
 
 	rangeVal := val.TypeVal(val.RangeType)
 	vm.builtinRange = rangeVal
@@ -1273,6 +1266,9 @@ func (vm *VM) initBuiltins() {
 	}))
 
 	vm.builtins.Set(val.InternString("open"), val.NewBuiltinFuncVal("open", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(kwnames) == 0 && len(args) == 2 && args[0].IsAnyString() && args[1].IsAnyString() {
+			return openFileBuiltinCtx(ctx, args[0].AsString(), args[1].AsString())
+		}
 		pa := posArgs(args, kwnames)
 		if len(pa) < 1 {
 			if v, ok := kwArg(args, kwnames, "file"); ok {
@@ -1372,18 +1368,21 @@ func (vm *VM) initBuiltins() {
 }
 
 func (vm *VM) instantiateGenerator(co *CodeObject, callable val.Value, defaults []val.Value, kwDefaults *val.PyDict, callerStack []val.Value, argBase int, nargs int, kwnames []val.Value, globals *val.PyDict) val.Value {
-	maxStack := max(co.MaxStackSize, co.NumLocals+16)
+	need := max(256, co.NumLocals+co.MaxStackSize+64)
+	genStack, poolCls := vm.acquireGeneratorStack(need)
 	var codeVal val.Value
 	if callable.IsFunction() {
 		codeVal = callable.AsFunction().Code
 	} else {
 		codeVal = callable
 	}
-	genVal := val.NewGeneratorVal(co.Name, codeVal, maxStack, nil, globals)
+	genVal := val.NewGeneratorWithStack(co.Name, codeVal, genStack, poolCls, nil, globals)
 	gen := genVal.AsGenerator()
 	spAfterBind := vm.bindFunctionArgsToSlice(co, defaults, kwDefaults, gen.Stack, callerStack[argBase:argBase+nargs], kwnames)
 	gen.SP = spAfterBind
-	gen.Cells = vm.setupCalleeCellsSlice(co, callable, gen.Stack, 0, nargs)
+	if len(co.CellVars) > 0 || len(co.FreeVars) > 0 {
+		gen.Cells, gen.CellPtrs = vm.setupCalleeCellsAndPtrs(co, callable, gen.Stack, 0, nargs)
+	}
 	gen.ResumeHook = vm.resumeGenerator
 	return genVal
 }
@@ -1505,29 +1504,24 @@ func (vm *VM) bindFunctionArgsToSlice(co *CodeObject, defaults []val.Value, kwDe
 	numParams := co.NumParams
 	numLocals := max(co.NumLocals, numParams)
 	nargs := len(src)
+	if len(kwnames) == 0 && co.SimplePositionalOnly && nargs == co.PositionalParamCount &&
+		len(defaults) == 0 && kwDefaults == nil {
+		if nargs <= len(dst) {
+			copy(dst[:nargs], src)
+		} else {
+			copy(dst, src[:len(dst)])
+		}
+		return numLocals
+	}
+	if !co.ParamShapeComputed {
+		co.computeParamShape()
+	}
 
 	paramNames := co.ParamNames
-	varKWIdx := -1
-	varArgsIdx := -1
-	posParamCount := 0
+	varKWIdx := co.VarKWIdx
+	varArgsIdx := co.VarArgsIdx
+	posParamCount := co.PosParamCount
 	kwOnlyCount := co.KWOnlyArgCount
-	for p := range paramNames {
-		pn := paramNames[p]
-		switch {
-		case pn.StringStartsWithTwoBytes('*', '*'):
-			varKWIdx = p
-		case pn.StringHasBytePrefix('*'):
-			if !pn.StringEquals("*") {
-				varArgsIdx = p
-			}
-		default:
-			posParamCount++
-		}
-	}
-	if len(paramNames) == 0 && numParams > 0 {
-		posParamCount = numParams
-	}
-	posParamCount -= kwOnlyCount
 
 	if len(kwnames) == 0 && kwOnlyCount == 0 && kwDefaults == nil {
 		minPos := posParamCount - len(defaults)
@@ -1766,9 +1760,11 @@ func (vm *VM) resumeGenerator(ctx *val.ExecContext, gen *val.PyGenerator, sentVa
 		return res, val.IterYielded
 	}
 	if gen.State == val.GenClosed && (vm.unhandledException.IsNone() || vm.unhandledException.HeaderPtr() == nil) {
+		vm.releaseGeneratorStack(gen)
 		return gen.RetVal, val.IterExhausted
 	}
 	if !vm.unhandledException.IsNone() && vm.unhandledException.HeaderPtr() != nil {
+		vm.releaseGeneratorStack(gen)
 		exc := vm.unhandledException
 		vm.unhandledException = val.NoneVal()
 		if ctx != nil {
@@ -1879,6 +1875,7 @@ func (vm *VM) joinGenerator(ctx *val.ExecContext, sep string, gen *val.PyGenerat
 		return val.NoneVal(), false
 	}
 	if gen.State == val.GenClosed && (vm.unhandledException.IsNone() || vm.unhandledException.HeaderPtr() == nil) {
+		vm.releaseGeneratorStack(gen)
 		if vm.joinErrMsg != "" {
 			if ctx != nil {
 				ctx.Raise(val.NewTypeError(vm.joinErrMsg))
@@ -1936,6 +1933,11 @@ func (vm *VM) inlineDunderCompare(dunder val.Value, newBase, retSP int, cmpLeft,
 	saved.cache = st.cache
 	saved.excStackLen = len(vm.excStack)
 	saved.stackIsVM = st.stackIsVM
+	saved.stack = st.stack
+	saved.activeGen = st.activeGen
+	saved.genFrameIdx = st.genFrameIdx
+	saved.genForIter = false
+	saved.genYieldFrom = false
 	saved.initInstance = val.Value{}
 	saved.cmpLeft = cmpLeft
 	saved.cmpRight = cmpRight
@@ -2103,6 +2105,11 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 			}
 		}
 
+		if st.activeGen != nil && st.frameIdx == st.genFrameIdx {
+			st.activeGen.State = val.GenClosed
+			vm.releaseGeneratorStack(st.activeGen)
+		}
+
 		if st.frameIdx > st.startFrameIdx {
 			if curShadow := vm.frames[st.frameIdx].shadowFrame; curShadow != nil {
 				curShadow.Detach()
@@ -2113,6 +2120,21 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 			caller := &vm.frames[st.frameIdx]
 			if len(vm.excStack) > caller.excStackLen {
 				vm.excStack = vm.excStack[:caller.excStackLen]
+			}
+			callerIP := caller.ip - 1
+			if caller.genYieldFrom {
+				callerIP = caller.ip
+			}
+			if caller.genForIter || caller.genYieldFrom {
+				st.stack = caller.stack
+				st.stackIsVM = caller.stackIsVM
+				vm.execCtx.Stack = caller.stack
+				st.activeGen = caller.activeGen
+				st.genFrameIdx = caller.genFrameIdx
+				caller.genForIter = false
+				caller.genYieldFrom = false
+				caller.stack = nil
+				caller.activeGen = nil
 			}
 			st.curCO = caller.co
 			st.codePtr = caller.codePtr
@@ -2126,7 +2148,6 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 			st.globals = caller.globals
 			st.curLocals = caller.locals
 			st.cache = caller.cache
-			callerIP := caller.ip - 1
 			ip = callerIP
 
 			if caller.co != nil {
@@ -2149,6 +2170,7 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 		vm.lastException = exc
 		if st.activeGen != nil {
 			st.activeGen.State = val.GenClosed
+			vm.releaseGeneratorStack(st.activeGen)
 		}
 		if st.activeCoro != nil {
 			st.activeCoro.State = val.CoroClosed
@@ -2267,6 +2289,18 @@ func (vm *VM) runFrame(co *CodeObject, startBase int, startSP int, startFrameIdx
 	savedActiveFrameIdx := vm.activeFrameIdx
 	st := vm.acquireLoopState()
 	defer func() {
+		if st.frameIdx > vm.maxFrameIdx {
+			vm.maxFrameIdx = st.frameIdx
+		}
+		if st.stackIsVM {
+			hw := st.base + 256
+			if st.curCO != nil && st.curCO.NumLocals+st.curCO.MaxStackSize > 256 {
+				hw = st.base + st.curCO.NumLocals + st.curCO.MaxStackSize
+			}
+			if hw > vm.maxSP {
+				vm.maxSP = hw
+			}
+		}
 		if wasVMStack {
 			vm.execCtx.Stack = vm.stack
 		} else {
@@ -2288,10 +2322,15 @@ func (vm *VM) runFrame(co *CodeObject, startBase int, startSP int, startFrameIdx
 		ip = activeCoro.IP
 	}
 	var cellPtrs []*val.PyCell
-	if len(startCells) > 0 {
+	if activeGen != nil && len(activeGen.CellPtrs) == len(startCells) {
+		cellPtrs = activeGen.CellPtrs
+	} else if len(startCells) > 0 {
 		cellPtrs = make([]*val.PyCell, len(startCells))
 		for i, c := range startCells {
 			cellPtrs[i] = c.AsCell()
+		}
+		if activeGen != nil {
+			activeGen.CellPtrs = cellPtrs
 		}
 	}
 	globals := startGlobals
@@ -2303,6 +2342,13 @@ func (vm *VM) runFrame(co *CodeObject, startBase int, startSP int, startFrameIdx
 	st.consts = co.Consts
 	st.frameIdx = startFrameIdx
 	st.startFrameIdx = startFrameIdx
+	st.genFrameIdx = -1
+	if activeGen != nil {
+		st.genFrameIdx = startFrameIdx
+	}
+	if startFrameIdx > vm.maxFrameIdx {
+		vm.maxFrameIdx = startFrameIdx
+	}
 	st.base = startBase
 	st.cells = startCells
 	st.cellPtrs = cellPtrs
@@ -2569,86 +2615,28 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 			ip = target
 			continue
 		case OP_CALL:
+			ip, sp, ctl = vm.opCallSlow(st, inst, ip, sp)
+		case OP_CALL_PY_EXACT_ARGS:
 			argc := int(uint8(inst >> 16))
-			bx := int(uint16(inst))
-			var target val.Value
-			var newBase int
-			var retSP int
-			var cTarget val.Value
-			if bx < len(st.consts) {
-				cTarget = *(*val.Value)(unsafe.Add(constsPtr, uintptr(bx)*16))
-			}
-			if ck := cTarget.Kind(); ck == val.KindCode || ck == val.KindFunction || ck == val.KindBuiltinFunc {
-				target = cTarget
-				newBase = sp - argc
-				retSP = newBase
-			} else {
-				target = *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-argc-1)*16))
-				newBase = sp - argc
-				retSP = sp - argc - 1
-			}
-			if target == vm.builtinRange && argc == 1 && (*val.Value)(unsafe.Add(stackPtr, uintptr(newBase)*16)).IsInt64() {
-				stop := (*val.Value)(unsafe.Add(stackPtr, uintptr(newBase)*16)).AsInt64()
-				if stop >= 0 && stop <= 0x7FFFFFFF {
-					*(*val.Value)(unsafe.Add(stackPtr, uintptr(retSP)*16)) = val.RangeVal(0, int32(stop))
-					sp = retSP + 1
-					ip++
-					continue
-				}
-			}
-			if target == vm.builtinLen && argc == 1 {
-				arg := *(*val.Value)(unsafe.Add(stackPtr, uintptr(newBase)*16))
-				switch arg.Kind() {
-				case val.KindList:
-					*(*val.Value)(unsafe.Add(stackPtr, uintptr(retSP)*16)) = val.Int64Val(int64(len(arg.AsList().Items)))
-					sp = retSP + 1
-					ip++
-					continue
-				case val.KindTuple:
-					*(*val.Value)(unsafe.Add(stackPtr, uintptr(retSP)*16)) = val.Int64Val(int64(len(arg.AsTuple().Items)))
-					sp = retSP + 1
-					ip++
-					continue
-				case val.KindMemoryView:
-					mv := arg.AsMemoryView()
-					if mv.NDim == 1 {
-						*(*val.Value)(unsafe.Add(stackPtr, uintptr(retSP)*16)) = val.Int64Val(int64(mv.Dim0))
-						sp = retSP + 1
-						ip++
-						continue
-					}
-					if mv.NDim == 0 && mv.ItemSize <= 1 {
-						*(*val.Value)(unsafe.Add(stackPtr, uintptr(retSP)*16)) = val.Int64Val(int64(len(mv.Buf)))
-						sp = retSP + 1
-						ip++
-						continue
-					}
-				case val.KindBytes:
-					*(*val.Value)(unsafe.Add(stackPtr, uintptr(retSP)*16)) = val.Int64Val(int64(len(arg.AsBytes().Data)))
-					sp = retSP + 1
-					ip++
-					continue
-				}
-			}
-			if target.IsFunction() && !vm.hasTrackedViews {
+			newBase := sp - argc
+			retSP := newBase - 1
+			target := *(*val.Value)(unsafe.Add(stackPtr, uintptr(retSP)*16))
+			entry := &st.cache.ic[ip]
+			if target == entry.CachedVal && !vm.hasTrackedViews {
 				fn := target.AsFunction()
-				callee := AsCodeObject(fn.Code)
-				st.periodicTick++
-				if (st.periodicTick&0xFF) != 0 &&
-					!callee.IsGenerator && !callee.IsCoroutine &&
-					callee.SimplePositionalOnly && argc == callee.PositionalParamCount &&
-					len(callee.CellVars) == 0 && (len(callee.FreeVars) == 0 || fn.Closure != nil) &&
-					st.frameIdx+2 <= len(vm.frames) &&
-					newBase+max(256, callee.NumLocals+64) <= len(st.stack) &&
-					(len(callee.ExceptionTable) > 0 || atomic.LoadInt32(&callee.IsTier2Optimized) != 0) {
-					pc := st.cache
-					if callee != st.curCO {
-						pc = (*VMCodeCache)(atomic.LoadPointer(&callee.primary))
-					}
-					if pc != nil && pc.owner == vm && atomic.LoadInt32(&callee.StreamGen) == pc.streamGen {
+				cc := entry.CalleeCache
+				if cc != nil && cc.owner == vm && cc.co != nil &&
+					fn.Code.HeaderPtr() == &cc.co.Header &&
+					len(fn.Defaults) == 0 && fn.KwDefaults == nil &&
+					atomic.LoadInt32(&cc.co.StreamGen) == cc.streamGen {
+					callee := cc.co
+					st.periodicTick++
+					if (st.periodicTick&0xFF) != 0 &&
+						st.frameIdx+2 <= len(vm.frames) &&
+						newBase+max(256, callee.NumLocals+64) <= len(st.stack) {
 						pushFn = fn
 						pushCallee = callee
-						pushCache = pc
+						pushCache = cc
 						pushNewBase = newBase
 						pushRetSP = retSP
 						pushTotalArgs = argc
@@ -2657,6 +2645,83 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				}
 			}
 			ip, sp, ctl = vm.opCallSlow(st, inst, ip, sp)
+		case OP_CALL_LEN:
+			target := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
+			if target == vm.builtinLen {
+				arg := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
+				switch arg.Kind() {
+				case val.KindString, val.KindInlineStr:
+					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.Int64Val(int64(arg.StringLen()))
+					sp--
+					ip++
+					continue
+				case val.KindList:
+					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.Int64Val(int64(len(arg.AsList().Items)))
+					sp--
+					ip++
+					continue
+				case val.KindTuple:
+					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.Int64Val(int64(len(arg.AsTuple().Items)))
+					sp--
+					ip++
+					continue
+				case val.KindDict:
+					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.Int64Val(int64(arg.AsDict().Len()))
+					sp--
+					ip++
+					continue
+				case val.KindSet:
+					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.Int64Val(int64(arg.AsSet().Len()))
+					sp--
+					ip++
+					continue
+				case val.KindBytes:
+					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.Int64Val(int64(len(arg.AsBytes().Data)))
+					sp--
+					ip++
+					continue
+				}
+			}
+			ip, sp, ctl = vm.opCallLenSlow(st, inst, ip, sp)
+		case OP_CALL_ISINSTANCE:
+			target := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-3)*16))
+			if target == vm.builtinIsInstance {
+				cls := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
+				if cls.IsType() {
+					tp := cls.AsType()
+					meta := tp.Header.Type
+					if meta == nil || meta == val.TypeType {
+						obj := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
+						if obj.Type() == tp {
+							*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-3)*16)) = val.BoolVal(true)
+							sp -= 2
+							ip++
+							continue
+						}
+					}
+				}
+			}
+			ip, sp, ctl = vm.opCallIsInstanceSlow(st, inst, ip, sp)
+		case OP_CALL_BUILTIN_FAST:
+			argc := int(uint8(inst >> 16))
+			newBase := sp - argc
+			retSP := newBase - 1
+			target := *(*val.Value)(unsafe.Add(stackPtr, uintptr(retSP)*16))
+			if target == vm.builtinRange && argc == 1 {
+				arg0 := *(*val.Value)(unsafe.Add(stackPtr, uintptr(newBase)*16))
+				if arg0.IsInt64() {
+					stop := arg0.AsInt64()
+					if stop >= 0 && stop <= 0x7FFFFFFF {
+						*(*val.Value)(unsafe.Add(stackPtr, uintptr(retSP)*16)) = val.RangeVal(0, int32(stop))
+						sp = retSP + 1
+						ip++
+						continue
+					}
+				}
+			}
+			ip, sp, ctl = vm.opCallBuiltinFast(st, inst, ip, sp)
+		case OP_CALL_METHOD_DESCR:
+			ip, sp, ctl = vm.opCallMethodDescr(st, inst, ip, sp)
 		case OP_CALL_KW:
 			ip, sp, ctl = vm.opCallKw(st, inst, ip, sp)
 		case OP_LOAD_METHOD:
@@ -2793,7 +2858,7 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 			if retVal.IsString() || retVal.Kind() == val.KindMemoryView {
 				vm.prepareReturnValue(retVal)
 			}
-			if st.frameIdx > st.startFrameIdx && vm.frames[st.frameIdx].shadowFrame == nil {
+			if st.frameIdx > st.startFrameIdx && st.frameIdx != st.genFrameIdx && vm.frames[st.frameIdx].shadowFrame == nil {
 				caller := &vm.frames[st.frameIdx-1]
 				if caller.initInstance.HeaderPtr() == nil && !caller.cmpActive && len(vm.excStack) <= caller.excStackLen && caller.cache != nil {
 					st.frameIdx--
@@ -3170,6 +3235,8 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				}
 			}
 			ip, sp, ctl = vm.opForIterSlow(st, inst, ip, sp)
+		case OP_FOR_ITER_GEN:
+			ip, sp, ctl = vm.opForIterGen(st, inst, ip, sp)
 		case OP_BUILD_LIST:
 			ip, sp, ctl = vm.opBuildList(st, inst, ip, sp)
 		case OP_LIST_APPEND:
@@ -3979,10 +4046,18 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 		saved.cache = st.cache
 		saved.excStackLen = len(vm.excStack)
 		saved.stackIsVM = st.stackIsVM
+		saved.stack = st.stack
+		saved.activeGen = st.activeGen
+		saved.genFrameIdx = st.genFrameIdx
+		saved.genForIter = false
+		saved.genYieldFrom = false
 		saved.initInstance = val.Value{}
 		saved.cmpActive = false
 		st.curLocals = val.NoneVal()
 		st.frameIdx++
+		if st.frameIdx > vm.maxFrameIdx {
+			vm.maxFrameIdx = st.frameIdx
+		}
 		st.curCO = pushCallee
 		st.cache = pushCache
 		codePtr = unsafe.Pointer(unsafe.SliceData(pushCache.active))

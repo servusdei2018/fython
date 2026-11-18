@@ -290,6 +290,10 @@ func (vm *VM) opForIterSlow(st *loopState, inst uint32, ip, sp int) (int, int, l
 		return jumpTarget, sp, ctlReload
 	}
 	if it.IsGenerator() {
+		if vm.activeJoinGen == nil {
+			st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_FOR_ITER_GEN))
+			return vm.pushInlineGenerator(st, it.AsGenerator(), ip, sp, sp, jumpTarget, false, val.NoneVal())
+		}
 		vm.syncActiveFrame(st, ip)
 		vm.execCtx.SP = sp
 		nextVal, status := vm.resumeGenerator(&vm.execCtx, it.AsGenerator(), val.NoneVal())
@@ -767,6 +771,11 @@ func (vm *VM) opFastSelfRecurseSlow(st *loopState, inst uint32, ip, sp int) (int
 				saved.cache = st.cache
 				saved.excStackLen = len(vm.excStack)
 				saved.stackIsVM = st.stackIsVM
+				saved.stack = st.stack
+				saved.activeGen = st.activeGen
+				saved.genFrameIdx = st.genFrameIdx
+				saved.genForIter = false
+				saved.genYieldFrom = false
 				saved.initInstance = val.Value{}
 				saved.cmpActive = false
 				st.curLocals = val.NoneVal()

@@ -35,6 +35,7 @@ type loopState struct {
 	stack         []val.Value
 	activeGen     *val.PyGenerator
 	activeCoro    *val.PyCoroutine
+	genFrameIdx   int
 	stackIsVM     bool
 	periodicTick  uint32
 
@@ -68,28 +69,47 @@ func (vm *VM) releaseLoopState(st *loopState) {
 	}
 }
 
-// syncStackFromVM refreshes st.stack if a VM-stack-backed call grew vm.stack.
+// syncStackFromVM refreshes st.stack if a call grew vm.stack (or vm.execCtx.Stack
+// when executing on a generator/coroutine/nested stack).
 func (st *loopState) syncStackFromVM(vm *VM, curStack []val.Value) []val.Value {
-	if st.stackIsVM && len(curStack) > 0 && len(vm.stack) > 0 && &curStack[0] != &vm.stack[0] {
-		st.stack = vm.stack
-		return vm.stack
+	if st.stackIsVM {
+		if len(curStack) > 0 && len(vm.stack) > 0 && &curStack[0] != &vm.stack[0] {
+			st.stack = vm.stack
+			vm.execCtx.Stack = vm.stack
+			return vm.stack
+		}
+	} else if len(curStack) > 0 && len(vm.execCtx.Stack) > 0 && &curStack[0] != &vm.execCtx.Stack[0] {
+		s := vm.execCtx.Stack
+		st.stack = s
+		switch {
+		case st.activeGen != nil:
+			st.activeGen.Stack = s
+		case st.activeCoro != nil:
+			st.activeCoro.Stack = s
+		}
+		return s
 	}
 	st.stack = curStack
 	return curStack
 }
 
 // syncStackFromExecCtx refreshes st.stack and the active owner slice when a
-// safe call grew vm.execCtx.Stack.
+// safe call grew vm.execCtx.Stack (or vm.stack).
 func (st *loopState) syncStackFromExecCtx(vm *VM, curStack []val.Value) []val.Value {
+	if st.stackIsVM && len(curStack) > 0 && len(vm.stack) > 0 && &curStack[0] != &vm.stack[0] {
+		st.stack = vm.stack
+		vm.execCtx.Stack = vm.stack
+		return vm.stack
+	}
 	if len(curStack) > 0 && len(vm.execCtx.Stack) > 0 && &curStack[0] != &vm.execCtx.Stack[0] {
 		s := vm.execCtx.Stack
 		st.stack = s
 		switch {
-		case st.activeCoro != nil:
-			st.activeCoro.Stack = s
 		case st.activeGen != nil:
 			st.activeGen.Stack = s
-		default:
+		case st.activeCoro != nil:
+			st.activeCoro.Stack = s
+		case st.stackIsVM:
 			vm.stack = s
 		}
 		return s
@@ -107,20 +127,14 @@ func (vm *VM) growStack(st *loopState, curStack []val.Value, minCap int) []val.V
 	st.stack = s
 	vm.execCtx.Stack = s
 	switch {
-	case st.activeCoro != nil:
-		st.activeCoro.Stack = s
 	case st.activeGen != nil:
 		st.activeGen.Stack = s
-	default:
+	case st.activeCoro != nil:
+		st.activeCoro.Stack = s
+	case st.stackIsVM:
 		vm.stack = s
 	}
 	return s
-}
-
-func (st *loopState) setWindow(ptr unsafe.Pointer, length int) unsafe.Pointer {
-	st.codePtr = ptr
-	st.codeLen = length
-	return ptr
 }
 
 func (st *loopState) reloadWindow(vm *VM, co *CodeObject) unsafe.Pointer {
@@ -135,6 +149,12 @@ func (st *loopState) reloadWindow(vm *VM, co *CodeObject) unsafe.Pointer {
 // frames or trigger tracebacks.
 func (vm *VM) syncActiveFrame(st *loopState, ip int) {
 	frameIdx := st.frameIdx
+	if frameIdx > vm.maxFrameIdx {
+		vm.maxFrameIdx = frameIdx
+	}
+	if st.stackIsVM && st.base+256 > vm.maxSP {
+		vm.maxSP = st.base + 256
+	}
 	if frameIdx >= 0 && frameIdx < len(vm.frames) {
 		saved := &vm.frames[frameIdx]
 		saved.co = st.curCO
@@ -150,6 +170,9 @@ func (vm *VM) syncActiveFrame(st *loopState, ip int) {
 		saved.cache = st.cache
 		saved.excStackLen = len(vm.excStack)
 		saved.stackIsVM = st.stackIsVM
+		saved.stack = st.stack
+		saved.activeGen = st.activeGen
+		saved.genFrameIdx = st.genFrameIdx
 		saved.initInstance = val.Value{}
 		saved.cmpActive = false
 		vm.activeFrameIdx = frameIdx

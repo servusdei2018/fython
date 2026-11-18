@@ -55,6 +55,20 @@ func (ctx *ExecContext) ClearException() {
 	}
 }
 
+// ensureStack grows ctx.Stack in place when fewer than minCap slots remain.
+func (ctx *ExecContext) ensureStack(minCap int) {
+	if minCap <= len(ctx.Stack) {
+		return
+	}
+	newCap := len(ctx.Stack) * 2
+	if newCap < minCap {
+		newCap = minCap + 256
+	}
+	ns := make([]Value, newCap)
+	copy(ns, ctx.Stack)
+	ctx.Stack = ns
+}
+
 // Invoke0 invokes callable with 0 arguments.
 func (ctx *ExecContext) Invoke0(callable Value) Value {
 	if callable.IsBuiltinFunc() {
@@ -80,14 +94,19 @@ func (ctx *ExecContext) Invoke0(callable Value) Value {
 
 // Invoke1 invokes callable with 1 positional argument (a) with 0 heap allocations.
 func (ctx *ExecContext) Invoke1(callable, a Value) Value {
-	if ctx != nil && ctx.SP+1 <= len(ctx.Stack) {
-		base := ctx.SP
-		ctx.Stack[base] = a
-		if callable.IsBuiltinFunc() {
-			return callable.AsBuiltinFunc().Fn(ctx, callable, ctx.Stack[base:base+1], nil)
+	if ctx != nil {
+		if ctx.SP+1 > len(ctx.Stack) && ctx.CallHook != nil {
+			ctx.ensureStack(ctx.SP + 1)
 		}
-		if ctx.CallHook != nil {
-			return ctx.CallHook(ctx, callable, base, 1, nil)
+		if ctx.SP+1 <= len(ctx.Stack) {
+			base := ctx.SP
+			ctx.Stack[base] = a
+			if callable.IsBuiltinFunc() {
+				return callable.AsBuiltinFunc().Fn(ctx, callable, ctx.Stack[base:base+1], nil)
+			}
+			if ctx.CallHook != nil {
+				return ctx.CallHook(ctx, callable, base, 1, nil)
+			}
 		}
 	}
 	if !callable.IsBuiltinFunc() && (ctx == nil || ctx.CallHook == nil) && AcquireExecContextHook != nil {
@@ -108,15 +127,20 @@ func (ctx *ExecContext) Invoke1(callable, a Value) Value {
 
 // Invoke2 invokes callable with 2 positional arguments (a, b) with 0 heap allocations.
 func (ctx *ExecContext) Invoke2(callable, a, b Value) Value {
-	if ctx != nil && ctx.SP+2 <= len(ctx.Stack) {
-		base := ctx.SP
-		ctx.Stack[base] = a
-		ctx.Stack[base+1] = b
-		if callable.IsBuiltinFunc() {
-			return callable.AsBuiltinFunc().Fn(ctx, callable, ctx.Stack[base:base+2], nil)
+	if ctx != nil {
+		if ctx.SP+2 > len(ctx.Stack) && ctx.CallHook != nil {
+			ctx.ensureStack(ctx.SP + 2)
 		}
-		if ctx.CallHook != nil {
-			return ctx.CallHook(ctx, callable, base, 2, nil)
+		if ctx.SP+2 <= len(ctx.Stack) {
+			base := ctx.SP
+			ctx.Stack[base] = a
+			ctx.Stack[base+1] = b
+			if callable.IsBuiltinFunc() {
+				return callable.AsBuiltinFunc().Fn(ctx, callable, ctx.Stack[base:base+2], nil)
+			}
+			if ctx.CallHook != nil {
+				return ctx.CallHook(ctx, callable, base, 2, nil)
+			}
 		}
 	}
 	if !callable.IsBuiltinFunc() && (ctx == nil || ctx.CallHook == nil) && AcquireExecContextHook != nil {
@@ -138,16 +162,21 @@ func (ctx *ExecContext) Invoke2(callable, a, b Value) Value {
 
 // Invoke3 invokes callable with 3 positional arguments (a, b, c) with 0 heap allocations.
 func (ctx *ExecContext) Invoke3(callable, a, b, c Value) Value {
-	if ctx != nil && ctx.SP+3 <= len(ctx.Stack) {
-		base := ctx.SP
-		ctx.Stack[base] = a
-		ctx.Stack[base+1] = b
-		ctx.Stack[base+2] = c
-		if callable.IsBuiltinFunc() {
-			return callable.AsBuiltinFunc().Fn(ctx, callable, ctx.Stack[base:base+3], nil)
+	if ctx != nil {
+		if ctx.SP+3 > len(ctx.Stack) && ctx.CallHook != nil {
+			ctx.ensureStack(ctx.SP + 3)
 		}
-		if ctx.CallHook != nil {
-			return ctx.CallHook(ctx, callable, base, 3, nil)
+		if ctx.SP+3 <= len(ctx.Stack) {
+			base := ctx.SP
+			ctx.Stack[base] = a
+			ctx.Stack[base+1] = b
+			ctx.Stack[base+2] = c
+			if callable.IsBuiltinFunc() {
+				return callable.AsBuiltinFunc().Fn(ctx, callable, ctx.Stack[base:base+3], nil)
+			}
+			if ctx.CallHook != nil {
+				return ctx.CallHook(ctx, callable, base, 3, nil)
+			}
 		}
 	}
 	if !callable.IsBuiltinFunc() && (ctx == nil || ctx.CallHook == nil) && AcquireExecContextHook != nil {
@@ -170,7 +199,10 @@ func (ctx *ExecContext) Invoke3(callable, a, b, c Value) Value {
 
 // Call invokes callable with arbitrary positional arguments and keyword names.
 func (ctx *ExecContext) Call(callable Value, args []Value, kwnames []Value) Value {
-	if ctx != nil && ctx.CallHook != nil && ctx.SP+len(args) <= len(ctx.Stack) {
+	if ctx != nil && ctx.CallHook != nil {
+		if ctx.SP+len(args) > len(ctx.Stack) {
+			ctx.ensureStack(ctx.SP + len(args))
+		}
 		base := ctx.SP
 		copy(ctx.Stack[base:], args)
 		return ctx.CallHook(ctx, callable, base, len(args), kwnames)

@@ -1983,12 +1983,12 @@ func formatStringModCtx(ctx *ExecContext, fmtStr string, arg Value) Value {
 			if val.IsAnyString() {
 				rendered = val.AsString()
 			} else {
-				rendered = modConvert(val, PyStr)
+				rendered = modConvert(ctx, val, PyStr)
 			}
 		case 'r':
-			rendered = modConvert(val, PyRepr)
+			rendered = modConvert(ctx, val, PyRepr)
 		case 'a':
-			rendered = asciiEscape(modConvert(val, PyRepr))
+			rendered = asciiEscape(modConvert(ctx, val, PyRepr))
 		case 'd', 'i', 'u':
 			if isAnyInt(val) {
 				rendered = fmt.Sprintf("%"+specifier+"d", toBigInt(val))
@@ -2049,15 +2049,18 @@ func formatStringModCtx(ctx *ExecContext, fmtStr string, arg Value) Value {
 	return NewStringVal(sb.String())
 }
 
-// modConvert renders v with fn, borrowing a VM context when one is
-// available so user-defined __str__ and __repr__ run.
-func modConvert(v Value, fn func(*ExecContext, Value) string) string {
-	if AcquireExecContextHook != nil {
-		ctx, release := AcquireExecContextHook()
-		defer release()
+// modConvert renders v with fn, borrowing a VM context only when no active
+// ExecContext was supplied.
+func modConvert(ctx *ExecContext, v Value, fn func(*ExecContext, Value) string) string {
+	if ctx != nil && ctx.CallHook != nil {
 		return fn(ctx, v)
 	}
-	return fn(nil, v)
+	if AcquireExecContextHook != nil {
+		tmpCtx, release := AcquireExecContextHook()
+		defer release()
+		return fn(tmpCtx, v)
+	}
+	return fn(ctx, v)
 }
 
 // bigFloorDivMod returns Python floor division and modulo for big integers.

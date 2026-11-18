@@ -2,9 +2,222 @@ package vm
 
 import (
 	"fmt"
+	"sync/atomic"
+	"unsafe"
 
 	"github.com/servusdei2018/fython/pkg/val"
 )
+
+func (vm *VM) restoreCallerFrame(st *loopState, caller *CallFrame) {
+	st.curCO = caller.co
+	if caller.cache != nil {
+		st.cache = caller.cache
+	} else {
+		st.cache = vm.cacheFor(st.curCO)
+	}
+	if st.cache != nil && len(st.cache.active) > 0 {
+		st.codePtr = unsafe.Pointer(unsafe.SliceData(st.cache.active))
+		st.codeLen = len(st.cache.active)
+	} else {
+		st.codePtr = caller.codePtr
+		st.codeLen = caller.codeLen
+	}
+	st.consts = caller.consts
+	st.base = caller.baseOffset
+	st.cells = caller.cells
+	st.cellPtrs = caller.cellPtrs
+	st.globals = caller.globals
+	st.curLocals = caller.locals
+	st.stack = caller.stack
+	st.stackIsVM = caller.stackIsVM
+	vm.execCtx.Stack = caller.stack
+	st.activeGen = caller.activeGen
+	st.genFrameIdx = caller.genFrameIdx
+	caller.genForIter = false
+	caller.genYieldFrom = false
+	caller.stack = nil
+	caller.activeGen = nil
+	vm.activeCO = st.curCO
+	vm.activeBaseOffset = st.base
+	vm.activeCells = st.cells
+	vm.activeCellPtrs = st.cellPtrs
+	vm.activeFrameIdx = st.frameIdx
+}
+
+// pushInlineGenerator pushes gen onto vm.frames directly inside the active
+// runLoopWithGlobals without recursing into resumeGenerator/runFrame.
+//
+//go:noinline
+func (vm *VM) pushInlineGenerator(st *loopState, gen *val.PyGenerator, callerIP, callerSP, retSP, jumpTarget int, isYieldFrom bool, sentVal val.Value) (int, int, loopCtl) {
+	switch gen.State {
+	case val.GenClosed:
+		if isYieldFrom {
+			st.stack[callerSP-1] = gen.RetVal
+			return callerIP + 1, callerSP, ctlReload
+		}
+		return jumpTarget, callerSP - 1, ctlNext
+	case val.GenRunning:
+		st.raiseExc = val.NewValueError("generator already executing")
+		return callerIP, callerSP, ctlRaise
+	case val.GenCreated:
+		if !sentVal.IsNone() && sentVal.HeaderPtr() != nil {
+			st.raiseExc = val.NewTypeError("can't send non-None value to a just-started generator")
+			return callerIP, callerSP, ctlRaise
+		}
+	case val.GenSuspended:
+		gen.LastSent = sentVal
+		callee := AsCodeObject(gen.Code)
+		if gen.IP < len(callee.Code) && DecodeOpcode(callee.Code[gen.IP]) != OP_YIELD_FROM {
+			gen.Stack[gen.SP] = sentVal
+			gen.SP++
+		}
+	}
+
+	gen.State = val.GenRunning
+	callee := AsCodeObject(gen.Code)
+	minCap := max(gen.Base+256, gen.Base+callee.NumLocals+callee.MaxStackSize+64)
+	if minCap > len(gen.Stack) {
+		gen.Stack = ensureStack(gen.Stack, minCap)
+	}
+	if len(gen.Cells) > 0 && len(gen.CellPtrs) == 0 {
+		ptrs := make([]*val.PyCell, len(gen.Cells))
+		for i, c := range gen.Cells {
+			ptrs[i] = c.AsCell()
+		}
+		gen.CellPtrs = ptrs
+	}
+
+	if st.frameIdx+2 > len(vm.frames) {
+		vm.ensureFrameCapacity(st.frameIdx + 2)
+	}
+	saved := &vm.frames[st.frameIdx]
+	saved.co = st.curCO
+	saved.codePtr = st.codePtr
+	saved.codeLen = st.codeLen
+	saved.consts = st.consts
+	if isYieldFrom {
+		saved.ip = callerIP
+	} else {
+		saved.ip = callerIP + 1
+	}
+	saved.baseOffset = st.base
+	saved.retSP = retSP
+	saved.cells = st.cells
+	saved.cellPtrs = st.cellPtrs
+	saved.globals = st.globals
+	saved.locals = st.curLocals
+	saved.cache = st.cache
+	saved.excStackLen = len(vm.excStack)
+	saved.stackIsVM = st.stackIsVM
+	saved.stack = st.stack
+	saved.activeGen = st.activeGen
+	saved.genFrameIdx = st.genFrameIdx
+	saved.genForIter = !isYieldFrom
+	saved.genYieldFrom = isYieldFrom
+	saved.genExitIP = jumpTarget
+	saved.initInstance = val.Value{}
+	saved.cmpActive = false
+
+	st.curLocals = val.NoneVal()
+	st.frameIdx++
+	if st.frameIdx > vm.maxFrameIdx {
+		vm.maxFrameIdx = st.frameIdx
+	}
+	st.genFrameIdx = st.frameIdx
+	st.activeGen = gen
+	st.stack = gen.Stack
+	st.stackIsVM = false
+	vm.execCtx.Stack = gen.Stack
+	st.curCO = callee
+	st.cache = vm.cacheFor(callee)
+	st.codePtr, st.codeLen = vm.loadWindow(callee, st.cache)
+	if atomic.LoadInt32(&callee.IsTier2Optimized) == 0 {
+		maybeOptimizeCodeObject(vm, callee, st.cache)
+		st.codePtr, st.codeLen = vm.loadWindow(callee, st.cache)
+	}
+	st.consts = callee.Consts
+	st.base = gen.Base
+	st.cells = gen.Cells
+	st.cellPtrs = gen.CellPtrs
+	if gen.Globals != nil {
+		st.globals = gen.Globals
+	} else {
+		st.globals = vm.globals
+	}
+	vm.activeCO = st.curCO
+	vm.activeBaseOffset = st.base
+	vm.activeCells = st.cells
+	vm.activeCellPtrs = st.cellPtrs
+	vm.activeFrameIdx = st.frameIdx
+	return gen.IP, gen.SP, ctlReload
+}
+
+//go:noinline
+func (vm *VM) opForIterGen(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
+	it := st.stack[sp-1]
+	if it.IsGenerator() {
+		jumpTarget := int(uint16(inst))
+		gen := it.AsGenerator()
+		if gen.State == val.GenClosed {
+			return jumpTarget, sp - 1, ctlNext
+		}
+		if vm.activeJoinGen == nil {
+			return vm.pushInlineGenerator(st, gen, ip, sp, sp, jumpTarget, false, val.NoneVal())
+		}
+	}
+	st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_FOR_ITER))
+	return vm.opForIterSlow(st, ReplaceOpcode(inst, OP_FOR_ITER), ip, sp)
+}
+
+func (vm *VM) suspendActiveGen(st *loopState, yieldVal val.Value, resumeIP, resumeSP int) (int, int, loopCtl) {
+	st.activeGen.YieldVal = yieldVal
+	st.activeGen.State = val.GenSuspended
+	st.activeGen.Stack = st.stack
+	st.activeGen.SP = resumeSP
+	st.activeGen.IP = resumeIP
+	for st.frameIdx == st.genFrameIdx && st.frameIdx > st.startFrameIdx {
+		if curShadow := vm.frames[st.frameIdx].shadowFrame; curShadow != nil {
+			curShadow.Detach()
+			vm.frames[st.frameIdx].shadowFrame = nil
+		}
+		st.frameIdx--
+		caller := &vm.frames[st.frameIdx]
+		if len(vm.excStack) > caller.excStackLen {
+			vm.excStack = vm.excStack[:caller.excStackLen]
+		}
+		if caller.genForIter {
+			retSP := caller.retSP
+			callerIP := caller.ip
+			vm.restoreCallerFrame(st, caller)
+			st.stack[retSP] = yieldVal
+			return callerIP, retSP + 1, ctlReload
+		}
+		if caller.genYieldFrom {
+			retSP := caller.retSP
+			callerIP := caller.ip
+			vm.restoreCallerFrame(st, caller)
+			if st.activeGen != nil {
+				st.activeGen.YieldVal = yieldVal
+				st.activeGen.State = val.GenSuspended
+				st.activeGen.Stack = st.stack
+				st.activeGen.SP = retSP
+				st.activeGen.IP = callerIP
+				continue
+			}
+			if st.activeCoro != nil {
+				st.activeCoro.YieldVal = yieldVal
+				st.activeCoro.State = val.CoroSuspended
+				st.activeCoro.SP = retSP
+				st.activeCoro.IP = callerIP
+				st.result = yieldVal
+				return callerIP, retSP, ctlExit
+			}
+		}
+		break
+	}
+	st.result = yieldVal
+	return resumeIP, resumeSP, ctlExit
+}
 
 //go:noinline
 func (vm *VM) opYieldValue(st *loopState, ip, sp int) (int, int, loopCtl) {
@@ -19,12 +232,7 @@ func (vm *VM) opYieldValue(st *loopState, ip, sp int) (int, int, loopCtl) {
 			ip++
 			return ip, sp, ctlNext
 		}
-		st.activeGen.YieldVal = yieldVal
-		st.activeGen.State = val.GenSuspended
-		st.activeGen.SP = sp
-		st.activeGen.IP = ip + 1
-		st.result = yieldVal
-		return ip, sp, ctlExit
+		return vm.suspendActiveGen(st, yieldVal, ip+1, sp)
 	}
 	ip++
 	return ip, sp, ctlNext
@@ -87,6 +295,9 @@ func (vm *VM) opYieldFrom(st *loopState, ip, sp int) (int, int, loopCtl) {
 		ip++
 		return ip, sp, ctlReload
 	}
+	if subiter.IsGenerator() && vm.activeJoinGen == nil {
+		return vm.pushInlineGenerator(st, subiter.AsGenerator(), ip, sp, sp, 0, true, sentVal)
+	}
 	var nextVal val.Value
 	var status val.IterStatus
 	if subiter.IsGenerator() {
@@ -103,12 +314,7 @@ func (vm *VM) opYieldFrom(st *loopState, ip, sp int) (int, int, loopCtl) {
 	switch {
 	case status == val.IterYielded:
 		if st.activeGen != nil {
-			st.activeGen.YieldVal = nextVal
-			st.activeGen.State = val.GenSuspended
-			st.activeGen.SP = sp
-			st.activeGen.IP = ip
-			st.result = nextVal
-			return ip, sp, ctlExit
+			return vm.suspendActiveGen(st, nextVal, ip, sp)
 		}
 		if st.activeCoro != nil {
 			st.activeCoro.YieldVal = nextVal

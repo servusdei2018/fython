@@ -103,6 +103,22 @@ func initFunctoolsTypes() {
 				return val.NoneVal()
 			}
 			part := (*pyPartial)(unsafe.Pointer(args[0].HeaderPtr()))
+			if part.Keywords == nil && len(kwnames) == 0 {
+				if len(part.Args) == 0 {
+					return ctx.Call(part.Target, args[1:], nil)
+				}
+				var stackBuf [16]val.Value
+				total := len(part.Args) + len(args) - 1
+				var mergedArgs []val.Value
+				if total <= len(stackBuf) {
+					mergedArgs = stackBuf[:total]
+				} else {
+					mergedArgs = make([]val.Value, total)
+				}
+				copy(mergedArgs, part.Args)
+				copy(mergedArgs[len(part.Args):], args[1:])
+				return ctx.Call(part.Target, mergedArgs, nil)
+			}
 			kwStart := len(args) - len(kwnames)
 			posCall := args[1:kwStart]
 			kwCallVals := args[kwStart:]

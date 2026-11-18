@@ -95,6 +95,9 @@ var (
 
 // NewTupleVal constructs a heap-allocated KindTuple Value wrapping items.
 func NewTupleVal(items ...Value) Value {
+	if len(items) == 0 && TupleType != nil {
+		return EmptyTupleVal()
+	}
 	obj := &PyTuple{
 		Header: ObjectHeader{
 			Kind: KindTuple,
@@ -661,7 +664,10 @@ func functionTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Va
 	if callable.IsType() && callable.AsType() == FunctionType {
 		return newFunctionFromArgs(args, kwnames)
 	}
-	if ctx != nil && ctx.CallHook != nil && ctx.SP+len(args) <= len(ctx.Stack) {
+	if ctx != nil && ctx.CallHook != nil {
+		if ctx.SP+len(args) > len(ctx.Stack) {
+			ctx.ensureStack(ctx.SP + len(args))
+		}
 		base := ctx.SP
 		copy(ctx.Stack[base:base+len(args)], args)
 		return ctx.CallHook(ctx, callable, base, len(args), kwnames)
@@ -1155,17 +1161,30 @@ func typeTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value)
 
 	var inst Value
 	if cls.dunderNew.ptr != nil {
-		newArgs := make([]Value, 1+len(args))
-		newArgs[0] = callable
-		copy(newArgs[1:], args)
-		if ctx != nil && ctx.CallHook != nil && ctx.SP+len(newArgs) <= len(ctx.Stack) {
+		totalNewArgs := 1 + len(args)
+		switch {
+		case ctx != nil && ctx.CallHook != nil:
+			if ctx.SP+totalNewArgs > len(ctx.Stack) {
+				ctx.ensureStack(ctx.SP + totalNewArgs)
+			}
 			base := ctx.SP
-			copy(ctx.Stack[base:base+len(newArgs)], newArgs)
-			inst = ctx.CallHook(ctx, cls.dunderNew, base, len(newArgs), kwnames)
-		} else if cls.dunderNew.IsBuiltinFunc() {
-			inst = cls.dunderNew.AsBuiltinFunc().Fn(ctx, cls.dunderNew, newArgs, kwnames)
-		} else if tpCall := cls.dunderNew.Type().Slots.TpCall; tpCall != nil {
-			inst = tpCall(ctx, cls.dunderNew, newArgs, kwnames)
+			ctx.Stack[base] = callable
+			copy(ctx.Stack[base+1:base+totalNewArgs], args)
+			inst = ctx.CallHook(ctx, cls.dunderNew, base, totalNewArgs, kwnames)
+		case cls.dunderNew.IsBuiltinFunc() && totalNewArgs <= 16:
+			var argBuf [16]Value
+			argBuf[0] = callable
+			copy(argBuf[1:], args)
+			inst = cls.dunderNew.AsBuiltinFunc().Fn(ctx, cls.dunderNew, argBuf[:totalNewArgs], kwnames)
+		default:
+			newArgs := make([]Value, totalNewArgs)
+			newArgs[0] = callable
+			copy(newArgs[1:], args)
+			if cls.dunderNew.IsBuiltinFunc() {
+				inst = cls.dunderNew.AsBuiltinFunc().Fn(ctx, cls.dunderNew, newArgs, kwnames)
+			} else if tpCall := cls.dunderNew.Type().Slots.TpCall; tpCall != nil {
+				inst = tpCall(ctx, cls.dunderNew, newArgs, kwnames)
+			}
 		}
 	} else {
 		inst = NewInstanceOfType(cls)
@@ -1199,17 +1218,30 @@ func typeTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value)
 		}
 		if cls.HasInit() {
 			initFn := cls.DunderInitVal()
-			buf := make([]Value, 1+len(args))
-			buf[0] = inst
-			copy(buf[1:], args)
-			if initFn.IsBuiltinFunc() {
-				initFn.AsBuiltinFunc().Fn(ctx, initFn, buf, kwnames)
-			} else if ctx != nil && ctx.CallHook != nil && ctx.SP+len(buf) <= len(ctx.Stack) {
+			totalInitArgs := 1 + len(args)
+			switch {
+			case initFn.IsBuiltinFunc() && totalInitArgs <= 16:
+				var argBuf [16]Value
+				argBuf[0] = inst
+				copy(argBuf[1:], args)
+				initFn.AsBuiltinFunc().Fn(ctx, initFn, argBuf[:totalInitArgs], kwnames)
+			case ctx != nil && ctx.CallHook != nil:
+				if ctx.SP+totalInitArgs > len(ctx.Stack) {
+					ctx.ensureStack(ctx.SP + totalInitArgs)
+				}
 				base := ctx.SP
-				copy(ctx.Stack[base:base+len(buf)], buf)
-				ctx.CallHook(ctx, initFn, base, len(buf), kwnames)
-			} else if tpCall := initFn.Type().Slots.TpCall; tpCall != nil {
-				tpCall(ctx, initFn, buf, kwnames)
+				ctx.Stack[base] = inst
+				copy(ctx.Stack[base+1:base+totalInitArgs], args)
+				ctx.CallHook(ctx, initFn, base, totalInitArgs, kwnames)
+			default:
+				buf := make([]Value, totalInitArgs)
+				buf[0] = inst
+				copy(buf[1:], args)
+				if initFn.IsBuiltinFunc() {
+					initFn.AsBuiltinFunc().Fn(ctx, initFn, buf, kwnames)
+				} else if tpCall := initFn.Type().Slots.TpCall; tpCall != nil {
+					tpCall(ctx, initFn, buf, kwnames)
+				}
 			}
 		}
 	}
@@ -5384,6 +5416,7 @@ func initTypes() {
 	}))
 
 	TupleType = MustNewType("tuple", []*PyType{ObjectType}, nil)
+	emptyTuple.Header.Type = TupleType
 	TupleType.Slots.NbAdd = tupleNbAdd
 	TupleType.Slots.NbMul = tupleNbMul
 	TupleType.Slots.SqLen = tupleSqLen

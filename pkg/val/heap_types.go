@@ -361,7 +361,10 @@ type PyGenerator struct {
 	SP         int
 	Base       int
 	IP         int
+	MaxSP      int
+	PoolClass  uint8
 	Cells      []Value
+	CellPtrs   []*PyCell
 	Globals    *PyDict
 	YieldVal   Value
 	RetVal     Value
@@ -1303,18 +1306,24 @@ func NewGeneratorVal(name string, code Value, maxStack int, cells []Value, globa
 	if maxStack < 8 {
 		maxStack = 8
 	}
+	return NewGeneratorWithStack(name, code, make([]Value, maxStack), 255, cells, globals)
+}
+
+// NewGeneratorWithStack constructs a heap-allocated KindGenerator Value using a caller-provided stack slice.
+func NewGeneratorWithStack(name string, code Value, stack []Value, poolClass uint8, cells []Value, globals *PyDict) Value {
 	gen := &PyGenerator{
-		Header:  ObjectHeader{Kind: KindGenerator, Type: GeneratorType},
-		Name:    name,
-		Code:    code,
-		State:   GenCreated,
-		Stack:   make([]Value, maxStack),
-		SP:      0,
-		Base:    0,
-		IP:      0,
-		Cells:   cells,
-		Globals: globals,
-		RetVal:  NoneVal(),
+		Header:    ObjectHeader{Kind: KindGenerator, Type: GeneratorType},
+		Name:      name,
+		Code:      code,
+		State:     GenCreated,
+		Stack:     stack,
+		PoolClass: poolClass,
+		SP:        0,
+		Base:      0,
+		IP:        0,
+		Cells:     cells,
+		Globals:   globals,
+		RetVal:    NoneVal(),
 	}
 	return Value{num: 0, ptr: &gen.Header}
 }

@@ -133,12 +133,30 @@ func (vm *VM) opReturnSlow(st *loopState, ip, sp int, retVal val.Value) (int, in
 		curShadow.Detach()
 		vm.frames[st.frameIdx].shadowFrame = nil
 	}
-	if st.activeGen != nil && st.frameIdx == st.startFrameIdx {
+	if st.activeGen != nil && st.frameIdx == st.genFrameIdx {
 		st.activeGen.RetVal = retVal
 		st.activeGen.State = val.GenClosed
 		st.activeGen.SP = sp
-		st.result = retVal
-		return ip, sp, ctlExit
+		vm.releaseGeneratorStack(st.activeGen)
+		if st.frameIdx == st.startFrameIdx {
+			st.result = retVal
+			return ip, sp, ctlExit
+		}
+		st.frameIdx--
+		caller := &vm.frames[st.frameIdx]
+		if len(vm.excStack) > caller.excStackLen {
+			vm.excStack = vm.excStack[:caller.excStackLen]
+		}
+		wasYieldFrom := caller.genYieldFrom
+		exitIP := caller.genExitIP
+		callerIP := caller.ip
+		retSP := caller.retSP
+		vm.restoreCallerFrame(st, caller)
+		if wasYieldFrom {
+			st.stack[retSP-1] = retVal
+			return callerIP + 1, retSP, ctlReload
+		}
+		return exitIP, retSP - 1, ctlReload
 	}
 	if st.activeCoro != nil && st.frameIdx == st.startFrameIdx {
 		st.activeCoro.RetVal = retVal

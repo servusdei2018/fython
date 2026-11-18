@@ -112,6 +112,11 @@ func (vm *VM) opLoadAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 							saved.cache = st.cache
 							saved.excStackLen = len(vm.excStack)
 							saved.stackIsVM = st.stackIsVM
+							saved.stack = st.stack
+							saved.activeGen = st.activeGen
+							saved.genFrameIdx = st.genFrameIdx
+							saved.genForIter = false
+							saved.genYieldFrom = false
 							saved.initInstance = val.Value{}
 							saved.cmpActive = false
 							st.curLocals = val.NoneVal()

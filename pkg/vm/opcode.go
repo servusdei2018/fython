@@ -196,6 +196,14 @@ const (
 
 	// Memoryview-aware local store (emitted only in functions with slice ops)
 	OP_STORE_FAST_VIEW
+
+	// Quickened call and generator iteration opcodes (Sections 3c, 5a, 5b)
+	OP_CALL_PY_EXACT_ARGS
+	OP_CALL_BUILTIN_FAST
+	OP_CALL_LEN
+	OP_CALL_ISINSTANCE
+	OP_CALL_METHOD_DESCR
+	OP_FOR_ITER_GEN
 )
 
 // Comparison operation codes for OP_COMPARE_OP (passed in ArgA field).
@@ -486,6 +494,18 @@ func (op Opcode) String() string {
 		return "OP_LOAD_FAST_ATTR_MUL_SELF"
 	case OP_STORE_FAST_VIEW:
 		return "OP_STORE_FAST_VIEW"
+	case OP_CALL_PY_EXACT_ARGS:
+		return "OP_CALL_PY_EXACT_ARGS"
+	case OP_CALL_BUILTIN_FAST:
+		return "OP_CALL_BUILTIN_FAST"
+	case OP_CALL_LEN:
+		return "OP_CALL_LEN"
+	case OP_CALL_ISINSTANCE:
+		return "OP_CALL_ISINSTANCE"
+	case OP_CALL_METHOD_DESCR:
+		return "OP_CALL_METHOD_DESCR"
+	case OP_FOR_ITER_GEN:
+		return "OP_FOR_ITER_GEN"
 	default:
 		return "OP_UNKNOWN"
 	}

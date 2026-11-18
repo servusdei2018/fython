@@ -1414,6 +1414,21 @@ func builtinIsInstance(ctx *val.ExecContext, callable val.Value, args []val.Valu
 }
 
 func checkIsInstance(ctx *val.ExecContext, obj, target val.Value) bool {
+	if target.IsType() {
+		tp := target.AsType()
+		meta := tp.Header.Type
+		if meta == nil || meta == val.TypeType {
+			if obj.Type() == tp || val.IsSubclass(obj.Type(), tp) {
+				return true
+			}
+			if obj.IsInstance() {
+				if spoofedCls, ok := obj.AsInstance().GetAttr(nameClass); ok && spoofedCls.IsType() {
+					return val.IsSubclass(spoofedCls.AsType(), tp)
+				}
+			}
+			return false
+		}
+	}
 	if target.IsTuple() {
 		for _, item := range target.AsTuple().Items {
 			if checkIsInstance(ctx, obj, item) {

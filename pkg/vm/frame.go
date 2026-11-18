@@ -43,7 +43,7 @@ type AttrPICEntry struct {
 }
 
 // ICSlot caches [ExpectedShapeID, ExpectedTypeVer, SlotIndex, CachedVal] for O(1)
-// zero-allocation attribute and method lookup in OP_LOAD_ATTR, OP_STORE_ATTR, and OP_LOAD_METHOD.
+// zero-allocation attribute, method, and call lookup.
 // Also caches [ExpectedGlobalsVer, ExpectedBuiltinsVer, CachedVal] for OP_LOAD_GLOBAL.
 type ICSlot struct {
 	ExpectedShapeID     uint32
@@ -52,8 +52,35 @@ type ICSlot struct {
 	ExpectedTypeVer     uint64
 	CodePtr             *uint32
 	CachedVal           val.Value
+	CalleeCache         *VMCodeCache
+	NativeFn            val.VectorcallFunc
 	ExpectedGlobalsVer  uint64
 	ExpectedBuiltinsVer uint64
+}
+
+// KwDefaultFill describes how to populate an omitted parameter slot in a quickened OP_CALL_KW site.
+type KwDefaultFill struct {
+	Slot   uint8
+	DefIdx int8 // >= 0: index into fn.Defaults; -1: use Val (from fn.KwDefaults)
+	Val    val.Value
+}
+
+// KwPICEntry caches a monomorphic/polymorphic OP_CALL_KW parameter binding plan so
+// keyword calls write directly into callee frame slots with 0 heap allocations.
+type KwPICEntry struct {
+	TargetCo      *CodeObject
+	TargetFn      *val.PyFunction
+	TargetType    *val.PyType
+	TypeVersion   uint64
+	DefaultsLen   int
+	HasKwDefaults bool
+	KwDefaultsVer uint64
+	NumLocals     int
+	PosCount      int
+	TotalArgs     int
+	CalleeCache   *VMCodeCache
+	KwSlots       [8]uint8
+	DefaultsFill  []KwDefaultFill
 }
 
 // ExceptionEntry records a protected instruction range and handler target in a static exception table.
@@ -83,6 +110,15 @@ type CallFrame struct {
 	shadowFrame *val.PyFrame
 	excStackLen int
 	stackIsVM   bool
+	// Inline generator linkage (Section 5b). When genForIter or genYieldFrom is
+	// true, the child frame is a generator executing on its own stack slice, and
+	// stack holds the caller's stack slice to restore on yield/return/unwind.
+	stack        []val.Value
+	activeGen    *val.PyGenerator
+	genFrameIdx  int
+	genForIter   bool
+	genYieldFrom bool
+	genExitIP    int
 	// initInstance holds the freshly allocated receiver for an in-loop
 	// __init__ call. When set, OP_RETURN substitutes it for a None
 	// return and raises TypeError otherwise.
@@ -156,6 +192,9 @@ type CodeObject struct {
 	// positional parameters, which lets a call skip argument binding.
 	SimplePositionalOnly bool
 	PositionalParamCount int
+	PosParamCount        int
+	VarArgsIdx           int
+	VarKWIdx             int
 	ParamShapeComputed   bool
 	// stream publishes the instruction slice the VM executes. It is created
 	// together with the code object, before the object is shared between VMs.
@@ -223,8 +262,33 @@ func refreshCode(co *CodeObject, cache *VMCodeCache) []uint32 {
 //
 //go:noinline
 func reloadCode(co *CodeObject, cache *VMCodeCache, gen int32) []uint32 {
+	newStream := co.Active()
+	if cache.privateActive && len(cache.active) == len(newStream) {
+		priv := make([]uint32, len(newStream))
+		copy(priv, newStream)
+		for i, oldInst := range cache.active {
+			switch DecodeOpcode(oldInst) {
+			case OP_CALL_PY_EXACT_ARGS, OP_CALL_BUILTIN_FAST, OP_CALL_LEN, OP_CALL_ISINSTANCE:
+				if DecodeOpcode(priv[i]) == OP_CALL {
+					priv[i] = oldInst
+				}
+			case OP_CALL_METHOD_DESCR:
+				if DecodeOpcode(priv[i]) == OP_CALL_METHOD_PIC {
+					priv[i] = oldInst
+				}
+			case OP_FOR_ITER_GEN:
+				if DecodeOpcode(priv[i]) == OP_FOR_ITER {
+					priv[i] = oldInst
+				}
+			}
+		}
+		cache.active = priv
+		cache.streamGen = gen
+		return cache.active
+	}
 	cache.streamGen = gen
-	cache.active = co.Active()
+	cache.active = newStream
+	cache.privateActive = false
 	return cache.active
 }
 
@@ -280,9 +344,11 @@ type VMCodeCache struct {
 	// owner is the VM this cache belongs to. It lets a code object publish
 	// its cache without carrying a VM pointer of its own.
 	owner     *VM
+	co        *CodeObject
 	ic        []ICSlot
 	methodPIC [][4]val.MethodPICEntry
 	attrPIC   [][4]AttrPICEntry
+	kwPIC     [][2]KwPICEntry
 	// hotness counts how often this VM executed the code object. It is
 	// VM-local, so it never shares a cache line with another VM.
 	hotness uint32
@@ -290,8 +356,35 @@ type VMCodeCache struct {
 	// and streamGen the generation it belongs to. The pair lets the VM pick
 	// up a stream published by the Tier-2 optimizer without loading it on
 	// every frame switch.
-	active    []uint32
-	streamGen int32
+	active        []uint32
+	streamGen     int32
+	privateActive bool
+}
+
+// quickenAt writes a quickened instruction word into this VM's private copy of
+// the instruction stream at ip, lazily cloning active once so shared streams
+// are never mutated across VMs.
+//
+//go:noinline
+func (c *VMCodeCache) quickenAt(ip int, newInst uint32) unsafe.Pointer {
+	if !c.privateActive {
+		priv := make([]uint32, len(c.active))
+		copy(priv, c.active)
+		c.active = priv
+		c.privateActive = true
+	}
+	c.active[ip] = newInst
+	return unsafe.Pointer(unsafe.SliceData(c.active))
+}
+
+// ensureKwPIC lazily allocates the OP_CALL_KW PIC slab for this code object.
+//
+//go:noinline
+func (c *VMCodeCache) ensureKwPIC(codeLen int) [][2]KwPICEntry {
+	if len(c.kwPIC) < codeLen {
+		c.kwPIC = make([][2]KwPICEntry, codeLen)
+	}
+	return c.kwPIC
 }
 
 // codeStream publishes the instruction slice that VMs execute for a code
@@ -414,6 +507,7 @@ type VM struct {
 	builtinRange       val.Value
 	builtinLen         val.Value
 	builtinOpen        val.Value
+	builtinIsInstance  val.Value
 	strScratch         []byte
 	internPool         *val.InternPool
 	execCtx            val.ExecContext
@@ -434,6 +528,9 @@ type VM struct {
 	bindingOSPath      bool
 	coroFreeList       []*val.PyCoroutine
 	loopStatePool      []*loopState
+	genStackPools      [4][][]val.Value
+	maxSP              int
+	maxFrameIdx        int
 	// Continuous join drain state. While activeJoinGen is set, a generator
 	// drained by joinGenerator runs inside a single runLoopWithGlobals
 	// invocation: yields append directly into joinSink instead of
@@ -482,6 +579,8 @@ func (vm *VM) getCodeCacheSlow(co *CodeObject) *VMCodeCache {
 		// The root slabs are only used by the low-level Run() API, so they
 		// are allocated on demand instead of for every VM.
 		cache := &vm.rootCache
+		cache.owner = vm
+		cache.co = co
 		need := DefaultICSlabSize
 		if co != nil && len(co.Code) > need {
 			need = len(co.Code)
@@ -496,6 +595,7 @@ func (vm *VM) getCodeCacheSlow(co *CodeObject) *VMCodeCache {
 			// instruction stream is always fetched anew.
 			cache.streamGen = atomic.LoadInt32(&co.StreamGen)
 			cache.active = co.Active()
+			cache.privateActive = false
 		}
 		return cache
 	}
@@ -507,14 +607,17 @@ func (vm *VM) getCodeCacheSlow(co *CodeObject) *VMCodeCache {
 	}
 	cache := vm.codeCaches[id]
 	if cache == nil {
-		cache = &VMCodeCache{owner: vm}
+		cache = &VMCodeCache{owner: vm, co: co}
 		vm.codeCaches[id] = cache
+	} else if cache.co == nil {
+		cache.co = co
 	}
 	if cache.active == nil {
 		// The generation is read before the stream, so a publication that
 		// happens in between is picked up by the next refresh.
 		cache.streamGen = atomic.LoadInt32(&co.StreamGen)
 		cache.active = co.Active()
+		cache.privateActive = false
 	}
 	if len(cache.ic) < len(co.Code) || len(cache.methodPIC) < len(co.Code) || len(cache.attrPIC) < len(co.Code) {
 		cache.ic = make([]ICSlot, len(co.Code))
@@ -532,15 +635,53 @@ func (vm *VM) Engine() *Engine {
 	return vm.engine
 }
 
+var genStackSizes = [4]int{256, 512, 1024, 2048}
+
+func (vm *VM) acquireGeneratorStack(minSize int) ([]val.Value, uint8) {
+	if minSize <= 256 {
+		minSize = 256
+	}
+	for cls, sz := range genStackSizes {
+		if minSize <= sz {
+			pool := vm.genStackPools[cls]
+			if n := len(pool); n > 0 {
+				s := pool[n-1]
+				vm.genStackPools[cls] = pool[:n-1]
+				return s, uint8(cls)
+			}
+			return make([]val.Value, sz), uint8(cls)
+		}
+	}
+	return make([]val.Value, minSize), 255
+}
+
+func (vm *VM) releaseGeneratorStack(gen *val.PyGenerator) {
+	if gen == nil || gen.Stack == nil {
+		return
+	}
+	s := gen.Stack
+	gen.Stack = nil
+	cls := gen.PoolClass
+	if cls < 4 && len(s) == genStackSizes[cls] && len(vm.genStackPools[cls]) < 128 {
+		clear(s)
+		vm.genStackPools[cls] = append(vm.genStackPools[cls], s)
+	}
+}
+
 // Reset clears the active stack and execution frame state for reuse in Engine's sync.Pool.
 func (vm *VM) Reset() {
-	sp := min(vm.execCtx.SP, len(vm.stack))
-	for i := range sp {
-		vm.stack[i] = val.NoneVal()
+	sp := min(max(vm.maxSP, vm.execCtx.SP), len(vm.stack))
+	if sp > 0 {
+		clear(vm.stack[:sp])
 	}
-	for i := range vm.frames {
-		vm.frames[i].shadowFrame = nil
+	vm.maxSP = 0
+
+	fLimit := min(vm.maxFrameIdx+1, len(vm.frames))
+	if fLimit > 0 {
+		clear(vm.frames[:fLimit])
 	}
+	vm.maxFrameIdx = 0
+
 	vm.execCtx.SP = 0
 	vm.execCtx.Stack = vm.stack
 	vm.execCtx.ClearException()
@@ -551,7 +692,9 @@ func (vm *VM) Reset() {
 	vm.activeCellPtrs = nil
 	vm.lastException = val.NoneVal()
 	vm.unhandledException = val.NoneVal()
-	vm.context = val.NewPyContext()
+	if vm.context == nil || vm.context.Len() > 0 {
+		vm.context = val.NewPyContext()
+	}
 }
 
 // ActiveContext returns the context ContextVar reads and writes on this VM.
@@ -837,7 +980,6 @@ func init() {
 	}
 	val.AcquireExecContextHook = func() (*val.ExecContext, func()) {
 		v := standaloneVMPool.Get().(*VM)
-		v.Reset()
 		return &v.execCtx, func() {
 			v.Reset()
 			standaloneVMPool.Put(v)
@@ -940,18 +1082,38 @@ func (co *CodeObject) computeParamShape() {
 	}
 	co.ParamShapeComputed = true
 	co.PositionalParamCount = 0
+	co.VarArgsIdx = -1
+	co.VarKWIdx = -1
+	posCount := 0
 	simple := co.KWOnlyArgCount == 0 && co.Flags&(CO_VARARGS|CO_VARKEYWORDS) == 0
-	for _, pn := range co.ParamNames {
+	for p, pn := range co.ParamNames {
 		if !pn.IsAnyString() {
 			simple = false
-			break
+			continue
 		}
-		name := pn.AsString()
-		if len(name) > 0 && name[0] == '*' {
+		switch {
+		case pn.StringStartsWithTwoBytes('*', '*'):
+			co.VarKWIdx = p
 			simple = false
-			break
+		case pn.StringHasBytePrefix('*'):
+			simple = false
+			if !pn.StringEquals("*") {
+				co.VarArgsIdx = p
+			}
+		default:
+			posCount++
+			if simple {
+				co.PositionalParamCount++
+			}
 		}
-		co.PositionalParamCount++
 	}
+	if len(co.ParamNames) == 0 && co.NumParams > 0 {
+		posCount = co.NumParams
+	}
+	posCount -= co.KWOnlyArgCount
+	if posCount < 0 {
+		posCount = 0
+	}
+	co.PosParamCount = posCount
 	co.SimplePositionalOnly = simple && co.PositionalParamCount == len(co.ParamNames)
 }

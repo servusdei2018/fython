@@ -74,17 +74,24 @@ func asScanner(v val.Value) *pyScanner {
 }
 
 // bindArgs resolves positional and keyword arguments against names. Missing
-// parameters are left Unbound.
-func bindArgs(fn string, args, kwnames []val.Value, names ...string) []val.Value {
-	out := make([]val.Value, len(names))
-	for i := range out {
+// parameters are left Unbound. Returns a fixed-size value array to avoid heap allocations.
+func bindArgs(fn string, args, kwnames []val.Value, names ...string) [8]val.Value {
+	var out [8]val.Value
+	for i := range names {
 		out[i] = val.UnboundVal()
+	}
+	if len(kwnames) == 0 {
+		if len(args) > len(names) {
+			panic("TypeError: " + fn + "() takes at most " + strconv.Itoa(len(names)) + " arguments (" + strconv.Itoa(len(args)) + " given)")
+		}
+		copy(out[:len(args)], args)
+		return out
 	}
 	npos := len(args) - len(kwnames)
 	if npos > len(names) {
 		panic("TypeError: " + fn + "() takes at most " + strconv.Itoa(len(names)) + " arguments (" + strconv.Itoa(npos) + " given)")
 	}
-	copy(out, args[:npos])
+	copy(out[:npos], args[:npos])
 	for i, kn := range kwnames {
 		name := kn.AsString()
 		idx := -1
@@ -559,7 +566,7 @@ func (p *pyPattern) sub(ctx *val.ExecContext, patVal, repl, strVal, countV val.V
 		switch {
 		case isCallable:
 			mv := newMatch(patVal, p, strVal, in, r, 0, len(in))
-			res := ctx.Call(repl, []val.Value{mv}, nil)
+			res := ctx.Invoke1(repl, mv)
 			out = append(out, p.valueRunes(res)...)
 		case isLiteral:
 			out = append(out, literal...)
