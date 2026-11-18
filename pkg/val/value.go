@@ -630,20 +630,22 @@ func (v Value) AsFloat64() float64 {
 
 // IsTruthy evaluates Python truthiness of v without heap allocation.
 func (v Value) IsTruthy() bool {
-	if v.ptr == &tagBool {
+	if v.ptr == &tagBool || v.ptr == &tagInt64 {
 		return v.num != 0
 	}
-	if v.ptr == &tagInt64 {
-		return v.num != 0
-	}
+	return v.isTruthySlow()
+}
+
+//go:noinline
+func (v Value) isTruthySlow() bool {
 	if v.ptr == &tagNone {
 		return false
 	}
-	if v.ptr == &tagFloat64 {
-		return math.Float64frombits(v.num) != 0.0
-	}
 	if v.ptr == &tagInlineStr {
 		return (v.num & 0xFF) != 0
+	}
+	if v.ptr == &tagFloat64 {
+		return math.Float64frombits(v.num) != 0.0
 	}
 	switch v.ptr.Kind {
 	case KindBigInt:

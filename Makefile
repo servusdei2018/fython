@@ -1,4 +1,4 @@
-.PHONY: all build test lint format clean shim test-extensions
+.PHONY: all build test lint format clean shim test-extensions loop-metrics
 
 export GOTOOLCHAIN ?= go1.27.0
 
@@ -66,3 +66,10 @@ $(EXT_DIR)/fython_testext.abi3.so: $(TEST_EXT_SRC)
 clean:
 	rm -rf $(BIN_DIR) $(SHIM_OUT) $(SHIM_DYLIB) $(SHIM_DLL) $(EXT_DIR)
 	rm -f libfython_abi3.so
+
+loop-metrics: build
+	@go tool objdump -s 'VM..runLoopWithGlobals$$' $(BINARY) > /tmp/fython_loop.asm
+	@grep -m1 'SUBQ' /tmp/fython_loop.asm || true
+	@printf "gcWriteBarrier sites: "; grep -c 'runtime.gcWriteBarrier' /tmp/fython_loop.asm || true
+	@python3 -c 'import re; addrs=[int(m,16) for m in re.findall(r"\t0x([0-9a-f]+)\t", open("/tmp/fython_loop.asm").read())]; print(f"code bytes: {addrs[-1]-addrs[0]}" if addrs else "code bytes: 0")'
+	@rm -f /tmp/fython_loop.asm

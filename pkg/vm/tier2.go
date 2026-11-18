@@ -35,7 +35,7 @@ func maybeOptimizeCodeObject(vm *VM, co *CodeObject, cache *VMCodeCache) {
 		return
 	}
 	if cache == nil {
-		cache = vm.getCodeCache(co)
+		cache = vm.cacheFor(co)
 	}
 	cache.hotness++
 	if cache.hotness >= tier2HotnessThreshold {

@@ -433,6 +433,7 @@ type VM struct {
 	context            *val.PyContext
 	bindingOSPath      bool
 	coroFreeList       []*val.PyCoroutine
+	loopStatePool      []*loopState
 	// Continuous join drain state. While activeJoinGen is set, a generator
 	// drained by joinGenerator runs inside a single runLoopWithGlobals
 	// invocation: yields append directly into joinSink instead of
@@ -464,7 +465,19 @@ func (vm *VM) loadWindow(co *CodeObject, cache *VMCodeCache) (unsafe.Pointer, in
 	return unsafe.Pointer(unsafe.SliceData(stream)), len(stream)
 }
 
-func (vm *VM) getCodeCache(co *CodeObject) *VMCodeCache {
+// cacheFor returns this VM's inline cache for co using a single owner-checked
+// load on the fast path, falling back to getCodeCacheSlow on miss.
+func (vm *VM) cacheFor(co *CodeObject) *VMCodeCache {
+	if co != nil {
+		if pc := (*VMCodeCache)(atomic.LoadPointer(&co.primary)); pc != nil && pc.owner == vm {
+			return pc
+		}
+	}
+	return vm.getCodeCacheSlow(co)
+}
+
+//go:noinline
+func (vm *VM) getCodeCacheSlow(co *CodeObject) *VMCodeCache {
 	if co == nil || co == &vm.rootCO {
 		// The root slabs are only used by the low-level Run() API, so they
 		// are allocated on demand instead of for every VM.
