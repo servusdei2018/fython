@@ -80,7 +80,7 @@ func (vm *VM) pushInlineGenerator(st *loopState, gen *val.PyGenerator, callerIP,
 		gen.Stack = ensureStack(gen.Stack, minCap)
 	}
 	if len(gen.Cells) > 0 && len(gen.CellPtrs) == 0 {
-		ptrs := make([]*val.PyCell, len(gen.Cells))
+		ptrs := vm.acquireGenCellPtrs(len(gen.Cells))
 		for i, c := range gen.Cells {
 			ptrs[i] = c.AsCell()
 		}

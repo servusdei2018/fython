@@ -30,33 +30,59 @@ const (
 	ICKindClassMethod           // Hit on PyType MRO method (CachedVal holds raw callable)
 	ICKindDataDescriptor        // Hit on PyType MRO data descriptor (CachedVal holds descriptor)
 	ICKindProperty              // Hit on a @property whose fget is cached for in-loop dispatch
-	ICKindClassAttr             // Hit on PyType MRO non-descriptor class attribute
+	ICKindClassAttr             // Hit on PyType MRO non-descriptor class attribute (CachedVal holds the value)
 	ICKindGlobal                // Hit on module globals dict
 	ICKindBuiltin               // Hit on builtins dict fallback
 	ICKindModuleAttr            // Hit on module dict
+	ICKindSlotMember            // __slots__ member descriptor: direct read/write of Slots[SlotIndex]
+	ICKindNativeDescr           // Native data descriptor with a Go getter/setter (CachedVal holds descriptor)
+	ICKindClassFunc             // Plain function found on the class: bind to the receiver without an MRO walk
+	ICKindTupleGetter           // namedtuple field: read Items[SlotIndex] of a tuple-kind receiver
+	ICKindTypeAttr              // Receiver is a type; CachedVal holds the already-resolved class attribute
+	ICKindSuperMethod           // super(ThisClass, Self) MRO resolution guarded by selfType + ThisClass versions
+	ICKindPropertySet           // @property setter (CachedVal holds fset) dispatched without descriptor machinery
 )
 
 // AttrPICEntry represents a single slot in a 4-way polymorphic inline cache for attribute access.
+//
+// Shape identifies the concrete type and the absence of any shadowing instance
+// attribute; TypeVer is the low 32 bits of the type version tag, so a data
+// descriptor added to the class later invalidates the entry. Truncation is
+// sound because Shape is compared as well.
 type AttrPICEntry struct {
 	Shape     *val.Shape
-	SlotIndex int
+	SlotIndex int32
+	TypeVer   uint32
 }
 
-// ICSlot caches [ExpectedShapeID, ExpectedTypeVer, SlotIndex, CachedVal] for O(1)
-// zero-allocation attribute, method, and call lookup.
-// Also caches [ExpectedGlobalsVer, ExpectedBuiltinsVer, CachedVal] for OP_LOAD_GLOBAL.
+// ICSlot caches resolved attribute, method, global, and call targets for O(1)
+// lookup. Sized to 64 bytes (one cache line) with pointer fields grouped first
+// to minimize GC pointer-scan work.
 type ICSlot struct {
-	ExpectedShapeID     uint32
-	Kind                ICKind
-	SlotIndex           int
-	ExpectedTypeVer     uint64
-	CodePtr             *uint32
-	CachedVal           val.Value
-	CalleeCache         *VMCodeCache
-	NativeFn            val.VectorcallFunc
-	ExpectedGlobalsVer  uint64
-	ExpectedBuiltinsVer uint64
+	CachedVal   val.Value          // 16 B: cached attr/callable/global/descriptor/fget/fset
+	CalleeCache *VMCodeCache       //  8 B: quickened call target cache
+	NativeFn    val.VectorcallFunc //  8 B: quickened builtin function pointer
+	// ExpectedTypeVer is the full 64-bit primary version tag (type version for
+	// attr/descriptor caches, module dict version for ICKindModuleAttr, or
+	// globals dict version for OP_LOAD_GLOBAL). Entries that skip the shape
+	// guard (data descriptors) rely on version uniqueness across types, so it
+	// must never be truncated.
+	ExpectedTypeVer uint64 //  8 B
+	// ExpectedAuxVer is the full 64-bit secondary version tag (metaclass version
+	// for ICKindTypeAttr, ThisClass version for ICKindSuperMethod, or builtins
+	// dict version for ICKindBuiltin).
+	ExpectedAuxVer  uint64 //  8 B
+	ExpectedShapeID uint32 //  4 B: Shape.ID (when non-data guard is needed)
+	SlotIndex       int32  //  4 B: PyInstance.Slots / PyTuple.Items index or dict slot hint
+	Kind            ICKind //  1 B
 }
+
+var (
+	_ [16 - unsafe.Sizeof(AttrPICEntry{})]byte
+	_ [unsafe.Sizeof(AttrPICEntry{}) - 16]byte
+	_ [64 - unsafe.Sizeof(ICSlot{})]byte
+	_ [unsafe.Sizeof(ICSlot{}) - 64]byte
+)
 
 // KwDefaultFill describes how to populate an omitted parameter slot in a quickened OP_CALL_KW site.
 type KwDefaultFill struct {
@@ -186,6 +212,7 @@ type CodeObject struct {
 	LineSpans        []LineSpanEntry
 	Hotness          int32
 	IsTier2Optimized int32
+	GenStackHint     atomic.Int32
 	// SimplePositionalOnly reports that every parameter of the code object is
 	// a required positional-only parameter: no keyword-only parameter, no
 	// *args and no **kwargs. PositionalParamCount is then the exact number of
@@ -529,6 +556,11 @@ type VM struct {
 	coroFreeList       []*val.PyCoroutine
 	loopStatePool      []*loopState
 	genStackPools      [4][][]val.Value
+	genCellValPools    [8][][]val.Value
+	genCellPtrPools    [8][][]*val.PyCell
+	genResumeHook      func(ctx *val.ExecContext, gen *val.PyGenerator, val val.Value) (val.Value, val.IterStatus)
+	genReleaseHook     func(gen *val.PyGenerator)
+	coroResumeHook     func(ctx *val.ExecContext, coro *val.PyCoroutine, val val.Value) (val.Value, val.IterStatus)
 	maxSP              int
 	maxFrameIdx        int
 	// Continuous join drain state. While activeJoinGen is set, a generator
@@ -538,6 +570,7 @@ type VM struct {
 	// nested invocations isolated.
 	activeJoinGen *val.PyGenerator
 	joinSink      *strings.Builder
+	joinBuf       strings.Builder
 	joinSep       string
 	joinFirst     bool
 	joinCount     int
@@ -647,24 +680,114 @@ func (vm *VM) acquireGeneratorStack(minSize int) ([]val.Value, uint8) {
 			if n := len(pool); n > 0 {
 				s := pool[n-1]
 				vm.genStackPools[cls] = pool[:n-1]
+				recordGenStackPool(true)
 				return s, uint8(cls)
 			}
+			recordGenStackPool(false)
 			return make([]val.Value, sz), uint8(cls)
 		}
 	}
+	recordGenStackPool(false)
 	return make([]val.Value, minSize), 255
 }
 
-func (vm *VM) releaseGeneratorStack(gen *val.PyGenerator) {
-	if gen == nil || gen.Stack == nil {
+func (vm *VM) releaseStackSlice(s []val.Value) {
+	if s == nil {
 		return
 	}
-	s := gen.Stack
-	gen.Stack = nil
-	cls := gen.PoolClass
-	if cls < 4 && len(s) == genStackSizes[cls] && len(vm.genStackPools[cls]) < 128 {
-		clear(s)
-		vm.genStackPools[cls] = append(vm.genStackPools[cls], s)
+	for cls, sz := range genStackSizes {
+		if len(s) == sz {
+			if len(vm.genStackPools[cls]) < 256 {
+				clear(s)
+				vm.genStackPools[cls] = append(vm.genStackPools[cls], s)
+			}
+			return
+		}
+	}
+}
+
+func (vm *VM) releaseGeneratorStack(gen *val.PyGenerator) {
+	if gen == nil {
+		return
+	}
+	if gen.Stack != nil {
+		s := gen.Stack
+		gen.Stack = nil
+		vm.releaseStackSlice(s)
+	}
+	vm.releaseGenCellSlices(gen)
+}
+
+func (vm *VM) releaseCellPtrSlice(p []*val.PyCell) {
+	if n := len(p); n >= 1 && n <= len(vm.genCellPtrPools) && len(vm.genCellPtrPools[n-1]) < 128 {
+		clear(p)
+		vm.genCellPtrPools[n-1] = append(vm.genCellPtrPools[n-1], p)
+	}
+}
+
+func (vm *VM) acquireGenCellSlices(n int) ([]val.Value, []*val.PyCell) {
+	if n <= 0 {
+		return nil, nil
+	}
+	if n <= len(vm.genCellValPools) {
+		idx := n - 1
+		var vals []val.Value
+		if vPool := vm.genCellValPools[idx]; len(vPool) > 0 {
+			vals = vPool[len(vPool)-1]
+			vm.genCellValPools[idx] = vPool[:len(vPool)-1]
+			recordGenCellPool(true)
+		} else {
+			recordGenCellPool(false)
+			vals = make([]val.Value, n)
+		}
+		ptrs := vm.acquireGenCellPtrs(n)
+		return vals, ptrs
+	}
+	recordGenCellPool(false)
+	return make([]val.Value, n), make([]*val.PyCell, n)
+}
+
+func (vm *VM) acquireGenCellPtrs(n int) []*val.PyCell {
+	if n <= 0 {
+		return nil
+	}
+	if n <= len(vm.genCellPtrPools) {
+		idx := n - 1
+		if pPool := vm.genCellPtrPools[idx]; len(pPool) > 0 {
+			ptrs := pPool[len(pPool)-1]
+			vm.genCellPtrPools[idx] = pPool[:len(pPool)-1]
+			recordGenCellPool(true)
+			return ptrs
+		}
+		recordGenCellPool(false)
+		return make([]*val.PyCell, n)
+	}
+	recordGenCellPool(false)
+	return make([]*val.PyCell, n)
+}
+
+func (vm *VM) releaseGenCellSlices(gen *val.PyGenerator) {
+	if !gen.OwnCells {
+		gen.Cells = nil
+		gen.CellPtrs = nil
+		return
+	}
+	gen.OwnCells = false
+	if gen.Cells != nil {
+		c := gen.Cells
+		gen.Cells = nil
+		if n := len(c); n >= 1 && n <= len(vm.genCellValPools) && len(vm.genCellValPools[n-1]) < 128 {
+			clear(c)
+			vm.genCellValPools[n-1] = append(vm.genCellValPools[n-1], c)
+		}
+	}
+	if gen.CellPtrs != nil {
+		p := gen.CellPtrs
+		gen.CellPtrs = nil
+		if n := len(p); n >= 1 && n <= len(vm.genCellPtrPools) && len(vm.genCellPtrPools[n-1]) < 128 {
+			clear(p)
+			vm.genCellPtrPools[n-1] = append(vm.genCellPtrPools[n-1], p)
+		}
 	}
 }
 

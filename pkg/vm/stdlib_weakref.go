@@ -152,6 +152,10 @@ func (e *Engine) createWeakrefCModule() val.Value {
 		refVal := val.NewWeakRefVal(pyRef)
 		registerWeakRef(addr, pyRef)
 
+		if !callback.IsNone() && callback.IsFunction() && callback.AsFunction().Globals != nil {
+			callback.AsFunction().Globals.Shared = true
+		}
+
 		cleanupObj := &weakCleanupData{
 			engine:   e,
 			addr:     addr,
@@ -193,6 +197,9 @@ func (e *Engine) createWeakrefCModule() val.Value {
 		proxyVal := val.NewWeakProxyVal(pyProxy)
 
 		if !callback.IsNone() {
+			if callback.IsFunction() && callback.AsFunction().Globals != nil {
+				callback.AsFunction().Globals.Shared = true
+			}
 			addr := uintptr(unsafe.Pointer(hdr))
 			runtime.AddCleanup(hdr, onWeakProxyCleanup, &weakCleanupData{
 				engine:   e,
@@ -272,6 +279,7 @@ func initWeakrefTypes(e *Engine) {
 			}
 			self := args[0]
 			dataDict := val.NewDictVal(16)
+			dataDict.AsDict().Shared = true
 			val.SetAttrCtx(ctx, self, dataKey, dataDict)
 			if len(args) > 1 && args[1].IsDict() {
 				srcDict := args[1].AsDict()
@@ -421,6 +429,7 @@ func initWeakrefTypes(e *Engine) {
 			}
 			self := args[0]
 			dataDict := val.NewDictVal(16)
+			dataDict.AsDict().Shared = true
 			val.SetAttrCtx(ctx, self, dataKey, dataDict)
 			if len(args) > 1 && args[1].IsDict() {
 				srcDict := args[1].AsDict()
@@ -582,6 +591,7 @@ func initWeakrefTypes(e *Engine) {
 			}
 			self := args[0]
 			dataDict := val.NewDictVal(16)
+			dataDict.AsDict().Shared = true
 			val.SetAttrCtx(ctx, self, dataKey, dataDict)
 			if len(args) > 1 {
 				addFn, _, _ := self.Type().LookupMRO(val.InternString("add"))

@@ -868,8 +868,8 @@ func (vm *VM) opFastAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 							if v.IsInt64() {
 								vi := v.AsInt64()
 								if int64(int32(vi)) == vi {
-									if pic[0].Shape == nil {
-										pic[0] = AttrPICEntry{Shape: instShape, SlotIndex: slotIdx}
+									if pic[0].Shape == nil || pic[0].Shape == instShape {
+										pic[0] = AttrPICEntry{Shape: instShape, SlotIndex: int32(slotIdx), TypeVer: uint32(instType.Version())}
 									}
 									stack[sp] = val.Int64Val(vi * vi)
 									return ip + 5, sp + 1, ctlNext
@@ -891,8 +891,8 @@ func (vm *VM) opFastAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 						if uint(slotIdx) < uint(len(instObj.Slots)) {
 							v := instObj.Slots[slotIdx]
 							if !v.IsUnbound() {
-								if pic[0].Shape == nil {
-									pic[0] = AttrPICEntry{Shape: instShape, SlotIndex: slotIdx}
+								if pic[0].Shape == nil || pic[0].Shape == instShape {
+									pic[0] = AttrPICEntry{Shape: instShape, SlotIndex: int32(slotIdx), TypeVer: uint32(instType.Version())}
 								}
 								stack[sp] = v
 								return ip + 2, sp + 1, ctlNext
@@ -914,8 +914,8 @@ func (vm *VM) opFastAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 						if _, _, foundInClass := instType.LookupMRO(st.consts[uint16(inst)]); !foundInClass {
 							if uint(slotIdx) < uint(len(instObj.Slots)) {
 								instObj.Slots[slotIdx] = v
-								if pic[0].Shape == nil {
-									pic[0] = AttrPICEntry{Shape: instShape, SlotIndex: slotIdx}
+								if pic[0].Shape == nil || pic[0].Shape == instShape {
+									pic[0] = AttrPICEntry{Shape: instShape, SlotIndex: int32(slotIdx), TypeVer: uint32(instType.Version())}
 								}
 								return ip + 2, sp - 1, ctlNext
 							}

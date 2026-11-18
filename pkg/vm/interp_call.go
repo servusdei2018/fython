@@ -191,7 +191,7 @@ func buildKwPICEntry(
 	hasKwDef, kwDefVer := kwDefaultsVersion(kwDefaults)
 	var typeVer uint64
 	if tp != nil {
-		typeVer = tp.VersionTag
+		typeVer = tp.Version()
 	}
 	numLocals := max(callee.NumLocals, callee.NumParams)
 	return KwPICEntry{
@@ -442,7 +442,7 @@ unwrapKw:
 							pic := &st.cache.kwPIC[ip]
 							for k := range 2 {
 								e := &pic[k]
-								if e.TargetType == tp && e.TypeVersion == tp.VersionTag &&
+								if e.TargetType == tp && e.TypeVersion == tp.Version() &&
 									e.TargetCo == callee && e.TargetFn == initFunc &&
 									e.PosCount == initPosCount && e.TotalArgs == totalInitArgs && e.DefaultsLen == len(initFunc.Defaults) &&
 									e.CalleeCache != nil && e.CalleeCache.owner == vm &&
@@ -1644,19 +1644,19 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 		var nativeFn val.VectorcallFunc
 		var targetVal val.Value
 		switch {
-		case pic[0].Shape == instShape && instType.VersionTag == pic[0].TypeVersion:
+		case pic[0].Shape == instShape && instType.Version() == pic[0].TypeVersion:
 			targetFn = pic[0].TargetFn
 			nativeFn = pic[0].NativeFn
 			targetVal = pic[0].TargetVal
-		case pic[1].Shape == instShape && instType.VersionTag == pic[1].TypeVersion:
+		case pic[1].Shape == instShape && instType.Version() == pic[1].TypeVersion:
 			targetFn = pic[1].TargetFn
 			nativeFn = pic[1].NativeFn
 			targetVal = pic[1].TargetVal
-		case pic[2].Shape == instShape && instType.VersionTag == pic[2].TypeVersion:
+		case pic[2].Shape == instShape && instType.Version() == pic[2].TypeVersion:
 			targetFn = pic[2].TargetFn
 			nativeFn = pic[2].NativeFn
 			targetVal = pic[2].TargetVal
-		case pic[3].Shape == instShape && instType.VersionTag == pic[3].TypeVersion:
+		case pic[3].Shape == instShape && instType.Version() == pic[3].TypeVersion:
 			targetFn = pic[3].TargetFn
 			nativeFn = pic[3].NativeFn
 			targetVal = pic[3].TargetVal

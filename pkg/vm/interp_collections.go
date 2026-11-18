@@ -702,15 +702,15 @@ func (vm *VM) opBuildMap(st *loopState, inst uint32, ip, sp int) (int, int, loop
 func (vm *VM) opBuildTuple(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
 	count := int(uint16(inst))
-	items := make([]val.Value, count)
-	copy(items, stack[sp-count:sp])
-	for i := range items {
-		val.DetachStringBuf(items[i])
-		markViewEscaped(items[i])
+	if count == 0 {
+		stack[sp] = val.EmptyTupleVal()
+		return ip + 1, sp + 1, ctlNext
 	}
-	sp -= count
-	stack[sp] = val.NewTupleVal(items...)
-	sp++
-	ip++
-	return ip, sp, ctlNext
+	base := sp - count
+	for i := base; i < sp; i++ {
+		val.DetachStringBuf(stack[i])
+		markViewEscaped(stack[i])
+	}
+	stack[base] = val.NewTupleFromSlice(stack[base:sp])
+	return ip + 1, base + 1, ctlNext
 }

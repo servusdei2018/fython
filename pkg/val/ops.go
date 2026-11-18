@@ -546,6 +546,44 @@ const (
 
 // RichCompare performs complete Python 3 rich comparisons (a <op> b)
 // with subclass reflected precedence and NotImplemented fallback.
+func getCompareDunder(tp *PyType, operation uint8) Value {
+	if tp == nil {
+		return Value{}
+	}
+	switch operation {
+	case CmpLT:
+		return tp.dunderLt
+	case CmpLTE:
+		return tp.dunderLe
+	case CmpEQ:
+		return tp.dunderEq
+	case CmpNEQ:
+		return tp.dunderNe
+	case CmpGT:
+		return tp.dunderGt
+	case CmpGTE:
+		return tp.dunderGe
+	}
+	return Value{}
+}
+
+func invokeCompareDunder(ctx *ExecContext, fn, self, other Value, tp *PyType) Value {
+	if fn.IsFunction() {
+		return ctx.Invoke2(fn, self, other)
+	}
+	if fn.IsBuiltinFunc() {
+		if fn.AsBuiltinFunc().NoBind {
+			return ctx.Invoke1(fn, other)
+		}
+		return ctx.Invoke2(fn, self, other)
+	}
+	if descrGet := fn.Type().Slots.TpDescrGet; descrGet != nil {
+		bound := descrGet(ctx, fn, self, tp)
+		return ctx.Invoke1(bound, other)
+	}
+	return ctx.Invoke2(fn, self, other)
+}
+
 func RichCompare(ctx *ExecContext, a, b Value, op uint8) Value {
 	// Fast path for identical integers
 	if a.ptr == &tagInt64 && b.ptr == &tagInt64 {
@@ -639,41 +677,12 @@ func RichCompare(ctx *ExecContext, a, b Value, op uint8) Value {
 		reflectedOp = CmpLTE
 	}
 
-	getOpDunder := func(tp *PyType, operation uint8) Value {
-		if tp == nil {
-			return Value{}
-		}
-		switch operation {
-		case CmpLT:
-			return tp.dunderLt
-		case CmpLTE:
-			return tp.dunderLe
-		case CmpEQ:
-			return tp.dunderEq
-		case CmpNEQ:
-			return tp.dunderNe
-		case CmpGT:
-			return tp.dunderGt
-		case CmpGTE:
-			return tp.dunderGe
-		}
-		return Value{}
-	}
-
-	invokeDunder := func(fn, self, other Value, tp *PyType) Value {
-		if descrGet := fn.Type().Slots.TpDescrGet; descrGet != nil {
-			bound := descrGet(ctx, fn, self, tp)
-			return ctx.Invoke1(bound, other)
-		}
-		return ctx.Invoke2(fn, self, other)
-	}
-
 	isStrictSub := aType != bType && IsSubclass(bType, aType)
 
 	// 1. If b is a strict subclass of a and defines the reflected comparison, try b first!
 	if isStrictSub {
-		if rFn := getOpDunder(bType, reflectedOp); rFn.ptr != nil {
-			res := invokeDunder(rFn, b, a, bType)
+		if rFn := getCompareDunder(bType, reflectedOp); rFn.ptr != nil {
+			res := invokeCompareDunder(ctx, rFn, b, a, bType)
 			if !res.IsNotImplemented() {
 				return res
 			}
@@ -681,8 +690,8 @@ func RichCompare(ctx *ExecContext, a, b Value, op uint8) Value {
 	}
 
 	// 2. Try a's comparison operator
-	if fn := getOpDunder(aType, op); fn.ptr != nil {
-		res := invokeDunder(fn, a, b, aType)
+	if fn := getCompareDunder(aType, op); fn.ptr != nil {
+		res := invokeCompareDunder(ctx, fn, a, b, aType)
 		if !res.IsNotImplemented() {
 			return res
 		}
@@ -690,8 +699,8 @@ func RichCompare(ctx *ExecContext, a, b Value, op uint8) Value {
 
 	// 3. Try b's reflected comparison operator (if not tried already)
 	if !isStrictSub {
-		if rFn := getOpDunder(bType, reflectedOp); rFn.ptr != nil {
-			res := invokeDunder(rFn, b, a, bType)
+		if rFn := getCompareDunder(bType, reflectedOp); rFn.ptr != nil {
+			res := invokeCompareDunder(ctx, rFn, b, a, bType)
 			if !res.IsNotImplemented() {
 				return res
 			}

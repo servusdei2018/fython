@@ -780,6 +780,7 @@ func NewTypeWithMeta(name string, bases []*PyType, dict *PyDict, meta *PyType) (
 		VersionTag: allocTypeVersion(),
 	}
 	t.RootShape.Type = t
+	dict.owner = t
 
 	mro, err := ComputeMRO(t)
 	if err != nil {
@@ -961,8 +962,31 @@ func MustNewType(name string, bases []*PyType, dict *PyDict) *PyType {
 	return t
 }
 
-// LookupMRO searches t.MRO in linearization order for internedName with 0 allocations.
+// LookupMRO searches t.MRO in linearization order for internedName. Results
+// (including misses) are served from a global cache keyed on the type version
+// tag and the interned name, so a hit costs one integer and one 16-byte
+// identity compare and never walks the MRO. Names that are not interned
+// (neither inline nor FlagInterned) bypass the cache.
 func (t *PyType) LookupMRO(internedName Value) (Value, *PyType, bool) {
+	if !internedName.IsInterned() {
+		return t.lookupMROUncached(internedName)
+	}
+	ver := t.Version()
+	slot := &typeLookupCache[typeLookupSlot(ver, internedName)]
+	if e := slot.Load(); e != nil && e.ver == ver && e.name == internedName {
+		return e.val, e.owner, e.found
+	}
+	v, owner, ok := t.lookupMROUncached(internedName)
+	// Only publish when the type was not mutated while we walked it.
+	if t.Version() == ver {
+		slot.Store(&typeLookupEntry{ver: ver, name: internedName, val: v, owner: owner, found: ok})
+	}
+	return v, owner, ok
+}
+
+// lookupMROUncached walks t.MRO directly. syncDunderSlots uses it so that the
+// roughly sixty dunder probes per class creation do not evict hot entries.
+func (t *PyType) lookupMROUncached(internedName Value) (Value, *PyType, bool) {
 	for _, cls := range t.MRO {
 		if cls.Dict != nil {
 			if v, ok := cls.Dict.Get(internedName); ok && v.ptr != nil && !v.IsUnbound() {
@@ -975,6 +999,33 @@ func (t *PyType) LookupMRO(internedName Value) (Value, *PyType, bool) {
 
 // LookupMROAfter searches t.MRO strictly after startClass for super() resolution with 0 allocations.
 func (t *PyType) LookupMROAfter(startClass *PyType, internedName Value) (Value, *PyType, bool) {
+	if !internedName.IsInterned() {
+		return t.lookupMROAfterUncached(startClass, internedName)
+	}
+	ver := t.Version()
+	slot := &superLookupCache[typeLookupSlot(ver^uint64(uintptr(unsafe.Pointer(startClass))), internedName)]
+	if e := slot.Load(); e != nil && e.ver == ver && e.start == startClass && e.name == internedName {
+		return e.val, e.owner, e.found
+	}
+	v, owner, ok := t.lookupMROAfterUncached(startClass, internedName)
+	if t.Version() == ver {
+		slot.Store(&superLookupEntry{ver: ver, start: startClass, name: internedName, val: v, owner: owner, found: ok})
+	}
+	return v, owner, ok
+}
+
+type superLookupEntry struct {
+	ver   uint64
+	start *PyType
+	name  Value
+	val   Value
+	owner *PyType
+	found bool
+}
+
+var superLookupCache [typeLookupCacheSize]atomic.Pointer[superLookupEntry]
+
+func (t *PyType) lookupMROAfterUncached(startClass *PyType, internedName Value) (Value, *PyType, bool) {
 	mro := t.MRO
 	startIdx := len(mro)
 	for i, cls := range mro {
@@ -1002,7 +1053,7 @@ func (t *PyType) SetAttr(name, value Value) {
 		value.ptr.Flags |= FlagDataDescriptor
 	}
 	if t.Dict == nil {
-		t.Dict = NewDictVal(8).AsDict()
+		t.SetDict(NewDictVal(8).AsDict())
 	}
 	t.Dict.Set(interned, value)
 	t.InvalidateVersion()
@@ -1016,7 +1067,7 @@ func (t *PyType) SetAttrStr(name string, value Value) {
 // InvalidateVersion bumps t.VersionTag, re-synchronizes dunder TypeSlots on t,
 // and recursively invalidates all subclasses of t.
 func (t *PyType) InvalidateVersion() {
-	t.VersionTag = allocTypeVersion()
+	atomic.StoreUint64(&t.VersionTag, allocTypeVersion())
 	t.syncDunderSlots()
 	subclassesMu.RLock()
 	subs := append([]*PyType(nil), t.Subclasses...)
@@ -1024,6 +1075,67 @@ func (t *PyType) InvalidateVersion() {
 	for _, sub := range subs {
 		sub.InvalidateVersion()
 	}
+}
+
+// Version returns the current monotonic version tag of t. Tags are drawn from
+// one global counter and never reused, so two equal tags always denote the same
+// type in the same unmutated state. The load is atomic (a plain MOV on amd64).
+func (t *PyType) Version() uint64 {
+	return atomic.LoadUint64(&t.VersionTag)
+}
+
+// bumpVersion invalidates t and every subclass without resynchronizing the
+// dunder TypeSlots. It is the hook run by a type namespace dict on every
+// mutation, so it must stay cheap and must not look anything up.
+func (t *PyType) bumpVersion() {
+	atomic.StoreUint64(&t.VersionTag, allocTypeVersion())
+	subclassesMu.RLock()
+	if len(t.Subclasses) == 0 {
+		subclassesMu.RUnlock()
+		return
+	}
+	subs := append([]*PyType(nil), t.Subclasses...)
+	subclassesMu.RUnlock()
+	for _, sub := range subs {
+		sub.bumpVersion()
+	}
+}
+
+// SetDict installs d as the namespace dict of t and makes every later mutation
+// of d invalidate t's version tag.
+func (t *PyType) SetDict(d *PyDict) {
+	t.Dict = d
+	if d != nil {
+		d.owner = t
+	}
+}
+
+// typeLookupCacheSize is the number of slots in the global (version, name)
+// lookup cache behind LookupMRO.
+const typeLookupCacheSize = 4096
+
+type typeLookupEntry struct {
+	ver   uint64
+	name  Value
+	val   Value
+	owner *PyType
+	found bool
+}
+
+var typeLookupCache [typeLookupCacheSize]atomic.Pointer[typeLookupEntry]
+
+// FlushTypeLookupCache drops every cached lookup so that types and values
+// referenced only by the cache can be collected (called from gc.collect()).
+func FlushTypeLookupCache() {
+	for i := range typeLookupCache {
+		typeLookupCache[i].Store(nil)
+		superLookupCache[i].Store(nil)
+	}
+}
+
+func typeLookupSlot(ver uint64, name Value) uint {
+	h := ver*0x9E3779B97F4A7C15 ^ uint64(uintptr(unsafe.Pointer(name.ptr)))>>3 ^ name.num*0xC2B2AE3D27D4EB4F
+	return uint(h>>32) & (typeLookupCacheSize - 1)
 }
 
 // subclassesMu guards every PyType.Subclasses slice; types are created
@@ -1163,71 +1275,71 @@ func (t *PyType) syncDunderSlots() {
 		return
 	}
 
-	if fn, _, ok := t.LookupMRO(DunderAdd); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderAdd); ok {
 		t.dunderAdd = fn
 		t.Slots.NbAdd = dunderNbAddSlot
 	}
-	if fn, _, ok := t.LookupMRO(DunderSub); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderSub); ok {
 		t.dunderSub = fn
 		t.Slots.NbSub = dunderNbSubSlot
 	}
-	if fn, _, ok := t.LookupMRO(DunderMul); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderMul); ok {
 		t.dunderMul = fn
 		t.Slots.NbMul = dunderNbMulSlot
 	}
-	if fn, _, ok := t.LookupMRO(DunderAbs); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderAbs); ok {
 		t.dunderAbs = fn
 		t.Slots.NbAbs = dunderNbAbsSlot
 	}
-	if fn, _, ok := t.LookupMRO(DunderLen); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderLen); ok {
 		t.dunderLen = fn
 		t.Slots.SqLen = dunderSqLenSlot
 	}
-	if fn, _, ok := t.LookupMRO(DunderGetItem); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderGetItem); ok {
 		t.dunderGetItem = fn
 		t.Slots.SqItem = dunderGetItemSlot
 		t.Slots.MpSubscript = dunderGetItemSlot
 	}
-	if fn, _, ok := t.LookupMRO(DunderSetItem); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderSetItem); ok {
 		t.dunderSetItem = fn
 		t.Slots.SqAssItem = dunderSetItemSlot
 		t.Slots.MpAssSubscript = dunderSetItemSlot
 	}
-	if fn, _, ok := t.LookupMRO(DunderCall); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderCall); ok {
 		t.dunderCall = fn
 		t.Slots.TpCall = dunderTpCallSlot
 	}
-	if fn, _, ok := t.LookupMRO(DunderGet); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderGet); ok {
 		t.dunderGet = fn
 		t.Slots.TpDescrGet = dunderTpDescrGetSlot
 	}
-	if fn, _, ok := t.LookupMRO(DunderSet); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderSet); ok {
 		t.dunderSet = fn
 		t.Slots.TpDescrSet = dunderTpDescrSetSlot
-	} else if _, _, ok := t.LookupMRO(strDelete); ok {
+	} else if _, _, ok := t.lookupMROUncached(strDelete); ok {
 		t.dunderSet = Value{}
 		t.Slots.TpDescrSet = dunderTpDescrSetSlot
 	} else {
 		t.dunderSet = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderInit); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderInit); ok {
 		t.dunderInit = fn
 	} else {
 		t.dunderInit = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderGetAttr); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderGetAttr); ok {
 		t.dunderGetAttr = fn
 	} else {
 		t.dunderGetAttr = Value{}
 	}
-	if fn, owner, ok := t.LookupMRO(DunderSetAttr); ok && owner != ObjectType && owner != TypeType && owner != ModuleType {
+	if fn, owner, ok := t.lookupMROUncached(DunderSetAttr); ok && owner != ObjectType && owner != TypeType && owner != ModuleType {
 		t.dunderSetAttr = fn
 		t.Flags |= FlagCustomSetAttr
 	} else {
 		t.dunderSetAttr = Value{}
 		t.Flags &= ^FlagCustomSetAttr
 	}
-	if fn, owner, ok := t.LookupMRO(DunderIter); ok {
+	if fn, owner, ok := t.lookupMROUncached(DunderIter); ok {
 		t.dunderIter = fn
 		// Builtin collections publish __iter__ as a method that calls the
 		// native slot. Replacing that slot with a wrapper around the method
@@ -1240,7 +1352,7 @@ func (t *PyType) syncDunderSlots() {
 	} else {
 		t.dunderIter = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderNext); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderNext); ok {
 		t.dunderNext = fn
 		t.Slots.TpIterNext = func(ctx *ExecContext, o Value) (Value, IterStatus) {
 			res := ctx.Invoke1(t.dunderNext, o)
@@ -1258,217 +1370,217 @@ func (t *PyType) syncDunderSlots() {
 	} else {
 		t.dunderNext = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderEnter); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderEnter); ok {
 		t.dunderEnter = fn
 	} else {
 		t.dunderEnter = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderExit); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderExit); ok {
 		t.dunderExit = fn
 	} else {
 		t.dunderExit = Value{}
 	}
 
 	// Rich comparisons
-	if fn, _, ok := t.LookupMRO(DunderLt); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderLt); ok {
 		t.dunderLt = fn
 	} else {
 		t.dunderLt = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderLe); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderLe); ok {
 		t.dunderLe = fn
 	} else {
 		t.dunderLe = Value{}
 	}
-	if fn, owner, ok := t.LookupMRO(DunderEq); ok && owner != ObjectType {
+	if fn, owner, ok := t.lookupMROUncached(DunderEq); ok && owner != ObjectType {
 		t.dunderEq = fn
 	} else {
 		t.dunderEq = Value{}
 	}
-	if fn, owner, ok := t.LookupMRO(DunderNe); ok && owner != ObjectType {
+	if fn, owner, ok := t.lookupMROUncached(DunderNe); ok && owner != ObjectType {
 		t.dunderNe = fn
 	} else {
 		t.dunderNe = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderGt); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderGt); ok {
 		t.dunderGt = fn
 	} else {
 		t.dunderGt = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderGe); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderGe); ok {
 		t.dunderGe = fn
 	} else {
 		t.dunderGe = Value{}
 	}
 
 	// Reflected arithmetic
-	if fn, _, ok := t.LookupMRO(DunderRAdd); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderRAdd); ok {
 		t.dunderRAdd = fn
 	} else {
 		t.dunderRAdd = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderRSub); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderRSub); ok {
 		t.dunderRSub = fn
 	} else {
 		t.dunderRSub = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderRMul); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderRMul); ok {
 		t.dunderRMul = fn
 	} else {
 		t.dunderRMul = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderRMatMul); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderRMatMul); ok {
 		t.dunderRMatMul = fn
 	} else {
 		t.dunderRMatMul = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderRTruediv); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderRTruediv); ok {
 		t.dunderRTruediv = fn
 	} else {
 		t.dunderRTruediv = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderRFloordiv); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderRFloordiv); ok {
 		t.dunderRFloordiv = fn
 	} else {
 		t.dunderRFloordiv = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderRMod); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderRMod); ok {
 		t.dunderRMod = fn
 	} else {
 		t.dunderRMod = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderRPow); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderRPow); ok {
 		t.dunderRPow = fn
 	} else {
 		t.dunderRPow = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderRLShift); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderRLShift); ok {
 		t.dunderRLShift = fn
 	} else {
 		t.dunderRLShift = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderRRShift); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderRRShift); ok {
 		t.dunderRRShift = fn
 	} else {
 		t.dunderRRShift = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderRAnd); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderRAnd); ok {
 		t.dunderRAnd = fn
 	} else {
 		t.dunderRAnd = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderRXor); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderRXor); ok {
 		t.dunderRXor = fn
 	} else {
 		t.dunderRXor = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderROr); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderROr); ok {
 		t.dunderROr = fn
 	} else {
 		t.dunderROr = Value{}
 	}
 
 	// In-place arithmetic
-	if fn, _, ok := t.LookupMRO(DunderIAdd); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderIAdd); ok {
 		t.dunderIAdd = fn
 	} else {
 		t.dunderIAdd = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderISub); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderISub); ok {
 		t.dunderISub = fn
 	} else {
 		t.dunderISub = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderIMul); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderIMul); ok {
 		t.dunderIMul = fn
 	} else {
 		t.dunderIMul = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderIMatMul); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderIMatMul); ok {
 		t.dunderIMatMul = fn
 	} else {
 		t.dunderIMatMul = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderITruediv); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderITruediv); ok {
 		t.dunderITruediv = fn
 	} else {
 		t.dunderITruediv = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderIFloordiv); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderIFloordiv); ok {
 		t.dunderIFloordiv = fn
 	} else {
 		t.dunderIFloordiv = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderIMod); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderIMod); ok {
 		t.dunderIMod = fn
 	} else {
 		t.dunderIMod = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderIPow); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderIPow); ok {
 		t.dunderIPow = fn
 	} else {
 		t.dunderIPow = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderILShift); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderILShift); ok {
 		t.dunderILShift = fn
 	} else {
 		t.dunderILShift = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderIRShift); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderIRShift); ok {
 		t.dunderIRShift = fn
 	} else {
 		t.dunderIRShift = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderIAnd); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderIAnd); ok {
 		t.dunderIAnd = fn
 	} else {
 		t.dunderIAnd = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderIXor); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderIXor); ok {
 		t.dunderIXor = fn
 	} else {
 		t.dunderIXor = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderIOr); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderIOr); ok {
 		t.dunderIOr = fn
 	} else {
 		t.dunderIOr = Value{}
 	}
 
 	// Reflection, attributes & lifecycle
-	if fn, owner, ok := t.LookupMRO(DunderGetAttribute); ok && owner != ObjectType && owner != ModuleType {
+	if fn, owner, ok := t.lookupMROUncached(DunderGetAttribute); ok && owner != ObjectType && owner != ModuleType {
 		t.dunderGetAttribute = fn
 		t.Flags |= FlagCustomGetAttribute
 	} else {
 		t.dunderGetAttribute = Value{}
 		t.Flags &= ^FlagCustomGetAttribute
 	}
-	if fn, owner, ok := t.LookupMRO(DunderDelAttr); ok && owner != ObjectType && owner != TypeType && owner != ModuleType {
+	if fn, owner, ok := t.lookupMROUncached(DunderDelAttr); ok && owner != ObjectType && owner != TypeType && owner != ModuleType {
 		t.dunderDelAttr = fn
 	} else {
 		t.dunderDelAttr = Value{}
 	}
-	if fn, owner, ok := t.LookupMRO(strHash); ok && owner != ObjectType {
+	if fn, owner, ok := t.lookupMROUncached(strHash); ok && owner != ObjectType {
 		t.dunderHash = fn
 	} else {
 		t.dunderHash = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderDir); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderDir); ok {
 		t.dunderDir = fn
 	} else {
 		t.dunderDir = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderContains); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderContains); ok {
 		t.dunderContains = fn
 	} else {
 		t.dunderContains = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderMissing); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderMissing); ok {
 		t.dunderMissing = fn
 	} else {
 		t.dunderMissing = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderNew); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderNew); ok {
 		if fn.IsStaticMethod() {
 			t.dunderNew = fn.AsStaticMethod().Callable
 		} else {
@@ -1478,12 +1590,12 @@ func (t *PyType) syncDunderSlots() {
 		t.dunderNew = Value{}
 	}
 	t.UsesDefaultNew = t.dunderNew.ptr == nil || t.dunderNew.ptr == ObjectNewBuiltin.ptr
-	if fn, _, ok := t.LookupMRO(DunderInitSubclass); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderInitSubclass); ok {
 		t.dunderInitSubclass = fn
 	} else {
 		t.dunderInitSubclass = Value{}
 	}
-	if fn, _, ok := t.LookupMRO(DunderSetName); ok {
+	if fn, _, ok := t.lookupMROUncached(DunderSetName); ok {
 		t.dunderSetName = fn
 	} else {
 		t.dunderSetName = Value{}
@@ -1639,7 +1751,11 @@ func LookupAttrOptional(ctx *ExecContext, obj, name Value) (Value, bool) {
 		}
 		return v, true
 	}
-	if tp.Slots.TpGetAttr == nil || (obj.IsInstance() && (tp.Flags&FlagHeapType) != 0) {
+	if tp.Slots.TpGetAttr == nil || (obj.Kind() != KindNative && !obj.IsModule() && ((tp.Flags&FlagHeapType) != 0 ||
+		tp == DictType || tp == ListType || tp == TupleType || tp == StrType ||
+		tp == IntType || tp == BigIntType || tp == FloatType || tp == BoolType ||
+		tp == NoneType || tp == BytesType || tp == ByteArrayType || tp == SetType ||
+		tp == RangeType)) {
 		v, ok := defaultObjectGetAttrOptional(ctx, obj, name)
 		if !ok {
 			if ctx != nil && ctx.HasException() && IsInstance(ctx.ActiveException, AttributeErrorType) {
@@ -1993,10 +2109,10 @@ func objectSetAttr(ctx *ExecContext, obj, name, value Value) Value {
 	if obj.IsType() {
 		cls := obj.AsType()
 		if cls.Dict == nil {
-			cls.Dict = NewDictVal(16).AsDict()
+			cls.SetDict(NewDictVal(16).AsDict())
 		}
 		cls.Dict.Set(interned, value)
-		cls.syncDunderSlots()
+		cls.InvalidateVersion()
 		return NoneVal()
 	}
 
@@ -2111,6 +2227,166 @@ func typeGetAttrOptional(ctx *ExecContext, typeObj, name Value) (Value, bool) {
 	}
 
 	return NoneVal(), false
+}
+
+func resolveMethodDescr(ctx *ExecContext, descr, selfObj Value, selfType *PyType) (Value, Value) {
+	if descr.IsFunction() {
+		if selfObj.IsNone() || selfObj.IsUnbound() {
+			return UnboundVal(), descr
+		}
+		return selfObj, descr
+	}
+	if descr.IsBuiltinFunc() {
+		bf := descr.AsBuiltinFunc()
+		if bf.NoBind || selfObj.IsNone() || selfObj.IsUnbound() {
+			return UnboundVal(), descr
+		}
+		return selfObj, descr
+	}
+	switch descr.Kind() {
+	case KindClassMethod:
+		if selfType == nil {
+			selfType = ObjectType
+		}
+		return TypeVal(selfType), descr.AsClassMethod().Callable
+	case KindStaticMethod:
+		return UnboundVal(), descr.AsStaticMethod().Callable
+	}
+	if descrGet := descr.Type().Slots.TpDescrGet; descrGet != nil {
+		res := descrGet(ctx, descr, selfObj, selfType)
+		if res.IsBoundMethod() {
+			bm := res.AsBoundMethod()
+			return bm.Self, bm.Func
+		}
+		return UnboundVal(), res
+	}
+	return UnboundVal(), descr
+}
+
+// LoadMethodNoBind resolves obj.name for an immediate method call without
+// allocating a temporary PyBoundMethod object. The caller invokes fn with rec
+// prepended when !rec.IsUnbound(), or with args alone otherwise.
+func LoadMethodNoBind(ctx *ExecContext, obj, name Value) (Value, Value) {
+	interned := InternValue(name)
+
+	if obj.IsSuper() {
+		sup := obj.AsSuper()
+		var selfType *PyType
+		var selfObj Value
+		if sup.Self.IsType() && IsSubclass(sup.Self.AsType(), sup.ThisClass) {
+			selfType = sup.Self.AsType()
+			selfObj = NoneVal()
+		} else {
+			selfType = sup.Self.Type()
+			selfObj = sup.Self
+		}
+		descr, _, ok := selfType.LookupMROAfter(sup.ThisClass, interned)
+		if !ok {
+			if ctx != nil {
+				ctx.Raise(NewLazyAttributeError(obj.Type(), interned))
+			}
+			return UnboundVal(), NoneVal()
+		}
+		return resolveMethodDescr(ctx, descr, selfObj, selfType)
+	}
+
+	if obj.IsType() {
+		cls := obj.AsType()
+		meta := cls.Header.Type
+		if meta == nil {
+			meta = TypeType
+		}
+		if (meta.Flags&FlagCustomGetAttribute) == 0 && meta.dunderGetAttribute.ptr == nil && interned != strDoc {
+			if descr, _, ok := meta.LookupMRO(interned); ok {
+				descrType := descr.Type()
+				if descr.IsDataDescriptor() || (descrType.Slots.TpDescrGet != nil && descrType.Slots.TpDescrSet != nil) {
+					if descrType.Slots.TpDescrGet != nil {
+						res := descrType.Slots.TpDescrGet(ctx, descr, obj, meta)
+						if res.IsBoundMethod() {
+							bm := res.AsBoundMethod()
+							return bm.Self, bm.Func
+						}
+						return UnboundVal(), res
+					}
+				}
+			}
+			if descr, _, ok := cls.LookupMRO(interned); ok {
+				return resolveMethodDescr(ctx, descr, NoneVal(), cls)
+			}
+			if descr, _, ok := meta.LookupMRO(interned); ok {
+				return resolveMethodDescr(ctx, descr, obj, meta)
+			}
+		}
+		res := GetAttrCtx(ctx, obj, interned)
+		if res.IsBoundMethod() {
+			bm := res.AsBoundMethod()
+			return bm.Self, bm.Func
+		}
+		return UnboundVal(), res
+	}
+
+	tp := obj.Type()
+	if (tp.Flags&FlagCustomGetAttribute) == 0 && tp.dunderGetAttribute.ptr == nil {
+		switch obj.Kind() {
+		case KindInstance, KindInt64, KindBigInt, KindFloat64, KindComplex, KindBool, KindNone,
+			KindString, KindInlineStr, KindBytes, KindByteArray, KindList, KindTuple,
+			KindDict, KindSet, KindSlice, KindRange:
+			if interned == strClass {
+				return UnboundVal(), TypeVal(tp)
+			}
+			descr, _, foundInClass := tp.LookupMRO(interned)
+			if foundInClass {
+				descrType := descr.Type()
+				if descr.IsDataDescriptor() || (descrType.Slots.TpDescrGet != nil && descrType.Slots.TpDescrSet != nil) {
+					if descrType.Slots.TpDescrGet != nil {
+						res := descrType.Slots.TpDescrGet(ctx, descr, obj, tp)
+						if res.IsBoundMethod() {
+							bm := res.AsBoundMethod()
+							return bm.Self, bm.Func
+						}
+						return UnboundVal(), res
+					}
+					return UnboundVal(), descr
+				}
+			}
+			switch {
+			case obj.IsInstance():
+				if inst := obj.AsInstance(); inst.Shape != nil {
+					if v, ok := inst.GetAttr(interned); ok {
+						return UnboundVal(), v
+					}
+				}
+			case obj.IsDict() && tp != DictType:
+				if d := obj.AsDict(); d.Attrs != nil {
+					if v, ok := d.Attrs.Get(interned); ok {
+						return UnboundVal(), v
+					}
+				}
+			case obj.IsList() && tp != ListType:
+				if l := obj.AsList(); l.Attrs != nil {
+					if v, ok := l.Attrs.Get(interned); ok {
+						return UnboundVal(), v
+					}
+				}
+			case obj.IsTuple() && tp != TupleType:
+				if t := obj.AsTuple(); t.Attrs != nil {
+					if v, ok := t.Attrs.Get(interned); ok {
+						return UnboundVal(), v
+					}
+				}
+			}
+			if foundInClass {
+				return resolveMethodDescr(ctx, descr, obj, tp)
+			}
+		}
+	}
+
+	res := GetAttrCtx(ctx, obj, interned)
+	if res.IsBoundMethod() {
+		bm := res.AsBoundMethod()
+		return bm.Self, bm.Func
+	}
+	return UnboundVal(), res
 }
 
 // typeSetAttr implements attribute assignment on a *PyType object, invalidating VersionTag.

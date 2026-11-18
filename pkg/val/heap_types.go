@@ -82,6 +82,10 @@ type PyDict struct {
 	// Shape-backed instance: every read and write is resolved through
 	// Live.Shape and Live.Slots (see NewInstanceDictProxy).
 	Live *PyInstance
+	// owner is set when this dict is the namespace of a type. Every mutation
+	// then invalidates the owner version tag (and its subclasses), so lookup
+	// caches never need to trust call sites to invalidate explicitly.
+	owner *PyType
 }
 
 // PyCell wraps a shared mutable Value on the heap for closures and nonlocal variables.
@@ -353,24 +357,26 @@ const (
 // PyGenerator represents a frame-detaching Python generator object on the heap.
 // Header MUST be at offset 0.
 type PyGenerator struct {
-	Header     ObjectHeader
-	Name       string
-	Code       Value
-	State      GenState
-	Stack      []Value
-	SP         int
-	Base       int
-	IP         int
-	MaxSP      int
-	PoolClass  uint8
-	Cells      []Value
-	CellPtrs   []*PyCell
-	Globals    *PyDict
-	YieldVal   Value
-	RetVal     Value
-	LastSent   Value
-	ResumeHook func(ctx *ExecContext, gen *PyGenerator, val Value) (Value, IterStatus)
-	Iters      [8]PyIter
+	Header      ObjectHeader
+	Name        string
+	Code        Value
+	State       GenState
+	Stack       []Value
+	SP          int
+	Base        int
+	IP          int
+	MaxSP       int
+	PoolClass   uint8
+	OwnCells    bool
+	Cells       []Value
+	CellPtrs    []*PyCell
+	Globals     *PyDict
+	YieldVal    Value
+	RetVal      Value
+	LastSent    Value
+	ResumeHook  func(ctx *ExecContext, gen *PyGenerator, val Value) (Value, IterStatus)
+	ReleaseHook func(gen *PyGenerator)
+	Iters       [8]PyIter
 }
 
 // CoroutineState classifies the lifecycle state of a PyCoroutine.
@@ -1339,16 +1345,22 @@ func (g *PyGenerator) Send(ctx *ExecContext, val Value) (Value, IterStatus) {
 	return NoneVal(), IterExhausted
 }
 
-// Close closes the generator and marks it GenClosed.
+// Close closes the generator, marks it GenClosed, and releases pooled stacks.
 func (g *PyGenerator) Close(ctx *ExecContext) {
 	if g.State == GenClosed || g.State == GenCreated {
 		g.State = GenClosed
+		if g.ReleaseHook != nil && g.Stack != nil {
+			g.ReleaseHook(g)
+		}
 		return
 	}
 	if g.State == GenSuspended && ctx != nil {
 		_, status := g.Throw(ctx, NewInstanceOfType(GeneratorExitType))
 		if status == IterYielded {
 			g.State = GenClosed
+			if g.ReleaseHook != nil && g.Stack != nil {
+				g.ReleaseHook(g)
+			}
 			ctx.Raise(NewRuntimeError("generator ignored GeneratorExit"))
 			return
 		}
@@ -1360,6 +1372,9 @@ func (g *PyGenerator) Close(ctx *ExecContext) {
 		}
 	}
 	g.State = GenClosed
+	if g.ReleaseHook != nil && g.Stack != nil {
+		g.ReleaseHook(g)
+	}
 }
 
 // Throw resumes the generator by raising an exception at the point of suspension.
@@ -1965,6 +1980,9 @@ func (d *PyDict) setLocked(key, value Value) {
 				if e.Key == key || (e.Hash == h && e.Active && dictKeyEqual(e.Key, key)) {
 					e.Value = value
 					atomic.AddUint64(&d.VersionTag, 1)
+					if d.owner != nil {
+						d.owner.bumpVersion()
+					}
 					return
 				}
 			}
@@ -1988,6 +2006,9 @@ func (d *PyDict) setLocked(key, value Value) {
 				if e.Key == key || (e.Hash == h && e.Active && dictKeyEqual(e.Key, key)) {
 					e.Value = value
 					atomic.AddUint64(&d.VersionTag, 1)
+					if d.owner != nil {
+						d.owner.bumpVersion()
+					}
 					return
 				}
 			}
@@ -2019,6 +2040,9 @@ func (d *PyDict) setLocked(key, value Value) {
 	d.writeIndex(uint32(insertSlot), uint32(entryIdx+dictIndexOffset))
 	d.used++
 	atomic.AddUint64(&d.VersionTag, 1)
+	if d.owner != nil {
+		d.owner.bumpVersion()
+	}
 }
 
 // PutNew inserts a key-value pair known to not exist in d (e.g. fresh parser output).
@@ -2048,6 +2072,9 @@ func (d *PyDict) PutNew(key, value Value) {
 	d.used++
 	d.filled++
 	atomic.AddUint64(&d.VersionTag, 1)
+	if d.owner != nil {
+		d.owner.bumpVersion()
+	}
 }
 
 // InitArenaDict initializes a PyDict allocated from a slab or arena.
@@ -2219,6 +2246,9 @@ func (d *PyDict) deleteLocked(key Value) bool {
 				d.writeIndex(slot, dictIndexDummy)
 				d.used--
 				atomic.AddUint64(&d.VersionTag, 1)
+				if d.owner != nil {
+					d.owner.bumpVersion()
+				}
 				return true
 			}
 		}
@@ -2933,20 +2963,39 @@ func (v Value) IsMappingProxy() bool {
 }
 
 // NewInstanceDictProxy returns a dict Value that is a live, zero-copy view of
-// inst's Shape-backed attribute storage. Writes go through the same path as
-// setattr/delattr, so the instance is never deoptimized into a hash table.
+// inst's Shape-backed attribute storage. The proxy is cached lazily on inst so
+// `obj.__dict__ is obj.__dict__` holds and repeated `vars(obj)` calls do not
+// allocate. Writes go through the same path as setattr/delattr, so the instance
+// is never deoptimized into a hash table.
 func NewInstanceDictProxy(inst *PyInstance) Value {
-	d := &PyDict{
-		Header: ObjectHeader{Kind: KindDict, Type: DictType},
-		Live:   inst,
+	if !MultiThreadedFlag.Load() {
+		if inst.dictView == nil {
+			inst.dictView = &PyDict{
+				Header: ObjectHeader{Kind: KindDict, Type: DictType},
+				Live:   inst,
+			}
+		}
+		return Value{num: 0, ptr: &inst.dictView.Header}
 	}
+	inst.mu.Lock()
+	d := inst.dictView
+	if d == nil {
+		d = &PyDict{
+			Header: ObjectHeader{Kind: KindDict, Type: DictType},
+			Live:   inst,
+		}
+		inst.dictView = d
+	}
+	inst.mu.Unlock()
 	return Value{num: 0, ptr: &d.Header}
 }
 
 func (d *PyDict) liveGetWithSlot(key Value) (Value, int, bool) {
 	inst := d.Live
-	inst.mu.RLock()
-	defer inst.mu.RUnlock()
+	if MultiThreadedFlag.Load() {
+		inst.mu.RLock()
+		defer inst.mu.RUnlock()
+	}
 	idx, ok := inst.Shape.Lookup(key)
 	if !ok || idx >= len(inst.Slots) || inst.Slots[idx].IsUnbound() {
 		return NoneVal(), -1, false
@@ -2956,8 +3005,10 @@ func (d *PyDict) liveGetWithSlot(key Value) (Value, int, bool) {
 
 func (d *PyDict) liveLen() int {
 	inst := d.Live
-	inst.mu.RLock()
-	defer inst.mu.RUnlock()
+	if MultiThreadedFlag.Load() {
+		inst.mu.RLock()
+		defer inst.mu.RUnlock()
+	}
 	n := 0
 	for _, a := range inst.Shape.Attrs {
 		if a.Index < len(inst.Slots) && !inst.Slots[a.Index].IsUnbound() {
@@ -2969,8 +3020,10 @@ func (d *PyDict) liveLen() int {
 
 func (d *PyDict) liveItems() []DictItem {
 	inst := d.Live
-	inst.mu.RLock()
-	defer inst.mu.RUnlock()
+	if MultiThreadedFlag.Load() {
+		inst.mu.RLock()
+		defer inst.mu.RUnlock()
+	}
 	items := make([]DictItem, 0, len(inst.Shape.Attrs))
 	for _, a := range inst.Shape.Attrs {
 		if a.Index < len(inst.Slots) && !inst.Slots[a.Index].IsUnbound() {
@@ -2982,8 +3035,10 @@ func (d *PyDict) liveItems() []DictItem {
 
 func (d *PyDict) liveIterNext(it *PyIter) (Value, bool) {
 	inst := d.Live
-	inst.mu.RLock()
-	defer inst.mu.RUnlock()
+	if MultiThreadedFlag.Load() {
+		inst.mu.RLock()
+		defer inst.mu.RUnlock()
+	}
 	attrs := inst.Shape.Attrs
 	for it.Idx < len(attrs) {
 		a := attrs[it.Idx]
@@ -3040,6 +3095,9 @@ func (d *PyDict) Clear() {
 	d.used = 0
 	d.filled = 0
 	atomic.AddUint64(&d.VersionTag, 1)
+	if d.owner != nil {
+		d.owner.bumpVersion()
+	}
 }
 
 // PopItem removes and returns the last (key, value) pair in LIFO order.

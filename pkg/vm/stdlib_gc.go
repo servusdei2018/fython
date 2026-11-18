@@ -13,6 +13,7 @@ func (e *Engine) createGCModule() val.Value {
 
 	// gc.collect(generation=2) -> int
 	mod.Dict.Set(val.InternString("collect"), val.NewBuiltinFuncVal("collect", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		val.FlushTypeLookupCache()
 		if ctx != nil {
 			if ctx.Stack != nil {
 				for i := ctx.SP; i < len(ctx.Stack); i++ {

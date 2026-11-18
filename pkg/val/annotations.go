@@ -55,7 +55,7 @@ func annotateFuncOf(d *PyDict, moduleStyle bool) (Value, bool) {
 // class's __annotate__(1) (cached), else a fresh empty dict (cached).
 func TypeAnnotations(ctx *ExecContext, cls *PyType) Value {
 	if cls.Dict == nil {
-		cls.Dict = NewDictVal(8).AsDict()
+		cls.SetDict(NewDictVal(8).AsDict())
 	}
 	if (cls.Flags & FlagHeapType) == 0 {
 		if ann, ok := cls.Dict.Get(keyAnnotations); ok && ann.IsDict() {
@@ -89,7 +89,7 @@ func TypeSetAnnotations(cls *PyType, value Value) {
 		panic("TypeError: cannot set '__annotations__' attribute of immutable type '" + cls.Name + "'")
 	}
 	if cls.Dict == nil {
-		cls.Dict = NewDictVal(8).AsDict()
+		cls.SetDict(NewDictVal(8).AsDict())
 	}
 	cls.Dict.Delete(keyAnnotations)
 	cls.Dict.Set(keyAnnotationCache, value)
@@ -138,7 +138,7 @@ func TypeSetAnnotateCtx(ctx *ExecContext, cls *PyType, value Value) {
 		return
 	}
 	if cls.Dict == nil {
-		cls.Dict = NewDictVal(8).AsDict()
+		cls.SetDict(NewDictVal(8).AsDict())
 	}
 	cls.Dict.Delete(keyAnnotate)
 	cls.Dict.Set(keyAnnotateFunc, value)

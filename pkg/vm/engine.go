@@ -58,6 +58,7 @@ type Engine struct {
 	rootShape                  *val.Shape
 	builtins                   *val.PyDict
 	vmPool                     sync.Pool
+	frameSlabPool              sync.Pool
 	codeCache                  sync.Map // maps canonical path or module name -> *CodeObject
 	singleflight               CompilerSingleflight
 	sharedModules              *val.PyDict
@@ -770,7 +771,7 @@ func (e *Engine) newVMInternal(stackCap, frameCap int) *VM {
 	v := &VM{
 		engine:       e,
 		stack:        make([]val.Value, stackCap),
-		frames:       make([]CallFrame, frameCap),
+		frames:       e.acquireFrameSlab(frameCap),
 		internPool:   e.internPool,
 		globals:      val.NewDictVal(64).AsDict(),
 		builtins:     e.builtins,
@@ -779,6 +780,9 @@ func (e *Engine) newVMInternal(stackCap, frameCap int) *VM {
 		builtinRange: val.TypeVal(val.RangeType),
 		strScratch:   make([]byte, 0, 1024),
 	}
+	v.genResumeHook = v.resumeGenerator
+	v.genReleaseHook = v.releaseGeneratorStack
+	v.coroResumeHook = v.resumeCoroutine
 	if lenVal, ok := e.builtins.Get(val.InternString("len")); ok {
 		v.builtinLen = lenVal
 	}
@@ -809,6 +813,32 @@ func (e *Engine) newVMInternal(stackCap, frameCap int) *VM {
 		}
 	}
 	return v
+}
+
+type frameSlab struct {
+	frames []CallFrame
+}
+
+func (e *Engine) acquireFrameSlab(minCap int) []CallFrame {
+	if e != nil {
+		if raw := e.frameSlabPool.Get(); raw != nil {
+			slab := raw.(*frameSlab)
+			if cap(slab.frames) >= minCap {
+				recordFrameSlabPool(true)
+				return slab.frames[:cap(slab.frames)]
+			}
+		}
+	}
+	recordFrameSlabPool(false)
+	return make([]CallFrame, minCap)
+}
+
+func (e *Engine) releaseFrameSlab(slab []CallFrame) {
+	if e == nil || cap(slab) < DefaultFrameSlabSize || cap(slab) > 8192 {
+		return
+	}
+	clear(slab[:cap(slab)])
+	e.frameSlabPool.Put(&frameSlab{frames: slab[:cap(slab)]})
 }
 
 // AcquireVM retrieves a lightweight *VM from the Engine's sync.Pool.

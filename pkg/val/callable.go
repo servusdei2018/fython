@@ -15,11 +15,13 @@ import (
 )
 
 // PyTuple represents an immutable sequence of Values on the heap (used for kwnames and tuple constants).
+// Tuples with up to 2 elements store their backing array inline inside the same 80-byte allocation.
 // Header MUST be at byte offset 0.
 type PyTuple struct {
 	Header ObjectHeader
 	Items  []Value
 	Attrs  *PyDict
+	inline [2]Value
 }
 
 // PyBuiltinFunc represents a zero-allocation native Go built-in callable using the Vectorcall convention.
@@ -94,9 +96,22 @@ var (
 )
 
 // NewTupleVal constructs a heap-allocated KindTuple Value wrapping items.
+// For 1..2 items, the elements are copied into inline storage inside PyTuple.
 func NewTupleVal(items ...Value) Value {
-	if len(items) == 0 && TupleType != nil {
+	n := len(items)
+	if n == 0 && TupleType != nil {
 		return EmptyTupleVal()
+	}
+	if n <= 2 {
+		obj := &PyTuple{
+			Header: ObjectHeader{
+				Kind: KindTuple,
+				Type: TupleType,
+			},
+		}
+		copy(obj.inline[:n], items)
+		obj.Items = obj.inline[:n]
+		return Value{num: 0, ptr: &obj.Header}
 	}
 	obj := &PyTuple{
 		Header: ObjectHeader{
@@ -105,6 +120,49 @@ func NewTupleVal(items ...Value) Value {
 		},
 		Items: items,
 	}
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+// NewTupleFromSlice constructs a tuple copying elements from src.
+// For 1..2 elements, it performs a single 80-byte allocation with no separate slice backing array.
+func NewTupleFromSlice(src []Value) Value {
+	n := len(src)
+	if n == 0 && TupleType != nil {
+		return EmptyTupleVal()
+	}
+	if n <= 2 {
+		obj := &PyTuple{
+			Header: ObjectHeader{
+				Kind: KindTuple,
+				Type: TupleType,
+			},
+		}
+		copy(obj.inline[:n], src)
+		obj.Items = obj.inline[:n]
+		return Value{num: 0, ptr: &obj.Header}
+	}
+	items := make([]Value, n)
+	copy(items, src)
+	obj := &PyTuple{
+		Header: ObjectHeader{
+			Kind: KindTuple,
+			Type: TupleType,
+		},
+		Items: items,
+	}
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+// NewTuple2 constructs a 2-element tuple in a single allocation without variadic slice overhead.
+func NewTuple2(a, b Value) Value {
+	obj := &PyTuple{
+		Header: ObjectHeader{
+			Kind: KindTuple,
+			Type: TupleType,
+		},
+		inline: [2]Value{a, b},
+	}
+	obj.Items = obj.inline[:2]
 	return Value{num: 0, ptr: &obj.Header}
 }
 
@@ -3137,8 +3195,8 @@ func initTypes() {
 	TypeType.MRO[0] = TypeType
 	TypeType.Header.Type = TypeType
 	ObjectType.Header.Type = TypeType
-	ObjectType.Dict = NewDictVal(8).AsDict()
-	TypeType.Dict = NewDictVal(8).AsDict()
+	ObjectType.SetDict(NewDictVal(8).AsDict())
+	TypeType.SetDict(NewDictVal(8).AsDict())
 	TypeType.Slots.TpGetAttr = typeGetAttr
 	TypeType.Slots.TpSetAttr = typeSetAttr
 	TypeType.Slots.TpCall = typeTpCall
@@ -4460,12 +4518,58 @@ func initTypes() {
 			ctx.Raise(NewException(TypeErrorType, "replace() takes at least 2 arguments"))
 			return NoneVal()
 		}
-		s := args[0].AsString()
-		oldStr := args[1].AsString()
-		newStr := args[2].AsString()
 		n := -1
 		if len(args) > 3 && args[3].IsInt64() {
 			n = int(args[3].AsInt64())
+		}
+		if args[0].ptr == &tagInlineStr {
+			var sBuf, oldBuf [7]byte
+			sb := inlineStrSlice(args[0], &sBuf)
+			var ob []byte
+			if args[1].ptr == &tagInlineStr {
+				ob = inlineStrSlice(args[1], &oldBuf)
+			} else {
+				sOld := args[1].AsString()
+				ob = unsafe.Slice(unsafe.StringData(sOld), len(sOld))
+			}
+			if n == 0 || (len(ob) > 0 && !bytes.Contains(sb, ob)) {
+				return args[0]
+			}
+			var newBuf [7]byte
+			var nb []byte
+			if args[2].ptr == &tagInlineStr {
+				nb = inlineStrSlice(args[2], &newBuf)
+			} else {
+				sNew := args[2].AsString()
+				nb = unsafe.Slice(unsafe.StringData(sNew), len(sNew))
+			}
+			out := bytes.Replace(sb, ob, nb, n)
+			if len(out) <= 7 {
+				return SmallStringFromBytes(out)
+			}
+			return NewStringVal(string(out))
+		}
+		s := args[0].AsString()
+		var oldBuf, newBuf [7]byte
+		var oldStr string
+		if args[1].ptr == &tagInlineStr {
+			ob := inlineStrSlice(args[1], &oldBuf)
+			oldStr = unsafe.String(&oldBuf[0], len(ob))
+		} else {
+			oldStr = args[1].AsString()
+		}
+		if n == 0 || (len(oldStr) > 0 && !strings.Contains(s, oldStr)) {
+			if args[0].Type() == StrType {
+				return args[0]
+			}
+			return NewStringVal(s)
+		}
+		var newStr string
+		if args[2].ptr == &tagInlineStr {
+			nb := inlineStrSlice(args[2], &newBuf)
+			newStr = unsafe.String(&newBuf[0], len(nb))
+		} else {
+			newStr = args[2].AsString()
 		}
 		return NewStringVal(strings.Replace(s, oldStr, newStr, n))
 	}))
@@ -4478,7 +4582,14 @@ func initTypes() {
 		s := args[0].AsString()
 		var parts []string
 		if len(args) > 1 && !args[1].IsNone() {
-			sep := args[1].AsString()
+			var sepBuf [7]byte
+			var sep string
+			if args[1].ptr == &tagInlineStr {
+				sb := inlineStrSlice(args[1], &sepBuf)
+				sep = unsafe.String(&sepBuf[0], len(sb))
+			} else {
+				sep = args[1].AsString()
+			}
 			maxsplit := -1
 			if len(args) > 2 && args[2].IsInt64() {
 				maxsplit = int(args[2].AsInt64())
@@ -4512,7 +4623,16 @@ func initTypes() {
 			ctx.Raise(NewException(TypeErrorType, "join() takes exactly one argument"))
 			return NoneVal()
 		}
-		sep := args[0].AsString()
+		var sepBuf, itemBuf [7]byte
+		var sepBytes []byte
+		var sepStr string
+		sepInline := args[0].ptr == &tagInlineStr
+		if sepInline {
+			sepBytes = inlineStrSlice(args[0], &sepBuf)
+		} else {
+			sepStr = args[0].AsString()
+		}
+		sepLen := args[0].StringLen()
 		iterable := args[1]
 		// Streaming container paths avoid building an intermediate []Value
 		// slice of every item.
@@ -4523,22 +4643,29 @@ func initTypes() {
 			if len(items) == 0 {
 				return NewStringVal("")
 			}
-			total := len(sep) * (len(items) - 1)
+			total := sepLen * (len(items) - 1)
 			for _, it := range items {
 				if it.IsAnyString() {
-					total += len(it.AsString())
+					total += it.StringLen()
 				} else {
 					total += 16
 				}
 			}
 			b.Grow(total)
 			for i, it := range items {
-				if i > 0 && len(sep) > 0 {
-					b.WriteString(sep)
+				if i > 0 && sepLen > 0 {
+					if sepInline {
+						b.Write(sepBytes)
+					} else {
+						b.WriteString(sepStr)
+					}
 				}
-				if it.IsAnyString() {
+				switch {
+				case it.ptr == &tagInlineStr:
+					b.Write(inlineStrSlice(it, &itemBuf))
+				case it.IsAnyString():
 					b.WriteString(it.AsString())
-				} else {
+				default:
 					b.WriteString(it.String())
 				}
 			}
@@ -4547,27 +4674,38 @@ func initTypes() {
 			if len(items) == 0 {
 				return NewStringVal("")
 			}
-			total := len(sep) * (len(items) - 1)
+			total := sepLen * (len(items) - 1)
 			for _, it := range items {
 				if it.IsAnyString() {
-					total += len(it.AsString())
+					total += it.StringLen()
 				} else {
 					total += 16
 				}
 			}
 			b.Grow(total)
 			for i, it := range items {
-				if i > 0 && len(sep) > 0 {
-					b.WriteString(sep)
+				if i > 0 && sepLen > 0 {
+					if sepInline {
+						b.Write(sepBytes)
+					} else {
+						b.WriteString(sepStr)
+					}
 				}
-				if it.IsAnyString() {
+				switch {
+				case it.ptr == &tagInlineStr:
+					b.Write(inlineStrSlice(it, &itemBuf))
+				case it.IsAnyString():
 					b.WriteString(it.AsString())
-				} else {
+				default:
 					b.WriteString(it.String())
 				}
 			}
 		case iterable.IsGenerator():
 			gen := iterable.AsGenerator()
+			sep := sepStr
+			if sepInline {
+				sep = args[0].AsString()
+			}
 			if JoinGeneratorHook != nil {
 				if res, ok := JoinGeneratorHook(ctx, sep, gen); ok {
 					if ctx.HasException() {
@@ -4595,9 +4733,12 @@ func initTypes() {
 					}
 				}
 				first = false
-				if v.IsAnyString() {
+				switch {
+				case v.ptr == &tagInlineStr:
+					b.Write(inlineStrSlice(v, &itemBuf))
+				case v.IsAnyString():
 					b.WriteString(v.AsString())
-				} else {
+				default:
 					b.WriteString(v.String())
 				}
 			}
@@ -4606,22 +4747,29 @@ func initTypes() {
 			if len(items) == 0 {
 				return NewStringVal("")
 			}
-			total := len(sep) * (len(items) - 1)
+			total := sepLen * (len(items) - 1)
 			for _, it := range items {
 				if it.IsAnyString() {
-					total += len(it.AsString())
+					total += it.StringLen()
 				} else {
 					total += 16
 				}
 			}
 			b.Grow(total)
 			for i, it := range items {
-				if i > 0 && len(sep) > 0 {
-					b.WriteString(sep)
+				if i > 0 && sepLen > 0 {
+					if sepInline {
+						b.Write(sepBytes)
+					} else {
+						b.WriteString(sepStr)
+					}
 				}
-				if it.IsAnyString() {
+				switch {
+				case it.ptr == &tagInlineStr:
+					b.Write(inlineStrSlice(it, &itemBuf))
+				case it.IsAnyString():
 					b.WriteString(it.AsString())
-				} else {
+				default:
 					b.WriteString(it.String())
 				}
 			}

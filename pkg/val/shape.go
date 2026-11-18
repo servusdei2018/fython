@@ -52,6 +52,7 @@ type Shape struct {
 	AttrName    Value
 	SlotIndex   int
 	Attrs       []ShapeAttr
+	index       atomic.Pointer[map[Value]int]
 	mu          sync.Mutex
 	transitions atomic.Pointer[[]ShapeTransition]
 }
@@ -80,10 +81,32 @@ func DefaultRootShape() *Shape {
 	return defaultRootShape
 }
 
-// Lookup resolves an attribute name to its flat slot index in O(N_attrs) without heap allocations.
-// For interned strings and inline strings, comparison is a single pointer+num check.
+// Lookup resolves an attribute name to its flat slot index without heap allocations.
+// For shapes with >8 attributes, a lazily built map index avoids O(N) scans.
 func (s *Shape) Lookup(name Value) (int, bool) {
 	attrs := s.Attrs
+	if len(attrs) > 8 {
+		m := s.index.Load()
+		if m == nil {
+			built := make(map[Value]int, len(attrs))
+			for i := range attrs {
+				built[attrs[i].Name] = attrs[i].Index
+			}
+			s.index.Store(&built)
+			m = &built
+		}
+		if idx, ok := (*m)[name]; ok {
+			return idx, true
+		}
+		if name.ptr != nil && name.ptr.Kind == KindString && (name.ptr.Flags&FlagInterned) == 0 {
+			for i := range attrs {
+				if StringEquals(attrs[i].Name, name) {
+					return attrs[i].Index, true
+				}
+			}
+		}
+		return -1, false
+	}
 	for i := range attrs {
 		a := &attrs[i]
 		if a.Name.ptr == name.ptr && a.Name.num == name.num {
@@ -172,11 +195,17 @@ type PyInstance struct {
 	Shape     *Shape
 	Slots     []Value
 	bootstrap [5]Value
+	dictView  *PyDict
 	mu        sync.RWMutex
 }
 
-// Compile-time assertion that PyInstance.Header is at byte offset 0.
-var _ [0 - unsafe.Offsetof(PyInstance{}.Header)]byte
+// Compile-time assertions that PyInstance.Header is at byte offset 0 and adding
+// dictView stays within the 160-byte Go size class.
+var (
+	_ [0 - unsafe.Offsetof(PyInstance{}.Header)]byte
+	_ [160 - unsafe.Sizeof(PyInstance{})]byte
+	_ [unsafe.Sizeof(PyInstance{}) - 160]byte
+)
 
 // NewInstanceVal constructs a new heap-allocated KindInstance Value with the given initial Shape.
 // If shape is nil, DefaultRootShape() is used.

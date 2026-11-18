@@ -123,12 +123,36 @@ func (st *loopState) syncStackFromExecCtx(vm *VM, curStack []val.Value) []val.Va
 //
 //go:noinline
 func (vm *VM) growStack(st *loopState, curStack []val.Value, minCap int) []val.Value {
+	if st.activeGen != nil && !st.stackIsVM {
+		if genCO := AsCodeObject(st.activeGen.Code); genCO != nil {
+			for {
+				cur := genCO.GenStackHint.Load()
+				if int(cur) >= minCap || genCO.GenStackHint.CompareAndSwap(cur, int32(minCap)) {
+					break
+				}
+			}
+		}
+		s, newCls := vm.acquireGeneratorStack(minCap)
+		copy(s, curStack)
+		if len(curStack) > 0 {
+			oldBase := &curStack[0]
+			for i := st.genFrameIdx; i < st.frameIdx && i < len(vm.frames); i++ {
+				if len(vm.frames[i].stack) > 0 && &vm.frames[i].stack[0] == oldBase {
+					vm.frames[i].stack = s
+				}
+			}
+		}
+		st.activeGen.Stack = s
+		st.activeGen.PoolClass = newCls
+		st.stack = s
+		vm.execCtx.Stack = s
+		vm.releaseStackSlice(curStack)
+		return s
+	}
 	s := ensureStack(curStack, minCap)
 	st.stack = s
 	vm.execCtx.Stack = s
 	switch {
-	case st.activeGen != nil:
-		st.activeGen.Stack = s
 	case st.activeCoro != nil:
 		st.activeCoro.Stack = s
 	case st.stackIsVM:

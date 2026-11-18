@@ -26,6 +26,8 @@ var (
 	nameInstanceCheck    = val.InternString("__instancecheck__")
 	nameSubclassCheck    = val.InternString("__subclasscheck__")
 	nameClass            = val.InternString("__class__")
+	nameDunderDoc        = val.InternString("__doc__")
+	nameDunderDict       = val.InternString("__dict__")
 	nameLen              = val.InternString("len")
 	nameIsInstance       = val.InternString("isinstance")
 )

@@ -77,6 +77,17 @@ func HashBytes(b []byte) uint32 {
 	return finishHash64(maphash.Bytes(strHashSeed, b))
 }
 
+// inlineStrSlice unpacks inline string bytes into buf and returns the subslice.
+// Unlike unsafe.String, returning a slice of buf passed directly to bytes.* or
+// Builder.Write does not cause buf to escape when the slice is not retained.
+func inlineStrSlice(v Value, buf *[7]byte) []byte {
+	n := int(v.num & 0xFF)
+	for i := range n {
+		buf[i] = byte(v.num >> ((i + 1) * 8))
+	}
+	return buf[:n]
+}
+
 // AppendValueBytes appends the UTF-8 bytes of string-like Value v into dst without heap allocations.
 // If v is KindInlineStr, it unpacks the 1–7 bytes directly from v.num using bit shifts.
 // If v is KindString (*PyString), it views the underlying bytes via unsafe.Slice without copying.
