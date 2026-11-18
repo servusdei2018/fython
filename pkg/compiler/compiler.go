@@ -30,8 +30,6 @@ func DefaultOptimizeLevel() int {
 func init() {
 	vm.SetDefaultCompileHook(CompileSource)
 	vm.SetDefaultCompileWithFilenameHook(CompileSourceWithFilename)
-	vm.DefaultEngine().SetCompileHook(CompileSource)
-	vm.DefaultEngine().SetCompileWithFilenameHook(CompileSourceWithFilename)
 	hook := func(src []byte, filename string, mode int) (*vm.CodeObject, error) {
 		return CompileSourceMode(src, filename, CompileMode(mode))
 	}
@@ -41,8 +39,6 @@ func init() {
 	vm.SetDynamicCompileHook(hook)
 	vm.SetDynamicCompileOptimizeHook(optHook)
 	vm.SetDefaultIncompleteHook(IncompleteInput)
-	vm.DefaultEngine().SetDynamicCompileHook(hook)
-	vm.DefaultEngine().SetDynamicCompileOptimizeHook(optHook)
 }
 
 type CleanupKind int
@@ -96,7 +92,7 @@ type Compiler struct {
 }
 
 func buildLineStarts(src []byte) []int {
-	starts := []int{0}
+	starts := make([]int, 1, max(16, len(src)/40+2))
 	for i, b := range src {
 		if b == '\n' {
 			starts = append(starts, i+1)
@@ -345,6 +341,7 @@ func CompileSourceModeWithOptimize(src []byte, filename string, mode CompileMode
 	}
 	c := &Compiler{
 		src:            src,
+		lineStarts:     buildLineStarts(src),
 		arena:          arena,
 		scope:          topScope,
 		constPool:      NewConstPool(),
@@ -2091,12 +2088,13 @@ func (c *Compiler) compileFuncDef(stmt *ASTStmt) error {
 		}
 
 		annCompiler := &Compiler{
-			src:       c.src,
-			arena:     c.arena,
-			scope:     annScope,
-			constPool: NewConstPool(),
-			code:      make([]uint32, 0, 32),
-			optimize:  c.optimize,
+			src:        c.src,
+			lineStarts: c.lineStarts,
+			arena:      c.arena,
+			scope:      annScope,
+			constPool:  NewConstPool(),
+			code:       make([]uint32, 0, 32),
+			optimize:   c.optimize,
 		}
 
 		// PEP 749: only VALUE (1) and VALUE_WITH_FAKE_GLOBALS (2) are
@@ -3981,13 +3979,17 @@ func (c *Compiler) compileGenExp(expr *ASTExpr) error {
 	genScope := c.nextChildScope(ScopeFunction, "<genexpr>")
 
 	// 3. Subcompiler for genexpr
+	if len(c.lineStarts) == 0 {
+		c.lineStarts = buildLineStarts(c.src)
+	}
 	subCompiler := &Compiler{
-		src:       c.src,
-		arena:     c.arena,
-		scope:     genScope,
-		constPool: NewConstPool(),
-		code:      make([]uint32, 0, 32),
-		optimize:  c.optimize,
+		src:        c.src,
+		lineStarts: c.lineStarts,
+		arena:      c.arena,
+		scope:      genScope,
+		constPool:  NewConstPool(),
+		code:       make([]uint32, 0, 32),
+		optimize:   c.optimize,
 	}
 
 	// Load parameter 0 (.0)

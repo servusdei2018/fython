@@ -424,6 +424,10 @@ func (vm *VM) addSiteDir(siteDir string) {
 	}
 
 	for _, impLine := range imports {
+		if impLine == "import _virtualenv" {
+			vm.pendingVirtualenvPth = true
+			continue
+		}
 		co, err := vm.engine.CompileDynamic([]byte(impLine+"\n"), "<pth>", 0)
 		if err == nil && co != nil {
 			vm.RunCode(co)

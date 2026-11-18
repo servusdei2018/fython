@@ -204,7 +204,16 @@ func (p *pyPattern) subject(v val.Value) []rune {
 	panic("TypeError: expected string or bytes-like object, got '" + typeNameOf(v) + "'")
 }
 
-func (p *pyPattern) slice(in []rune, s, e int) val.Value {
+func (p *pyPattern) sliceSubject(strVal val.Value, in []rune, s, e int) val.Value {
+	if !p.IsBytes && strVal.IsAnyString() {
+		orig := strVal.AsString()
+		if len(orig) == len(in) {
+			if s == 0 && e == len(orig) && strVal.Type() == val.StrType {
+				return strVal
+			}
+			return val.NewStringVal(orig[s:e])
+		}
+	}
 	return p.fromRunes(in[s:e])
 }
 
@@ -390,7 +399,7 @@ func (m *pyMatch) groupVal(idx int, def val.Value) val.Value {
 	if s < 0 || e < 0 {
 		return def
 	}
-	return m.Pat.slice(m.In, s, e)
+	return m.Pat.sliceSubject(m.StringVal, m.In, s, e)
 }
 
 func (m *pyMatch) lastGroupName() val.Value {
@@ -451,12 +460,12 @@ func (p *pyPattern) findall(ctx *val.ExecContext, strVal, posV, endV val.Value) 
 		if s < 0 || e < 0 {
 			return p.fromRunes(nil)
 		}
-		return p.slice(in, s, e)
+		return p.sliceSubject(strVal, in, s, e)
 	}
 	p.iterate(in, pos, end, func(r *sre.Result) bool {
 		switch ng {
 		case 0:
-			list = append(list, p.slice(in, r.Caps[0], r.Caps[1]))
+			list = append(list, p.sliceSubject(strVal, in, r.Caps[0], r.Caps[1]))
 		case 1:
 			list = append(list, grp(r, 1))
 		default:
@@ -485,20 +494,20 @@ func (p *pyPattern) split(ctx *val.ExecContext, strVal, maxV val.Value) val.Valu
 		if maxsplit > 0 && n >= maxsplit {
 			return false
 		}
-		out = append(out, p.slice(in, last, r.Caps[0]))
+		out = append(out, p.sliceSubject(strVal, in, last, r.Caps[0]))
 		for i := 1; i <= p.Re.NumGroups; i++ {
 			s, e := r.Caps[2*i], r.Caps[2*i+1]
 			if s < 0 || e < 0 {
 				out = append(out, val.NoneVal())
 			} else {
-				out = append(out, p.slice(in, s, e))
+				out = append(out, p.sliceSubject(strVal, in, s, e))
 			}
 		}
 		n++
 		last = r.Caps[1]
 		return true
 	})
-	out = append(out, p.slice(in, last, len(in)))
+	out = append(out, p.sliceSubject(strVal, in, last, len(in)))
 	return val.NewListVal(out...)
 }
 

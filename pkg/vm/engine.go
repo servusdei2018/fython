@@ -60,6 +60,7 @@ type Engine struct {
 	vmPool                     sync.Pool
 	frameSlabPool              sync.Pool
 	codeCache                  sync.Map // maps canonical path or module name -> *CodeObject
+	dirCache                   sync.Map // maps directory path -> *dirListing
 	singleflight               CompilerSingleflight
 	sharedModules              *val.PyDict
 	isSharedModules            bool
@@ -153,15 +154,16 @@ func NewEngine() *Engine {
 	}
 
 	e := &Engine{
-		internPool:              val.NewInternPool(256),
-		rootShape:               val.NewRootShape(),
-		builtins:                val.NewDictVal(64).AsDict(),
-		searchPaths:             searchPaths,
-		asyncMode:               AsyncModeSingleThread,
-		compileHook:             defaultCompileHook,
-		compileWithFilenameHook: defaultCompileWithFilenameHook,
-		dynamicCompileHook:      defaultDynamicCompileHook,
-		incompleteHook:          defaultIncompleteHook,
+		internPool:                 val.NewInternPool(256),
+		rootShape:                  val.NewRootShape(),
+		builtins:                   val.NewDictVal(64).AsDict(),
+		searchPaths:                searchPaths,
+		asyncMode:                  AsyncModeSingleThread,
+		compileHook:                defaultCompileHook,
+		compileWithFilenameHook:    defaultCompileWithFilenameHook,
+		dynamicCompileHook:         defaultDynamicCompileHook,
+		dynamicCompileOptimizeHook: defaultDynamicCompileOptimizeHook,
+		incompleteHook:             defaultIncompleteHook,
 	}
 	// Temporary bootstrap VM to populate e.builtins
 	bootVM := &VM{
@@ -179,6 +181,7 @@ func NewEngine() *Engine {
 	// dictionary. It is installed once, because that dictionary is shared
 	// by every VM of the engine.
 	initImportlibTypes()
+	initLazyTypingHooks()
 	builtinsModVal := val.NewModuleVal("builtins", "")
 	builtinsModVal.AsModule().Dict = e.builtins
 	finalizeBuiltinModule(builtinsModVal)
@@ -203,10 +206,7 @@ func (e *Engine) newSysModules() *val.PyDict {
 func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 	initImportlibTypes()
 	initZipImportTypes()
-	// The typing types install the __class_getitem__ hook of the builtin
-	// container types and the union operator hook, so they have to exist
-	// even when the _typing module itself is never imported.
-	initTypingTypes()
+	initLazyTypingHooks()
 
 	modules := val.NewDictVal(64).AsDict()
 	eff := e.runtimeConfig.Effective()
@@ -806,6 +806,10 @@ func (e *Engine) newVMInternal(stackCap, frameCap int) *VM {
 		modules.Set(val.InternString("__main__"), mainModVal)
 	}
 	for _, impLine := range pthImports {
+		if impLine == "import _virtualenv" {
+			v.pendingVirtualenvPth = true
+			continue
+		}
 		co, err := e.CompileDynamic([]byte(impLine+"\n"), "<pth>", 0)
 		if err == nil && co != nil {
 			v.RunCode(co)

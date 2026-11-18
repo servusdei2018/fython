@@ -176,6 +176,7 @@ func NewServer(target string, cfg Config) (*Server, error) {
 	if cfg.Engine == nil {
 		cfg.Engine = vm.NewEngine()
 	}
+	vm.EnsureIOTypes()
 
 	cfg.Engine.SetSharedModules(true)
 	val.SetMultiThreaded(true)

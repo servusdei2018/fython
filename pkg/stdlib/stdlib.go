@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"path"
 	"strings"
+	"sync"
 )
 
 //go:generate go run generate.go
@@ -12,17 +13,23 @@ import (
 //go:embed all:lib
 var StdlibFS embed.FS
 
-// CPythonLicense is the PSF license shipped with the pinned CPython drop.
-// It lives in the embedded tree as lib/LICENSE so the build does not depend
-// on a second //go:embed pattern.
-var CPythonLicense = mustCPythonLicense()
+var (
+	cpythonLicenseOnce sync.Once
+	cpythonLicenseData []byte
+)
 
-func mustCPythonLicense() []byte {
-	b, err := StdlibFS.ReadFile("lib/LICENSE")
-	if err != nil {
-		panic("stdlib: embedded CPython license missing: " + err.Error())
-	}
-	return b
+// CPythonLicense returns the PSF license shipped with the pinned CPython drop.
+// It lives in the embedded tree as lib/LICENSE so the build does not depend
+// on a second //go:embed pattern, and is loaded lazily on first use.
+func CPythonLicense() []byte {
+	cpythonLicenseOnce.Do(func() {
+		b, err := StdlibFS.ReadFile("lib/LICENSE")
+		if err != nil {
+			panic("stdlib: embedded CPython license missing: " + err.Error())
+		}
+		cpythonLicenseData = b
+	})
+	return cpythonLicenseData
 }
 
 // FindModule locates a pure-Python module in the embedded standard library.

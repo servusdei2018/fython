@@ -9,7 +9,7 @@ import (
 )
 
 func TestCPythonLicense(t *testing.T) {
-	text := string(CPythonLicense)
+	text := string(CPythonLicense())
 	if !strings.Contains(text, "PYTHON SOFTWARE FOUNDATION LICENSE VERSION 2") {
 		t.Fatal("embedded lib/LICENSE is missing the PSF License Version 2")
 	}

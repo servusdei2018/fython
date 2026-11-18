@@ -860,7 +860,6 @@ func (vm *VM) opFastAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 			instShape := instObj.Shape
 			instType := instObj.Header.Type
 			if instShape != nil && instType != nil && (instType.Flags&val.FlagCustomGetAttribute) == 0 && !val.MultiThreadedFlag.Load() {
-				pic := &st.cache.attrPIC[ip+1]
 				if slotIdx, ok := instShape.Lookup(st.consts[uint16(inst)]); ok {
 					if _, _, foundInClass := instType.LookupMRO(st.consts[uint16(inst)]); !foundInClass {
 						if uint(slotIdx) < uint(len(instObj.Slots)) {
@@ -868,6 +867,7 @@ func (vm *VM) opFastAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 							if v.IsInt64() {
 								vi := v.AsInt64()
 								if int64(int32(vi)) == vi {
+									pic := &st.cache.ensureAttrPIC()[ip+1]
 									if pic[0].Shape == nil || pic[0].Shape == instShape {
 										pic[0] = AttrPICEntry{Shape: instShape, SlotIndex: int32(slotIdx), TypeVer: uint32(instType.Version())}
 									}
@@ -885,12 +885,12 @@ func (vm *VM) opFastAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 			instShape := instObj.Shape
 			instType := instObj.Header.Type
 			if instShape != nil && instType != nil && (instType.Flags&val.FlagCustomGetAttribute) == 0 && !val.MultiThreadedFlag.Load() {
-				pic := &st.cache.attrPIC[ip+1]
 				if slotIdx, ok := instShape.Lookup(st.consts[uint16(inst)]); ok {
 					if _, _, foundInClass := instType.LookupMRO(st.consts[uint16(inst)]); !foundInClass {
 						if uint(slotIdx) < uint(len(instObj.Slots)) {
 							v := instObj.Slots[slotIdx]
 							if !v.IsUnbound() {
+								pic := &st.cache.ensureAttrPIC()[ip+1]
 								if pic[0].Shape == nil || pic[0].Shape == instShape {
 									pic[0] = AttrPICEntry{Shape: instShape, SlotIndex: int32(slotIdx), TypeVer: uint32(instType.Version())}
 								}
@@ -909,11 +909,11 @@ func (vm *VM) opFastAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 				instShape := instObj.Shape
 				instType := instObj.Header.Type
 				if instShape != nil && instType != nil && (instType.Flags&val.FlagCustomSetAttr) == 0 && !val.MultiThreadedFlag.Load() {
-					pic := &st.cache.attrPIC[ip+1]
 					if slotIdx, ok := instShape.Lookup(st.consts[uint16(inst)]); ok {
 						if _, _, foundInClass := instType.LookupMRO(st.consts[uint16(inst)]); !foundInClass {
 							if uint(slotIdx) < uint(len(instObj.Slots)) {
 								instObj.Slots[slotIdx] = v
+								pic := &st.cache.ensureAttrPIC()[ip+1]
 								if pic[0].Shape == nil || pic[0].Shape == instShape {
 									pic[0] = AttrPICEntry{Shape: instShape, SlotIndex: int32(slotIdx), TypeVer: uint32(instType.Version())}
 								}

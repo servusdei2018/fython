@@ -174,7 +174,7 @@ func (vm *VM) ensureFrameCapacity(minFrames int) {
 }
 
 func (vm *VM) runNestedCode(co *CodeObject, globals *val.PyDict, locals val.Value, cells []val.Value) val.Value {
-	extra := co.NumLocals + co.MaxStackSize + 64
+	extra := co.NumLocals + max(co.MaxStackSize, len(co.Code)) + 64
 	base, nextFrame := vm.nextNestedStackAndFrame(extra)
 	savedSP := vm.execCtx.SP
 	savedFrameIdx := vm.activeFrameIdx
@@ -2413,8 +2413,9 @@ func (vm *VM) runFrame(co *CodeObject, startBase int, startSP int, startFrameIdx
 	vm.activeCells = startCells
 	vm.activeCellPtrs = cellPtrs
 
-	if startBase+256 > len(stack) {
-		stack = vm.growStack(st, stack, startBase+256)
+	minStack := startBase + max(256, co.NumLocals+max(co.MaxStackSize, len(co.Code))+64)
+	if minStack > len(stack) {
+		stack = vm.growStack(st, stack, minStack)
 	}
 	st.stack = stack
 	st.stackIsVM = activeGen == nil && activeCoro == nil && len(vm.stack) > 0 && &stack[0] == &vm.stack[0]
@@ -2778,13 +2779,15 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				instObj := obj.AsInstance()
 				instShape := instObj.Shape
 				instType := instObj.Header.Type
-				pic := &st.cache.methodPIC[ip]
-				for k := range 4 {
-					if pic[k].Shape == instShape && instType.Version() == pic[k].TypeVersion {
-						*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16)) = pic[k].TargetVal
-						sp++
-						ip++
-						goto loadMethodHit
+				if uint(ip) < uint(len(st.cache.methodPIC)) {
+					pic := &st.cache.methodPIC[ip]
+					for k := range 4 {
+						if pic[k].Shape == instShape && instType.Version() == pic[k].TypeVersion {
+							*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16)) = pic[k].TargetVal
+							sp++
+							ip++
+							goto loadMethodHit
+						}
 					}
 				}
 				entry := st.cache.ic[ip]
@@ -2859,7 +2862,7 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 			newBase := sp - argc - 1
 			receiver := *(*val.Value)(unsafe.Add(stackPtr, uintptr(newBase)*16))
 			totalArgs := argc + 1
-			if !vm.hasTrackedViews && receiver.IsInstance() {
+			if !vm.hasTrackedViews && receiver.IsInstance() && uint(ip) < uint(len(st.cache.methodPIC)) {
 				instObj := receiver.AsInstance()
 				instShape := instObj.Shape
 				instType := instObj.Header.Type
@@ -2953,7 +2956,7 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 			if instObj := obj.AsInstanceChecked(); instObj != nil {
 				instShape := instObj.Shape
 				instType := instObj.Header.Type
-				if instShape != nil && instType != nil && (instType.Flags&val.FlagCustomGetAttribute) == 0 && !val.MultiThreadedFlag.Load() {
+				if instShape != nil && instType != nil && (instType.Flags&val.FlagCustomGetAttribute) == 0 && !val.MultiThreadedFlag.Load() && uint(ip+1) < uint(len(st.cache.attrPIC)) {
 					pic := &st.cache.attrPIC[ip+1]
 					if pic[0].Shape == instShape && pic[0].TypeVer == uint32(instType.Version()) {
 						slotIdx := pic[0].SlotIndex
@@ -2980,7 +2983,7 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 			if instObj := obj.AsInstanceChecked(); instObj != nil {
 				instShape := instObj.Shape
 				instType := instObj.Header.Type
-				if instShape != nil && instType != nil && (instType.Flags&val.FlagCustomGetAttribute) == 0 && !val.MultiThreadedFlag.Load() {
+				if instShape != nil && instType != nil && (instType.Flags&val.FlagCustomGetAttribute) == 0 && !val.MultiThreadedFlag.Load() && uint(ip+1) < uint(len(st.cache.attrPIC)) {
 					pic := &st.cache.attrPIC[ip+1]
 					if pic[0].Shape == instShape && pic[0].TypeVer == uint32(instType.Version()) {
 						slotIdx := pic[0].SlotIndex
@@ -3006,7 +3009,7 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				if instObj := obj.AsInstanceChecked(); instObj != nil {
 					instShape := instObj.Shape
 					instType := instObj.Header.Type
-					if instShape != nil && instType != nil && (instType.Flags&val.FlagCustomSetAttr) == 0 {
+					if instShape != nil && instType != nil && (instType.Flags&val.FlagCustomSetAttr) == 0 && uint(ip+1) < uint(len(st.cache.attrPIC)) {
 						pic := &st.cache.attrPIC[ip+1]
 						if pic[0].Shape == instShape && pic[0].TypeVer == uint32(instType.Version()) {
 							slotIdx := pic[0].SlotIndex
@@ -3041,16 +3044,18 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 							}
 						}
 					}
-					pic := &st.cache.attrPIC[ip]
-					for k := range 4 {
-						if pic[k].Shape == instShape && pic[k].TypeVer == uint32(typeVer) {
-							slotIdx := pic[k].SlotIndex
-							if uint(slotIdx) < uint(len(instObj.Slots)) {
-								v := instObj.Slots[slotIdx]
-								if !v.IsUnbound() {
-									*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)) = v
-									ip++
-									goto loadAttrHit
+					if uint(ip) < uint(len(st.cache.attrPIC)) {
+						pic := &st.cache.attrPIC[ip]
+						for k := range 4 {
+							if pic[k].Shape == instShape && pic[k].TypeVer == uint32(typeVer) {
+								slotIdx := pic[k].SlotIndex
+								if uint(slotIdx) < uint(len(instObj.Slots)) {
+									v := instObj.Slots[slotIdx]
+									if !v.IsUnbound() {
+										*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)) = v
+										ip++
+										goto loadAttrHit
+									}
 								}
 							}
 						}
@@ -3089,15 +3094,17 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 					instType := instObj.Header.Type
 					if instShape != nil && instType != nil && (instType.Flags&val.FlagCustomSetAttr) == 0 {
 						typeVer := instType.Version()
-						pic := &st.cache.attrPIC[ip]
-						for k := range 4 {
-							if pic[k].Shape == instShape && pic[k].TypeVer == uint32(typeVer) {
-								slotIdx := pic[k].SlotIndex
-								if uint(slotIdx) < uint(len(instObj.Slots)) {
-									instObj.Slots[slotIdx] = v
-									sp -= 2
-									ip++
-									goto storeAttrHit
+						if uint(ip) < uint(len(st.cache.attrPIC)) {
+							pic := &st.cache.attrPIC[ip]
+							for k := range 4 {
+								if pic[k].Shape == instShape && pic[k].TypeVer == uint32(typeVer) {
+									slotIdx := pic[k].SlotIndex
+									if uint(slotIdx) < uint(len(instObj.Slots)) {
+										instObj.Slots[slotIdx] = v
+										sp -= 2
+										ip++
+										goto storeAttrHit
+									}
 								}
 							}
 						}

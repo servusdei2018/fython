@@ -2,7 +2,6 @@ package val
 
 import (
 	"bytes"
-	"encoding/hex"
 	"fmt"
 	"math"
 	"math/big"
@@ -4375,42 +4374,6 @@ func initTypes() {
 		return NewStringVal(strings.ToUpper(args[0].AsString()))
 	}))
 
-	StrType.Dict.Set(InternString("strip"), NewBuiltinFuncVal("strip", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		if len(args) < 1 {
-			ctx.Raise(NewException(TypeErrorType, "descriptor 'strip' of 'str' object needs an argument"))
-			return NoneVal()
-		}
-		cutset := " \t\r\n\v\f"
-		if len(args) > 1 && args[1].IsAnyString() {
-			cutset = args[1].AsString()
-		}
-		return NewStringVal(strings.Trim(args[0].AsString(), cutset))
-	}))
-
-	StrType.Dict.Set(InternString("lstrip"), NewBuiltinFuncVal("lstrip", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		if len(args) < 1 {
-			ctx.Raise(NewException(TypeErrorType, "descriptor 'lstrip' of 'str' object needs an argument"))
-			return NoneVal()
-		}
-		cutset := " \t\r\n\v\f"
-		if len(args) > 1 && args[1].IsAnyString() {
-			cutset = args[1].AsString()
-		}
-		return NewStringVal(strings.TrimLeft(args[0].AsString(), cutset))
-	}))
-
-	StrType.Dict.Set(InternString("rstrip"), NewBuiltinFuncVal("rstrip", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		if len(args) < 1 {
-			ctx.Raise(NewException(TypeErrorType, "descriptor 'rstrip' of 'str' object needs an argument"))
-			return NoneVal()
-		}
-		cutset := " \t\r\n\v\f"
-		if len(args) > 1 && args[1].IsAnyString() {
-			cutset = args[1].AsString()
-		}
-		return NewStringVal(strings.TrimRight(args[0].AsString(), cutset))
-	}))
-
 	StrType.Dict.Set(InternString("startswith"), NewBuiltinFuncVal("startswith", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
 			ctx.Raise(NewException(TypeErrorType, "startswith() takes at least 1 argument"))
@@ -4572,41 +4535,6 @@ func initTypes() {
 			newStr = args[2].AsString()
 		}
 		return NewStringVal(strings.Replace(s, oldStr, newStr, n))
-	}))
-
-	StrType.Dict.Set(InternString("split"), NewBuiltinFuncVal("split", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		if len(args) < 1 {
-			ctx.Raise(NewException(TypeErrorType, "descriptor 'split' of 'str' object needs an argument"))
-			return NoneVal()
-		}
-		s := args[0].AsString()
-		var parts []string
-		if len(args) > 1 && !args[1].IsNone() {
-			var sepBuf [7]byte
-			var sep string
-			if args[1].ptr == &tagInlineStr {
-				sb := inlineStrSlice(args[1], &sepBuf)
-				sep = unsafe.String(&sepBuf[0], len(sb))
-			} else {
-				sep = args[1].AsString()
-			}
-			maxsplit := -1
-			if len(args) > 2 && args[2].IsInt64() {
-				maxsplit = int(args[2].AsInt64())
-			}
-			if maxsplit >= 0 {
-				parts = strings.SplitN(s, sep, maxsplit+1)
-			} else {
-				parts = strings.Split(s, sep)
-			}
-		} else {
-			parts = strings.Fields(s)
-		}
-		items := make([]Value, len(parts))
-		for i, p := range parts {
-			items[i] = NewStringVal(p)
-		}
-		return NewListVal(items...)
 	}))
 
 	TypeType.Dict.Set(DunderCall, NewBuiltinFuncVal("type.__call__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
@@ -4775,54 +4703,6 @@ func initTypes() {
 			}
 		}
 		return NewStringVal(b.String())
-	}))
-
-	StrType.Dict.Set(InternString("find"), NewBuiltinFuncVal("find", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		if len(args) < 2 {
-			ctx.Raise(NewException(TypeErrorType, "find() takes at least 1 argument"))
-			return NoneVal()
-		}
-		s := args[0].AsString()
-		sub := args[1].AsString()
-		start := 0
-		if len(args) > 2 && args[2].IsInt64() {
-			start = int(args[2].AsInt64())
-			if start < 0 {
-				start += len(s)
-				if start < 0 {
-					start = 0
-				}
-			}
-		}
-		if start >= len(s) {
-			return Int64Val(-1)
-		}
-		idx := strings.Index(s[start:], sub)
-		if idx == -1 {
-			return Int64Val(-1)
-		}
-		return Int64Val(int64(start + idx))
-	}))
-
-	StrType.Dict.Set(InternString("rfind"), NewBuiltinFuncVal("rfind", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		if len(args) < 2 {
-			ctx.Raise(NewException(TypeErrorType, "rfind() takes at least 1 argument"))
-			return NoneVal()
-		}
-		s := args[0].AsString()
-		sub := args[1].AsString()
-		idx := strings.LastIndex(s, sub)
-		return Int64Val(int64(idx))
-	}))
-
-	StrType.Dict.Set(InternString("count"), NewBuiltinFuncVal("count", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		if len(args) < 2 {
-			ctx.Raise(NewException(TypeErrorType, "count() takes at least 1 argument"))
-			return NoneVal()
-		}
-		s := args[0].AsString()
-		sub := args[1].AsString()
-		return Int64Val(int64(strings.Count(s, sub)))
 	}))
 
 	StrType.Dict.Set(InternString("encode"), NewBuiltinFuncVal("encode", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
@@ -7455,68 +7335,6 @@ func initTypes() {
 		}
 		return NewStringVal(decoded)
 	}))
-	BytesType.Dict.Set(InternString("hex"), NewBuiltinFuncVal("hex", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		if len(args) < 1 {
-			ctx.Raise(NewException(TypeErrorType, "hex() takes at least 1 argument"))
-			return NoneVal()
-		}
-		b := args[0].AsBytes()
-		return NewStringVal(hex.EncodeToString(b.Data))
-	}))
-	BytesType.Dict.Set(InternString("startswith"), NewBuiltinFuncVal("startswith", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		if len(args) < 2 {
-			ctx.Raise(NewException(TypeErrorType, "startswith() takes 1 argument"))
-			return NoneVal()
-		}
-		b := args[0].AsBytes().Data
-		var prefix []byte
-		switch {
-		case args[1].IsBytes():
-			prefix = args[1].AsBytes().Data
-		case args[1].IsByteArray():
-			prefix = args[1].AsByteArray().Data
-		default:
-			ctx.Raise(NewException(TypeErrorType, "startswith first arg must be bytes or a tuple of bytes"))
-			return NoneVal()
-		}
-		return BoolVal(bytes.HasPrefix(b, prefix))
-	}))
-	BytesType.Dict.Set(InternString("endswith"), NewBuiltinFuncVal("endswith", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		if len(args) < 2 {
-			ctx.Raise(NewException(TypeErrorType, "endswith() takes 1 argument"))
-			return NoneVal()
-		}
-		b := args[0].AsBytes().Data
-		var suffix []byte
-		switch {
-		case args[1].IsBytes():
-			suffix = args[1].AsBytes().Data
-		case args[1].IsByteArray():
-			suffix = args[1].AsByteArray().Data
-		default:
-			ctx.Raise(NewException(TypeErrorType, "endswith first arg must be bytes or a tuple of bytes"))
-			return NoneVal()
-		}
-		return BoolVal(bytes.HasSuffix(b, suffix))
-	}))
-	BytesType.Dict.Set(InternString("find"), NewBuiltinFuncVal("find", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		if len(args) < 2 {
-			ctx.Raise(NewException(TypeErrorType, "find() takes 1 argument"))
-			return NoneVal()
-		}
-		b := args[0].AsBytes().Data
-		var sub []byte
-		switch {
-		case args[1].IsBytes():
-			sub = args[1].AsBytes().Data
-		case args[1].IsByteArray():
-			sub = args[1].AsByteArray().Data
-		default:
-			ctx.Raise(NewException(TypeErrorType, "find argument must be bytes"))
-			return NoneVal()
-		}
-		return Int64Val(int64(bytes.Index(b, sub)))
-	}))
 
 	ByteArrayType = MustNewType("bytearray", []*PyType{ObjectType}, nil)
 	ByteArrayType.Dict.Set(InternString("__hash__"), NoneVal())
@@ -7633,17 +7451,6 @@ func initTypes() {
 			panic(err.Error())
 		}
 		return NewStringVal(decoded)
-	}))
-	ByteArrayType.Dict.Set(InternString("hex"), NewBuiltinFuncVal("hex", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		if len(args) < 1 {
-			ctx.Raise(NewException(TypeErrorType, "hex() takes at least 1 argument"))
-			return NoneVal()
-		}
-		ba := args[0].AsByteArray()
-		ba.mu.RLock()
-		s := hex.EncodeToString(ba.Data)
-		ba.mu.RUnlock()
-		return NewStringVal(s)
 	}))
 
 	initBytesMethods()

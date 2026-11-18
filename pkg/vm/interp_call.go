@@ -708,7 +708,7 @@ func (vm *VM) opCallMethodDescr(st *loopState, inst uint32, ip, sp int) (int, in
 	retSP := newBase
 	receiver := stack[newBase]
 	totalArgs := argc + 1
-	if !receiver.IsInstance() && !receiver.IsSuper() && !receiver.IsModule() && !receiver.IsType() {
+	if !receiver.IsInstance() && !receiver.IsSuper() && !receiver.IsModule() && !receiver.IsType() && uint(ip) < uint(len(st.cache.methodPIC)) {
 		tp := receiver.Type()
 		pic := &st.cache.methodPIC[ip]
 		var nativeFn val.VectorcallFunc
@@ -1562,11 +1562,12 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 	if vm.hasTrackedViews && totalArgs > 0 {
 		markViewsEscaped(stack[newBase : newBase+totalArgs])
 	}
+	methodPIC := st.cache.ensureMethodPIC()
 
 	if !receiver.IsInstance() && !receiver.IsSuper() && !receiver.IsModule() && !receiver.IsType() {
 		tp := receiver.Type()
 		attrName := st.consts[methIdx]
-		pic := &st.cache.methodPIC[ip]
+		pic := &methodPIC[ip]
 		var nativeFn val.VectorcallFunc
 		var targetVal val.Value
 		found := false
@@ -1588,7 +1589,7 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 				st.stack = stack
 				vm.syncActiveFrame(st, ip)
 				vm.execCtx.SP = newBase + totalArgs
-				res := vm.callMethodPICSlowSafe(receiver, st.consts[methIdx], ip, newBase, argc, st.frameIdx, st.cache.methodPIC)
+				res := vm.callMethodPICSlowSafe(receiver, st.consts[methIdx], ip, newBase, argc, st.frameIdx, methodPIC)
 				stack = st.syncStackFromExecCtx(vm, stack)
 				if vm.execCtx.HasException() {
 					exc := vm.execCtx.ActiveException
@@ -1639,7 +1640,7 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 		instObj := receiver.AsInstance()
 		instShape := instObj.Shape
 		instType := instObj.Header.Type
-		pic := &st.cache.methodPIC[ip]
+		pic := &methodPIC[ip]
 		var targetFn *val.PyFunction
 		var nativeFn val.VectorcallFunc
 		var targetVal val.Value
@@ -1707,7 +1708,7 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 	st.stack = stack
 	vm.syncActiveFrame(st, ip)
 	vm.execCtx.SP = newBase + totalArgs
-	res := vm.callMethodPICSlowSafe(receiver, st.consts[methIdx], ip, newBase, argc, st.frameIdx, st.cache.methodPIC)
+	res := vm.callMethodPICSlowSafe(receiver, st.consts[methIdx], ip, newBase, argc, st.frameIdx, methodPIC)
 	stack = st.syncStackFromExecCtx(vm, stack)
 	if vm.execCtx.HasException() {
 		exc := vm.execCtx.ActiveException

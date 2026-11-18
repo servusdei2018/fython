@@ -72,6 +72,18 @@ func (pf *pyFile) flushLocked() {
 	}
 }
 
+func (pf *pyFile) ensureReader() *bufio.Reader {
+	if pf.reader == nil && pf.f != nil {
+		pf.reader = bufio.NewReader(pf.f)
+	}
+	return pf.reader
+}
+
+// EnsureIOTypes initializes BytesIOType, StringIOType, and FileType.
+func EnsureIOTypes() {
+	initIOTypes()
+}
+
 func initIOTypes() {
 	ioInitOnce.Do(func() {
 		// BytesIO
@@ -720,7 +732,7 @@ func initIOTypes() {
 						}
 					}
 				}
-				content, err := io.ReadAll(pf.reader)
+				content, err := io.ReadAll(pf.ensureReader())
 				if err != nil && len(content) == 0 {
 					if isMT {
 						pf.mu.Unlock()
@@ -748,7 +760,7 @@ func initIOTypes() {
 				return val.ObjectVal(&ps.Header)
 			}
 			buf := make([]byte, n)
-			readN, _ := io.ReadFull(pf.reader, buf)
+			readN, _ := io.ReadFull(pf.ensureReader(), buf)
 			if isMT {
 				pf.mu.Unlock()
 			}
@@ -781,7 +793,7 @@ func initIOTypes() {
 				ctx.Raise(val.NewException(val.ValueErrorType, "I/O operation on closed file."))
 				return val.NoneVal()
 			}
-			line, err := pf.reader.ReadBytes('\n')
+			line, err := pf.ensureReader().ReadBytes('\n')
 			if err != nil && len(line) == 0 {
 				if pf.binary {
 					return val.NewBytesVal(nil)
@@ -802,9 +814,10 @@ func initIOTypes() {
 				ctx.Raise(val.NewException(val.ValueErrorType, "I/O operation on closed file."))
 				return val.NoneVal()
 			}
+			rdr := pf.ensureReader()
 			var lines []val.Value
 			for {
-				line, err := pf.reader.ReadBytes('\n')
+				line, err := rdr.ReadBytes('\n')
 				if len(line) > 0 {
 					if pf.binary {
 						lines = append(lines, val.NewBytesVal(line))
@@ -996,7 +1009,7 @@ func initIOTypes() {
 				if pf.isClosed {
 					return val.NoneVal(), false
 				}
-				line, err := pf.reader.ReadBytes('\n')
+				line, err := pf.ensureReader().ReadBytes('\n')
 				if err != nil && len(line) == 0 {
 					return val.NoneVal(), false
 				}
@@ -1120,15 +1133,9 @@ func openFileBuiltinValCtx(ctx *val.ExecContext, fileVal val.Value, mode string)
 		writeBuf = (*pooledBuf)[:0]
 	}
 
-	var reader *bufio.Reader
-	if strings.Contains(mode, "r") || strings.Contains(mode, "+") {
-		reader = bufio.NewReader(f)
-	}
-
 	pf := &pyFile{
 		inst:      val.PyInstance{Header: val.ObjectHeader{Kind: val.KindInstance, Type: FileType}, Shape: FileType.RootShape},
 		f:         f,
-		reader:    reader,
 		writeBuf:  writeBuf,
 		binary:    binary,
 		pooledBuf: pooledBuf,
@@ -1166,7 +1173,6 @@ func newStdStream(f *os.File, name string, writable bool) val.Value {
 	bufPf := &pyFile{
 		inst:       val.PyInstance{Header: val.ObjectHeader{Kind: val.KindInstance, Type: FileType}, Shape: FileType.RootShape},
 		f:          f,
-		reader:     bufio.NewReader(f),
 		binary:     true,
 		unbuffered: writable,
 		name:       name,
@@ -1179,7 +1185,6 @@ func newStdStream(f *os.File, name string, writable bool) val.Value {
 	pf := &pyFile{
 		inst:       val.PyInstance{Header: val.ObjectHeader{Kind: val.KindInstance, Type: FileType}, Shape: FileType.RootShape},
 		f:          f,
-		reader:     bufio.NewReader(f),
 		unbuffered: writable,
 		name:       name,
 	}

@@ -79,8 +79,20 @@ func (re *Regexp) ExecFrom(input []rune, pos, endpos int, mode Mode, mustAdvance
 				if canon(r, ascii) != canon(re.firstLit, ascii) {
 					return nil
 				}
-			} else if r != re.firstLit {
-				return nil
+			} else {
+				if r != re.firstLit {
+					return nil
+				}
+				if len(re.prefix) > 1 {
+					if pos+len(re.prefix) > endpos {
+						return nil
+					}
+					for i := 1; i < len(re.prefix); i++ {
+						if input[pos+i] != re.prefix[i] {
+							return nil
+						}
+					}
+				}
 			}
 		} else if re.hasFirstMask {
 			if r < 256 {
@@ -158,16 +170,40 @@ func (re *Regexp) ExecFrom(input []rune, pos, endpos int, mode Mode, mustAdvance
 		for s := pos; s <= endpos; s++ {
 			if re.hasFirst {
 				ascii := re.Flags&FlagASCII != 0
-				for s < endpos {
-					r := input[s]
-					if re.firstFold {
-						if canon(r, ascii) == canon(re.firstLit, ascii) {
+				switch {
+				case re.firstFold:
+					want := canon(re.firstLit, ascii)
+					for s < endpos {
+						if canon(input[s], ascii) == want {
 							break
 						}
-					} else if r == re.firstLit {
-						break
+						s++
 					}
-					s++
+				case len(re.prefix) > 1:
+					pref := re.prefix
+					plen := len(pref)
+					first := pref[0]
+				scanPrefix:
+					for s+plen <= endpos {
+						if input[s] == first {
+							for i := 1; i < plen; i++ {
+								if input[s+i] != pref[i] {
+									s++
+									continue scanPrefix
+								}
+							}
+							break
+						}
+						s++
+					}
+					if s+plen > endpos {
+						s = endpos
+					}
+				default:
+					want := re.firstLit
+					for s < endpos && input[s] != want {
+						s++
+					}
 				}
 				if s >= endpos {
 					break
@@ -175,10 +211,7 @@ func (re *Regexp) ExecFrom(input []rune, pos, endpos int, mode Mode, mustAdvance
 			} else if re.hasFirstMask {
 				for s < endpos {
 					r := input[s]
-					if r >= 256 {
-						break
-					}
-					if (re.firstMask[r>>6]>>(uint(r)&63))&1 != 0 {
+					if r >= 256 || (re.firstMask[r>>6]>>(uint(r)&63))&1 != 0 {
 						break
 					}
 					s++
@@ -270,6 +303,10 @@ func (m *matcher) backtrack(base int) (pc, pos int, ok bool) {
 			next := &m.prog[e.pc]
 			for cur >= floor {
 				if next.op == opChar && (cur >= m.end || m.in[cur] != next.r) {
+					cur--
+					continue
+				}
+				if next.op == opSet && cur < m.end && !next.set.has(m.in[cur]) {
 					cur--
 					continue
 				}
@@ -522,8 +559,39 @@ func (m *matcher) run(pc, pos int) (int, bool) {
 			if in.max >= 0 && in.max < limit {
 				limit = in.max
 			}
-			for n < limit && m.single(in, m.in[pos+n]) {
-				n++
+			subSlice := m.in[pos : pos+limit]
+			switch in.sub {
+			case opChar:
+				want := in.r
+				for n < len(subSlice) && subSlice[n] == want {
+					n++
+				}
+			case opCharFold:
+				ascii := in.flags&flAscii != 0
+				want := in.r
+				for n < len(subSlice) && canon(subSlice[n], ascii) == want {
+					n++
+				}
+			case opAny:
+				for n < len(subSlice) && subSlice[n] != '\n' {
+					n++
+				}
+			case opAnyNL:
+				n = len(subSlice)
+			case opSet:
+				cs := in.set
+				tbl := &cs.table
+				for n < len(subSlice) {
+					r := subSlice[n]
+					if uint32(r) < 128 {
+						if !tbl[r] {
+							break
+						}
+					} else if !cs.slow(r) {
+						break
+					}
+					n++
+				}
 			}
 			if n < in.min {
 				ok = false

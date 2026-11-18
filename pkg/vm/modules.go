@@ -3,14 +3,32 @@ package vm
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/servusdei2018/fython/pkg/stdlib"
 	"github.com/servusdei2018/fython/pkg/val"
 )
+
+var (
+	stdlibFycDirOnce sync.Once
+	stdlibFycBaseDir string
+)
+
+func getStdlibFycPath(vfsPath string, optimize int) string {
+	stdlibFycDirOnce.Do(func() {
+		stdlibFycBaseDir = filepath.Join(os.TempDir(), fmt.Sprintf("fython-stdlib-fyc-v%d", FycVersion))
+	})
+	rel := strings.TrimSuffix(filepath.FromSlash(vfsPath), ".py")
+	if optimize > 0 {
+		return filepath.Join(stdlibFycBaseDir, fmt.Sprintf("%s.opt-%d.fyc", rel, optimize))
+	}
+	return filepath.Join(stdlibFycBaseDir, rel+".fyc")
+}
 
 // resolveRelativeImport converts a relative import (level > 0) to a canonical absolute module name
 // using __package__ or __name__ from callerGlobals according to PEP 328 / PEP 451.
@@ -87,11 +105,67 @@ func (vm *VM) liveSysPath() []string {
 	return []string{"."}
 }
 
+type dirListing struct {
+	mtimeNano int64
+	files     map[string]bool
+	dirs      map[string]bool
+	hasExt    bool
+}
+
+func (e *Engine) getDirListing(dir string) *dirListing {
+	dirInfo, err := os.Stat(dir)
+	if err != nil || !dirInfo.IsDir() {
+		return nil
+	}
+	mtime := dirInfo.ModTime().UnixNano()
+	if cached, ok := e.dirCache.Load(dir); ok {
+		dl := cached.(*dirListing)
+		if dl.mtimeNano == mtime {
+			return dl
+		}
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	dl := &dirListing{
+		mtimeNano: mtime,
+		files:     make(map[string]bool, len(entries)),
+		dirs:      make(map[string]bool, max(4, len(entries)/4)),
+	}
+	for _, ent := range entries {
+		name := ent.Name()
+		switch {
+		case ent.IsDir():
+			dl.dirs[name] = true
+		case ent.Type()&os.ModeSymlink != 0:
+			if info, err := os.Stat(filepath.Join(dir, name)); err == nil {
+				if info.IsDir() {
+					dl.dirs[name] = true
+				} else {
+					dl.files[name] = true
+					if strings.HasSuffix(name, ".so") || strings.HasSuffix(name, ".pyd") {
+						dl.hasExt = true
+					}
+				}
+			}
+		default:
+			dl.files[name] = true
+			if strings.HasSuffix(name, ".so") || strings.HasSuffix(name, ".pyd") {
+				dl.hasExt = true
+			}
+		}
+	}
+	e.dirCache.Store(dir, dl)
+	return dl
+}
+
 // findModuleFile searches the provided search paths for a module or package file.
 func (e *Engine) findModuleFile(moduleName string, searchDirs []string) (string, bool, bool) {
 	parts := strings.Split(moduleName, ".")
 	relPath := filepath.Join(parts...)
 	relSlash := path.Join(parts...)
+	single := len(parts) == 1
 
 	for _, dir := range searchDirs {
 		if dir == "" {
@@ -99,11 +173,11 @@ func (e *Engine) findModuleFile(moduleName string, searchDirs []string) (string,
 		}
 		if vfsDir, ok := strings.CutPrefix(dir, "stdlib:"); ok {
 			initPath := path.Join(vfsDir, relSlash, "__init__.py")
-			if _, err := stdlib.StdlibFS.ReadFile(initPath); err == nil {
+			if _, err := fs.Stat(stdlib.StdlibFS, initPath); err == nil {
 				return "stdlib:" + initPath, true, true
 			}
 			modPath := path.Join(vfsDir, relSlash+".py")
-			if _, err := stdlib.StdlibFS.ReadFile(modPath); err == nil {
+			if _, err := fs.Stat(stdlib.StdlibFS, modPath); err == nil {
 				return "stdlib:" + modPath, false, true
 			}
 			continue
@@ -113,6 +187,39 @@ func (e *Engine) findModuleFile(moduleName string, searchDirs []string) (string,
 		if archPath, prefix, arch, ok := splitZipArchivePath(dir); ok && arch != nil {
 			if entryPath, isPkg, found := arch.findModule(prefix, relSlash); found {
 				return archPath + "/" + entryPath, isPkg, true
+			}
+			continue
+		}
+
+		if single {
+			dl := e.getDirListing(dir)
+			if dl == nil {
+				continue
+			}
+			if dl.dirs[moduleName] {
+				subListing := e.getDirListing(filepath.Join(dir, moduleName))
+				if subListing != nil {
+					if subListing.files["__init__.py"] {
+						return filepath.Join(dir, moduleName, "__init__.py"), true, true
+					}
+					if subListing.hasExt {
+						for _, suf := range extensionSuffixes() {
+							if subListing.files["__init__"+suf] {
+								return filepath.Join(dir, moduleName, "__init__"+suf), true, true
+							}
+						}
+					}
+				}
+			}
+			if dl.files[moduleName+".py"] {
+				return filepath.Join(dir, moduleName+".py"), false, true
+			}
+			if dl.hasExt {
+				for _, suf := range extensionSuffixes() {
+					if dl.files[moduleName+suf] {
+						return filepath.Join(dir, moduleName+suf), false, true
+					}
+				}
 			}
 			continue
 		}
@@ -188,6 +295,16 @@ func (e *Engine) LoadOrCompileModule(filePath, moduleName string) (*CodeObject, 
 		}
 
 		if vfsPath, ok := strings.CutPrefix(filePath, "stdlib:"); ok {
+			eff := e.runtimeConfig.Effective()
+			fycPath := getStdlibFycPath(vfsPath, eff.Optimize)
+			if info, statErr := fs.Stat(stdlib.StdlibFS, vfsPath); statErr == nil {
+				if fycCO, fycHdr, err := LoadFyc(fycPath); err == nil {
+					if ValidateFyc(fycHdr, uint64(info.Size()), 0, [32]byte{}) {
+						e.codeCache.Store(cacheKey, fycCO)
+						return fycCO, nil
+					}
+				}
+			}
 			src, err := stdlib.ReadModule(vfsPath)
 			if err != nil {
 				return nil, fmt.Errorf("ModuleNotFoundError: No module named '%s' (%v)", moduleName, err)
@@ -203,6 +320,9 @@ func (e *Engine) LoadOrCompileModule(filePath, moduleName string) (*CodeObject, 
 			}
 			if err != nil {
 				return nil, err
+			}
+			if !eff.DontWriteBytecode {
+				_ = SaveFyc(fycPath, co, uint64(len(src)), 0, [32]byte{})
 			}
 			e.codeCache.Store(cacheKey, co)
 			return co, nil
@@ -310,6 +430,14 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 	}
 
 	parts := strings.Split(canonicalName, ".")
+
+	if vm.pendingVirtualenvPth && (canonicalName == "_virtualenv" ||
+		parts[0] == "distutils" || parts[0] == "setuptools") {
+		vm.pendingVirtualenvPth = false
+		if canonicalName != "_virtualenv" {
+			_, _ = vm.ImportModule("_virtualenv", 0, true, nil)
+		}
+	}
 
 	if canonicalName == "os" || canonicalName == "os.path" || canonicalName == "posixpath" || canonicalName == "genericpath" {
 		vm.ensureOSPath()

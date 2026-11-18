@@ -6,6 +6,7 @@ package pyast
 import (
 	"fmt"
 	"math/big"
+	"sync"
 )
 
 // Field describes one ASDL field.
@@ -31,31 +32,39 @@ type Spec struct {
 }
 
 var (
-	specByName = map[string]*Spec{}
+	specsOnce  sync.Once
+	specByName map[string]*Spec
 	// Specs lists every node class, bases first.
 	Specs []*Spec
 )
 
-func init() {
-	specByName = make(map[string]*Spec, len(specTable))
-	Specs = make([]*Spec, 0, len(specTable))
-	for i := range specTable {
-		s := &specTable[i]
-		s.ID = i
-		s.fieldIdx = make(map[string]int, len(s.Fields))
-		for j, f := range s.Fields {
-			s.fieldIdx[f.Name] = j
+// EnsureSpecs initializes Specs and specByName lazily on first use.
+func EnsureSpecs() []*Spec {
+	specsOnce.Do(func() {
+		specByName = make(map[string]*Spec, len(specTable))
+		Specs = make([]*Spec, 0, len(specTable))
+		for i := range specTable {
+			s := &specTable[i]
+			s.ID = i
+			s.fieldIdx = make(map[string]int, len(s.Fields))
+			for j, f := range s.Fields {
+				s.fieldIdx[f.Name] = j
+			}
+			specByName[s.Name] = s
+			Specs = append(Specs, s)
 		}
-		specByName[s.Name] = s
-		Specs = append(Specs, s)
-	}
-	for _, s := range Specs {
-		s.Concrete = s.Base != "" || len(s.Fields) > 0
-	}
+		for _, s := range Specs {
+			s.Concrete = s.Base != "" || len(s.Fields) > 0
+		}
+	})
+	return Specs
 }
 
 // Lookup returns the spec for a class name, or nil.
-func Lookup(name string) *Spec { return specByName[name] }
+func Lookup(name string) *Spec {
+	EnsureSpecs()
+	return specByName[name]
+}
 
 // FieldIndex returns the index of the named field or -1.
 func (s *Spec) FieldIndex(name string) int {
@@ -67,6 +76,7 @@ func (s *Spec) FieldIndex(name string) int {
 
 // IsA reports whether s is the class base or derives from it.
 func (s *Spec) IsA(base string) bool {
+	EnsureSpecs()
 	for c := s; c != nil; c = specByName[c.Base] {
 		if c.Name == base {
 			return true
@@ -116,6 +126,7 @@ type Node struct {
 
 // New creates a node of the named class with the given positional field values.
 func New(name string, fields ...any) *Node {
+	EnsureSpecs()
 	s := specByName[name]
 	if s == nil {
 		panic("pyast: unknown node " + name)

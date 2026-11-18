@@ -5,6 +5,7 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf8"
+	"unsafe"
 )
 
 // strMethodArg extracts the underlying Go string from a str or str-subclass instance.
@@ -500,10 +501,38 @@ func strIntArg(v Value, def int) int {
 	panic("TypeError: slice indices must be integers or None or have an __index__ method")
 }
 
-// strSliceBounds normalizes optional start/end args (rune indices) into byte offsets.
+// strSliceBounds normalizes optional start/end args (rune indices) into a substring slice and start rune offset.
 func strSliceBounds(s string, args []Value) (string, int) {
-	runes := []rune(s)
-	ln := len(runes)
+	if isASCII(s) {
+		ln := len(s)
+		start, end := 0, ln
+		if len(args) > 0 {
+			start = strIntArg(args[0], 0)
+		}
+		if len(args) > 1 {
+			end = strIntArg(args[1], ln)
+		}
+		if start < 0 {
+			start += ln
+			if start < 0 {
+				start = 0
+			}
+		}
+		if end < 0 {
+			end += ln
+			if end < 0 {
+				end = 0
+			}
+		}
+		if end > ln {
+			end = ln
+		}
+		if start > end {
+			return "", -1
+		}
+		return s[start:end], start
+	}
+	ln := utf8.RuneCountInString(s)
 	start, end := 0, ln
 	if len(args) > 0 {
 		start = strIntArg(args[0], 0)
@@ -529,16 +558,71 @@ func strSliceBounds(s string, args []Value) (string, int) {
 	if start > end {
 		return "", -1
 	}
-	return string(runes[start:end]), start
+	byteStart, byteEnd := 0, len(s)
+	curRune := 0
+	for i := 0; i < len(s); {
+		if curRune == start {
+			byteStart = i
+		}
+		if curRune == end {
+			byteEnd = i
+			break
+		}
+		_, sz := utf8.DecodeRuneInString(s[i:])
+		i += sz
+		curRune++
+	}
+	if start == ln {
+		byteStart = len(s)
+	}
+	return s[byteStart:byteEnd], start
 }
 
 func strFindImpl(s, sub string, extra []Value, last bool) int {
 	ascii := isASCII(s)
-	if ascii && len(extra) == 0 {
-		if last {
-			return strings.LastIndex(s, sub)
+	if ascii {
+		if len(extra) == 0 {
+			if last {
+				return strings.LastIndex(s, sub)
+			}
+			return strings.Index(s, sub)
 		}
-		return strings.Index(s, sub)
+		ln := len(s)
+		start, end := 0, ln
+		if len(extra) > 0 {
+			start = strIntArg(extra[0], 0)
+		}
+		if len(extra) > 1 {
+			end = strIntArg(extra[1], ln)
+		}
+		if start < 0 {
+			start += ln
+			if start < 0 {
+				start = 0
+			}
+		}
+		if end < 0 {
+			end += ln
+			if end < 0 {
+				end = 0
+			}
+		}
+		if end > ln {
+			end = ln
+		}
+		if start > end {
+			return -1
+		}
+		var idx int
+		if last {
+			idx = strings.LastIndex(s[start:end], sub)
+		} else {
+			idx = strings.Index(s[start:end], sub)
+		}
+		if idx < 0 {
+			return -1
+		}
+		return start + idx
 	}
 	seg, off := strSliceBounds(s, extra)
 	if off < 0 {
@@ -557,7 +641,18 @@ func strFindImpl(s, sub string, extra []Value, last bool) int {
 }
 
 func isASCII(s string) bool {
-	for i := range len(s) {
+	n := len(s)
+	if n == 0 {
+		return true
+	}
+	p := unsafe.Pointer(unsafe.StringData(s))
+	i := 0
+	for ; i+8 <= n; i += 8 {
+		if *(*uint64)(unsafe.Add(p, i))&0x8080808080808080 != 0 {
+			return false
+		}
+	}
+	for ; i < n; i++ {
 		if s[i] >= 0x80 {
 			return false
 		}
@@ -661,7 +756,9 @@ func initStrExtraMethods() {
 	StrType.Dict.Set(InternString("isalpha"), strPredicate("isalpha", false, unicode.IsLetter))
 	StrType.Dict.Set(InternString("isalnum"), strPredicate("isalnum", false, func(r rune) bool { return unicode.IsLetter(r) || unicode.IsNumber(r) }))
 	StrType.Dict.Set(InternString("isspace"), strPredicate("isspace", false, unicode.IsSpace))
-	StrType.Dict.Set(InternString("isascii"), strPredicate("isascii", true, func(r rune) bool { return r < 128 }))
+	set("isascii", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		return BoolVal(isASCII(strSelf("isascii", args)))
+	})
 	StrType.Dict.Set(InternString("isprintable"), strPredicate("isprintable", true, func(r rune) bool { return r == ' ' || (unicode.IsPrint(r)) }))
 
 	set("isidentifier", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {

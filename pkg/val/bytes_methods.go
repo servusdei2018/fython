@@ -7,7 +7,64 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf8"
+	"unsafe"
 )
+
+func isASCIIBytesSpace(b byte) bool {
+	return b == ' ' || (b >= '\t' && b <= '\r')
+}
+
+func bytesSplitWhitespace(self []byte, maxsplit int, fromRight bool) [][]byte {
+	if maxsplit < 0 {
+		return bytes.FieldsFunc(self, func(r rune) bool {
+			return r < 128 && isASCIIBytesSpace(byte(r))
+		})
+	}
+	var parts [][]byte
+	if !fromRight {
+		i, n := 0, len(self)
+		for i < n && isASCIIBytesSpace(self[i]) {
+			i++
+		}
+		for i < n {
+			if len(parts) == maxsplit {
+				parts = append(parts, self[i:])
+				return parts
+			}
+			start := i
+			for i < n && !isASCIIBytesSpace(self[i]) {
+				i++
+			}
+			parts = append(parts, self[start:i])
+			for i < n && isASCIIBytesSpace(self[i]) {
+				i++
+			}
+		}
+		return parts
+	}
+	end := len(self)
+	for end > 0 && isASCIIBytesSpace(self[end-1]) {
+		end--
+	}
+	for end > 0 {
+		if len(parts) == maxsplit {
+			parts = append(parts, self[:end])
+			break
+		}
+		wordEnd := end
+		for end > 0 && !isASCIIBytesSpace(self[end-1]) {
+			end--
+		}
+		parts = append(parts, self[end:wordEnd])
+		for end > 0 && isASCIIBytesSpace(self[end-1]) {
+			end--
+		}
+	}
+	for l, r := 0, len(parts)-1; l < r; l, r = l+1, r-1 {
+		parts[l], parts[r] = parts[r], parts[l]
+	}
+	return parts
+}
 
 func bytesMethodArg(v Value) ([]byte, bool) {
 	if v.IsBytes() {
@@ -291,16 +348,55 @@ func initBytesMethods() {
 				parts = bytes.Split(self, sepBytes)
 			}
 		} else {
-			if maxsplit >= 0 {
-				parts = bytes.Fields(self)
-				if len(parts) > maxsplit+1 {
-					// Join remainder
-					rest := bytes.Join(parts[maxsplit:], []byte(" "))
-					parts = append(parts[:maxsplit], rest)
-				}
+			parts = bytesSplitWhitespace(self, maxsplit, false)
+		}
+		out := make([]Value, len(parts))
+		for i, p := range parts {
+			if args[0].IsByteArray() {
+				out[i] = NewByteArrayVal(p)
 			} else {
-				parts = bytes.Fields(self)
+				out[i] = NewBytesVal(p)
 			}
+		}
+		return NewListVal(out...)
+	}
+
+	rsplitFn := func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		self := bytesSelf("rsplit", args)
+		maxsplit := -1
+		if len(args) > 2 {
+			maxsplit = int(args[2].AsInt64())
+		}
+		var parts [][]byte
+		if len(args) > 1 && !args[1].IsNone() {
+			sepBytes, ok := bytesMethodArg(args[1])
+			if !ok {
+				ctx.Raise(NewException(TypeErrorType, "sep must be bytes-like or None"))
+				return NoneVal()
+			}
+			if len(sepBytes) == 0 {
+				ctx.Raise(NewException(ValueErrorType, "empty separator"))
+				return NoneVal()
+			}
+			if maxsplit < 0 {
+				parts = bytes.Split(self, sepBytes)
+			} else {
+				rest := self
+				for len(parts) < maxsplit {
+					idx := bytes.LastIndex(rest, sepBytes)
+					if idx < 0 {
+						break
+					}
+					parts = append(parts, rest[idx+len(sepBytes):])
+					rest = rest[:idx]
+				}
+				parts = append(parts, rest)
+				for l, r := 0, len(parts)-1; l < r; l, r = l+1, r-1 {
+					parts[l], parts[r] = parts[r], parts[l]
+				}
+			}
+		} else {
+			parts = bytesSplitWhitespace(self, maxsplit, true)
 		}
 		out := make([]Value, len(parts))
 		for i, p := range parts {
@@ -672,6 +768,122 @@ func initBytesMethods() {
 		return Int64Val(int64(bytes.Count(self, sub)))
 	}
 
+	indexFn := func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		res := findFn(ctx, callable, args, kwnames)
+		if res.IsInt64() && res.AsInt64() < 0 {
+			ctx.Raise(NewException(ValueErrorType, "subsection not found"))
+			return NoneVal()
+		}
+		return res
+	}
+
+	rindexFn := func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		res := rfindFn(ctx, callable, args, kwnames)
+		if res.IsInt64() && res.AsInt64() < 0 {
+			ctx.Raise(NewException(ValueErrorType, "subsection not found"))
+			return NoneVal()
+		}
+		return res
+	}
+
+	partitionFn := func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		self := bytesSelf("partition", args)
+		if len(args) < 2 {
+			ctx.Raise(NewException(TypeErrorType, "partition() takes exactly one argument (0 given)"))
+			return NoneVal()
+		}
+		sep, ok := bytesMethodArg(args[1])
+		if !ok {
+			ctx.Raise(NewException(TypeErrorType, "a bytes-like object is required"))
+			return NoneVal()
+		}
+		if len(sep) == 0 {
+			ctx.Raise(NewException(ValueErrorType, "empty separator"))
+			return NoneVal()
+		}
+		wrap := NewBytesVal
+		if args[0].IsByteArray() {
+			wrap = NewByteArrayVal
+		}
+		if before, after, found := bytes.Cut(self, sep); found {
+			return NewTupleVal(wrap(before), wrap(sep), wrap(after))
+		}
+		return NewTupleVal(wrap(self), wrap(nil), wrap(nil))
+	}
+
+	rpartitionFn := func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		self := bytesSelf("rpartition", args)
+		if len(args) < 2 {
+			ctx.Raise(NewException(TypeErrorType, "rpartition() takes exactly one argument (0 given)"))
+			return NoneVal()
+		}
+		sep, ok := bytesMethodArg(args[1])
+		if !ok {
+			ctx.Raise(NewException(TypeErrorType, "a bytes-like object is required"))
+			return NoneVal()
+		}
+		if len(sep) == 0 {
+			ctx.Raise(NewException(ValueErrorType, "empty separator"))
+			return NoneVal()
+		}
+		wrap := NewBytesVal
+		if args[0].IsByteArray() {
+			wrap = NewByteArrayVal
+		}
+		if idx := bytes.LastIndex(self, sep); idx >= 0 {
+			return NewTupleVal(wrap(self[:idx]), wrap(sep), wrap(self[idx+len(sep):]))
+		}
+		return NewTupleVal(wrap(nil), wrap(nil), wrap(self))
+	}
+
+	removeprefixFn := func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		self := bytesSelf("removeprefix", args)
+		if len(args) < 2 {
+			ctx.Raise(NewException(TypeErrorType, "removeprefix() takes exactly one argument (0 given)"))
+			return NoneVal()
+		}
+		p, ok := bytesMethodArg(args[1])
+		if !ok {
+			ctx.Raise(NewException(TypeErrorType, "removeprefix argument must be bytes-like"))
+			return NoneVal()
+		}
+		out := bytes.TrimPrefix(self, p)
+		if args[0].IsByteArray() {
+			cp := make([]byte, len(out))
+			copy(cp, out)
+			return NewByteArrayVal(cp)
+		}
+		return NewBytesVal(out)
+	}
+
+	removesuffixFn := func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		self := bytesSelf("removesuffix", args)
+		if len(args) < 2 {
+			ctx.Raise(NewException(TypeErrorType, "removesuffix() takes exactly one argument (0 given)"))
+			return NoneVal()
+		}
+		p, ok := bytesMethodArg(args[1])
+		if !ok {
+			ctx.Raise(NewException(TypeErrorType, "removesuffix argument must be bytes-like"))
+			return NoneVal()
+		}
+		out := bytes.TrimSuffix(self, p)
+		if args[0].IsByteArray() {
+			cp := make([]byte, len(out))
+			copy(cp, out)
+			return NewByteArrayVal(cp)
+		}
+		return NewBytesVal(out)
+	}
+
+	isasciiFn := func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		self := bytesSelf("isascii", args)
+		if len(self) == 0 {
+			return BoolVal(true)
+		}
+		return BoolVal(isASCII(unsafe.String(unsafe.SliceData(self), len(self))))
+	}
+
 	for _, t := range []*PyType{BytesType, ByteArrayType} {
 		t.Dict.Set(InternString("count"), NewBuiltinFuncVal("count", countFn))
 		t.Dict.Set(InternString("maketrans"), NewBuiltinFuncVal("maketrans", maketransFn))
@@ -681,6 +893,7 @@ func initBytesMethods() {
 		t.Dict.Set(InternString("join"), NewBuiltinFuncVal("join", joinFn))
 		t.Dict.Set(InternString("replace"), NewBuiltinFuncVal("replace", replaceFn))
 		t.Dict.Set(InternString("split"), NewBuiltinFuncVal("split", splitFn))
+		t.Dict.Set(InternString("rsplit"), NewBuiltinFuncVal("rsplit", rsplitFn))
 		t.Dict.Set(InternString("strip"), NewBuiltinFuncVal("strip", stripFn))
 		t.Dict.Set(InternString("lstrip"), NewBuiltinFuncVal("lstrip", lstripFn))
 		t.Dict.Set(InternString("rstrip"), NewBuiltinFuncVal("rstrip", rstripFn))
@@ -690,6 +903,13 @@ func initBytesMethods() {
 		t.Dict.Set(InternString("hex"), NewBuiltinFuncVal("hex", hexFn))
 		t.Dict.Set(InternString("find"), NewBuiltinFuncVal("find", findFn))
 		t.Dict.Set(InternString("rfind"), NewBuiltinFuncVal("rfind", rfindFn))
+		t.Dict.Set(InternString("index"), NewBuiltinFuncVal("index", indexFn))
+		t.Dict.Set(InternString("rindex"), NewBuiltinFuncVal("rindex", rindexFn))
+		t.Dict.Set(InternString("partition"), NewBuiltinFuncVal("partition", partitionFn))
+		t.Dict.Set(InternString("rpartition"), NewBuiltinFuncVal("rpartition", rpartitionFn))
+		t.Dict.Set(InternString("removeprefix"), NewBuiltinFuncVal("removeprefix", removeprefixFn))
+		t.Dict.Set(InternString("removesuffix"), NewBuiltinFuncVal("removesuffix", removesuffixFn))
+		t.Dict.Set(InternString("isascii"), NewBuiltinFuncVal("isascii", isasciiFn))
 		t.Dict.Set(InternString("startswith"), NewBuiltinFuncVal("startswith", startswithFn))
 		t.Dict.Set(InternString("endswith"), NewBuiltinFuncVal("endswith", endswithFn))
 	}

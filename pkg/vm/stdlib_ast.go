@@ -49,6 +49,7 @@ func builtinFn(name string, fn func(ctx *val.ExecContext, args []val.Value, kwna
 
 func astInit() *astState {
 	astOnce.Do(func() {
+		pyast.EnsureSpecs()
 		st := &astState{
 			classes: make([]*val.PyType, len(pyast.Specs)),
 			byName:  map[string]*val.PyType{},

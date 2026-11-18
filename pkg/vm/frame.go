@@ -12,9 +12,9 @@ import (
 
 const (
 	// DefaultStackSize is the default pre-allocated Value slab capacity per VM instance.
-	DefaultStackSize = 65536
+	DefaultStackSize = 4096
 	// DefaultFrameSlabSize is the default pre-allocated CallFrame slab capacity per VM instance.
-	DefaultFrameSlabSize = 256
+	DefaultFrameSlabSize = 64
 	// DefaultICSlabSize is the initial Inline Cache side-table capacity per
 	// VM instance. The slabs grow on demand, so a small initial size keeps
 	// the resident set of the interpreter low.
@@ -388,6 +388,20 @@ type VMCodeCache struct {
 	privateActive bool
 }
 
+func (c *VMCodeCache) ensureMethodPIC() [][4]val.MethodPICEntry {
+	if len(c.methodPIC) < len(c.ic) {
+		c.methodPIC = make([][4]val.MethodPICEntry, len(c.ic))
+	}
+	return c.methodPIC
+}
+
+func (c *VMCodeCache) ensureAttrPIC() [][4]AttrPICEntry {
+	if len(c.attrPIC) < len(c.ic) {
+		c.attrPIC = make([][4]AttrPICEntry, len(c.ic))
+	}
+	return c.attrPIC
+}
+
 // quickenAt writes a quickened instruction word into this VM's private copy of
 // the instruction stream at ip, lazily cloning active once so shared streams
 // are never mutated across VMs.
@@ -527,42 +541,43 @@ func AsCodeObject(v val.Value) *CodeObject {
 // VM represents a single execution thread with contiguous Value, CallFrame, and ICSlot slabs,
 // plus a VM-managed string interning pool and zero-allocation Vectorcall execution context.
 type VM struct {
-	engine             *Engine
-	stack              []val.Value
-	frames             []CallFrame
-	codeCaches         []*VMCodeCache
-	builtinRange       val.Value
-	builtinLen         val.Value
-	builtinOpen        val.Value
-	builtinIsInstance  val.Value
-	strScratch         []byte
-	internPool         *val.InternPool
-	execCtx            val.ExecContext
-	activeFrameIdx     int
-	activeCO           *CodeObject
-	activeBaseOffset   int
-	activeCells        []val.Value
-	activeCellPtrs     []*val.PyCell
-	kwScratch          [64]val.Value
-	kwSet              [64]bool
-	globals            *val.PyDict
-	builtins           *val.PyDict
-	modules            *val.PyDict
-	lastException      val.Value
-	unhandledException val.Value
-	excStack           []val.Value
-	context            *val.PyContext
-	bindingOSPath      bool
-	coroFreeList       []*val.PyCoroutine
-	loopStatePool      []*loopState
-	genStackPools      [4][][]val.Value
-	genCellValPools    [8][][]val.Value
-	genCellPtrPools    [8][][]*val.PyCell
-	genResumeHook      func(ctx *val.ExecContext, gen *val.PyGenerator, val val.Value) (val.Value, val.IterStatus)
-	genReleaseHook     func(gen *val.PyGenerator)
-	coroResumeHook     func(ctx *val.ExecContext, coro *val.PyCoroutine, val val.Value) (val.Value, val.IterStatus)
-	maxSP              int
-	maxFrameIdx        int
+	engine               *Engine
+	stack                []val.Value
+	frames               []CallFrame
+	codeCaches           []*VMCodeCache
+	builtinRange         val.Value
+	builtinLen           val.Value
+	builtinOpen          val.Value
+	builtinIsInstance    val.Value
+	strScratch           []byte
+	internPool           *val.InternPool
+	execCtx              val.ExecContext
+	activeFrameIdx       int
+	activeCO             *CodeObject
+	activeBaseOffset     int
+	activeCells          []val.Value
+	activeCellPtrs       []*val.PyCell
+	kwScratch            [64]val.Value
+	kwSet                [64]bool
+	globals              *val.PyDict
+	builtins             *val.PyDict
+	modules              *val.PyDict
+	lastException        val.Value
+	unhandledException   val.Value
+	excStack             []val.Value
+	context              *val.PyContext
+	bindingOSPath        bool
+	pendingVirtualenvPth bool
+	coroFreeList         []*val.PyCoroutine
+	loopStatePool        []*loopState
+	genStackPools        [4][][]val.Value
+	genCellValPools      [8][][]val.Value
+	genCellPtrPools      [8][][]*val.PyCell
+	genResumeHook        func(ctx *val.ExecContext, gen *val.PyGenerator, val val.Value) (val.Value, val.IterStatus)
+	genReleaseHook       func(gen *val.PyGenerator)
+	coroResumeHook       func(ctx *val.ExecContext, coro *val.PyCoroutine, val val.Value) (val.Value, val.IterStatus)
+	maxSP                int
+	maxFrameIdx          int
 	// Continuous join drain state. While activeJoinGen is set, a generator
 	// drained by joinGenerator runs inside a single runLoopWithGlobals
 	// invocation: yields append directly into joinSink instead of
@@ -620,8 +635,6 @@ func (vm *VM) getCodeCacheSlow(co *CodeObject) *VMCodeCache {
 		}
 		if len(cache.ic) < need {
 			cache.ic = make([]ICSlot, need)
-			cache.methodPIC = make([][4]val.MethodPICEntry, need)
-			cache.attrPIC = make([][4]AttrPICEntry, need)
 		}
 		if co != nil {
 			// The root code object is recreated for every Run() call, so its
@@ -652,10 +665,8 @@ func (vm *VM) getCodeCacheSlow(co *CodeObject) *VMCodeCache {
 		cache.active = co.Active()
 		cache.privateActive = false
 	}
-	if len(cache.ic) < len(co.Code) || len(cache.methodPIC) < len(co.Code) || len(cache.attrPIC) < len(co.Code) {
+	if len(cache.ic) < len(co.Code) {
 		cache.ic = make([]ICSlot, len(co.Code))
-		cache.methodPIC = make([][4]val.MethodPICEntry, len(co.Code))
-		cache.attrPIC = make([][4]AttrPICEntry, len(co.Code))
 	}
 	// Publish the cache so that the interpreter loop can reach it without a
 	// call into getCodeCache.

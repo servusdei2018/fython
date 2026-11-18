@@ -497,6 +497,11 @@ func initImportlibTypes() {
 			return val.NoneVal()
 		}))
 		FileFinderType.Dict.Set(val.InternString("invalidate_caches"), val.NewBuiltinFuncVal("invalidate_caches", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if ctx != nil && ctx.VM != nil {
+				if vmInstance, ok := ctx.VM.(*VM); ok && vmInstance.engine != nil {
+					vmInstance.engine.dirCache.Clear()
+				}
+			}
 			return val.NoneVal()
 		}))
 		FileFinderType.Dict.Set(val.InternString("find_spec"), val.NewBuiltinFuncVal("find_spec", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -541,6 +546,11 @@ func initImportlibTypes() {
 
 		PathFinderType = val.MustNewType("PathFinder", []*val.PyType{val.ObjectType}, nil)
 		PathFinderType.Dict.Set(val.InternString("invalidate_caches"), val.NewModuleFuncVal("invalidate_caches", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if ctx != nil && ctx.VM != nil {
+				if vmInstance, ok := ctx.VM.(*VM); ok && vmInstance.engine != nil {
+					vmInstance.engine.dirCache.Clear()
+				}
+			}
 			return val.NoneVal()
 		}))
 		PathFinderType.Dict.Set(val.InternString("find_spec"), val.NewModuleFuncVal("find_spec", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {

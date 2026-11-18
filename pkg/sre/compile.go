@@ -65,6 +65,7 @@ type Regexp struct {
 
 	prog         []inst
 	nregs        int
+	prefix       []rune
 	hasFirst     bool
 	firstLit     rune
 	firstFold    bool
@@ -103,25 +104,53 @@ func Compile(pattern []rune, flags int, isBytes bool) (*Regexp, error) {
 	re.prog = c.prog
 	re.nregs = c.nregs
 	if len(re.prog) > 0 {
-		first := &re.prog[0]
-		switch {
-		case first.op == opChar:
-			re.hasFirst = true
-			re.firstLit = first.r
-		case first.op == opCharFold:
-			re.hasFirst = true
-			re.firstLit = first.r
-			re.firstFold = true
-		case first.op == opSet && first.set != nil:
-			re.hasFirstMask = true
-			for b := range 256 {
-				if first.set.has(rune(b)) {
-					re.firstMask[b>>6] |= 1 << (uint(b) & 63)
+		if re.prog[0].op == opAt && (atKind(re.prog[0].x) == atBOS || atKind(re.prog[0].x) == atBOL) {
+			re.bosOnly = true
+		}
+		startPC := 0
+		for startPC < len(re.prog) && re.prog[startPC].op == opSave {
+			startPC++
+		}
+		if startPC < len(re.prog) {
+			first := &re.prog[startPC]
+			if first.op == opAt && (atKind(first.x) == atBOS || atKind(first.x) == atBOL) {
+				re.bosOnly = true
+			}
+			switch {
+			case first.op == opChar:
+				re.hasFirst = true
+				re.firstLit = first.r
+				var pref []rune
+				for pc := startPC; pc < len(re.prog); pc++ {
+					if re.prog[pc].op == opSave {
+						continue
+					}
+					if re.prog[pc].op == opChar {
+						pref = append(pref, re.prog[pc].r)
+						continue
+					}
+					break
+				}
+				if len(pref) > 1 {
+					re.prefix = pref
+				}
+			case first.op == opCharFold:
+				re.hasFirst = true
+				re.firstLit = first.r
+				re.firstFold = true
+			case first.op == opSet && first.set != nil:
+				re.hasFirstMask = true
+				for b := range 256 {
+					if first.set.has(rune(b)) {
+						re.firstMask[b>>6] |= 1 << (uint(b) & 63)
+					}
+				}
+			default:
+				if m, ok := branchMask(re.prog, startPC, 0); ok {
+					re.hasFirstMask = true
+					re.firstMask = m
 				}
 			}
-		}
-		if first.op == opAt && (atKind(first.x) == atBOS || atKind(first.x) == atBOL) {
-			re.bosOnly = true
 		}
 	}
 	for i := range re.prog {
@@ -194,7 +223,7 @@ func branchMask(prog []inst, pc, depth int) ([4]uint64, bool) {
 	case opAnyNL:
 		out = [4]uint64{^uint64(0), ^uint64(0), ^uint64(0), ^uint64(0)}
 		return out, true
-	case opSave:
+	case opSave, opAt:
 		return branchMask(prog, pc+1, depth+1)
 	case opJmp:
 		return branchMask(prog, in.x, depth+1)

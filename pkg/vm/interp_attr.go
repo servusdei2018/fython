@@ -104,7 +104,7 @@ func (vm *VM) opLoadAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 			instShape := instObj.Shape
 			typeVer := instType.Version()
 			isMT := val.MultiThreadedFlag.Load()
-			if isMT {
+			if isMT && uint(ip) < uint(len(st.cache.attrPIC)) {
 				pic := &st.cache.attrPIC[ip]
 				typeVer32 := uint32(typeVer)
 				for k := range 4 {
@@ -179,7 +179,7 @@ func (vm *VM) opLoadAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 			}
 			vm.syncActiveFrame(st, ip)
 			vm.execCtx.SP = sp
-			attrRes = vm.loadAttrInstanceSlowSafe(instObj, obj, consts[uint16(inst)], ip, sp, st.frameIdx, st.cache.ic, st.cache.attrPIC)
+			attrRes = vm.loadAttrInstanceSlowSafe(instObj, obj, consts[uint16(inst)], ip, sp, st.frameIdx, st.cache.ic, st.cache.ensureAttrPIC())
 			goto loadAttrDone
 		}
 		vm.syncActiveFrame(st, ip)
@@ -456,20 +456,22 @@ func (vm *VM) opStoreAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int,
 			instShape := instObj.Shape
 			typeVer := instType.Version()
 			typeVer32 := uint32(typeVer)
-			pic := &st.cache.attrPIC[ip]
 			isMT := val.MultiThreadedFlag.Load()
-			for k := range 4 {
-				if pic[k].Shape == instShape && pic[k].TypeVer == typeVer32 {
-					slotIdx := int(pic[k].SlotIndex)
-					if !isMT {
-						if uint(slotIdx) < uint(len(instObj.Slots)) {
-							instObj.Slots[slotIdx] = v
+			if uint(ip) < uint(len(st.cache.attrPIC)) {
+				pic := &st.cache.attrPIC[ip]
+				for k := range 4 {
+					if pic[k].Shape == instShape && pic[k].TypeVer == typeVer32 {
+						slotIdx := int(pic[k].SlotIndex)
+						if !isMT {
+							if uint(slotIdx) < uint(len(instObj.Slots)) {
+								instObj.Slots[slotIdx] = v
+								recordAttrPICHit()
+								return ip + 1, sp - 2, ctlNext
+							}
+						} else if instObj.SetSlot(slotIdx, v) {
 							recordAttrPICHit()
 							return ip + 1, sp - 2, ctlNext
 						}
-					} else if instObj.SetSlot(slotIdx, v) {
-						recordAttrPICHit()
-						return ip + 1, sp - 2, ctlNext
 					}
 				}
 			}
@@ -536,7 +538,7 @@ func (vm *VM) opStoreAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int,
 			}
 			vm.syncActiveFrame(st, ip)
 			vm.execCtx.SP = sp
-			vm.storeAttrInstanceSlowSafe(instObj, obj, consts[uint16(inst)], v, ip, sp, st.frameIdx, st.cache.ic, st.cache.attrPIC)
+			vm.storeAttrInstanceSlowSafe(instObj, obj, consts[uint16(inst)], v, ip, sp, st.frameIdx, st.cache.ic, st.cache.ensureAttrPIC())
 		}
 	} else {
 		vm.syncActiveFrame(st, ip)
@@ -724,7 +726,11 @@ func (vm *VM) opLoadMethodSlow(st *loopState, inst uint32, ip, sp int) (int, int
 
 	vm.syncActiveFrame(st, ip)
 	vm.execCtx.SP = sp
-	rec, meth := vm.loadMethodSlowSafe(obj, consts[uint16(inst)], ip, sp, st.frameIdx, st.cache.ic, st.cache.methodPIC)
+	var methodPIC [][4]val.MethodPICEntry
+	if obj.IsInstance() {
+		methodPIC = st.cache.ensureMethodPIC()
+	}
+	rec, meth := vm.loadMethodSlowSafe(obj, consts[uint16(inst)], ip, sp, st.frameIdx, st.cache.ic, methodPIC)
 	stack = st.syncStackFromExecCtx(vm, stack)
 	if vm.execCtx.HasException() {
 		exc := vm.execCtx.ActiveException

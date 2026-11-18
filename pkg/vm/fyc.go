@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"unsafe"
 
 	"github.com/servusdei2018/fython/pkg/val"
 )
@@ -16,7 +17,7 @@ const (
 	// FycMagic is the 4-byte magic signature for Fython bytecode files ("FYTH" in ASCII).
 	FycMagic uint32 = 0x48545946
 	// FycVersion is the current bytecode format version.
-	FycVersion uint32 = 6
+	FycVersion uint32 = 7
 	// FycHeaderSize is the fixed size of the .fyc file header in bytes.
 	FycHeaderSize = 64
 )
@@ -94,6 +95,8 @@ func (sc *stringCollector) collectFromCodeObject(co *CodeObject) {
 	for _, v := range co.FreeVars {
 		sc.add(v.AsString())
 	}
+
+	sc.collectFromValue(co.Doc)
 
 	for _, c := range co.Consts {
 		sc.collectFromValue(c)
@@ -202,12 +205,15 @@ func encodeCodeObject(buf []byte, co *CodeObject, sc *stringCollector) []byte {
 	binary.LittleEndian.PutUint32(tmp4[:], flags)
 	buf = append(buf, tmp4[:]...)
 
+	// Doc
+	buf = encodeValue(buf, co.Doc, sc)
+
 	// Instructions
 	binary.LittleEndian.PutUint32(tmp4[:], uint32(len(co.Code)))
 	buf = append(buf, tmp4[:]...)
-	for _, inst := range co.Code {
-		binary.LittleEndian.PutUint32(tmp4[:], inst)
-		buf = append(buf, tmp4[:]...)
+	if len(co.Code) > 0 {
+		rawCode := unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(co.Code))), len(co.Code)*4)
+		buf = append(buf, rawCode...)
 	}
 
 	// Constants
@@ -434,13 +440,9 @@ func DeserializeCodeObject(data []byte) (*CodeObject, *FycHeader, error) {
 		return nil, nil, err
 	}
 
-	lengths := make([]uint32, stringCount)
-	for i := range stringCount {
-		l, err := r.readUint32()
-		if err != nil {
-			return nil, nil, err
-		}
-		lengths[i] = l
+	lengthsBytes, err := r.readBytes(int(stringCount) * 4)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	blob, err := r.readBytes(int(totalBlobSize))
@@ -448,13 +450,15 @@ func DeserializeCodeObject(data []byte) (*CodeObject, *FycHeader, error) {
 		return nil, nil, err
 	}
 
-	// Bulk-intern all strings with zero duplicate allocations
+	// Bulk-intern all strings directly from byte slices (0 intermediate string allocations)
 	stringTable := make([]val.Value, stringCount)
 	blobOff := 0
-	for i := range stringCount {
-		l := int(lengths[i])
-		s := string(blob[blobOff : blobOff+l])
-		stringTable[i] = val.InternString(s)
+	for i := range int(stringCount) {
+		l := int(binary.LittleEndian.Uint32(lengthsBytes[i*4 : i*4+4]))
+		if l < 0 || blobOff+l > len(blob) {
+			return nil, nil, ErrCorruptFycData
+		}
+		stringTable[i] = val.InternBytes(blob[blobOff : blobOff+l])
 		blobOff += l
 	}
 
@@ -525,18 +529,24 @@ func decodeCodeObject(r *binaryReader, stringTable []val.Value) (*CodeObject, er
 		return nil, err
 	}
 
+	// Doc
+	docVal, err := decodeValue(r, stringTable)
+	if err != nil {
+		return nil, err
+	}
+
 	// Instructions
 	codeLen, err := r.readUint32()
 	if err != nil {
 		return nil, err
 	}
+	codeBytes, err := r.readBytes(int(codeLen) * 4)
+	if err != nil {
+		return nil, err
+	}
 	code := make([]uint32, codeLen)
-	for i := range codeLen {
-		inst, err := r.readUint32()
-		if err != nil {
-			return nil, err
-		}
-		code[i] = inst
+	if codeLen > 0 {
+		copy(unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(code))), int(codeLen)*4), codeBytes)
 	}
 
 	// Constants
@@ -711,6 +721,7 @@ func decodeCodeObject(r *binaryReader, stringTable []val.Value) (*CodeObject, er
 		NumParams:       int(numParams),
 		MaxStackSize:    int(maxStackSize),
 		Flags:           flags,
+		Doc:             docVal,
 		IsGenerator:     (flags & CO_GENERATOR) != 0,
 		IsCoroutine:     (flags & CO_COROUTINE) != 0,
 		ExceptionTable:  excTable,
@@ -820,7 +831,7 @@ func SaveFyc(fycPath string, co *CodeObject, srcSize uint64, srcMTimeNano int64,
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
-	tmpFile := fycPath + ".tmp"
+	tmpFile := fmt.Sprintf("%s.%d.tmp", fycPath, os.Getpid())
 	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
 		return err
 	}

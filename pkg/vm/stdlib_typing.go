@@ -9,7 +9,9 @@ import (
 )
 
 var (
-	typingOnce sync.Once
+	typingOnce          sync.Once
+	lazyTypingOnce      sync.Once
+	origTypeAliasTpCall func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value
 
 	UnionType           *val.PyType
 	GenericType         *val.PyType
@@ -80,6 +82,42 @@ func asParamSpecKwargs(v val.Value) *pyParamSpecKwargs {
 func initTypingTypes() {
 	typingOnce.Do(func() {
 		initTypingTypesBody()
+	})
+}
+
+func initLazyTypingHooks() {
+	lazyTypingOnce.Do(func() {
+		if val.TypeAliasTypeType != nil {
+			origTypeAliasTpCall = val.TypeAliasTypeType.Slots.TpCall
+		}
+		lazyCall := func(t *val.PyType) func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			return func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+				initTypingTypes()
+				return t.Slots.TpCall(ctx, callable, args, kwnames)
+			}
+		}
+		for _, t := range []*val.PyType{val.TypeVarType, val.ParamSpecType, val.TypeVarTupleType, val.TypeAliasTypeType} {
+			if t != nil {
+				t.Slots.TpCall = lazyCall(t)
+			}
+		}
+		lazyClassGetItem := val.NewClassMethodVal(val.NewBuiltinFuncVal("__class_getitem__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			initTypingTypes()
+			return GenericAliasType.Slots.TpCall(ctx, val.TypeVal(GenericAliasType), args, kwnames)
+		}))
+		name := val.InternString("__class_getitem__")
+		for _, t := range []*val.PyType{val.ListType, val.DictType, val.TupleType, val.SetType, val.TypeType} {
+			if t != nil {
+				t.Dict.Set(name, lazyClassGetItem)
+			}
+		}
+		val.UnionOrHook = func(ctx *val.ExecContext, a, b val.Value) (val.Value, bool) {
+			initTypingTypes()
+			if !isUnionable(a) || !isUnionable(b) {
+				return val.NoneVal(), false
+			}
+			return makeUnion([]val.Value{a, b}), true
+		}
 	})
 }
 
@@ -587,6 +625,9 @@ func installTypeVarTupleMethods() {
 }
 
 func installTypeAliasMethods() {
+	if origTypeAliasTpCall != nil {
+		val.TypeAliasTypeType.Slots.TpCall = origTypeAliasTpCall
+	}
 	val.TypeAliasTypeType.Slots.TpGetAttr = func(ctx *val.ExecContext, obj, name val.Value) val.Value {
 		tat := asTypeAliasType(obj)
 		switch name.AsString() {
@@ -645,6 +686,7 @@ func normalizeUnionArg(v val.Value) val.Value {
 }
 
 func makeUnion(parts []val.Value) val.Value {
+	initTypingTypes()
 	var flat []val.Value
 	for _, p := range parts {
 		p = normalizeUnionArg(p)
@@ -896,6 +938,7 @@ func collectTypeParams(ctx *val.ExecContext, args []val.Value) []val.Value {
 }
 
 func newGenericAliasWithCls(cls *val.PyType, origin val.Value, args []val.Value) val.Value {
+	initTypingTypes()
 	if cls == nil {
 		cls = GenericAliasType
 	}
