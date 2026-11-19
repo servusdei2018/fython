@@ -123,11 +123,17 @@ func (st *loopState) syncStackFromExecCtx(vm *VM, curStack []val.Value) []val.Va
 //
 //go:noinline
 func (vm *VM) growStack(st *loopState, curStack []val.Value, minCap int) []val.Value {
-	if st.activeGen != nil && !st.stackIsVM {
-		if genCO := AsCodeObject(st.activeGen.Code); genCO != nil {
+	if (st.activeGen != nil || st.activeCoro != nil) && !st.stackIsVM {
+		var targetCO *CodeObject
+		if st.activeGen != nil {
+			targetCO = AsCodeObject(st.activeGen.Code)
+		} else {
+			targetCO = AsCodeObject(st.activeCoro.Code)
+		}
+		if st.activeGen != nil && targetCO != nil {
 			for {
-				cur := genCO.GenStackHint.Load()
-				if int(cur) >= minCap || genCO.GenStackHint.CompareAndSwap(cur, int32(minCap)) {
+				cur := targetCO.GenStackHint.Load()
+				if int(cur) >= minCap || targetCO.GenStackHint.CompareAndSwap(cur, int32(minCap)) {
 					break
 				}
 			}
@@ -142,8 +148,13 @@ func (vm *VM) growStack(st *loopState, curStack []val.Value, minCap int) []val.V
 				}
 			}
 		}
-		st.activeGen.Stack = s
-		st.activeGen.PoolClass = newCls
+		if st.activeGen != nil {
+			st.activeGen.Stack = s
+			st.activeGen.PoolClass = newCls
+		} else {
+			st.activeCoro.Stack = s
+			st.activeCoro.PoolClass = newCls
+		}
 		st.stack = s
 		vm.execCtx.Stack = s
 		vm.releaseStackSlice(curStack)
@@ -152,10 +163,7 @@ func (vm *VM) growStack(st *loopState, curStack []val.Value, minCap int) []val.V
 	s := ensureStack(curStack, minCap)
 	st.stack = s
 	vm.execCtx.Stack = s
-	switch {
-	case st.activeCoro != nil:
-		st.activeCoro.Stack = s
-	case st.stackIsVM:
+	if st.stackIsVM {
 		vm.stack = s
 	}
 	return s
@@ -204,6 +212,7 @@ func (vm *VM) syncActiveFrame(st *loopState, ip int) {
 		saved.stackIsVM = st.stackIsVM
 		saved.stack = st.stack
 		saved.activeGen = st.activeGen
+		saved.activeCoro = st.activeCoro
 		saved.genFrameIdx = st.genFrameIdx
 		saved.initInstance = val.Value{}
 		saved.cmpActive = false

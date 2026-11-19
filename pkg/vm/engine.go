@@ -782,6 +782,7 @@ func (e *Engine) newVMInternal(stackCap, frameCap int) *VM {
 	v.genResumeHook = v.resumeGenerator
 	v.genReleaseHook = v.releaseGeneratorStack
 	v.coroResumeHook = v.resumeCoroutine
+	v.coroReleaseHook = v.releaseCoroutineStack
 	if lenVal, ok := e.builtins.Get(nameLen); ok {
 		v.builtinLen = lenVal
 	}

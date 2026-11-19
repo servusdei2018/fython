@@ -435,3 +435,84 @@ res = c.send(None)
 		t.Fatalf("expected 42, got: %v", res)
 	}
 }
+
+func TestCoroutineChainingPoolingAndExceptions(t *testing.T) {
+	src := `
+import asyncio
+
+class Service:
+    async def leaf_no_suspend(self, x):
+        return x + 1
+
+    async def failing(self):
+        await asyncio.sleep(0.001)
+        raise ValueError("boom")
+
+async def mid(svc, x):
+    v = await svc.leaf_no_suspend(x)
+    if x == 10:
+        await asyncio.sleep(0.001)
+    return v * 2
+
+async def caught(svc):
+    try:
+        await svc.failing()
+    except ValueError as e:
+        return str(e)
+    return "missed"
+
+async def main():
+    svc = Service()
+    total = 0
+    for i in range(300):
+        total += await mid(svc, i)
+    err_msg = await caught(svc)
+
+    # Named coroutine referenced across await and close()
+    c = mid(svc, 5)
+    c_res = await c
+    c.close()
+
+    return total, err_msg, c_res
+
+total, err_msg, c_res = asyncio.run(main())
+
+async def step_inner():
+    v = await asyncio.sleep(0.05, 77)
+    return v + 22
+
+async def step_coro():
+    return await step_inner()
+
+sc = step_coro()
+first = sc.send(None)
+first.set_result(77)
+second = sc.send(None)
+sc.close()
+`
+	_, v := runAsyncPython(t, src)
+	if !v.LastException().IsNone() && v.LastException().HeaderPtr() != nil {
+		t.Fatalf("unexpected exception: %v", v.LastException())
+	}
+	total, ok := v.GetGlobal("total")
+	// sum(2*(i+1) for i in range(300)) = 2 * 300 * 301 / 2 = 90300
+	if !ok || total.AsInt64() != 90300 {
+		t.Fatalf("expected total 90300, got: %v", total)
+	}
+	errMsg, ok := v.GetGlobal("err_msg")
+	if !ok || errMsg.AsString() != "boom" {
+		t.Fatalf("expected err_msg 'boom', got: %v", errMsg)
+	}
+	cRes, ok := v.GetGlobal("c_res")
+	if !ok || cRes.AsInt64() != 12 {
+		t.Fatalf("expected c_res 12, got: %v", cRes)
+	}
+	first, ok := v.GetGlobal("first")
+	if !ok || !first.IsFuture() {
+		t.Fatalf("expected Future from first sc.send(None), got: %v", first)
+	}
+	second, ok := v.GetGlobal("second")
+	if !ok || second.AsInt64() != 99 {
+		t.Fatalf("expected 99 from second sc.send(None), got: %v", second)
+	}
+}

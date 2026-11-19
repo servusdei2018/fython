@@ -112,17 +112,45 @@ type jsonParser struct {
 	byteSlab    []byte
 }
 
-func newJSONParser(src []byte, pool *val.InternPool) *jsonParser {
+func acquireJSONParser(ctx *val.ExecContext, src []byte, pool *val.InternPool) *jsonParser {
+	if ctx != nil && ctx.VM != nil && !val.MultiThreadedFlag.Load() {
+		if vm, ok := ctx.VM.(*VM); ok && vm.jsonParser != nil {
+			p := vm.jsonParser
+			vm.jsonParser = nil
+			p.src = src
+			p.pos = 0
+			p.pool = pool
+			p.scratch = p.scratch[:0]
+			p.dictCapHint = 5
+			return p
+		}
+	}
 	return &jsonParser{
 		src:         src,
 		pos:         0,
 		pool:        pool,
 		scratch:     make([]byte, 0, 64),
-		dictCapHint: 8,
+		dictCapHint: 5,
+	}
+}
+
+func releaseJSONParser(ctx *val.ExecContext, p *jsonParser) {
+	if p == nil {
+		return
+	}
+	p.src = nil
+	p.pool = nil
+	if ctx != nil && ctx.VM != nil && !val.MultiThreadedFlag.Load() {
+		if vm, ok := ctx.VM.(*VM); ok && vm.jsonParser == nil {
+			vm.jsonParser = p
+		}
 	}
 }
 
 func (p *jsonParser) allocString(raw []byte) val.Value {
+	if len(raw) > 1024 {
+		return val.NewStringVal(string(raw))
+	}
 	if len(p.strSlab) >= cap(p.strSlab) {
 		p.strSlab = make([]val.PyString, 0, 256)
 	}
@@ -130,7 +158,7 @@ func (p *jsonParser) allocString(raw []byte) val.Value {
 	p.strSlab = p.strSlab[:idx+1]
 	ps := &p.strSlab[idx]
 	if len(p.byteSlab)+len(raw) > cap(p.byteSlab) {
-		p.byteSlab = make([]byte, 0, max(4096, len(raw)*16))
+		p.byteSlab = make([]byte, 0, 4096)
 	}
 	bStart := len(p.byteSlab)
 	p.byteSlab = append(p.byteSlab, raw...)
@@ -173,8 +201,11 @@ func (p *jsonParser) allocList(items []val.Value) val.Value {
 }
 
 func (p *jsonParser) allocValSlice(capNeeded int) []val.Value {
+	if capNeeded > 256 {
+		return make([]val.Value, 0, capNeeded)
+	}
 	if len(p.valSlab)+capNeeded > cap(p.valSlab) {
-		p.valSlab = make([]val.Value, 0, max(1024, capNeeded*16))
+		p.valSlab = make([]val.Value, 0, 1024)
 	}
 	start := len(p.valSlab)
 	end := start + capNeeded
@@ -183,9 +214,11 @@ func (p *jsonParser) allocValSlice(capNeeded int) []val.Value {
 }
 
 func (p *jsonParser) allocEntries(capNeeded int) []val.DictEntry {
+	if capNeeded > 256 {
+		return make([]val.DictEntry, 0, capNeeded)
+	}
 	if len(p.entrySlab)+capNeeded > cap(p.entrySlab) {
-		slabCap := max(1024, capNeeded*16)
-		p.entrySlab = make([]val.DictEntry, 0, slabCap)
+		p.entrySlab = make([]val.DictEntry, 0, 1024)
 	}
 	start := len(p.entrySlab)
 	end := start + capNeeded
@@ -979,8 +1012,9 @@ func (e *Engine) createJSONModule() val.Value {
 			return val.NoneVal()
 		}
 
-		p := newJSONParser(rawBytes, e.internPool)
+		p := acquireJSONParser(ctx, rawBytes, e.internPool)
 		res, err := p.parseValue()
+		releaseJSONParser(ctx, p)
 		if err != nil {
 			panic(newJSONDecodeError(err, rawBytes))
 		}
@@ -1031,8 +1065,9 @@ func (e *Engine) createJSONModule() val.Value {
 			ctx.Raise(val.NewException(val.TypeErrorType, "fp.read() must return str or bytes"))
 			return val.NoneVal()
 		}
-		p := newJSONParser(rawBytes, e.internPool)
+		p := acquireJSONParser(ctx, rawBytes, e.internPool)
 		res, err := p.parseValue()
+		releaseJSONParser(ctx, p)
 		if err != nil {
 			panic(newJSONDecodeError(err, rawBytes))
 		}

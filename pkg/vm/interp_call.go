@@ -168,6 +168,47 @@ func isEphemeralGenCallSite(st *loopState, ip int) bool {
 	return false
 }
 
+func isDirectAwaitCallSite(st *loopState, ip int) bool {
+	return ip+2 < st.codeLen &&
+		DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4))) == OP_GET_AWAITABLE &&
+		DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+2)*4))) == OP_AWAIT
+}
+
+func isEphemeralCoroCallSite(st *loopState, ip int) bool {
+	if isDirectAwaitCallSite(st, ip) {
+		return true
+	}
+	return ip+1 < st.codeLen &&
+		DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4))) == OP_YIELD_FROM
+}
+
+func (vm *VM) dispatchCoroutineCall(
+	st *loopState,
+	co *CodeObject,
+	callable val.Value,
+	defaults []val.Value,
+	kwDefaults *val.PyDict,
+	stack []val.Value,
+	ip, sp, argBase, retSP, nargs int,
+	kwnames []val.Value,
+	globals *val.PyDict,
+	isDirectAwait bool,
+) (int, int, loopCtl) {
+	ephemeral := isDirectAwait || isEphemeralCoroCallSite(st, ip)
+	coroVal, ok := vm.instantiateCoroutineSafe(co, callable, defaults, kwDefaults, stack, argBase, nargs, kwnames, globals, ephemeral)
+	if !ok {
+		exc := vm.execCtx.ActiveException
+		vm.execCtx.ClearException()
+		st.raiseExc = exc
+		return ip, sp, ctlRaise
+	}
+	stack[retSP] = coroVal
+	if isDirectAwait {
+		return vm.pushInlineCoroutine(st, coroVal.AsCoroutine(), ip+2, retSP+1, retSP+1, genModeAwait, val.NoneVal())
+	}
+	return ip + 1, retSP + 1, ctlReload
+}
+
 func (vm *VM) pushFuncPositional(
 	st *loopState,
 	fn *val.PyFunction,
@@ -192,7 +233,16 @@ func (vm *VM) pushFuncPositional(
 		return retIP, retSP + 1, ctlReload, true
 	}
 	if callee.IsCoroutine {
-		return 0, 0, ctlNext, false
+		isDirectAwait := isDirectAwaitCallSite(st, ip)
+		if !isDirectAwait || callee.CanSuspend {
+			fnGlobals := fn.Globals
+			if fnGlobals == nil {
+				fnGlobals = st.globals
+			}
+			rIP, rSP, rCtl := vm.dispatchCoroutineCall(st, callee, val.ObjectVal(&fn.Header), fn.Defaults, fn.KwDefaults, stack, ip, sp, argBase, retSP, argCount, nil, fnGlobals, isDirectAwait)
+			return rIP, rSP, rCtl, true
+		}
+		retIP = ip + 3
 	}
 	minCap := max(argBase+256, argBase+callee.NumLocals+64)
 	if minCap > len(stack) {
@@ -409,9 +459,7 @@ func (vm *VM) opCallKw(st *loopState, inst uint32, ip, sp int) (int, int, loopCt
 	totalArgs := int(uint8(inst >> 16))
 	bx := int(uint16(inst))
 	kwnames := st.consts[bx].AsTuple().Items
-	isDirectAwait := ip+2 < st.codeLen &&
-		DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4))) == OP_GET_AWAITABLE &&
-		DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+2)*4))) == OP_AWAIT
+	isDirectAwait := isDirectAwaitCallSite(st, ip)
 
 	target := stack[sp-totalArgs-1]
 	newBase := sp - totalArgs
@@ -483,16 +531,8 @@ unwrapKw:
 			stack[retSP] = genVal
 			return ip + 1, retSP + 1, ctlReload
 		}
-		if callee.IsCoroutine {
-			coroVal, ok := vm.instantiateCoroutineSafe(callee, target, fn.Defaults, fn.KwDefaults, stack, newBase, totalArgs, kwnames, fnGlobals)
-			if !ok {
-				exc := vm.execCtx.ActiveException
-				vm.execCtx.ClearException()
-				st.raiseExc = exc
-				return ip, sp, ctlRaise
-			}
-			stack[retSP] = coroVal
-			return ip + 1, retSP + 1, ctlReload
+		if callee.IsCoroutine && (!isDirectAwait || callee.CanSuspend) {
+			return vm.dispatchCoroutineCall(st, callee, target, fn.Defaults, fn.KwDefaults, stack, ip, sp, newBase, retSP, totalArgs, kwnames, fnGlobals, isDirectAwait)
 		}
 
 		// Fast path: OP_CALL_KW PIC hit writes kwargs directly into callee slots with 0 allocations.
@@ -560,16 +600,8 @@ unwrapKw:
 			stack[retSP] = genVal
 			return ip + 1, retSP + 1, ctlReload
 		}
-		if callee.IsCoroutine {
-			coroVal, ok := vm.instantiateCoroutineSafe(callee, target, nil, nil, stack, newBase, totalArgs, kwnames, st.globals)
-			if !ok {
-				exc := vm.execCtx.ActiveException
-				vm.execCtx.ClearException()
-				st.raiseExc = exc
-				return ip, sp, ctlRaise
-			}
-			stack[retSP] = coroVal
-			return ip + 1, retSP + 1, ctlReload
+		if callee.IsCoroutine && (!isDirectAwait || callee.CanSuspend) {
+			return vm.dispatchCoroutineCall(st, callee, target, nil, nil, stack, ip, sp, newBase, retSP, totalArgs, kwnames, st.globals, isDirectAwait)
 		}
 		minCap := max(newBase+256, newBase+callee.NumLocals+64)
 		if minCap > len(stack) {
@@ -1166,6 +1198,9 @@ func (vm *VM) opCallMethodDescr(st *loopState, inst uint32, ip, sp int) (int, in
 			if argc == 1 && receiver.IsGenerator() && targetVal == val.GenSendBuiltin && vm.activeJoinGen == nil {
 				return vm.pushInlineGenerator(st, receiver.AsGenerator(), ip, sp, retSP, 0, genModeSend, val.Value{}, stack[newBase+1])
 			}
+			if argc == 1 && receiver.IsCoroutine() && targetVal == val.CoroSendBuiltin {
+				return vm.pushInlineCoroutine(st, receiver.AsCoroutine(), ip, sp, retSP, genModeCoroSend, stack[newBase+1])
+			}
 			if vm.hasTrackedViews && totalArgs > 0 {
 				markViewsEscaped(stack[newBase : newBase+totalArgs])
 			}
@@ -1197,9 +1232,7 @@ func (vm *VM) opCallSlow(st *loopState, inst uint32, ip, sp int) (int, int, loop
 	stack := st.stack
 	argc := int(uint8(inst >> 16))
 	bx := int(uint16(inst))
-	isDirectAwait := ip+2 < st.codeLen &&
-		DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4))) == OP_GET_AWAITABLE &&
-		DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+2)*4))) == OP_AWAIT
+	isDirectAwait := isDirectAwaitCallSite(st, ip)
 
 	var target val.Value
 	var newBase int
@@ -1387,18 +1420,8 @@ unwrapCall:
 			stack[retSP] = genVal
 			return ip + 1, retSP + 1, ctlReload
 		}
-		if callee.IsCoroutine {
-			if !isDirectAwait || callee.CanSuspend {
-				coroVal, ok := vm.instantiateCoroutineSafe(callee, target, nil, nil, stack, newBase, argc, nil, st.globals)
-				if !ok {
-					exc := vm.execCtx.ActiveException
-					vm.execCtx.ClearException()
-					st.raiseExc = exc
-					return ip, sp, ctlRaise
-				}
-				stack[retSP] = coroVal
-				return ip + 1, retSP + 1, ctlReload
-			}
+		if callee.IsCoroutine && (!isDirectAwait || callee.CanSuspend) {
+			return vm.dispatchCoroutineCall(st, callee, target, nil, nil, stack, ip, sp, newBase, retSP, argc, nil, st.globals, isDirectAwait)
 		}
 		minCap := max(newBase+256, newBase+callee.NumLocals+64)
 		if minCap > len(stack) {
@@ -1438,18 +1461,8 @@ unwrapCall:
 			stack[retSP] = genVal
 			return ip + 1, retSP + 1, ctlReload
 		}
-		if callee.IsCoroutine {
-			if !isDirectAwait || callee.CanSuspend {
-				coroVal, ok := vm.instantiateCoroutineSafe(callee, target, fn.Defaults, fn.KwDefaults, stack, newBase, argc, nil, fnGlobals)
-				if !ok {
-					exc := vm.execCtx.ActiveException
-					vm.execCtx.ClearException()
-					st.raiseExc = exc
-					return ip, sp, ctlRaise
-				}
-				stack[retSP] = coroVal
-				return ip + 1, retSP + 1, ctlReload
-			}
+		if callee.IsCoroutine && (!isDirectAwait || callee.CanSuspend) {
+			return vm.dispatchCoroutineCall(st, callee, target, fn.Defaults, fn.KwDefaults, stack, ip, sp, newBase, retSP, argc, nil, fnGlobals, isDirectAwait)
 		}
 		minCap := max(newBase+256, newBase+callee.NumLocals+64)
 		if minCap > len(stack) {
@@ -1653,9 +1666,7 @@ func (vm *VM) opCallMethodSlow(st *loopState, inst uint32, ip, sp int) (int, int
 	retSP := sp - argc - 2
 	receiver := stack[retSP]
 	callable := stack[retSP+1]
-	isDirectAwait := ip+2 < st.codeLen &&
-		DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4))) == OP_GET_AWAITABLE &&
-		DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+2)*4))) == OP_AWAIT
+	isDirectAwait := isDirectAwaitCallSite(st, ip)
 
 	var newBase int
 	var totalArgs int
@@ -1677,6 +1688,9 @@ func (vm *VM) opCallMethodSlow(st *loopState, inst uint32, ip, sp int) (int, int
 
 	if argc == 1 && !receiver.IsUnbound() && receiver.IsGenerator() && callable == val.GenSendBuiltin && vm.activeJoinGen == nil {
 		return vm.pushInlineGenerator(st, receiver.AsGenerator(), ip, sp, retSP, 0, genModeSend, val.Value{}, stack[newBase+1])
+	}
+	if argc == 1 && !receiver.IsUnbound() && receiver.IsCoroutine() && callable == val.CoroSendBuiltin {
+		return vm.pushInlineCoroutine(st, receiver.AsCoroutine(), ip, sp, retSP, genModeCoroSend, stack[newBase+1])
 	}
 
 	if argc == 1 && !receiver.IsUnbound() && receiver.IsInstance() && callable.IsBuiltinFunc() && callable.AsBuiltinFunc().Name == "write" {
@@ -1800,16 +1814,8 @@ func (vm *VM) opCallMethodSlow(st *loopState, inst uint32, ip, sp int) (int, int
 			stack[retSP] = genVal
 			return ip + 1, retSP + 1, ctlReload
 		}
-		if callee.IsCoroutine {
-			coroVal, ok := vm.instantiateCoroutineSafe(callee, callable, fn.Defaults, fn.KwDefaults, stack, newBase, totalArgs, nil, fnGlobals)
-			if !ok {
-				exc := vm.execCtx.ActiveException
-				vm.execCtx.ClearException()
-				st.raiseExc = exc
-				return ip, sp, ctlRaise
-			}
-			stack[retSP] = coroVal
-			return ip + 1, retSP + 1, ctlReload
+		if callee.IsCoroutine && (!isDirectAwait || callee.CanSuspend) {
+			return vm.dispatchCoroutineCall(st, callee, callable, fn.Defaults, fn.KwDefaults, stack, ip, sp, newBase, retSP, totalArgs, nil, fnGlobals, isDirectAwait)
 		}
 		minCap := max(newBase+256, newBase+callee.NumLocals+64)
 		if minCap > len(stack) {
@@ -1855,16 +1861,8 @@ func (vm *VM) opCallMethodSlow(st *loopState, inst uint32, ip, sp int) (int, int
 			stack[retSP] = genVal
 			return ip + 1, retSP + 1, ctlReload
 		}
-		if callee.IsCoroutine {
-			coroVal, ok := vm.instantiateCoroutineSafe(callee, callable, nil, nil, stack, newBase, totalArgs, nil, st.globals)
-			if !ok {
-				exc := vm.execCtx.ActiveException
-				vm.execCtx.ClearException()
-				st.raiseExc = exc
-				return ip, sp, ctlRaise
-			}
-			stack[retSP] = coroVal
-			return ip + 1, retSP + 1, ctlReload
+		if callee.IsCoroutine && (!isDirectAwait || callee.CanSuspend) {
+			return vm.dispatchCoroutineCall(st, callee, callable, nil, nil, stack, ip, sp, newBase, retSP, totalArgs, nil, st.globals, isDirectAwait)
 		}
 		minCap := max(newBase+256, newBase+callee.NumLocals+64)
 		if minCap > len(stack) {
@@ -2206,6 +2204,10 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 			if argc == 1 && receiver.IsGenerator() && targetVal == val.GenSendBuiltin && vm.activeJoinGen == nil {
 				st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL_METHOD_DESCR))
 				return vm.pushInlineGenerator(st, receiver.AsGenerator(), ip, sp, retSP, 0, genModeSend, val.Value{}, stack[newBase+1])
+			}
+			if argc == 1 && receiver.IsCoroutine() && targetVal == val.CoroSendBuiltin {
+				st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL_METHOD_DESCR))
+				return vm.pushInlineCoroutine(st, receiver.AsCoroutine(), ip, sp, retSP, genModeCoroSend, stack[newBase+1])
 			}
 			if methIdx >= uint16(len(st.consts)) || (attrName != nameExists && attrName != nameRemove && attrName != nameUnlink) {
 				st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL_METHOD_DESCR))

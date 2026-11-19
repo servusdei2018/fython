@@ -17,6 +17,10 @@ import (
 // enabling O(1) pointer-equality interception in the VM call handlers.
 var GenSendBuiltin Value
 
+// CoroSendBuiltin is the cached PyBuiltinFunc Value for coroutine.send,
+// enabling O(1) pointer-equality interception in the VM call handlers.
+var CoroSendBuiltin Value
+
 // PyTuple represents an immutable sequence of Values on the heap (used for kwnames and tuple constants).
 // Tuples with up to 2 elements store their backing array inline inside the same allocation (80 B size class).
 // Header MUST be at byte offset 0.
@@ -6603,7 +6607,7 @@ func initTypes() {
 		coro := o.AsCoroutine()
 		return coro.Send(ctx, NoneVal())
 	}
-	CoroutineType.Dict.Set(InternString("send"), NewBuiltinFuncVal("send", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+	CoroSendBuiltin = NewBuiltinFuncVal("send", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
 			ctx.Raise(NewException(TypeErrorType, "send() takes exactly one argument"))
 			return NoneVal()
@@ -6611,7 +6615,8 @@ func initTypes() {
 		coro := args[0].AsCoroutine()
 		v, _ := coro.Send(ctx, args[1])
 		return v
-	}))
+	})
+	CoroutineType.Dict.Set(InternString("send"), CoroSendBuiltin)
 	CoroutineType.Dict.Set(InternString("close"), NewBuiltinFuncVal("close", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
 			ctx.Raise(NewException(TypeErrorType, "close() takes at least 1 argument"))
@@ -7400,7 +7405,12 @@ func initTypes() {
 			cls = args[0].AsType()
 		}
 		inst := NewInstanceOfType(cls)
-		inst.AsInstance().Slots = []Value{res}
+		instObj := inst.AsInstance()
+		if len(instObj.Slots) == 0 {
+			instObj.ExtendBootstrapSlot(0, res)
+		} else {
+			instObj.SetSlot(0, res)
+		}
 		return inst
 	})
 	BytesType.Dict.Set(DunderNew, bytesNewBuiltin)

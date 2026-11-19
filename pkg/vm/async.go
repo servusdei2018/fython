@@ -356,6 +356,7 @@ func (l *EventLoop) stepTask(vm *VM, task *val.PyTask) {
 	switch status {
 	case val.IterExhausted:
 		task.SetResult(coro.RetVal)
+		task.Coro = nil
 		vm.releaseCoroutine(coro)
 	case val.IterYielded:
 		aw := coro.YieldVal
@@ -377,6 +378,7 @@ func (l *EventLoop) stepTask(vm *VM, task *val.PyTask) {
 			exc = vm.LastException()
 		}
 		task.SetException(exc)
+		task.Coro = nil
 		vm.releaseCoroutine(coro)
 	}
 }

@@ -395,21 +395,25 @@ const (
 // PyCoroutine represents a frame-detaching Python coroutine object on the heap.
 // Header MUST be at offset 0.
 type PyCoroutine struct {
-	Header     ObjectHeader
-	Name       string
-	Code       Value
-	State      CoroutineState
-	Stack      []Value
-	SP         int
-	Base       int
-	IP         int
-	Cells      []Value
-	Globals    *PyDict
-	YieldVal   Value
-	RetVal     Value
-	LastSent   Value
-	ResumeHook func(ctx *ExecContext, coro *PyCoroutine, val Value) (Value, IterStatus)
-	Iters      [8]PyIter
+	Header      ObjectHeader
+	Name        string
+	Code        Value
+	State       CoroutineState
+	Stack       []Value
+	SP          int
+	Base        int
+	IP          int
+	MaxSP       int
+	PoolClass   uint8
+	OwnCells    bool
+	Cells       []Value
+	CellPtrs    []*PyCell
+	Globals     *PyDict
+	YieldVal    Value
+	RetVal      Value
+	LastSent    Value
+	ResumeHook  func(ctx *ExecContext, coro *PyCoroutine, val Value) (Value, IterStatus)
+	ReleaseHook func(coro *PyCoroutine)
 }
 
 // FutureState classifies the lifecycle state of a PyFuture.
@@ -1487,21 +1491,25 @@ func NewCoroutineVal(name string, code Value, maxStack int, cells []Value, globa
 		maxStack = 8
 	}
 	stack := make([]Value, maxStack)
-	for i := range stack {
-		stack[i] = NoneVal()
-	}
+	return NewCoroutineWithStack(name, code, stack, 255, cells, globals)
+}
+
+// NewCoroutineWithStack constructs a KindCoroutine Value wrapping an existing
+// (possibly pooled) stack slice.
+func NewCoroutineWithStack(name string, code Value, stack []Value, poolClass uint8, cells []Value, globals *PyDict) Value {
 	coro := &PyCoroutine{
-		Header:  ObjectHeader{Kind: KindCoroutine, Type: CoroutineType},
-		Name:    name,
-		Code:    code,
-		State:   CoroCreated,
-		Stack:   stack,
-		SP:      0,
-		Base:    0,
-		IP:      0,
-		Cells:   cells,
-		Globals: globals,
-		RetVal:  NoneVal(),
+		Header:    ObjectHeader{Kind: KindCoroutine, Type: CoroutineType},
+		Name:      name,
+		Code:      code,
+		State:     CoroCreated,
+		Stack:     stack,
+		PoolClass: poolClass,
+		SP:        0,
+		Base:      0,
+		IP:        0,
+		Cells:     cells,
+		Globals:   globals,
+		RetVal:    NoneVal(),
 	}
 	return Value{num: 0, ptr: &coro.Header}
 }
@@ -1517,9 +1525,12 @@ func (c *PyCoroutine) Send(ctx *ExecContext, val Value) (Value, IterStatus) {
 	return NoneVal(), IterExhausted
 }
 
-// Close closes the coroutine and marks it CoroClosed.
+// Close closes the coroutine, marks it CoroClosed, and releases pooled stacks.
 func (c *PyCoroutine) Close(ctx *ExecContext) {
 	c.State = CoroClosed
+	if c.ReleaseHook != nil && c.Stack != nil {
+		c.ReleaseHook(c)
+	}
 }
 
 // Throw resumes the coroutine by raising an exception at the point of suspension.

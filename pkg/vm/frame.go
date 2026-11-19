@@ -130,7 +130,7 @@ type ExceptionEntry struct {
 	PushLasti        bool
 }
 
-// Inline generator resumption modes stored on the caller CallFrame.
+// Inline generator and coroutine resumption modes stored on the caller CallFrame.
 const (
 	genModeNone uint8 = iota
 	genModeForIter
@@ -138,6 +138,8 @@ const (
 	genModeNext        // next(gen): raise StopIteration(retVal) on exhaustion
 	genModeNextDefault // next(gen, default): return genDefault on exhaustion
 	genModeSend        // gen.send(v): raise StopIteration(retVal) on exhaustion
+	genModeAwait       // await aw: store retVal at stack[retSP-1] on completion
+	genModeCoroSend    // coro.send(v): store retVal at stack[retSP] on completion
 )
 
 // CallFrame is an unboxed value struct stored in the contiguous VM.frames slab.
@@ -158,11 +160,12 @@ type CallFrame struct {
 	shadowFrame *val.PyFrame
 	excStackLen int
 	stackIsVM   bool
-	// Inline generator linkage. When genMode != genModeNone, the child frame
-	// is a generator executing on its own stack slice, and stack holds the
-	// caller's stack slice to restore on yield/return/unwind.
+	// Inline generator/coroutine linkage. When genMode != genModeNone, the child
+	// frame is executing on its own stack slice, and stack holds the caller's
+	// stack slice to restore on yield/suspend/return/unwind.
 	stack       []val.Value
 	activeGen   *val.PyGenerator
+	activeCoro  *val.PyCoroutine
 	genFrameIdx int
 	genMode     uint8
 	genDefault  val.Value
@@ -624,6 +627,8 @@ type VM struct {
 	genResumeHook        func(ctx *val.ExecContext, gen *val.PyGenerator, val val.Value) (val.Value, val.IterStatus)
 	genReleaseHook       func(gen *val.PyGenerator)
 	coroResumeHook       func(ctx *val.ExecContext, coro *val.PyCoroutine, val val.Value) (val.Value, val.IterStatus)
+	coroReleaseHook      func(coro *val.PyCoroutine)
+	jsonParser           *jsonParser
 	maxSP                int
 	maxFrameIdx          int
 	// Continuous join drain state. While activeJoinGen is set, a generator
@@ -872,29 +877,48 @@ func (vm *VM) acquireGenCellPtrs(n int) []*val.PyCell {
 	return make([]*val.PyCell, n)
 }
 
-func (vm *VM) releaseGenCellSlices(gen *val.PyGenerator) {
-	if !gen.OwnCells {
-		gen.Cells = nil
-		gen.CellPtrs = nil
+func (vm *VM) releaseCellSlices(own bool, cells []val.Value, ptrs []*val.PyCell) {
+	if !own {
 		return
 	}
+	if cells != nil {
+		if n := len(cells); n >= 1 && n <= len(vm.genCellValPools) && len(vm.genCellValPools[n-1]) < 128 {
+			clear(cells)
+			vm.genCellValPools[n-1] = append(vm.genCellValPools[n-1], cells)
+		}
+	}
+	if ptrs != nil {
+		if n := len(ptrs); n >= 1 && n <= len(vm.genCellPtrPools) && len(vm.genCellPtrPools[n-1]) < 128 {
+			clear(ptrs)
+			vm.genCellPtrPools[n-1] = append(vm.genCellPtrPools[n-1], ptrs)
+		}
+	}
+}
+
+func (vm *VM) releaseGenCellSlices(gen *val.PyGenerator) {
+	own := gen.OwnCells
+	cells, ptrs := gen.Cells, gen.CellPtrs
 	gen.OwnCells = false
-	if gen.Cells != nil {
-		c := gen.Cells
-		gen.Cells = nil
-		if n := len(c); n >= 1 && n <= len(vm.genCellValPools) && len(vm.genCellValPools[n-1]) < 128 {
-			clear(c)
-			vm.genCellValPools[n-1] = append(vm.genCellValPools[n-1], c)
-		}
+	gen.Cells = nil
+	gen.CellPtrs = nil
+	vm.releaseCellSlices(own, cells, ptrs)
+}
+
+func (vm *VM) releaseCoroutineStack(coro *val.PyCoroutine) {
+	if coro == nil || val.MultiThreadedFlag.Load() {
+		return
 	}
-	if gen.CellPtrs != nil {
-		p := gen.CellPtrs
-		gen.CellPtrs = nil
-		if n := len(p); n >= 1 && n <= len(vm.genCellPtrPools) && len(vm.genCellPtrPools[n-1]) < 128 {
-			clear(p)
-			vm.genCellPtrPools[n-1] = append(vm.genCellPtrPools[n-1], p)
-		}
+	if coro.Stack != nil {
+		s := coro.Stack
+		coro.Stack = nil
+		vm.releaseStackSlice(s)
 	}
+	own := coro.OwnCells
+	cells, ptrs := coro.Cells, coro.CellPtrs
+	coro.OwnCells = false
+	coro.Cells = nil
+	coro.CellPtrs = nil
+	vm.releaseCellSlices(own, cells, ptrs)
 }
 
 // Reset clears the active stack and execution frame state for reuse in Engine's sync.Pool.
@@ -922,6 +946,7 @@ func (vm *VM) Reset() {
 	vm.activeState = nil
 	vm.lastException = val.NoneVal()
 	vm.unhandledException = val.NoneVal()
+	vm.jsonParser = nil
 	if vm.context == nil || vm.context.Len() > 0 {
 		vm.context = val.NewPyContext()
 	}

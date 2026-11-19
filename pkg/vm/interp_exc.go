@@ -154,11 +154,11 @@ func (vm *VM) opReturnSlow(st *loopState, ip, sp int, retVal val.Value) (int, in
 		callerIP := caller.ip
 		retSP := caller.retSP
 		vm.restoreCallerFrame(st, caller)
-		if mode == genModeForIter || mode == genModeYieldFrom {
+		if mode == genModeForIter || mode == genModeYieldFrom || mode == genModeAwait {
 			vm.releaseGenerator(gen)
 		}
 		switch mode {
-		case genModeYieldFrom:
+		case genModeYieldFrom, genModeAwait:
 			st.stack[retSP-1] = retVal
 			return callerIP + 1, retSP, ctlReload
 		case genModeForIter:
@@ -172,12 +172,36 @@ func (vm *VM) opReturnSlow(st *loopState, ip, sp int, retVal val.Value) (int, in
 		}
 		return exitIP, retSP - 1, ctlReload
 	}
-	if st.activeCoro != nil && st.frameIdx == st.startFrameIdx {
-		st.activeCoro.RetVal = retVal
-		st.activeCoro.State = val.CoroClosed
-		st.activeCoro.SP = sp
-		st.result = retVal
-		return ip, sp, ctlExit
+	if st.activeCoro != nil && st.frameIdx == st.genFrameIdx {
+		coro := st.activeCoro
+		coro.RetVal = retVal
+		coro.State = val.CoroClosed
+		coro.SP = sp
+		vm.releaseCoroutineStack(coro)
+		if st.frameIdx == st.startFrameIdx {
+			st.result = retVal
+			return ip, sp, ctlExit
+		}
+		st.frameIdx--
+		caller := &vm.frames[st.frameIdx]
+		if len(vm.excStack) > caller.excStackLen {
+			vm.excStack = vm.excStack[:caller.excStackLen]
+		}
+		mode := caller.genMode
+		callerIP := caller.ip
+		retSP := caller.retSP
+		vm.restoreCallerFrame(st, caller)
+		if mode == genModeAwait || mode == genModeYieldFrom {
+			vm.releaseEphemeralCoroutine(coro)
+			st.stack[retSP-1] = retVal
+			return callerIP + 1, retSP, ctlReload
+		}
+		if mode == genModeCoroSend {
+			st.stack[retSP] = retVal
+			return callerIP, retSP + 1, ctlReload
+		}
+		st.stack[retSP-1] = retVal
+		return callerIP + 1, retSP, ctlReload
 	}
 	if st.frameIdx == st.startFrameIdx {
 		st.result = retVal

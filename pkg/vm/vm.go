@@ -501,7 +501,7 @@ func (vm *VM) callFromHook(ctx *val.ExecContext, callable val.Value, argBase int
 			return vm.instantiateGenerator(co, callable, fn.Defaults, fn.KwDefaults, ctx.Stack, argBase, nargs, kwnames, fnGlobals, false)
 		}
 		if co.IsCoroutine {
-			return vm.instantiateCoroutine(co, callable, fn.Defaults, fn.KwDefaults, ctx.Stack, argBase, nargs, kwnames, fnGlobals)
+			return vm.instantiateCoroutine(co, callable, fn.Defaults, fn.KwDefaults, ctx.Stack, argBase, nargs, kwnames, fnGlobals, false)
 		}
 		need := argBase + co.NumLocals + co.MaxStackSize + 256
 		if need > len(ctx.Stack) {
@@ -542,7 +542,7 @@ func (vm *VM) callFromHook(ctx *val.ExecContext, callable val.Value, argBase int
 			return vm.instantiateGenerator(co, callable, nil, nil, ctx.Stack, argBase, nargs, kwnames, vm.globals, false)
 		}
 		if co.IsCoroutine {
-			return vm.instantiateCoroutine(co, callable, nil, nil, ctx.Stack, argBase, nargs, kwnames, vm.globals)
+			return vm.instantiateCoroutine(co, callable, nil, nil, ctx.Stack, argBase, nargs, kwnames, vm.globals, false)
 		}
 		need := argBase + co.NumLocals + co.MaxStackSize + 256
 		if need > len(ctx.Stack) {
@@ -1495,29 +1495,29 @@ func (vm *VM) instantiateGenerator(co *CodeObject, callable val.Value, defaults 
 	return genVal
 }
 
-func (vm *VM) acquireCoroutine(name string, codeVal val.Value, maxStack int, globals *val.PyDict) (*val.PyCoroutine, val.Value) {
-	if maxStack < 256 {
-		maxStack = 256
+func (vm *VM) acquireCoroutine(name string, codeVal val.Value, stack []val.Value, poolCls uint8, globals *val.PyDict, ephemeral bool) (*val.PyCoroutine, val.Value) {
+	var flags uint8
+	if ephemeral {
+		flags = val.FlagEphemeralCoro
 	}
 	if len(vm.coroFreeList) > 0 {
 		n := len(vm.coroFreeList) - 1
 		coro := vm.coroFreeList[n]
+		vm.coroFreeList[n] = nil
 		vm.coroFreeList = vm.coroFreeList[:n]
-		if cap(coro.Stack) < maxStack {
-			coro.Stack = make([]val.Value, maxStack)
-		} else {
-			coro.Stack = coro.Stack[:cap(coro.Stack)]
-		}
-		for i := range maxStack {
-			coro.Stack[i] = val.NoneVal()
-		}
+		coro.Header = val.ObjectHeader{Kind: val.KindCoroutine, Flags: flags, Type: val.CoroutineType}
 		coro.Name = name
 		coro.Code = codeVal
 		coro.State = val.CoroCreated
+		coro.Stack = stack
 		coro.SP = 0
 		coro.Base = 0
 		coro.IP = 0
+		coro.MaxSP = 0
+		coro.PoolClass = poolCls
+		coro.OwnCells = false
 		coro.Cells = nil
+		coro.CellPtrs = nil
 		coro.Globals = globals
 		coro.YieldVal = val.NoneVal()
 		coro.RetVal = val.NoneVal()
@@ -1525,28 +1525,52 @@ func (vm *VM) acquireCoroutine(name string, codeVal val.Value, maxStack int, glo
 		return coro, val.ObjectVal(&coro.Header)
 	}
 
-	coroVal := val.NewCoroutineVal(name, codeVal, maxStack, nil, globals)
+	coroVal := val.NewCoroutineWithStack(name, codeVal, stack, poolCls, nil, globals)
 	coro := coroVal.AsCoroutine()
+	coro.Header.Flags = flags
 	if vm.coroResumeHook != nil {
 		coro.ResumeHook = vm.coroResumeHook
 	} else {
 		coro.ResumeHook = vm.resumeCoroutine
 	}
+	if vm.coroReleaseHook != nil {
+		coro.ReleaseHook = vm.coroReleaseHook
+	} else {
+		coro.ReleaseHook = vm.releaseCoroutineStack
+	}
 	return coro, coroVal
 }
 
 func (vm *VM) releaseCoroutine(coro *val.PyCoroutine) {
-	if coro == nil {
+	if coro == nil || val.MultiThreadedFlag.Load() {
 		return
 	}
-	coro.Globals = nil
+	vm.releaseCoroutineStack(coro)
+	coro.Header.Flags &^= val.FlagEphemeralCoro
+	coro.Name = ""
+	coro.Code = val.Value{}
+	coro.State = val.CoroClosed
+	coro.SP = 0
+	coro.Base = 0
+	coro.IP = 0
+	coro.MaxSP = 0
+	coro.OwnCells = false
 	coro.Cells = nil
-	coro.YieldVal = val.NoneVal()
-	coro.RetVal = val.NoneVal()
-	coro.LastSent = val.NoneVal()
+	coro.CellPtrs = nil
+	coro.Globals = nil
+	coro.YieldVal = val.Value{}
+	coro.RetVal = val.Value{}
+	coro.LastSent = val.Value{}
 	if len(vm.coroFreeList) < 128 {
 		vm.coroFreeList = append(vm.coroFreeList, coro)
 	}
+}
+
+func (vm *VM) releaseEphemeralCoroutine(coro *val.PyCoroutine) {
+	if coro == nil || (coro.Header.Flags&val.FlagEphemeralCoro) == 0 || val.MultiThreadedFlag.Load() {
+		return
+	}
+	vm.releaseCoroutine(coro)
 }
 
 // ReleaseCoroutine returns a closed coroutine to the VM's free list.
@@ -1597,18 +1621,24 @@ func (vm *VM) CallUserExcepthook(exc val.Value) bool {
 	return true
 }
 
-func (vm *VM) instantiateCoroutine(co *CodeObject, callable val.Value, defaults []val.Value, kwDefaults *val.PyDict, callerStack []val.Value, argBase int, nargs int, kwnames []val.Value, globals *val.PyDict) val.Value {
-	maxStack := max(co.MaxStackSize, co.NumLocals+16)
+func (vm *VM) instantiateCoroutine(co *CodeObject, callable val.Value, defaults []val.Value, kwDefaults *val.PyDict, callerStack []val.Value, argBase int, nargs int, kwnames []val.Value, globals *val.PyDict, ephemeral bool) val.Value {
+	need := max(256, co.NumLocals+max(co.MaxStackSize, len(co.Code))+64)
+	coroStack, poolCls := vm.acquireGeneratorStack(need)
 	var codeVal val.Value
 	if callable.IsFunction() {
 		codeVal = callable.AsFunction().Code
 	} else {
 		codeVal = callable
 	}
-	coro, coroVal := vm.acquireCoroutine(co.Name, codeVal, maxStack, globals)
+	coro, coroVal := vm.acquireCoroutine(co.Name, codeVal, coroStack, poolCls, globals, ephemeral)
 	spAfterBind := vm.bindFunctionArgsToSlice(co, defaults, kwDefaults, coro.Stack, callerStack[argBase:argBase+nargs], kwnames)
 	coro.SP = spAfterBind
-	coro.Cells = vm.setupCalleeCellsSlice(co, callable, coro.Stack, 0, nargs)
+	if len(co.CellVars) > 0 || len(co.FreeVars) > 0 {
+		coro.Cells, coro.CellPtrs = vm.setupCalleeCellsWithPool(co, callable, coro.Stack, 0, nargs, true)
+		if len(co.CellVars) > 0 || !callable.IsFunction() {
+			coro.OwnCells = true
+		}
+	}
 	return coroVal
 }
 
@@ -1765,58 +1795,6 @@ func (vm *VM) bindFunctionArgsToSlice(co *CodeObject, defaults []val.Value, kwDe
 	}
 
 	return numLocals
-}
-
-func (vm *VM) setupCalleeCellsSlice(callee *CodeObject, target val.Value, stack []val.Value, newBase int, argc int) []val.Value {
-	nCells := len(callee.CellVars)
-	nFree := len(callee.FreeVars)
-	if nCells == 0 && nFree == 0 {
-		return nil
-	}
-	if nCells == 0 && target.IsFunction() {
-		return target.AsFunction().Closure
-	}
-	res := make([]val.Value, nCells+nFree)
-	boundLimit := len(callee.ParamNames)
-	if !target.IsFunction() && argc < boundLimit {
-		boundLimit = argc
-	}
-	for i := range nCells {
-		name := callee.CellVars[i]
-		nameStr := ""
-		initVal := val.NoneVal()
-		for p := range boundLimit {
-			pn := callee.ParamNames[p]
-			if val.StringEquals(pn, name) {
-				initVal = stack[newBase+p]
-				break
-			}
-			if pn.StringHasBytePrefix('*') {
-				pnStr := pn.AsString()
-				if len(pnStr) > 1 {
-					clean := pnStr[1:]
-					if len(clean) > 0 && clean[0] == '*' {
-						clean = clean[1:]
-					}
-					if nameStr == "" {
-						nameStr = name.AsString()
-					}
-					if clean == nameStr {
-						initVal = stack[newBase+p]
-						break
-					}
-				}
-			}
-		}
-		res[i] = val.NewCellVal(initVal)
-	}
-	if target.IsFunction() {
-		closure := target.AsFunction().Closure
-		for j := 0; j < nFree && j < len(closure); j++ {
-			res[nCells+j] = closure[j]
-		}
-	}
-	return res
 }
 
 func (vm *VM) resumeGenerator(ctx *val.ExecContext, gen *val.PyGenerator, sentVal val.Value) (val.Value, val.IterStatus) {
@@ -2234,9 +2212,14 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 			}
 		}
 
+		var finishedCoro *val.PyCoroutine
 		if st.activeGen != nil && st.frameIdx == st.genFrameIdx {
 			st.activeGen.State = val.GenClosed
 			vm.releaseGeneratorStack(st.activeGen)
+		} else if st.activeCoro != nil && st.frameIdx == st.genFrameIdx {
+			finishedCoro = st.activeCoro
+			finishedCoro.State = val.CoroClosed
+			vm.releaseCoroutineStack(finishedCoro)
 		}
 
 		if st.frameIdx > st.startFrameIdx {
@@ -2257,19 +2240,25 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 				vm.excStack = vm.excStack[:caller.excStackLen]
 			}
 			callerIP := caller.ip - 1
-			if caller.genMode == genModeYieldFrom {
+			if caller.genMode == genModeYieldFrom || caller.genMode == genModeAwait {
 				callerIP = caller.ip
 			}
-			if caller.genMode != genModeNone {
+			mode := caller.genMode
+			if mode != genModeNone {
 				st.stack = caller.stack
 				st.stackIsVM = caller.stackIsVM
 				vm.execCtx.Stack = caller.stack
 				st.activeGen = caller.activeGen
+				st.activeCoro = caller.activeCoro
 				st.genFrameIdx = caller.genFrameIdx
 				caller.genMode = genModeNone
 				caller.genDefault = val.Value{}
 				caller.stack = nil
 				caller.activeGen = nil
+				caller.activeCoro = nil
+				if finishedCoro != nil && (mode == genModeAwait || mode == genModeYieldFrom) {
+					vm.releaseEphemeralCoroutine(finishedCoro)
+				}
 			}
 			st.curCO = caller.co
 			st.codePtr = caller.codePtr
@@ -2310,6 +2299,7 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 		}
 		if st.activeCoro != nil {
 			st.activeCoro.State = val.CoroClosed
+			vm.releaseCoroutineStack(st.activeCoro)
 		}
 		st.result = val.NoneVal()
 		return 0, 0, ctlExit
@@ -2433,16 +2423,22 @@ func (vm *VM) runFrame(co *CodeObject, startBase int, startSP int, startFrameIdx
 	st := vm.acquireLoopState()
 	var cellPtrs []*val.PyCell
 	ownCellPtrs := false
-	if activeGen != nil && len(activeGen.CellPtrs) == len(startCells) {
+	switch {
+	case activeGen != nil && len(activeGen.CellPtrs) == len(startCells):
 		cellPtrs = activeGen.CellPtrs
-	} else if len(startCells) > 0 {
+	case activeCoro != nil && len(activeCoro.CellPtrs) == len(startCells):
+		cellPtrs = activeCoro.CellPtrs
+	case len(startCells) > 0:
 		cellPtrs = vm.acquireGenCellPtrs(len(startCells))
 		for i, c := range startCells {
 			cellPtrs[i] = c.AsCell()
 		}
-		if activeGen != nil {
+		switch {
+		case activeGen != nil:
 			activeGen.CellPtrs = cellPtrs
-		} else {
+		case activeCoro != nil:
+			activeCoro.CellPtrs = cellPtrs
+		default:
 			ownCellPtrs = true
 		}
 	}
@@ -2494,7 +2490,7 @@ func (vm *VM) runFrame(co *CodeObject, startBase int, startSP int, startFrameIdx
 	st.frameIdx = startFrameIdx
 	st.startFrameIdx = startFrameIdx
 	st.genFrameIdx = -1
-	if activeGen != nil {
+	if activeGen != nil || activeCoro != nil {
 		st.genFrameIdx = startFrameIdx
 	}
 	if startFrameIdx > vm.maxFrameIdx {
@@ -3120,8 +3116,8 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 			top := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
 			if top.IsString() || top.Kind() == val.KindMemoryView {
 				vm.opDetachDupTop(top)
-			} else if top.IsIter() || top.IsGenerator() {
-				top.HeaderPtr().Flags &^= val.FlagEphemeralIter | val.FlagEphemeralGen
+			} else if top.IsIter() || top.IsGenerator() || top.IsCoroutine() {
+				top.HeaderPtr().Flags &^= val.FlagEphemeralIter | val.FlagEphemeralGen | val.FlagEphemeralCoro
 			}
 			*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16)) = top
 			sp++
@@ -4328,8 +4324,8 @@ func (vm *VM) instantiateGeneratorSafe(co *CodeObject, callable val.Value, defau
 	return res, !vm.execCtx.HasException()
 }
 
-func (vm *VM) instantiateCoroutineSafe(co *CodeObject, callable val.Value, defaults []val.Value, kwDefaults *val.PyDict, callerStack []val.Value, argBase int, nargs int, kwnames []val.Value, globals *val.PyDict) (val.Value, bool) {
-	res := vm.instantiateCoroutine(co, callable, defaults, kwDefaults, callerStack, argBase, nargs, kwnames, globals)
+func (vm *VM) instantiateCoroutineSafe(co *CodeObject, callable val.Value, defaults []val.Value, kwDefaults *val.PyDict, callerStack []val.Value, argBase int, nargs int, kwnames []val.Value, globals *val.PyDict, ephemeral bool) (val.Value, bool) {
+	res := vm.instantiateCoroutine(co, callable, defaults, kwDefaults, callerStack, argBase, nargs, kwnames, globals, ephemeral)
 	return res, !vm.execCtx.HasException()
 }
 

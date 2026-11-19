@@ -375,9 +375,13 @@ func (inst *PyInstance) ApplyShapeTransition(newShape *Shape, slotIdx int, v Val
 	}
 	mu := inst.lock()
 	mu.Lock()
-	if slotIdx < len(inst.Slots) {
+	switch {
+	case slotIdx < len(inst.Slots):
 		inst.Slots[slotIdx] = v
-	} else {
+	case slotIdx == len(inst.Slots) && slotIdx < len(inst.bootstrap) && (slotIdx == 0 || &inst.Slots[0] == &inst.bootstrap[0]):
+		inst.bootstrap[slotIdx] = v
+		inst.Slots = inst.bootstrap[:slotIdx+1]
+	default:
 		inst.Slots = inst.appendSlot(v)
 	}
 	inst.Shape = newShape
