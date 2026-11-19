@@ -1,8 +1,10 @@
 package val
 
 import (
+	"bytes"
 	"hash/maphash"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"unicode/utf8"
@@ -196,13 +198,136 @@ func inlineEqualsHeapString(num uint64, s string) bool {
 	return true
 }
 
-// StringLen returns the character length of a KindInlineStr or KindString Value (0 allocations for ASCII).
+// StringLen returns the character length of a KindInlineStr, KindString, or str subclass Value (0 allocations).
 func (v Value) StringLen() int {
+	if v.ptr == &tagInlineStr {
+		if (v.num & 0x8080808080808000) == 0 {
+			return int(v.num & 0xFF)
+		}
+		var buf [7]byte
+		return utf8.RuneCount(inlineStrSlice(v, &buf))
+	}
+	if v.ptr != nil && v.ptr.Kind == KindString {
+		s := (*PyString)(unsafe.Pointer(v.ptr)).Data
+		if isASCII(s) {
+			return len(s)
+		}
+		return utf8.RuneCountInString(s)
+	}
+	var buf [7]byte
+	if b := valueStringBytes(v, &buf); b != nil {
+		for _, c := range b {
+			if c >= 0x80 {
+				return utf8.RuneCount(b)
+			}
+		}
+		return len(b)
+	}
 	s := v.AsString()
 	if isASCII(s) {
 		return len(s)
 	}
 	return utf8.RuneCountInString(s)
+}
+
+// WriteToBuilder writes the UTF-8 bytes of string-like Value v into b without heap allocations.
+func (v Value) WriteToBuilder(b *strings.Builder) bool {
+	if v.ptr == &tagInlineStr {
+		var buf [7]byte
+		b.Write(inlineStrSlice(v, &buf))
+		return true
+	}
+	if v.ptr != nil && v.ptr.Kind == KindString {
+		b.WriteString((*PyString)(unsafe.Pointer(v.ptr)).Data)
+		return true
+	}
+	if v.ptr != nil && v.ptr.Kind == KindInstance {
+		inst := (*PyInstance)(unsafe.Pointer(v.ptr))
+		if inst.Header.Type != nil && StrType != nil && IsSubclass(inst.Header.Type, StrType) {
+			if len(inst.Slots) > 0 && inst.Slots[0].IsAnyString() {
+				inner := inst.Slots[0]
+				if inner.ptr == &tagInlineStr {
+					var buf [7]byte
+					b.Write(inlineStrSlice(inner, &buf))
+					return true
+				}
+				if inner.ptr != nil && inner.ptr.Kind == KindString {
+					b.WriteString((*PyString)(unsafe.Pointer(inner.ptr)).Data)
+					return true
+				}
+				b.WriteString(inner.AsString())
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func valueStringBytes(v Value, buf *[7]byte) []byte {
+	if v.ptr == &tagInlineStr {
+		return inlineStrSlice(v, buf)
+	}
+	if v.ptr != nil && v.ptr.Kind == KindString {
+		s := (*PyString)(unsafe.Pointer(v.ptr)).Data
+		return unsafe.Slice(unsafe.StringData(s), len(s))
+	}
+	if v.ptr != nil && v.ptr.Kind == KindInstance {
+		inst := (*PyInstance)(unsafe.Pointer(v.ptr))
+		if inst.Header.Type != nil && StrType != nil && IsSubclass(inst.Header.Type, StrType) {
+			if len(inst.Slots) > 0 {
+				inner := inst.Slots[0]
+				if inner.ptr == &tagInlineStr {
+					return inlineStrSlice(inner, buf)
+				}
+				if inner.ptr != nil && inner.ptr.Kind == KindString {
+					s := (*PyString)(unsafe.Pointer(inner.ptr)).Data
+					return unsafe.Slice(unsafe.StringData(s), len(s))
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// StringCompare lexicographically compares two string Values (0 allocations).
+func StringCompare(a, b Value) int {
+	if a.ptr == &tagInlineStr && b.ptr == &tagInlineStr && a.num == b.num {
+		return 0
+	}
+	var bufA, bufB [7]byte
+	return bytes.Compare(valueStringBytes(a, &bufA), valueStringBytes(b, &bufB))
+}
+
+// StringContains reports whether item is a substring of container (0 allocations).
+func StringContains(container, item Value) bool {
+	var bufA, bufB [7]byte
+	return bytes.Contains(valueStringBytes(container, &bufA), valueStringBytes(item, &bufB))
+}
+
+// IsInlineStrASCII reports whether v is a KindInlineStr containing only ASCII bytes (< 0x80).
+func IsInlineStrASCII(v Value) bool {
+	return v.ptr == &tagInlineStr && (v.num&0x8080808080808000) == 0
+}
+
+// SliceInlineStrASCII returns the byte slice [start:stop] of an ASCII KindInlineStr directly
+// from v.num using bit shifts (0 allocations).
+func SliceInlineStrASCII(v Value, start, stop int) Value {
+	n := int(v.num & 0xFF)
+	if start < 0 {
+		start = 0
+	}
+	if stop > n {
+		stop = n
+	}
+	if start >= stop {
+		return Value{num: 0, ptr: &tagInlineStr}
+	}
+	slen := stop - start
+	payload := (v.num >> uint(start*8)) & (^uint64(0) >> uint((7-slen)*8))
+	return Value{
+		num: (payload &^ 0xFF) | uint64(slen),
+		ptr: &tagInlineStr,
+	}
 }
 
 // ascii1Backing holds every single-byte string; ascii2Backing holds every

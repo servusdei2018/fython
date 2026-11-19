@@ -211,15 +211,15 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		}
 		sb.WriteString(end)
 		if !file.IsNone() {
-			write := val.GetAttrCtx(ctx, file, val.InternString("write"))
+			write := val.GetAttrCtx(ctx, file, nameWrite)
 			ctx.Invoke1(write, val.NewStringVal(sb.String()))
 			return val.NoneVal()
 		}
 		if ctx != nil && ctx.VM != nil {
 			if vmInstance, ok := ctx.VM.(*VM); ok {
-				if sysVal, ok := vmInstance.modules.Get(val.InternString("sys")); ok && sysVal.IsModule() {
-					if stdoutVal, ok := sysVal.AsModule().Dict.Get(val.InternString("stdout")); ok && !stdoutVal.IsNone() {
-						write := val.GetAttrCtx(ctx, stdoutVal, val.InternString("write"))
+				if sysVal, ok := vmInstance.modules.Get(nameSys); ok && sysVal.IsModule() {
+					if stdoutVal, ok := sysVal.AsModule().Dict.Get(nameStdout); ok && !stdoutVal.IsNone() {
+						write := val.GetAttrCtx(ctx, stdoutVal, nameWrite)
 						ctx.Invoke1(write, val.NewStringVal(sb.String()))
 						return val.NoneVal()
 					}
@@ -249,7 +249,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			return val.NoneVal()
 		}
 		if args[0].IsType() && args[0].AsType() == val.DictType {
-			out := val.NewDictVal(8)
+			out := val.NewDictVal(4)
 			d := out.AsDict()
 			for {
 				k, ok := it.Next()
@@ -371,7 +371,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			return nextVal
 		}
 
-		if nextMeth, _, ok := it.Type().LookupMRO(val.InternString("__next__")); ok {
+		if nextMeth, _, ok := it.Type().LookupMRO(nameNext); ok {
 			nextVal := ctx.Invoke1(nextMeth, it)
 			if ctx != nil && ctx.HasException() {
 				if val.IsInstance(ctx.ActiveException, val.StopIterationType) {
@@ -477,7 +477,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			return val.Int64Val(int64(val.HashValue(obj)))
 		}
 		tp := obj.Type()
-		if hashFn, owner, ok := tp.LookupMRO(val.InternString("__hash__")); ok {
+		if hashFn, owner, ok := tp.LookupMRO(nameHash); ok {
 			if hashFn.IsNone() {
 				return val.RaiseTypeError(ctx, "unhashable type: '"+tp.Name+"'")
 			}
@@ -530,7 +530,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			return val.RaiseTypeError(ctx, "format() takes at least 1 argument")
 		}
 		obj := args[0]
-		if formatFn, _, ok := obj.Type().LookupMRO(val.InternString("__format__")); ok {
+		if formatFn, _, ok := obj.Type().LookupMRO(nameFormat); ok {
 			spec := val.NewStringVal("")
 			if len(args) > 1 {
 				spec = args[1]
@@ -552,7 +552,39 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		if len(args) < 1 {
 			return val.RaiseTypeError(ctx, "all() takes exactly one argument")
 		}
-		it := getBuiltinIter(ctx, args[0])
+		arg := args[0]
+		if arg.IsGenerator() {
+			gen := arg.AsGenerator()
+			for {
+				v, status := gen.Send(ctx, val.NoneVal())
+				if status == val.IterExhausted || status == val.IterError {
+					if ctx != nil && ctx.HasException() {
+						return val.NoneVal()
+					}
+					return val.BoolVal(true)
+				}
+				if !v.IsTruthy() {
+					return val.BoolVal(false)
+				}
+			}
+		}
+		if arg.IsList() {
+			for _, item := range arg.AsList().Items {
+				if !item.IsTruthy() {
+					return val.BoolVal(false)
+				}
+			}
+			return val.BoolVal(true)
+		}
+		if arg.IsTuple() {
+			for _, item := range arg.AsTuple().Items {
+				if !item.IsTruthy() {
+					return val.BoolVal(false)
+				}
+			}
+			return val.BoolVal(true)
+		}
+		it := getBuiltinIter(ctx, arg)
 		if it == nil {
 			return val.NoneVal()
 		}
@@ -572,7 +604,39 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		if len(args) < 1 {
 			return val.RaiseTypeError(ctx, "any() takes exactly one argument")
 		}
-		it := getBuiltinIter(ctx, args[0])
+		arg := args[0]
+		if arg.IsGenerator() {
+			gen := arg.AsGenerator()
+			for {
+				v, status := gen.Send(ctx, val.NoneVal())
+				if status == val.IterExhausted || status == val.IterError {
+					if ctx != nil && ctx.HasException() {
+						return val.NoneVal()
+					}
+					return val.BoolVal(false)
+				}
+				if v.IsTruthy() {
+					return val.BoolVal(true)
+				}
+			}
+		}
+		if arg.IsList() {
+			for _, item := range arg.AsList().Items {
+				if item.IsTruthy() {
+					return val.BoolVal(true)
+				}
+			}
+			return val.BoolVal(false)
+		}
+		if arg.IsTuple() {
+			for _, item := range arg.AsTuple().Items {
+				if item.IsTruthy() {
+					return val.BoolVal(true)
+				}
+			}
+			return val.BoolVal(false)
+		}
+		it := getBuiltinIter(ctx, arg)
 		if it == nil {
 			return val.NoneVal()
 		}
@@ -598,7 +662,42 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			start = args[1]
 		}
 		total := start
-		it := iterFor(ctx, args[0])
+		arg := args[0]
+		if arg.IsGenerator() {
+			gen := arg.AsGenerator()
+			for {
+				item, status := gen.Send(ctx, val.NoneVal())
+				if status == val.IterExhausted || status == val.IterError {
+					if ctx != nil && ctx.HasException() {
+						return val.NoneVal()
+					}
+					return total
+				}
+				total = val.AddCtx(ctx, total, item)
+				if ctx != nil && ctx.HasException() {
+					return val.NoneVal()
+				}
+			}
+		}
+		if arg.IsList() {
+			for _, item := range arg.AsList().Items {
+				total = val.AddCtx(ctx, total, item)
+				if ctx != nil && ctx.HasException() {
+					return val.NoneVal()
+				}
+			}
+			return total
+		}
+		if arg.IsTuple() {
+			for _, item := range arg.AsTuple().Items {
+				total = val.AddCtx(ctx, total, item)
+				if ctx != nil && ctx.HasException() {
+					return val.NoneVal()
+				}
+			}
+			return total
+		}
+		it := iterFor(ctx, arg)
 		if it == nil {
 			return val.NoneVal()
 		}
@@ -631,18 +730,41 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			if len(pos) == 0 {
 				return val.RaiseTypeError(ctx, name+" expected at least 1 argument, got 0")
 			}
+			var buf [8]val.Value
 			var items []val.Value
 			if len(pos) == 1 {
-				it := iterFor(ctx, pos[0])
-				if it == nil {
-					return val.NoneVal()
-				}
-				for {
-					v, ok := it.Next()
-					if !ok {
-						break
+				arg := pos[0]
+				switch {
+				case arg.IsList():
+					items = arg.AsList().Items
+				case arg.IsTuple():
+					items = arg.AsTuple().Items
+				case arg.IsGenerator():
+					gen := arg.AsGenerator()
+					items = buf[:0]
+					for {
+						v, status := gen.Send(ctx, val.NoneVal())
+						if status == val.IterExhausted || status == val.IterError {
+							if ctx != nil && ctx.HasException() {
+								return val.NoneVal()
+							}
+							break
+						}
+						items = append(items, v)
 					}
-					items = append(items, v)
+				default:
+					it := iterFor(ctx, arg)
+					if it == nil {
+						return val.NoneVal()
+					}
+					items = buf[:0]
+					for {
+						v, ok := it.Next()
+						if !ok {
+							break
+						}
+						items = append(items, v)
+					}
 				}
 			} else {
 				if hasDef {
@@ -791,17 +913,41 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		if len(args) < 1 {
 			return val.RaiseTypeError(ctx, "sorted() takes at least 1 argument")
 		}
-		it := iterFor(ctx, args[0])
-		if it == nil {
-			return val.NoneVal()
-		}
+		arg := args[0]
 		var items []val.Value
-		for {
-			v, ok := it.Next()
-			if !ok {
-				break
+		switch {
+		case arg.IsList():
+			src := arg.AsList().Items
+			items = make([]val.Value, len(src))
+			copy(items, src)
+		case arg.IsTuple():
+			src := arg.AsTuple().Items
+			items = make([]val.Value, len(src))
+			copy(items, src)
+		case arg.IsGenerator():
+			gen := arg.AsGenerator()
+			for {
+				v, status := gen.Send(ctx, val.NoneVal())
+				if status == val.IterExhausted || status == val.IterError {
+					if ctx != nil && ctx.HasException() {
+						return val.NoneVal()
+					}
+					break
+				}
+				items = append(items, v)
 			}
-			items = append(items, v)
+		default:
+			it := iterFor(ctx, arg)
+			if it == nil {
+				return val.NoneVal()
+			}
+			for {
+				v, ok := it.Next()
+				if !ok {
+					break
+				}
+				items = append(items, v)
+			}
 		}
 		var keyFunc val.Value
 		reverse := false
@@ -1104,7 +1250,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			return val.NewInstanceDictProxy(inst)
 		}
 		if obj.IsDict() || obj.IsList() {
-			if d := val.GetAttrCtx(ctx, obj, val.InternString("__dict__")); d.IsDict() {
+			if d := val.GetAttrCtx(ctx, obj, nameDunderDict); d.IsDict() {
 				return d
 			}
 		}
@@ -1193,11 +1339,11 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			return val.RaiseTypeError(ctx, "globals must be a dict")
 		}
 
-		if _, ok := globalsDict.Get(val.InternString("__builtins__")); !ok {
-			if builtinsMod, ok := vmInstance.modules.Get(val.InternString("builtins")); ok {
-				globalsDict.Set(val.InternString("__builtins__"), builtinsMod)
+		if _, ok := globalsDict.Get(nameDunderBuiltins); !ok {
+			if builtinsMod, ok := vmInstance.modules.Get(nameBuiltins); ok {
+				globalsDict.Set(nameDunderBuiltins, builtinsMod)
 			} else {
-				globalsDict.Set(val.InternString("__builtins__"), val.DictVal(vmInstance.builtins))
+				globalsDict.Set(nameDunderBuiltins, val.DictVal(vmInstance.builtins))
 			}
 		}
 
@@ -1289,11 +1435,11 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			return val.RaiseTypeError(ctx, "globals must be a dict")
 		}
 
-		if _, ok := globalsDict.Get(val.InternString("__builtins__")); !ok {
-			if builtinsMod, ok := vmInstance.modules.Get(val.InternString("builtins")); ok {
-				globalsDict.Set(val.InternString("__builtins__"), builtinsMod)
+		if _, ok := globalsDict.Get(nameDunderBuiltins); !ok {
+			if builtinsMod, ok := vmInstance.modules.Get(nameBuiltins); ok {
+				globalsDict.Set(nameDunderBuiltins, builtinsMod)
 			} else {
-				globalsDict.Set(val.InternString("__builtins__"), val.DictVal(vmInstance.builtins))
+				globalsDict.Set(nameDunderBuiltins, val.DictVal(vmInstance.builtins))
 			}
 		}
 
@@ -1520,7 +1666,7 @@ func iterFor(ctx *val.ExecContext, o val.Value) *val.PyIter {
 			if o.IsIter() {
 				return o.AsIter()
 			}
-		} else if iterFn, _, ok := o.Type().LookupMRO(val.InternString("__iter__")); ok && !iterFn.IsNone() && !isPrimitiveIterable(o) {
+		} else if iterFn, _, ok := o.Type().LookupMRO(nameIter); ok && !iterFn.IsNone() && !isPrimitiveIterable(o) {
 			o = ctx.Invoke1(iterFn, o)
 			if o.IsIter() {
 				return o.AsIter()
@@ -1544,7 +1690,7 @@ func iterFor(ctx *val.ExecContext, o val.Value) *val.PyIter {
 			return val.NoneVal(), false
 		}).AsIter()
 	}
-	if nextFn, _, ok := tp.LookupMRO(val.InternString("__next__")); ok {
+	if nextFn, _, ok := tp.LookupMRO(nameNext); ok {
 		return val.NewIterValWithNext(func() (val.Value, bool) {
 			v := ctx.Invoke1(nextFn, o)
 			if ctx != nil && ctx.HasException() {

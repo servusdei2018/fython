@@ -379,7 +379,7 @@ func (e *Engine) createFunctoolsModule() val.Value {
 		KeyCls.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, cArgs []val.Value, kwnames []val.Value) val.Value {
 			inst := val.NewInstanceOfType(KeyCls)
 			if len(cArgs) > 0 {
-				inst.AsInstance().SetAttr(val.InternString("obj"), cArgs[0])
+				inst.AsInstance().SetAttr(nameObj, cArgs[0])
 			}
 			return inst
 		}
@@ -399,8 +399,8 @@ func (e *Engine) createFunctoolsModule() val.Value {
 				if len(cArgs) < 2 || !cArgs[0].IsInstance() || !cArgs[1].IsInstance() {
 					return val.NotImplementedVal()
 				}
-				selfObj, _ := cArgs[0].AsInstance().GetAttr(val.InternString("obj"))
-				otherObj, ok := cArgs[1].AsInstance().GetAttr(val.InternString("obj"))
+				selfObj, _ := cArgs[0].AsInstance().GetAttr(nameObj)
+				otherObj, ok := cArgs[1].AsInstance().GetAttr(nameObj)
 				if !ok {
 					return val.NotImplementedVal()
 				}

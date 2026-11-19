@@ -17,7 +17,7 @@ var (
 
 func initFrameSummaryType() {
 	frameSummaryTypeOnce.Do(func() {
-		d := val.NewDictVal(8).AsDict()
+		d := val.NewDictVal(4).AsDict()
 		d.Set(val.InternString("__init__"), val.NewBuiltinFuncVal("__init__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 4 {
 				ctx.Raise(val.NewException(val.TypeErrorType, "FrameSummary.__init__() missing required arguments"))
@@ -30,18 +30,18 @@ func initFrameSummaryType() {
 			line := val.NewStringVal("")
 			npos := len(args) - len(kwnames)
 			for i, kn := range kwnames {
-				if kn.AsString() == "line" {
+				if kn.StringEquals("line") {
 					line = args[npos+i]
 				}
 			}
 			if line.IsNone() || line.IsUnbound() {
 				line = val.NewStringVal("")
 			}
-			val.SetAttrCtx(ctx, self, val.InternString("filename"), fn)
-			val.SetAttrCtx(ctx, self, val.InternString("lineno"), lineno)
-			val.SetAttrCtx(ctx, self, val.InternString("name"), name)
-			val.SetAttrCtx(ctx, self, val.InternString("line"), line)
-			val.SetAttrCtx(ctx, self, val.InternString("locals"), val.NoneVal())
+			val.SetAttrCtx(ctx, self, nameFilename, fn)
+			val.SetAttrCtx(ctx, self, nameLineno, lineno)
+			val.SetAttrCtx(ctx, self, nameAttrName, name)
+			val.SetAttrCtx(ctx, self, nameLine, line)
+			val.SetAttrCtx(ctx, self, nameLocals, val.NoneVal())
 			return val.NoneVal()
 		}))
 		d.Set(val.InternString("__getitem__"), val.NewBuiltinFuncVal("__getitem__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -50,12 +50,12 @@ func initFrameSummaryType() {
 				return val.NoneVal()
 			}
 			self := args[0]
-			fn := val.GetAttrCtx(ctx, self, val.InternString("filename"))
-			lineno := val.GetAttrCtx(ctx, self, val.InternString("lineno"))
-			name := val.GetAttrCtx(ctx, self, val.InternString("name"))
-			line := val.GetAttrCtx(ctx, self, val.InternString("line"))
+			fn := val.GetAttrCtx(ctx, self, nameFilename)
+			lineno := val.GetAttrCtx(ctx, self, nameLineno)
+			name := val.GetAttrCtx(ctx, self, nameAttrName)
+			line := val.GetAttrCtx(ctx, self, nameLine)
 			tup := val.NewTupleVal(fn, lineno, name, line)
-			return ctx.Invoke1(val.GetAttrCtx(ctx, tup, val.InternString("__getitem__")), args[1])
+			return ctx.Invoke1(val.GetAttrCtx(ctx, tup, nameGetitem), args[1])
 		}))
 		d.Set(val.InternString("__iter__"), val.NewBuiltinFuncVal("__iter__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
@@ -63,10 +63,10 @@ func initFrameSummaryType() {
 				return val.NoneVal()
 			}
 			self := args[0]
-			fn := val.GetAttrCtx(ctx, self, val.InternString("filename"))
-			lineno := val.GetAttrCtx(ctx, self, val.InternString("lineno"))
-			name := val.GetAttrCtx(ctx, self, val.InternString("name"))
-			line := val.GetAttrCtx(ctx, self, val.InternString("line"))
+			fn := val.GetAttrCtx(ctx, self, nameFilename)
+			lineno := val.GetAttrCtx(ctx, self, nameLineno)
+			name := val.GetAttrCtx(ctx, self, nameAttrName)
+			line := val.GetAttrCtx(ctx, self, nameLine)
 			return val.NewIterVal(val.NewTupleVal(fn, lineno, name, line))
 		}))
 		d.Set(val.InternString("__len__"), val.NewBuiltinFuncVal("__len__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -74,10 +74,10 @@ func initFrameSummaryType() {
 		}))
 		d.Set(val.InternString("__repr__"), val.NewBuiltinFuncVal("__repr__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			self := args[0]
-			fn := val.GetAttrCtx(ctx, self, val.InternString("filename"))
-			lineno := val.GetAttrCtx(ctx, self, val.InternString("lineno"))
-			name := val.GetAttrCtx(ctx, self, val.InternString("name"))
-			line := val.GetAttrCtx(ctx, self, val.InternString("line"))
+			fn := val.GetAttrCtx(ctx, self, nameFilename)
+			lineno := val.GetAttrCtx(ctx, self, nameLineno)
+			name := val.GetAttrCtx(ctx, self, nameAttrName)
+			line := val.GetAttrCtx(ctx, self, nameLine)
 			return val.NewStringVal(fmt.Sprintf("<FrameSummary file %s, line %s, name %s, line %s>", fn.String(), lineno.String(), name.String(), line.String()))
 		}))
 		FrameSummaryType = val.MustNewType("FrameSummary", []*val.PyType{val.ObjectType}, d)
@@ -87,11 +87,11 @@ func initFrameSummaryType() {
 func newFrameSummaryVal(ctx *val.ExecContext, fileName string, lineno int, fnName string, line string) val.Value {
 	initFrameSummaryType()
 	inst := val.NewInstanceOfType(FrameSummaryType)
-	val.SetAttrCtx(ctx, inst, val.InternString("filename"), val.NewStringVal(fileName))
-	val.SetAttrCtx(ctx, inst, val.InternString("lineno"), val.Int64Val(int64(lineno)))
-	val.SetAttrCtx(ctx, inst, val.InternString("name"), val.NewStringVal(fnName))
-	val.SetAttrCtx(ctx, inst, val.InternString("line"), val.NewStringVal(line))
-	val.SetAttrCtx(ctx, inst, val.InternString("locals"), val.NoneVal())
+	val.SetAttrCtx(ctx, inst, nameFilename, val.NewStringVal(fileName))
+	val.SetAttrCtx(ctx, inst, nameLineno, val.Int64Val(int64(lineno)))
+	val.SetAttrCtx(ctx, inst, nameAttrName, val.NewStringVal(fnName))
+	val.SetAttrCtx(ctx, inst, nameLine, val.NewStringVal(line))
+	val.SetAttrCtx(ctx, inst, nameLocals, val.NoneVal())
 	return inst
 }
 
@@ -102,7 +102,7 @@ func (vm *VM) FormatException(exc val.Value) string {
 	}
 	tb := val.NoneVal()
 	if exc.IsInstance() {
-		tb, _ = exc.AsInstance().GetAttr(val.InternString("__traceback__"))
+		tb, _ = exc.AsInstance().GetAttr(nameTraceback)
 	}
 	var sb strings.Builder
 	sb.WriteString("Traceback (most recent call last):\n")
@@ -190,7 +190,7 @@ func (e *Engine) createTracebackModule() val.Value {
 		case len(args) == 1:
 			exc = args[0]
 			if exc.IsInstance() {
-				tb, _ = exc.AsInstance().GetAttr(val.InternString("__traceback__"))
+				tb, _ = exc.AsInstance().GetAttr(nameTraceback)
 			}
 		case len(args) >= 3:
 			exc = args[1]
@@ -229,7 +229,7 @@ func (e *Engine) createTracebackModule() val.Value {
 		if exc.IsNone() || exc.HeaderPtr() == nil {
 			return val.NewStringVal("NoneType: None\n")
 		}
-		tb, _ := exc.AsInstance().GetAttr(val.InternString("__traceback__"))
+		tb, _ := exc.AsInstance().GetAttr(nameTraceback)
 		var sb strings.Builder
 		sb.WriteString("Traceback (most recent call last):\n")
 		tbLines := formatTracebackChain(tb)
@@ -242,7 +242,7 @@ func (e *Engine) createTracebackModule() val.Value {
 
 	// print_exc()
 	mod.Dict.Set(val.InternString("print_exc"), val.NewBuiltinFuncVal("print_exc", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		fmtExcFn, _ := mod.Dict.Get(val.InternString("format_exc"))
+		fmtExcFn, _ := mod.Dict.Get(nameFormatExc)
 		res := ctx.Invoke0(fmtExcFn)
 		_, _ = os.Stderr.WriteString(res.AsString())
 		return val.NoneVal()
@@ -270,7 +270,7 @@ func (e *Engine) createTracebackModule() val.Value {
 		}
 		fileVal := val.NoneVal()
 		for i, kn := range kwnames {
-			if kn.AsString() == "file" {
+			if kn.StringEquals("file") {
 				fileVal = args[npos+i]
 			}
 		}
@@ -278,7 +278,7 @@ func (e *Engine) createTracebackModule() val.Value {
 			fileVal = posArgs[4]
 		}
 
-		fmtExcFn, _ := mod.Dict.Get(val.InternString("format_exception"))
+		fmtExcFn, _ := mod.Dict.Get(nameFormatException)
 		linesVal := ctx.Call(fmtExcFn, posArgs, nil)
 		var text string
 		if linesVal.IsList() {
@@ -291,7 +291,7 @@ func (e *Engine) createTracebackModule() val.Value {
 		}
 
 		if !fileVal.IsNone() {
-			writeFn := val.GetAttrCtx(ctx, fileVal, val.InternString("write"))
+			writeFn := val.GetAttrCtx(ctx, fileVal, nameWrite)
 			if !writeFn.IsUnbound() && !writeFn.IsNone() {
 				ctx.ClearException()
 				ctx.Invoke1(writeFn, val.NewStringVal(text))
@@ -318,7 +318,7 @@ func (e *Engine) createTracebackModule() val.Value {
 		for !curr.IsNone() && curr.IsFrame() {
 			frames = append(frames, curr)
 			f := curr.AsFrame()
-			fBack, _ := val.FrameType.Dict.Get(val.InternString("f_back"))
+			fBack, _ := val.FrameType.Dict.Get(nameFBack)
 			_ = fBack
 			curr = f.Back
 		}
@@ -381,7 +381,7 @@ func exceptionNotes(exc val.Value) []string {
 	if !exc.IsInstance() {
 		return nil
 	}
-	notesVal, ok := exc.AsInstance().GetAttr(val.InternString("__notes__"))
+	notesVal, ok := exc.AsInstance().GetAttr(nameNotes)
 	if !ok || !notesVal.IsList() {
 		return nil
 	}

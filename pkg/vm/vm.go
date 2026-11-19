@@ -351,7 +351,7 @@ func (vm *VM) buildClass(classBody, nameVal val.Value, origBases []val.Value, kw
 		for i := range nCells {
 			c := val.NewCellVal(val.UnboundVal())
 			bodyCells[i] = c
-			if co.CellVars[i].AsString() == "__class__" {
+			if co.CellVars[i].StringEquals("__class__") {
 				classCell = c
 				classCellIdx = i
 			}
@@ -1054,7 +1054,7 @@ func (vm *VM) initBuiltins() {
 			found := false
 
 			for i, fv := range co.FreeVars {
-				if fv.AsString() == "__class__" {
+				if fv.StringEquals("__class__") {
 					idx := len(co.CellVars) + i
 					if idx < len(activeCells) {
 						c := activeCells[idx]
@@ -1068,7 +1068,7 @@ func (vm *VM) initBuiltins() {
 			}
 			if !found {
 				for i, cv := range co.CellVars {
-					if cv.AsString() == "__class__" {
+					if cv.StringEquals("__class__") {
 						if i < len(activeCells) {
 							c := activeCells[i]
 							if c.IsCell() && !c.AsCell().Value.IsUnbound() && c.AsCell().Value.IsType() {
@@ -1136,9 +1136,9 @@ func (vm *VM) initBuiltins() {
 				activeGlobals = vmInstance.globals
 			}
 			if activeGlobals != nil {
-				if v, ok := activeGlobals.Get(val.InternString("__package__")); ok && v.IsAnyString() {
+				if v, ok := activeGlobals.Get(namePackage); ok && v.IsAnyString() {
 					pkgName = v.AsString()
-				} else if v, ok := activeGlobals.Get(val.InternString("__name__")); ok && v.IsAnyString() {
+				} else if v, ok := activeGlobals.Get(nameDunderName); ok && v.IsAnyString() {
 					pkgName = v.AsString()
 				}
 			}
@@ -1413,8 +1413,8 @@ func (vm *VM) instantiateGenerator(co *CodeObject, callable val.Value, defaults 
 }
 
 func (vm *VM) acquireCoroutine(name string, codeVal val.Value, maxStack int, globals *val.PyDict) (*val.PyCoroutine, val.Value) {
-	if maxStack < 8 {
-		maxStack = 8
+	if maxStack < 256 {
+		maxStack = 256
 	}
 	if len(vm.coroFreeList) > 0 {
 		n := len(vm.coroFreeList) - 1
@@ -1423,9 +1423,9 @@ func (vm *VM) acquireCoroutine(name string, codeVal val.Value, maxStack int, glo
 		if cap(coro.Stack) < maxStack {
 			coro.Stack = make([]val.Value, maxStack)
 		} else {
-			coro.Stack = coro.Stack[:maxStack]
+			coro.Stack = coro.Stack[:cap(coro.Stack)]
 		}
-		for i := range coro.Stack {
+		for i := range maxStack {
 			coro.Stack[i] = val.NoneVal()
 		}
 		coro.Name = name
@@ -1698,10 +1698,9 @@ func (vm *VM) setupCalleeCellsSlice(callee *CodeObject, target val.Value, stack 
 	if !target.IsFunction() && argc < boundLimit {
 		boundLimit = argc
 	}
-	var nameStr string
 	for i := range nCells {
 		name := callee.CellVars[i]
-		nameStr = name.AsString()
+		nameStr := ""
 		initVal := val.NoneVal()
 		for p := range boundLimit {
 			pn := callee.ParamNames[p]
@@ -1709,15 +1708,20 @@ func (vm *VM) setupCalleeCellsSlice(callee *CodeObject, target val.Value, stack 
 				initVal = stack[newBase+p]
 				break
 			}
-			pnStr := pn.AsString()
-			if len(pnStr) > 1 && pnStr[0] == '*' {
-				clean := pnStr[1:]
-				if len(clean) > 0 && clean[0] == '*' {
-					clean = clean[1:]
-				}
-				if clean == nameStr {
-					initVal = stack[newBase+p]
-					break
+			if pn.StringHasBytePrefix('*') {
+				pnStr := pn.AsString()
+				if len(pnStr) > 1 {
+					clean := pnStr[1:]
+					if len(clean) > 0 && clean[0] == '*' {
+						clean = clean[1:]
+					}
+					if nameStr == "" {
+						nameStr = name.AsString()
+					}
+					if clean == nameStr {
+						initVal = stack[newBase+p]
+						break
+					}
 				}
 			}
 		}
@@ -1821,7 +1825,7 @@ func (vm *VM) appendJoinItem(v val.Value) {
 		vm.joinSink.WriteString(vm.joinSep)
 	}
 	vm.joinFirst = false
-	vm.joinSink.WriteString(v.AsString())
+	v.WriteToBuilder(vm.joinSink)
 }
 
 // joinGenerator drains gen in a single runLoopWithGlobals invocation,
@@ -2224,6 +2228,9 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 func ensureStack(stack []val.Value, minCap int) []val.Value {
 	if minCap <= len(stack) {
 		return stack
+	}
+	if minCap <= cap(stack) {
+		return stack[:cap(stack)]
 	}
 	newCap := len(stack) * 2
 	if newCap < minCap {
@@ -3109,13 +3116,23 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 							}
 						}
 						entry := &st.cache.ic[ip]
-						if instShape.ID == entry.ExpectedShapeID && typeVer == entry.ExpectedTypeVer && entry.Kind == ICKindInstanceSlot {
-							slotIdx := entry.SlotIndex
-							if uint(slotIdx) < uint(len(instObj.Slots)) {
-								instObj.Slots[slotIdx] = v
-								sp -= 2
-								ip++
-								continue
+						if instShape.ID == entry.ExpectedShapeID && typeVer == entry.ExpectedTypeVer {
+							if entry.Kind == ICKindInstanceSlot {
+								slotIdx := entry.SlotIndex
+								if uint(slotIdx) < uint(len(instObj.Slots)) {
+									instObj.Slots[slotIdx] = v
+									sp -= 2
+									ip++
+									continue
+								}
+							} else if entry.Kind == ICKindInstanceTransition && uint(ip) < uint(len(st.cache.transitionIC)) {
+								tc := &st.cache.transitionIC[ip]
+								if tc.OldShape == instShape && tc.NewShape != nil && instObj.ExtendBootstrapSlot(int(tc.SlotIdx), v) {
+									instObj.Shape = tc.NewShape
+									sp -= 2
+									ip++
+									continue
+								}
 							}
 						}
 					}
@@ -3141,6 +3158,8 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 			top := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
 			if top.IsString() || top.Kind() == val.KindMemoryView {
 				vm.opDetachDupTop(top)
+			} else if top.IsIter() {
+				top.HeaderPtr().Flags &^= val.FlagEphemeralIter
 			}
 			*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16)) = top
 			sp++
@@ -3240,7 +3259,7 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				continue
 			}
 			if top.IsList() || top.IsTuple() || top.IsDict() {
-				*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)) = val.NewIterVal(top)
+				*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)) = val.AcquireForIterVal(top)
 				ip++
 				continue
 			}
@@ -3284,6 +3303,7 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 						ip++
 						continue
 					}
+					val.ReleaseForIter(pyIter)
 					sp--
 					ip = jumpTarget
 					continue
@@ -3297,6 +3317,7 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 						ip++
 						continue
 					}
+					val.ReleaseForIter(pyIter)
 					sp--
 					ip = jumpTarget
 					continue
@@ -4569,7 +4590,9 @@ func (vm *VM) loadAttrInstanceSlow(instObj *val.PyInstance, obj, attrName val.Va
 }
 
 //go:noinline
-func (vm *VM) storeAttrInstanceSlow(instObj *val.PyInstance, obj, attrName, v val.Value, ip, sp, frameIdx int, curIC []ICSlot, curAttrPIC [][4]AttrPICEntry) {
+func (vm *VM) storeAttrInstanceSlow(instObj *val.PyInstance, obj, attrName, v val.Value, ip, sp, frameIdx int, cache *VMCodeCache) {
+	curIC := cache.ic
+	curAttrPIC := cache.ensureAttrPIC()
 	attrName = val.InternValue(attrName)
 	instType := instObj.Header.Type
 	typeVer := instType.Version()
@@ -4642,10 +4665,28 @@ func (vm *VM) storeAttrInstanceSlow(instObj *val.PyInstance, obj, attrName, v va
 		return
 	}
 
+	oldShape := instObj.Shape
 	slotIdx := instObj.SetAttr(attrName, v)
-	insertAttrPIC(&curAttrPIC[ip], instObj.Shape, slotIdx, typeVer)
+	newShape := instObj.Shape
+	insertAttrPIC(&curAttrPIC[ip], newShape, slotIdx, typeVer)
+	if oldShape != nil && newShape != nil && newShape != oldShape {
+		transIC := cache.ensureTransitionIC()
+		transIC[ip] = TransitionICEntry{
+			OldShape: oldShape,
+			NewShape: newShape,
+			TypeVer:  typeVer,
+			SlotIdx:  int32(slotIdx),
+		}
+		curIC[ip] = ICSlot{
+			ExpectedShapeID: oldShape.ID,
+			Kind:            ICKindInstanceTransition,
+			SlotIndex:       int32(slotIdx),
+			ExpectedTypeVer: typeVer,
+		}
+		return
+	}
 	curIC[ip] = ICSlot{
-		ExpectedShapeID: instObj.Shape.ID,
+		ExpectedShapeID: newShape.ID,
 		Kind:            ICKindInstanceSlot,
 		SlotIndex:       int32(slotIdx),
 		ExpectedTypeVer: typeVer,
@@ -4814,8 +4855,8 @@ func (vm *VM) descrSetSafe(descr, obj, v val.Value) {
 	}
 }
 
-func (vm *VM) storeAttrInstanceSlowSafe(instObj *val.PyInstance, obj, attrName, v val.Value, ip, sp, frameIdx int, curIC []ICSlot, curAttrPIC [][4]AttrPICEntry) {
-	vm.storeAttrInstanceSlow(instObj, obj, attrName, v, ip, sp, frameIdx, curIC, curAttrPIC)
+func (vm *VM) storeAttrInstanceSlowSafe(instObj *val.PyInstance, obj, attrName, v val.Value, ip, sp, frameIdx int, cache *VMCodeCache) {
+	vm.storeAttrInstanceSlow(instObj, obj, attrName, v, ip, sp, frameIdx, cache)
 }
 
 func (vm *VM) getIterSafe(obj val.Value) val.Value {
@@ -5019,7 +5060,6 @@ func (vm *VM) callFunctionExSafe(callable, argsVal, kwDictVal val.Value, hasKW b
 	}
 
 	var argsBuf [16]val.Value
-	var kwBuf [8]val.Value
 	var argsSlice []val.Value
 	var kwnames []val.Value
 
@@ -5034,15 +5074,14 @@ func (vm *VM) callFunctionExSafe(callable, argsVal, kwDictVal val.Value, hasKW b
 			return vm.Vectorcall(callable, posArgs, nil)
 		}
 		total := len(posArgs) + kwLen
-		if total <= len(argsBuf) && kwLen <= len(kwBuf) {
+		if total <= len(argsBuf) {
 			argsSlice = argsBuf[:len(posArgs)]
 			copy(argsSlice, posArgs)
-			kwnames = kwBuf[:0]
 		} else {
 			argsSlice = make([]val.Value, len(posArgs), total)
 			copy(argsSlice, posArgs)
-			kwnames = make([]val.Value, 0, kwLen)
 		}
+		kwnames = make([]val.Value, 0, kwLen)
 		if d.Live == nil && !d.Shared && !val.MultiThreadedFlag.Load() {
 			for i := range d.Entries {
 				e := &d.Entries[i]
@@ -5081,15 +5120,14 @@ func (vm *VM) callFunctionExSafe(callable, argsVal, kwDictVal val.Value, hasKW b
 			return val.NoneVal()
 		}
 		total := len(posArgs) + len(keys)
-		if total <= len(argsBuf) && len(keys) <= len(kwBuf) {
+		if total <= len(argsBuf) {
 			argsSlice = argsBuf[:len(posArgs)]
 			copy(argsSlice, posArgs)
-			kwnames = kwBuf[:0]
 		} else {
 			argsSlice = make([]val.Value, len(posArgs), total)
 			copy(argsSlice, posArgs)
-			kwnames = make([]val.Value, 0, len(keys))
 		}
+		kwnames = make([]val.Value, 0, len(keys))
 		for _, k := range keys {
 			v := val.GetItemCtx(&vm.execCtx, kwDictVal, k)
 			if vm.execCtx.HasException() {

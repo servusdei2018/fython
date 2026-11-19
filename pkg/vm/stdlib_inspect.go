@@ -96,7 +96,7 @@ func initInspectTypes() {
 				return val.NoneVal()
 			}
 			self := args[0]
-			paramsDict := val.NewDictVal(8)
+			paramsDict := val.NewDictVal(4)
 			if len(args) > 1 && !args[1].IsNone() {
 				paramsDict = args[1]
 			}
@@ -764,7 +764,7 @@ func (e *Engine) createInspectModule() val.Value {
 		hasVarKW := (flags & CO_VARKEYWORDS) != 0
 		varnames := hook.VarNames(co)
 
-		paramDict := val.NewDictVal(8).AsDict()
+		paramDict := val.NewDictVal(4).AsDict()
 
 		// defaults align with the right end of positional parameters
 		numDefaults := len(defaults)

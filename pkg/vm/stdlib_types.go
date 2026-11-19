@@ -179,7 +179,7 @@ func initTypesModule() {
 				return val.NoneVal()
 			}
 			if attr.Attrs == nil {
-				attr.Attrs = val.NewDictVal(8).AsDict()
+				attr.Attrs = val.NewDictVal(4).AsDict()
 			}
 			attr.Attrs.Set(val.InternValue(name), value)
 			return val.NoneVal()

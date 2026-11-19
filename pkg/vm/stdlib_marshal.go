@@ -237,7 +237,7 @@ func unmarshalValue(r *bytes.Reader) (val.Value, error) {
 		}
 		return val.NewListVal(items...), nil
 	case tagDict:
-		d := val.NewDictVal(8)
+		d := val.NewDictVal(4)
 		for {
 			peek, err := r.ReadByte()
 			if err != nil {

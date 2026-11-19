@@ -39,11 +39,11 @@ func resolveRelativeImport(name string, level int, callerGlobals *val.PyDict) (s
 
 	var basePkg string
 	if callerGlobals != nil {
-		if pkgVal, ok := callerGlobals.Get(val.InternString("__package__")); ok && pkgVal.IsAnyString() && pkgVal.AsString() != "" {
+		if pkgVal, ok := callerGlobals.Get(namePackage); ok && pkgVal.IsAnyString() && pkgVal.StringByteLen() > 0 {
 			basePkg = pkgVal.AsString()
-		} else if nameVal, ok := callerGlobals.Get(val.InternString("__name__")); ok && nameVal.IsAnyString() {
+		} else if nameVal, ok := callerGlobals.Get(nameDunderName); ok && nameVal.IsAnyString() {
 			nameStr := nameVal.AsString()
-			if _, hasPath := callerGlobals.Get(val.InternString("__path__")); hasPath {
+			if _, hasPath := callerGlobals.Get(namePath); hasPath {
 				basePkg = nameStr
 			} else if idx := strings.LastIndex(nameStr, "."); idx >= 0 {
 				basePkg = nameStr[:idx]
@@ -86,8 +86,8 @@ func (vm *VM) SysPath() []string { return vm.liveSysPath() }
 // falling back to vm.engine.searchPaths if sys.path is unavailable.
 func (vm *VM) liveSysPath() []string {
 	if vm != nil && vm.modules != nil {
-		if sysVal, ok := vm.modules.Get(val.InternString("sys")); ok && sysVal.IsModule() {
-			if pathVal, ok := sysVal.AsModule().Dict.Get(val.InternString("path")); ok && pathVal.IsList() {
+		if sysVal, ok := vm.modules.Get(nameSys); ok && sysVal.IsModule() {
+			if pathVal, ok := sysVal.AsModule().Dict.Get(nameAttrPath); ok && pathVal.IsList() {
 				items := pathVal.AsList().Items
 				out := make([]string, 0, len(items))
 				for _, item := range items {
@@ -484,11 +484,11 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 		}
 
 		// Check custom finders in sys.meta_path before fallback disk lookup
-		if sysVal, ok := vm.modules.Get(val.InternString("sys")); ok && sysVal.IsModule() {
-			if mpVal, ok := sysVal.AsModule().Dict.Get(val.InternString("meta_path")); ok && mpVal.IsList() {
+		if sysVal, ok := vm.modules.Get(nameSys); ok && sysVal.IsModule() {
+			if mpVal, ok := sysVal.AsModule().Dict.Get(nameMetaPath); ok && mpVal.IsList() {
 				pathArg := val.NoneVal()
 				if i > 0 && parentVal.IsModule() {
-					if pVal, ok := parentVal.AsModule().Dict.Get(val.InternString("__path__")); ok {
+					if pVal, ok := parentVal.AsModule().Dict.Get(namePath); ok {
 						pathArg = pVal
 					}
 				}
@@ -531,21 +531,21 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 							if i > 0 {
 								mod.Package = strings.Join(parts[:i], ".")
 							}
-							mod.Dict.Set(val.InternString("__name__"), val.NewStringVal(currName))
-							mod.Dict.Set(val.InternString("__loader__"), loaderVal)
-							mod.Dict.Set(val.InternString("__spec__"), spec)
+							mod.Dict.Set(nameDunderName, val.NewStringVal(currName))
+							mod.Dict.Set(nameLoader, loaderVal)
+							mod.Dict.Set(nameSpec, spec)
 							if originStr != "" {
-								mod.Dict.Set(val.InternString("__file__"), val.NewStringVal(originStr))
+								mod.Dict.Set(nameFile, val.NewStringVal(originStr))
 							}
 							if pVal, ok := vmGetAttrSafe(&vm.execCtx, spec, "parent"); ok && !pVal.IsNone() {
-								mod.Dict.Set(val.InternString("__package__"), pVal)
+								mod.Dict.Set(namePackage, pVal)
 							} else if mod.Package != "" {
-								mod.Dict.Set(val.InternString("__package__"), val.NewStringVal(mod.Package))
+								mod.Dict.Set(namePackage, val.NewStringVal(mod.Package))
 							} else {
-								mod.Dict.Set(val.InternString("__package__"), val.NewStringVal(""))
+								mod.Dict.Set(namePackage, val.NewStringVal(""))
 							}
 							if subLocs, ok := vmGetAttrSafe(&vm.execCtx, spec, "submodule_search_locations"); ok && !subLocs.IsNone() {
-								mod.Dict.Set(val.InternString("__path__"), subLocs)
+								mod.Dict.Set(namePath, subLocs)
 							}
 
 							// Register into sys.modules BEFORE executing bytecode (circular import resolution)
@@ -601,7 +601,7 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 		} else {
 			// Search in parent package's __path__
 			parentMod := parentVal.AsModule()
-			if pathVal, ok := parentMod.Dict.Get(val.InternString("__path__")); ok && pathVal.IsList() {
+			if pathVal, ok := parentMod.Dict.Get(namePath); ok && pathVal.IsList() {
 				for _, item := range pathVal.AsList().Items {
 					if item.IsAnyString() {
 						searchDirs = append(searchDirs, item.AsString())
@@ -627,7 +627,7 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 				modVal := val.NewModuleVal(currName, "")
 				prefix, base := vm.engine.sysPrefix()
 				btv := buildSysconfigData(prefix, base)
-				modVal.AsModule().Dict.Set(val.InternString("build_time_vars"), val.DictVal(btv))
+				modVal.AsModule().Dict.Set(nameBuildTimeVars, val.DictVal(btv))
 				vm.modules.Set(internedCurr, modVal)
 				if i > 0 {
 					if parentVal.IsModule() {
@@ -673,13 +673,13 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 				if vfsDir, ok := strings.CutPrefix(filePath, "stdlib:"); ok {
 					pkgPath = "stdlib:" + path.Dir(vfsDir)
 				}
-				mod.Dict.Set(val.InternString("__package__"), val.NewStringVal(currName))
-				mod.Dict.Set(val.InternString("__path__"), val.NewListVal(val.NewStringVal(pkgPath)))
+				mod.Dict.Set(namePackage, val.NewStringVal(currName))
+				mod.Dict.Set(namePath, val.NewListVal(val.NewStringVal(pkgPath)))
 			} else {
 				if mod.Package != "" {
-					mod.Dict.Set(val.InternString("__package__"), val.NewStringVal(mod.Package))
+					mod.Dict.Set(namePackage, val.NewStringVal(mod.Package))
 				} else {
-					mod.Dict.Set(val.InternString("__package__"), val.NewStringVal(""))
+					mod.Dict.Set(namePackage, val.NewStringVal(""))
 				}
 			}
 			// Loader/spec
@@ -689,10 +689,10 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 				pkgPath := filepath.Dir(filePath)
 				// Re-create spec with search locations for packages? Use spec with subLocs
 				specVal = newModuleSpecVal(currName, loaderVal, filePath, true, []string{pkgPath})
-				mod.Dict.Set(val.InternString("__path__"), val.NewListVal(val.NewStringVal(pkgPath)))
+				mod.Dict.Set(namePath, val.NewListVal(val.NewStringVal(pkgPath)))
 			}
-			mod.Dict.Set(val.InternString("__loader__"), loaderVal)
-			mod.Dict.Set(val.InternString("__spec__"), specVal)
+			mod.Dict.Set(nameLoader, loaderVal)
+			mod.Dict.Set(nameSpec, specVal)
 			vm.modules.Set(internedCurr, modVal)
 			if i > 0 {
 				if parentVal.IsModule() {
@@ -743,13 +743,13 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 				pkgPath = "stdlib:" + path.Dir(vfsDir)
 			}
 			subSearchLocs = []string{pkgPath}
-			mod.Dict.Set(val.InternString("__package__"), val.NewStringVal(currName))
-			mod.Dict.Set(val.InternString("__path__"), val.NewListVal(val.NewStringVal(pkgPath)))
+			mod.Dict.Set(namePackage, val.NewStringVal(currName))
+			mod.Dict.Set(namePath, val.NewListVal(val.NewStringVal(pkgPath)))
 		} else {
 			if mod.Package != "" {
-				mod.Dict.Set(val.InternString("__package__"), val.NewStringVal(mod.Package))
+				mod.Dict.Set(namePackage, val.NewStringVal(mod.Package))
 			} else {
-				mod.Dict.Set(val.InternString("__package__"), val.NewStringVal(""))
+				mod.Dict.Set(namePackage, val.NewStringVal(""))
 			}
 		}
 
@@ -768,8 +768,8 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 			loaderVal = newSourceFileLoaderVal(currName, filePath)
 		}
 		specVal := newModuleSpecVal(currName, loaderVal, filePath, isPackage, subSearchLocs)
-		mod.Dict.Set(val.InternString("__loader__"), loaderVal)
-		mod.Dict.Set(val.InternString("__spec__"), specVal)
+		mod.Dict.Set(nameLoader, loaderVal)
+		mod.Dict.Set(nameSpec, specVal)
 
 		// CRITICAL: Register into sys.modules BEFORE executing bytecode to resolve circular imports
 		vm.modules.Set(internedCurr, modVal)
@@ -896,7 +896,7 @@ func (vm *VM) ImportFrom(modVal val.Value, symbolName string, callerGlobals *val
 	modName := ""
 	if modVal.IsModule() {
 		modName = modVal.AsModule().Name
-	} else if nameVal, ok := val.LookupAttrOptional(&vm.execCtx, modVal, val.InternString("__name__")); ok && nameVal.IsAnyString() {
+	} else if nameVal, ok := val.LookupAttrOptional(&vm.execCtx, modVal, nameDunderName); ok && nameVal.IsAnyString() {
 		modName = nameVal.AsString()
 	} else {
 		vm.execCtx.ClearException()
@@ -935,7 +935,7 @@ func (vm *VM) ImportStar(modVal val.Value, callerGlobals *val.PyDict) error {
 	mod := modVal.AsModule()
 
 	// If __all__ is defined, copy only symbols in __all__
-	if allVal, ok := mod.Dict.Get(val.InternString("__all__")); ok {
+	if allVal, ok := mod.Dict.Get(nameAll); ok {
 		if allVal.IsList() {
 			for _, item := range allVal.AsList().Items {
 				if item.IsAnyString() {

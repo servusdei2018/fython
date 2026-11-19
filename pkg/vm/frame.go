@@ -25,22 +25,23 @@ const (
 type ICKind uint8
 
 const (
-	ICKindNone           ICKind = iota
-	ICKindInstanceSlot          // Hit in PyInstance.Slots[SlotIndex]
-	ICKindClassMethod           // Hit on PyType MRO method (CachedVal holds raw callable)
-	ICKindDataDescriptor        // Hit on PyType MRO data descriptor (CachedVal holds descriptor)
-	ICKindProperty              // Hit on a @property whose fget is cached for in-loop dispatch
-	ICKindClassAttr             // Hit on PyType MRO non-descriptor class attribute (CachedVal holds the value)
-	ICKindGlobal                // Hit on module globals dict
-	ICKindBuiltin               // Hit on builtins dict fallback
-	ICKindModuleAttr            // Hit on module dict
-	ICKindSlotMember            // __slots__ member descriptor: direct read/write of Slots[SlotIndex]
-	ICKindNativeDescr           // Native data descriptor with a Go getter/setter (CachedVal holds descriptor)
-	ICKindClassFunc             // Plain function found on the class: bind to the receiver without an MRO walk
-	ICKindTupleGetter           // namedtuple field: read Items[SlotIndex] of a tuple-kind receiver
-	ICKindTypeAttr              // Receiver is a type; CachedVal holds the already-resolved class attribute
-	ICKindSuperMethod           // super(ThisClass, Self) MRO resolution guarded by selfType + ThisClass versions
-	ICKindPropertySet           // @property setter (CachedVal holds fset) dispatched without descriptor machinery
+	ICKindNone               ICKind = iota
+	ICKindInstanceSlot              // Hit in PyInstance.Slots[SlotIndex]
+	ICKindClassMethod               // Hit on PyType MRO method (CachedVal holds raw callable)
+	ICKindDataDescriptor            // Hit on PyType MRO data descriptor (CachedVal holds descriptor)
+	ICKindProperty                  // Hit on a @property whose fget is cached for in-loop dispatch
+	ICKindClassAttr                 // Hit on PyType MRO non-descriptor class attribute (CachedVal holds the value)
+	ICKindGlobal                    // Hit on module globals dict
+	ICKindBuiltin                   // Hit on builtins dict fallback
+	ICKindModuleAttr                // Hit on module dict
+	ICKindSlotMember                // __slots__ member descriptor: direct read/write of Slots[SlotIndex]
+	ICKindNativeDescr               // Native data descriptor with a Go getter/setter (CachedVal holds descriptor)
+	ICKindClassFunc                 // Plain function found on the class: bind to the receiver without an MRO walk
+	ICKindTupleGetter               // namedtuple field: read Items[SlotIndex] of a tuple-kind receiver
+	ICKindTypeAttr                  // Receiver is a type; CachedVal holds the already-resolved class attribute
+	ICKindSuperMethod               // super(ThisClass, Self) MRO resolution guarded by selfType + ThisClass versions
+	ICKindPropertySet               // @property setter (CachedVal holds fset) dispatched without descriptor machinery
+	ICKindInstanceTransition        // Shape-transitioning attribute store (OldShape -> NewShape via transitionIC)
 )
 
 // AttrPICEntry represents a single slot in a 4-way polymorphic inline cache for attribute access.
@@ -53,6 +54,16 @@ type AttrPICEntry struct {
 	Shape     *val.Shape
 	SlotIndex int32
 	TypeVer   uint32
+}
+
+// TransitionICEntry caches a monomorphic shape transition for OP_STORE_ATTR
+// (such as self.x = val in __init__) so fresh instances transition from OldShape
+// to NewShape in O(1) without LookupMRO or Shape.Transition.
+type TransitionICEntry struct {
+	OldShape *val.Shape
+	NewShape *val.Shape
+	TypeVer  uint64
+	SlotIdx  int32
 }
 
 // ICSlot caches resolved attribute, method, global, and call targets for O(1)
@@ -370,12 +381,13 @@ func (co *CodeObject) LineTableBytes() []byte {
 type VMCodeCache struct {
 	// owner is the VM this cache belongs to. It lets a code object publish
 	// its cache without carrying a VM pointer of its own.
-	owner     *VM
-	co        *CodeObject
-	ic        []ICSlot
-	methodPIC [][4]val.MethodPICEntry
-	attrPIC   [][4]AttrPICEntry
-	kwPIC     [][2]KwPICEntry
+	owner        *VM
+	co           *CodeObject
+	ic           []ICSlot
+	methodPIC    [][4]val.MethodPICEntry
+	attrPIC      [][4]AttrPICEntry
+	transitionIC []TransitionICEntry
+	kwPIC        [][2]KwPICEntry
 	// hotness counts how often this VM executed the code object. It is
 	// VM-local, so it never shares a cache line with another VM.
 	hotness uint32
@@ -400,6 +412,13 @@ func (c *VMCodeCache) ensureAttrPIC() [][4]AttrPICEntry {
 		c.attrPIC = make([][4]AttrPICEntry, len(c.ic))
 	}
 	return c.attrPIC
+}
+
+func (c *VMCodeCache) ensureTransitionIC() []TransitionICEntry {
+	if len(c.transitionIC) < len(c.ic) {
+		c.transitionIC = make([]TransitionICEntry, len(c.ic))
+	}
+	return c.transitionIC
 }
 
 // quickenAt writes a quickened instruction word into this VM's private copy of
@@ -484,21 +503,26 @@ func (co *CodeObject) InitCellParamIndices() {
 	indices := make([]int, len(co.CellVars))
 	for i, name := range co.CellVars {
 		indices[i] = -1
-		nameStr := name.AsString()
+		nameStr := ""
 		for p, pn := range co.ParamNames {
 			if val.StringEquals(pn, name) {
 				indices[i] = p
 				break
 			}
-			pnStr := pn.AsString()
-			if len(pnStr) > 1 && pnStr[0] == '*' {
-				clean := pnStr[1:]
-				if len(clean) > 0 && clean[0] == '*' {
-					clean = clean[1:]
-				}
-				if clean == nameStr {
-					indices[i] = p
-					break
+			if pn.StringHasBytePrefix('*') {
+				pnStr := pn.AsString()
+				if len(pnStr) > 1 {
+					clean := pnStr[1:]
+					if len(clean) > 0 && clean[0] == '*' {
+						clean = clean[1:]
+					}
+					if nameStr == "" {
+						nameStr = name.AsString()
+					}
+					if clean == nameStr {
+						indices[i] = p
+						break
+					}
 				}
 			}
 		}
@@ -559,6 +583,7 @@ type VM struct {
 	activeCellPtrs       []*val.PyCell
 	kwScratch            [64]val.Value
 	kwSet                [64]bool
+	kwNamesScratch       [16]val.Value
 	globals              *val.PyDict
 	builtins             *val.PyDict
 	modules              *val.PyDict

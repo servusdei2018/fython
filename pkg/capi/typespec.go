@@ -601,6 +601,9 @@ func PyType_FromSpecWithBases(spec unsafe.Pointer, bases unsafe.Pointer) unsafe.
 	t.Flags |= val.FlagHeapType
 	if basicsize > 0 {
 		t.Basicsize = basicsize
+		if basicsize > 16 {
+			t.Flags |= val.FlagHasCExtBase
+		}
 	}
 	if itemsize > 0 {
 		t.Itemsize = itemsize
@@ -966,6 +969,9 @@ func applySlotsToType(t *val.PyType, slots []struct {
 			}
 		case slot_tp_basicsize:
 			t.Basicsize = int(*(*int64)(s.pfunc))
+			if t.Basicsize > 16 {
+				t.Flags |= val.FlagHasCExtBase
+			}
 		case slot_tp_itemsize:
 			t.Itemsize = int(*(*int64)(s.pfunc))
 		case slot_tp_flags:
@@ -1204,6 +1210,9 @@ func PyType_Ready(t unsafe.Pointer) int32 {
 		return -1
 	}
 	gt.Basicsize = basicsize
+	if basicsize > 16 {
+		gt.Flags |= val.FlagHasCExtBase
+	}
 	gt.Itemsize = itemsize
 	gt.Native = &val.NativeTypeInfo{}
 	// tp_doc @176

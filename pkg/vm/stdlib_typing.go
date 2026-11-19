@@ -105,10 +105,9 @@ func initLazyTypingHooks() {
 			initTypingTypes()
 			return GenericAliasType.Slots.TpCall(ctx, val.TypeVal(GenericAliasType), args, kwnames)
 		}))
-		name := val.InternString("__class_getitem__")
 		for _, t := range []*val.PyType{val.ListType, val.DictType, val.TupleType, val.SetType, val.TypeType} {
 			if t != nil {
-				t.Dict.Set(name, lazyClassGetItem)
+				t.Dict.Set(nameClassGetitem, lazyClassGetItem)
 			}
 		}
 		val.UnionOrHook = func(ctx *val.ExecContext, a, b val.Value) (val.Value, bool) {
@@ -126,7 +125,7 @@ func initTypingTypesBody() {
 	nd := &pyNoDefault{Header: val.ObjectHeader{Kind: val.KindNative, Type: NoDefaultType}}
 	NoDefaultVal = val.ObjectVal(&nd.Header)
 	NoDefaultType.Dict.Set(val.InternString("__repr__"), val.NewBuiltinFuncVal("NoDefault.__repr__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		return val.InternString("typing.NoDefault")
+		return nameTypingNoDefault
 	}))
 	NoDefaultType.Dict.Set(val.InternString("__module__"), val.InternString("typing"))
 	NoDefaultType.InvalidateVersion()
@@ -161,14 +160,13 @@ func initTypingTypesBody() {
 
 func installBuiltinClassGetItem() {
 	getter := val.NewClassMethodVal(val.TypeVal(GenericAliasType))
-	name := val.InternString("__class_getitem__")
 	for _, t := range []*val.PyType{val.ListType, val.DictType, val.TupleType, val.SetType, val.TypeType} {
 		if t == nil {
 			continue
 		}
 		// Dict lookup finds __class_getitem__. Do not InvalidateVersion:
 		// re-syncing set/list slots wraps TpIter around __iter__, which calls TpIter.
-		t.Dict.Set(name, getter)
+		t.Dict.Set(nameClassGetitem, getter)
 	}
 }
 
@@ -248,7 +246,7 @@ func callerModuleName(ctx *val.ExecContext) string {
 	if g == nil {
 		return "typing"
 	}
-	if n, ok := g.Get(val.InternString("__name__")); ok && n.IsAnyString() {
+	if n, ok := g.Get(nameDunderName); ok && n.IsAnyString() {
 		name := n.AsString()
 		if name != "" {
 			return name
@@ -265,7 +263,7 @@ func typingDict(ctx *val.ExecContext) *val.PyDict {
 	if !ok || vm.modules == nil {
 		return nil
 	}
-	mod, ok := vm.modules.Get(val.InternString("typing"))
+	mod, ok := vm.modules.Get(nameTyping)
 	if !ok || !mod.IsModule() {
 		return nil
 	}
@@ -416,7 +414,7 @@ func typeVarGetAttr(ctx *val.ExecContext, obj, name val.Value) val.Value {
 		return NoDefaultVal
 	case "__module__":
 		if tv.Module == "" {
-			return val.InternString("typing")
+			return nameTyping
 		}
 		return val.InternString(tv.Module)
 	case "evaluate_bound":
@@ -545,7 +543,7 @@ func paramSpecGetAttr(ctx *val.ExecContext, obj, name val.Value) val.Value {
 		return NoDefaultVal
 	case "__module__":
 		if ps.Module == "" {
-			return val.InternString("typing")
+			return nameTyping
 		}
 		return val.InternString(ps.Module)
 	case "args":
@@ -586,7 +584,7 @@ func installTypeVarTupleMethods() {
 			return NoDefaultVal
 		case "__module__":
 			if tvt.Module == "" {
-				return val.InternString("typing")
+				return nameTyping
 			}
 			return val.InternString(tvt.Module)
 		default:
@@ -638,7 +636,7 @@ func installTypeAliasMethods() {
 		case "__type_params__":
 			return val.NewTupleVal(tat.TypeParams...)
 		case "__module__":
-			return val.InternString("typing")
+			return nameTyping
 		default:
 			return val.ObjectGetAttr(ctx, obj, name)
 		}
@@ -1002,7 +1000,7 @@ func installGenericAliasMethods() {
 				return asGenericAlias(self).Origin
 			}
 			if self.IsInstance() {
-				if v, ok := self.AsInstance().GetAttr(val.InternString("__origin__")); ok {
+				if v, ok := self.AsInstance().GetAttr(nameOriginDunder); ok {
 					return v
 				}
 			}
@@ -1020,7 +1018,7 @@ func installGenericAliasMethods() {
 				return val.NewTupleVal(asGenericAlias(self).Args...)
 			}
 			if self.IsInstance() {
-				if v, ok := self.AsInstance().GetAttr(val.InternString("__args__")); ok {
+				if v, ok := self.AsInstance().GetAttr(nameArgsDunder); ok {
 					return v
 				}
 			}
@@ -1038,7 +1036,7 @@ func installGenericAliasMethods() {
 				return val.NewTupleVal(collectTypeParams(ctx, asGenericAlias(self).Args)...)
 			}
 			if self.IsInstance() {
-				if v, ok := self.AsInstance().GetAttr(val.InternString("__parameters__")); ok {
+				if v, ok := self.AsInstance().GetAttr(nameParameters); ok {
 					return v
 				}
 			}
@@ -1176,7 +1174,7 @@ func installParamSpecArgsMethods() {
 		return asParamSpecArgs(obj).Origin
 	}
 	attr := func(ctx *val.ExecContext, obj, name val.Value) val.Value {
-		if name.AsString() == "__origin__" {
+		if name.StringEquals("__origin__") {
 			return getOrigin(obj)
 		}
 		return val.ObjectGetAttr(ctx, obj, name)
@@ -1232,7 +1230,7 @@ func installGenericMethods() {
 			return v
 		}
 		if len(args) > 0 && args[0].IsType() {
-			args[0].AsType().Dict.Set(val.InternString("__parameters__"), val.NewTupleVal())
+			args[0].AsType().Dict.Set(nameParameters, val.NewTupleVal())
 		}
 		return val.NoneVal()
 	})))

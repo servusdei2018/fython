@@ -14,7 +14,7 @@ import (
 )
 
 // PyTuple represents an immutable sequence of Values on the heap (used for kwnames and tuple constants).
-// Tuples with up to 2 elements store their backing array inline inside the same 80-byte allocation.
+// Tuples with up to 2 elements store their backing array inline inside the same allocation (80 B size class).
 // Header MUST be at byte offset 0.
 type PyTuple struct {
 	Header ObjectHeader
@@ -95,35 +95,13 @@ var (
 )
 
 // NewTupleVal constructs a heap-allocated KindTuple Value wrapping items.
-// For 1..2 items, the elements are copied into inline storage inside PyTuple.
+// Delegates to NewTupleFromSlice so the variadic slice does not escape at fixed-arity call sites.
 func NewTupleVal(items ...Value) Value {
-	n := len(items)
-	if n == 0 && TupleType != nil {
-		return EmptyTupleVal()
-	}
-	if n <= 2 {
-		obj := &PyTuple{
-			Header: ObjectHeader{
-				Kind: KindTuple,
-				Type: TupleType,
-			},
-		}
-		copy(obj.inline[:n], items)
-		obj.Items = obj.inline[:n]
-		return Value{num: 0, ptr: &obj.Header}
-	}
-	obj := &PyTuple{
-		Header: ObjectHeader{
-			Kind: KindTuple,
-			Type: TupleType,
-		},
-		Items: items,
-	}
-	return Value{num: 0, ptr: &obj.Header}
+	return NewTupleFromSlice(items)
 }
 
 // NewTupleFromSlice constructs a tuple copying elements from src.
-// For 1..2 elements, it performs a single 80-byte allocation with no separate slice backing array.
+// For 1..2 elements, it performs a single allocation with no separate slice backing array.
 func NewTupleFromSlice(src []Value) Value {
 	n := len(src)
 	if n == 0 && TupleType != nil {
@@ -149,6 +127,32 @@ func NewTupleFromSlice(src []Value) Value {
 		},
 		Items: items,
 	}
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+// newTupleOfTypeFromSlice constructs a tuple of type cls copying elements from src.
+func newTupleOfTypeFromSlice(cls *PyType, src []Value) Value {
+	if cls == TupleType {
+		return NewTupleFromSlice(src)
+	}
+	n := len(src)
+	obj := &PyTuple{
+		Header: ObjectHeader{
+			Kind: KindTuple,
+			Type: cls,
+		},
+	}
+	if n == 0 {
+		return Value{num: 0, ptr: &obj.Header}
+	}
+	if n <= len(obj.inline) {
+		copy(obj.inline[:n], src)
+		obj.Items = obj.inline[:n]
+		return Value{num: 0, ptr: &obj.Header}
+	}
+	items := make([]Value, n)
+	copy(items, src)
+	obj.Items = items
 	return Value{num: 0, ptr: &obj.Header}
 }
 
@@ -661,7 +665,7 @@ func newFunctionFromArgs(args []Value, kwnames []Value) Value {
 	for i, kn := range kwnames {
 		found := false
 		for j, n := range names {
-			if kn.AsString() == n {
+			if kn.StringEquals(n) {
 				if set[j] {
 					panic("TypeError: function() got multiple values for argument '" + n + "'")
 				}
@@ -743,6 +747,28 @@ func functionTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Va
 
 func functionTpGetAttr(ctx *ExecContext, obj, name Value) Value {
 	fn := obj.AsFunction()
+	if name.ptr == &tagInlineStr {
+		if name.StringEquals("__doc__") {
+			if fn.Dict != nil {
+				if v, ok := fn.Dict.Get(name); ok {
+					return v
+				}
+			}
+			if CodeInspectorHook != nil && fn.Code.ptr != nil {
+				docVal := CodeInspectorHook.Doc(fn.Code)
+				if !docVal.IsNone() && docVal.ptr != nil {
+					return docVal
+				}
+			}
+			return NoneVal()
+		}
+		if fn.Dict != nil {
+			if v, ok := fn.Dict.Get(name); ok {
+				return v
+			}
+		}
+		return objectGetAttr(ctx, obj, name)
+	}
 	nameStr := name.AsString()
 	switch nameStr {
 	case "__name__":
@@ -767,11 +793,11 @@ func functionTpGetAttr(ctx *ExecContext, obj, name Value) Value {
 			}
 		}
 		if fn.Globals != nil {
-			if modVal, ok := fn.Globals.Get(InternString("__name__")); ok {
+			if modVal, ok := fn.Globals.Get(strName); ok {
 				return modVal
 			}
 		}
-		return InternString("builtins")
+		return strBuiltins
 	case "__code__":
 		return fn.Code
 	case "__defaults__":
@@ -811,7 +837,7 @@ func functionTpGetAttr(ctx *ExecContext, obj, name Value) Value {
 		return NewDictVal(4)
 	case "__builtins__":
 		if fn.Globals != nil {
-			if b, ok := fn.Globals.Get(InternString("__builtins__")); ok {
+			if b, ok := fn.Globals.Get(strDunderBuiltins); ok {
 				if b.IsModule() {
 					return ObjectVal(&b.AsModule().Dict.Header)
 				}
@@ -848,7 +874,7 @@ func functionTpGetAttr(ctx *ExecContext, obj, name Value) Value {
 		}
 		// Lazy PEP 649 deferred annotation evaluation
 		if fn.Dict != nil {
-			if annotateFn, ok := fn.Dict.Get(InternString("__annotate__")); ok {
+			if annotateFn, ok := fn.Dict.Get(strAnnotate); ok {
 				var annDict Value
 				if ctx != nil && ctx.CallHook != nil {
 					base := ctx.SP
@@ -954,11 +980,10 @@ func boundMethodTpCall(ctx *ExecContext, callable Value, args []Value, kwnames [
 
 func boundMethodTpGetAttr(ctx *ExecContext, obj, name Value) Value {
 	bm := obj.AsBoundMethod()
-	nameStr := name.AsString()
-	switch nameStr {
-	case "__func__", "__wrapped__":
+	if name.StringEquals("__func__") || name.StringEquals("__wrapped__") {
 		return bm.Func
-	case "__self__":
+	}
+	if name.StringEquals("__self__") {
 		return bm.Self
 	}
 	interned := InternValue(name)
@@ -1176,7 +1201,7 @@ func typeTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value)
 				dict = dictArg.AsDict()
 			} else if !dictArg.IsNone() && dictArg.ptr != nil {
 				dict = NewDictVal(16).AsDict()
-				if itemsFn, _, ok := dictArg.Type().LookupMRO(InternString("items")); ok {
+				if itemsFn, _, ok := dictArg.Type().LookupMRO(strItems); ok {
 					itemsVal := ctx.Invoke1(itemsFn, dictArg)
 					if tpIter := itemsVal.Type().Slots.TpIter; tpIter != nil {
 						itVal := tpIter(ctx, itemsVal)
@@ -1219,21 +1244,28 @@ func typeTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value)
 	var inst Value
 	if cls.dunderNew.ptr != nil {
 		totalNewArgs := 1 + len(args)
-		switch {
-		case ctx != nil && ctx.CallHook != nil:
+		if ctx != nil {
 			if ctx.SP+totalNewArgs > len(ctx.Stack) {
 				ctx.ensureStack(ctx.SP + totalNewArgs)
 			}
 			base := ctx.SP
 			ctx.Stack[base] = callable
 			copy(ctx.Stack[base+1:base+totalNewArgs], args)
-			inst = ctx.CallHook(ctx, cls.dunderNew, base, totalNewArgs, kwnames)
-		case cls.dunderNew.IsBuiltinFunc() && totalNewArgs <= 16:
-			var argBuf [16]Value
-			argBuf[0] = callable
-			copy(argBuf[1:], args)
-			inst = cls.dunderNew.AsBuiltinFunc().Fn(ctx, cls.dunderNew, argBuf[:totalNewArgs], kwnames)
-		default:
+			switch {
+			case cls.dunderNew.IsBuiltinFunc():
+				ctx.SP = base + totalNewArgs
+				inst = cls.dunderNew.AsBuiltinFunc().Fn(ctx, cls.dunderNew, ctx.Stack[base:base+totalNewArgs], kwnames)
+				ctx.SP = base
+			case ctx.CallHook != nil:
+				inst = ctx.CallHook(ctx, cls.dunderNew, base, totalNewArgs, kwnames)
+			default:
+				if tpCall := cls.dunderNew.Type().Slots.TpCall; tpCall != nil {
+					ctx.SP = base + totalNewArgs
+					inst = tpCall(ctx, cls.dunderNew, ctx.Stack[base:base+totalNewArgs], kwnames)
+					ctx.SP = base
+				}
+			}
+		} else {
 			newArgs := make([]Value, totalNewArgs)
 			newArgs[0] = callable
 			copy(newArgs[1:], args)
@@ -1255,9 +1287,8 @@ func typeTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value)
 				if fnCode.ptr != nil {
 					vnames := CodeInspectorHook.VarNames(fnCode)
 					for _, kn := range kwnames {
-						knStr := kn.AsString()
 						for _, vn := range vnames {
-							if vn.AsString() == knStr {
+							if StringEquals(vn, kn) {
 								consumedByMeta = true
 								break
 							}
@@ -1276,21 +1307,28 @@ func typeTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value)
 		if cls.HasInit() {
 			initFn := cls.DunderInitVal()
 			totalInitArgs := 1 + len(args)
-			switch {
-			case initFn.IsBuiltinFunc() && totalInitArgs <= 16:
-				var argBuf [16]Value
-				argBuf[0] = inst
-				copy(argBuf[1:], args)
-				initFn.AsBuiltinFunc().Fn(ctx, initFn, argBuf[:totalInitArgs], kwnames)
-			case ctx != nil && ctx.CallHook != nil:
+			if ctx != nil {
 				if ctx.SP+totalInitArgs > len(ctx.Stack) {
 					ctx.ensureStack(ctx.SP + totalInitArgs)
 				}
 				base := ctx.SP
 				ctx.Stack[base] = inst
 				copy(ctx.Stack[base+1:base+totalInitArgs], args)
-				ctx.CallHook(ctx, initFn, base, totalInitArgs, kwnames)
-			default:
+				switch {
+				case initFn.IsBuiltinFunc():
+					ctx.SP = base + totalInitArgs
+					initFn.AsBuiltinFunc().Fn(ctx, initFn, ctx.Stack[base:base+totalInitArgs], kwnames)
+					ctx.SP = base
+				case ctx.CallHook != nil:
+					ctx.CallHook(ctx, initFn, base, totalInitArgs, kwnames)
+				default:
+					if tpCall := initFn.Type().Slots.TpCall; tpCall != nil {
+						ctx.SP = base + totalInitArgs
+						tpCall(ctx, initFn, ctx.Stack[base:base+totalInitArgs], kwnames)
+						ctx.SP = base
+					}
+				}
+			} else {
 				buf := make([]Value, totalInitArgs)
 				buf[0] = inst
 				copy(buf[1:], args)
@@ -2316,7 +2354,7 @@ func sliceTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value
 
 func typeMpSubscript(ctx *ExecContext, a, b Value) Value {
 	if a.IsType() {
-		if fn, _, ok := a.AsType().LookupMRO(InternString("__class_getitem__")); ok {
+		if fn, _, ok := a.AsType().LookupMRO(strClassGetItem); ok {
 			if fn.Kind() == KindClassMethod {
 				fn = fn.AsClassMethod().Callable
 			}
@@ -2744,7 +2782,7 @@ func weakRefEqual(a, b Value) bool {
 
 func weakRefTpGetAttr(ctx *ExecContext, obj, name Value) Value {
 	ref := obj.AsWeakRef()
-	if name.AsString() == "__callback__" {
+	if name.StringEquals("__callback__") {
 		return ref.Callback
 	}
 	ctx.Raise(NewException(AttributeErrorType, "'ReferenceType' object has no attribute '"+name.AsString()+"'"))
@@ -2888,16 +2926,41 @@ func ExtractIterableItems(ctx *ExecContext, arg Value) []Value {
 	}
 	if arg.IsList() {
 		l := arg.AsList()
-		l.mu.RLock()
+		if MultiThreadedFlag.Load() {
+			l.mu.RLock()
+			res := make([]Value, len(l.Items))
+			copy(res, l.Items)
+			l.mu.RUnlock()
+			return res
+		}
 		res := make([]Value, len(l.Items))
 		copy(res, l.Items)
-		l.mu.RUnlock()
 		return res
 	}
 	if arg.IsTuple() {
 		t := arg.AsTuple()
 		res := make([]Value, len(t.Items))
 		copy(res, t.Items)
+		return res
+	}
+	if arg.IsGenerator() {
+		if ctx == nil && AcquireExecContextHook != nil {
+			var release func()
+			ctx, release = AcquireExecContextHook()
+			defer release()
+		}
+		gen := arg.AsGenerator()
+		var res []Value
+		for {
+			v, status := gen.Send(ctx, NoneVal())
+			if status == IterExhausted || status == IterError {
+				if ctx != nil && ctx.HasException() {
+					return nil
+				}
+				break
+			}
+			res = append(res, v)
+		}
 		return res
 	}
 	if arg.IsDict() {
@@ -2959,7 +3022,7 @@ func ExtractIterableItems(ctx *ExecContext, arg Value) []Value {
 		if tp.Slots.TpIter != nil {
 			it = tp.Slots.TpIter(ctx, arg)
 			hasIter = true
-		} else if iterFn, _, ok := tp.LookupMRO(InternString("__iter__")); ok && !iterFn.IsNone() {
+		} else if iterFn, _, ok := tp.LookupMRO(DunderIter); ok && !iterFn.IsNone() {
 			it = ctx.Invoke1(iterFn, arg)
 			hasIter = true
 		} else {
@@ -3012,7 +3075,7 @@ func ExtractIterableItems(ctx *ExecContext, arg Value) []Value {
 				return res
 			}
 			if itType != nil {
-				if nextFn, _, okNext := itType.LookupMRO(InternString("__next__")); okNext {
+				if nextFn, _, okNext := itType.LookupMRO(DunderNext); okNext {
 					var res []Value
 					for {
 						var v Value
@@ -3081,14 +3144,14 @@ func floatFromInstance(ctx *ExecContext, a Value) (float64, bool) {
 	if inst.Header.Type == nil {
 		return 0, false
 	}
-	if fn, _, ok := inst.Header.Type.LookupMRO(InternString("__float__")); ok && !fn.IsNone() {
+	if fn, _, ok := inst.Header.Type.LookupMRO(strFloat); ok && !fn.IsNone() {
 		res := ctx.Invoke1(fn, a)
 		if res.IsFloat64() {
 			return res.AsFloat64(), true
 		}
 		return 0, false
 	}
-	if fn, _, ok := inst.Header.Type.LookupMRO(InternString("__index__")); ok && !fn.IsNone() {
+	if fn, _, ok := inst.Header.Type.LookupMRO(strIndex); ok && !fn.IsNone() {
 		res := ctx.Invoke1(fn, a)
 		if res.IsInt64() {
 			return float64(res.AsInt64()), true
@@ -3202,13 +3265,12 @@ func initTypes() {
 	TypeType.Slots.MpSubscript = typeMpSubscript
 
 	// 3. Construct built-in primitive and heap object types.
-	primAttrName := InternString("\x00prim")
 	initPrimRootShape := func(t *PyType) {
 		t.RootShape = &Shape{
 			ID:        allocShapeID(),
 			Type:      t,
 			SlotIndex: 0,
-			Attrs:     []ShapeAttr{{Name: primAttrName, Index: 0}},
+			Attrs:     []ShapeAttr{{Name: strPrimAttr, Index: 0}},
 		}
 		empty := make([]ShapeTransition, 0, 4)
 		t.RootShape.transitions.Store(&empty)
@@ -3605,10 +3667,10 @@ func initTypes() {
 			if len(inst.Slots) > 0 && inst.Slots[0].IsInt64() {
 				return inst.Slots[0]
 			}
-			if fn, _, ok := a.Type().LookupMRO(InternString("__int__")); ok {
+			if fn, _, ok := a.Type().LookupMRO(strInt); ok {
 				return ctx.Invoke1(fn, a)
 			}
-			if fn, _, ok := a.Type().LookupMRO(InternString("__index__")); ok {
+			if fn, _, ok := a.Type().LookupMRO(strIndex); ok {
 				return ctx.Invoke1(fn, a)
 			}
 		}
@@ -3745,7 +3807,7 @@ func initTypes() {
 		}
 		a := args[0]
 		if a.IsInstance() || a.Kind() == KindNative || a.IsMappingProxy() {
-			if fn, _, ok := a.Type().LookupMRO(InternString("__bool__")); ok {
+			if fn, _, ok := a.Type().LookupMRO(strBool); ok {
 				res := ctx.Invoke1(fn, a)
 				return BoolVal(res.IsTruthy())
 			}
@@ -4069,7 +4131,7 @@ func initTypes() {
 				case len(inst.Slots) > 0 && inst.Slots[0].IsAnyString():
 					s = inst.Slots[0]
 				case ctx != nil && a.Type() != nil && a.Type() != StrType:
-					if strFn, _, ok := a.Type().LookupMRO(InternString("__str__")); ok {
+					if strFn, _, ok := a.Type().LookupMRO(strStr); ok {
 						res := ctx.Invoke1(strFn, a)
 						if res.IsAnyString() {
 							s = res
@@ -4083,14 +4145,14 @@ func initTypes() {
 					s = NewStringVal(a.String())
 				}
 			case ctx != nil && a.Type() != nil && a.Type() != StrType:
-				if strFn, _, ok := a.Type().LookupMRO(InternString("__str__")); ok {
+				if strFn, _, ok := a.Type().LookupMRO(strStr); ok {
 					res := ctx.Invoke1(strFn, a)
 					if res.IsAnyString() {
 						s = res
 					} else {
 						s = NewStringVal(res.String())
 					}
-				} else if reprFn, _, ok := a.Type().LookupMRO(InternString("__repr__")); ok {
+				} else if reprFn, _, ok := a.Type().LookupMRO(strRepr); ok {
 					res := ctx.Invoke1(reprFn, a)
 					if res.IsAnyString() {
 						s = res
@@ -4292,14 +4354,14 @@ func initTypes() {
 			return inst
 		}
 		if ctx != nil && a.Type() != nil && a.Type() != StrType {
-			if strFn, _, ok := a.Type().LookupMRO(InternString("__str__")); ok {
+			if strFn, _, ok := a.Type().LookupMRO(strStr); ok {
 				res := ctx.Invoke1(strFn, a)
 				if res.IsAnyString() {
 					return res
 				}
 				return NewStringVal(res.String())
 			}
-			if reprFn, _, ok := a.Type().LookupMRO(InternString("__repr__")); ok {
+			if reprFn, _, ok := a.Type().LookupMRO(strRepr); ok {
 				res := ctx.Invoke1(reprFn, a)
 				if res.IsAnyString() {
 					return res
@@ -4357,6 +4419,18 @@ func initTypes() {
 			ctx.Raise(NewException(TypeErrorType, "descriptor 'lower' of 'str' object needs an argument"))
 			return NoneVal()
 		}
+		if IsInlineStrASCII(args[0]) {
+			n := int(args[0].num & 0xFF)
+			out := uint64(n)
+			for i := range n {
+				c := byte(args[0].num >> ((i + 1) * 8))
+				if c >= 'A' && c <= 'Z' {
+					c += 'a' - 'A'
+				}
+				out |= uint64(c) << ((i + 1) * 8)
+			}
+			return Value{num: out, ptr: &tagInlineStr}
+		}
 		if s, ok := unwrapStrVal(args[0]); ok {
 			return NewStringVal(strings.ToLower(s))
 		}
@@ -4367,6 +4441,18 @@ func initTypes() {
 		if len(args) < 1 {
 			ctx.Raise(NewException(TypeErrorType, "descriptor 'upper' of 'str' object needs an argument"))
 			return NoneVal()
+		}
+		if IsInlineStrASCII(args[0]) {
+			n := int(args[0].num & 0xFF)
+			out := uint64(n)
+			for i := range n {
+				c := byte(args[0].num >> ((i + 1) * 8))
+				if c >= 'a' && c <= 'z' {
+					c -= 'a' - 'A'
+				}
+				out |= uint64(c) << ((i + 1) * 8)
+			}
+			return Value{num: out, ptr: &tagInlineStr}
 		}
 		if s, ok := unwrapStrVal(args[0]); ok {
 			return NewStringVal(strings.ToUpper(s))
@@ -4379,8 +4465,9 @@ func initTypes() {
 			ctx.Raise(NewException(TypeErrorType, "startswith() takes at least 1 argument"))
 			return NoneVal()
 		}
-		s := args[0].AsString()
-		sLen := len(s)
+		var sBuf, pBuf [7]byte
+		sb := valueStringBytes(args[0], &sBuf)
+		sLen := len(sb)
 		start := 0
 		end := sLen
 		if len(args) > 2 && !args[2].IsNone() {
@@ -4412,17 +4499,17 @@ func initTypes() {
 		if start > end {
 			start = end
 		}
-		s = s[start:end]
+		sb = sb[start:end]
 		prefix := args[1]
 		if prefix.IsTuple() {
 			for _, item := range prefix.AsTuple().Items {
-				if strings.HasPrefix(s, item.AsString()) {
+				if bytes.HasPrefix(sb, valueStringBytes(item, &pBuf)) {
 					return BoolVal(true)
 				}
 			}
 			return BoolVal(false)
 		}
-		return BoolVal(strings.HasPrefix(s, prefix.AsString()))
+		return BoolVal(bytes.HasPrefix(sb, valueStringBytes(prefix, &pBuf)))
 	}))
 
 	StrType.Dict.Set(InternString("endswith"), NewBuiltinFuncVal("endswith", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
@@ -4430,8 +4517,9 @@ func initTypes() {
 			ctx.Raise(NewException(TypeErrorType, "endswith() takes at least 1 argument"))
 			return NoneVal()
 		}
-		s := args[0].AsString()
-		sLen := len(s)
+		var sBuf, pBuf [7]byte
+		sb := valueStringBytes(args[0], &sBuf)
+		sLen := len(sb)
 		start := 0
 		end := sLen
 		if len(args) > 2 && !args[2].IsNone() {
@@ -4463,17 +4551,17 @@ func initTypes() {
 		if start > end {
 			start = end
 		}
-		s = s[start:end]
+		sb = sb[start:end]
 		suffix := args[1]
 		if suffix.IsTuple() {
 			for _, item := range suffix.AsTuple().Items {
-				if strings.HasSuffix(s, item.AsString()) {
+				if bytes.HasSuffix(sb, valueStringBytes(item, &pBuf)) {
 					return BoolVal(true)
 				}
 			}
 			return BoolVal(false)
 		}
-		return BoolVal(strings.HasSuffix(s, suffix.AsString()))
+		return BoolVal(bytes.HasSuffix(sb, valueStringBytes(suffix, &pBuf)))
 	}))
 
 	StrType.Dict.Set(InternString("replace"), NewBuiltinFuncVal("replace", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
@@ -4551,83 +4639,55 @@ func initTypes() {
 			ctx.Raise(NewException(TypeErrorType, "join() takes exactly one argument"))
 			return NoneVal()
 		}
-		var sepBuf, itemBuf [7]byte
+		var sepBuf [7]byte
 		var sepBytes []byte
 		var sepStr string
 		sepInline := args[0].ptr == &tagInlineStr
-		if sepInline {
+		switch {
+		case sepInline:
 			sepBytes = inlineStrSlice(args[0], &sepBuf)
-		} else {
+		case args[0].ptr != nil && args[0].ptr.Kind == KindString:
+			sepStr = (*PyString)(unsafe.Pointer(args[0].ptr)).Data
+		default:
 			sepStr = args[0].AsString()
 		}
-		sepLen := args[0].StringLen()
+		sepLen := args[0].StringByteLen()
 		iterable := args[1]
 		// Streaming container paths avoid building an intermediate []Value
 		// slice of every item.
 		var b strings.Builder
+		joinItems := func(items []Value) Value {
+			if len(items) == 0 {
+				return NewStringVal("")
+			}
+			total := sepLen * (len(items) - 1)
+			for _, it := range items {
+				if n := it.StringByteLen(); n > 0 || it.IsAnyString() {
+					total += n
+				} else {
+					total += 16
+				}
+			}
+			b.Grow(total)
+			for i, it := range items {
+				if i > 0 && sepLen > 0 {
+					if sepInline {
+						b.Write(sepBytes)
+					} else {
+						b.WriteString(sepStr)
+					}
+				}
+				if !it.WriteToBuilder(&b) {
+					b.WriteString(it.String())
+				}
+			}
+			return NewStringVal(b.String())
+		}
 		switch {
 		case iterable.IsList():
-			items := iterable.AsList().Items
-			if len(items) == 0 {
-				return NewStringVal("")
-			}
-			total := sepLen * (len(items) - 1)
-			for _, it := range items {
-				if it.IsAnyString() {
-					total += it.StringLen()
-				} else {
-					total += 16
-				}
-			}
-			b.Grow(total)
-			for i, it := range items {
-				if i > 0 && sepLen > 0 {
-					if sepInline {
-						b.Write(sepBytes)
-					} else {
-						b.WriteString(sepStr)
-					}
-				}
-				switch {
-				case it.ptr == &tagInlineStr:
-					b.Write(inlineStrSlice(it, &itemBuf))
-				case it.IsAnyString():
-					b.WriteString(it.AsString())
-				default:
-					b.WriteString(it.String())
-				}
-			}
+			return joinItems(iterable.AsList().Items)
 		case iterable.IsTuple():
-			items := iterable.AsTuple().Items
-			if len(items) == 0 {
-				return NewStringVal("")
-			}
-			total := sepLen * (len(items) - 1)
-			for _, it := range items {
-				if it.IsAnyString() {
-					total += it.StringLen()
-				} else {
-					total += 16
-				}
-			}
-			b.Grow(total)
-			for i, it := range items {
-				if i > 0 && sepLen > 0 {
-					if sepInline {
-						b.Write(sepBytes)
-					} else {
-						b.WriteString(sepStr)
-					}
-				}
-				switch {
-				case it.ptr == &tagInlineStr:
-					b.Write(inlineStrSlice(it, &itemBuf))
-				case it.IsAnyString():
-					b.WriteString(it.AsString())
-				default:
-					b.WriteString(it.String())
-				}
-			}
+			return joinItems(iterable.AsTuple().Items)
 		case iterable.IsGenerator():
 			gen := iterable.AsGenerator()
 			sep := sepStr
@@ -4655,52 +4715,16 @@ func initTypes() {
 					}
 					break
 				}
-				if !first {
-					if len(sep) > 0 {
-						b.WriteString(sep)
-					}
+				if !first && len(sep) > 0 {
+					b.WriteString(sep)
 				}
 				first = false
-				switch {
-				case v.ptr == &tagInlineStr:
-					b.Write(inlineStrSlice(v, &itemBuf))
-				case v.IsAnyString():
-					b.WriteString(v.AsString())
-				default:
+				if !v.WriteToBuilder(&b) {
 					b.WriteString(v.String())
 				}
 			}
 		default:
-			items := ExtractIterableItems(ctx, iterable)
-			if len(items) == 0 {
-				return NewStringVal("")
-			}
-			total := sepLen * (len(items) - 1)
-			for _, it := range items {
-				if it.IsAnyString() {
-					total += it.StringLen()
-				} else {
-					total += 16
-				}
-			}
-			b.Grow(total)
-			for i, it := range items {
-				if i > 0 && sepLen > 0 {
-					if sepInline {
-						b.Write(sepBytes)
-					} else {
-						b.WriteString(sepStr)
-					}
-				}
-				switch {
-				case it.ptr == &tagInlineStr:
-					b.Write(inlineStrSlice(it, &itemBuf))
-				case it.IsAnyString():
-					b.WriteString(it.AsString())
-				default:
-					b.WriteString(it.String())
-				}
-			}
+			return joinItems(ExtractIterableItems(ctx, iterable))
 		}
 		return NewStringVal(b.String())
 	}))
@@ -5366,7 +5390,7 @@ func initTypes() {
 						d.Set(e.Key, e.Value)
 					}
 				}
-			} else if keysFn, _, ok := other.Type().LookupMRO(InternString("keys")); ok {
+			} else if keysFn, _, ok := other.Type().LookupMRO(strKeys); ok {
 				keysVal := ctx.Invoke1(keysFn, other)
 				for _, k := range ExtractIterableItems(ctx, keysVal) {
 					var v Value
@@ -5396,7 +5420,7 @@ func initTypes() {
 		if len(args) < 1 {
 			return NoneVal()
 		}
-		if updateFn, ok := DictType.Dict.Get(InternString("update")); ok {
+		if updateFn, ok := DictType.Dict.Get(strUpdate); ok {
 			return updateFn.AsBuiltinFunc().Fn(ctx, updateFn, args, kwnames)
 		}
 		return NoneVal()
@@ -5450,39 +5474,103 @@ func initTypes() {
 	TupleType.Slots.SqLen = tupleSqLen
 	TupleType.Slots.SqItem = tupleSqItem
 	TupleType.Slots.MpSubscript = tupleMpSubscript
+	buildTupleFromIterable := func(ctx *ExecContext, cls *PyType, arg Value) Value {
+		if arg.IsTuple() {
+			if cls == TupleType {
+				if arg.Type() == TupleType {
+					return arg
+				}
+				return NewTupleFromSlice(arg.AsTuple().Items)
+			}
+			src := arg.AsTuple().Items
+			obj := &PyTuple{
+				Header: ObjectHeader{
+					Kind: KindTuple,
+					Type: cls,
+				},
+			}
+			n := len(src)
+			if n <= len(obj.inline) {
+				copy(obj.inline[:n], src)
+				obj.Items = obj.inline[:n]
+			} else {
+				obj.Items = src
+			}
+			return Value{num: 0, ptr: &obj.Header}
+		}
+		if arg.IsList() {
+			l := arg.AsList()
+			if MultiThreadedFlag.Load() {
+				l.mu.RLock()
+				res := newTupleOfTypeFromSlice(cls, l.Items)
+				l.mu.RUnlock()
+				return res
+			}
+			return newTupleOfTypeFromSlice(cls, l.Items)
+		}
+		if arg.IsGenerator() {
+			gen := arg.AsGenerator()
+			var buf [8]Value
+			items := buf[:0]
+			for {
+				v, status := gen.Send(ctx, NoneVal())
+				if status == IterExhausted || status == IterError {
+					if ctx != nil && ctx.HasException() {
+						return NoneVal()
+					}
+					break
+				}
+				items = append(items, v)
+			}
+			return newTupleOfTypeFromSlice(cls, items)
+		}
+		if arg.IsIter() {
+			it := arg.AsIter()
+			if it.Kind == IterKindInvalid {
+				ctx.Raise(NewException(TypeErrorType, "'"+it.Obj.Type().Name+"' object is not iterable"))
+				return NoneVal()
+			}
+			var buf [8]Value
+			items := buf[:0]
+			for {
+				v, ok := it.Next()
+				if !ok {
+					break
+				}
+				items = append(items, v)
+			}
+			return newTupleOfTypeFromSlice(cls, items)
+		}
+		items := ExtractIterableItems(ctx, arg)
+		if ctx != nil && ctx.HasException() {
+			return NoneVal()
+		}
+		return newTupleOfTypeFromSlice(cls, items)
+	}
 	TupleType.Slots.TpCall = func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) == 0 {
 			return EmptyTupleVal()
 		}
-		if args[0].Kind() == KindTuple && args[0].Type() == TupleType {
-			return args[0]
-		}
-		items := ExtractIterableItems(ctx, args[0])
-		return NewTupleVal(items...)
+		return buildTupleFromIterable(ctx, TupleType, args[0])
 	}
 	tupleNewBuiltin := NewBuiltinFuncVal("tuple.__new__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		cls := TupleType
 		if len(args) > 0 && args[0].IsType() {
 			cls = args[0].AsType()
 		}
-		var items []Value
-		if len(args) > 1 {
-			items = ExtractIterableItems(ctx, args[1])
-		}
-		if cls == TupleType {
-			if len(items) == 0 {
+		if len(args) <= 1 {
+			if cls == TupleType {
 				return EmptyTupleVal()
 			}
-			return NewTupleVal(items...)
+			obj := &PyTuple{
+				Header: ObjectHeader{
+					Kind: KindTuple,
+					Type: cls,
+				},
+			}
+			return Value{num: 0, ptr: &obj.Header}
 		}
-		obj := &PyTuple{
-			Header: ObjectHeader{
-				Kind: KindTuple,
-				Type: cls,
-			},
-			Items: items,
-		}
-		return Value{num: 0, ptr: &obj.Header}
+		return buildTupleFromIterable(ctx, cls, args[1])
 	})
 	TupleType.Dict.Set(DunderNew, tupleNewBuiltin)
 	TupleType.dunderNew = tupleNewBuiltin
@@ -5809,15 +5897,18 @@ func initTypes() {
 	BuiltinFuncType.dunderGet = builtinFuncGetBuiltin
 	BuiltinFuncType.Slots.TpGetAttr = func(ctx *ExecContext, obj, name Value) Value {
 		bf := obj.AsBuiltinFunc()
-		switch name.AsString() {
-		case "__name__":
-			return InternString(bf.Name)
-		case "__qualname__":
-			return InternString(bf.Name)
-		case "__module__":
-			return InternString("builtins")
-		case "__doc__":
+		if name.StringEquals("__doc__") {
 			return NoneVal()
+		}
+		if name.ptr != &tagInlineStr {
+			switch name.AsString() {
+			case "__name__":
+				return InternString(bf.Name)
+			case "__qualname__":
+				return InternString(bf.Name)
+			case "__module__":
+				return strBuiltins
+			}
 		}
 		return ObjectType.Slots.TpGetAttr(ctx, obj, name)
 	}
@@ -5843,23 +5934,23 @@ func initTypes() {
 	PropertyType.Slots.TpDescrSet = propertyDescrSet
 	PropertyType.Slots.TpGetAttr = func(ctx *ExecContext, obj, name Value) Value {
 		p := obj.AsProperty()
-		switch name.AsString() {
-		case "fget":
+		switch {
+		case name.StringEquals("fget"):
 			if p.FGet.ptr != nil || p.FGet.num != 0 {
 				return p.FGet
 			}
 			return NoneVal()
-		case "fset":
+		case name.StringEquals("fset"):
 			if p.FSet.ptr != nil || p.FSet.num != 0 {
 				return p.FSet
 			}
 			return NoneVal()
-		case "fdel":
+		case name.StringEquals("fdel"):
 			if p.FDel.ptr != nil || p.FDel.num != 0 {
 				return p.FDel
 			}
 			return NoneVal()
-		case "__doc__":
+		case name.StringEquals("__doc__"):
 			if p.Doc.ptr != nil || p.Doc.num != 0 {
 				return p.Doc
 			}
@@ -6222,20 +6313,20 @@ func initTypes() {
 			return NoneVal()
 		}
 		inst := NewInstanceOfType(SentinelType)
-		inst.AsInstance().SetAttr(InternString("name"), nameVal)
+		inst.AsInstance().SetAttr(strAttrName, nameVal)
 		if reprVal.IsNone() {
 			reprVal = NewStringVal("<" + nameVal.AsString() + ">")
 		}
-		inst.AsInstance().SetAttr(InternString("_repr"), reprVal)
+		inst.AsInstance().SetAttr(strUnderscoreRepr, reprVal)
 		return inst
 	}
 	SentinelType.Dict.Set(InternString("__repr__"), NewBuiltinFuncVal("sentinel.__repr__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) > 0 && args[0].IsInstance() {
-			if r, ok := args[0].AsInstance().GetAttr(InternString("_repr")); ok {
+			if r, ok := args[0].AsInstance().GetAttr(strUnderscoreRepr); ok {
 				return r
 			}
 		}
-		return InternString("<sentinel>")
+		return strSentinelRepr
 	}))
 	tagEllipsis.Type = EllipsisType
 
@@ -6290,7 +6381,7 @@ func initTypes() {
 
 	CellType = MustNewType("cell", []*PyType{ObjectType}, nil)
 	CellType.Slots.TpGetAttr = func(ctx *ExecContext, obj, name Value) Value {
-		if name.AsString() == "cell_contents" {
+		if name.StringEquals("cell_contents") {
 			v := obj.AsCell().Value
 			if v.IsUnbound() {
 				ctx.Raise(NewException(ValueErrorType, "Cell is empty"))
@@ -6319,7 +6410,7 @@ func initTypes() {
 		return NoneVal()
 	}
 	CellType.Slots.TpSetAttr = func(ctx *ExecContext, obj, name, value Value) Value {
-		if name.AsString() == "cell_contents" {
+		if name.StringEquals("cell_contents") {
 			obj.AsCell().Value = value
 			return NoneVal()
 		}
@@ -6491,7 +6582,7 @@ func initTypes() {
 			}
 		}
 		if len(args) >= 4 && !args[3].IsNone() && exc.IsInstance() {
-			exc.AsInstance().SetAttr(InternString("__traceback__"), args[3])
+			exc.AsInstance().SetAttr(strTraceback, args[3])
 		}
 		v, status := gen.Throw(ctx, exc)
 		if status == IterExhausted {
@@ -6673,11 +6764,11 @@ func initTypes() {
 					tupleItems = make([]Value, len(args)-1)
 					copy(tupleItems, args[1:])
 				}
-				self.AsInstance().SetAttr(InternString("args"), NewTupleVal(tupleItems...))
-				self.AsInstance().SetAttr(InternString("__traceback__"), NoneVal())
-				self.AsInstance().SetAttr(InternString("__cause__"), NoneVal())
-				self.AsInstance().SetAttr(InternString("__context__"), NoneVal())
-				self.AsInstance().SetAttr(InternString("__suppress_context__"), BoolVal(false))
+				self.AsInstance().SetAttr(strArgs, NewTupleVal(tupleItems...))
+				self.AsInstance().SetAttr(strTraceback, NoneVal())
+				self.AsInstance().SetAttr(strCause, NoneVal())
+				self.AsInstance().SetAttr(strContext, NoneVal())
+				self.AsInstance().SetAttr(strSuppressContext, BoolVal(false))
 			}
 		}
 		return NoneVal()
@@ -6709,7 +6800,7 @@ func initTypes() {
 		self := args[0]
 		tb := args[1]
 		if self.IsInstance() {
-			self.AsInstance().SetAttr(InternString("__traceback__"), tb)
+			self.AsInstance().SetAttr(strTraceback, tb)
 		}
 		return self
 	}))
@@ -6731,10 +6822,10 @@ func initTypes() {
 			return NoneVal()
 		}
 		inst := self.AsInstance()
-		notes, ok := inst.GetAttr(InternString("__notes__"))
+		notes, ok := inst.GetAttr(strNotes)
 		if !ok || !notes.IsList() {
 			notes = NewListVal()
-			inst.SetAttr(InternString("__notes__"), notes)
+			inst.SetAttr(strNotes, notes)
 		}
 		notes.AsList().Append(note)
 		return NoneVal()
@@ -6841,7 +6932,7 @@ func initTypes() {
 		if len(args) > 0 && args[0].IsInstance() {
 			inst := args[0].AsInstance()
 			rest := append([]Value(nil), args[1:]...)
-			inst.SetAttr(InternString("args"), NewTupleVal(rest...))
+			inst.SetAttr(strArgs, NewTupleVal(rest...))
 			code := NoneVal()
 			switch len(rest) {
 			case 0:
@@ -6850,7 +6941,7 @@ func initTypes() {
 			default:
 				code = NewTupleVal(rest...)
 			}
-			inst.SetAttr(InternString("code"), code)
+			inst.SetAttr(strCode, code)
 		}
 		return NoneVal()
 	}))
@@ -6865,25 +6956,25 @@ func initTypes() {
 			inst := args[0].AsInstance()
 			posEnd := max(1, len(args)-len(kwnames))
 			rest := append([]Value(nil), args[1:posEnd]...)
-			inst.SetAttr(InternString("args"), NewTupleVal(rest...))
+			inst.SetAttr(strArgs, NewTupleVal(rest...))
 			if len(rest) == 1 {
-				inst.SetAttr(InternString("msg"), rest[0])
+				inst.SetAttr(strMsg, rest[0])
 			} else {
-				inst.SetAttr(InternString("msg"), NoneVal())
+				inst.SetAttr(strMsg, NoneVal())
 			}
 			nameVal := NoneVal()
 			pathVal := NoneVal()
 			for i, kw := range kwnames {
 				v := args[posEnd+i]
-				switch kw.AsString() {
-				case "name":
+				switch {
+				case kw.StringEquals("name"):
 					nameVal = v
-				case "path":
+				case kw.StringEquals("path"):
 					pathVal = v
 				}
 			}
-			inst.SetAttr(InternString("name"), nameVal)
-			inst.SetAttr(InternString("path"), pathVal)
+			inst.SetAttr(strAttrName, nameVal)
+			inst.SetAttr(strPath, pathVal)
 		}
 		return NoneVal()
 	}))
@@ -7756,6 +7847,7 @@ func initTypes() {
 	}))
 
 	ModuleType = MustNewType("module", []*PyType{ObjectType}, nil)
+	ModuleType.Flags |= FlagIsModuleSub
 	ModuleType.Slots.TpGetAttr = moduleGetAttr
 	ModuleType.Slots.TpSetAttr = moduleSetAttr
 
@@ -7800,10 +7892,10 @@ func initTypes() {
 			docV = args[2]
 		}
 		for i, kn := range kwnames {
-			switch kn.AsString() {
-			case "name":
+			switch {
+			case kn.StringEquals("name"):
 				nameV, haveName = args[npos+i], true
-			case "doc":
+			case kn.StringEquals("doc"):
 				docV = args[npos+i]
 			default:
 				ctx.Raise(NewException(TypeErrorType, "module.__init__() got an unexpected keyword argument '"+kn.AsString()+"'"))
@@ -7816,12 +7908,12 @@ func initTypes() {
 				return NoneVal()
 			}
 			mod.Name = nameV.AsString()
-			mod.Dict.Set(InternString("__name__"), nameV)
+			mod.Dict.Set(strName, nameV)
 		}
-		mod.Dict.Set(InternString("__doc__"), docV)
-		mod.Dict.Set(InternString("__package__"), NoneVal())
-		mod.Dict.Set(InternString("__loader__"), NoneVal())
-		mod.Dict.Set(InternString("__spec__"), NoneVal())
+		mod.Dict.Set(strDoc, docV)
+		mod.Dict.Set(strPackage, NoneVal())
+		mod.Dict.Set(strLoader, NoneVal())
+		mod.Dict.Set(strSpec, NoneVal())
 		return NoneVal()
 	})
 	ModuleType.Dict.Set(DunderInit, moduleInitBuiltin)
@@ -7864,10 +7956,10 @@ func initTypes() {
 		}
 		m := args[0].AsModule()
 		name := m.Name
-		if nameV, ok := m.Dict.Get(InternString("__name__")); ok && nameV.IsAnyString() {
+		if nameV, ok := m.Dict.Get(strName); ok && nameV.IsAnyString() {
 			name = nameV.AsString()
 		}
-		if fileV, ok := m.Dict.Get(InternString("__file__")); ok && fileV.IsAnyString() {
+		if fileV, ok := m.Dict.Get(strFile); ok && fileV.IsAnyString() {
 			return NewStringVal(fmt.Sprintf("<module '%s' from '%s'>", name, fileV.AsString()))
 		}
 		return NewStringVal(fmt.Sprintf("<module '%s'>", name))
@@ -7977,7 +8069,7 @@ func initTypes() {
 			dict = args[3].AsDict()
 		} else if !args[3].IsNone() && args[3].ptr != nil {
 			dict = NewDictVal(16).AsDict()
-			if itemsFn, _, ok := args[3].Type().LookupMRO(InternString("items")); ok {
+			if itemsFn, _, ok := args[3].Type().LookupMRO(strItems); ok {
 				itemsVal := ctx.Invoke1(itemsFn, args[3])
 				if tpIter := itemsVal.Type().Slots.TpIter; tpIter != nil {
 					itVal := tpIter(ctx, itemsVal)
@@ -8135,8 +8227,8 @@ func initTypes() {
 		if obj.IsInstance() {
 			if tp.Flags&FlagForbidDynamicAttrs != 0 {
 				if BaseExceptionType != nil && IsSubclass(tp, BaseExceptionType) {
-					switch interned.AsString() {
-					case "__traceback__", "__cause__", "__context__", "__suppress_context__":
+					if interned.StringEquals("__traceback__") || interned.StringEquals("__cause__") ||
+						interned.StringEquals("__context__") || interned.StringEquals("__suppress_context__") {
 						goto allowDynamicSet
 					}
 				}
@@ -8156,7 +8248,7 @@ func initTypes() {
 			return NoneVal()
 		}
 		if obj.IsModule() {
-			if interned.AsString() == "__class__" {
+			if interned.StringEquals("__class__") {
 				AssignInstanceClass(obj, value)
 				return NoneVal()
 			}
@@ -8166,7 +8258,7 @@ func initTypes() {
 		if obj.IsDict() && tp != DictType {
 			d := obj.AsDict()
 			if d.Attrs == nil {
-				d.Attrs = NewDictVal(8).AsDict()
+				d.Attrs = NewDictVal(4).AsDict()
 			}
 			d.Attrs.Set(interned, value)
 			return NoneVal()
@@ -8174,7 +8266,7 @@ func initTypes() {
 		if obj.IsList() && tp != ListType {
 			l := obj.AsList()
 			if l.Attrs == nil {
-				l.Attrs = NewDictVal(8).AsDict()
+				l.Attrs = NewDictVal(4).AsDict()
 			}
 			l.Attrs.Set(interned, value)
 			return NoneVal()
@@ -8286,7 +8378,7 @@ func initTypes() {
 		}
 		self := args[0]
 		// Honour an overridden __reduce__, like CPython's object.__reduce_ex__.
-		if fn, owner, ok := self.Type().LookupMRO(InternString("__reduce__")); ok && owner != ObjectType {
+		if fn, owner, ok := self.Type().LookupMRO(strReduce); ok && owner != ObjectType {
 			return ctx.Invoke1(fn, self)
 		}
 
@@ -8342,7 +8434,7 @@ func initTypes() {
 		if len(args) < 1 {
 			return NoneVal()
 		}
-		if redEx, _, ok := args[0].Type().LookupMRO(InternString("__reduce_ex__")); ok && redEx != callable {
+		if redEx, _, ok := args[0].Type().LookupMRO(strReduceEx); ok && redEx != callable {
 			return ctx.Invoke2(redEx, args[0], Int64Val(0))
 		}
 		return NewTupleVal(ObjectNewBuiltin, NewTupleVal(TypeVal(args[0].Type())))

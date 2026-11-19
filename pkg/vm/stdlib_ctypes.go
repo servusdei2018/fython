@@ -105,7 +105,7 @@ func typeCodeOf(t val.Value) string {
 	if t.IsType() {
 		tt := t.AsType()
 		if tt.Dict != nil {
-			if v, ok := tt.Dict.Get(val.InternString("_type_")); ok && v.IsAnyString() {
+			if v, ok := tt.Dict.Get(nameCtypesType); ok && v.IsAnyString() {
 				return v.AsString()
 			}
 		}
@@ -186,7 +186,7 @@ type structLayout struct {
 
 func computeStructLayout(t *val.PyType, isUnion bool) (*structLayout, error) {
 	// Read _fields_ from type dict (or MRO).
-	fieldsVal, _, ok := t.LookupMRO(val.InternString("_fields_"))
+	fieldsVal, _, ok := t.LookupMRO(nameFields)
 	if !ok {
 		return &structLayout{Size: 0, Align: 1}, nil
 	}
@@ -429,7 +429,7 @@ func (e *Engine) createCtypesLowerModule() val.Value {
 			if code == "" {
 				code = "B"
 			}
-			d.Set(val.InternString("_type_"), val.NewStringVal(code))
+			d.Set(nameCtypesType, val.NewStringVal(code))
 		}
 		return val.DictVal(d)
 	})

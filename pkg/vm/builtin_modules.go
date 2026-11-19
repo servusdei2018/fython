@@ -31,8 +31,8 @@ func init() {
 		"_io":  func(vm *VM) val.Value { return vm.engine.createIOModule() },
 		"asyncio": func(vm *VM) val.Value {
 			asyncioMod := vm.engine.createAsyncioModule()
-			if coroMod, ok := asyncioMod.AsModule().Dict.Get(val.InternString("coroutines")); ok {
-				vm.modules.Set(val.InternString("asyncio.coroutines"), coroMod)
+			if coroMod, ok := asyncioMod.AsModule().Dict.Get(nameCoroutines); ok {
+				vm.modules.Set(nameAsyncioCoros, coroMod)
 				finalizeBuiltinModule(coroMod)
 			}
 			return asyncioMod
@@ -112,7 +112,7 @@ func init() {
 		"site":      func(vm *VM) val.Value { return vm.engine.createSiteModule() },
 		"test": func(vm *VM) val.Value {
 			testMod, testSupportMod := vm.engine.createTestPackage()
-			vm.modules.Set(val.InternString("test.support"), testSupportMod)
+			vm.modules.Set(nameTestSupport, testSupportMod)
 			for _, sub := range []string{"import_helper", "os_helper", "warnings_helper"} {
 				if helper, ok := testSupportMod.AsModule().Dict.Get(val.InternString(sub)); ok {
 					vm.modules.Set(val.InternString("test.support."+sub), helper)
@@ -188,16 +188,16 @@ func finalizeBuiltinModule(modVal val.Value) {
 		return
 	}
 	m := modVal.AsModule()
-	m.Dict.Set(val.InternString("__loader__"), val.TypeVal(BuiltinImporterType))
-	if pathVal, hasPath := m.Dict.Get(val.InternString("__path__")); hasPath && pathVal.IsList() {
+	m.Dict.Set(nameLoader, val.TypeVal(BuiltinImporterType))
+	if pathVal, hasPath := m.Dict.Get(namePath); hasPath && pathVal.IsList() {
 		var locs []string
 		for _, it := range pathVal.AsList().Items {
 			if it.IsAnyString() {
 				locs = append(locs, it.AsString())
 			}
 		}
-		m.Dict.Set(val.InternString("__spec__"), newModuleSpecVal(m.Name, val.TypeVal(BuiltinImporterType), "built-in", true, locs))
+		m.Dict.Set(nameSpec, newModuleSpecVal(m.Name, val.TypeVal(BuiltinImporterType), "built-in", true, locs))
 		return
 	}
-	m.Dict.Set(val.InternString("__spec__"), newBuiltinModuleSpecVal(m.Name))
+	m.Dict.Set(nameSpec, newBuiltinModuleSpecVal(m.Name))
 }

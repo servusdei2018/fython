@@ -302,7 +302,7 @@ func complexConstruct(ctx *ExecContext, args []Value, kwnames []Value) Value {
 			return realArg
 		}
 		if ctx != nil && !realArg.IsComplex() && !isNumberKind(realArg) {
-			if fn, _, ok := realArg.Type().LookupMRO(InternString("__complex__")); ok {
+			if fn, _, ok := realArg.Type().LookupMRO(strComplex); ok {
 				res := ctx.Invoke1(fn, realArg)
 				if !res.IsComplex() {
 					ctx.Raise(NewException(TypeErrorType, "__complex__ returned non-complex (type"+res.Type().Name+")"))
@@ -312,7 +312,7 @@ func complexConstruct(ctx *ExecContext, args []Value, kwnames []Value) Value {
 					return res
 				}
 				realArg = res
-			} else if fn, _, ok := realArg.Type().LookupMRO(InternString("__float__")); ok {
+			} else if fn, _, ok := realArg.Type().LookupMRO(strFloat); ok {
 				res := ctx.Invoke1(fn, realArg)
 				if res.IsFloat64() {
 					realArg = res

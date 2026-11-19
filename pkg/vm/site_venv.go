@@ -377,8 +377,8 @@ func (e *Engine) createSiteModule() val.Value {
 	mod.Dict.Set(val.InternString("getsitepackages"), val.NewBuiltinFuncVal("getsitepackages", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		vmInstance := ctx.VM.(*VM)
 		prefix := "/usr/local"
-		if sysVal, ok := vmInstance.modules.Get(val.InternString("sys")); ok && sysVal.IsModule() {
-			if p, ok := sysVal.AsModule().Dict.Get(val.InternString("prefix")); ok && p.IsAnyString() {
+		if sysVal, ok := vmInstance.modules.Get(nameSys); ok && sysVal.IsModule() {
+			if p, ok := sysVal.AsModule().Dict.Get(namePrefix); ok && p.IsAnyString() {
 				prefix = p.AsString()
 			}
 		}
@@ -405,8 +405,8 @@ func (vm *VM) addSiteDir(siteDir string) {
 	extraPaths, imports := processPthDirectory(cleanDir)
 	allNew := append([]string{cleanDir}, extraPaths...)
 
-	if sysVal, ok := vm.modules.Get(val.InternString("sys")); ok && sysVal.IsModule() {
-		if pathVal, ok := sysVal.AsModule().Dict.Get(val.InternString("path")); ok && pathVal.IsList() {
+	if sysVal, ok := vm.modules.Get(nameSys); ok && sysVal.IsModule() {
+		if pathVal, ok := sysVal.AsModule().Dict.Get(nameAttrPath); ok && pathVal.IsList() {
 			list := pathVal.AsList()
 			existing := make(map[string]bool, len(list.Items))
 			for _, it := range list.Items {

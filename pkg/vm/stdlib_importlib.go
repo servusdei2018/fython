@@ -71,24 +71,24 @@ func initImportlibTypes() {
 				}
 			}
 
-			self.SetAttr(val.InternString("name"), nameVal)
-			self.SetAttr(val.InternString("loader"), loaderVal)
-			self.SetAttr(val.InternString("origin"), originVal)
-			self.SetAttr(val.InternString("loader_state"), loaderStateVal)
+			self.SetAttr(nameAttrName, nameVal)
+			self.SetAttr(nameAttrLoader, loaderVal)
+			self.SetAttr(nameOrigin, originVal)
+			self.SetAttr(nameLoaderState, loaderStateVal)
 			if isPkg {
-				self.SetAttr(val.InternString("submodule_search_locations"), val.NewListVal())
+				self.SetAttr(nameSubmoduleLocs, val.NewListVal())
 			} else {
-				self.SetAttr(val.InternString("submodule_search_locations"), val.NoneVal())
+				self.SetAttr(nameSubmoduleLocs, val.NoneVal())
 			}
-			self.SetAttr(val.InternString("_set_fileattr"), val.BoolVal(false))
-			self.SetAttr(val.InternString("_cached"), val.NoneVal())
+			self.SetAttr(nameSetFileattr, val.BoolVal(false))
+			self.SetAttr(nameCached, val.NoneVal())
 			return val.NoneVal()
 		}))
 
 		parentGetter := val.NewBuiltinFuncVal("parent", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			self := args[0].AsInstance()
-			nameVal, _ := self.GetAttr(val.InternString("name"))
-			subLocs, _ := self.GetAttr(val.InternString("submodule_search_locations"))
+			nameVal, _ := self.GetAttr(nameAttrName)
+			subLocs, _ := self.GetAttr(nameSubmoduleLocs)
 			nameStr := ""
 			if nameVal.IsAnyString() {
 				nameStr = nameVal.AsString()
@@ -105,36 +105,36 @@ func initImportlibTypes() {
 
 		hasLocGetter := val.NewBuiltinFuncVal("has_location", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			self := args[0].AsInstance()
-			if v, ok := self.GetAttr(val.InternString("_set_fileattr")); ok {
+			if v, ok := self.GetAttr(nameSetFileattr); ok {
 				return val.BoolVal(v.IsTruthy())
 			}
 			return val.BoolVal(false)
 		})
 		hasLocSetter := val.NewBuiltinFuncVal("has_location", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			self := args[0].AsInstance()
-			self.SetAttr(val.InternString("_set_fileattr"), val.BoolVal(args[1].IsTruthy()))
+			self.SetAttr(nameSetFileattr, val.BoolVal(args[1].IsTruthy()))
 			return val.NoneVal()
 		})
 		ModuleSpecType.Dict.Set(val.InternString("has_location"), val.NewPropertyVal(hasLocGetter, hasLocSetter, val.NoneVal()))
 
 		cachedGetter := val.NewBuiltinFuncVal("cached", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			self := args[0].AsInstance()
-			if v, ok := self.GetAttr(val.InternString("_cached")); ok {
+			if v, ok := self.GetAttr(nameCached); ok {
 				return v
 			}
 			return val.NoneVal()
 		})
 		cachedSetter := val.NewBuiltinFuncVal("cached", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			self := args[0].AsInstance()
-			self.SetAttr(val.InternString("_cached"), args[1])
+			self.SetAttr(nameCached, args[1])
 			return val.NoneVal()
 		})
 		ModuleSpecType.Dict.Set(val.InternString("cached"), val.NewPropertyVal(cachedGetter, cachedSetter, val.NoneVal()))
 
 		ModuleSpecType.Dict.Set(val.InternString("__repr__"), val.NewBuiltinFuncVal("__repr__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			self := args[0].AsInstance()
-			nameVal, _ := self.GetAttr(val.InternString("name"))
-			loaderVal, _ := self.GetAttr(val.InternString("origin"))
+			nameVal, _ := self.GetAttr(nameAttrName)
+			loaderVal, _ := self.GetAttr(nameOrigin)
 			return val.NewStringVal(fmt.Sprintf("ModuleSpec(name=%s, origin=%s)", val.PyRepr(ctx, nameVal), val.PyRepr(ctx, loaderVal)))
 		}))
 		ModuleSpecType.InvalidateVersion()
@@ -154,7 +154,7 @@ func initImportlibTypes() {
 			}
 			self := args[0]
 			mod := args[1].AsModule()
-			getCodeFn := val.GetAttrCtx(ctx, self, val.InternString("get_code"))
+			getCodeFn := val.GetAttrCtx(ctx, self, nameGetCode)
 			codeVal := ctx.Invoke1(getCodeFn, val.NewStringVal(mod.Name))
 			if codeVal.IsNone() {
 				ctx.Raise(val.NewImportError(fmt.Sprintf("cannot load module %q when get_code() returns None", mod.Name)))
@@ -189,12 +189,12 @@ func initImportlibTypes() {
 				return val.NoneVal()
 			}
 			inst := args[0].AsInstance()
-			inst.SetAttr(val.InternString("name"), args[1])
-			inst.SetAttr(val.InternString("path"), args[2])
+			inst.SetAttr(nameAttrName, args[1])
+			inst.SetAttr(nameAttrPath, args[2])
 			return val.NoneVal()
 		}))
 		FileLoaderType.Dict.Set(val.InternString("get_filename"), val.NewBuiltinFuncVal("get_filename", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-			if p, ok := args[0].AsInstance().GetAttr(val.InternString("path")); ok {
+			if p, ok := args[0].AsInstance().GetAttr(nameAttrPath); ok {
 				return p
 			}
 			return val.NewStringVal("")
@@ -219,7 +219,7 @@ func initImportlibTypes() {
 			if err != nil || !readersMod.IsModule() {
 				return val.NoneVal()
 			}
-			fileReaderCls, ok := readersMod.AsModule().Dict.Get(val.InternString("FileReader"))
+			fileReaderCls, ok := readersMod.AsModule().Dict.Get(nameFileReader)
 			if !ok {
 				return val.NoneVal()
 			}
@@ -265,8 +265,8 @@ func initImportlibTypes() {
 					ctx.Raise(val.NewException(val.FileNotFoundErrorType, err.Error()))
 					return val.NoneVal()
 				}
-				d.Set(val.InternString("mtime"), val.Float64Val(0))
-				d.Set(val.InternString("size"), val.Int64Val(int64(len(data))))
+				d.Set(nameMtime, val.Float64Val(0))
+				d.Set(nameSize, val.Int64Val(int64(len(data))))
 				return val.DictVal(d)
 			}
 			info, err := os.Stat(reqPath)
@@ -274,15 +274,15 @@ func initImportlibTypes() {
 				ctx.Raise(val.NewException(val.FileNotFoundErrorType, err.Error()))
 				return val.NoneVal()
 			}
-			d.Set(val.InternString("mtime"), val.Float64Val(float64(info.ModTime().UnixNano())/1e9))
-			d.Set(val.InternString("size"), val.Int64Val(info.Size()))
+			d.Set(nameMtime, val.Float64Val(float64(info.ModTime().UnixNano())/1e9))
+			d.Set(nameSize, val.Int64Val(info.Size()))
 			return val.DictVal(d)
 		}))
 		SourceFileLoaderType.Dict.Set(val.InternString("set_data"), val.NewBuiltinFuncVal("set_data", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			return val.NoneVal()
 		}))
 		SourceFileLoaderType.Dict.Set(val.InternString("is_package"), val.NewBuiltinFuncVal("is_package", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-			p, ok := args[0].AsInstance().GetAttr(val.InternString("path"))
+			p, ok := args[0].AsInstance().GetAttr(nameAttrPath)
 			if !ok || !p.IsAnyString() {
 				return val.BoolVal(false)
 			}
@@ -290,7 +290,7 @@ func initImportlibTypes() {
 			return val.BoolVal(base == "__init__.py" || base == "__init__.pyc" || base == "__init__.fyc")
 		}))
 		SourceFileLoaderType.Dict.Set(val.InternString("get_source"), val.NewBuiltinFuncVal("get_source", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-			p, ok := args[0].AsInstance().GetAttr(val.InternString("path"))
+			p, ok := args[0].AsInstance().GetAttr(nameAttrPath)
 			if !ok || !p.IsAnyString() {
 				return val.NoneVal()
 			}
@@ -303,14 +303,14 @@ func initImportlibTypes() {
 		}))
 		SourceFileLoaderType.Dict.Set(val.InternString("get_code"), val.NewBuiltinFuncVal("get_code", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			inst := args[0].AsInstance()
-			p, ok := inst.GetAttr(val.InternString("path"))
+			p, ok := inst.GetAttr(nameAttrPath)
 			if !ok || !p.IsAnyString() {
 				return val.NoneVal()
 			}
 			modName := ""
 			if len(args) > 1 && args[1].IsAnyString() {
 				modName = args[1].AsString()
-			} else if n, ok := inst.GetAttr(val.InternString("name")); ok && n.IsAnyString() {
+			} else if n, ok := inst.GetAttr(nameAttrName); ok && n.IsAnyString() {
 				modName = n.AsString()
 			}
 			vmInstance := ctx.VM.(*VM)
@@ -329,24 +329,24 @@ func initImportlibTypes() {
 			self := args[0]
 			inst := self.AsInstance()
 			mod := args[1].AsModule()
-			pVal, ok := inst.GetAttr(val.InternString("path"))
+			pVal, ok := inst.GetAttr(nameAttrPath)
 			if !ok || !pVal.IsAnyString() {
 				ctx.Raise(val.NewImportError("loader has no path"))
 				return val.NoneVal()
 			}
 			filePath := pVal.AsString()
 			mod.File = filePath
-			mod.Dict.Set(val.InternString("__file__"), val.NewStringVal(filePath))
-			mod.Dict.Set(val.InternString("__loader__"), self)
+			mod.Dict.Set(nameFile, val.NewStringVal(filePath))
+			mod.Dict.Set(nameLoader, self)
 			base := filepath.Base(filePath)
 			if base == "__init__.py" || base == "__init__.pyc" || base == "__init__.fyc" {
 				pkgDir := filepath.Dir(filePath)
 				if vfsDir, ok := strings.CutPrefix(filePath, "stdlib:"); ok {
 					pkgDir = "stdlib:" + path.Dir(vfsDir)
 				}
-				mod.Dict.Set(val.InternString("__package__"), val.NewStringVal(mod.Name))
-				if _, hasPath := mod.Dict.Get(val.InternString("__path__")); !hasPath {
-					mod.Dict.Set(val.InternString("__path__"), val.NewListVal(val.NewStringVal(pkgDir)))
+				mod.Dict.Set(namePackage, val.NewStringVal(mod.Name))
+				if _, hasPath := mod.Dict.Get(namePath); !hasPath {
+					mod.Dict.Set(namePath, val.NewListVal(val.NewStringVal(pkgDir)))
 				}
 			}
 			vmInstance := ctx.VM.(*VM)
@@ -382,15 +382,15 @@ func initImportlibTypes() {
 				ctx.Raise(val.NewException(val.PermissionErrorType, "native extensions and ctypes are disabled by sandbox policy"))
 				return val.NoneVal()
 			}
-			pVal, ok := inst.GetAttr(val.InternString("path"))
+			pVal, ok := inst.GetAttr(nameAttrPath)
 			if !ok || !pVal.IsAnyString() {
 				ctx.Raise(val.NewImportError("loader has no path"))
 				return val.NoneVal()
 			}
 			filePath := pVal.AsString()
 			mod.File = filePath
-			mod.Dict.Set(val.InternString("__file__"), val.NewStringVal(filePath))
-			mod.Dict.Set(val.InternString("__loader__"), self)
+			mod.Dict.Set(nameFile, val.NewStringVal(filePath))
+			mod.Dict.Set(nameLoader, self)
 			if err := execExtensionModule(ctx, args[1], filePath); err != nil {
 				// Map to ImportError
 				if ctx != nil && ctx.HasException() {
@@ -415,11 +415,11 @@ func initImportlibTypes() {
 			inst := args[0].AsInstance()
 			switch {
 			case len(args) > 2:
-				inst.SetAttr(val.InternString("_path"), args[2])
+				inst.SetAttr(nameUnderscorePath, args[2])
 			case len(args) > 1:
-				inst.SetAttr(val.InternString("_path"), args[1])
+				inst.SetAttr(nameUnderscorePath, args[1])
 			default:
-				inst.SetAttr(val.InternString("_path"), val.NewListVal())
+				inst.SetAttr(nameUnderscorePath, val.NewListVal())
 			}
 			return val.NoneVal()
 		}))
@@ -493,7 +493,7 @@ func initImportlibTypes() {
 			if len(args) > 1 && args[1].IsAnyString() && args[1].AsString() != "" {
 				p = args[1].AsString()
 			}
-			inst.SetAttr(val.InternString("path"), val.NewStringVal(p))
+			inst.SetAttr(nameAttrPath, val.NewStringVal(p))
 			return val.NoneVal()
 		}))
 		FileFinderType.Dict.Set(val.InternString("invalidate_caches"), val.NewBuiltinFuncVal("invalidate_caches", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -509,7 +509,7 @@ func initImportlibTypes() {
 				return val.NoneVal()
 			}
 			inst := args[0].AsInstance()
-			pVal, ok := inst.GetAttr(val.InternString("path"))
+			pVal, ok := inst.GetAttr(nameAttrPath)
 			if !ok || !pVal.IsAnyString() {
 				return val.NoneVal()
 			}
@@ -529,7 +529,7 @@ func initImportlibTypes() {
 				}
 				if strings.HasPrefix(p, "stdlib:") {
 					inst := val.NewInstanceOfType(FileFinderType)
-					inst.AsInstance().SetAttr(val.InternString("path"), val.NewStringVal(p))
+					inst.AsInstance().SetAttr(nameAttrPath, val.NewStringVal(p))
 					return inst
 				}
 				info, err := os.Stat(p)
@@ -538,7 +538,7 @@ func initImportlibTypes() {
 					return val.NoneVal()
 				}
 				inst := val.NewInstanceOfType(FileFinderType)
-				inst.AsInstance().SetAttr(val.InternString("path"), val.NewStringVal(p))
+				inst.AsInstance().SetAttr(nameAttrPath, val.NewStringVal(p))
 				return inst
 			})
 		}))
@@ -567,11 +567,11 @@ func initImportlibTypes() {
 			if err != nil || !metaMod.IsModule() {
 				return val.NewIterVal(val.NewTupleVal())
 			}
-			mpf, ok := metaMod.AsModule().Dict.Get(val.InternString("MetadataPathFinder"))
+			mpf, ok := metaMod.AsModule().Dict.Get(nameMetadataPathFndr)
 			if !ok {
 				return val.NewIterVal(val.NewTupleVal())
 			}
-			findDist := val.GetAttrCtx(ctx, mpf, val.InternString("find_distributions"))
+			findDist := val.GetAttrCtx(ctx, mpf, nameFindDists)
 			callArgs := args
 			if len(callArgs) > 0 && (callArgs[0] == val.TypeVal(PathFinderType) || (callArgs[0].IsInstance() && callArgs[0].Type() == PathFinderType)) {
 				callArgs = callArgs[1:]
@@ -624,8 +624,8 @@ func extractPathFinderArgs(args []val.Value) (string, val.Value) {
 
 func isBuiltinModuleName(vm *VM, name string) bool {
 	if vm != nil && vm.modules != nil {
-		if sysVal, ok := vm.modules.Get(val.InternString("sys")); ok && sysVal.IsModule() {
-			if bn, ok := sysVal.AsModule().Dict.Get(val.InternString("builtin_module_names")); ok && bn.IsTuple() {
+		if sysVal, ok := vm.modules.Get(nameSys); ok && sysVal.IsModule() {
+			if bn, ok := sysVal.AsModule().Dict.Get(nameBuiltinModNames); ok && bn.IsTuple() {
 				for _, item := range bn.AsTuple().Items {
 					if item.IsAnyString() && item.AsString() == name {
 						return true
@@ -641,8 +641,8 @@ func newExtensionFileLoaderVal(name, filePath string) val.Value {
 	initImportlibTypes()
 	instVal := val.NewInstanceOfType(ExtensionFileLoaderType)
 	inst := instVal.AsInstance()
-	inst.SetAttr(val.InternString("name"), val.NewStringVal(name))
-	inst.SetAttr(val.InternString("path"), val.NewStringVal(filePath))
+	inst.SetAttr(nameAttrName, val.NewStringVal(name))
+	inst.SetAttr(nameAttrPath, val.NewStringVal(filePath))
 	return instVal
 }
 
@@ -650,8 +650,8 @@ func newSourceFileLoaderVal(name, filePath string) val.Value {
 	initImportlibTypes()
 	instVal := val.NewInstanceOfType(SourceFileLoaderType)
 	inst := instVal.AsInstance()
-	inst.SetAttr(val.InternString("name"), val.NewStringVal(name))
-	inst.SetAttr(val.InternString("path"), val.NewStringVal(filePath))
+	inst.SetAttr(nameAttrName, val.NewStringVal(name))
+	inst.SetAttr(nameAttrPath, val.NewStringVal(filePath))
 	return instVal
 }
 
@@ -659,25 +659,25 @@ func newModuleSpecVal(name string, loader val.Value, origin string, isPkg bool, 
 	initImportlibTypes()
 	specVal := val.NewInstanceOfType(ModuleSpecType)
 	inst := specVal.AsInstance()
-	inst.SetAttr(val.InternString("name"), val.NewStringVal(name))
-	inst.SetAttr(val.InternString("loader"), loader)
+	inst.SetAttr(nameAttrName, val.NewStringVal(name))
+	inst.SetAttr(nameAttrLoader, loader)
 	if origin != "" {
-		inst.SetAttr(val.InternString("origin"), val.NewStringVal(origin))
-		inst.SetAttr(val.InternString("_set_fileattr"), val.BoolVal(true))
+		inst.SetAttr(nameOrigin, val.NewStringVal(origin))
+		inst.SetAttr(nameSetFileattr, val.BoolVal(true))
 	} else {
-		inst.SetAttr(val.InternString("origin"), val.NoneVal())
-		inst.SetAttr(val.InternString("_set_fileattr"), val.BoolVal(false))
+		inst.SetAttr(nameOrigin, val.NoneVal())
+		inst.SetAttr(nameSetFileattr, val.BoolVal(false))
 	}
-	inst.SetAttr(val.InternString("loader_state"), val.NoneVal())
-	inst.SetAttr(val.InternString("_cached"), val.NoneVal())
+	inst.SetAttr(nameLoaderState, val.NoneVal())
+	inst.SetAttr(nameCached, val.NoneVal())
 	if isPkg {
 		items := make([]val.Value, len(searchLocations))
 		for i, loc := range searchLocations {
 			items[i] = val.NewStringVal(loc)
 		}
-		inst.SetAttr(val.InternString("submodule_search_locations"), val.NewListVal(items...))
+		inst.SetAttr(nameSubmoduleLocs, val.NewListVal(items...))
 	} else {
-		inst.SetAttr(val.InternString("submodule_search_locations"), val.NoneVal())
+		inst.SetAttr(nameSubmoduleLocs, val.NoneVal())
 	}
 	return specVal
 }
@@ -690,17 +690,17 @@ func newNamespaceModuleSpecVal(name string, searchLocations []string) val.Value 
 	}
 	nsPath := val.NewListVal(items...)
 	nsLoader := val.NewInstanceOfType(NamespaceLoaderType)
-	nsLoader.AsInstance().SetAttr(val.InternString("_path"), nsPath)
+	nsLoader.AsInstance().SetAttr(nameUnderscorePath, nsPath)
 
 	specVal := val.NewInstanceOfType(ModuleSpecType)
 	inst := specVal.AsInstance()
-	inst.SetAttr(val.InternString("name"), val.NewStringVal(name))
-	inst.SetAttr(val.InternString("loader"), nsLoader)
-	inst.SetAttr(val.InternString("origin"), val.NoneVal())
-	inst.SetAttr(val.InternString("loader_state"), val.NoneVal())
-	inst.SetAttr(val.InternString("_set_fileattr"), val.BoolVal(false))
-	inst.SetAttr(val.InternString("_cached"), val.NoneVal())
-	inst.SetAttr(val.InternString("submodule_search_locations"), nsPath)
+	inst.SetAttr(nameAttrName, val.NewStringVal(name))
+	inst.SetAttr(nameAttrLoader, nsLoader)
+	inst.SetAttr(nameOrigin, val.NoneVal())
+	inst.SetAttr(nameLoaderState, val.NoneVal())
+	inst.SetAttr(nameSetFileattr, val.BoolVal(false))
+	inst.SetAttr(nameCached, val.NoneVal())
+	inst.SetAttr(nameSubmoduleLocs, nsPath)
 	return specVal
 }
 
@@ -708,13 +708,13 @@ func newBuiltinModuleSpecVal(name string) val.Value {
 	initImportlibTypes()
 	specVal := val.NewInstanceOfType(ModuleSpecType)
 	inst := specVal.AsInstance()
-	inst.SetAttr(val.InternString("name"), val.NewStringVal(name))
-	inst.SetAttr(val.InternString("loader"), val.TypeVal(BuiltinImporterType))
-	inst.SetAttr(val.InternString("origin"), val.InternString("built-in"))
-	inst.SetAttr(val.InternString("loader_state"), val.NoneVal())
-	inst.SetAttr(val.InternString("_set_fileattr"), val.BoolVal(false))
-	inst.SetAttr(val.InternString("_cached"), val.NoneVal())
-	inst.SetAttr(val.InternString("submodule_search_locations"), val.NoneVal())
+	inst.SetAttr(nameAttrName, val.NewStringVal(name))
+	inst.SetAttr(nameAttrLoader, val.TypeVal(BuiltinImporterType))
+	inst.SetAttr(nameOrigin, nameBuiltIn)
+	inst.SetAttr(nameLoaderState, val.NoneVal())
+	inst.SetAttr(nameSetFileattr, val.BoolVal(false))
+	inst.SetAttr(nameCached, val.NoneVal())
+	inst.SetAttr(nameSubmoduleLocs, val.NoneVal())
 	return specVal
 }
 
@@ -927,7 +927,7 @@ func (e *Engine) createImpModule() val.Value {
 		if len(args) < 1 || !args[0].IsInstance() {
 			return val.NoneVal()
 		}
-		nameVal, _ := args[0].AsInstance().GetAttr(val.InternString("name"))
+		nameVal, _ := args[0].AsInstance().GetAttr(nameAttrName)
 		vmInstance := ctx.VM.(*VM)
 		if m, ok := vmInstance.modules.Get(val.InternValue(nameVal)); ok {
 			return m
@@ -953,7 +953,7 @@ func (e *Engine) createImpModule() val.Value {
 		// CPython signature: exec_dynamic(spec, module). spec.origin holds .so path.
 		pathStr := ""
 		if len(args) >= 1 && args[0].IsInstance() {
-			if v, ok := args[0].AsInstance().GetAttr(val.InternString("origin")); ok && v.IsAnyString() {
+			if v, ok := args[0].AsInstance().GetAttr(nameOrigin); ok && v.IsAnyString() {
 				pathStr = v.AsString()
 			}
 			if pathStr == "" {
@@ -1042,10 +1042,10 @@ func (e *Engine) createFrozenImportlibModule() val.Value {
 		}
 		spec := args[0]
 		inst := spec.AsInstance()
-		nameVal, _ := inst.GetAttr(val.InternString("name"))
-		loaderVal, _ := inst.GetAttr(val.InternString("loader"))
-		originVal, _ := inst.GetAttr(val.InternString("origin"))
-		subLocs, _ := inst.GetAttr(val.InternString("submodule_search_locations"))
+		nameVal, _ := inst.GetAttr(nameAttrName)
+		loaderVal, _ := inst.GetAttr(nameAttrLoader)
+		originVal, _ := inst.GetAttr(nameOrigin)
+		subLocs, _ := inst.GetAttr(nameSubmoduleLocs)
 
 		if !loaderVal.IsNone() {
 			if createFn, ok := vmGetAttrSafe(ctx, loaderVal, "create_module"); ok && !createFn.IsNone() {
@@ -1100,8 +1100,8 @@ func (e *Engine) createFrozenImportlibModule() val.Value {
 			targetArg = args[2]
 		}
 		vmInstance := ctx.VM.(*VM)
-		if sysVal, ok := vmInstance.modules.Get(val.InternString("sys")); ok && sysVal.IsModule() {
-			if mpVal, ok := sysVal.AsModule().Dict.Get(val.InternString("meta_path")); ok && mpVal.IsList() {
+		if sysVal, ok := vmInstance.modules.Get(nameSys); ok && sysVal.IsModule() {
+			if mpVal, ok := sysVal.AsModule().Dict.Get(nameMetaPath); ok && mpVal.IsList() {
 				for _, finder := range mpVal.AsList().Items {
 					if findSpecFn, ok := vmGetAttrSafe(ctx, finder, "find_spec"); ok && !findSpecFn.IsNone() {
 						spec := ctx.Call(findSpecFn, []val.Value{val.NewStringVal(name), pathArg, targetArg}, nil)
@@ -1127,7 +1127,7 @@ func (e *Engine) createFrozenImportlibModule() val.Value {
 		}
 		spec := args[0]
 		module := args[1]
-		loader := val.GetAttrCtx(ctx, spec, val.InternString("loader"))
+		loader := val.GetAttrCtx(ctx, spec, nameAttrLoader)
 		if !loader.IsNone() {
 			if execFn, ok := vmGetAttrSafe(ctx, loader, "exec_module"); ok && !execFn.IsNone() {
 				ctx.Invoke1(execFn, module)
@@ -1153,7 +1153,7 @@ func (e *Engine) createFrozenImportlibModule() val.Value {
 		var callerGlobals *val.PyDict
 		if level > 0 && pkg != "" {
 			callerGlobals = val.NewDictVal(2).AsDict()
-			callerGlobals.Set(val.InternString("__package__"), val.NewStringVal(pkg))
+			callerGlobals.Set(namePackage, val.NewStringVal(pkg))
 		}
 		vmInstance := ctx.VM.(*VM)
 		res, err := vmInstance.ImportModule(name, level, true, callerGlobals)
@@ -1168,24 +1168,24 @@ func (e *Engine) createFrozenImportlibModule() val.Value {
 		return res
 	}))
 
-	if impFn, ok := e.builtins.Get(val.InternString("__import__")); ok {
-		mod.Dict.Set(val.InternString("__import__"), impFn)
+	if impFn, ok := e.builtins.Get(nameImport); ok {
+		mod.Dict.Set(nameImport, impFn)
 	}
 
 	return modVal
 }
 
 func initModuleAttrsFromSpec(ctx *val.ExecContext, modVal, spec, nameVal, loaderVal, originVal, subLocs val.Value) {
-	val.SetAttrCtx(ctx, modVal, val.InternString("__name__"), nameVal)
-	val.SetAttrCtx(ctx, modVal, val.InternString("__loader__"), loaderVal)
-	val.SetAttrCtx(ctx, modVal, val.InternString("__spec__"), spec)
-	parentVal := val.GetAttrCtx(ctx, spec, val.InternString("parent"))
-	val.SetAttrCtx(ctx, modVal, val.InternString("__package__"), parentVal)
+	val.SetAttrCtx(ctx, modVal, nameDunderName, nameVal)
+	val.SetAttrCtx(ctx, modVal, nameLoader, loaderVal)
+	val.SetAttrCtx(ctx, modVal, nameSpec, spec)
+	parentVal := val.GetAttrCtx(ctx, spec, nameParent)
+	val.SetAttrCtx(ctx, modVal, namePackage, parentVal)
 	if !originVal.IsNone() {
-		val.SetAttrCtx(ctx, modVal, val.InternString("__file__"), originVal)
+		val.SetAttrCtx(ctx, modVal, nameFile, originVal)
 	}
 	if !subLocs.IsNone() {
-		val.SetAttrCtx(ctx, modVal, val.InternString("__path__"), subLocs)
+		val.SetAttrCtx(ctx, modVal, namePath, subLocs)
 	}
 }
 

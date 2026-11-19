@@ -551,6 +551,116 @@ func (vm *VM) opCallFunctionEx(st *loopState, inst uint32, ip, sp int) (int, int
 		callable = stack[sp-2]
 		sp -= 2
 	}
+
+	// Fast in-loop frame push for Python functions and bound methods when
+	// positional args are a tuple/list and kwargs are absent or a small local dict.
+	target := callable
+	hasSelf := false
+	var selfVal val.Value
+	if target.IsBoundMethod() {
+		bm := target.AsBoundMethod()
+		if bm.Func.IsFunction() {
+			hasSelf = true
+			selfVal = bm.Self
+			target = bm.Func
+		}
+	}
+	if target.IsFunction() {
+		fn := target.AsFunction()
+		callee := AsCodeObject(fn.Code)
+		if !callee.IsGenerator && !callee.IsCoroutine {
+			var posArgs []val.Value
+			argsOK := false
+			switch {
+			case argsVal.IsTuple():
+				posArgs = argsVal.AsTuple().Items
+				argsOK = true
+			case argsVal.IsList():
+				posArgs = argsVal.AsList().Items
+				argsOK = true
+			}
+			var kwDict *val.PyDict
+			kwOK := false
+			kwLen := 0
+			if !hasKW || kwDictVal.IsNone() || kwDictVal.HeaderPtr() == nil {
+				kwOK = true
+			} else {
+				kd := kwDictVal
+				if kd.IsMappingProxy() {
+					kd = kd.AsMappingProxy().Mapping
+				}
+				if kd.IsDict() {
+					d := kd.AsDict()
+					if d.Live == nil && !d.Shared && !val.MultiThreadedFlag.Load() {
+						kwLen = d.Len()
+						if kwLen <= len(vm.kwNamesScratch) {
+							kwDict = d
+							kwOK = true
+						}
+					}
+				}
+			}
+			if argsOK && kwOK {
+				newBase := sp
+				selfCount := 0
+				if hasSelf {
+					selfCount = 1
+				}
+				totalArgs := selfCount + len(posArgs) + kwLen
+				minCap := max(newBase+totalArgs+256, newBase+callee.NumLocals+64)
+				if minCap > len(stack) {
+					stack = vm.growStack(st, stack, minCap)
+				}
+				dst := newBase
+				if hasSelf {
+					stack[dst] = selfVal
+					dst++
+				}
+				if len(posArgs) > 0 {
+					copy(stack[dst:dst+len(posArgs)], posArgs)
+					dst += len(posArgs)
+				}
+				var kwnames []val.Value
+				if kwLen > 0 {
+					kwCount := 0
+					for i := range kwDict.Entries {
+						e := &kwDict.Entries[i]
+						if !e.Active {
+							continue
+						}
+						if !e.Key.IsAnyString() {
+							clear(vm.kwNamesScratch[:kwCount])
+							st.raiseExc = val.NewTypeError("keywords must be strings")
+							return ip, sp, ctlRaise
+						}
+						vm.kwNamesScratch[kwCount] = val.InternValue(e.Key)
+						stack[dst] = e.Value
+						kwCount++
+						dst++
+					}
+					kwnames = vm.kwNamesScratch[:kwCount]
+					totalArgs = dst - newBase
+				}
+				nextSP, ok := vm.bindFunctionArgsSafe(callee, fn.Defaults, fn.KwDefaults, stack, newBase, totalArgs, kwnames)
+				if len(kwnames) > 0 {
+					clear(vm.kwNamesScratch[:len(kwnames)])
+				}
+				if !ok {
+					exc := vm.execCtx.ActiveException
+					vm.execCtx.ClearException()
+					st.raiseExc = exc
+					return ip, sp, ctlRaise
+				}
+				fnGlobals := fn.Globals
+				if fnGlobals == nil {
+					fnGlobals = st.globals
+				}
+				cc := vm.cacheFor(callee)
+				return vm.pushCalleeFrame(st, callee, target, fn, stack, newBase, sp, totalArgs, nextSP, ip+1, val.Value{}, fnGlobals, cc)
+			}
+		}
+	}
+
 	st.stack = stack
 	vm.syncActiveFrame(st, ip)
 	vm.execCtx.SP = sp

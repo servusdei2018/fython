@@ -283,6 +283,21 @@ func (vm *VM) opBinarySlice(st *loopState, ip, sp int) (int, int, loopCtl) {
 		}
 	}
 
+	if val.IsInlineStrASCII(container) {
+		n := container.StringByteLen()
+		start, stop, _, sliceLen, err := val.NormalizeSliceIndices(startVal, stopVal, val.NoneVal(), n)
+		if err == nil {
+			if sliceLen == 0 {
+				stack[sp-3] = val.SmallStringVal("")
+			} else {
+				stack[sp-3] = val.SliceInlineStrASCII(container, start, stop)
+			}
+			sp -= 2
+			ip++
+			return ip, sp, ctlReload
+		}
+	}
+
 	if container.Kind() == val.KindString || container.Kind() == val.KindInlineStr {
 		s := container.AsString()
 		start, stop, _, sliceLen, err := val.NormalizeSliceIndices(startVal, stopVal, val.NoneVal(), len(s))
@@ -556,7 +571,7 @@ func (vm *VM) opBuildMapUnpack(st *loopState, inst uint32, ip, sp int) (int, int
 	stack := st.stack
 	count := int(uint16(inst))
 	sp -= count
-	resVal := val.NewDictVal(8)
+	resVal := val.NewDictVal(4)
 	resDict := resVal.AsDict()
 	st.stack = stack
 	vm.syncActiveFrame(st, ip)

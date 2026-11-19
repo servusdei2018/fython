@@ -32,15 +32,21 @@ type pyPattern struct {
 
 type pyMatch struct {
 	Header     val.ObjectHeader
-	PatternVal val.Value
 	Pat        *pyPattern
 	StringVal  val.Value
-	In         []rune
-	Caps       []int
-	LastIndex  int
-	Pos        int
-	EndPos     int
+	extCaps    *[]int32
+	inlineCaps [4]int32
+	Pos        int32
+	EndPos     int32
+	LastIndex  int32
+	numCaps    int32
 }
+
+var (
+	_ [0 - unsafe.Offsetof(pyMatch{}.Header)]byte
+	_ [80 - unsafe.Sizeof(pyMatch{})]byte
+	_ [unsafe.Sizeof(pyMatch{}) - 80]byte
+)
 
 type pyScanner struct {
 	Header     val.ObjectHeader
@@ -204,7 +210,25 @@ func (p *pyPattern) subject(v val.Value) []rune {
 	panic("TypeError: expected string or bytes-like object, got '" + typeNameOf(v) + "'")
 }
 
+// subjectInto converts v into runes using buf on the caller's stack for ASCII
+// KindInlineStr values without allocating a string or rune slice.
+// Callers must ensure the returned slice is not stored in heap structs outliving buf.
+func (p *pyPattern) subjectInto(v val.Value, buf *[7]rune) []rune {
+	if !p.IsBytes && val.IsInlineStrASCII(v) {
+		raw := v.RawNum()
+		n := int(raw & 0xFF)
+		for i := range n {
+			buf[i] = rune((raw >> ((uint(i) + 1) * 8)) & 0xFF)
+		}
+		return buf[:n]
+	}
+	return p.subject(v)
+}
+
 func (p *pyPattern) sliceSubject(strVal val.Value, in []rune, s, e int) val.Value {
+	if !p.IsBytes && val.IsInlineStrASCII(strVal) {
+		return val.SliceInlineStrASCII(strVal, s, e)
+	}
 	if !p.IsBytes && strVal.IsAnyString() {
 		orig := strVal.AsString()
 		if len(orig) == len(in) {
@@ -264,12 +288,12 @@ func newPatternError(msg string, pattern val.Value, pos int) val.Value {
 			full += " (line " + strconv.Itoa(lineno) + ", column " + strconv.Itoa(colno) + ")"
 		}
 	}
-	inst.SetAttr(val.InternString("args"), val.NewTupleVal(val.NewStringVal(full)))
-	inst.SetAttr(val.InternString("msg"), val.NewStringVal(msg))
-	inst.SetAttr(val.InternString("pattern"), pattern)
-	inst.SetAttr(val.InternString("pos"), posV)
-	inst.SetAttr(val.InternString("lineno"), linenoV)
-	inst.SetAttr(val.InternString("colno"), colnoV)
+	inst.SetAttr(nameArgs, val.NewTupleVal(val.NewStringVal(full)))
+	inst.SetAttr(nameMsg, val.NewStringVal(msg))
+	inst.SetAttr(namePattern, pattern)
+	inst.SetAttr(namePos, posV)
+	inst.SetAttr(nameLineno, linenoV)
+	inst.SetAttr(nameColno, colnoV)
 	return exc
 }
 
@@ -358,19 +382,39 @@ func purgeCache() {
 	patCacheMu.Unlock()
 }
 
-func newMatch(patVal val.Value, p *pyPattern, strVal val.Value, in []rune, r *sre.Result, pos, endpos int) val.Value {
+func newMatch(p *pyPattern, strVal val.Value, caps []int32, lastIndex, pos, endpos int) val.Value {
 	m := &pyMatch{
-		Header:     val.ObjectHeader{Kind: val.KindNative, Type: MatchType},
-		PatternVal: patVal,
-		Pat:        p,
-		StringVal:  strVal,
-		In:         in,
-		Caps:       r.Caps,
-		LastIndex:  r.LastIndex,
-		Pos:        pos,
-		EndPos:     endpos,
+		Header:    val.ObjectHeader{Kind: val.KindNative, Type: MatchType},
+		Pat:       p,
+		StringVal: strVal,
+		Pos:       int32(pos),
+		EndPos:    int32(endpos),
+		LastIndex: int32(lastIndex),
+		numCaps:   int32(len(caps)),
+	}
+	if len(caps) <= len(m.inlineCaps) {
+		copy(m.inlineCaps[:], caps)
+	} else {
+		c := make([]int32, len(caps))
+		copy(c, caps)
+		m.extCaps = &c
 	}
 	return val.ObjectVal(&m.Header)
+}
+
+func (m *pyMatch) capBounds(idx int) (int, int) {
+	if m.extCaps == nil {
+		return int(m.inlineCaps[2*idx]), int(m.inlineCaps[2*idx+1])
+	}
+	c := *m.extCaps
+	return int(c[2*idx]), int(c[2*idx+1])
+}
+
+func (m *pyMatch) allCaps() []int32 {
+	if m.extCaps == nil {
+		return m.inlineCaps[:m.numCaps]
+	}
+	return *m.extCaps
 }
 
 func (m *pyMatch) group(ctx *val.ExecContext, g val.Value) int {
@@ -395,11 +439,14 @@ func (m *pyMatch) group(ctx *val.ExecContext, g val.Value) int {
 }
 
 func (m *pyMatch) groupVal(idx int, def val.Value) val.Value {
-	s, e := m.Caps[2*idx], m.Caps[2*idx+1]
+	s, e := m.capBounds(idx)
 	if s < 0 || e < 0 {
 		return def
 	}
-	return m.Pat.sliceSubject(m.StringVal, m.In, s, e)
+	if !m.Pat.IsBytes && val.IsInlineStrASCII(m.StringVal) {
+		return val.SliceInlineStrASCII(m.StringVal, s, e)
+	}
+	return m.Pat.sliceSubject(m.StringVal, m.Pat.subject(m.StringVal), s, e)
 }
 
 func (m *pyMatch) lastGroupName() val.Value {
@@ -412,68 +459,67 @@ func (m *pyMatch) lastGroupName() val.Value {
 	return val.NoneVal()
 }
 
-// execFrom runs a search/match for the Pattern methods.
-func (p *pyPattern) exec(in []rune, pos, endpos int, mode sre.Mode, mustAdv bool) *sre.Result {
-	return p.Re.ExecFrom(in, pos, endpos, mode, mustAdv)
-}
-
 func (p *pyPattern) posArgs(ctx *val.ExecContext, in []rune, posV, endV val.Value) (int, int) {
 	pos := clampInt(intArg(ctx, posV, 0), 0, len(in))
 	end := clampInt(intArg(ctx, endV, int64(len(in))), 0, len(in))
 	return pos, end
 }
 
-func (p *pyPattern) doMatch(ctx *val.ExecContext, patVal val.Value, mode sre.Mode, strVal, posV, endV val.Value) val.Value {
-	in := p.subject(strVal)
+func (p *pyPattern) doMatch(ctx *val.ExecContext, mode sre.Mode, strVal, posV, endV val.Value) val.Value {
+	var buf [7]rune
+	in := p.subjectInto(strVal, &buf)
 	pos, end := p.posArgs(ctx, in, posV, endV)
-	r := p.exec(in, pos, end, mode, false)
-	if r == nil {
+	var capsBuf [32]int32
+	caps, last, ok := p.Re.ExecInto(in, pos, end, mode, false, capsBuf[:0])
+	if !ok {
 		return val.NoneVal()
 	}
-	return newMatch(patVal, p, strVal, in, r, pos, end)
+	return newMatch(p, strVal, caps, last, pos, end)
 }
 
 // iterate drives the CPython 3.7+ iteration protocol used by findall,
 // finditer, sub and split: after an empty match the next match must advance.
-func (p *pyPattern) iterate(in []rune, pos, end int, fn func(r *sre.Result) bool) {
+func (p *pyPattern) iterate(in []rune, pos, end int, fn func(caps []int32, last int) bool) {
+	var capsBuf [32]int32
 	mustAdv := false
 	for {
-		r := p.exec(in, pos, end, sre.ModeSearch, mustAdv)
-		if r == nil {
+		caps, last, ok := p.Re.ExecInto(in, pos, end, sre.ModeSearch, mustAdv, capsBuf[:0])
+		if !ok {
 			return
 		}
-		if !fn(r) {
+		if !fn(caps, last) {
 			return
 		}
-		pos = r.Caps[1]
-		mustAdv = r.Caps[1] == r.Caps[0]
+		pos = int(caps[1])
+		mustAdv = caps[1] == caps[0]
 	}
 }
 
 func (p *pyPattern) findall(ctx *val.ExecContext, strVal, posV, endV val.Value) val.Value {
-	in := p.subject(strVal)
+	var buf [7]rune
+	in := p.subjectInto(strVal, &buf)
 	pos, end := p.posArgs(ctx, in, posV, endV)
 	var list []val.Value
 	ng := p.Re.NumGroups
-	grp := func(r *sre.Result, i int) val.Value {
-		s, e := r.Caps[2*i], r.Caps[2*i+1]
+	grp := func(caps []int32, i int) val.Value {
+		s, e := int(caps[2*i]), int(caps[2*i+1])
 		if s < 0 || e < 0 {
 			return p.fromRunes(nil)
 		}
 		return p.sliceSubject(strVal, in, s, e)
 	}
-	p.iterate(in, pos, end, func(r *sre.Result) bool {
+	p.iterate(in, pos, end, func(caps []int32, last int) bool {
 		switch ng {
 		case 0:
-			list = append(list, p.sliceSubject(strVal, in, r.Caps[0], r.Caps[1]))
+			list = append(list, p.sliceSubject(strVal, in, int(caps[0]), int(caps[1])))
 		case 1:
-			list = append(list, grp(r, 1))
+			list = append(list, grp(caps, 1))
 		default:
 			items := make([]val.Value, ng)
 			for i := 1; i <= ng; i++ {
-				items[i-1] = grp(r, i)
+				items[i-1] = grp(caps, i)
 			}
-			list = append(list, val.NewTupleVal(items...))
+			list = append(list, val.NewTupleFromSlice(items))
 		}
 		return true
 	})
@@ -481,22 +527,23 @@ func (p *pyPattern) findall(ctx *val.ExecContext, strVal, posV, endV val.Value) 
 }
 
 func (p *pyPattern) split(ctx *val.ExecContext, strVal, maxV val.Value) val.Value {
-	in := p.subject(strVal)
+	var buf [7]rune
+	in := p.subjectInto(strVal, &buf)
 	maxsplit := intArg(ctx, maxV, 0)
 	if maxsplit < 0 {
 		ctx.Raise(val.NewException(val.ValueErrorType, "maxsplit must be non-negative"))
 		return val.NoneVal()
 	}
 	var out []val.Value
-	last := 0
+	lastPos := 0
 	n := int64(0)
-	p.iterate(in, 0, len(in), func(r *sre.Result) bool {
+	p.iterate(in, 0, len(in), func(caps []int32, last int) bool {
 		if maxsplit > 0 && n >= maxsplit {
 			return false
 		}
-		out = append(out, p.sliceSubject(strVal, in, last, r.Caps[0]))
+		out = append(out, p.sliceSubject(strVal, in, lastPos, int(caps[0])))
 		for i := 1; i <= p.Re.NumGroups; i++ {
-			s, e := r.Caps[2*i], r.Caps[2*i+1]
+			s, e := int(caps[2*i]), int(caps[2*i+1])
 			if s < 0 || e < 0 {
 				out = append(out, val.NoneVal())
 			} else {
@@ -504,15 +551,16 @@ func (p *pyPattern) split(ctx *val.ExecContext, strVal, maxV val.Value) val.Valu
 			}
 		}
 		n++
-		last = r.Caps[1]
+		lastPos = int(caps[1])
 		return true
 	})
-	out = append(out, p.sliceSubject(strVal, in, last, len(in)))
+	out = append(out, p.sliceSubject(strVal, in, lastPos, len(in)))
 	return val.NewListVal(out...)
 }
 
-func (p *pyPattern) sub(ctx *val.ExecContext, patVal, repl, strVal, countV val.Value) (val.Value, int64) {
-	in := p.subject(strVal)
+func (p *pyPattern) sub(ctx *val.ExecContext, repl, strVal, countV val.Value) (val.Value, int64) {
+	var buf [7]rune
+	in := p.subjectInto(strVal, &buf)
 	count := intArg(ctx, countV, 0)
 	count = max(count, 0)
 	var tmpl *sre.Template
@@ -565,28 +613,28 @@ func (p *pyPattern) sub(ctx *val.ExecContext, patVal, repl, strVal, countV val.V
 		isCallable = true
 	}
 	var out []rune
-	last := 0
+	lastPos := 0
 	n := int64(0)
-	p.iterate(in, 0, len(in), func(r *sre.Result) bool {
+	p.iterate(in, 0, len(in), func(caps []int32, last int) bool {
 		if count > 0 && n >= count {
 			return false
 		}
-		out = append(out, in[last:r.Caps[0]]...)
+		out = append(out, in[lastPos:int(caps[0])]...)
 		switch {
 		case isCallable:
-			mv := newMatch(patVal, p, strVal, in, r, 0, len(in))
+			mv := newMatch(p, strVal, caps, last, 0, len(in))
 			res := ctx.Invoke1(repl, mv)
 			out = append(out, p.valueRunes(res)...)
 		case isLiteral:
 			out = append(out, literal...)
 		default:
-			out = tmpl.Expand(out, in, r.Caps)
+			out = tmpl.ExpandInt32(out, in, caps)
 		}
-		last = r.Caps[1]
+		lastPos = int(caps[1])
 		n++
 		return true
 	})
-	out = append(out, in[last:]...)
+	out = append(out, in[lastPos:]...)
 	return p.fromRunes(out), n
 }
 
@@ -620,14 +668,15 @@ func (sc *pyScanner) step(ctx *val.ExecContext, mode sre.Mode) val.Value {
 	if sc.done || sc.next > sc.EndPos {
 		return val.NoneVal()
 	}
-	r := sc.Pat.exec(sc.In, sc.next, sc.EndPos, mode, sc.mustAdv)
-	if r == nil {
+	var capsBuf [32]int32
+	caps, last, ok := sc.Pat.Re.ExecInto(sc.In, sc.next, sc.EndPos, mode, sc.mustAdv, capsBuf[:0])
+	if !ok {
 		sc.done = true
 		return val.NoneVal()
 	}
-	sc.mustAdv = r.Caps[1] == r.Caps[0]
-	sc.next = r.Caps[1]
-	return newMatch(sc.PatternVal, sc.Pat, sc.StringVal, sc.In, r, sc.Pos, sc.EndPos)
+	sc.mustAdv = caps[1] == caps[0]
+	sc.next = int(caps[1])
+	return newMatch(sc.Pat, sc.StringVal, caps, last, sc.Pos, sc.EndPos)
 }
 
 func (p *pyPattern) newScanner(ctx *val.ExecContext, patVal, strVal, posV, endV val.Value) *pyScanner {
@@ -711,9 +760,9 @@ func initSRETypes() {
 			}
 			ne := newPatternError(msg.AsString(), pattern, pos)
 			self := args[0].AsInstance()
-			for _, k := range []string{"args", "msg", "pattern", "pos", "lineno", "colno"} {
-				if v, ok := ne.AsInstance().GetAttr(val.InternString(k)); ok {
-					self.SetAttr(val.InternString(k), v)
+			for _, k := range [6]val.Value{nameArgs, nameMsg, namePattern, namePos, nameLineno, nameColno} {
+				if v, ok := ne.AsInstance().GetAttr(k); ok {
+					self.SetAttr(k, v)
 				}
 			}
 			return val.NoneVal()
@@ -787,12 +836,13 @@ func initSRETypes() {
 				if !b[0].IsUnbound() {
 					g = m.group(ctx, b[0])
 				}
-				return f(m.Caps[2*g], m.Caps[2*g+1])
+				s, e := m.capBounds(g)
+				return f(s, e)
 			})
 		}
 		offsetFn("start", func(s, e int) val.Value { return val.Int64Val(int64(s)) })
 		offsetFn("end", func(s, e int) val.Value { return val.Int64Val(int64(e)) })
-		offsetFn("span", func(s, e int) val.Value { return val.NewTupleVal(val.Int64Val(int64(s)), val.Int64Val(int64(e))) })
+		offsetFn("span", func(s, e int) val.Value { return val.NewTuple2(val.Int64Val(int64(s)), val.Int64Val(int64(e))) })
 		method(MatchType, "expand", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			m := asMatch(args[0])
 			b := bindArgs("expand", args[1:], kwnames, "template")
@@ -803,12 +853,15 @@ func initSRETypes() {
 				raiseReError(ctx, err.(*sre.Error), tv)
 				return val.NoneVal()
 			}
-			return m.Pat.fromRunes(t.Expand(nil, m.In, m.Caps))
+			var buf [7]rune
+			in := m.Pat.subjectInto(m.StringVal, &buf)
+			return m.Pat.fromRunes(t.ExpandInt32(nil, in, m.allCaps()))
 		})
 		method(MatchType, "__repr__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			m := asMatch(args[0])
+			s, e := m.capBounds(0)
 			matched := val.PyRepr(ctx, m.groupVal(0, val.NoneVal()))
-			return val.NewStringVal("<re.Match object; span=(" + strconv.Itoa(m.Caps[0]) + ", " + strconv.Itoa(m.Caps[1]) + "), match=" + matched + ">")
+			return val.NewStringVal("<re.Match object; span=(" + strconv.Itoa(s) + ", " + strconv.Itoa(e) + "), match=" + matched + ">")
 		})
 		method(MatchType, "__copy__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			return args[0]
@@ -816,7 +869,7 @@ func initSRETypes() {
 		method(MatchType, "__deepcopy__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			return args[0]
 		})
-		prop(MatchType, "re", func(self val.Value) val.Value { return asMatch(self).PatternVal })
+		prop(MatchType, "re", func(self val.Value) val.Value { return val.ObjectVal(&asMatch(self).Pat.Header) })
 		prop(MatchType, "string", func(self val.Value) val.Value { return asMatch(self).StringVal })
 		prop(MatchType, "pos", func(self val.Value) val.Value { return val.Int64Val(int64(asMatch(self).Pos)) })
 		prop(MatchType, "endpos", func(self val.Value) val.Value { return val.Int64Val(int64(asMatch(self).EndPos)) })
@@ -830,14 +883,37 @@ func initSRETypes() {
 		prop(MatchType, "lastgroup", func(self val.Value) val.Value { return asMatch(self).lastGroupName() })
 		prop(MatchType, "regs", func(self val.Value) val.Value {
 			m := asMatch(self)
-			items := make([]val.Value, 0, len(m.Caps)/2)
-			for i := 0; i < len(m.Caps); i += 2 {
-				items = append(items, val.NewTupleVal(val.Int64Val(int64(m.Caps[i])), val.Int64Val(int64(m.Caps[i+1]))))
+			n := int(m.numCaps) / 2
+			items := make([]val.Value, n)
+			for i := range n {
+				s, e := m.capBounds(i)
+				items[i] = val.NewTuple2(val.Int64Val(int64(s)), val.Int64Val(int64(e)))
 			}
-			return val.NewTupleVal(items...)
+			return val.NewTupleFromSlice(items)
 		})
 
 		// ---- Scanner ----
+		ScannerType.Slots.TpIter = func(ctx *val.ExecContext, o val.Value) val.Value {
+			return o
+		}
+		ScannerType.Slots.TpIterNext = func(ctx *val.ExecContext, o val.Value) (val.Value, val.IterStatus) {
+			m := asScanner(o).step(ctx, sre.ModeSearch)
+			if m.IsNone() {
+				return val.NoneVal(), val.IterExhausted
+			}
+			return m, val.IterYielded
+		}
+		method(ScannerType, "__iter__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			return args[0]
+		})
+		method(ScannerType, "__next__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			m := asScanner(args[0]).step(ctx, sre.ModeSearch)
+			if m.IsNone() {
+				ctx.Raise(val.NewException(val.StopIterationType, ""))
+				return val.NoneVal()
+			}
+			return m
+		})
 		method(ScannerType, "match", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			return asScanner(args[0]).step(ctx, sre.ModeMatch)
 		})
@@ -854,7 +930,7 @@ func initSRETypes() {
 			method(PatternType, spec.name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 				p := asPattern(args[0])
 				b := bindArgs(spec.name, args[1:], kwnames, "string", "pos", "endpos")
-				return p.doMatch(ctx, args[0], spec.mode, required(spec.name, b[0], "string"), b[1], b[2])
+				return p.doMatch(ctx, spec.mode, required(spec.name, b[0], "string"), b[1], b[2])
 			})
 		}
 		method(PatternType, "findall", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -866,13 +942,7 @@ func initSRETypes() {
 			p := asPattern(args[0])
 			b := bindArgs("finditer", args[1:], kwnames, "string", "pos", "endpos")
 			sc := p.newScanner(ctx, args[0], required("finditer", b[0], "string"), b[1], b[2])
-			return val.NewIterValWithNext(func() (val.Value, bool) {
-				m := sc.step(ctx, sre.ModeSearch)
-				if m.IsNone() {
-					return val.NoneVal(), false
-				}
-				return m, true
-			})
+			return val.ObjectVal(&sc.Header)
 		})
 		method(PatternType, "scanner", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			p := asPattern(args[0])
@@ -888,13 +958,13 @@ func initSRETypes() {
 		method(PatternType, "sub", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			p := asPattern(args[0])
 			b := bindArgs("sub", args[1:], kwnames, "repl", "string", "count")
-			res, _ := p.sub(ctx, args[0], required("sub", b[0], "repl"), required("sub", b[1], "string"), b[2])
+			res, _ := p.sub(ctx, required("sub", b[0], "repl"), required("sub", b[1], "string"), b[2])
 			return res
 		})
 		method(PatternType, "subn", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			p := asPattern(args[0])
 			b := bindArgs("subn", args[1:], kwnames, "repl", "string", "count")
-			res, n := p.sub(ctx, args[0], required("subn", b[0], "repl"), required("subn", b[1], "string"), b[2])
+			res, n := p.sub(ctx, required("subn", b[0], "repl"), required("subn", b[1], "string"), b[2])
 			return val.NewTupleVal(res, val.Int64Val(n))
 		})
 		method(PatternType, "__repr__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -1060,8 +1130,8 @@ func (e *Engine) createReModule() val.Value {
 	}{{"match", sre.ModeMatch}, {"prefixmatch", sre.ModeMatch}, {"fullmatch", sre.ModeFullMatch}, {"search", sre.ModeSearch}} {
 		fn(spec.name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			b := bindArgs(spec.name, args, kwnames, "pattern", "string", "flags")
-			pv, p := pat(ctx, required(spec.name, b[0], "pattern"), b[2])
-			return p.doMatch(ctx, pv, spec.mode, required(spec.name, b[1], "string"), val.UnboundVal(), val.UnboundVal())
+			_, p := pat(ctx, required(spec.name, b[0], "pattern"), b[2])
+			return p.doMatch(ctx, spec.mode, required(spec.name, b[1], "string"), val.UnboundVal(), val.UnboundVal())
 		})
 	}
 	fn("findall", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -1073,13 +1143,7 @@ func (e *Engine) createReModule() val.Value {
 		b := bindArgs("finditer", args, kwnames, "pattern", "string", "flags")
 		pv, p := pat(ctx, required("finditer", b[0], "pattern"), b[2])
 		sc := p.newScanner(ctx, pv, required("finditer", b[1], "string"), val.UnboundVal(), val.UnboundVal())
-		return val.NewIterValWithNext(func() (val.Value, bool) {
-			m := sc.step(ctx, sre.ModeSearch)
-			if m.IsNone() {
-				return val.NoneVal(), false
-			}
-			return m, true
-		})
+		return val.ObjectVal(&sc.Header)
 	})
 	fn("split", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		b := bindArgs("split", args, kwnames, "pattern", "string", "maxsplit", "flags")
@@ -1088,14 +1152,14 @@ func (e *Engine) createReModule() val.Value {
 	})
 	fn("sub", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		b := bindArgs("sub", args, kwnames, "pattern", "repl", "string", "count", "flags")
-		pv, p := pat(ctx, required("sub", b[0], "pattern"), b[4])
-		res, _ := p.sub(ctx, pv, required("sub", b[1], "repl"), required("sub", b[2], "string"), b[3])
+		_, p := pat(ctx, required("sub", b[0], "pattern"), b[4])
+		res, _ := p.sub(ctx, required("sub", b[1], "repl"), required("sub", b[2], "string"), b[3])
 		return res
 	})
 	fn("subn", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		b := bindArgs("subn", args, kwnames, "pattern", "repl", "string", "count", "flags")
-		pv, p := pat(ctx, required("subn", b[0], "pattern"), b[4])
-		res, n := p.sub(ctx, pv, required("subn", b[1], "repl"), required("subn", b[2], "string"), b[3])
+		_, p := pat(ctx, required("subn", b[0], "pattern"), b[4])
+		res, n := p.sub(ctx, required("subn", b[1], "repl"), required("subn", b[2], "string"), b[3])
 		return val.NewTupleVal(res, val.Int64Val(n))
 	})
 	fn("escape", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {

@@ -732,21 +732,19 @@ func RichCompare(ctx *ExecContext, a, b Value, op uint8) Value {
 
 	if (a.ptr == &tagInlineStr || a.ptr.Kind == KindString) &&
 		(b.ptr == &tagInlineStr || b.ptr.Kind == KindString) {
-		as := a.AsString()
-		bs := b.AsString()
 		switch op {
 		case CmpLT:
-			return BoolVal(as < bs)
+			return BoolVal(StringCompare(a, b) < 0)
 		case CmpLTE:
-			return BoolVal(as <= bs)
+			return BoolVal(StringCompare(a, b) <= 0)
 		case CmpEQ:
-			return BoolVal(as == bs)
+			return BoolVal(StringEquals(a, b))
 		case CmpNEQ:
-			return BoolVal(as != bs)
+			return BoolVal(!StringEquals(a, b))
 		case CmpGT:
-			return BoolVal(as > bs)
+			return BoolVal(StringCompare(a, b) > 0)
 		case CmpGTE:
-			return BoolVal(as >= bs)
+			return BoolVal(StringCompare(a, b) >= 0)
 		}
 	}
 
@@ -971,7 +969,7 @@ func FloorDivCtx(ctx *ExecContext, a, b Value) Value {
 	bType := b.Type()
 	isStrictSub := aType != bType && IsSubclass(bType, aType)
 	if isStrictSub {
-		if fn, _, ok := bType.LookupMRO(InternString("__rfloordiv__")); ok {
+		if fn, _, ok := bType.LookupMRO(DunderRFloordiv); ok {
 			res := ctx.Invoke2(fn, b, a)
 			if !res.IsNotImplemented() {
 				return res
@@ -1008,14 +1006,14 @@ func FloorDivCtx(ctx *ExecContext, a, b Value) Value {
 		q, _ := bigFloorDivMod(ba, bb)
 		return normBig(q)
 	}
-	if fn, _, ok := aType.LookupMRO(InternString("__floordiv__")); ok {
+	if fn, _, ok := aType.LookupMRO(strFloordiv); ok {
 		res := ctx.Invoke2(fn, a, b)
 		if !res.IsNotImplemented() {
 			return res
 		}
 	}
 	if !isStrictSub {
-		if fn, _, ok := bType.LookupMRO(InternString("__rfloordiv__")); ok {
+		if fn, _, ok := bType.LookupMRO(DunderRFloordiv); ok {
 			res := ctx.Invoke2(fn, b, a)
 			if !res.IsNotImplemented() {
 				return res
@@ -1036,7 +1034,7 @@ func TrueDivCtx(ctx *ExecContext, a, b Value) Value {
 	bType := b.Type()
 	isStrictSub := aType != bType && IsSubclass(bType, aType)
 	if isStrictSub {
-		if fn, _, ok := bType.LookupMRO(InternString("__rtruediv__")); ok {
+		if fn, _, ok := bType.LookupMRO(DunderRTruediv); ok {
 			res := ctx.Invoke2(fn, b, a)
 			if !res.IsNotImplemented() {
 				return res
@@ -1062,14 +1060,14 @@ func TrueDivCtx(ctx *ExecContext, a, b Value) Value {
 		af := toFloat64(a)
 		return Float64Val(af / bf)
 	}
-	if fn, _, ok := aType.LookupMRO(InternString("__truediv__")); ok {
+	if fn, _, ok := aType.LookupMRO(strTruediv); ok {
 		res := ctx.Invoke2(fn, a, b)
 		if !res.IsNotImplemented() {
 			return res
 		}
 	}
 	if !isStrictSub {
-		if fn, _, ok := bType.LookupMRO(InternString("__rtruediv__")); ok {
+		if fn, _, ok := bType.LookupMRO(DunderRTruediv); ok {
 			res := ctx.Invoke2(fn, b, a)
 			if !res.IsNotImplemented() {
 				return res
@@ -1096,7 +1094,7 @@ func ModCtx(ctx *ExecContext, a, b Value) Value {
 	bType := b.Type()
 	isStrictSub := aType != bType && IsSubclass(bType, aType)
 	if isStrictSub {
-		if fn, _, ok := bType.LookupMRO(InternString("__rmod__")); ok {
+		if fn, _, ok := bType.LookupMRO(DunderRMod); ok {
 			res := ctx.Invoke2(fn, b, a)
 			if !res.IsNotImplemented() {
 				return res
@@ -1136,14 +1134,14 @@ func ModCtx(ctx *ExecContext, a, b Value) Value {
 		_, r := bigFloorDivMod(ba, bb)
 		return normBig(r)
 	}
-	if fn, _, ok := aType.LookupMRO(InternString("__mod__")); ok {
+	if fn, _, ok := aType.LookupMRO(strMod); ok {
 		res := ctx.Invoke2(fn, a, b)
 		if !res.IsNotImplemented() {
 			return res
 		}
 	}
 	if !isStrictSub {
-		if fn, _, ok := bType.LookupMRO(InternString("__rmod__")); ok {
+		if fn, _, ok := bType.LookupMRO(DunderRMod); ok {
 			res := ctx.Invoke2(fn, b, a)
 			if !res.IsNotImplemented() {
 				return res
@@ -1164,7 +1162,7 @@ func PowCtx(ctx *ExecContext, a, b Value) Value {
 	bType := b.Type()
 	isStrictSub := aType != bType && IsSubclass(bType, aType)
 	if isStrictSub {
-		if fn, _, ok := bType.LookupMRO(InternString("__rpow__")); ok {
+		if fn, _, ok := bType.LookupMRO(DunderRPow); ok {
 			res := ctx.Invoke2(fn, b, a)
 			if !res.IsNotImplemented() {
 				return res
@@ -1247,14 +1245,14 @@ func PowCtx(ctx *ExecContext, a, b Value) Value {
 		return NewComplexVal(r, i)
 	}
 	if !isNumberKind(a) || !isNumberKind(b) {
-		if fn, _, ok := aType.LookupMRO(InternString("__pow__")); ok {
+		if fn, _, ok := aType.LookupMRO(strPow); ok {
 			res := ctx.Invoke2(fn, a, b)
 			if !res.IsNotImplemented() {
 				return res
 			}
 		}
 		if !isStrictSub {
-			if fn, _, ok := bType.LookupMRO(InternString("__rpow__")); ok {
+			if fn, _, ok := bType.LookupMRO(DunderRPow); ok {
 				res := ctx.Invoke2(fn, b, a)
 				if !res.IsNotImplemented() {
 					return res
@@ -1331,7 +1329,7 @@ func InCtx(ctx *ExecContext, item, container Value) Value {
 		if !item.IsAnyString() {
 			return raiseTypeError(ctx, "'in <string>' requires string as left operand, not "+item.Type().Name)
 		}
-		return BoolVal(strings.Contains(container.AsString(), item.AsString()))
+		return BoolVal(StringContains(container, item))
 	}
 	if cType != nil {
 		invokeContains := func(fn Value) Value {
@@ -1541,7 +1539,7 @@ func BitAnd(ctx *ExecContext, a, b Value) Value {
 	if a.IsSet() && b.IsSet() {
 		return a.AsSet().Intersection(b.AsSet())
 	}
-	if m, _, ok := a.Type().LookupMRO(InternString("__and__")); ok {
+	if m, _, ok := a.Type().LookupMRO(strAnd); ok {
 		if ctx != nil {
 			res := ctx.Invoke2(m, a, b)
 			if !res.IsNotImplemented() {
@@ -1549,7 +1547,7 @@ func BitAnd(ctx *ExecContext, a, b Value) Value {
 			}
 		}
 	}
-	if m, _, ok := b.Type().LookupMRO(InternString("__rand__")); ok {
+	if m, _, ok := b.Type().LookupMRO(DunderRAnd); ok {
 		if ctx != nil {
 			res := ctx.Invoke2(m, b, a)
 			if !res.IsNotImplemented() {
@@ -1593,7 +1591,7 @@ func BitOr(ctx *ExecContext, a, b Value) Value {
 		u := MustNewType(nameA+" | "+nameB, []*PyType{ObjectType}, nil)
 		return TypeVal(u)
 	}
-	if m, _, ok := a.Type().LookupMRO(InternString("__or__")); ok {
+	if m, _, ok := a.Type().LookupMRO(strOr); ok {
 		if ctx != nil {
 			res := ctx.Invoke2(m, a, b)
 			if !res.IsNotImplemented() {
@@ -1612,7 +1610,7 @@ func BitOr(ctx *ExecContext, a, b Value) Value {
 		}
 		return merged
 	}
-	if m, _, ok := b.Type().LookupMRO(InternString("__ror__")); ok {
+	if m, _, ok := b.Type().LookupMRO(DunderROr); ok {
 		if ctx != nil {
 			res := ctx.Invoke2(m, b, a)
 			if !res.IsNotImplemented() {
@@ -1634,7 +1632,7 @@ func BitXor(ctx *ExecContext, a, b Value) Value {
 	if a.IsSet() && b.IsSet() {
 		return a.AsSet().SymmetricDifference(b.AsSet())
 	}
-	if m, _, ok := a.Type().LookupMRO(InternString("__xor__")); ok {
+	if m, _, ok := a.Type().LookupMRO(strXor); ok {
 		if ctx != nil {
 			res := ctx.Invoke2(m, a, b)
 			if !res.IsNotImplemented() {
@@ -1642,7 +1640,7 @@ func BitXor(ctx *ExecContext, a, b Value) Value {
 			}
 		}
 	}
-	if m, _, ok := b.Type().LookupMRO(InternString("__rxor__")); ok {
+	if m, _, ok := b.Type().LookupMRO(DunderRXor); ok {
 		if ctx != nil {
 			res := ctx.Invoke2(m, b, a)
 			if !res.IsNotImplemented() {
@@ -1683,7 +1681,7 @@ func LShift(ctx *ExecContext, a, b Value) Value {
 		res := new(big.Int).Lsh(toBigInt(a), uint(biB.Uint64()))
 		return normBig(res)
 	}
-	if m, _, ok := a.Type().LookupMRO(InternString("__lshift__")); ok {
+	if m, _, ok := a.Type().LookupMRO(strLshift); ok {
 		if ctx != nil {
 			res := ctx.Invoke2(m, a, b)
 			if !res.IsNotImplemented() {
@@ -1691,7 +1689,7 @@ func LShift(ctx *ExecContext, a, b Value) Value {
 			}
 		}
 	}
-	if m, _, ok := b.Type().LookupMRO(InternString("__rlshift__")); ok {
+	if m, _, ok := b.Type().LookupMRO(DunderRLShift); ok {
 		if ctx != nil {
 			res := ctx.Invoke2(m, b, a)
 			if !res.IsNotImplemented() {
@@ -1732,7 +1730,7 @@ func RShift(ctx *ExecContext, a, b Value) Value {
 		res := new(big.Int).Rsh(toBigInt(a), uint(biB.Uint64()))
 		return normBig(res)
 	}
-	if m, _, ok := a.Type().LookupMRO(InternString("__rshift__")); ok {
+	if m, _, ok := a.Type().LookupMRO(strRshift); ok {
 		if ctx != nil {
 			res := ctx.Invoke2(m, a, b)
 			if !res.IsNotImplemented() {
@@ -1740,7 +1738,7 @@ func RShift(ctx *ExecContext, a, b Value) Value {
 			}
 		}
 	}
-	if m, _, ok := b.Type().LookupMRO(InternString("__rrshift__")); ok {
+	if m, _, ok := b.Type().LookupMRO(DunderRRShift); ok {
 		if ctx != nil {
 			res := ctx.Invoke2(m, b, a)
 			if !res.IsNotImplemented() {
@@ -1757,10 +1755,10 @@ func unwrapInstanceInt(a Value) (int64, bool) {
 		if len(inst.Slots) > 0 && inst.Slots[0].IsInt64() {
 			return inst.Slots[0].AsInt64(), true
 		}
-		if v, ok := inst.GetAttr(InternString("value")); ok && v.IsInt64() {
+		if v, ok := inst.GetAttr(strValue); ok && v.IsInt64() {
 			return v.AsInt64(), true
 		}
-		if v, ok := inst.GetAttr(InternString("\x00prim")); ok && v.IsInt64() {
+		if v, ok := inst.GetAttr(strPrimAttr); ok && v.IsInt64() {
 			return v.AsInt64(), true
 		}
 	}
@@ -1782,7 +1780,7 @@ func Invert(ctx *ExecContext, a Value) Value {
 		res.Neg(res)
 		return normBig(res)
 	}
-	if m, _, ok := a.Type().LookupMRO(InternString("__invert__")); ok {
+	if m, _, ok := a.Type().LookupMRO(strInvert); ok {
 		if ctx != nil {
 			res := ctx.Invoke1(m, a)
 			if !res.IsNotImplemented() {
@@ -1810,7 +1808,7 @@ func Positive(ctx *ExecContext, a Value) Value {
 	if isAnyInt(a) {
 		return a
 	}
-	if m, _, ok := a.Type().LookupMRO(InternString("__pos__")); ok {
+	if m, _, ok := a.Type().LookupMRO(strPos); ok {
 		if ctx != nil {
 			res := ctx.Invoke1(m, a)
 			if !res.IsNotImplemented() {
@@ -1843,7 +1841,7 @@ func Negative(ctx *ExecContext, a Value) Value {
 		bi := toBigInt(a)
 		return normBig(new(big.Int).Neg(bi))
 	}
-	if m, _, ok := a.Type().LookupMRO(InternString("__neg__")); ok {
+	if m, _, ok := a.Type().LookupMRO(strNeg); ok {
 		if ctx != nil {
 			res := ctx.Invoke1(m, a)
 			if !res.IsNotImplemented() {
@@ -1856,7 +1854,7 @@ func Negative(ctx *ExecContext, a Value) Value {
 
 // MatMul performs Python matrix multiplication (a @ b).
 func MatMul(ctx *ExecContext, a, b Value) Value {
-	if m, _, ok := a.Type().LookupMRO(InternString("__matmul__")); ok {
+	if m, _, ok := a.Type().LookupMRO(strMatmul); ok {
 		if ctx != nil {
 			res := ctx.Invoke2(m, a, b)
 			if !res.IsNotImplemented() {
@@ -1864,7 +1862,7 @@ func MatMul(ctx *ExecContext, a, b Value) Value {
 			}
 		}
 	}
-	if m, _, ok := b.Type().LookupMRO(InternString("__rmatmul__")); ok {
+	if m, _, ok := b.Type().LookupMRO(DunderRMatMul); ok {
 		if ctx != nil {
 			res := ctx.Invoke2(m, b, a)
 			if !res.IsNotImplemented() {

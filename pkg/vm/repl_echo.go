@@ -12,11 +12,11 @@ func (vm *VM) getDisplayhook() (val.Value, bool) {
 	if vm.modules == nil {
 		return val.NoneVal(), false
 	}
-	sysVal, ok := vm.modules.Get(val.InternString("sys"))
+	sysVal, ok := vm.modules.Get(nameSys)
 	if !ok || !sysVal.IsModule() {
 		return val.NoneVal(), false
 	}
-	hook, ok := sysVal.AsModule().Dict.Get(val.InternString("displayhook"))
+	hook, ok := sysVal.AsModule().Dict.Get(nameDisplayhook)
 	if !ok || hook.IsNone() {
 		return val.NoneVal(), false
 	}

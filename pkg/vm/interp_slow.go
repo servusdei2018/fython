@@ -286,6 +286,7 @@ func (vm *VM) opForIterSlow(st *loopState, inst uint32, ip, sp int) (int, int, l
 			ip++
 			return ip, sp, ctlReload
 		}
+		val.ReleaseForIter(pyIter)
 		sp--
 		return jumpTarget, sp, ctlReload
 	}

@@ -424,13 +424,12 @@ func initCollectionsTypes() {
 		DefaultDictType = val.MustNewType("defaultdict", []*val.PyType{val.DictType}, nil)
 		DefaultDictType.Dict.Set(val.InternString("default_factory"), val.NoneVal())
 		getDefaultFactory := func(d *val.PyDict) (val.Value, bool) {
-			key := val.InternString("default_factory")
 			if d.Attrs != nil {
-				if f, ok := d.Attrs.Get(key); ok {
+				if f, ok := d.Attrs.Get(nameDefaultFactory); ok {
 					return f, true
 				}
 			}
-			return d.Get(key)
+			return d.Get(nameDefaultFactory)
 		}
 		defaultDictInit := func(ctx *val.ExecContext, dVal val.Value, args []val.Value, kwnames []val.Value) {
 			d := dVal.AsDict()
@@ -446,7 +445,7 @@ func initCollectionsTypes() {
 			if d.Attrs == nil {
 				d.Attrs = val.NewDictVal(4).AsDict()
 			}
-			d.Attrs.Set(val.InternString("default_factory"), defaultFactory)
+			d.Attrs.Set(nameDefaultFactory, defaultFactory)
 			if len(dictArgs) > 0 {
 				initFn, _, ok := val.DictType.LookupMRO(val.DunderInit)
 				if ok && initFn.IsBuiltinFunc() {
@@ -482,7 +481,7 @@ func initCollectionsTypes() {
 			if v, ok := d.Get(key); ok {
 				return v
 			}
-			if missingFn, _, ok := o.Type().LookupMRO(val.InternString("__missing__")); ok {
+			if missingFn, _, ok := o.Type().LookupMRO(nameMissing); ok {
 				return ctx.Invoke2(missingFn, o, key)
 			}
 			ctx.Raise(val.NewException(val.KeyErrorType, key.String()))
@@ -567,7 +566,7 @@ func (e *Engine) createCollectionsModule() val.Value {
 
 		for _, elem := range elems {
 			curVal := val.Int64Val(0)
-			getFn, _, okGet := mapping.Type().LookupMRO(val.InternString("get"))
+			getFn, _, okGet := mapping.Type().LookupMRO(nameGet)
 			if okGet {
 				curVal = ctx.Invoke3(getFn, mapping, elem, val.Int64Val(0))
 			}

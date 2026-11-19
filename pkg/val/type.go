@@ -109,18 +109,22 @@ func (ctx *ExecContext) Invoke1(callable, a Value) Value {
 			}
 		}
 	}
+	return ctx.invoke1Slow(callable, a)
+}
+
+//go:noinline
+func (ctx *ExecContext) invoke1Slow(callable, a Value) Value {
 	if !callable.IsBuiltinFunc() && (ctx == nil || ctx.CallHook == nil) && AcquireExecContextHook != nil {
 		tmpCtx, release := AcquireExecContextHook()
 		defer release()
 		return tmpCtx.Invoke1(callable, a)
 	}
-	var buf [1]Value
-	buf[0] = a
+	args := []Value{a}
 	if callable.IsBuiltinFunc() {
-		return callable.AsBuiltinFunc().Fn(ctx, callable, buf[:], nil)
+		return callable.AsBuiltinFunc().Fn(ctx, callable, args, nil)
 	}
 	if tpCall := callable.Type().Slots.TpCall; tpCall != nil {
-		return tpCall(ctx, callable, buf[:], nil)
+		return tpCall(ctx, callable, args, nil)
 	}
 	return RaiseTypeError(ctx, "'"+callable.Type().Name+"' object is not callable")
 }
@@ -143,19 +147,22 @@ func (ctx *ExecContext) Invoke2(callable, a, b Value) Value {
 			}
 		}
 	}
+	return ctx.invoke2Slow(callable, a, b)
+}
+
+//go:noinline
+func (ctx *ExecContext) invoke2Slow(callable, a, b Value) Value {
 	if !callable.IsBuiltinFunc() && (ctx == nil || ctx.CallHook == nil) && AcquireExecContextHook != nil {
 		tmpCtx, release := AcquireExecContextHook()
 		defer release()
 		return tmpCtx.Invoke2(callable, a, b)
 	}
-	var buf [2]Value
-	buf[0] = a
-	buf[1] = b
+	args := []Value{a, b}
 	if callable.IsBuiltinFunc() {
-		return callable.AsBuiltinFunc().Fn(ctx, callable, buf[:], nil)
+		return callable.AsBuiltinFunc().Fn(ctx, callable, args, nil)
 	}
 	if tpCall := callable.Type().Slots.TpCall; tpCall != nil {
-		return tpCall(ctx, callable, buf[:], nil)
+		return tpCall(ctx, callable, args, nil)
 	}
 	return RaiseTypeError(ctx, "'"+callable.Type().Name+"' object is not callable")
 }
@@ -179,20 +186,22 @@ func (ctx *ExecContext) Invoke3(callable, a, b, c Value) Value {
 			}
 		}
 	}
+	return ctx.invoke3Slow(callable, a, b, c)
+}
+
+//go:noinline
+func (ctx *ExecContext) invoke3Slow(callable, a, b, c Value) Value {
 	if !callable.IsBuiltinFunc() && (ctx == nil || ctx.CallHook == nil) && AcquireExecContextHook != nil {
 		tmpCtx, release := AcquireExecContextHook()
 		defer release()
 		return tmpCtx.Invoke3(callable, a, b, c)
 	}
-	var buf [3]Value
-	buf[0] = a
-	buf[1] = b
-	buf[2] = c
+	args := []Value{a, b, c}
 	if callable.IsBuiltinFunc() {
-		return callable.AsBuiltinFunc().Fn(ctx, callable, buf[:], nil)
+		return callable.AsBuiltinFunc().Fn(ctx, callable, args, nil)
 	}
 	if tpCall := callable.Type().Slots.TpCall; tpCall != nil {
-		return tpCall(ctx, callable, buf[:], nil)
+		return tpCall(ctx, callable, args, nil)
 	}
 	return RaiseTypeError(ctx, "'"+callable.Type().Name+"' object is not callable")
 }
@@ -757,7 +766,7 @@ func NewTypeWithMeta(name string, bases []*PyType, dict *PyDict, meta *PyType) (
 		bases = []*PyType{ObjectType}
 	}
 	if dict == nil {
-		dict = NewDictVal(8).AsDict()
+		dict = NewDictVal(4).AsDict()
 	} else {
 		// Ensure all existing keys in dict are canonicalized in the intern pool.
 		for i := range dict.Entries {
@@ -787,6 +796,7 @@ func NewTypeWithMeta(name string, bases []*PyType, dict *PyDict, meta *PyType) (
 		return nil, err
 	}
 	t.MRO = mro
+	t.RefreshInstanceFlags()
 
 	subclassesMu.Lock()
 	for _, b := range bases {
@@ -953,6 +963,33 @@ func NewTypeWithMeta(name string, bases []*PyType, dict *PyDict, meta *PyType) (
 	return t, nil
 }
 
+// RefreshInstanceFlags precomputes FlagHasCExtBase and FlagIsModuleSub from t.MRO
+// so NewInstanceOfType can check both conditions in a single flag test.
+func (t *PyType) RefreshInstanceFlags() {
+	if t == nil {
+		return
+	}
+	hasCExt := t.Basicsize > 16
+	isMod := false
+	for _, b := range t.MRO {
+		if b == nil {
+			continue
+		}
+		if b.Basicsize > 16 || (b.Flags&FlagHasCExtBase) != 0 {
+			hasCExt = true
+		}
+		if ModuleType != nil && b == ModuleType {
+			isMod = true
+		}
+	}
+	if hasCExt {
+		t.Flags |= FlagHasCExtBase
+	}
+	if isMod {
+		t.Flags |= FlagIsModuleSub
+	}
+}
+
 // MustNewType constructs a *PyType or panics if C3 MRO linearization fails.
 func MustNewType(name string, bases []*PyType, dict *PyDict) *PyType {
 	t, err := NewType(name, bases, dict)
@@ -1053,7 +1090,7 @@ func (t *PyType) SetAttr(name, value Value) {
 		value.ptr.Flags |= FlagDataDescriptor
 	}
 	if t.Dict == nil {
-		t.SetDict(NewDictVal(8).AsDict())
+		t.SetDict(NewDictVal(4).AsDict())
 	}
 	t.Dict.Set(interned, value)
 	t.InvalidateVersion()
@@ -1689,21 +1726,25 @@ func objectGetAttr(ctx *ExecContext, obj, name Value) Value {
 	return defaultObjectGetAttr(ctx, obj, name)
 }
 
+func clearAttrError(ctx *ExecContext) {
+	if ctx != nil && ctx.HasException() && IsInstance(ctx.ActiveException, AttributeErrorType) {
+		exc := ctx.ActiveException
+		ctx.ClearException()
+		ReleaseLazyAttributeError(exc)
+	}
+}
+
 // LookupAttrOptional resolves obj.name without panicking or allocating an AttributeError
 // when the attribute does not exist on standard objects/modules/types.
 func LookupAttrOptional(ctx *ExecContext, obj, name Value) (Value, bool) {
 	if obj.IsType() {
 		v, ok := typeGetAttrOptional(ctx, obj, name)
 		if !ok {
-			if ctx != nil && ctx.HasException() && IsInstance(ctx.ActiveException, AttributeErrorType) {
-				ctx.ClearException()
-			}
+			clearAttrError(ctx)
 			return NoneVal(), false
 		}
 		if ctx != nil && ctx.HasException() {
-			if IsInstance(ctx.ActiveException, AttributeErrorType) {
-				ctx.ClearException()
-			}
+			clearAttrError(ctx)
 			return NoneVal(), false
 		}
 		return v, true
@@ -1711,15 +1752,11 @@ func LookupAttrOptional(ctx *ExecContext, obj, name Value) (Value, bool) {
 	if obj.IsSuper() {
 		v, ok := superGetAttrOptional(ctx, obj, name)
 		if !ok {
-			if ctx != nil && ctx.HasException() && IsInstance(ctx.ActiveException, AttributeErrorType) {
-				ctx.ClearException()
-			}
+			clearAttrError(ctx)
 			return NoneVal(), false
 		}
 		if ctx != nil && ctx.HasException() {
-			if IsInstance(ctx.ActiveException, AttributeErrorType) {
-				ctx.ClearException()
-			}
+			clearAttrError(ctx)
 			return NoneVal(), false
 		}
 		return v, true
@@ -1728,9 +1765,7 @@ func LookupAttrOptional(ctx *ExecContext, obj, name Value) (Value, bool) {
 	if (tp.Flags&FlagCustomGetAttribute) != 0 || tp.dunderGetAttribute.ptr != nil {
 		v := GetAttrCtx(ctx, obj, name)
 		if ctx != nil && ctx.HasException() {
-			if IsInstance(ctx.ActiveException, AttributeErrorType) {
-				ctx.ClearException()
-			}
+			clearAttrError(ctx)
 			return NoneVal(), false
 		}
 		return v, true
@@ -1738,15 +1773,11 @@ func LookupAttrOptional(ctx *ExecContext, obj, name Value) (Value, bool) {
 	if obj.IsModule() && tp == ModuleType {
 		v, ok := defaultModuleGetAttrOptional(ctx, obj, InternValue(name))
 		if !ok {
-			if ctx != nil && ctx.HasException() && IsInstance(ctx.ActiveException, AttributeErrorType) {
-				ctx.ClearException()
-			}
+			clearAttrError(ctx)
 			return NoneVal(), false
 		}
 		if ctx != nil && ctx.HasException() {
-			if IsInstance(ctx.ActiveException, AttributeErrorType) {
-				ctx.ClearException()
-			}
+			clearAttrError(ctx)
 			return NoneVal(), false
 		}
 		return v, true
@@ -1758,24 +1789,18 @@ func LookupAttrOptional(ctx *ExecContext, obj, name Value) (Value, bool) {
 		tp == RangeType)) {
 		v, ok := defaultObjectGetAttrOptional(ctx, obj, name)
 		if !ok {
-			if ctx != nil && ctx.HasException() && IsInstance(ctx.ActiveException, AttributeErrorType) {
-				ctx.ClearException()
-			}
+			clearAttrError(ctx)
 			return NoneVal(), false
 		}
 		if ctx != nil && ctx.HasException() {
-			if IsInstance(ctx.ActiveException, AttributeErrorType) {
-				ctx.ClearException()
-			}
+			clearAttrError(ctx)
 			return NoneVal(), false
 		}
 		return v, true
 	}
 	v := GetAttrCtx(ctx, obj, name)
 	if ctx != nil && ctx.HasException() {
-		if IsInstance(ctx.ActiveException, AttributeErrorType) {
-			ctx.ClearException()
-		}
+		clearAttrError(ctx)
 		return NoneVal(), false
 	}
 	return v, true
@@ -1921,7 +1946,7 @@ func defaultObjectGetAttrOptional(ctx *ExecContext, obj, name Value) (Value, boo
 		ci := obj.AsCInstance()
 		if ci != nil {
 			if ci.Dict == nil {
-				ci.Dict = NewDictVal(8).AsDict()
+				ci.Dict = NewDictVal(4).AsDict()
 			}
 			return DictVal(ci.Dict), true
 		}
@@ -1957,21 +1982,21 @@ func defaultObjectGetAttrOptional(ctx *ExecContext, obj, name Value) (Value, boo
 		if obj.IsDict() && tp != DictType {
 			d := obj.AsDict()
 			if d.Attrs == nil {
-				d.Attrs = NewDictVal(8).AsDict()
+				d.Attrs = NewDictVal(4).AsDict()
 			}
 			return Value{num: uint64(KindDict), ptr: &d.Attrs.Header}, true
 		}
 		if obj.IsList() && tp != ListType {
 			l := obj.AsList()
 			if l.Attrs == nil {
-				l.Attrs = NewDictVal(8).AsDict()
+				l.Attrs = NewDictVal(4).AsDict()
 			}
 			return Value{num: uint64(KindDict), ptr: &l.Attrs.Header}, true
 		}
 		if obj.IsTuple() && tp != TupleType {
 			t := obj.AsTuple()
 			if t.Attrs == nil {
-				t.Attrs = NewDictVal(8).AsDict()
+				t.Attrs = NewDictVal(4).AsDict()
 			}
 			return Value{num: uint64(KindDict), ptr: &t.Attrs.Header}, true
 		}
@@ -2051,7 +2076,7 @@ func objectSetAttr(ctx *ExecContext, obj, name, value Value) Value {
 			return NoneVal()
 		}
 		if ci.Dict == nil {
-			ci.Dict = NewDictVal(8).AsDict()
+			ci.Dict = NewDictVal(4).AsDict()
 		}
 		ci.Dict.Set(interned, value)
 		return NoneVal()
@@ -2077,7 +2102,7 @@ func objectSetAttr(ctx *ExecContext, obj, name, value Value) Value {
 	if obj.IsDict() && tp != DictType {
 		d := obj.AsDict()
 		if d.Attrs == nil {
-			d.Attrs = NewDictVal(8).AsDict()
+			d.Attrs = NewDictVal(4).AsDict()
 		}
 		d.Attrs.Set(interned, value)
 		return NoneVal()
@@ -2086,7 +2111,7 @@ func objectSetAttr(ctx *ExecContext, obj, name, value Value) Value {
 	if obj.IsList() && tp != ListType {
 		l := obj.AsList()
 		if l.Attrs == nil {
-			l.Attrs = NewDictVal(8).AsDict()
+			l.Attrs = NewDictVal(4).AsDict()
 		}
 		l.Attrs.Set(interned, value)
 		return NoneVal()
@@ -2095,7 +2120,7 @@ func objectSetAttr(ctx *ExecContext, obj, name, value Value) Value {
 	if obj.IsTuple() && tp != TupleType {
 		t := obj.AsTuple()
 		if t.Attrs == nil {
-			t.Attrs = NewDictVal(8).AsDict()
+			t.Attrs = NewDictVal(4).AsDict()
 		}
 		t.Attrs.Set(interned, value)
 		return NoneVal()
@@ -2615,7 +2640,7 @@ func moduleSetAttr(ctx *ExecContext, obj, name, value Value) Value {
 		ctx.Invoke3(tp.dunderSetAttr, obj, interned, value)
 		return NoneVal()
 	}
-	if interned.AsString() == "__class__" {
+	if interned.StringEquals("__class__") {
 		AssignInstanceClass(obj, value)
 		return NoneVal()
 	}
@@ -2626,7 +2651,7 @@ func moduleSetAttr(ctx *ExecContext, obj, name, value Value) Value {
 			return NoneVal()
 		}
 	}
-	if interned.AsString() == "__dict__" {
+	if interned.StringEquals("__dict__") {
 		if !value.IsDict() {
 			return RaiseTypeError(ctx, "__dict__ must be set to a dictionary, not a '"+value.Type().Name+"'")
 		}
@@ -2647,12 +2672,31 @@ func ReplaceInstanceDict(ctx *ExecContext, inst *PyInstance, mapping Value) {
 	}
 	entries := mapping.AsDict().ActiveEntries()
 	tp := inst.Header.Type
-	inst.mu.RLock()
+	if MultiThreadedFlag.Load() {
+		mu := inst.lock()
+		mu.RLock()
+		names := make([]Value, 0, len(inst.Shape.Attrs))
+		for _, a := range inst.Shape.Attrs {
+			names = append(names, a.Name)
+		}
+		mu.RUnlock()
+		for _, n := range names {
+			if tp != nil {
+				if _, _, isClassAttr := tp.LookupMRO(n); isClassAttr {
+					continue
+				}
+			}
+			inst.DeleteAttr(n)
+		}
+		for _, e := range entries {
+			inst.SetAttr(InternValue(e.Key), e.Value)
+		}
+		return
+	}
 	names := make([]Value, 0, len(inst.Shape.Attrs))
 	for _, a := range inst.Shape.Attrs {
 		names = append(names, a.Name)
 	}
-	inst.mu.RUnlock()
 	for _, n := range names {
 		if tp != nil {
 			if _, _, isClassAttr := tp.LookupMRO(n); isClassAttr {
@@ -2687,18 +2731,33 @@ func AssignInstanceClass(obj, value Value) {
 		panic("TypeError: __class__ assignment only supported for heap types or ModuleType subclasses")
 	}
 	fi := fresh.AsInstance()
-	old.mu.RLock()
-	attrs := append([]ShapeAttr(nil), old.Shape.Attrs...)
-	slots := append([]Value(nil), old.Slots...)
-	old.mu.RUnlock()
+	var attrs []ShapeAttr
+	var slots []Value
+	if MultiThreadedFlag.Load() {
+		mu := old.lock()
+		mu.RLock()
+		attrs = append([]ShapeAttr(nil), old.Shape.Attrs...)
+		slots = append([]Value(nil), old.Slots...)
+		mu.RUnlock()
+	} else {
+		attrs = append([]ShapeAttr(nil), old.Shape.Attrs...)
+		slots = append([]Value(nil), old.Slots...)
+	}
 	for _, a := range attrs {
 		if a.Index < len(slots) && slots[a.Index].ptr != nil {
 			fi.SetAttr(a.Name, slots[a.Index])
 		}
 	}
-	old.mu.Lock()
-	old.Shape = fi.Shape
-	old.Slots = fi.Slots
-	old.Header.Type = newT
-	old.mu.Unlock()
+	if MultiThreadedFlag.Load() {
+		mu := old.lock()
+		mu.Lock()
+		old.Shape = fi.Shape
+		old.Slots = fi.Slots
+		old.Header.Type = newT
+		mu.Unlock()
+	} else {
+		old.Shape = fi.Shape
+		old.Slots = fi.Slots
+		old.Header.Type = newT
+	}
 }

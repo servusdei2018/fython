@@ -977,10 +977,10 @@ func initIOTypes() {
 			}
 			inst := args[0].AsInstance()
 			if v, ok := kwArg(args, kwnames, "encoding"); ok && !v.IsNone() {
-				inst.SetAttr(val.InternString("encoding"), v)
+				inst.SetAttr(nameEncoding, v)
 			}
 			if v, ok := kwArg(args, kwnames, "errors"); ok && !v.IsNone() {
-				inst.SetAttr(val.InternString("errors"), v)
+				inst.SetAttr(nameErrors, v)
 			}
 			return val.NoneVal()
 		}))
@@ -1140,9 +1140,9 @@ func openFileBuiltinValCtx(ctx *val.ExecContext, fileVal val.Value, mode string)
 		binary:    binary,
 		pooledBuf: pooledBuf,
 	}
-	pf.inst.SetAttr(val.InternString("mode"), val.NewStringVal(mode))
+	pf.inst.SetAttr(nameMode, val.NewStringVal(mode))
 	if fileVal.IsAnyString() {
-		pf.inst.SetAttr(val.InternString("name"), fileVal)
+		pf.inst.SetAttr(nameAttrName, fileVal)
 	}
 	if !binary && f != nil {
 		bufPf := &pyFile{
@@ -1152,10 +1152,10 @@ func openFileBuiltinValCtx(ctx *val.ExecContext, fileVal val.Value, mode string)
 			writeBuf: writeBuf,
 			binary:   true,
 		}
-		bufPf.inst.SetAttr(val.InternString("mode"), val.NewStringVal(mode+"b"))
-		pf.inst.SetAttr(val.InternString("buffer"), val.ObjectVal(&bufPf.inst.Header))
-		pf.inst.SetAttr(val.InternString("encoding"), val.NewStringVal("utf-8"))
-		pf.inst.SetAttr(val.InternString("errors"), val.NewStringVal("strict"))
+		bufPf.inst.SetAttr(nameMode, val.NewStringVal(mode+"b"))
+		pf.inst.SetAttr(nameBuffer, val.ObjectVal(&bufPf.inst.Header))
+		pf.inst.SetAttr(nameEncoding, val.NewStringVal("utf-8"))
+		pf.inst.SetAttr(nameErrors, val.NewStringVal("strict"))
 	}
 
 	return val.ObjectVal(&pf.inst.Header)
@@ -1178,9 +1178,9 @@ func newStdStream(f *os.File, name string, writable bool) val.Value {
 		name:       name,
 	}
 	bufVal := val.ObjectVal(&bufPf.inst.Header)
-	bufPf.inst.SetAttr(val.InternString("name"), val.NewStringVal(name))
-	bufPf.inst.SetAttr(val.InternString("mode"), val.NewStringVal(bufMode))
-	bufPf.inst.SetAttr(val.InternString("raw"), bufVal)
+	bufPf.inst.SetAttr(nameAttrName, val.NewStringVal(name))
+	bufPf.inst.SetAttr(nameMode, val.NewStringVal(bufMode))
+	bufPf.inst.SetAttr(nameRaw, bufVal)
 
 	pf := &pyFile{
 		inst:       val.PyInstance{Header: val.ObjectHeader{Kind: val.KindInstance, Type: FileType}, Shape: FileType.RootShape},
@@ -1188,11 +1188,11 @@ func newStdStream(f *os.File, name string, writable bool) val.Value {
 		unbuffered: writable,
 		name:       name,
 	}
-	pf.inst.SetAttr(val.InternString("name"), val.NewStringVal(name))
-	pf.inst.SetAttr(val.InternString("mode"), val.NewStringVal(mode))
-	pf.inst.SetAttr(val.InternString("encoding"), val.NewStringVal("utf-8"))
-	pf.inst.SetAttr(val.InternString("errors"), val.NewStringVal("surrogateescape"))
-	pf.inst.SetAttr(val.InternString("buffer"), bufVal)
+	pf.inst.SetAttr(nameAttrName, val.NewStringVal(name))
+	pf.inst.SetAttr(nameMode, val.NewStringVal(mode))
+	pf.inst.SetAttr(nameEncoding, val.NewStringVal("utf-8"))
+	pf.inst.SetAttr(nameErrors, val.NewStringVal("surrogateescape"))
+	pf.inst.SetAttr(nameBuffer, bufVal)
 	return val.ObjectVal(&pf.inst.Header)
 }
 
@@ -1220,7 +1220,7 @@ func (e *Engine) createIOModule() val.Value {
 	}))
 	ioBaseType.Dict.Set(val.InternString("__exit__"), val.NewBuiltinFuncVal("__exit__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) > 0 {
-			if closeFn, _, ok := args[0].Type().LookupMRO(val.InternString("close")); ok {
+			if closeFn, _, ok := args[0].Type().LookupMRO(nameClose); ok {
 				return ctx.Invoke1(closeFn, args[0])
 			}
 		}
@@ -1228,7 +1228,7 @@ func (e *Engine) createIOModule() val.Value {
 	}))
 	ioBaseType.Dict.Set(val.InternString("close"), val.NewBuiltinFuncVal("close", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) > 0 && args[0].IsInstance() {
-			args[0].AsInstance().SetAttr(val.InternString("closed"), val.BoolVal(true))
+			args[0].AsInstance().SetAttr(nameClosed, val.BoolVal(true))
 		}
 		return val.NoneVal()
 	}))
@@ -1243,7 +1243,7 @@ func (e *Engine) createIOModule() val.Value {
 			ctx.Raise(val.NewException(val.TypeErrorType, "descriptor 'tell' of 'IOBase' object needs an argument"))
 			return val.NoneVal()
 		}
-		if seekFn, _, ok := args[0].Type().LookupMRO(val.InternString("seek")); ok {
+		if seekFn, _, ok := args[0].Type().LookupMRO(nameSeek); ok {
 			return ctx.Invoke3(seekFn, args[0], val.Int64Val(0), val.Int64Val(1))
 		}
 		panic("io.UnsupportedOperation: seek")
@@ -1259,7 +1259,7 @@ func (e *Engine) createIOModule() val.Value {
 	}))
 	ioBaseType.Dict.Set(val.InternString("_checkClosed"), val.NewBuiltinFuncVal("_checkClosed", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) > 0 {
-			clVal := val.GetAttrCtx(ctx, args[0], val.InternString("closed"))
+			clVal := val.GetAttrCtx(ctx, args[0], nameClosed)
 			if clVal.IsTruthy() {
 				ctx.Raise(val.NewException(val.ValueErrorType, "I/O operation on closed file."))
 				return val.NoneVal()
@@ -1269,7 +1269,7 @@ func (e *Engine) createIOModule() val.Value {
 	}))
 	ioBaseType.Dict.Set(val.InternString("_checkReadable"), val.NewBuiltinFuncVal("_checkReadable", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) > 0 {
-			if fn, _, ok := args[0].Type().LookupMRO(val.InternString("readable")); ok {
+			if fn, _, ok := args[0].Type().LookupMRO(nameReadable); ok {
 				res := ctx.Invoke1(fn, args[0])
 				if !res.IsTruthy() {
 					ctx.Raise(val.NewException(val.OSErrorType, "File or stream is not readable."))
@@ -1281,7 +1281,7 @@ func (e *Engine) createIOModule() val.Value {
 	}))
 	ioBaseType.Dict.Set(val.InternString("_checkWritable"), val.NewBuiltinFuncVal("_checkWritable", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) > 0 {
-			if fn, _, ok := args[0].Type().LookupMRO(val.InternString("writable")); ok {
+			if fn, _, ok := args[0].Type().LookupMRO(nameWritable); ok {
 				res := ctx.Invoke1(fn, args[0])
 				if !res.IsTruthy() {
 					ctx.Raise(val.NewException(val.OSErrorType, "File or stream is not writable."))
@@ -1293,7 +1293,7 @@ func (e *Engine) createIOModule() val.Value {
 	}))
 	ioBaseType.Dict.Set(val.InternString("_checkSeekable"), val.NewBuiltinFuncVal("_checkSeekable", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) > 0 {
-			if fn, _, ok := args[0].Type().LookupMRO(val.InternString("seekable")); ok {
+			if fn, _, ok := args[0].Type().LookupMRO(nameSeekable); ok {
 				res := ctx.Invoke1(fn, args[0])
 				if !res.IsTruthy() {
 					ctx.Raise(val.NewException(val.OSErrorType, "File or stream is not seekable."))
@@ -1305,7 +1305,7 @@ func (e *Engine) createIOModule() val.Value {
 	}))
 
 	invokeIOSeek := func(ctx *val.ExecContext, rawVal val.Value, args []val.Value) val.Value {
-		seekFn, _, ok := rawVal.Type().LookupMRO(val.InternString("seek"))
+		seekFn, _, ok := rawVal.Type().LookupMRO(nameSeek)
 		if !ok {
 			panic("io.UnsupportedOperation: seek")
 		}
@@ -1335,7 +1335,7 @@ func (e *Engine) createIOModule() val.Value {
 	}
 
 	invokeIOTell := func(ctx *val.ExecContext, rawVal val.Value) val.Value {
-		tellFn, _, ok := rawVal.Type().LookupMRO(val.InternString("tell"))
+		tellFn, _, ok := rawVal.Type().LookupMRO(nameTell)
 		if !ok {
 			panic("io.UnsupportedOperation: tell")
 		}
@@ -1358,7 +1358,7 @@ func (e *Engine) createIOModule() val.Value {
 			return val.NoneVal()
 		}
 		inst := val.NewInstanceOfType(bufferedReaderType)
-		inst.AsInstance().SetAttr(val.InternString("raw"), args[0])
+		inst.AsInstance().SetAttr(nameRaw, args[0])
 		return inst
 	}
 	bufferedReaderType.Dict.Set(val.InternString("read"), val.NewBuiltinFuncVal("read", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -1366,12 +1366,12 @@ func (e *Engine) createIOModule() val.Value {
 			ctx.Raise(val.NewException(val.TypeErrorType, "read() missing self"))
 			return val.NoneVal()
 		}
-		rawVal, _ := args[0].AsInstance().GetAttr(val.InternString("raw"))
+		rawVal, _ := args[0].AsInstance().GetAttr(nameRaw)
 		size := -1
 		if len(args) > 1 && !args[1].IsNone() {
 			size = int(args[1].AsInt64())
 		}
-		readintoFn, _, hasReadinto := rawVal.Type().LookupMRO(val.InternString("readinto"))
+		readintoFn, _, hasReadinto := rawVal.Type().LookupMRO(nameReadinto)
 		if hasReadinto {
 			if size >= 0 {
 				buf := val.NewByteArrayVal(make([]byte, size))
@@ -1391,7 +1391,7 @@ func (e *Engine) createIOModule() val.Value {
 			}
 			return val.NewBytesVal(accumulated)
 		}
-		if readFn, _, hasRead := rawVal.Type().LookupMRO(val.InternString("read")); hasRead {
+		if readFn, _, hasRead := rawVal.Type().LookupMRO(nameRead); hasRead {
 			if size >= 0 {
 				return ctx.Invoke2(readFn, rawVal, val.Int64Val(int64(size)))
 			}
@@ -1405,8 +1405,8 @@ func (e *Engine) createIOModule() val.Value {
 			ctx.Raise(val.NewException(val.TypeErrorType, "readline() missing self"))
 			return val.NoneVal()
 		}
-		rawVal, _ := args[0].AsInstance().GetAttr(val.InternString("raw"))
-		readintoFn, _, hasReadinto := rawVal.Type().LookupMRO(val.InternString("readinto"))
+		rawVal, _ := args[0].AsInstance().GetAttr(nameRaw)
+		readintoFn, _, hasReadinto := rawVal.Type().LookupMRO(nameReadinto)
 		var line []byte
 		if hasReadinto {
 			oneByte := val.NewByteArrayVal(make([]byte, 1))
@@ -1429,8 +1429,8 @@ func (e *Engine) createIOModule() val.Value {
 			ctx.Raise(val.NewException(val.TypeErrorType, "readinto() takes 1 argument"))
 			return val.NoneVal()
 		}
-		rawVal, _ := args[0].AsInstance().GetAttr(val.InternString("raw"))
-		if fn, _, ok := rawVal.Type().LookupMRO(val.InternString("readinto")); ok {
+		rawVal, _ := args[0].AsInstance().GetAttr(nameRaw)
+		if fn, _, ok := rawVal.Type().LookupMRO(nameReadinto); ok {
 			return ctx.Invoke2(fn, rawVal, args[1])
 		}
 		ctx.Raise(val.NewException(val.AttributeErrorType, "raw object has no readinto"))
@@ -1438,8 +1438,8 @@ func (e *Engine) createIOModule() val.Value {
 	}))
 	bufferedReaderType.Dict.Set(val.InternString("flush"), val.NewBuiltinFuncVal("flush", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) > 0 {
-			if rawVal, ok := args[0].AsInstance().GetAttr(val.InternString("raw")); ok {
-				if fn, _, has := rawVal.Type().LookupMRO(val.InternString("flush")); has {
+			if rawVal, ok := args[0].AsInstance().GetAttr(nameRaw); ok {
+				if fn, _, has := rawVal.Type().LookupMRO(nameFlush); has {
 					return ctx.Invoke1(fn, rawVal)
 				}
 			}
@@ -1448,8 +1448,8 @@ func (e *Engine) createIOModule() val.Value {
 	}))
 	bufferedReaderType.Dict.Set(val.InternString("close"), val.NewBuiltinFuncVal("close", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) > 0 {
-			if rawVal, ok := args[0].AsInstance().GetAttr(val.InternString("raw")); ok {
-				if fn, _, has := rawVal.Type().LookupMRO(val.InternString("close")); has {
+			if rawVal, ok := args[0].AsInstance().GetAttr(nameRaw); ok {
+				if fn, _, has := rawVal.Type().LookupMRO(nameClose); has {
 					return ctx.Invoke1(fn, rawVal)
 				}
 			}
@@ -1458,8 +1458,8 @@ func (e *Engine) createIOModule() val.Value {
 	}))
 	bufferedReaderType.Dict.Set(val.InternString("fileno"), val.NewBuiltinFuncVal("fileno", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) > 0 {
-			if rawVal, ok := args[0].AsInstance().GetAttr(val.InternString("raw")); ok {
-				if fn, _, has := rawVal.Type().LookupMRO(val.InternString("fileno")); has {
+			if rawVal, ok := args[0].AsInstance().GetAttr(nameRaw); ok {
+				if fn, _, has := rawVal.Type().LookupMRO(nameFileno); has {
 					return ctx.Invoke1(fn, rawVal)
 				}
 			}
@@ -1475,8 +1475,8 @@ func (e *Engine) createIOModule() val.Value {
 	bufferedReaderType.Dict.Set(val.InternString("closed"), val.NewPropertyVal(
 		val.NewBuiltinFuncVal("closed", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) > 0 {
-				if rawVal, ok := args[0].AsInstance().GetAttr(val.InternString("raw")); ok {
-					return val.GetAttrCtx(ctx, rawVal, val.InternString("closed"))
+				if rawVal, ok := args[0].AsInstance().GetAttr(nameRaw); ok {
+					return val.GetAttrCtx(ctx, rawVal, nameClosed)
 				}
 			}
 			return val.BoolVal(false)
@@ -1489,7 +1489,7 @@ func (e *Engine) createIOModule() val.Value {
 			ctx.Raise(val.NewException(val.TypeErrorType, "seek() missing self"))
 			return val.NoneVal()
 		}
-		rawVal, _ := args[0].AsInstance().GetAttr(val.InternString("raw"))
+		rawVal, _ := args[0].AsInstance().GetAttr(nameRaw)
 		return invokeIOSeek(ctx, rawVal, args)
 	}))
 	bufferedReaderType.Dict.Set(val.InternString("tell"), val.NewBuiltinFuncVal("tell", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -1497,7 +1497,7 @@ func (e *Engine) createIOModule() val.Value {
 			ctx.Raise(val.NewException(val.TypeErrorType, "tell() missing self"))
 			return val.NoneVal()
 		}
-		rawVal, _ := args[0].AsInstance().GetAttr(val.InternString("raw"))
+		rawVal, _ := args[0].AsInstance().GetAttr(nameRaw)
 		return invokeIOTell(ctx, rawVal)
 	}))
 
@@ -1509,7 +1509,7 @@ func (e *Engine) createIOModule() val.Value {
 			return val.NoneVal()
 		}
 		inst := val.NewInstanceOfType(bufferedWriterType)
-		inst.AsInstance().SetAttr(val.InternString("raw"), args[0])
+		inst.AsInstance().SetAttr(nameRaw, args[0])
 		return inst
 	}
 	bufferedWriterType.Dict.Set(val.InternString("write"), val.NewBuiltinFuncVal("write", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -1517,8 +1517,8 @@ func (e *Engine) createIOModule() val.Value {
 			ctx.Raise(val.NewException(val.TypeErrorType, "write() takes 1 argument"))
 			return val.NoneVal()
 		}
-		rawVal, _ := args[0].AsInstance().GetAttr(val.InternString("raw"))
-		if fn, _, ok := rawVal.Type().LookupMRO(val.InternString("write")); ok {
+		rawVal, _ := args[0].AsInstance().GetAttr(nameRaw)
+		if fn, _, ok := rawVal.Type().LookupMRO(nameWrite); ok {
 			return ctx.Invoke2(fn, rawVal, args[1])
 		}
 		ctx.Raise(val.NewException(val.AttributeErrorType, "raw object has no write"))
@@ -1526,8 +1526,8 @@ func (e *Engine) createIOModule() val.Value {
 	}))
 	bufferedWriterType.Dict.Set(val.InternString("flush"), val.NewBuiltinFuncVal("flush", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) > 0 {
-			if rawVal, ok := args[0].AsInstance().GetAttr(val.InternString("raw")); ok {
-				if fn, _, has := rawVal.Type().LookupMRO(val.InternString("flush")); has {
+			if rawVal, ok := args[0].AsInstance().GetAttr(nameRaw); ok {
+				if fn, _, has := rawVal.Type().LookupMRO(nameFlush); has {
 					return ctx.Invoke1(fn, rawVal)
 				}
 			}
@@ -1536,8 +1536,8 @@ func (e *Engine) createIOModule() val.Value {
 	}))
 	bufferedWriterType.Dict.Set(val.InternString("close"), val.NewBuiltinFuncVal("close", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) > 0 {
-			if rawVal, ok := args[0].AsInstance().GetAttr(val.InternString("raw")); ok {
-				if fn, _, has := rawVal.Type().LookupMRO(val.InternString("close")); has {
+			if rawVal, ok := args[0].AsInstance().GetAttr(nameRaw); ok {
+				if fn, _, has := rawVal.Type().LookupMRO(nameClose); has {
 					return ctx.Invoke1(fn, rawVal)
 				}
 			}
@@ -1546,8 +1546,8 @@ func (e *Engine) createIOModule() val.Value {
 	}))
 	bufferedWriterType.Dict.Set(val.InternString("fileno"), val.NewBuiltinFuncVal("fileno", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) > 0 {
-			if rawVal, ok := args[0].AsInstance().GetAttr(val.InternString("raw")); ok {
-				if fn, _, has := rawVal.Type().LookupMRO(val.InternString("fileno")); has {
+			if rawVal, ok := args[0].AsInstance().GetAttr(nameRaw); ok {
+				if fn, _, has := rawVal.Type().LookupMRO(nameFileno); has {
 					return ctx.Invoke1(fn, rawVal)
 				}
 			}
@@ -1563,8 +1563,8 @@ func (e *Engine) createIOModule() val.Value {
 	bufferedWriterType.Dict.Set(val.InternString("closed"), val.NewPropertyVal(
 		val.NewBuiltinFuncVal("closed", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) > 0 {
-				if rawVal, ok := args[0].AsInstance().GetAttr(val.InternString("raw")); ok {
-					return val.GetAttrCtx(ctx, rawVal, val.InternString("closed"))
+				if rawVal, ok := args[0].AsInstance().GetAttr(nameRaw); ok {
+					return val.GetAttrCtx(ctx, rawVal, nameClosed)
 				}
 			}
 			return val.BoolVal(false)
@@ -1577,7 +1577,7 @@ func (e *Engine) createIOModule() val.Value {
 			ctx.Raise(val.NewException(val.TypeErrorType, "seek() missing self"))
 			return val.NoneVal()
 		}
-		rawVal, _ := args[0].AsInstance().GetAttr(val.InternString("raw"))
+		rawVal, _ := args[0].AsInstance().GetAttr(nameRaw)
 		return invokeIOSeek(ctx, rawVal, args)
 	}))
 	bufferedWriterType.Dict.Set(val.InternString("tell"), val.NewBuiltinFuncVal("tell", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -1585,7 +1585,7 @@ func (e *Engine) createIOModule() val.Value {
 			ctx.Raise(val.NewException(val.TypeErrorType, "tell() missing self"))
 			return val.NoneVal()
 		}
-		rawVal, _ := args[0].AsInstance().GetAttr(val.InternString("raw"))
+		rawVal, _ := args[0].AsInstance().GetAttr(nameRaw)
 		return invokeIOTell(ctx, rawVal)
 	}))
 
@@ -1597,13 +1597,13 @@ func (e *Engine) createIOModule() val.Value {
 			return val.NoneVal()
 		}
 		inst := val.NewInstanceOfType(bufferedRWPairType)
-		inst.AsInstance().SetAttr(val.InternString("reader"), args[0])
-		inst.AsInstance().SetAttr(val.InternString("writer"), args[1])
+		inst.AsInstance().SetAttr(nameReader, args[0])
+		inst.AsInstance().SetAttr(nameWriter, args[1])
 		return inst
 	}
 	bufferedRWPairType.Dict.Set(val.InternString("read"), val.NewBuiltinFuncVal("read", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		rVal, _ := args[0].AsInstance().GetAttr(val.InternString("reader"))
-		if fn, _, ok := rVal.Type().LookupMRO(val.InternString("read")); ok {
+		rVal, _ := args[0].AsInstance().GetAttr(nameReader)
+		if fn, _, ok := rVal.Type().LookupMRO(nameRead); ok {
 			if len(args) > 1 {
 				return ctx.Invoke2(fn, rVal, args[1])
 			}
@@ -1613,8 +1613,8 @@ func (e *Engine) createIOModule() val.Value {
 		return val.NoneVal()
 	}))
 	bufferedRWPairType.Dict.Set(val.InternString("readline"), val.NewBuiltinFuncVal("readline", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		rVal, _ := args[0].AsInstance().GetAttr(val.InternString("reader"))
-		if fn, _, ok := rVal.Type().LookupMRO(val.InternString("readline")); ok {
+		rVal, _ := args[0].AsInstance().GetAttr(nameReader)
+		if fn, _, ok := rVal.Type().LookupMRO(nameReadline); ok {
 			if len(args) > 1 {
 				return ctx.Invoke2(fn, rVal, args[1])
 			}
@@ -1624,34 +1624,34 @@ func (e *Engine) createIOModule() val.Value {
 		return val.NoneVal()
 	}))
 	bufferedRWPairType.Dict.Set(val.InternString("write"), val.NewBuiltinFuncVal("write", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		wVal, _ := args[0].AsInstance().GetAttr(val.InternString("writer"))
-		if fn, _, ok := wVal.Type().LookupMRO(val.InternString("write")); ok {
+		wVal, _ := args[0].AsInstance().GetAttr(nameWriter)
+		if fn, _, ok := wVal.Type().LookupMRO(nameWrite); ok {
 			return ctx.Invoke2(fn, wVal, args[1])
 		}
 		ctx.Raise(val.NewException(val.AttributeErrorType, "writer has no write"))
 		return val.NoneVal()
 	}))
 	bufferedRWPairType.Dict.Set(val.InternString("flush"), val.NewBuiltinFuncVal("flush", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		wVal, _ := args[0].AsInstance().GetAttr(val.InternString("writer"))
-		if fn, _, ok := wVal.Type().LookupMRO(val.InternString("flush")); ok {
+		wVal, _ := args[0].AsInstance().GetAttr(nameWriter)
+		if fn, _, ok := wVal.Type().LookupMRO(nameFlush); ok {
 			return ctx.Invoke1(fn, wVal)
 		}
 		return val.NoneVal()
 	}))
 	bufferedRWPairType.Dict.Set(val.InternString("close"), val.NewBuiltinFuncVal("close", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		rVal, _ := args[0].AsInstance().GetAttr(val.InternString("reader"))
-		wVal, _ := args[0].AsInstance().GetAttr(val.InternString("writer"))
-		if fn, _, ok := rVal.Type().LookupMRO(val.InternString("close")); ok {
+		rVal, _ := args[0].AsInstance().GetAttr(nameReader)
+		wVal, _ := args[0].AsInstance().GetAttr(nameWriter)
+		if fn, _, ok := rVal.Type().LookupMRO(nameClose); ok {
 			ctx.Invoke1(fn, rVal)
 		}
-		if fn, _, ok := wVal.Type().LookupMRO(val.InternString("close")); ok {
+		if fn, _, ok := wVal.Type().LookupMRO(nameClose); ok {
 			ctx.Invoke1(fn, wVal)
 		}
 		return val.NoneVal()
 	}))
 	bufferedRWPairType.Dict.Set(val.InternString("fileno"), val.NewBuiltinFuncVal("fileno", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		wVal, _ := args[0].AsInstance().GetAttr(val.InternString("writer"))
-		if fn, _, ok := wVal.Type().LookupMRO(val.InternString("fileno")); ok {
+		wVal, _ := args[0].AsInstance().GetAttr(nameWriter)
+		if fn, _, ok := wVal.Type().LookupMRO(nameFileno); ok {
 			return ctx.Invoke1(fn, wVal)
 		}
 		panic("UnsupportedOperation: fileno")
@@ -1665,8 +1665,8 @@ func (e *Engine) createIOModule() val.Value {
 	bufferedRWPairType.Dict.Set(val.InternString("closed"), val.NewPropertyVal(
 		val.NewBuiltinFuncVal("closed", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) > 0 {
-				if wVal, ok := args[0].AsInstance().GetAttr(val.InternString("writer")); ok {
-					return val.GetAttrCtx(ctx, wVal, val.InternString("closed"))
+				if wVal, ok := args[0].AsInstance().GetAttr(nameWriter); ok {
+					return val.GetAttrCtx(ctx, wVal, nameClosed)
 				}
 			}
 			return val.BoolVal(false)
@@ -1696,21 +1696,21 @@ func (e *Engine) createIOModule() val.Value {
 		}
 		self := args[0].AsInstance()
 		bufVal := args[1]
-		self.SetAttr(val.InternString("buffer"), bufVal)
+		self.SetAttr(nameBuffer, bufVal)
 		enc := "utf-8"
 		if v, ok := kwArg(args, kwnames, "encoding"); ok && !v.IsNone() {
 			enc = v.AsString()
 		} else if len(args) > 2 && !args[2].IsNone() {
 			enc = args[2].AsString()
 		}
-		self.SetAttr(val.InternString("encoding"), val.NewStringVal(enc))
+		self.SetAttr(nameEncoding, val.NewStringVal(enc))
 		errs := "strict"
 		if v, ok := kwArg(args, kwnames, "errors"); ok && !v.IsNone() {
 			errs = v.AsString()
 		} else if len(args) > 3 && !args[3].IsNone() {
 			errs = args[3].AsString()
 		}
-		self.SetAttr(val.InternString("errors"), val.NewStringVal(errs))
+		self.SetAttr(nameErrors, val.NewStringVal(errs))
 		return val.NoneVal()
 	}))
 	textIOWrapperType.Dict.Set(val.InternString("encoding"), val.NewStringVal("utf-8"))
@@ -1719,8 +1719,8 @@ func (e *Engine) createIOModule() val.Value {
 	textIOWrapperType.Dict.Set(val.InternString("mode"), val.NewStringVal("r"))
 	textIOWrapperType.Dict.Set(val.InternString("isatty"), val.NewBuiltinFuncVal("isatty", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) > 0 {
-			if bufVal, ok := getAttrOrNone(ctx, args[0], val.InternString("buffer")); ok && !bufVal.IsNone() {
-				if meth, ok := getAttrOrNone(ctx, bufVal, val.InternString("isatty")); ok {
+			if bufVal, ok := getAttrOrNone(ctx, args[0], nameBuffer); ok && !bufVal.IsNone() {
+				if meth, ok := getAttrOrNone(ctx, bufVal, nameIsatty); ok {
 					return ctx.Invoke0(meth)
 				}
 			}
@@ -1734,10 +1734,10 @@ func (e *Engine) createIOModule() val.Value {
 		}
 		inst := args[0].AsInstance()
 		if v, ok := kwArg(args, kwnames, "encoding"); ok && !v.IsNone() {
-			inst.SetAttr(val.InternString("encoding"), v)
+			inst.SetAttr(nameEncoding, v)
 		}
 		if v, ok := kwArg(args, kwnames, "errors"); ok && !v.IsNone() {
-			inst.SetAttr(val.InternString("errors"), v)
+			inst.SetAttr(nameErrors, v)
 		}
 		return val.NoneVal()
 	}))
@@ -1747,10 +1747,10 @@ func (e *Engine) createIOModule() val.Value {
 			ctx.Raise(val.NewException(val.TypeErrorType, "read() missing self"))
 			return val.NoneVal()
 		}
-		bufVal, ok := getAttrOrNone(ctx, args[0], val.InternString("buffer"))
+		bufVal, ok := getAttrOrNone(ctx, args[0], nameBuffer)
 		var res val.Value
 		if ok && !bufVal.IsNone() {
-			if meth, ok := getAttrOrNone(ctx, bufVal, val.InternString("read")); ok {
+			if meth, ok := getAttrOrNone(ctx, bufVal, nameRead); ok {
 				if len(args) > 1 {
 					res = ctx.Invoke1(meth, args[1])
 				} else {
@@ -1768,10 +1768,10 @@ func (e *Engine) createIOModule() val.Value {
 			ctx.Raise(val.NewException(val.TypeErrorType, "readline() missing self"))
 			return val.NoneVal()
 		}
-		bufVal, ok := getAttrOrNone(ctx, args[0], val.InternString("buffer"))
+		bufVal, ok := getAttrOrNone(ctx, args[0], nameBuffer)
 		var res val.Value
 		if ok && !bufVal.IsNone() {
-			if meth, ok := getAttrOrNone(ctx, bufVal, val.InternString("readline")); ok {
+			if meth, ok := getAttrOrNone(ctx, bufVal, nameReadline); ok {
 				if len(args) > 1 {
 					res = ctx.Invoke1(meth, args[1])
 				} else {
@@ -1793,11 +1793,11 @@ func (e *Engine) createIOModule() val.Value {
 			ctx.Raise(val.NewException(val.TypeErrorType, "write() argument must be str, not"+args[1].Type().Name))
 			return val.NoneVal()
 		}
-		bufVal, ok := getAttrOrNone(ctx, args[0], val.InternString("buffer"))
+		bufVal, ok := getAttrOrNone(ctx, args[0], nameBuffer)
 		strData := args[1].AsString()
 		bytesVal := val.NewBytesVal([]byte(strData))
 		if ok && !bufVal.IsNone() {
-			if meth, ok := getAttrOrNone(ctx, bufVal, val.InternString("write")); ok {
+			if meth, ok := getAttrOrNone(ctx, bufVal, nameWrite); ok {
 				ctx.Invoke1(meth, bytesVal)
 			}
 		}
@@ -1805,8 +1805,8 @@ func (e *Engine) createIOModule() val.Value {
 	}))
 	textIOWrapperType.Dict.Set(val.InternString("flush"), val.NewBuiltinFuncVal("flush", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) > 0 {
-			if bufVal, ok := getAttrOrNone(ctx, args[0], val.InternString("buffer")); ok && !bufVal.IsNone() {
-				if meth, ok := getAttrOrNone(ctx, bufVal, val.InternString("flush")); ok {
+			if bufVal, ok := getAttrOrNone(ctx, args[0], nameBuffer); ok && !bufVal.IsNone() {
+				if meth, ok := getAttrOrNone(ctx, bufVal, nameFlush); ok {
 					return ctx.Invoke0(meth)
 				}
 			}
@@ -1815,8 +1815,8 @@ func (e *Engine) createIOModule() val.Value {
 	}))
 	textIOWrapperType.Dict.Set(val.InternString("close"), val.NewBuiltinFuncVal("close", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) > 0 {
-			if bufVal, ok := getAttrOrNone(ctx, args[0], val.InternString("buffer")); ok && !bufVal.IsNone() {
-				if meth, ok := getAttrOrNone(ctx, bufVal, val.InternString("close")); ok {
+			if bufVal, ok := getAttrOrNone(ctx, args[0], nameBuffer); ok && !bufVal.IsNone() {
+				if meth, ok := getAttrOrNone(ctx, bufVal, nameClose); ok {
 					return ctx.Invoke0(meth)
 				}
 			}
@@ -1825,8 +1825,8 @@ func (e *Engine) createIOModule() val.Value {
 	}))
 	textIOWrapperType.Dict.Set(val.InternString("fileno"), val.NewBuiltinFuncVal("fileno", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) > 0 {
-			if bufVal, ok := getAttrOrNone(ctx, args[0], val.InternString("buffer")); ok && !bufVal.IsNone() {
-				if meth, ok := getAttrOrNone(ctx, bufVal, val.InternString("fileno")); ok {
+			if bufVal, ok := getAttrOrNone(ctx, args[0], nameBuffer); ok && !bufVal.IsNone() {
+				if meth, ok := getAttrOrNone(ctx, bufVal, nameFileno); ok {
 					return ctx.Invoke0(meth)
 				}
 			}
@@ -1836,8 +1836,8 @@ func (e *Engine) createIOModule() val.Value {
 	textIOWrapperType.Dict.Set(val.InternString("closed"), val.NewPropertyVal(
 		val.NewBuiltinFuncVal("closed", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) > 0 {
-				if bufVal, ok := getAttrOrNone(ctx, args[0], val.InternString("buffer")); ok && !bufVal.IsNone() {
-					if c, ok := getAttrOrNone(ctx, bufVal, val.InternString("closed")); ok {
+				if bufVal, ok := getAttrOrNone(ctx, args[0], nameBuffer); ok && !bufVal.IsNone() {
+					if c, ok := getAttrOrNone(ctx, bufVal, nameClosed); ok {
 						return c
 					}
 				}

@@ -1,6 +1,7 @@
 package val
 
 import (
+	"bytes"
 	"strconv"
 	"strings"
 	"unicode"
@@ -102,7 +103,7 @@ func PyStrRepr(s string) string {
 // PyRepr computes repr(v), dispatching to user-defined __repr__ where present.
 func PyRepr(ctx *ExecContext, v Value) string {
 	if ctx != nil && !isPrimitiveReprKind(v) {
-		if fn, owner, ok := v.Type().LookupMRO(InternString("__repr__")); ok && owner != ObjectType {
+		if fn, owner, ok := v.Type().LookupMRO(strRepr); ok && owner != ObjectType {
 			var res Value
 			if descrGet := fn.Type().Slots.TpDescrGet; descrGet != nil {
 				bound := descrGet(ctx, fn, v, v.Type())
@@ -180,7 +181,7 @@ func NativeRepr(ctx *ExecContext, v Value) string {
 // inherits object.__repr__, and code that keys a table on type.__repr__
 // (pprint does) sees every builtin type as the same entry.
 func InstallNativeRepr(t *PyType) {
-	t.Dict.Set(InternString("__repr__"), NewBuiltinFuncVal(t.Name+".__repr__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+	t.Dict.Set(strRepr, NewBuiltinFuncVal(t.Name+".__repr__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) != 1 {
 			ctx.Raise(NewException(TypeErrorType, "expected 0 arguments, got"+strconv.Itoa(len(args)-1)))
 			return NoneVal()
@@ -203,7 +204,7 @@ func PyStr(ctx *ExecContext, v Value) string {
 		return v.String()
 	}
 	if ctx != nil {
-		if fn, owner, ok := v.Type().LookupMRO(InternString("__str__")); ok && owner != ObjectType {
+		if fn, owner, ok := v.Type().LookupMRO(strStr); ok && owner != ObjectType {
 			var res Value
 			if descrGet := fn.Type().Slots.TpDescrGet; descrGet != nil {
 				bound := descrGet(ctx, fn, v, v.Type())
@@ -224,7 +225,7 @@ func PyStr(ctx *ExecContext, v Value) string {
 // PyFormat computes format(v, spec), dispatching to user-defined __format__ where present.
 func PyFormat(ctx *ExecContext, v Value, spec string) string {
 	if ctx != nil && !isPrimitiveReprKind(v) {
-		if fn, owner, ok := v.Type().LookupMRO(InternString("__format__")); ok && owner != ObjectType && owner != StrType {
+		if fn, owner, ok := v.Type().LookupMRO(strFormat); ok && owner != ObjectType && owner != StrType {
 			res := ctx.Invoke2(fn, v, NewStringVal(spec))
 			if s, ok := strMethodArg(res); ok {
 				return s
@@ -1113,8 +1114,45 @@ func initStrExtraMethods() {
 	})
 
 	// Strip variants accepting None.
+	isASCIIWhitespace := func(c byte) bool {
+		return c == ' ' || (c >= '\t' && c <= '\r')
+	}
 	stripImpl := func(name string, mode int) func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		return func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+			if len(args) > 0 && IsInlineStrASCII(args[0]) {
+				n := int(args[0].num & 0xFF)
+				start, stop := 0, n
+				if len(args) > 1 && !args[1].IsNone() {
+					if !args[1].IsAnyString() {
+						ctx.Raise(NewException(TypeErrorType, name+" arg must be None or str"))
+						return NoneVal()
+					}
+					var cutBuf [7]byte
+					cut := valueStringBytes(args[1], &cutBuf)
+					if mode == 0 || mode == 1 {
+						for start < stop && bytes.IndexByte(cut, byte(args[0].num>>((start+1)*8))) >= 0 {
+							start++
+						}
+					}
+					if mode == 0 || mode == 2 {
+						for stop > start && bytes.IndexByte(cut, byte(args[0].num>>(stop*8))) >= 0 {
+							stop--
+						}
+					}
+					return SliceInlineStrASCII(args[0], start, stop)
+				}
+				if mode == 0 || mode == 1 {
+					for start < stop && isASCIIWhitespace(byte(args[0].num>>((start+1)*8))) {
+						start++
+					}
+				}
+				if mode == 0 || mode == 2 {
+					for stop > start && isASCIIWhitespace(byte(args[0].num>>(stop*8))) {
+						stop--
+					}
+				}
+				return SliceInlineStrASCII(args[0], start, stop)
+			}
 			s := strSelf(name, args)
 			if len(args) > 1 && !args[1].IsNone() {
 				cut, ok := strMethodArg(args[1])

@@ -154,3 +154,18 @@ func (t *Template) Expand(dst []rune, input []rune, caps []int) []rune {
 	}
 	return dst
 }
+
+// ExpandInt32 appends the expansion of the template for a match with int32 capture bounds.
+func (t *Template) ExpandInt32(dst []rune, input []rune, caps []int32) []rune {
+	for _, p := range t.Parts {
+		if p.Group < 0 {
+			dst = append(dst, p.Lit...)
+			continue
+		}
+		s, e := int(caps[2*p.Group]), int(caps[2*p.Group+1])
+		if s >= 0 && e >= 0 {
+			dst = append(dst, input[s:e]...)
+		}
+	}
+	return dst
+}

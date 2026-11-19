@@ -187,6 +187,20 @@ func (s *Shape) Transition(name Value) *Shape {
 	return child
 }
 
+// instanceLocks is a striped RWMutex table used to synchronize PyInstance slot
+// access only when MultiThreadedFlag is set, keeping PyInstance free of an
+// embedded 24-byte sync.RWMutex.
+type paddedRWMutex struct {
+	sync.RWMutex
+	_ [64 - unsafe.Sizeof(sync.RWMutex{})]byte
+}
+
+var instanceLocks [64]paddedRWMutex
+
+func (inst *PyInstance) lock() *sync.RWMutex {
+	return &instanceLocks[(uintptr(unsafe.Pointer(inst))>>5)&63].RWMutex
+}
+
 // PyInstance represents a Python object instance backed by a Hidden Class Shape
 // and a flat contiguous slice of attribute Values (never backed by a PyDict or Go map).
 // Header MUST be at offset 0.
@@ -194,17 +208,16 @@ type PyInstance struct {
 	Header    ObjectHeader
 	Shape     *Shape
 	Slots     []Value
-	bootstrap [5]Value
+	bootstrap [6]Value
 	dictView  *PyDict
-	mu        sync.RWMutex
 }
 
-// Compile-time assertions that PyInstance.Header is at byte offset 0 and adding
-// dictView stays within the 160-byte Go size class.
+// Compile-time assertions that PyInstance.Header is at byte offset 0 and the
+// struct stays at 152 bytes (inside Go's 160-byte size class).
 var (
 	_ [0 - unsafe.Offsetof(PyInstance{}.Header)]byte
-	_ [160 - unsafe.Sizeof(PyInstance{})]byte
-	_ [unsafe.Sizeof(PyInstance{}) - 160]byte
+	_ [152 - unsafe.Sizeof(PyInstance{})]byte
+	_ [unsafe.Sizeof(PyInstance{}) - 152]byte
 )
 
 // NewInstanceVal constructs a new heap-allocated KindInstance Value with the given initial Shape.
@@ -250,14 +263,12 @@ func NewInstanceOfType(cls *PyType) Value {
 	if cls == nil {
 		cls = ObjectType
 	}
-	// C extension types (tp_basicsize > 16) use PyCInstance even for Python subclasses,
-	// so C private fields at offsets 16.. survive Python __dict__ additions.
-	for _, base := range cls.MRO {
-		if base != nil && base.Basicsize > 16 {
+	if (cls.Flags & (FlagHasCExtBase | FlagIsModuleSub)) != 0 {
+		// C extension types (tp_basicsize > 16) use PyCInstance even for Python subclasses,
+		// so C private fields at offsets 16.. survive Python __dict__ additions.
+		if (cls.Flags & FlagHasCExtBase) != 0 {
 			return NewCInstanceVal(cls)
 		}
-	}
-	if ModuleType != nil && IsSubclass(cls, ModuleType) {
 		mod := &PyModule{
 			Header: ObjectHeader{Kind: KindModule, Type: cls},
 			Dict:   NewDictVal(16).AsDict(),
@@ -304,13 +315,14 @@ func (inst *PyInstance) GetSlot(idx int) (Value, bool) {
 		}
 		return NoneVal(), false
 	}
-	inst.mu.RLock()
+	mu := inst.lock()
+	mu.RLock()
 	if idx < 0 || idx >= len(inst.Slots) {
-		inst.mu.RUnlock()
+		mu.RUnlock()
 		return NoneVal(), false
 	}
 	val := inst.Slots[idx]
-	inst.mu.RUnlock()
+	mu.RUnlock()
 	return val, true
 }
 
@@ -323,14 +335,53 @@ func (inst *PyInstance) SetSlot(idx int, val Value) bool {
 		}
 		return false
 	}
-	inst.mu.Lock()
+	mu := inst.lock()
+	mu.Lock()
 	if idx < 0 || idx >= len(inst.Slots) {
-		inst.mu.Unlock()
+		mu.Unlock()
 		return false
 	}
 	inst.Slots[idx] = val
-	inst.mu.Unlock()
+	mu.Unlock()
 	return true
+}
+
+// ExtendBootstrapSlot appends v into the inline bootstrap array at slotIdx when
+// slotIdx is the next contiguous slot and still fits inline.
+func (inst *PyInstance) ExtendBootstrapSlot(slotIdx int, v Value) bool {
+	if slotIdx == len(inst.Slots) && slotIdx < len(inst.bootstrap) && (slotIdx == 0 || &inst.Slots[0] == &inst.bootstrap[0]) {
+		inst.bootstrap[slotIdx] = v
+		inst.Slots = inst.bootstrap[:slotIdx+1]
+		return true
+	}
+	return false
+}
+
+// ApplyShapeTransition writes v at slotIdx (extending Slots if needed) and
+// advances inst.Shape to newShape.
+func (inst *PyInstance) ApplyShapeTransition(newShape *Shape, slotIdx int, v Value) {
+	if !MultiThreadedFlag.Load() {
+		switch {
+		case slotIdx < len(inst.Slots):
+			inst.Slots[slotIdx] = v
+		case slotIdx == len(inst.Slots) && slotIdx < len(inst.bootstrap) && (slotIdx == 0 || &inst.Slots[0] == &inst.bootstrap[0]):
+			inst.bootstrap[slotIdx] = v
+			inst.Slots = inst.bootstrap[:slotIdx+1]
+		default:
+			inst.Slots = inst.appendSlot(v)
+		}
+		inst.Shape = newShape
+		return
+	}
+	mu := inst.lock()
+	mu.Lock()
+	if slotIdx < len(inst.Slots) {
+		inst.Slots[slotIdx] = v
+	} else {
+		inst.Slots = inst.appendSlot(v)
+	}
+	inst.Shape = newShape
+	mu.Unlock()
 }
 
 // GetAttr looks up an attribute by name on the instance using its Shape.
@@ -346,14 +397,15 @@ func (inst *PyInstance) GetAttr(name Value) (Value, bool) {
 		}
 		return val, true
 	}
-	inst.mu.RLock()
+	mu := inst.lock()
+	mu.RLock()
 	idx, ok := inst.Shape.Lookup(name)
 	if !ok || idx >= len(inst.Slots) {
-		inst.mu.RUnlock()
+		mu.RUnlock()
 		return NoneVal(), false
 	}
 	val := inst.Slots[idx]
-	inst.mu.RUnlock()
+	mu.RUnlock()
 	if val.IsUnbound() {
 		return NoneVal(), false
 	}
@@ -370,8 +422,9 @@ func (inst *PyInstance) DeleteAttr(name Value) bool {
 		inst.Slots[idx] = UnboundVal()
 		return true
 	}
-	inst.mu.Lock()
-	defer inst.mu.Unlock()
+	mu := inst.lock()
+	mu.Lock()
+	defer mu.Unlock()
 	idx, ok := inst.Shape.Lookup(name)
 	if !ok || idx >= len(inst.Slots) || inst.Slots[idx].IsUnbound() {
 		return false
@@ -386,8 +439,9 @@ func (inst *PyInstance) SetAttr(name, value Value) int {
 	if !MultiThreadedFlag.Load() {
 		return inst.setAttrUnlocked(name, value)
 	}
-	inst.mu.Lock()
-	defer inst.mu.Unlock()
+	mu := inst.lock()
+	mu.Lock()
+	defer mu.Unlock()
 	return inst.setAttrUnlocked(name, value)
 }
 
@@ -402,8 +456,8 @@ func (inst *PyInstance) setAttrUnlocked(name, value Value) int {
 	}
 	if inst.Header.Type != nil && (inst.Header.Type.Flags&FlagForbidDynamicAttrs) != 0 {
 		if BaseExceptionType != nil && IsSubclass(inst.Header.Type, BaseExceptionType) {
-			switch name.AsString() {
-			case "__traceback__", "__cause__", "__context__", "__suppress_context__":
+			if name.StringEquals("__traceback__") || name.StringEquals("__cause__") ||
+				name.StringEquals("__context__") || name.StringEquals("__suppress_context__") {
 				goto allowDynamic
 			}
 		}

@@ -38,7 +38,7 @@ func (st *localState) threadAttrs(threadID int64) *val.PyDict {
 	defer st.mu.Unlock()
 	d, ok := st.store[threadID]
 	if !ok {
-		d = val.NewDictVal(8).AsDict()
+		d = val.NewDictVal(4).AsDict()
 		st.store[threadID] = d
 	}
 	return d

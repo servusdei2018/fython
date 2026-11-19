@@ -22,7 +22,7 @@ func installSimpleCDataConstructor() {
 		}
 		// Allocate buffer.
 		code := ""
-		if v, _, ok := cls.LookupMRO(val.InternString("_type_")); ok && v.IsAnyString() {
+		if v, _, ok := cls.LookupMRO(nameCtypesType); ok && v.IsAnyString() {
 			code = v.AsString()
 		}
 		sz := sizeofTypeCode(code)
@@ -65,7 +65,7 @@ func installSimpleCDataConstructor() {
 		obj.Header.Type = cls
 		res := val.ObjectVal(&obj.Header)
 		// Support _init_ hook in subclass Dict (Python __init__).
-		if initFn, _, ok := cls.LookupMRO(val.InternString("__init__")); ok {
+		if initFn, _, ok := cls.LookupMRO(val.DunderInit); ok {
 			// Only call if it's not the default object.__init__.
 			// To avoid recursion with this TpCall, call directly.
 			if initFn.IsBuiltinFunc() {
@@ -367,7 +367,7 @@ func installStructureConstructor() {
 		if name.AsString() == "__class__" {
 			return val.TypeVal(obj.Type())
 		}
-		if v, _, ok := obj.Type().LookupMRO(val.InternString(name.AsString())); ok {
+		if v, _, ok := obj.Type().LookupMRO(val.InternValue(name)); ok {
 			if v.Type().Slots.TpDescrGet != nil {
 				return v.Type().Slots.TpDescrGet(ctx, v, obj, obj.Type())
 			}
@@ -454,7 +454,7 @@ func makeArrayType(itemType val.Value, count int) val.Value {
 	if itemType.IsType() {
 		name = "Array_" + itemType.AsType().Name + "_" + ctypesItoa(count)
 	}
-	dict.Set(val.InternString("_length_"), val.Int64Val(int64(count)))
+	dict.Set(nameCtypesLength, val.Int64Val(int64(count)))
 	dict.Set(val.InternString("_ctypes_size_"), val.Int64Val(int64(sizeofOfValue(itemType)*count)))
 	// Store item type for sizeof.
 	// Keep a Go-side map for constructors.
@@ -466,9 +466,9 @@ func makeArrayType(itemType val.Value, count int) val.Value {
 	t.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		cls := callable.AsType()
 		// Determine count/item from cls dict.
-		countVal, _, _ := cls.LookupMRO(val.InternString("_length_"))
+		countVal, _, _ := cls.LookupMRO(nameCtypesLength)
 		cnt := int(countVal.AsInt64())
-		itemVal, _, _ := cls.LookupMRO(val.InternString("_type_")) // may be missing; fallback to itemType passed in
+		itemVal, _, _ := cls.LookupMRO(nameCtypesType) // may be missing; fallback to itemType passed in
 		_ = itemVal
 		// Use outer itemType/count if lookup fails (for first creation).
 		if cnt == 0 {
@@ -635,7 +635,7 @@ func installCFuncPtrConstructor() {
 			dllVal := items[1]
 			var handle uintptr
 			if dllVal.HeaderPtr() != nil && dllVal.IsInstance() {
-				if h, ok := dllVal.AsInstance().GetAttr(val.InternString("_handle")); ok {
+				if h, ok := dllVal.AsInstance().GetAttr(nameHandle); ok {
 					handle = uintptr(h.AsInt64())
 				}
 			} else if dllVal.IsInt64() {
@@ -650,13 +650,13 @@ func installCFuncPtrConstructor() {
 				obj.Addr = uintptr(nameVal.AsInt64())
 			}
 			// Resolve argtypes/restype from cls dict.
-			if v, ok := cls.Dict.Get(val.InternString("_argtypes_")); ok && v.IsTuple() {
+			if v, ok := cls.Dict.Get(nameArgtypes); ok && v.IsTuple() {
 				obj.ArgTypes = v.AsTuple().Items
 			}
-			if v, ok := cls.Dict.Get(val.InternString("_restype_")); ok {
+			if v, ok := cls.Dict.Get(nameRestype); ok {
 				obj.RestType = v
 			}
-			if v, ok := cls.Dict.Get(val.InternString("_flags_")); ok && v.IsInt64() {
+			if v, ok := cls.Dict.Get(nameFlags); ok && v.IsInt64() {
 				obj.Flags = v.AsInt64()
 			}
 			return res
@@ -668,10 +668,10 @@ func installCFuncPtrConstructor() {
 			obj.Callback = makeCFuncCallback(ctx, cls, arg0)
 			// Addr is callback address for C.
 			obj.Addr = obj.Callback
-			if v, ok := cls.Dict.Get(val.InternString("_argtypes_")); ok && v.IsTuple() {
+			if v, ok := cls.Dict.Get(nameArgtypes); ok && v.IsTuple() {
 				obj.ArgTypes = v.AsTuple().Items
 			}
-			if v, ok := cls.Dict.Get(val.InternString("_restype_")); ok {
+			if v, ok := cls.Dict.Get(nameRestype); ok {
 				obj.RestType = v
 			}
 			return res
@@ -680,10 +680,10 @@ func installCFuncPtrConstructor() {
 		if arg0.IsInt64() {
 			obj.Addr = uintptr(arg0.AsInt64())
 			// Sentinel handling for _string_at etc.: callCFuncPtr intercepts negative Addr.
-			if v, ok := cls.Dict.Get(val.InternString("_argtypes_")); ok && v.IsTuple() {
+			if v, ok := cls.Dict.Get(nameArgtypes); ok && v.IsTuple() {
 				obj.ArgTypes = v.AsTuple().Items
 			}
-			if v, ok := cls.Dict.Get(val.InternString("_restype_")); ok {
+			if v, ok := cls.Dict.Get(nameRestype); ok {
 				obj.RestType = v
 			}
 			return res
@@ -726,7 +726,7 @@ func installCFuncPtrConstructor() {
 			case "argtypes":
 				if fp.ArgTypes == nil {
 					// Fall back to type-level _argtypes_.
-					if v, _, ok := obj.Type().LookupMRO(val.InternString("_argtypes_")); ok {
+					if v, _, ok := obj.Type().LookupMRO(nameArgtypes); ok {
 						return v
 					}
 					return val.NoneVal()
@@ -734,7 +734,7 @@ func installCFuncPtrConstructor() {
 				return val.NewTupleVal(fp.ArgTypes...)
 			case "restype":
 				if fp.RestType.HeaderPtr() == nil {
-					if v, _, ok := obj.Type().LookupMRO(val.InternString("_restype_")); ok {
+					if v, _, ok := obj.Type().LookupMRO(nameRestype); ok {
 						return v
 					}
 					return val.NoneVal()
@@ -743,7 +743,7 @@ func installCFuncPtrConstructor() {
 			}
 		}
 		// Fallback: look up in type MRO (non-data descriptors + class attrs).
-		if v, _, ok := obj.Type().LookupMRO(val.InternString(name.AsString())); ok {
+		if v, _, ok := obj.Type().LookupMRO(val.InternValue(name)); ok {
 			if v.Type().Slots.TpDescrGet != nil {
 				return v.Type().Slots.TpDescrGet(ctx, v, obj, obj.Type())
 			}
@@ -806,7 +806,7 @@ func cfuncPtrConstruct(ctx *val.ExecContext, callable val.Value, args []val.Valu
 		dllVal := items[1]
 		var handle uintptr
 		if dllVal.HeaderPtr() != nil && dllVal.IsInstance() {
-			if h, ok := dllVal.AsInstance().GetAttr(val.InternString("_handle")); ok {
+			if h, ok := dllVal.AsInstance().GetAttr(nameHandle); ok {
 				handle = uintptr(h.AsInt64())
 			}
 		} else if dllVal.IsInt64() {
@@ -820,23 +820,23 @@ func cfuncPtrConstruct(ctx *val.ExecContext, callable val.Value, args []val.Valu
 		} else if nameVal.IsInt64() {
 			obj.Addr = uintptr(nameVal.AsInt64())
 		}
-		if v, ok := cls.Dict.Get(val.InternString("_argtypes_")); ok && v.IsTuple() {
+		if v, ok := cls.Dict.Get(nameArgtypes); ok && v.IsTuple() {
 			obj.ArgTypes = v.AsTuple().Items
 		}
-		if v, ok := cls.Dict.Get(val.InternString("_restype_")); ok {
+		if v, ok := cls.Dict.Get(nameRestype); ok {
 			obj.RestType = v
 		}
-		if v, ok := cls.Dict.Get(val.InternString("_flags_")); ok && v.IsInt64() {
+		if v, ok := cls.Dict.Get(nameFlags); ok && v.IsInt64() {
 			obj.Flags = v.AsInt64()
 		}
 		return res
 	}
 	if arg0.IsInt64() {
 		obj.Addr = uintptr(arg0.AsInt64())
-		if v, ok := cls.Dict.Get(val.InternString("_argtypes_")); ok && v.IsTuple() {
+		if v, ok := cls.Dict.Get(nameArgtypes); ok && v.IsTuple() {
 			obj.ArgTypes = v.AsTuple().Items
 		}
-		if v, ok := cls.Dict.Get(val.InternString("_restype_")); ok {
+		if v, ok := cls.Dict.Get(nameRestype); ok {
 			obj.RestType = v
 		}
 		return res
@@ -845,10 +845,10 @@ func cfuncPtrConstruct(ctx *val.ExecContext, callable val.Value, args []val.Valu
 	obj.Callable = arg0
 	obj.Callback = makeCFuncCallback(ctx, cls, arg0)
 	obj.Addr = obj.Callback
-	if v, ok := cls.Dict.Get(val.InternString("_argtypes_")); ok && v.IsTuple() {
+	if v, ok := cls.Dict.Get(nameArgtypes); ok && v.IsTuple() {
 		obj.ArgTypes = v.AsTuple().Items
 	}
-	if v, ok := cls.Dict.Get(val.InternString("_restype_")); ok {
+	if v, ok := cls.Dict.Get(nameRestype); ok {
 		obj.RestType = v
 	}
 	return res
@@ -859,10 +859,10 @@ func makeCFuncCallback(ctx *val.ExecContext, cls *val.PyType, callable val.Value
 	// MVP supports: (c_void_p, c_void_p) -> c_int (qsort comparator) and simple variants.
 	var argTypes []val.Value
 	var restType val.Value
-	if v, ok := cls.Dict.Get(val.InternString("_argtypes_")); ok && v.IsTuple() {
+	if v, ok := cls.Dict.Get(nameArgtypes); ok && v.IsTuple() {
 		argTypes = v.AsTuple().Items
 	}
-	if v, ok := cls.Dict.Get(val.InternString("_restype_")); ok {
+	if v, ok := cls.Dict.Get(nameRestype); ok {
 		restType = v
 	}
 	restCode := typeCodeOf(restType)
@@ -982,7 +982,7 @@ func installPointerConstructor() {
 		fp := asCPointer(self)
 		// Determine pointed-to type from cls._type_.
 		cls := self.Type()
-		pt, _, ok := cls.LookupMRO(val.InternString("_type_"))
+		pt, _, ok := cls.LookupMRO(nameCtypesType)
 		if !ok || !pt.IsType() {
 			return val.NoneVal()
 		}

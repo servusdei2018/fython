@@ -289,12 +289,12 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 	sysMod.Dict.Set(val.InternString("flags"), newSysFlags(eff))
 
 	// PEP 451 / 302 import hooks
-	sysMod.Dict.Set(val.InternString("meta_path"), val.NewListVal(
+	sysMod.Dict.Set(nameMetaPath, val.NewListVal(
 		val.TypeVal(BuiltinImporterType),
 		val.TypeVal(FrozenImporterType),
 		val.TypeVal(PathFinderType),
 	))
-	fileFinderHook, _ := FileFinderType.Dict.Get(val.InternString("path_hook"))
+	fileFinderHook, _ := FileFinderType.Dict.Get(namePathHook)
 	ffHookCallable := val.TypeVal(FileFinderType)
 	if fileFinderHook.IsBuiltinFunc() {
 		ffHookCallable = fileFinderHook.AsBuiltinFunc().Fn(nil, fileFinderHook, nil, nil)
@@ -359,8 +359,8 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 		}
 		exc := val.NewException(val.SystemExitType, "")
 		inst := exc.AsInstance()
-		inst.SetAttr(val.InternString("args"), val.NewTupleVal(items...))
-		inst.SetAttr(val.InternString("code"), code)
+		inst.SetAttr(nameArgs, val.NewTupleVal(items...))
+		inst.SetAttr(nameAttrCode, code)
 		ctx.Raise(exc)
 		return val.NoneVal()
 	}))
@@ -409,7 +409,7 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 		}
 		tb := val.NoneVal()
 		if lastExc.IsInstance() {
-			tb, _ = lastExc.AsInstance().GetAttr(val.InternString("__traceback__"))
+			tb, _ = lastExc.AsInstance().GetAttr(nameTraceback)
 		}
 		return val.NewTupleVal(val.TypeVal(lastExc.Type()), lastExc, tb)
 	}))
@@ -449,9 +449,9 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 		if text == "" {
 			return val.NoneVal()
 		}
-		if sysVal, ok := vmInstance.modules.Get(val.InternString("sys")); ok && sysVal.IsModule() {
-			if stderrVal, ok := sysVal.AsModule().Dict.Get(val.InternString("stderr")); ok && !stderrVal.IsNone() {
-				write := val.GetAttrCtx(ctx, stderrVal, val.InternString("write"))
+		if sysVal, ok := vmInstance.modules.Get(nameSys); ok && sysVal.IsModule() {
+			if stderrVal, ok := sysVal.AsModule().Dict.Get(nameStderr); ok && !stderrVal.IsNone() {
+				write := val.GetAttrCtx(ctx, stderrVal, nameWrite)
 				if !write.IsUnbound() && !write.IsNone() {
 					ctx.Invoke1(write, val.NewStringVal(text))
 					return val.NoneVal()
@@ -474,13 +474,13 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 			return val.NoneVal()
 		}
 		if vmInstance, ok := ctx.VM.(*VM); ok && vmInstance.builtins != nil {
-			vmInstance.builtins.Set(val.InternString("_"), v)
+			vmInstance.builtins.Set(nameUnderscore, v)
 		}
 		text := val.PyRepr(ctx, v) + "\n"
 		if vmInstance, ok := ctx.VM.(*VM); ok {
-			if sysVal, ok := vmInstance.modules.Get(val.InternString("sys")); ok && sysVal.IsModule() {
-				if stdoutVal, ok := sysVal.AsModule().Dict.Get(val.InternString("stdout")); ok && !stdoutVal.IsNone() {
-					write := val.GetAttrCtx(ctx, stdoutVal, val.InternString("write"))
+			if sysVal, ok := vmInstance.modules.Get(nameSys); ok && sysVal.IsModule() {
+				if stdoutVal, ok := sysVal.AsModule().Dict.Get(nameStdout); ok && !stdoutVal.IsNone() {
+					write := val.GetAttrCtx(ctx, stdoutVal, nameWrite)
 					if !write.IsUnbound() && !write.IsNone() {
 						ctx.Invoke1(write, val.NewStringVal(text))
 						return val.NoneVal()
@@ -508,7 +508,6 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 		self := args[0]
 		if self.IsInstance() {
 			inst := self.AsInstance()
-			fieldNames := []string{"exc_type", "exc_value", "exc_traceback", "err_msg", "object"}
 			posArgs := args[1:]
 			if len(kwnames) > 0 {
 				posArgs = args[1 : len(args)-len(kwnames)]
@@ -518,8 +517,8 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 				}
 			}
 			for i, arg := range posArgs {
-				if i < len(fieldNames) {
-					inst.SetAttr(val.InternString(fieldNames[i]), arg)
+				if i < len(unraisableHookFields) {
+					inst.SetAttr(unraisableHookFields[i], arg)
 				}
 			}
 		}
@@ -583,13 +582,13 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 	}))
 	sysMod.Dict.Set(val.InternString("monitoring"), monitoringModVal)
 
-	modules.Set(val.InternString("sys"), sysModVal)
+	modules.Set(nameSys, sysModVal)
 
 	// 2. Built-in builtins module
 	builtinsModVal := val.NewModuleVal("builtins", "")
 	builtinsMod := builtinsModVal.AsModule()
 	builtinsMod.Dict = e.builtins
-	modules.Set(val.InternString("builtins"), builtinsModVal)
+	modules.Set(nameBuiltins, builtinsModVal)
 
 	// 3. Native standard library modules are created on first import, see
 	//    builtinModuleLoaders.
@@ -597,7 +596,7 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 	// The builtins module is not finalized here: its dictionary is shared
 	// by every VM of the engine, so the engine finalizes it once, when the
 	// engine is created.
-	if m, ok := modules.Get(val.InternString("sys")); ok && m.IsModule() {
+	if m, ok := modules.Get(nameSys); ok && m.IsModule() {
 		finalizeBuiltinModule(m)
 	}
 
@@ -783,13 +782,13 @@ func (e *Engine) newVMInternal(stackCap, frameCap int) *VM {
 	v.genResumeHook = v.resumeGenerator
 	v.genReleaseHook = v.releaseGeneratorStack
 	v.coroResumeHook = v.resumeCoroutine
-	if lenVal, ok := e.builtins.Get(val.InternString("len")); ok {
+	if lenVal, ok := e.builtins.Get(nameLen); ok {
 		v.builtinLen = lenVal
 	}
-	if openVal, ok := e.builtins.Get(val.InternString("open")); ok {
+	if openVal, ok := e.builtins.Get(nameOpen); ok {
 		v.builtinOpen = openVal
 	}
-	if isInstVal, ok := e.builtins.Get(val.InternString("isinstance")); ok {
+	if isInstVal, ok := e.builtins.Get(nameIsInstance); ok {
 		v.builtinIsInstance = isInstVal
 	}
 	v.execCtx.Stack = v.stack
@@ -798,12 +797,12 @@ func (e *Engine) newVMInternal(stackCap, frameCap int) *VM {
 	if !e.isSharedModules {
 		mainModVal := val.NewModuleVal("__main__", "")
 		mainModVal.AsModule().Dict = v.globals
-		v.globals.Set(val.InternString("__name__"), val.InternString("__main__"))
-		v.globals.Set(val.InternString("__doc__"), val.NoneVal())
-		v.globals.Set(val.InternString("__package__"), val.NoneVal())
-		v.globals.Set(val.InternString("__loader__"), val.NoneVal())
-		v.globals.Set(val.InternString("__spec__"), val.NoneVal())
-		modules.Set(val.InternString("__main__"), mainModVal)
+		v.globals.Set(nameDunderName, nameMain)
+		v.globals.Set(nameDunderDoc, val.NoneVal())
+		v.globals.Set(namePackage, val.NoneVal())
+		v.globals.Set(nameLoader, val.NoneVal())
+		v.globals.Set(nameSpec, val.NoneVal())
+		modules.Set(nameMain, mainModVal)
 	}
 	for _, impLine := range pthImports {
 		if impLine == "import _virtualenv" {
@@ -900,13 +899,13 @@ func (e *Engine) SetSharedModules(enabled bool) {
 func (e *Engine) SetSearchPaths(paths []string) {
 	e.searchPaths = append([]string(nil), paths...)
 	if e.sharedModules != nil {
-		if sysVal, ok := e.sharedModules.Get(val.InternString("sys")); ok && sysVal.IsModule() {
+		if sysVal, ok := e.sharedModules.Get(nameSys); ok && sysVal.IsModule() {
 			disc := discoverVenvAndPaths(e.runtimeConfig, e.searchPaths)
 			pathItems := make([]val.Value, len(disc.paths))
 			for i, p := range disc.paths {
 				pathItems[i] = val.NewStringVal(p)
 			}
-			sysVal.AsModule().Dict.Set(val.InternString("path"), val.NewListVal(pathItems...))
+			sysVal.AsModule().Dict.Set(nameAttrPath, val.NewListVal(pathItems...))
 		}
 	}
 }

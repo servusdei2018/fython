@@ -70,6 +70,8 @@ const (
 	// FlagDataDescriptor marks a descriptor object (such as @property or custom __set__)
 	// as a data descriptor that takes precedence over instance attributes.
 	FlagDataDescriptor uint8 = 1 << 1
+	// FlagEphemeralIter marks a pooled PyIter owned exclusively by OP_GET_ITER -> OP_FOR_ITER.
+	FlagEphemeralIter uint8 = 1 << 7
 )
 
 const (
@@ -83,6 +85,10 @@ const (
 	FlagInitSubclassKwDone uint32 = 1 << 5
 	// FlagCustomSetAttr marks a type that defines a custom __setattr__ requiring inline cache bypass.
 	FlagCustomSetAttr uint32 = 1 << 6
+	// FlagHasCExtBase marks a type whose MRO contains a C-extension type with Basicsize > 16.
+	FlagHasCExtBase uint32 = 1 << 7
+	// FlagIsModuleSub marks ModuleType and any subclass of ModuleType.
+	FlagIsModuleSub uint32 = 1 << 8
 )
 
 // String returns the human-readable name of the Kind.
@@ -733,6 +739,11 @@ func equalsStructural(a, b Value) bool {
 		return false
 	}
 
+	if (a.ptr == &tagInlineStr || a.ptr.Kind == KindString) &&
+		(b.ptr == &tagInlineStr || b.ptr.Kind == KindString) {
+		return StringEquals(a, b)
+	}
+
 	// String comparison across inline, heap strings, and string subclasses.
 	if a.IsAnyString() && b.IsAnyString() {
 		return a.AsString() == b.AsString()
@@ -1167,10 +1178,10 @@ func TypeQualName(t *PyType) string {
 	qual := t.Name
 	module := ""
 	if t.Dict != nil {
-		if q, ok := t.Dict.Get(InternString("__qualname__")); ok && q.IsAnyString() {
+		if q, ok := t.Dict.Get(strQualname); ok && q.IsAnyString() {
 			qual = q.AsString()
 		}
-		if m, ok := t.Dict.Get(InternString("__module__")); ok && m.IsAnyString() {
+		if m, ok := t.Dict.Get(strModule); ok && m.IsAnyString() {
 			module = m.AsString()
 		}
 	}

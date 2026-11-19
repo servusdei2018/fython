@@ -534,11 +534,25 @@ func (vm *VM) opStoreAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int,
 							return ip + 1, sp - 2, ctlNext
 						}
 					}
+				case ICKindInstanceTransition:
+					if instShape.ID == entry.ExpectedShapeID && uint(ip) < uint(len(st.cache.transitionIC)) {
+						tc := &st.cache.transitionIC[ip]
+						if tc.OldShape == instShape && tc.TypeVer == typeVer && tc.NewShape != nil {
+							slotIdx := int(tc.SlotIdx)
+							if !isMT && instObj.ExtendBootstrapSlot(slotIdx, v) {
+								instObj.Shape = tc.NewShape
+							} else {
+								instObj.ApplyShapeTransition(tc.NewShape, slotIdx, v)
+							}
+							recordICSlowHit(ICKindInstanceTransition)
+							return ip + 1, sp - 2, ctlNext
+						}
+					}
 				}
 			}
 			vm.syncActiveFrame(st, ip)
 			vm.execCtx.SP = sp
-			vm.storeAttrInstanceSlowSafe(instObj, obj, consts[uint16(inst)], v, ip, sp, st.frameIdx, st.cache.ic, st.cache.ensureAttrPIC())
+			vm.storeAttrInstanceSlowSafe(instObj, obj, consts[uint16(inst)], v, ip, sp, st.frameIdx, st.cache)
 		}
 	} else {
 		vm.syncActiveFrame(st, ip)

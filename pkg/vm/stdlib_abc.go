@@ -54,7 +54,7 @@ func abcSubclassCheck(ctx *val.ExecContext, cls, sub *val.PyType) bool {
 	}
 
 	// 1. Check __subclasshook__ on cls
-	if hook, _, ok := cls.LookupMRO(val.InternString("__subclasshook__")); ok {
+	if hook, _, ok := cls.LookupMRO(nameSubclasshook); ok {
 		if ctx != nil {
 			fn := hook
 			if fn.Kind() == val.KindClassMethod {
@@ -160,7 +160,7 @@ func (e *Engine) createABCModule() val.Value {
 		inst := args[1]
 		instType := inst.Type()
 		if inst.IsInstance() {
-			if clsVal, ok := inst.AsInstance().GetAttr(val.InternString("__class__")); ok && clsVal.IsType() {
+			if clsVal, ok := inst.AsInstance().GetAttr(nameClass); ok && clsVal.IsType() {
 				instType = clsVal.AsType()
 			}
 		}

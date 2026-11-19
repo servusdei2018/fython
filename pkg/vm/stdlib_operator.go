@@ -285,7 +285,7 @@ func (e *Engine) createOperatorModule() val.Value {
 			args[0].AsDict().Delete(args[1])
 			return val.NoneVal()
 		}
-		if delFn, _, ok := args[0].Type().LookupMRO(val.InternString("__delitem__")); ok {
+		if delFn, _, ok := args[0].Type().LookupMRO(nameDelitem); ok {
 			return ctx.Invoke2(delFn, args[0], args[1])
 		}
 		ctx.Raise(val.NewException(val.TypeErrorType, "'delitem' unsupported on type"+args[0].Type().Name))
@@ -349,7 +349,7 @@ func (e *Engine) createOperatorModule() val.Value {
 		if args[0].IsInt64() {
 			return args[0]
 		}
-		if idxFn, _, ok := args[0].Type().LookupMRO(val.InternString("__index__")); ok {
+		if idxFn, _, ok := args[0].Type().LookupMRO(nameIndex); ok {
 			return ctx.Invoke1(idxFn, args[0])
 		}
 		ctx.Raise(val.NewException(val.TypeErrorType, "'index' expected integer"))

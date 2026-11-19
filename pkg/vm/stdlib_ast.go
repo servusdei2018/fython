@@ -77,7 +77,7 @@ func astInit() *astState {
 			if sp.Base != "" {
 				base = st.byName[sp.Base]
 			}
-			cd := val.NewDictVal(8).AsDict()
+			cd := val.NewDictVal(4).AsDict()
 			cd.Set(internS("__module__"), internS("ast"))
 			names := make([]string, len(sp.Fields))
 			for i, f := range sp.Fields {
@@ -287,7 +287,7 @@ func astReduce(ctx *val.ExecContext, args []val.Value, kwnames []val.Value) val.
 	for i := range none {
 		none[i] = val.NoneVal()
 	}
-	state := val.NewDictVal(8)
+	state := val.NewDictVal(4)
 	if inst := instOf(self); inst != nil {
 		for _, e := range val.NewInstanceDictProxy(inst).AsDict().ActiveEntries() {
 			state.AsDict().Set(e.Key, e.Value)

@@ -58,6 +58,20 @@ func (re *Regexp) Exec(input []rune, pos, endpos int, mode Mode) *Result {
 // ExecFrom is Exec with CPython's must_advance semantics: when mustAdvance is
 // set, an empty match at pos is rejected (used by iteration after an empty match).
 func (re *Regexp) ExecFrom(input []rune, pos, endpos int, mode Mode, mustAdvance bool) *Result {
+	caps32, last, ok := re.ExecInto(input, pos, endpos, mode, mustAdvance, nil)
+	if !ok {
+		return nil
+	}
+	caps := make([]int, len(caps32))
+	for i, c := range caps32 {
+		caps[i] = int(c)
+	}
+	return &Result{Caps: caps, LastIndex: last}
+}
+
+// ExecInto runs the regexp against input[:endpos] starting at pos, copying capture
+// positions into dst (reusing dst[:n] when cap(dst) >= n) to avoid allocating *Result.
+func (re *Regexp) ExecInto(input []rune, pos, endpos int, mode Mode, mustAdvance bool, dst []int32) ([]int32, int, bool) {
 	if pos < 0 {
 		pos = 0
 	}
@@ -68,7 +82,7 @@ func (re *Regexp) ExecFrom(input []rune, pos, endpos int, mode Mode, mustAdvance
 		endpos = 0
 	}
 	if pos > endpos {
-		return nil
+		return nil, -1, false
 	}
 	// Prefix reject for anchored matches: avoid matcher setup entirely.
 	if (mode == ModeMatch || mode == ModeFullMatch) && pos < endpos {
@@ -77,19 +91,19 @@ func (re *Regexp) ExecFrom(input []rune, pos, endpos int, mode Mode, mustAdvance
 			ascii := re.Flags&FlagASCII != 0
 			if re.firstFold {
 				if canon(r, ascii) != canon(re.firstLit, ascii) {
-					return nil
+					return nil, -1, false
 				}
 			} else {
 				if r != re.firstLit {
-					return nil
+					return nil, -1, false
 				}
 				if len(re.prefix) > 1 {
 					if pos+len(re.prefix) > endpos {
-						return nil
+						return nil, -1, false
 					}
 					for i := 1; i < len(re.prefix); i++ {
 						if input[pos+i] != re.prefix[i] {
-							return nil
+							return nil, -1, false
 						}
 					}
 				}
@@ -97,7 +111,7 @@ func (re *Regexp) ExecFrom(input []rune, pos, endpos int, mode Mode, mustAdvance
 		} else if re.hasFirstMask {
 			if r < 256 {
 				if (re.firstMask[r>>6]>>(uint(r)&63))&1 == 0 {
-					return nil
+					return nil, -1, false
 				}
 			}
 		}
@@ -157,12 +171,12 @@ func (re *Regexp) ExecFrom(input []rune, pos, endpos int, mode Mode, mustAdvance
 	switch mode {
 	case ModeMatch, ModeFullMatch:
 		if !try(pos) {
-			return nil
+			return nil, -1, false
 		}
 	default:
 		if re.bosOnly {
 			if pos != 0 || !try(0) {
-				return nil
+				return nil, -1, false
 			}
 			break
 		}
@@ -226,10 +240,20 @@ func (re *Regexp) ExecFrom(input []rune, pos, endpos int, mode Mode, mustAdvance
 			}
 		}
 		if !found {
-			return nil
+			return nil, -1, false
 		}
 	}
-	return &Result{Caps: m.caps, LastIndex: m.last}
+	n := len(m.caps)
+	var out []int32
+	if cap(dst) >= n {
+		out = dst[:n]
+	} else {
+		out = make([]int32, n)
+	}
+	for i, c := range m.caps {
+		out[i] = int32(c)
+	}
+	return out, m.last, true
 }
 
 func (m *matcher) setReg(i, v int) {

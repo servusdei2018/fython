@@ -2,6 +2,7 @@ package val
 
 import (
 	"math"
+	"strings"
 	"testing"
 	"unsafe"
 )
@@ -607,5 +608,90 @@ func TestModuleTypeSubclassingAndPEP562(t *testing.T) {
 	reclassedAttr := GetAttrCtx(ctx, plainMod, InternString("class_prop"))
 	if reclassedAttr.AsString() != "from_class" {
 		t.Fatalf("expected class_prop on reclassed module, got %v", reclassedAttr)
+	}
+}
+
+func TestInlineStrZeroAllocOps(t *testing.T) {
+	ctx := &ExecContext{}
+	s7 := NewStringVal("AbCdEfG")
+	s3 := NewStringVal("bcd")
+	sHeap := NewStringVal("AbCdEfGhI")
+	sNonASCII := NewStringVal("héllo")
+	ws := NewStringVal(" \tabc\n ")
+
+	if !IsInlineStrASCII(s7) || IsInlineStrASCII(sNonASCII) || IsInlineStrASCII(sHeap) {
+		t.Fatalf("unexpected IsInlineStrASCII results")
+	}
+	if s7.StringLen() != 7 || sNonASCII.StringLen() != 5 || sHeap.StringLen() != 9 {
+		t.Fatalf("unexpected StringLen: %d %d %d", s7.StringLen(), sNonASCII.StringLen(), sHeap.StringLen())
+	}
+
+	// Zero-alloc helpers (verified via AllocsPerRun)
+	var b strings.Builder
+	b.Grow(1024)
+	var cmpRes int
+	var hasRes bool
+	var lenRes int
+	var sl Value
+	allocs := testing.AllocsPerRun(50, func() {
+		s7.WriteToBuilder(&b)
+		lenRes = s7.StringLen() + sNonASCII.StringLen()
+		cmpRes = StringCompare(s7, sHeap)
+		hasRes = StringContains(s7, NewStringVal("CdE"))
+		sl = SliceInlineStrASCII(s7, 1, 5)
+	})
+	if allocs != 0 {
+		t.Fatalf("inline string helpers allocs = %v, want 0", allocs)
+	}
+	if !strings.HasPrefix(b.String(), "AbCdEfG") || lenRes != 12 || cmpRes >= 0 || !hasRes || sl.AsString() != "bCdE" || !sl.IsInlineStr() {
+		t.Fatalf("unexpected helper results: b=%q len=%d cmp=%d has=%v sl=%q", b.String(), lenRes, cmpRes, hasRes, sl.AsString())
+	}
+
+	// RichCompare and InCtx across inline & heap
+	if !RichCompare(ctx, s7, sHeap, CmpLT).AsBool() || !RichCompare(ctx, sHeap, s7, CmpGT).AsBool() {
+		t.Fatalf("RichCompare order failed")
+	}
+	if !InCtx(ctx, s3, NewStringVal("abcdef")).AsBool() || !InCtx(ctx, NewStringVal("fGh"), sHeap).AsBool() {
+		t.Fatalf("InCtx substring check failed")
+	}
+
+	// Zero-alloc str ASCII fast paths
+	callMethod := func(name string, args ...Value) Value {
+		fn, _, _ := StrType.LookupMRO(InternString(name))
+		return fn.Type().Slots.TpCall(ctx, fn, args, nil)
+	}
+
+	if got := callMethod("lower", s7); !got.IsInlineStr() || got.AsString() != "abcdefg" {
+		t.Fatalf("lower failed: %v", got.AsString())
+	}
+	if got := callMethod("upper", s7); !got.IsInlineStr() || got.AsString() != "ABCDEFG" {
+		t.Fatalf("upper failed: %v", got.AsString())
+	}
+	if !callMethod("startswith", s7, NewStringVal("AbC")).AsBool() {
+		t.Fatalf("startswith failed")
+	}
+	if !callMethod("endswith", s7, NewStringVal("EfG")).AsBool() {
+		t.Fatalf("endswith failed")
+	}
+	if got := callMethod("strip", ws); !got.IsInlineStr() || got.AsString() != "abc" {
+		t.Fatalf("strip failed: %q", got.AsString())
+	}
+	if got := callMethod("lstrip", ws); !got.IsInlineStr() || got.AsString() != "abc\n " {
+		t.Fatalf("lstrip failed: %q", got.AsString())
+	}
+	if got := callMethod("rstrip", ws); !got.IsInlineStr() || got.AsString() != " \tabc" {
+		t.Fatalf("rstrip failed: %q", got.AsString())
+	}
+
+	// StrType subclass (like markupsafe.Markup) StringLen and WriteToBuilder
+	subCls := MustNewType("MarkupSub", []*PyType{StrType}, nil)
+	subInst := NewInstanceOfType(subCls)
+	subInst.AsInstance().Slots = []Value{NewStringVal("<td>")}
+	if subInst.StringLen() != 4 {
+		t.Fatalf("str subclass StringLen = %d, want 4", subInst.StringLen())
+	}
+	b.Reset()
+	if !subInst.WriteToBuilder(&b) || b.String() != "<td>" {
+		t.Fatalf("str subclass WriteToBuilder = %q, want \"<td>\"", b.String())
 	}
 }

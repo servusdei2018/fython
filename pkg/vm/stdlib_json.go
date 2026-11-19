@@ -53,12 +53,12 @@ func initJSONDecodeErrorType() *val.PyType {
 			errmsg := fmt.Sprintf("%s: line %d column %d (char %d)", msg, lineno, colno, pos)
 			if self.IsInstance() {
 				inst := self.AsInstance()
-				inst.SetAttr(val.InternString("args"), val.NewTupleVal(val.NewStringVal(errmsg)))
-				inst.SetAttr(val.InternString("msg"), val.NewStringVal(msg))
-				inst.SetAttr(val.InternString("doc"), val.NewStringVal(doc))
-				inst.SetAttr(val.InternString("pos"), val.Int64Val(int64(pos)))
-				inst.SetAttr(val.InternString("lineno"), val.Int64Val(int64(lineno)))
-				inst.SetAttr(val.InternString("colno"), val.Int64Val(int64(colno)))
+				inst.SetAttr(nameArgs, val.NewTupleVal(val.NewStringVal(errmsg)))
+				inst.SetAttr(nameMsg, val.NewStringVal(msg))
+				inst.SetAttr(nameDoc, val.NewStringVal(doc))
+				inst.SetAttr(namePos, val.Int64Val(int64(pos)))
+				inst.SetAttr(nameLineno, val.Int64Val(int64(lineno)))
+				inst.SetAttr(nameColno, val.Int64Val(int64(colno)))
 			}
 			return val.NoneVal()
 		}))
@@ -84,16 +84,16 @@ func newJSONDecodeError(err error, doc []byte) val.Value {
 	colno := pos - strings.LastIndex(docStr[:pos], "\n")
 	errmsg := fmt.Sprintf("%s: line %d column %d (char %d)", msg, lineno, colno, pos)
 	inst := val.NewInstanceOfType(initJSONDecodeErrorType())
-	inst.AsInstance().SetAttr(val.InternString("args"), val.NewTupleVal(val.NewStringVal(errmsg)))
-	inst.AsInstance().SetAttr(val.InternString("msg"), val.NewStringVal(msg))
-	inst.AsInstance().SetAttr(val.InternString("doc"), val.NewStringVal(docStr))
-	inst.AsInstance().SetAttr(val.InternString("pos"), val.Int64Val(int64(pos)))
-	inst.AsInstance().SetAttr(val.InternString("lineno"), val.Int64Val(int64(lineno)))
-	inst.AsInstance().SetAttr(val.InternString("colno"), val.Int64Val(int64(colno)))
-	inst.AsInstance().SetAttr(val.InternString("__traceback__"), val.NoneVal())
-	inst.AsInstance().SetAttr(val.InternString("__cause__"), val.NoneVal())
-	inst.AsInstance().SetAttr(val.InternString("__context__"), val.NoneVal())
-	inst.AsInstance().SetAttr(val.InternString("__suppress_context__"), val.BoolVal(false))
+	inst.AsInstance().SetAttr(nameArgs, val.NewTupleVal(val.NewStringVal(errmsg)))
+	inst.AsInstance().SetAttr(nameMsg, val.NewStringVal(msg))
+	inst.AsInstance().SetAttr(nameDoc, val.NewStringVal(docStr))
+	inst.AsInstance().SetAttr(namePos, val.Int64Val(int64(pos)))
+	inst.AsInstance().SetAttr(nameLineno, val.Int64Val(int64(lineno)))
+	inst.AsInstance().SetAttr(nameColno, val.Int64Val(int64(colno)))
+	inst.AsInstance().SetAttr(nameTraceback, val.NoneVal())
+	inst.AsInstance().SetAttr(nameCause, val.NoneVal())
+	inst.AsInstance().SetAttr(nameContext, val.NoneVal())
+	inst.AsInstance().SetAttr(nameSuppressContext, val.BoolVal(false))
 	return val.ObjectVal(&inst.AsInstance().Header)
 }
 
@@ -1019,7 +1019,7 @@ func (e *Engine) createJSONModule() val.Value {
 			}
 		}
 		fp := pa[0]
-		readMethod := val.GetAttrCtx(ctx, fp, val.InternString("read"))
+		readMethod := val.GetAttrCtx(ctx, fp, nameRead)
 		content := ctx.Invoke0(readMethod)
 		var rawBytes []byte
 		switch {
@@ -1054,7 +1054,7 @@ func (e *Engine) createJSONModule() val.Value {
 			panic(err.Error())
 		}
 		fp := pa[1]
-		writeMethod := val.GetAttrCtx(ctx, fp, val.InternString("write"))
+		writeMethod := val.GetAttrCtx(ctx, fp, nameWrite)
 		ctx.Invoke1(writeMethod, val.NewStringVal(resStr))
 		return val.NoneVal()
 	}))

@@ -6,7 +6,7 @@ import "sync/atomic"
 
 // ICStats holds build-tagged counters used to verify inline-cache and pool hit rates.
 type ICStats struct {
-	ICSlotHits            [16]atomic.Uint64
+	ICSlotHits            [24]atomic.Uint64
 	AttrPICHits           atomic.Uint64
 	LoadAttrSlowEntries   atomic.Uint64
 	StoreAttrSlowEntries  atomic.Uint64

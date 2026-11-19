@@ -86,6 +86,10 @@ type PyDict struct {
 	// then invalidates the owner version tag (and its subclasses), so lookup
 	// caches never need to trust call sites to invalidate explicitly.
 	owner *PyType
+	// Small-table inline storage for dicts and sets with <= 5 entries, avoiding
+	// separate heap allocations for indices and Entries in initTable.
+	inlineIndices [8]byte
+	inlineEntries [5]DictEntry
 }
 
 // PyCell wraps a shared mutable Value on the heap for closures and nonlocal variables.
@@ -305,13 +309,13 @@ func NewModuleVal(name, file string) Value {
 		File: file,
 		Dict: NewDictVal(16).AsDict(),
 	}
-	mod.Dict.Set(InternString("__name__"), NewStringVal(name))
+	mod.Dict.Set(strName, NewStringVal(name))
 	if file != "" {
-		mod.Dict.Set(InternString("__file__"), NewStringVal(file))
+		mod.Dict.Set(strFile, NewStringVal(file))
 	} else {
-		mod.Dict.Set(InternString("__file__"), NoneVal())
+		mod.Dict.Set(strFile, NoneVal())
 	}
-	mod.Dict.Set(InternString("__doc__"), NoneVal())
+	mod.Dict.Set(strDoc, NoneVal())
 	return ObjectVal(&mod.Header)
 }
 
@@ -448,7 +452,7 @@ func AsyncAttrs(obj Value, create bool) *PyDict {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.Attrs == nil && create {
-		f.Attrs = NewDictVal(8).AsDict()
+		f.Attrs = NewDictVal(4).AsDict()
 	}
 	return f.Attrs
 }
@@ -809,8 +813,46 @@ func NewByteArrayFromConcat(a, b []byte) Value {
 
 // NewMemoryViewVal constructs a zero-copy PyMemoryView Value referencing the buffer of target.
 func NewMemoryViewVal(target Value) Value {
-	var view PyBuffer
 	tp := target.Type()
+	if tp == BytesType {
+		data := slices.Clip(target.AsBytes().Data)
+		obj := &PyMemoryView{
+			Header:   ObjectHeader{Kind: KindMemoryView, Type: MemoryViewType},
+			Obj:      target,
+			Buf:      data,
+			ReadOnly: true,
+			ItemSize: 1,
+			Format:   "B",
+			NDim:     1,
+			Dim0:     len(data),
+			Stride0:  1,
+		}
+		return Value{num: 0, ptr: &obj.Header}
+	}
+	if tp == ByteArrayType {
+		ba := target.AsByteArray()
+		ba.mu.RLock()
+		data := ba.Data
+		ba.mu.RUnlock()
+		obj := &PyMemoryView{
+			Header:   ObjectHeader{Kind: KindMemoryView, Type: MemoryViewType},
+			Obj:      target,
+			Buf:      data,
+			ReadOnly: false,
+			ItemSize: 1,
+			Format:   "B",
+			NDim:     1,
+			Dim0:     len(data),
+			Stride0:  1,
+		}
+		return Value{num: 0, ptr: &obj.Header}
+	}
+	return newMemoryViewSlow(target, tp)
+}
+
+//go:noinline
+func newMemoryViewSlow(target Value, tp *PyType) Value {
+	var view PyBuffer
 	if tp.Slots.TpAsBuffer == nil {
 		panic("TypeError: a bytes-like object is required, not '" + tp.Name + "'")
 	}
@@ -1147,6 +1189,46 @@ func (c *PyChan) Close() bool {
 	return false
 }
 
+var forIterPool = sync.Pool{
+	New: func() any { return new(PyIter) },
+}
+
+// AcquireForIterVal acquires a pooled ephemeral PyIter for OP_GET_ITER -> OP_FOR_ITER loops.
+func AcquireForIterVal(obj Value) Value {
+	it := forIterPool.Get().(*PyIter)
+	it.Header = ObjectHeader{Kind: KindIter, Flags: FlagEphemeralIter, Type: IterType}
+	it.Obj = obj
+	it.Idx = 0
+	switch {
+	case obj.IsList():
+		it.Kind = IterKindList
+	case obj.IsTuple():
+		it.Kind = IterKindTuple
+	case obj.IsDict():
+		it.Kind = IterKindDict
+	default:
+		it.Kind = IterKindInvalid
+	}
+	return Value{num: 0, ptr: &it.Header}
+}
+
+// ReleaseForIter returns an ephemeral PyIter to the pool once exhausted by OP_FOR_ITER.
+//
+//go:noinline
+func ReleaseForIter(it *PyIter) {
+	if it == nil || (it.Header.Flags&FlagEphemeralIter) == 0 {
+		return
+	}
+	it.Header.Flags = 0
+	it.Obj = Value{}
+	it.NextFn = nil
+	it.Idx = 0
+	it.Cur = 0
+	it.Stop = 0
+	it.Step = 0
+	forIterPool.Put(it)
+}
+
 // NewIterVal constructs a heap-allocated KindIter Value wrapping an iterable.
 func NewIterVal(obj Value) Value {
 	if obj.IsIter() {
@@ -1238,17 +1320,21 @@ func (it *PyIter) Next() (Value, bool) {
 		if dict.Live != nil {
 			return dict.liveIterNext(it)
 		}
-		dict.mu.RLock()
+		locked := dict.rlockDict()
 		for it.Idx < len(dict.Entries) {
 			entry := &dict.Entries[it.Idx]
 			it.Idx++
 			if entry.Active {
 				key := entry.Key
-				dict.mu.RUnlock()
+				if locked {
+					dict.mu.RUnlock()
+				}
 				return key, true
 			}
 		}
-		dict.mu.RUnlock()
+		if locked {
+			dict.mu.RUnlock()
+		}
 		return NoneVal(), false
 	case IterKindRange:
 		if (it.Step > 0 && it.Cur >= it.Stop) || (it.Step < 0 && it.Cur <= it.Stop) {
@@ -1673,15 +1759,23 @@ func NewAttributeError(msg string) Value {
 	return NewException(AttributeErrorType, msg)
 }
 
+var lazyAttrErrPool = sync.Pool{
+	New: func() any {
+		return &PyInstance{
+			Header: ObjectHeader{Kind: KindInstance, Type: AttributeErrorType},
+		}
+	},
+}
+
 // NewLazyAttributeError constructs an AttributeError instance without eagerly
 // formatting or interning the error message string. The message is materialized
 // lazily only if .args or __str__() is accessed.
 func NewLazyAttributeError(targetType *PyType, attrName Value) Value {
 	initExcShapes()
-	obj := &PyInstance{
-		Header: ObjectHeader{Kind: KindInstance, Type: AttributeErrorType},
-		Shape:  lazyAttrErrShape,
-	}
+	obj := lazyAttrErrPool.Get().(*PyInstance)
+	obj.Header.Type = AttributeErrorType
+	obj.Shape = lazyAttrErrShape
+	obj.dictView = nil
 	obj.Slots = obj.bootstrap[:4]
 	obj.Slots[0] = UnboundVal()
 	obj.Slots[1] = NoneVal()
@@ -1692,6 +1786,23 @@ func NewLazyAttributeError(targetType *PyType, attrName Value) Value {
 	}
 	obj.Slots[3] = attrName
 	return Value{num: 0, ptr: &obj.Header}
+}
+
+// ReleaseLazyAttributeError returns an unexposed lazy AttributeError instance
+// to the pool after clearing its slot references. Must only be called when exc
+// was raised internally and cleared before being exposed to Python code.
+func ReleaseLazyAttributeError(exc Value) {
+	if !exc.IsInstance() {
+		return
+	}
+	inst := exc.AsInstance()
+	if lazyAttrErrShape == nil || inst.Shape != lazyAttrErrShape || inst.dictView != nil || !inst.Slots[0].IsUnbound() {
+		return
+	}
+	clear(inst.bootstrap[:4])
+	inst.Slots = nil
+	inst.Shape = nil
+	lazyAttrErrPool.Put(inst)
 }
 
 // ExceptionArgs returns the exception's args tuple, lazily materializing it
@@ -1806,12 +1917,22 @@ func (d *PyDict) initTable(minEntries int) {
 	} else if tableCap > 256 {
 		shift = 1
 	}
-	d.indices = make([]byte, int(tableCap)<<shift)
-	d.mask = tableCap - 1
-	d.indexShift = shift
-	maxDense := int(tableCap) * 2 / 3
-	if cap(d.Entries) < maxDense {
-		d.Entries = make([]DictEntry, 0, maxDense)
+	if tableCap == 8 {
+		clear(d.inlineIndices[:])
+		d.indices = d.inlineIndices[:]
+		d.mask = 7
+		d.indexShift = 0
+		if cap(d.Entries) < len(d.inlineEntries) {
+			d.Entries = d.inlineEntries[:0]
+		}
+	} else {
+		d.indices = make([]byte, int(tableCap)<<shift)
+		d.mask = tableCap - 1
+		d.indexShift = shift
+		maxDense := int(tableCap) * 2 / 3
+		if cap(d.Entries) < maxDense {
+			d.Entries = make([]DictEntry, 0, maxDense)
+		}
 	}
 	if d.VersionTag == 0 {
 		d.VersionTag = 1
@@ -1899,6 +2020,9 @@ func (d *PyDict) resize(minEntries int) {
 		d.used++
 		d.filled++
 	}
+	if len(oldEntries) > 0 && &oldEntries[0] == &d.inlineEntries[0] {
+		clear(d.inlineEntries[:])
+	}
 	d.Entries = newEntries
 }
 
@@ -1946,15 +2070,21 @@ func dictKeyEqual(a, b Value) bool {
 	if a.ptr == &tagInlineStr && b.ptr == &tagInlineStr {
 		return false
 	}
-	if a.ptr != nil && b.ptr != nil && (a.ptr.Flags&b.ptr.Flags&FlagInterned) != 0 {
-		return false
+	if a.ptr != nil && b.ptr != nil {
+		if (a.ptr.Flags & b.ptr.Flags & FlagInterned) != 0 {
+			return false
+		}
+		if (a.ptr == &tagInlineStr || a.ptr.Kind == KindString) &&
+			(b.ptr == &tagInlineStr || b.ptr.Kind == KindString) {
+			return StringEquals(a, b)
+		}
 	}
 	return Equals(a, b)
 }
 
 func (d *PyDict) setLocked(key, value Value) {
 	if len(d.indices) == 0 {
-		d.initTable(8)
+		d.initTable(4)
 	}
 
 	h := HashValue(key)
@@ -2048,7 +2178,7 @@ func (d *PyDict) setLocked(key, value Value) {
 // PutNew inserts a key-value pair known to not exist in d (e.g. fresh parser output).
 func (d *PyDict) PutNew(key, value Value) {
 	if len(d.indices) == 0 {
-		d.initTable(8)
+		d.initTable(4)
 	}
 	h := HashValue(key)
 	mask := d.mask
@@ -2261,10 +2391,10 @@ func (d *PyDict) Len() int {
 	if d.Live != nil {
 		return d.liveLen()
 	}
-	d.mu.RLock()
-	n := d.used
-	d.mu.RUnlock()
-	return n
+	if d.rlockDict() {
+		defer d.mu.RUnlock()
+	}
+	return d.used
 }
 
 // Keys returns a slice of all active keys in PyDict in a thread-safe manner.
@@ -2977,7 +3107,8 @@ func NewInstanceDictProxy(inst *PyInstance) Value {
 		}
 		return Value{num: 0, ptr: &inst.dictView.Header}
 	}
-	inst.mu.Lock()
+	mu := inst.lock()
+	mu.Lock()
 	d := inst.dictView
 	if d == nil {
 		d = &PyDict{
@@ -2986,15 +3117,16 @@ func NewInstanceDictProxy(inst *PyInstance) Value {
 		}
 		inst.dictView = d
 	}
-	inst.mu.Unlock()
+	mu.Unlock()
 	return Value{num: 0, ptr: &d.Header}
 }
 
 func (d *PyDict) liveGetWithSlot(key Value) (Value, int, bool) {
 	inst := d.Live
 	if MultiThreadedFlag.Load() {
-		inst.mu.RLock()
-		defer inst.mu.RUnlock()
+		mu := inst.lock()
+		mu.RLock()
+		defer mu.RUnlock()
 	}
 	idx, ok := inst.Shape.Lookup(key)
 	if !ok || idx >= len(inst.Slots) || inst.Slots[idx].IsUnbound() {
@@ -3006,8 +3138,9 @@ func (d *PyDict) liveGetWithSlot(key Value) (Value, int, bool) {
 func (d *PyDict) liveLen() int {
 	inst := d.Live
 	if MultiThreadedFlag.Load() {
-		inst.mu.RLock()
-		defer inst.mu.RUnlock()
+		mu := inst.lock()
+		mu.RLock()
+		defer mu.RUnlock()
 	}
 	n := 0
 	for _, a := range inst.Shape.Attrs {
@@ -3021,8 +3154,9 @@ func (d *PyDict) liveLen() int {
 func (d *PyDict) liveItems() []DictItem {
 	inst := d.Live
 	if MultiThreadedFlag.Load() {
-		inst.mu.RLock()
-		defer inst.mu.RUnlock()
+		mu := inst.lock()
+		mu.RLock()
+		defer mu.RUnlock()
 	}
 	items := make([]DictItem, 0, len(inst.Shape.Attrs))
 	for _, a := range inst.Shape.Attrs {
@@ -3036,8 +3170,9 @@ func (d *PyDict) liveItems() []DictItem {
 func (d *PyDict) liveIterNext(it *PyIter) (Value, bool) {
 	inst := d.Live
 	if MultiThreadedFlag.Load() {
-		inst.mu.RLock()
-		defer inst.mu.RUnlock()
+		mu := inst.lock()
+		mu.RLock()
+		defer mu.RUnlock()
 	}
 	attrs := inst.Shape.Attrs
 	for it.Idx < len(attrs) {
@@ -3088,10 +3223,9 @@ func (d *PyDict) Clear() {
 	if d.lockDict() {
 		defer d.mu.Unlock()
 	}
+	clear(d.Entries)
 	d.Entries = d.Entries[:0]
-	for i := range d.indices {
-		d.indices[i] = 0
-	}
+	clear(d.indices)
 	d.used = 0
 	d.filled = 0
 	atomic.AddUint64(&d.VersionTag, 1)
