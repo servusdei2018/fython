@@ -43,6 +43,7 @@ const (
 	ICKindPropertySet               // @property setter (CachedVal holds fset) dispatched without descriptor machinery
 	ICKindInstanceTransition        // Shape-transitioning attribute store (OldShape -> NewShape via transitionIC)
 	ICKindCompareDunder             // Quickened comparison dunder (CachedVal=*PyFunction, CalleeCache=*VMCodeCache, ExpectedTypeVer=left, ExpectedAuxVer=right, SlotIndex=mode)
+	ICKindMethodDescr               // Monomorphic native method descriptor (CachedVal=BuiltinFunc, NativeFn=fn, ExpectedTypeVer=type ver, ExpectedShapeID=shape ID or 0)
 )
 
 // AttrPICEntry represents a single slot in a 4-way polymorphic inline cache for attribute access.
@@ -317,7 +318,7 @@ func reloadCode(co *CodeObject, cache *VMCodeCache, gen int32) []uint32 {
 				if DecodeOpcode(priv[i]) == OP_CALL {
 					priv[i] = oldInst
 				}
-			case OP_CALL_METHOD_DESCR:
+			case OP_CALL_METHOD_DESCR, OP_CALL_METHOD_DESCR_FAST:
 				if DecodeOpcode(priv[i]) == OP_CALL_METHOD_PIC {
 					priv[i] = oldInst
 				}

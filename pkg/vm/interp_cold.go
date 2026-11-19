@@ -106,7 +106,8 @@ func (vm *VM) dispatchColdOpcode(st *loopState, op Opcode, inst uint32, ip, sp i
 		return vm.opCompareLtSlow(st, ip, sp)
 	case OP_LOAD_METHOD:
 		obj := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
-		if obj.IsInstance() {
+		switch {
+		case obj.IsInstance():
 			instObj := obj.AsInstance()
 			instShape := instObj.Shape
 			instType := instObj.Header.Type
@@ -128,11 +129,22 @@ func (vm *VM) dispatchColdOpcode(st *loopState, op Opcode, inst uint32, ip, sp i
 				ip++
 				return ip, sp, ctlNext
 			}
-		} else if obj.IsModule() && obj.AsModule().Header.Type == val.ModuleType {
+		case obj.IsModule() && obj.AsModule().Header.Type == val.ModuleType:
 			mod := obj.AsModule()
 			entry := &st.cache.ic[ip]
 			if entry.Kind == ICKindModuleAttr && entry.ExpectedTypeVer == atomic.LoadUint64(&mod.Dict.VersionTag) {
 				*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)) = val.UnboundVal()
+				*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16)) = entry.CachedVal
+				sp++
+				ip++
+				return ip, sp, ctlNext
+			}
+		case !obj.IsSuper() && !obj.IsModule() && !obj.IsType():
+			entry := &st.cache.ic[ip]
+			if entry.Kind == ICKindMethodDescr && entry.ExpectedShapeID == 0 && obj.Type().Version() == entry.ExpectedTypeVer {
+				if entry.SlotIndex == 0 {
+					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)) = val.UnboundVal()
+				}
 				*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16)) = entry.CachedVal
 				sp++
 				ip++

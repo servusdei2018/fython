@@ -7,6 +7,15 @@ import (
 	"github.com/servusdei2018/fython/pkg/val"
 )
 
+func isNativeAttrCacheableType(tp *val.PyType) bool {
+	return tp == val.StrType || tp == val.ListType || tp == val.DictType ||
+		tp == val.SetType || tp == val.BytesType || tp == val.ByteArrayType ||
+		tp == val.IntType || tp == val.BigIntType || tp == val.FloatType ||
+		tp == val.BoolType || tp == val.NoneType || tp == val.RangeType ||
+		(PatternType != nil && tp == PatternType) ||
+		(MatchType != nil && tp == MatchType)
+}
+
 // dispatchPropertyGet executes a cached @property getter directly in the VM loop
 // for simple Python functions, or via a zero-alloc stack-slice call for builtins.
 func (vm *VM) dispatchPropertyGet(st *loopState, fget val.Value, cc *VMCodeCache, stack []val.Value, ip, sp int) (int, int, loopCtl) {
@@ -451,6 +460,76 @@ func (vm *VM) opLoadAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 
 	default:
 		recordLoadAttrSlowRecv(icRecvOther)
+		tp := obj.Type()
+		if isNativeAttrCacheableType(tp) && tp.Flags&val.FlagCustomGetAttribute == 0 {
+			typeVer := tp.Version()
+			if entry.ExpectedTypeVer == typeVer {
+				switch entry.Kind {
+				case ICKindClassFunc:
+					recordICSlowHit(ICKindClassFunc)
+					stack[sp-1] = val.NewBoundMethodVal(obj, entry.CachedVal)
+					return ip + 1, sp, ctlNext
+				case ICKindClassAttr:
+					recordICSlowHit(ICKindClassAttr)
+					stack[sp-1] = entry.CachedVal
+					return ip + 1, sp, ctlNext
+				case ICKindNativeDescr:
+					descr := entry.CachedVal
+					descrType := descr.Type()
+					if descrType != nil && descrType.Slots.TpDescrGet != nil {
+						recordICSlowHit(ICKindNativeDescr)
+						attrRes = descrType.Slots.TpDescrGet(&vm.execCtx, descr, obj, tp)
+						if vm.execCtx.HasException() {
+							goto loadAttrCheckExc
+						}
+						stack[sp-1] = attrRes
+						return ip + 1, sp, ctlNext
+					}
+				}
+			}
+			attrName := val.InternValue(consts[uint16(inst)])
+			if descr, _, ok := tp.LookupMRO(attrName); ok {
+				switch {
+				case descr.IsFunction() || (descr.IsBuiltinFunc() && !descr.AsBuiltinFunc().NoBind):
+					*entry = ICSlot{
+						Kind:            ICKindClassFunc,
+						ExpectedTypeVer: typeVer,
+						CachedVal:       descr,
+					}
+					stack[sp-1] = val.NewBoundMethodVal(obj, descr)
+					return ip + 1, sp, ctlNext
+				case descr.Kind() == val.KindStaticMethod:
+					smVal := descr.AsStaticMethod().Callable
+					*entry = ICSlot{
+						Kind:            ICKindClassAttr,
+						ExpectedTypeVer: typeVer,
+						CachedVal:       smVal,
+					}
+					stack[sp-1] = smVal
+					return ip + 1, sp, ctlNext
+				case !descr.IsProperty() && descr.Type() != nil && descr.Type().Slots.TpDescrGet != nil:
+					*entry = ICSlot{
+						Kind:            ICKindNativeDescr,
+						ExpectedTypeVer: typeVer,
+						CachedVal:       descr,
+					}
+					attrRes = descr.Type().Slots.TpDescrGet(&vm.execCtx, descr, obj, tp)
+					if vm.execCtx.HasException() {
+						goto loadAttrCheckExc
+					}
+					stack[sp-1] = attrRes
+					return ip + 1, sp, ctlNext
+				case descr.Type() != nil && (descr.Type().Slots.TpDescrGet == nil || (descr.IsBuiltinFunc() && descr.AsBuiltinFunc().NoBind)):
+					*entry = ICSlot{
+						Kind:            ICKindClassAttr,
+						ExpectedTypeVer: typeVer,
+						CachedVal:       descr,
+					}
+					stack[sp-1] = descr
+					return ip + 1, sp, ctlNext
+				}
+			}
+		}
 		recordLoadAttrSlowCold(icRecvOther, obj, consts[uint16(inst)])
 		st.ip = ip
 		vm.execCtx.SP = sp
@@ -765,6 +844,61 @@ func (vm *VM) opLoadMethodSlow(st *loopState, inst uint32, ip, sp int) (int, int
 			stack[sp-1] = val.UnboundVal()
 			stack[sp] = v
 			return ip + 1, sp + 1, ctlNext
+		}
+
+	case !obj.IsSuper() && !obj.IsModule() && !obj.IsType():
+		tp := obj.Type()
+		if isNativeAttrCacheableType(tp) && tp.Flags&val.FlagCustomGetAttribute == 0 {
+			typeVer := tp.Version()
+			if entry.Kind == ICKindMethodDescr && entry.ExpectedShapeID == 0 && entry.ExpectedTypeVer == typeVer {
+				recordICSlowHit(ICKindMethodDescr)
+				if entry.SlotIndex == 0 {
+					stack[sp-1] = val.UnboundVal()
+				}
+				stack[sp] = entry.CachedVal
+				return ip + 1, sp + 1, ctlNext
+			}
+			attrName := val.InternValue(consts[uint16(inst)])
+			if descr, _, ok := tp.LookupMRO(attrName); ok {
+				switch {
+				case descr.IsBuiltinFunc() && descr.AsBuiltinFunc().NoBind:
+					*entry = ICSlot{
+						Kind:            ICKindMethodDescr,
+						ExpectedTypeVer: typeVer,
+						CachedVal:       descr,
+						NativeFn:        descr.AsBuiltinFunc().Fn,
+						SlotIndex:       0,
+					}
+					stack[sp-1] = val.UnboundVal()
+					stack[sp] = descr
+					return ip + 1, sp + 1, ctlNext
+				case descr.IsFunction() || descr.IsBuiltinFunc() || descr.Kind() == val.KindCode:
+					var nativeFn val.VectorcallFunc
+					if descr.IsBuiltinFunc() {
+						nativeFn = descr.AsBuiltinFunc().Fn
+					}
+					*entry = ICSlot{
+						Kind:            ICKindMethodDescr,
+						ExpectedTypeVer: typeVer,
+						CachedVal:       descr,
+						NativeFn:        nativeFn,
+						SlotIndex:       1,
+					}
+					stack[sp] = descr
+					return ip + 1, sp + 1, ctlNext
+				case descr.Kind() == val.KindStaticMethod:
+					smVal := descr.AsStaticMethod().Callable
+					*entry = ICSlot{
+						Kind:            ICKindMethodDescr,
+						ExpectedTypeVer: typeVer,
+						CachedVal:       smVal,
+						SlotIndex:       0,
+					}
+					stack[sp-1] = val.UnboundVal()
+					stack[sp] = smVal
+					return ip + 1, sp + 1, ctlNext
+				}
+			}
 		}
 	}
 

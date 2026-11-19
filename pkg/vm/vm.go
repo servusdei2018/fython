@@ -2792,7 +2792,50 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 			ip, sp, ctl = vm.opCallBuiltinFast(st, inst, ip, sp)
 		case OP_CALL_METHOD_DESCR:
 			ip, sp, ctl = vm.opCallMethodDescr(st, inst, ip, sp)
+		case OP_CALL_METHOD_DESCR_FAST:
+			ip, sp, ctl = vm.opCallMethodDescrFast(st, inst, ip, sp)
 		case OP_CALL_TYPE_INIT:
+			argc := int(uint8(inst >> 16))
+			initBase := sp - argc - 1
+			target := *(*val.Value)(unsafe.Add(stackPtr, uintptr(initBase)*16))
+			entry := &st.cache.ic[ip]
+			if !vm.hasTrackedViews && target == entry.CachedVal && entry.SlotIndex == 0 {
+				tp := target.AsType()
+				meta := tp.Header.Type
+				if tp.Version() == entry.ExpectedTypeVer && (meta == nil || meta == val.TypeType) && entry.ExpectedAuxVer == 0 {
+					cc := entry.CalleeCache
+					if cc == nil {
+						if argc == 0 && !tp.HasInit() {
+							instObj := val.NewInstanceOfType(tp)
+							stackPtr = unsafe.Pointer(unsafe.SliceData(st.stack))
+							*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)) = instObj
+							ip++
+							continue
+						}
+					} else if initFn := tp.DunderInitVal(); initFn.IsFunction() {
+						fn := initFn.AsFunction()
+						if cc.owner == vm && cc.co != nil &&
+							fn.Code.HeaderPtr() == &cc.co.Header &&
+							len(fn.Defaults) == 0 && fn.KwDefaults == nil &&
+							atomic.LoadInt32(&cc.co.StreamGen) == cc.streamGen {
+							callee := cc.co
+							totalArgs := argc + 1
+							if totalArgs == callee.NumParams && callee.KWOnlyArgCount == 0 &&
+								(callee.Flags&(CO_VARARGS|CO_VARKEYWORDS)) == 0 && !callee.HasCellVars {
+								st.periodicTick++
+								if (st.periodicTick&0xFF) != 0 &&
+									st.frameIdx+2 <= len(vm.frames) &&
+									initBase+max(256, callee.NumLocals+64) <= len(st.stack) {
+									pushFn = fn
+									pushCache = cc
+									pushTotalArgs = totalArgs | 0x40000000
+									goto pushFrame
+								}
+							}
+						}
+					}
+				}
+			}
 			ip, sp, ctl = vm.opCallTypeInit(st, inst, ip, sp)
 		case OP_CALL_KW:
 			ip, sp, ctl = vm.opCallKw(st, inst, ip, sp)
@@ -3636,13 +3679,22 @@ func (vm *VM) pushFrameFast(
 	pushCallee := pushCache.co
 	pushTotalArgs := encodedTotalArgs
 	popCallable := 0
+	isTypeInit := false
 	if pushTotalArgs < 0 {
 		pushTotalArgs = ^pushTotalArgs
 		popCallable = 1
+	} else if (pushTotalArgs & 0x40000000) != 0 {
+		pushTotalArgs &^= 0x40000000
+		isTypeInit = true
 	}
 	pushNewBase := sp - pushTotalArgs
 	pushRetSP := pushNewBase - popCallable
 	saved := &vm.frames[st.frameIdx]
+	if isTypeInit {
+		instObj := val.NewInstanceOfType(st.stack[pushNewBase].AsType())
+		st.stack[pushNewBase] = instObj
+		saved.initInstance = instObj
+	}
 	saved.co = st.curCO
 	saved.codePtr = st.codePtr
 	saved.codeLen = st.codeLen

@@ -1098,20 +1098,32 @@ func (vm *VM) opCallTypeInit(st *loopState, inst uint32, ip, sp int) (int, int, 
 			metaOK = meta.Version() == entry.ExpectedAuxVer
 		}
 		if tp.Version() == entry.ExpectedTypeVer && metaOK {
-			initFn := tp.DunderInitVal()
+			if entry.SlotIndex == 0 && entry.CalleeCache == nil && argc == 0 && !tp.HasInit() {
+				stack[retSP] = val.NewInstanceOfType(tp)
+				return ip + 1, retSP + 1, ctlReload
+			}
+			var targetFn val.Value
+			isNewOnly := entry.SlotIndex == 1
+			if isNewOnly {
+				targetFn = tp.DunderNewVal()
+			} else {
+				targetFn = tp.DunderInitVal()
+			}
 			cc := entry.CalleeCache
-			if initFn.IsFunction() && cc != nil && cc.owner == vm {
-				initFunc := initFn.AsFunction()
-				callee := AsCodeObject(initFunc.Code)
-				if cc.co == callee {
-					totalInitArgs := argc + 1
+			if targetFn.IsFunction() && cc != nil && cc.owner == vm && cc.co != nil {
+				fn := targetFn.AsFunction()
+				callee := AsCodeObject(fn.Code)
+				if cc.co == callee && atomic.LoadInt32(&callee.StreamGen) == cc.streamGen &&
+					!callee.HasCellVars && (!callee.HasCells || fn.Closure != nil) {
+					totalArgs := argc + 1
+					initBase := retSP
 					var nextSP int
 					matched := false
-					if totalInitArgs == callee.NumParams && len(initFunc.Defaults) == 0 && initFunc.KwDefaults == nil && callee.KWOnlyArgCount == 0 && (callee.Flags&(CO_VARARGS|CO_VARKEYWORDS)) == 0 && !callee.HasCellVars {
-						nextSP = newBase + max(callee.NumLocals, totalInitArgs)
+					if totalArgs == callee.NumParams && len(fn.Defaults) == 0 && fn.KwDefaults == nil && callee.KWOnlyArgCount == 0 && (callee.Flags&(CO_VARARGS|CO_VARKEYWORDS)) == 0 {
+						nextSP = initBase + max(callee.NumLocals, totalArgs)
 						matched = true
-					} else if callee.SimplePositionalOnly && initFunc.KwDefaults == nil && totalInitArgs >= callee.PositionalParamCount-len(initFunc.Defaults) && totalInitArgs <= callee.PositionalParamCount {
-						nextSP = newBase + callee.EffectiveLocals
+					} else if callee.SimplePositionalOnly && fn.KwDefaults == nil && totalArgs >= callee.PositionalParamCount-len(fn.Defaults) && totalArgs <= callee.PositionalParamCount {
+						nextSP = initBase + callee.EffectiveLocals
 						matched = true
 					}
 					if matched {
@@ -1122,21 +1134,23 @@ func (vm *VM) opCallTypeInit(st *loopState, inst uint32, ip, sp int) (int, int, 
 						if vm.hasTrackedViews && argc > 0 {
 							markViewsEscaped(stack[newBase : newBase+argc])
 						}
-						minCap := max(newBase+1+argc+256, newBase+1+callee.NumLocals+64)
+						minCap := max(initBase+totalArgs+256, initBase+callee.NumLocals+64)
 						if minCap > len(stack) {
 							stack = vm.growStack(st, stack, minCap)
 						}
-						if argc > 0 {
-							copy(stack[newBase+1:newBase+1+argc], stack[newBase:newBase+argc])
+						var instObj val.Value
+						if !isNewOnly {
+							instObj = val.NewInstanceOfType(tp)
+							stack[initBase] = instObj
 						}
-						instObj := val.NewInstanceOfType(tp)
-						stack[newBase] = instObj
-						if callee.SimplePositionalOnly && totalInitArgs < callee.PositionalParamCount {
-							defStart := callee.PositionalParamCount - len(initFunc.Defaults)
-							copy(stack[newBase+totalInitArgs:newBase+callee.PositionalParamCount], initFunc.Defaults[totalInitArgs-defStart:])
+						if callee.SimplePositionalOnly && totalArgs < callee.PositionalParamCount {
+							defStart := callee.PositionalParamCount - len(fn.Defaults)
+							copy(stack[initBase+totalArgs:initBase+callee.PositionalParamCount], fn.Defaults[totalArgs-defStart:])
 						}
-						rIP, rSP, rCtl := vm.pushCalleeFrame(st, callee, initFunc, cc, newBase, retSP, nextSP, ip+1)
-						vm.frames[st.frameIdx-1].initInstance = instObj
+						rIP, rSP, rCtl := vm.pushCalleeFrame(st, callee, fn, cc, initBase, retSP, nextSP, ip+1)
+						if !isNewOnly {
+							vm.frames[st.frameIdx-1].initInstance = instObj
+						}
 						return rIP, rSP, rCtl
 					}
 				}
@@ -1207,6 +1221,7 @@ func (vm *VM) opCallMethodDescr(st *loopState, inst uint32, ip, sp int) (int, in
 			origData := unsafe.SliceData(stack)
 			st.stack = stack
 			st.ip = ip
+			vm.frames[st.frameIdx].ip = ip
 			vm.execCtx.SP = newBase + totalArgs
 			res := nativeFn(&vm.execCtx, targetVal, stack[newBase:newBase+totalArgs], nil)
 			stack = st.syncStackFromExecCtx(vm, stack)
@@ -1225,6 +1240,54 @@ func (vm *VM) opCallMethodDescr(st *loopState, inst uint32, ip, sp int) (int, in
 	}
 	st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL_METHOD_PIC))
 	return vm.opCallMethodPICSlow(st, ReplaceOpcode(inst, OP_CALL_METHOD_PIC), ip, sp)
+}
+
+//go:noinline
+func (vm *VM) opCallMethodDescrFast(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
+	stack := st.stack
+	argc := int(uint8(inst >> 16))
+	newBase := sp - argc - 1
+	receiver := stack[newBase]
+	entry := &st.cache.ic[ip]
+	if entry.Kind == ICKindMethodDescr && entry.NativeFn != nil {
+		matched := false
+		if entry.ExpectedShapeID == 0 {
+			if hdr := receiver.HeaderPtr(); hdr != nil &&
+				hdr.Kind != val.KindInstance && hdr.Kind != val.KindSuper && hdr.Kind != val.KindModule && hdr.Kind != val.KindType &&
+				receiver.Type().Version() == entry.ExpectedTypeVer {
+				matched = true
+			}
+		} else if instObj := receiver.AsInstanceChecked(); instObj != nil && instObj.Shape != nil &&
+			instObj.Shape.ID == entry.ExpectedShapeID && instObj.Header.Type.Version() == entry.ExpectedTypeVer {
+			matched = true
+		}
+		if matched {
+			totalArgs := argc + 1
+			if vm.hasTrackedViews && totalArgs > 0 {
+				markViewsEscaped(stack[newBase : newBase+totalArgs])
+			}
+			origData := unsafe.SliceData(stack)
+			st.stack = stack
+			st.ip = ip
+			vm.frames[st.frameIdx].ip = ip
+			vm.execCtx.SP = sp
+			res := entry.NativeFn(&vm.execCtx, entry.CachedVal, stack[newBase:newBase+totalArgs], nil)
+			stack = st.syncStackFromExecCtx(vm, stack)
+			if vm.execCtx.HasException() {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				st.raiseExc = exc
+				return ip, sp, ctlRaise
+			}
+			stack[newBase] = res
+			if unsafe.SliceData(stack) == origData {
+				return ip + 1, newBase + 1, ctlNext
+			}
+			return ip + 1, newBase + 1, ctlReload
+		}
+	}
+	st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL_METHOD_DESCR))
+	return vm.opCallMethodDescr(st, ReplaceOpcode(inst, OP_CALL_METHOD_DESCR), ip, sp)
 }
 
 //go:noinline
@@ -1531,6 +1594,18 @@ unwrapCall:
 		tp := target.AsType()
 		if canFastInstantiate(tp) {
 			if !tp.HasInit() {
+				if argc == 0 && canQuicken {
+					var metaVer uint64
+					if meta := tp.Header.Type; meta != nil && meta != val.TypeType {
+						metaVer = meta.Version()
+					}
+					st.cache.ic[ip] = ICSlot{
+						CachedVal:       target,
+						ExpectedTypeVer: tp.Version(),
+						ExpectedAuxVer:  metaVer,
+					}
+					st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL_TYPE_INIT))
+				}
 				stack[retSP] = val.NewInstanceOfType(tp)
 				return ip + 1, retSP + 1, ctlReload
 			}
@@ -1539,30 +1614,30 @@ unwrapCall:
 				initFunc := initFn.AsFunction()
 				callee := AsCodeObject(initFunc.Code)
 				if !callee.IsGenerator && !callee.IsCoroutine {
-					minCap := max(newBase+1+argc+256, newBase+1+callee.NumLocals+64)
+					initBase := retSP
+					totalInitArgs := argc + 1
+					minCap := max(initBase+totalInitArgs+256, initBase+callee.NumLocals+64)
 					if minCap > len(stack) {
 						stack = vm.growStack(st, stack, minCap)
 					}
-					copy(stack[newBase+1:newBase+1+argc], stack[newBase:newBase+argc])
 					instObj := val.NewInstanceOfType(tp)
-					stack[newBase] = instObj
-					totalInitArgs := argc + 1
+					stack[initBase] = instObj
 					var nextSP int
 					simplePos := false
 					switch {
 					case totalInitArgs == callee.NumParams && len(initFunc.Defaults) == 0 && initFunc.KwDefaults == nil && callee.KWOnlyArgCount == 0 && (callee.Flags&(CO_VARARGS|CO_VARKEYWORDS)) == 0 && !callee.HasCellVars:
-						nextSP = newBase + max(callee.NumLocals, totalInitArgs)
+						nextSP = initBase + max(callee.NumLocals, totalInitArgs)
 						simplePos = true
 					case callee.SimplePositionalOnly && initFunc.KwDefaults == nil && totalInitArgs >= callee.PositionalParamCount-len(initFunc.Defaults) && totalInitArgs <= callee.PositionalParamCount:
 						if totalInitArgs < callee.PositionalParamCount {
 							defStart := callee.PositionalParamCount - len(initFunc.Defaults)
-							copy(stack[newBase+totalInitArgs:newBase+callee.PositionalParamCount], initFunc.Defaults[totalInitArgs-defStart:])
+							copy(stack[initBase+totalInitArgs:initBase+callee.PositionalParamCount], initFunc.Defaults[totalInitArgs-defStart:])
 						}
-						nextSP = newBase + callee.EffectiveLocals
+						nextSP = initBase + callee.EffectiveLocals
 						simplePos = true
 					default:
 						var ok bool
-						nextSP, ok = vm.bindFunctionArgsSafe(callee, initFunc.Defaults, initFunc.KwDefaults, stack, newBase, totalInitArgs, nil)
+						nextSP, ok = vm.bindFunctionArgsSafe(callee, initFunc.Defaults, initFunc.KwDefaults, stack, initBase, totalInitArgs, nil)
 						if !ok {
 							exc := vm.execCtx.ActiveException
 							vm.execCtx.ClearException()
@@ -1571,7 +1646,11 @@ unwrapCall:
 						}
 					}
 					cc := vm.fastCalleeCache(callee)
-					if canQuicken && simplePos {
+					if canQuicken && simplePos && !callee.HasCellVars && (!callee.HasCells || initFunc.Closure != nil) {
+						if len(callee.ExceptionTable) == 0 && atomic.LoadInt32(&callee.IsTier2Optimized) == 0 {
+							maybeOptimizeCodeObject(vm, callee, cc)
+						}
+						_, _ = vm.loadWindow(callee, cc)
 						var metaVer uint64
 						if meta := tp.Header.Type; meta != nil && meta != val.TypeType {
 							metaVer = meta.Version()
@@ -1584,9 +1663,68 @@ unwrapCall:
 						}
 						st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL_TYPE_INIT))
 					}
-					rIP, rSP, rCtl := vm.pushCalleeFrame(st, callee, initFunc, cc, newBase, retSP, nextSP, ip+1)
+					rIP, rSP, rCtl := vm.pushCalleeFrame(st, callee, initFunc, cc, initBase, retSP, nextSP, ip+1)
 					vm.frames[st.frameIdx-1].initInstance = instObj
 					return rIP, rSP, rCtl
+				}
+			}
+		} else if (tp.Flags&val.FlagHeapType) != 0 && (tp.Flags&val.FlagHasCExtBase) == 0 && !val.IsSubclass(tp, val.TypeType) && !tp.HasInit() {
+			meta := tp.Header.Type
+			if meta == nil || meta == val.TypeType || meta.UsesDefaultTypeCall() {
+				if newFn := tp.DunderNewVal(); newFn.IsFunction() {
+					newFunc := newFn.AsFunction()
+					callee := AsCodeObject(newFunc.Code)
+					if !callee.IsGenerator && !callee.IsCoroutine {
+						initBase := retSP
+						totalNewArgs := argc + 1
+						minCap := max(initBase+totalNewArgs+256, initBase+callee.NumLocals+64)
+						if minCap > len(stack) {
+							stack = vm.growStack(st, stack, minCap)
+						}
+						var nextSP int
+						simplePos := false
+						switch {
+						case totalNewArgs == callee.NumParams && len(newFunc.Defaults) == 0 && newFunc.KwDefaults == nil && callee.KWOnlyArgCount == 0 && (callee.Flags&(CO_VARARGS|CO_VARKEYWORDS)) == 0 && !callee.HasCellVars:
+							nextSP = initBase + max(callee.NumLocals, totalNewArgs)
+							simplePos = true
+						case callee.SimplePositionalOnly && newFunc.KwDefaults == nil && totalNewArgs >= callee.PositionalParamCount-len(newFunc.Defaults) && totalNewArgs <= callee.PositionalParamCount:
+							if totalNewArgs < callee.PositionalParamCount {
+								defStart := callee.PositionalParamCount - len(newFunc.Defaults)
+								copy(stack[initBase+totalNewArgs:initBase+callee.PositionalParamCount], newFunc.Defaults[totalNewArgs-defStart:])
+							}
+							nextSP = initBase + callee.EffectiveLocals
+							simplePos = true
+						default:
+							var ok bool
+							nextSP, ok = vm.bindFunctionArgsSafe(callee, newFunc.Defaults, newFunc.KwDefaults, stack, initBase, totalNewArgs, nil)
+							if !ok {
+								exc := vm.execCtx.ActiveException
+								vm.execCtx.ClearException()
+								st.raiseExc = exc
+								return ip, sp, ctlRaise
+							}
+						}
+						cc := vm.fastCalleeCache(callee)
+						if canQuicken && simplePos && !callee.HasCellVars && (!callee.HasCells || newFunc.Closure != nil) {
+							if len(callee.ExceptionTable) == 0 && atomic.LoadInt32(&callee.IsTier2Optimized) == 0 {
+								maybeOptimizeCodeObject(vm, callee, cc)
+							}
+							_, _ = vm.loadWindow(callee, cc)
+							var metaVer uint64
+							if meta != nil && meta != val.TypeType {
+								metaVer = meta.Version()
+							}
+							st.cache.ic[ip] = ICSlot{
+								CachedVal:       target,
+								CalleeCache:     cc,
+								ExpectedTypeVer: tp.Version(),
+								ExpectedAuxVer:  metaVer,
+								SlotIndex:       1,
+							}
+							st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL_TYPE_INIT))
+						}
+						return vm.pushCalleeFrame(st, callee, newFunc, cc, initBase, retSP, nextSP, ip+1)
+					}
 				}
 			}
 		}
@@ -2210,10 +2348,21 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 				return vm.pushInlineCoroutine(st, receiver.AsCoroutine(), ip, sp, retSP, genModeCoroSend, stack[newBase+1])
 			}
 			if methIdx >= uint16(len(st.consts)) || (attrName != nameExists && attrName != nameRemove && attrName != nameUnlink) {
-				st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL_METHOD_DESCR))
+				if pic[0].ReceiverType == tp && pic[1].ReceiverType == nil {
+					st.cache.ic[ip] = ICSlot{
+						Kind:            ICKindMethodDescr,
+						ExpectedTypeVer: tp.Version(),
+						CachedVal:       targetVal,
+						NativeFn:        nativeFn,
+					}
+					st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL_METHOD_DESCR_FAST))
+				} else {
+					st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL_METHOD_DESCR))
+				}
 			}
 			st.stack = stack
 			st.ip = ip
+			vm.frames[st.frameIdx].ip = ip
 			vm.execCtx.SP = newBase + totalArgs
 			res := vm.invokeBuiltinSafe(nativeFn, targetVal, stack[newBase:newBase+totalArgs], nil)
 			stack = st.syncStackFromExecCtx(vm, stack)
@@ -2328,11 +2477,23 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 			if methIdx >= uint16(len(st.consts)) || (st.consts[methIdx] != nameWrite && st.consts[methIdx] != nameEnter &&
 				st.consts[methIdx] != nameGetValue && st.consts[methIdx] != nameRead && st.consts[methIdx] != nameExit &&
 				st.consts[methIdx] != nameExists && st.consts[methIdx] != nameRemove && st.consts[methIdx] != nameUnlink) {
-				st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL_METHOD_DESCR))
+				if pic[0].Shape == instShape && pic[1].Shape == nil && instShape != nil && instShape.ID != 0 {
+					st.cache.ic[ip] = ICSlot{
+						Kind:            ICKindMethodDescr,
+						ExpectedTypeVer: instVer,
+						ExpectedShapeID: instShape.ID,
+						CachedVal:       targetVal,
+						NativeFn:        nativeFn,
+					}
+					st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL_METHOD_DESCR_FAST))
+				} else {
+					st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL_METHOD_DESCR))
+				}
 			}
 			origData := unsafe.SliceData(stack)
 			st.stack = stack
 			st.ip = ip
+			vm.frames[st.frameIdx].ip = ip
 			vm.execCtx.SP = newBase + totalArgs
 			res := vm.invokeBuiltinSafe(nativeFn, targetVal, stack[newBase:newBase+totalArgs], nil)
 			stack = st.syncStackFromVM(vm, stack)
