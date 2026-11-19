@@ -404,6 +404,7 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 	sysMod.Dict.Set(val.InternString("exc_info"), val.NewBuiltinFuncVal("exc_info", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		vmInstance := ctx.VM.(*VM)
 		lastExc := vmInstance.lastException
+		val.ClearEphemeral(lastExc)
 		if lastExc.IsNone() || lastExc.HeaderPtr() == nil {
 			return val.NewTupleVal(val.NoneVal(), val.NoneVal(), val.NoneVal())
 		}
@@ -418,6 +419,7 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 	sysMod.Dict.Set(val.InternString("exception"), val.NewBuiltinFuncVal("exception", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		vmInstance := ctx.VM.(*VM)
 		lastExc := vmInstance.lastException
+		val.ClearEphemeral(lastExc)
 		if lastExc.IsNone() || lastExc.HeaderPtr() == nil {
 			return val.NoneVal()
 		}
@@ -797,6 +799,12 @@ func (e *Engine) newVMInternal(stackCap, frameCap int) *VM {
 	}
 	if superVal, ok := e.builtins.Get(nameSuper); ok {
 		v.builtinSuper = superVal
+	}
+	if hasattrVal, ok := e.builtins.Get(nameHasattr); ok {
+		v.builtinHasattr = hasattrVal
+	}
+	if getattrVal, ok := e.builtins.Get(nameGetattr); ok {
+		v.builtinGetattr = getattrVal
 	}
 	v.execCtx.Stack = v.stack
 	v.execCtx.CallHook = v.callFromHook

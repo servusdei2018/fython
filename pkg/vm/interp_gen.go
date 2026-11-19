@@ -184,6 +184,152 @@ func (js *strJoinState) materialize() val.Value {
 	return val.NewStringVal(js.buf.String())
 }
 
+func (vm *VM) acquireCollectState(mode uint8) *collectState {
+	var cs *collectState
+	if n := len(vm.collectPool); n > 0 {
+		cs = vm.collectPool[n-1]
+		vm.collectPool[n-1] = nil
+		vm.collectPool = vm.collectPool[:n-1]
+	} else {
+		cs = &collectState{}
+	}
+	if mode == genModeCollectSet {
+		cs.set = val.NewSetVal().AsSet()
+	} else if (mode == genModeCollectList || mode == genModeCollectTuple) && cap(cs.items) == 0 {
+		cs.items = make([]val.Value, 0, 16)
+	}
+	return cs
+}
+
+func (vm *VM) releaseCollectState(cs *collectState) {
+	if cs == nil {
+		return
+	}
+	cs.set = nil
+	cs.list = nil
+	if cs.items != nil {
+		if cap(cs.items) <= 4096 {
+			clear(cs.items[:cap(cs.items)])
+			cs.items = cs.items[:0]
+		} else {
+			cs.items = nil
+		}
+	}
+	if len(vm.collectPool) < 32 {
+		vm.collectPool = append(vm.collectPool, cs)
+	}
+}
+
+func (cs *collectState) appendValue(v val.Value, mode uint8, hasTrackedViews bool) (val.Value, bool) {
+	val.ClearEphemeral(v)
+	val.DetachStringBuf(v)
+	if hasTrackedViews {
+		markViewEscaped(v)
+	}
+	switch mode {
+	case genModeCollectSet:
+		return cs.set.AddChecked(v)
+	case genModeListExtend:
+		cs.list.Append(v)
+		return val.Value{}, true
+	}
+	cs.items = append(cs.items, v)
+	return val.Value{}, true
+}
+
+func (cs *collectState) materialize(mode uint8) val.Value {
+	switch mode {
+	case genModeCollectList:
+		if len(cs.items) == 0 {
+			return val.NewListVal()
+		}
+		items := cs.items
+		cs.items = nil
+		return val.NewListFromOwnedSlice(items)
+	case genModeCollectTuple:
+		if len(cs.items) == 0 {
+			return val.EmptyTupleVal()
+		}
+		return val.NewTupleFromSlice(cs.items)
+	case genModeCollectSet:
+		if cs.set == nil {
+			return val.NewSetVal()
+		}
+		out := val.SetVal(cs.set)
+		cs.set = nil
+		return out
+	case genModeListExtend:
+		cs.list = nil
+		return val.NoneVal()
+	}
+	return val.NoneVal()
+}
+
+// pushListExtendGenerator pushes gen onto vm.frames in genModeListExtend so all
+// yielded items append directly to targetList inside runLoopWithGlobals.
+//
+//go:noinline
+func (vm *VM) pushListExtendGenerator(st *loopState, targetList *val.PyList, gen *val.PyGenerator, callerIP, callerSP, retSP int) (int, int, loopCtl) {
+	switch gen.State {
+	case val.GenClosed:
+		st.stack[retSP] = val.NoneVal()
+		vm.releaseGenerator(gen)
+		return callerIP + 1, retSP + 1, ctlReload
+	case val.GenRunning:
+		st.raiseExc = val.NewValueError("generator already executing")
+		return callerIP, callerSP, ctlRaise
+	}
+	cs := vm.acquireCollectState(genModeListExtend)
+	cs.list = targetList
+	ip, sp, ctl := vm.pushInlineGenerator(st, gen, callerIP, callerSP, retSP, 0, genModeListExtend, val.Value{}, val.NoneVal())
+	if ctl == ctlRaise {
+		vm.releaseCollectState(cs)
+		return ip, sp, ctl
+	}
+	if st.frameIdx > st.startFrameIdx {
+		vm.frames[st.frameIdx-1].collectState = cs
+	} else {
+		vm.releaseCollectState(cs)
+	}
+	return ip, sp, ctl
+}
+
+// pushCollectGenerator pushes gen onto vm.frames in genModeCollectList,
+// genModeCollectTuple, or genModeCollectSet so yielded values drain directly
+// inside runLoopWithGlobals without host-stack re-entrancy.
+//
+//go:noinline
+func (vm *VM) pushCollectGenerator(st *loopState, mode uint8, gen *val.PyGenerator, callerIP, callerSP, retSP int) (int, int, loopCtl) {
+	switch gen.State {
+	case val.GenClosed:
+		switch mode {
+		case genModeCollectList:
+			st.stack[retSP] = val.NewListVal()
+		case genModeCollectTuple:
+			st.stack[retSP] = val.EmptyTupleVal()
+		case genModeCollectSet:
+			st.stack[retSP] = val.NewSetVal()
+		}
+		vm.releaseGenerator(gen)
+		return callerIP + 1, retSP + 1, ctlReload
+	case val.GenRunning:
+		st.raiseExc = val.NewValueError("generator already executing")
+		return callerIP, callerSP, ctlRaise
+	}
+	cs := vm.acquireCollectState(mode)
+	ip, sp, ctl := vm.pushInlineGenerator(st, gen, callerIP, callerSP, retSP, 0, mode, val.Value{}, val.NoneVal())
+	if ctl == ctlRaise {
+		vm.releaseCollectState(cs)
+		return ip, sp, ctl
+	}
+	if st.frameIdx > st.startFrameIdx {
+		vm.frames[st.frameIdx-1].collectState = cs
+	} else {
+		vm.releaseCollectState(cs)
+	}
+	return ip, sp, ctl
+}
+
 // pushStrJoinGenerator pushes gen onto vm.frames in genModeStrJoin so all
 // yielded strings drain directly into a pooled strings.Builder inside runLoopWithGlobals.
 //
@@ -212,26 +358,27 @@ func (vm *VM) pushStrJoinGenerator(st *loopState, sepVal val.Value, gen *val.PyG
 	return ip, sp, ctl
 }
 
-func (vm *VM) findStrJoinCaller(st *loopState) (int, bool) {
+func (vm *VM) findGenDrainCaller(st *loopState) (int, uint8) {
 	if st.frameIdx != st.genFrameIdx || st.frameIdx <= st.startFrameIdx {
-		return -1, false
+		return -1, genModeNone
 	}
 	k := st.frameIdx - 1
 	for {
 		mode := vm.frames[k].genMode
-		if mode == genModeStrJoin {
-			return k, true
+		switch mode {
+		case genModeStrJoin, genModeCollectList, genModeCollectTuple, genModeCollectSet, genModeListExtend:
+			return k, mode
+		case genModeYieldFrom, genModeAwait:
+			if k > st.startFrameIdx {
+				k--
+				continue
+			}
 		}
-		if (mode == genModeYieldFrom || mode == genModeAwait) && k > st.startFrameIdx {
-			k--
-			continue
-		}
-		return -1, false
+		return -1, genModeNone
 	}
 }
 
-func (vm *VM) failStrJoinNonString(st *loopState, js *strJoinState, callerIdx int, badVal val.Value, ip, sp int) (int, int, loopCtl) {
-	errMsg := fmt.Sprintf("sequence item %d: expected str instance, %s found", js.count, badVal.Type().Name)
+func (vm *VM) failGenDrainCaller(st *loopState, callerIdx int, badVal, errExc val.Value, ip, sp int) (int, int, loopCtl) {
 	if st.activeGen != nil {
 		gen := st.activeGen
 		if (gen.Header.Flags & val.FlagEphemeralGen) != 0 {
@@ -257,10 +404,16 @@ func (vm *VM) failStrJoinNonString(st *loopState, js *strJoinState, callerIdx in
 		}
 		if st.frameIdx == callerIdx {
 			callerIP := caller.ip
-			caller.joinState = nil
+			if caller.joinState != nil {
+				vm.releaseStrJoinState(caller.joinState)
+				caller.joinState = nil
+			}
+			if caller.collectState != nil {
+				vm.releaseCollectState(caller.collectState)
+				caller.collectState = nil
+			}
 			vm.restoreCallerFrame(st, caller)
-			vm.releaseStrJoinState(js)
-			st.raiseExc = val.NewTypeError(errMsg)
+			st.raiseExc = errExc
 			return callerIP - 1, caller.retSP, ctlRaise
 		}
 		retSP := caller.retSP
@@ -280,9 +433,13 @@ func (vm *VM) failStrJoinNonString(st *loopState, js *strJoinState, callerIdx in
 			st.activeCoro.IP = callerIP
 		}
 	}
-	vm.releaseStrJoinState(js)
-	st.raiseExc = val.NewTypeError(errMsg)
+	st.raiseExc = errExc
 	return ip, sp, ctlRaise
+}
+
+func (vm *VM) failStrJoinNonString(st *loopState, js *strJoinState, callerIdx int, badVal val.Value, ip, sp int) (int, int, loopCtl) {
+	errMsg := fmt.Sprintf("sequence item %d: expected str instance, %s found", js.count, badVal.Type().Name)
+	return vm.failGenDrainCaller(st, callerIdx, badVal, val.NewTypeError(errMsg), ip, sp)
 }
 
 // pushInlineGenerator pushes gen onto vm.frames directly inside the active
@@ -308,6 +465,22 @@ func (vm *VM) pushInlineGenerator(st *loopState, gen *val.PyGenerator, callerIP,
 			return callerIP, callerSP, ctlRaise
 		case genModeStrJoin:
 			st.stack[retSP] = val.NewStringVal("")
+			vm.releaseGenerator(gen)
+			return callerIP + 1, retSP + 1, ctlReload
+		case genModeCollectList:
+			st.stack[retSP] = val.NewListVal()
+			vm.releaseGenerator(gen)
+			return callerIP + 1, retSP + 1, ctlReload
+		case genModeCollectTuple:
+			st.stack[retSP] = val.EmptyTupleVal()
+			vm.releaseGenerator(gen)
+			return callerIP + 1, retSP + 1, ctlReload
+		case genModeCollectSet:
+			st.stack[retSP] = val.NewSetVal()
+			vm.releaseGenerator(gen)
+			return callerIP + 1, retSP + 1, ctlReload
+		case genModeListExtend:
+			st.stack[retSP] = val.NoneVal()
 			vm.releaseGenerator(gen)
 			return callerIP + 1, retSP + 1, ctlReload
 		}
@@ -493,10 +666,17 @@ func (vm *VM) opYieldValue(st *loopState, ip, sp int) (int, int, loopCtl) {
 	sp--
 	yieldVal := stack[sp]
 	if st.activeGen != nil {
-		if callerIdx, ok := vm.findStrJoinCaller(st); ok {
-			js := vm.frames[callerIdx].joinState
-			if !js.appendValue(yieldVal) {
-				return vm.failStrJoinNonString(st, js, callerIdx, yieldVal, ip, sp)
+		if callerIdx, mode := vm.findGenDrainCaller(st); mode != genModeNone {
+			if mode == genModeStrJoin {
+				js := vm.frames[callerIdx].joinState
+				if !js.appendValue(yieldVal) {
+					return vm.failStrJoinNonString(st, js, callerIdx, yieldVal, ip, sp)
+				}
+			} else {
+				cs := vm.frames[callerIdx].collectState
+				if errExc, ok := cs.appendValue(yieldVal, mode, vm.hasTrackedViews); !ok {
+					return vm.failGenDrainCaller(st, callerIdx, yieldVal, errExc, ip, sp)
+				}
 			}
 			stack[sp] = val.NoneVal()
 			return ip + 1, sp + 1, ctlNext
@@ -579,8 +759,9 @@ func (vm *VM) opYieldFrom(st *loopState, ip, sp int) (int, int, loopCtl) {
 	if subiter.IsCoroutine() {
 		return vm.pushInlineCoroutine(st, subiter.AsCoroutine(), ip, sp, sp, genModeYieldFrom, sentVal)
 	}
-	if callerIdx, ok := vm.findStrJoinCaller(st); ok {
+	if callerIdx, mode := vm.findGenDrainCaller(st); mode != genModeNone {
 		js := vm.frames[callerIdx].joinState
+		cs := vm.frames[callerIdx].collectState
 		for {
 			var nextVal val.Value
 			var status val.IterStatus
@@ -590,8 +771,12 @@ func (vm *VM) opYieldFrom(st *loopState, ip, sp int) (int, int, loopCtl) {
 				break
 			}
 			if status == val.IterYielded {
-				if !js.appendValue(nextVal) {
-					return vm.failStrJoinNonString(st, js, callerIdx, nextVal, ip, sp)
+				if mode == genModeStrJoin {
+					if !js.appendValue(nextVal) {
+						return vm.failStrJoinNonString(st, js, callerIdx, nextVal, ip, sp)
+					}
+				} else if errExc, ok := cs.appendValue(nextVal, mode, vm.hasTrackedViews); !ok {
+					return vm.failGenDrainCaller(st, callerIdx, nextVal, errExc, ip, sp)
 				}
 				continue
 			}

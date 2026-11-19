@@ -333,6 +333,7 @@ const (
 	IterKindString
 	IterKindBytes
 	IterKindByteArray
+	IterKindSet
 )
 
 // PyIter represents a zero-allocation iterator over lists, tuples, dicts, or ranges.
@@ -536,6 +537,15 @@ func NewBigIntFromInt64(x int64) Value {
 
 // NewListVal constructs a heap-allocated KindList Value wrapping the provided slice.
 func NewListVal(items ...Value) Value {
+	obj := &PyList{
+		Header: ObjectHeader{Kind: KindList, Type: ListType},
+		Items:  items,
+	}
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+// NewListFromOwnedSlice constructs a KindList Value taking ownership of items directly.
+func NewListFromOwnedSlice(items []Value) Value {
 	obj := &PyList{
 		Header: ObjectHeader{Kind: KindList, Type: ListType},
 		Items:  items,
@@ -1192,46 +1202,6 @@ func (c *PyChan) Close() bool {
 	return false
 }
 
-var forIterPool = sync.Pool{
-	New: func() any { return new(PyIter) },
-}
-
-// AcquireForIterVal acquires a pooled ephemeral PyIter for OP_GET_ITER -> OP_FOR_ITER loops.
-func AcquireForIterVal(obj Value) Value {
-	it := forIterPool.Get().(*PyIter)
-	it.Header = ObjectHeader{Kind: KindIter, Flags: FlagEphemeralIter, Type: IterType}
-	it.Obj = obj
-	it.Idx = 0
-	switch {
-	case obj.IsList():
-		it.Kind = IterKindList
-	case obj.IsTuple():
-		it.Kind = IterKindTuple
-	case obj.IsDict():
-		it.Kind = IterKindDict
-	default:
-		it.Kind = IterKindInvalid
-	}
-	return Value{num: 0, ptr: &it.Header}
-}
-
-// ReleaseForIter returns an ephemeral PyIter to the pool once exhausted by OP_FOR_ITER.
-//
-//go:noinline
-func ReleaseForIter(it *PyIter) {
-	if it == nil || (it.Header.Flags&FlagEphemeralIter) == 0 {
-		return
-	}
-	it.Header.Flags = 0
-	it.Obj = Value{}
-	it.NextFn = nil
-	it.Idx = 0
-	it.Cur = 0
-	it.Stop = 0
-	it.Step = 0
-	forIterPool.Put(it)
-}
-
 // NewIterVal constructs a heap-allocated KindIter Value wrapping an iterable.
 func NewIterVal(obj Value) Value {
 	if obj.IsIter() {
@@ -1256,8 +1226,7 @@ func NewIterVal(obj Value) Value {
 	case obj.IsGenerator():
 		it.Kind = IterKindGenerator
 	case obj.IsSet():
-		it.Kind = IterKindList
-		it.Obj = NewListVal(obj.AsSet().Items()...)
+		it.Kind = IterKindSet
 	case obj.IsAnyString():
 		it.Kind = IterKindString
 	case obj.IsBytes():
@@ -1337,6 +1306,16 @@ func (it *PyIter) Next() (Value, bool) {
 		}
 		if locked {
 			dict.mu.RUnlock()
+		}
+		return NoneVal(), false
+	case IterKindSet:
+		set := it.Obj.AsSet()
+		for it.Idx < len(set.dict.Entries) {
+			entry := &set.dict.Entries[it.Idx]
+			it.Idx++
+			if entry.Active {
+				return entry.Key, true
+			}
 		}
 		return NoneVal(), false
 	case IterKindRange:
@@ -1769,20 +1748,33 @@ func NewAttributeError(msg string) Value {
 	return NewException(AttributeErrorType, msg)
 }
 
-var lazyAttrErrPool = sync.Pool{
-	New: func() any {
-		return &PyInstance{
-			Header: ObjectHeader{Kind: KindInstance, Type: AttributeErrorType},
-		}
-	},
-}
-
 // NewLazyAttributeError constructs an AttributeError instance without eagerly
 // formatting or interning the error message string. The message is materialized
 // lazily only if .args or __str__() is accessed.
 func NewLazyAttributeError(targetType *PyType, attrName Value) Value {
+	return NewLazyAttributeErrorCtx(nil, targetType, attrName)
+}
+
+// NewLazyAttributeErrorCtx constructs a lazy AttributeError, reusing an instance
+// from ctx.LazyAttrErrFreeList when available instead of boxing through sync.Pool.
+func NewLazyAttributeErrorCtx(ctx *ExecContext, targetType *PyType, attrName Value) Value {
 	initExcShapes()
-	obj := lazyAttrErrPool.Get().(*PyInstance)
+	var obj *PyInstance
+	if ctx != nil && len(ctx.LazyAttrErrFreeList) > 0 {
+		n := len(ctx.LazyAttrErrFreeList) - 1
+		obj = ctx.LazyAttrErrFreeList[n]
+		ctx.LazyAttrErrFreeList[n] = nil
+		ctx.LazyAttrErrFreeList = ctx.LazyAttrErrFreeList[:n]
+	} else {
+		obj = &PyInstance{
+			Header: ObjectHeader{Kind: KindInstance, Type: AttributeErrorType},
+		}
+	}
+	var flags uint8
+	if ctx != nil && !MultiThreadedFlag.Load() {
+		flags = FlagEphemeralAttrErr
+	}
+	obj.Header.Flags = flags
 	obj.Header.Type = AttributeErrorType
 	obj.Shape = lazyAttrErrShape
 	obj.dictView = nil
@@ -1799,9 +1791,14 @@ func NewLazyAttributeError(targetType *PyType, attrName Value) Value {
 }
 
 // ReleaseLazyAttributeError returns an unexposed lazy AttributeError instance
-// to the pool after clearing its slot references. Must only be called when exc
-// was raised internally and cleared before being exposed to Python code.
+// after clearing its slot references.
 func ReleaseLazyAttributeError(exc Value) {
+	ReleaseLazyAttributeErrorCtx(nil, exc)
+}
+
+// ReleaseLazyAttributeErrorCtx clears and recycles an unexposed lazy AttributeError
+// instance into ctx.LazyAttrErrFreeList when ctx is provided.
+func ReleaseLazyAttributeErrorCtx(ctx *ExecContext, exc Value) {
 	if !exc.IsInstance() {
 		return
 	}
@@ -1810,9 +1807,12 @@ func ReleaseLazyAttributeError(exc Value) {
 		return
 	}
 	clear(inst.bootstrap[:4])
+	inst.Header.Flags = 0
 	inst.Slots = nil
 	inst.Shape = nil
-	lazyAttrErrPool.Put(inst)
+	if ctx != nil && len(ctx.LazyAttrErrFreeList) < 64 {
+		ctx.LazyAttrErrFreeList = append(ctx.LazyAttrErrFreeList, inst)
+	}
 }
 
 // ExceptionArgs returns the exception's args tuple, lazily materializing it
@@ -2564,6 +2564,51 @@ func SetVal(s *PySet) Value {
 // Add adds an element to the set.
 func (s *PySet) Add(v Value) {
 	s.dict.Set(v, NoneVal())
+}
+
+// DictEntries returns the underlying dict entry slice for direct iteration.
+func (s *PySet) DictEntries() []DictEntry {
+	return s.dict.Entries
+}
+
+func isUnhashableValue(v Value) (string, bool) {
+	if v.ptr == nil || v.ptr == &tagInt64 || v.ptr == &tagBool || v.ptr == &tagFloat64 ||
+		v.ptr == &tagInlineStr || v.ptr == &tagNone {
+		return "", false
+	}
+	switch v.ptr.Kind {
+	case KindString, KindBigInt, KindComplex, KindBytes, KindRange:
+		return "", false
+	case KindList, KindDict, KindSet, KindByteArray:
+		tp := v.Type()
+		if tp != nil {
+			return tp.Name, true
+		}
+		return v.Kind().String(), true
+	case KindTuple:
+		tp := v.ptr.Type
+		if tp == nil || tp == TupleType || tp.dunderHash.ptr == nil {
+			for _, it := range v.AsTuple().Items {
+				if name, bad := isUnhashableValue(it); bad {
+					return name, true
+				}
+			}
+			return "", false
+		}
+	}
+	if tp := v.Type(); tp != nil && tp.dunderHash.ptr != nil && tp.dunderHash.IsNone() {
+		return tp.Name, true
+	}
+	return "", false
+}
+
+// AddChecked adds v to the set, returning an error exception Value if v is unhashable.
+func (s *PySet) AddChecked(v Value) (Value, bool) {
+	if badType, bad := isUnhashableValue(v); bad {
+		return NewTypeError("unhashable type: '" + badType + "'"), false
+	}
+	s.dict.Set(v, NoneVal())
+	return Value{}, true
 }
 
 // Contains reports whether v is an element of the set.

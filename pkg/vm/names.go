@@ -129,6 +129,12 @@ var (
 	nameArgtypes         = val.InternString("_argtypes_")
 	nameRestype          = val.InternString("_restype_")
 	nameFlags            = val.InternString("_flags_")
+	nameHasattr          = val.InternString("hasattr")
+	nameGetattr          = val.InternString("getattr")
+	nameMRO              = val.InternString("__mro__")
+	nameBases            = val.InternString("__bases__")
+	nameTypeParams       = val.InternString("__type_params__")
+	nameAnnotations      = val.InternString("__annotations__")
 
 	unraisableHookFields = [5]val.Value{
 		val.InternString("exc_type"),

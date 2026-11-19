@@ -226,6 +226,7 @@ func (e *Engine) createTracebackModule() val.Value {
 	mod.Dict.Set(val.InternString("format_exc"), val.NewBuiltinFuncVal("format_exc", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		vmInstance := ctx.VM.(*VM)
 		exc := vmInstance.lastException
+		val.ClearEphemeral(exc)
 		if exc.IsNone() || exc.HeaderPtr() == nil {
 			return val.NewStringVal("NoneType: None\n")
 		}

@@ -415,7 +415,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		if hasDefault {
 			return defVal
 		}
-		ctx.Raise(val.NewLazyAttributeError(obj.Type(), interned))
+		ctx.Raise(val.NewLazyAttributeErrorCtx(ctx, obj.Type(), interned))
 		return val.NoneVal()
 	}))
 

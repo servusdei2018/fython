@@ -49,7 +49,7 @@ func RaiseIndexError(ctx *ExecContext, msg string) Value {
 
 func RaiseAttributeError(ctx *ExecContext, targetType *PyType, name Value) Value {
 	if ctx != nil {
-		ctx.Raise(NewLazyAttributeError(targetType, InternValue(name)))
+		ctx.Raise(NewLazyAttributeErrorCtx(ctx, targetType, InternValue(name)))
 		return NoneVal()
 	}
 	tpName := "object"

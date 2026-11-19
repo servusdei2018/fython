@@ -973,6 +973,12 @@ func (vm *VM) initBuiltins() {
 	if nextVal, ok := vm.builtins.Get(nameBuiltinNext); ok {
 		vm.builtinNext = nextVal
 	}
+	if hasattrVal, ok := vm.builtins.Get(nameHasattr); ok {
+		vm.builtinHasattr = hasattrVal
+	}
+	if getattrVal, ok := vm.builtins.Get(nameGetattr); ok {
+		vm.builtinGetattr = getattrVal
+	}
 
 	rangeVal := val.TypeVal(val.RangeType)
 	vm.builtinRange = rangeVal
@@ -2400,7 +2406,12 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 					vm.releaseStrJoinState(caller.joinState)
 					caller.joinState = nil
 				}
-				if finishedGen != nil && (mode == genModeForIter || mode == genModeYieldFrom || mode == genModeAwait || mode == genModeStrJoin) {
+				if caller.collectState != nil {
+					vm.releaseCollectState(caller.collectState)
+					caller.collectState = nil
+				}
+				if finishedGen != nil && (mode == genModeForIter || mode == genModeYieldFrom || mode == genModeAwait || mode == genModeStrJoin ||
+					mode == genModeCollectList || mode == genModeCollectTuple || mode == genModeCollectSet || mode == genModeListExtend) {
 					vm.releaseGenerator(finishedGen)
 				}
 				if finishedCoro != nil && (mode == genModeAwait || mode == genModeYieldFrom) {
@@ -2439,6 +2450,7 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 		}
 
 		vm.unhandledException = exc
+		val.ClearEphemeral(exc)
 		vm.lastException = exc
 		if st.activeGen != nil {
 			st.activeGen.State = val.GenClosed
@@ -2920,6 +2932,10 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				}
 			}
 			ip, sp, ctl = vm.opCallIsInstanceSlow(st, inst, ip, sp)
+		case OP_CALL_HASATTR:
+			ip, sp, ctl = vm.opCallHasattr(st, inst, ip, sp)
+		case OP_CALL_GETATTR:
+			ip, sp, ctl = vm.opCallGetattr(st, inst, ip, sp)
 		case OP_CALL_BUILTIN_FAST:
 			argc := int(uint8(inst >> 16))
 			newBase := sp - argc
@@ -3035,6 +3051,9 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 		case OP_RETURN:
 			sp--
 			retVal := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16))
+			if sp > st.base+st.curCO.EffectiveLocals {
+				vm.releaseDeadEphemeralIters(st.stack[st.base+st.curCO.EffectiveLocals : sp])
+			}
 			if retVal.IsString() || retVal.Kind() == val.KindMemoryView {
 				vm.prepareReturnValue(retVal)
 			}
@@ -3194,7 +3213,7 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 					meta = val.TypeType
 				}
 				entry := &st.cache.ic[ip]
-				if entry.Kind == ICKindTypeAttr && entry.ExpectedTypeVer == cls.Version() && entry.ExpectedAuxVer == meta.Version() {
+				if entry.Kind == ICKindTypeAttr && entry.SlotIndex == 0 && entry.ExpectedTypeVer == cls.Version() && entry.ExpectedAuxVer == meta.Version() {
 					recordICSlowHit(ICKindTypeAttr)
 					attrRes = entry.CachedVal
 					goto loadAttrHit
@@ -3246,7 +3265,8 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 		case OP_STORE_ATTR:
 			v := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
 			obj := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
-			if !v.IsString() && v.Kind() != val.KindMemoryView && !val.MultiThreadedFlag.Load() {
+			vhdr := v.HeaderPtr()
+			if (vhdr == nil || ((vhdr.Flags&val.FlagEphemeralAll) == 0 && vhdr.Kind != val.KindMemoryView && (vhdr.Kind != val.KindString || (*val.PyString)(unsafe.Pointer(vhdr)).Buf == nil))) && !val.MultiThreadedFlag.Load() {
 				if instObj := obj.AsInstanceChecked(); instObj != nil {
 					instShape := instObj.Shape
 					instType := instObj.Header.Type
@@ -3267,8 +3287,8 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 							}
 						}
 						entry := &st.cache.ic[ip]
-						if instShape.ID == entry.ExpectedShapeID && typeVer == entry.ExpectedTypeVer {
-							if entry.Kind == ICKindInstanceSlot {
+						if typeVer == entry.ExpectedTypeVer {
+							if entry.Kind == ICKindSlotMember {
 								slotIdx := entry.SlotIndex
 								if uint(slotIdx) < uint(len(instObj.Slots)) {
 									instObj.Slots[slotIdx] = v
@@ -3276,13 +3296,23 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 									ip++
 									continue
 								}
-							} else if entry.Kind == ICKindInstanceTransition && uint(ip) < uint(len(st.cache.transitionIC)) {
-								tc := &st.cache.transitionIC[ip]
-								if tc.OldShape == instShape && tc.NewShape != nil && instObj.ExtendBootstrapSlot(int(tc.SlotIdx), v) {
-									instObj.Shape = tc.NewShape
-									sp -= 2
-									ip++
-									continue
+							} else if instShape.ID == entry.ExpectedShapeID {
+								if entry.Kind == ICKindInstanceSlot {
+									slotIdx := entry.SlotIndex
+									if uint(slotIdx) < uint(len(instObj.Slots)) {
+										instObj.Slots[slotIdx] = v
+										sp -= 2
+										ip++
+										continue
+									}
+								} else if entry.Kind == ICKindInstanceTransition && uint(ip) < uint(len(st.cache.transitionIC)) {
+									tc := &st.cache.transitionIC[ip]
+									if tc.OldShape == instShape && tc.NewShape != nil && instObj.ExtendBootstrapSlot(int(tc.SlotIdx), v) {
+										instObj.Shape = tc.NewShape
+										sp -= 2
+										ip++
+										continue
+									}
 								}
 							}
 						}
@@ -3307,8 +3337,13 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 			top := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
 			if top.IsString() || top.Kind() == val.KindMemoryView {
 				vm.opDetachDupTop(top)
-			} else if hdr := top.HeaderPtr(); hdr != nil && (hdr.Flags&val.FlagEphemeralAll) != 0 {
-				hdr.Flags &^= val.FlagEphemeralAll
+			} else if hdr := top.HeaderPtr(); hdr != nil {
+				if (hdr.Flags & val.FlagEphemeralAll) != 0 {
+					hdr.Flags &^= val.FlagEphemeralAll
+				}
+				if hdr.Kind == val.KindInstance && hdr == vm.lastException.HeaderPtr() {
+					hdr.Flags &^= val.FlagEphemeralAttrErr
+				}
 			}
 			*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16)) = top
 			sp++
@@ -3354,7 +3389,7 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				ip++
 				continue
 			}
-			if top.IsList() || top.IsTuple() || top.IsDict() {
+			if top.IsList() || top.IsTuple() || top.IsDict() || top.IsSet() {
 				*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)) = vm.acquireForIter(top)
 				ip++
 				continue
@@ -4059,7 +4094,7 @@ func (vm *VM) loadMethodSlow(obj, attrName val.Value, ip, sp, frameIdx int, curI
 		return val.UnboundVal(), descr
 	}
 
-	vm.execCtx.Raise(val.NewLazyAttributeError(tp, attrName))
+	vm.execCtx.Raise(val.NewLazyAttributeErrorCtx(&vm.execCtx, tp, attrName))
 	return val.UnboundVal(), val.NoneVal()
 }
 
@@ -4269,7 +4304,7 @@ func (vm *VM) loadAttrInstanceSlow(instObj *val.PyInstance, obj, attrName val.Va
 			return v
 		}
 		if !foundInClass {
-			vm.execCtx.Raise(val.NewLazyAttributeError(instType, attrName))
+			vm.execCtx.Raise(val.NewLazyAttributeErrorCtx(&vm.execCtx, instType, attrName))
 			return val.NoneVal()
 		}
 	}
@@ -4553,7 +4588,7 @@ func (vm *VM) callMethodPICSlowSafe(receiver, attrName val.Value, ip, newBase, a
 func (vm *VM) getAttrSafe(obj, attrName val.Value) val.Value {
 	v, ok := val.LookupAttrOptional(&vm.execCtx, obj, attrName)
 	if !ok && !vm.execCtx.HasException() {
-		vm.execCtx.Raise(val.NewLazyAttributeError(obj.Type(), val.InternValue(attrName)))
+		vm.execCtx.Raise(val.NewLazyAttributeErrorCtx(&vm.execCtx, obj.Type(), val.InternValue(attrName)))
 		return val.NoneVal()
 	}
 	return v

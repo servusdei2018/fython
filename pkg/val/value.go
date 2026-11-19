@@ -87,6 +87,12 @@ const (
 	FlagEphemeralGen uint8 = 1 << 6
 	// FlagEphemeralIter marks a pooled PyIter owned exclusively by OP_GET_ITER -> OP_FOR_ITER.
 	FlagEphemeralIter uint8 = 1 << 7
+	// FlagEphemeralAttrErr shares bit 0 on KindInstance (never KindString) for
+	// pooled lazy AttributeError instances not yet bound to a variable or exc_info.
+	FlagEphemeralAttrErr uint8 = FlagInterned
+	// FlagEphemeralTuple shares bit 3 on KindTuple for short-lived opBuildTuple
+	// results consumed immediately by OP_CALL_FUNCTION_EX or OP_UNPACK_SEQUENCE.
+	FlagEphemeralTuple uint8 = FlagEphemeralDict
 	// FlagEphemeralAll masks all ephemeral ownership flags cleared when a value
 	// escapes via stack duplication or container/variable storage.
 	FlagEphemeralAll uint8 = FlagEphemeralSuper | FlagEphemeralDict | FlagEphemeralFrameDict | FlagEphemeralCoro | FlagEphemeralGen | FlagEphemeralIter
@@ -95,8 +101,13 @@ const (
 // ClearEphemeral clears any ephemeral ownership flags on v when v is stored
 // into a variable or container or duplicated on the evaluation stack.
 func ClearEphemeral(v Value) {
-	if hdr := v.HeaderPtr(); hdr != nil && (hdr.Flags&FlagEphemeralAll) != 0 {
-		hdr.Flags &^= FlagEphemeralAll
+	if hdr := v.HeaderPtr(); hdr != nil {
+		if (hdr.Flags & FlagEphemeralAll) != 0 {
+			hdr.Flags &^= FlagEphemeralAll
+		}
+		if hdr.Kind == KindInstance && (hdr.Flags&FlagEphemeralAttrErr) != 0 {
+			hdr.Flags &^= FlagEphemeralAttrErr
+		}
 	}
 }
 

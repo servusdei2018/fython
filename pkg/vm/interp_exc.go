@@ -12,6 +12,7 @@ func (vm *VM) opRaise(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl
 	switch argc {
 	case 0:
 		exc = vm.lastException
+		val.ClearEphemeral(exc)
 		if exc.IsNone() || exc.HeaderPtr() == nil {
 			exc = val.NewRuntimeError("No active exception to reraise")
 		}
@@ -77,12 +78,16 @@ func (vm *VM) opPushExcInfo(st *loopState, ip, sp int) (int, int, loopCtl) {
 
 //go:noinline
 func (vm *VM) opPopExcept(st *loopState, ip, sp int) (int, int, loopCtl) {
+	discarded := vm.lastException
 	n := len(vm.excStack)
 	if n > 0 {
 		vm.lastException = vm.excStack[n-1]
 		vm.excStack = vm.excStack[:n-1]
 	} else {
 		vm.lastException = val.NoneVal()
+	}
+	if hdr := discarded.HeaderPtr(); hdr != nil && hdr.Kind == val.KindInstance && (hdr.Flags&val.FlagEphemeralAttrErr) != 0 {
+		val.ReleaseLazyAttributeErrorCtx(&vm.execCtx, discarded)
 	}
 	ip++
 	return ip, sp, ctlNext
@@ -114,6 +119,7 @@ func (vm *VM) opCheckExcMatchStar(st *loopState, ip, sp int) (int, int, loopCtl)
 			matches = val.IsSubclass(exc.Type(), targetType.AsType())
 		}
 		if matches {
+			val.ClearEphemeral(exc)
 			stack[sp-2] = val.NoneVal()
 			stack[sp-1] = exc
 			stack[sp] = val.BoolVal(true)
@@ -129,6 +135,9 @@ func (vm *VM) opCheckExcMatchStar(st *loopState, ip, sp int) (int, int, loopCtl)
 //go:noinline
 func (vm *VM) opReturnSlow(st *loopState, ip, sp int, retVal val.Value) (int, int, loopCtl) {
 	stack := st.stack
+	if st.curCO != nil && st.frameIdx != st.genFrameIdx && sp > st.base+st.curCO.EffectiveLocals {
+		vm.releaseDeadEphemeralIters(stack[st.base+st.curCO.EffectiveLocals : sp])
+	}
 	if st.curCO != nil && st.curCO.VarKWSafe && st.frameIdx != st.genFrameIdx && vm.frames[st.frameIdx].shadowFrame == nil {
 		idx := st.base + st.curCO.VarKWIdx
 		if idx >= 0 && idx < len(stack) {
@@ -161,8 +170,11 @@ func (vm *VM) opReturnSlow(st *loopState, ip, sp int, retVal val.Value) (int, in
 		retSP := caller.retSP
 		js := caller.joinState
 		caller.joinState = nil
+		cs := caller.collectState
+		caller.collectState = nil
 		vm.restoreCallerFrame(st, caller)
-		if mode == genModeForIter || mode == genModeYieldFrom || mode == genModeAwait || mode == genModeStrJoin {
+		if mode == genModeForIter || mode == genModeYieldFrom || mode == genModeAwait || mode == genModeStrJoin ||
+			mode == genModeCollectList || mode == genModeCollectTuple || mode == genModeCollectSet || mode == genModeListExtend {
 			vm.releaseGenerator(gen)
 		}
 		switch mode {
@@ -173,6 +185,25 @@ func (vm *VM) opReturnSlow(st *loopState, ip, sp int, retVal val.Value) (int, in
 				vm.releaseStrJoinState(js)
 			} else {
 				out = val.NewStringVal("")
+			}
+			st.stack[retSP] = out
+			return callerIP, retSP + 1, ctlReload
+		case genModeCollectList, genModeCollectTuple, genModeCollectSet, genModeListExtend:
+			var out val.Value
+			if cs != nil {
+				out = cs.materialize(mode)
+				vm.releaseCollectState(cs)
+			} else {
+				switch mode {
+				case genModeCollectList:
+					out = val.NewListVal()
+				case genModeCollectTuple:
+					out = val.EmptyTupleVal()
+				case genModeCollectSet:
+					out = val.NewSetVal()
+				default:
+					out = val.NoneVal()
+				}
 			}
 			st.stack[retSP] = out
 			return callerIP, retSP + 1, ctlReload

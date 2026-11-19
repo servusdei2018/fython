@@ -648,25 +648,48 @@ func OptimizeCodeObject(co *CodeObject) {
 			continue
 		}
 		gName := co.Consts[nameIdx]
-		if gName == nameLen && !isJumpTarget[i+1] && !isJumpTarget[i+2] {
-			op1 := DecodeOpcode(view[i+1])
-			w2 := view[i+2]
-			if isSimpleLoadOp(op1) && DecodeOpcode(w2) == OP_CALL &&
-				DecodeArgA(w2) == 1 && DecodeArgBx(w2) == CallFromStack {
-				code = fusionCopy(co, code)
-				code[i+2] = ReplaceOpcode(w2, OP_CALL_LEN)
-				view = code
+		switch gName {
+		case nameLen:
+			if !isJumpTarget[i+1] && !isJumpTarget[i+2] {
+				op1 := DecodeOpcode(view[i+1])
+				w2 := view[i+2]
+				if isSimpleLoadOp(op1) && DecodeOpcode(w2) == OP_CALL &&
+					DecodeArgA(w2) == 1 && DecodeArgBx(w2) == CallFromStack {
+					code = fusionCopy(co, code)
+					code[i+2] = ReplaceOpcode(w2, OP_CALL_LEN)
+					view = code
+				}
 			}
-		} else if i+3 < len(view) && gName == nameIsInstance &&
-			!isJumpTarget[i+1] && !isJumpTarget[i+2] && !isJumpTarget[i+3] {
-			op1 := DecodeOpcode(view[i+1])
-			op2 := DecodeOpcode(view[i+2])
-			w3 := view[i+3]
-			if isSimpleLoadOp(op1) && isSimpleLoadOp(op2) && DecodeOpcode(w3) == OP_CALL &&
-				DecodeArgA(w3) == 2 && DecodeArgBx(w3) == CallFromStack {
-				code = fusionCopy(co, code)
-				code[i+3] = ReplaceOpcode(w3, OP_CALL_ISINSTANCE)
-				view = code
+		case nameIsInstance, nameHasattr, nameGetattr:
+			if i+3 < len(view) && !isJumpTarget[i+1] && !isJumpTarget[i+2] && !isJumpTarget[i+3] {
+				op1 := DecodeOpcode(view[i+1])
+				op2 := DecodeOpcode(view[i+2])
+				if isSimpleLoadOp(op1) && isSimpleLoadOp(op2) {
+					w3 := view[i+3]
+					if DecodeOpcode(w3) == OP_CALL && DecodeArgA(w3) == 2 && DecodeArgBx(w3) == CallFromStack {
+						var qOp Opcode
+						switch gName {
+						case nameIsInstance:
+							qOp = OP_CALL_ISINSTANCE
+						case nameHasattr:
+							qOp = OP_CALL_HASATTR
+						default:
+							qOp = OP_CALL_GETATTR
+						}
+						code = fusionCopy(co, code)
+						code[i+3] = ReplaceOpcode(w3, qOp)
+						view = code
+					} else if gName == nameGetattr && i+4 < len(view) && !isJumpTarget[i+4] {
+						op3 := DecodeOpcode(view[i+3])
+						w4 := view[i+4]
+						if isSimpleLoadOp(op3) && DecodeOpcode(w4) == OP_CALL &&
+							DecodeArgA(w4) == 3 && DecodeArgBx(w4) == CallFromStack {
+							code = fusionCopy(co, code)
+							code[i+4] = ReplaceOpcode(w4, OP_CALL_GETATTR)
+							view = code
+						}
+					}
+				}
 			}
 		}
 	}

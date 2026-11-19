@@ -90,6 +90,49 @@ func (vm *VM) cacheForPropertyFGet(fget val.Value) *VMCodeCache {
 	return cc
 }
 
+func resolveCachedTypeReflectionAttr(cls, meta *val.PyType, attrName val.Value) (val.Value, bool) {
+	switch attrName {
+	case nameClass:
+		return val.TypeVal(meta), true
+	case nameDunderName:
+		return val.InternString(cls.Name), true
+	case nameQualname:
+		if cls.Dict != nil {
+			if qn, ok := cls.Dict.Get(nameQualname); ok {
+				return qn, true
+			}
+		}
+		return val.InternString(cls.Name), true
+	case nameTypeParams:
+		if cls.Dict != nil {
+			if tp, ok := cls.Dict.Get(nameTypeParams); ok {
+				return tp, true
+			}
+		}
+		return val.EmptyTupleVal(), true
+	case nameModule:
+		if cls.Dict != nil {
+			if modVal, ok := cls.Dict.Get(nameModule); ok {
+				return modVal, true
+			}
+		}
+		return nameBuiltins, true
+	case nameBases:
+		basesItems := make([]val.Value, len(cls.Bases))
+		for i, b := range cls.Bases {
+			basesItems[i] = val.TypeVal(b)
+		}
+		return val.NewTupleFromSlice(basesItems), true
+	case nameMRO:
+		mroItems := make([]val.Value, len(cls.MRO))
+		for i, m := range cls.MRO {
+			mroItems[i] = val.TypeVal(m)
+		}
+		return val.NewTupleFromSlice(mroItems), true
+	}
+	return val.Value{}, false
+}
+
 //go:noinline
 func (vm *VM) opLoadAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
 	recordLoadAttrSlow()
@@ -308,20 +351,47 @@ func (vm *VM) opLoadAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 		metaVer := meta.Version()
 		if entry.Kind == ICKindTypeAttr && entry.ExpectedTypeVer == clsVer && entry.ExpectedAuxVer == metaVer {
 			recordICSlowHit(ICKindTypeAttr)
-			stack[sp-1] = entry.CachedVal
+			if entry.SlotIndex == 1 {
+				stack[sp-1] = val.NewBoundMethodVal(obj, entry.CachedVal)
+			} else {
+				stack[sp-1] = entry.CachedVal
+			}
 			return ip + 1, sp, ctlNext
 		}
 		attrName := val.InternValue(consts[uint16(inst)])
-		if meta.Flags&val.FlagCustomGetAttribute == 0 && attrName != nameDunderDoc {
+		if meta.Flags&val.FlagCustomGetAttribute == 0 {
+			metaDescr, _, metaFound := meta.LookupMRO(attrName)
 			metaHasDataDescr := false
-			if mDescr, _, mOK := meta.LookupMRO(attrName); mOK {
-				mt := mDescr.Type()
-				if mDescr.IsDataDescriptor() || (mt.Slots.TpDescrGet != nil && mt.Slots.TpDescrSet != nil) {
+			if metaFound {
+				mt := metaDescr.Type()
+				if metaDescr.IsDataDescriptor() || (mt.Slots.TpDescrGet != nil && mt.Slots.TpDescrSet != nil) {
 					metaHasDataDescr = true
 				}
 			}
 			if !metaHasDataDescr {
-				if descr, _, ok := cls.LookupMRO(attrName); ok {
+				if attrName == nameDunderDoc {
+					docVal := val.NoneVal()
+					cacheable := true
+					if cls.Dict != nil {
+						if dVal, ok := cls.Dict.Get(attrName); ok {
+							if dVal.Type().Slots.TpDescrGet != nil {
+								cacheable = false
+							} else {
+								docVal = dVal
+							}
+						}
+					}
+					if cacheable {
+						*entry = ICSlot{
+							Kind:            ICKindTypeAttr,
+							ExpectedTypeVer: clsVer,
+							ExpectedAuxVer:  metaVer,
+							CachedVal:       docVal,
+						}
+						stack[sp-1] = docVal
+						return ip + 1, sp, ctlNext
+					}
+				} else if descr, _, ok := cls.LookupMRO(attrName); ok {
 					dt := descr.Type()
 					switch {
 					case dt.Slots.TpDescrGet == nil || descr.IsFunction() || descr.IsBuiltinFunc():
@@ -342,6 +412,28 @@ func (vm *VM) opLoadAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 							CachedVal:       smVal,
 						}
 						stack[sp-1] = smVal
+						return ip + 1, sp, ctlNext
+					case descr.Kind() == val.KindClassMethod:
+						cmVal := descr.AsClassMethod().Callable
+						*entry = ICSlot{
+							Kind:            ICKindTypeAttr,
+							ExpectedTypeVer: clsVer,
+							ExpectedAuxVer:  metaVer,
+							SlotIndex:       1,
+							CachedVal:       cmVal,
+						}
+						stack[sp-1] = val.NewBoundMethodVal(obj, cmVal)
+						return ip + 1, sp, ctlNext
+					}
+				} else if !metaFound {
+					if reflVal, okRefl := resolveCachedTypeReflectionAttr(cls, meta, attrName); okRefl {
+						*entry = ICSlot{
+							Kind:            ICKindTypeAttr,
+							ExpectedTypeVer: clsVer,
+							ExpectedAuxVer:  metaVer,
+							CachedVal:       reflVal,
+						}
+						stack[sp-1] = reflVal
 						return ip + 1, sp, ctlNext
 					}
 				}

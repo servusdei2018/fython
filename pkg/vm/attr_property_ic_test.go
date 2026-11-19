@@ -301,3 +301,143 @@ for _ in range(50):
 		t.Fatalf("expected non-zero LoadAttrInlinePropHitCount")
 	}
 }
+
+func TestTypeAttrAndStoreAttrFastPaths(t *testing.T) {
+	eng, v := runPySource(t, `
+import sys
+
+# 1. __slots__ + string attribute stores + >6-slot shape transitions
+class SlottedBox:
+    __slots__ = ("a", "b", "c")
+    def __init__(self, a, b, c):
+        self.a = a
+        self.b = b
+        self.c = c
+
+for i in range(10):
+    sb = SlottedBox("s_" + str(i), i, "tail")
+    assert sb.a == "s_" + str(i) and sb.b == i and sb.c == "tail"
+
+class WideBox:
+    def __init__(self, n):
+        self.f0 = "a"
+        self.f1 = "b"
+        self.f2 = n
+        self.f3 = n + 1
+        self.f4 = n + 2
+        self.f5 = n + 3
+        self.f6 = "wide_str"
+        self.f7 = n + 4
+
+for i in range(10):
+    wb = WideBox(i)
+    assert wb.f0 == "a" and wb.f6 == "wide_str" and wb.f7 == i + 4
+
+# 2. type.__doc__, @classmethod via LOAD_ATTR, reflection attrs, and invalidation
+class MetaDoc:
+    """initial doc"""
+    @classmethod
+    def make(cls, x):
+        return (cls.__name__, x)
+
+class NoDoc:
+    pass
+
+for _ in range(10):
+    assert MetaDoc.__doc__ == "initial doc"
+    assert NoDoc.__doc__ is None
+    fn = MetaDoc.make
+    assert fn(42) == ("MetaDoc", 42)
+    assert MetaDoc.__name__ == "MetaDoc"
+    assert MetaDoc in MetaDoc.__mro__
+
+MetaDoc.__doc__ = "updated doc"
+assert MetaDoc.__doc__ == "updated doc"
+
+# 3. del inst.attr falling back to class attr under hasattr/getattr PIC
+class Shadowed:
+    val = "from_class"
+    def __init__(self):
+        self.val = "from_inst"
+
+sh = Shadowed()
+for i in range(5):
+    assert hasattr(sh, "val")
+    assert getattr(sh, "val") == "from_inst"
+del sh.val
+assert hasattr(sh, "val")
+assert getattr(sh, "val") == "from_class"
+
+# 4. Polymorphic hasattr / getattr + AttributeError binding & sys.exc_info safety
+class Markup(str):
+    def __html__(self):
+        return self
+
+samples = ["plain", Markup("<b>ok</b>"), 123, {"k": 1}]
+html_flags = []
+for _ in range(5):
+    for item in samples:
+        html_flags.append(hasattr(item, "__html__"))
+assert html_flags == [False, True, False, False] * 5
+
+caught_list = []
+exc_info_list = []
+d = {"score": 10}
+for i in range(6):
+    try:
+        getattr(d, "missing_" + str(i % 2))
+    except AttributeError as e:
+        caught_list.append(e)
+    try:
+        getattr(d, "missing_" + str(i % 2))
+    except AttributeError:
+        t_exc, v_exc, _ = sys.exc_info()
+        exc_info_list.append(v_exc)
+assert len(caught_list) == 6
+assert all("dict" in str(e) for e in caught_list)
+assert all("dict" in str(e) for e in exc_info_list)
+`)
+	defer eng.ReleaseVM(v)
+}
+
+func TestEarlyReturnIterAndZeroCopyTupleSlice(t *testing.T) {
+	eng, v := runPySource(t, `
+def find_in_set(s, target):
+    for x in s:
+        if x == target:
+            return True
+    return False
+
+def find_in_list(xs, target):
+    for x in xs:
+        if x == target:
+            return x
+    return -1
+
+fs = {"a", "b", "c", "d"}
+for _ in range(50):
+    assert find_in_set(fs, "b")
+    assert not find_in_set(fs, "z")
+    assert find_in_list([10, 20, 30], 20) == 20
+    assert find_in_list((1, 2, 3), 2) == 2
+
+# Verify NewTupleView clears FlagEphemeralTuple before sharing backing slice
+def check_slice_from_unpacked():
+    kept = []
+    for _ in range(10):
+        a, b = (10, 20)
+        t = (a, b, 30, 40)
+        sub = t[1:4]
+        kept.append(sub)
+        sub2 = (a, b)[:]
+        kept.append(sub2)
+    return kept
+
+res = check_slice_from_unpacked()
+assert res[0] == (20, 30, 40)
+assert res[1] == (10, 20)
+assert res[-2] == (20, 30, 40)
+assert res[-1] == (10, 20)
+`)
+	defer eng.ReleaseVM(v)
+}

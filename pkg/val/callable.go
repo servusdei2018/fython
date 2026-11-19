@@ -25,6 +25,10 @@ var CoroSendBuiltin Value
 // enabling O(1) pointer-equality interception in the VM call handlers.
 var StrJoinBuiltin Value
 
+// ListExtendBuiltin is the cached PyBuiltinFunc Value for list.extend,
+// enabling O(1) pointer-equality interception in the VM call handlers.
+var ListExtendBuiltin Value
+
 // PyTuple represents an immutable sequence of Values on the heap (used for kwnames and tuple constants).
 // Tuples with up to 2 elements store their backing array inline inside the same allocation (80 B size class).
 // Header MUST be at byte offset 0.
@@ -33,6 +37,19 @@ type PyTuple struct {
 	Items  []Value
 	Attrs  *PyDict
 	inline [2]Value
+}
+
+// SetInline copies up to 2 elements into t's inline storage and binds t.Items.
+func (t *PyTuple) SetInline(src []Value) {
+	n := len(src)
+	copy(t.inline[:n], src)
+	t.Items = t.inline[:n]
+}
+
+// ClearInline zeroes t's inline storage and clears t.Items for freelist reuse.
+func (t *PyTuple) ClearInline() {
+	t.inline = [2]Value{}
+	t.Items = nil
 }
 
 // PyBuiltinFunc represents a zero-allocation native Go built-in callable using the Vectorcall convention.
@@ -1046,7 +1063,7 @@ func superGetAttr(ctx *ExecContext, superObj, name Value) Value {
 	if !ok {
 		if ctx != nil {
 			if !ctx.HasException() {
-				ctx.Raise(NewLazyAttributeError(superObj.Type(), InternValue(name)))
+				ctx.Raise(NewLazyAttributeErrorCtx(ctx, superObj.Type(), InternValue(name)))
 			}
 			return NoneVal()
 		}
@@ -4990,12 +5007,27 @@ func initTypes() {
 		return NoneVal()
 	}))
 
-	ListType.Dict.Set(InternString("extend"), NewBuiltinFuncVal("extend", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+	ListExtendBuiltin = NewBuiltinFuncVal("extend", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
 			ctx.Raise(NewException(TypeErrorType, "extend() takes exactly one argument"))
 			return NoneVal()
 		}
 		list := args[0].AsList()
+		if args[1].IsList() {
+			src := args[1].AsList()
+			if src == list {
+				dup := make([]Value, len(src.Items))
+				copy(dup, src.Items)
+				list.Items = append(list.Items, dup...)
+			} else {
+				list.Items = append(list.Items, src.Items...)
+			}
+			return NoneVal()
+		}
+		if args[1].IsTuple() {
+			list.Items = append(list.Items, args[1].AsTuple().Items...)
+			return NoneVal()
+		}
 		it := NewIterVal(args[1]).AsIter()
 		for {
 			item, ok := it.Next()
@@ -5005,7 +5037,8 @@ func initTypes() {
 			list.Append(item)
 		}
 		return NoneVal()
-	}))
+	})
+	ListType.Dict.Set(InternString("extend"), ListExtendBuiltin)
 
 	ListType.Dict.Set(InternString("pop"), NewBuiltinFuncVal("pop", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
@@ -7033,18 +7066,6 @@ func initTypes() {
 		return 0
 	}
 	SetType.Slots.TpIter = func(ctx *ExecContext, o Value) Value {
-		if o.IsSet() {
-			items := o.AsSet().Items()
-			idx := 0
-			return NewIterValWithNext(func() (Value, bool) {
-				if idx >= len(items) {
-					return NoneVal(), false
-				}
-				v := items[idx]
-				idx++
-				return v, true
-			})
-		}
 		return NewIterVal(o)
 	}
 
@@ -7064,7 +7085,37 @@ func initTypes() {
 		if len(args) == 0 {
 			return NewSetVal()
 		}
-		items := ExtractIterableItems(ctx, args[0])
+		arg := args[0]
+		switch {
+		case arg.IsList():
+			return NewSetVal(arg.AsList().Items...)
+		case arg.IsTuple():
+			return NewSetVal(arg.AsTuple().Items...)
+		case arg.IsSet():
+			s := NewSetVal().AsSet()
+			for _, e := range arg.AsSet().DictEntries() {
+				if e.Active {
+					s.Add(e.Key)
+				}
+			}
+			return SetVal(s)
+		case arg.IsDict():
+			s := NewSetVal().AsSet()
+			d := arg.AsDict()
+			if d.Live != nil {
+				return NewSetVal(d.Keys()...)
+			}
+			for _, e := range d.Entries {
+				if e.Active {
+					s.Add(e.Key)
+				}
+			}
+			return SetVal(s)
+		}
+		items := ExtractIterableItems(ctx, arg)
+		if ctx != nil && ctx.HasException() {
+			return NoneVal()
+		}
 		return NewSetVal(items...)
 	}
 

@@ -46,6 +46,25 @@ const (
 	ICKindMethodDescr               // Monomorphic native method descriptor (CachedVal=BuiltinFunc, NativeFn=fn, ExpectedTypeVer=type ver, ExpectedShapeID=shape ID or 0)
 )
 
+const (
+	attrQueryNone uint8 = iota
+	attrQueryMiss
+	attrQuerySlot
+	attrQueryClassAttr
+	attrQueryClassFunc
+)
+
+// AttrQueryPICEntry caches a 4-way polymorphic hasattr/getattr lookup keyed on
+// (Name, TypeVer, ShapeID) so repeated attribute probes resolve in O(1).
+type AttrQueryPICEntry struct {
+	Name      val.Value
+	CachedVal val.Value
+	TypeVer   uint64
+	ShapeID   uint32
+	SlotIndex int32
+	Kind      uint8
+}
+
 // AttrPICEntry represents a single slot in a 4-way polymorphic inline cache for attribute access.
 //
 // Shape identifies the concrete type and the absence of any shadowing instance
@@ -136,12 +155,16 @@ const (
 	genModeNone uint8 = iota
 	genModeForIter
 	genModeYieldFrom
-	genModeNext        // next(gen): raise StopIteration(retVal) on exhaustion
-	genModeNextDefault // next(gen, default): return genDefault on exhaustion
-	genModeSend        // gen.send(v): raise StopIteration(retVal) on exhaustion
-	genModeAwait       // await aw: store retVal at stack[retSP-1] on completion
-	genModeCoroSend    // coro.send(v): store retVal at stack[retSP] on completion
-	genModeStrJoin     // sep.join(gen): drain yielded strings directly into CallFrame.joinState
+	genModeNext         // next(gen): raise StopIteration(retVal) on exhaustion
+	genModeNextDefault  // next(gen, default): return genDefault on exhaustion
+	genModeSend         // gen.send(v): raise StopIteration(retVal) on exhaustion
+	genModeAwait        // await aw: store retVal at stack[retSP-1] on completion
+	genModeCoroSend     // coro.send(v): store retVal at stack[retSP] on completion
+	genModeStrJoin      // sep.join(gen): drain yielded strings directly into CallFrame.joinState
+	genModeCollectList  // list(gen): drain yielded values directly into CallFrame.collectState
+	genModeCollectTuple // tuple(gen): drain yielded values directly into CallFrame.collectState
+	genModeCollectSet   // set(gen): drain yielded values directly into CallFrame.collectState
+	genModeListExtend   // list.extend(gen): drain yielded values directly into CallFrame.collectState.list
 )
 
 type strJoinState struct {
@@ -150,6 +173,12 @@ type strJoinState struct {
 	sepLen uint8
 	first  bool
 	count  int
+}
+
+type collectState struct {
+	items []val.Value
+	set   *val.PySet
+	list  *val.PyList
 }
 
 // CallFrame is an unboxed value struct stored in the contiguous VM.frames slab.
@@ -173,14 +202,15 @@ type CallFrame struct {
 	// Inline generator/coroutine linkage. When genMode != genModeNone, the child
 	// frame is executing on its own stack slice, and stack holds the caller's
 	// stack slice to restore on yield/suspend/return/unwind.
-	stack       []val.Value
-	activeGen   *val.PyGenerator
-	activeCoro  *val.PyCoroutine
-	genFrameIdx int
-	genMode     uint8
-	genDefault  val.Value
-	genExitIP   int
-	joinState   *strJoinState
+	stack        []val.Value
+	activeGen    *val.PyGenerator
+	activeCoro   *val.PyCoroutine
+	genFrameIdx  int
+	genMode      uint8
+	genDefault   val.Value
+	genExitIP    int
+	joinState    *strJoinState
+	collectState *collectState
 	// initInstance holds the freshly allocated receiver for an in-loop
 	// __init__ call. When set, OP_RETURN substitutes it for a None
 	// return and raises TypeError otherwise.
@@ -326,7 +356,8 @@ func reloadCode(co *CodeObject, cache *VMCodeCache, gen int32) []uint32 {
 		copy(priv, newStream)
 		for i, oldInst := range cache.active {
 			switch DecodeOpcode(oldInst) {
-			case OP_CALL_PY_EXACT_ARGS, OP_CALL_BUILTIN_FAST, OP_CALL_LEN, OP_CALL_ISINSTANCE, OP_CALL_TYPE_INIT:
+			case OP_CALL_PY_EXACT_ARGS, OP_CALL_BUILTIN_FAST, OP_CALL_LEN, OP_CALL_ISINSTANCE, OP_CALL_TYPE_INIT,
+				OP_CALL_HASATTR, OP_CALL_GETATTR:
 				if DecodeOpcode(priv[i]) == OP_CALL {
 					priv[i] = oldInst
 				}
@@ -414,6 +445,7 @@ type VMCodeCache struct {
 	ic           []ICSlot
 	methodPIC    [][4]val.MethodPICEntry
 	attrPIC      [][4]AttrPICEntry
+	attrQueryPIC [][4]AttrQueryPICEntry
 	transitionIC []TransitionICEntry
 	kwPIC        [][2]KwPICEntry
 	// hotness counts how often this VM executed the code object. It is
@@ -442,6 +474,13 @@ func (c *VMCodeCache) ensureAttrPIC() [][4]AttrPICEntry {
 		c.attrPIC = make([][4]AttrPICEntry, len(c.ic))
 	}
 	return c.attrPIC
+}
+
+func (c *VMCodeCache) ensureAttrQueryPIC() [][4]AttrQueryPICEntry {
+	if len(c.attrQueryPIC) < len(c.ic) {
+		c.attrQueryPIC = make([][4]AttrQueryPICEntry, len(c.ic))
+	}
+	return c.attrQueryPIC
 }
 
 func (c *VMCodeCache) ensureTransitionIC() []TransitionICEntry {
@@ -610,6 +649,8 @@ type VM struct {
 	builtinIsInstance    val.Value
 	builtinNext          val.Value
 	builtinSuper         val.Value
+	builtinHasattr       val.Value
+	builtinGetattr       val.Value
 	strScratch           []byte
 	internPool           *val.InternPool
 	execCtx              val.ExecContext
@@ -634,9 +675,11 @@ type VM struct {
 	coroFreeList         []*val.PyCoroutine
 	genFreeList          []*val.PyGenerator
 	iterFreeList         []*val.PyIter
+	tupleFreeList        []*val.PyTuple
 	superFreeList        []*val.PySuper
 	dictFreeList         []*val.PyDict
 	strJoinPool          []*strJoinState
+	collectPool          []*collectState
 	loopStatePool        []*loopState
 	genStackPools        [4][][]val.Value
 	genCellValPools      [8][][]val.Value
@@ -812,6 +855,8 @@ func (vm *VM) acquireForIter(obj val.Value) val.Value {
 		it.Kind = val.IterKindTuple
 	case obj.IsDict():
 		it.Kind = val.IterKindDict
+	case obj.IsSet():
+		it.Kind = val.IterKindSet
 	default:
 		it.Kind = val.IterKindInvalid
 	}
@@ -829,8 +874,47 @@ func (vm *VM) releaseForIter(it *val.PyIter) {
 	it.Cur = 0
 	it.Stop = 0
 	it.Step = 0
-	if len(vm.iterFreeList) < 128 {
+	if len(vm.iterFreeList) < 256 {
 		vm.iterFreeList = append(vm.iterFreeList, it)
+	}
+}
+
+//go:noinline
+func (vm *VM) releaseDeadEphemeralIters(dead []val.Value) {
+	for i := range dead {
+		v := dead[i]
+		if v.IsIter() && (v.HeaderPtr().Flags&val.FlagEphemeralIter) != 0 {
+			vm.releaseForIter(v.AsIter())
+		}
+	}
+}
+
+func (vm *VM) acquireEphemeralTuple(src []val.Value) val.Value {
+	var t *val.PyTuple
+	if n := len(vm.tupleFreeList); n > 0 {
+		t = vm.tupleFreeList[n-1]
+		vm.tupleFreeList[n-1] = nil
+		vm.tupleFreeList = vm.tupleFreeList[:n-1]
+	} else {
+		t = &val.PyTuple{}
+	}
+	t.Header = val.ObjectHeader{Kind: val.KindTuple, Flags: val.FlagEphemeralTuple, Type: val.TupleType}
+	t.Attrs = nil
+	t.SetInline(src)
+	return val.ObjectVal(&t.Header)
+}
+
+func (vm *VM) releaseEphemeralTupleVal(v val.Value) {
+	if !v.IsTuple() || (v.HeaderPtr().Flags&val.FlagEphemeralTuple) == 0 {
+		return
+	}
+	t := v.AsTuple()
+	t.Header.Flags = 0
+	t.Header.Hash = 0
+	t.Attrs = nil
+	t.ClearInline()
+	if len(vm.tupleFreeList) < 128 {
+		vm.tupleFreeList = append(vm.tupleFreeList, t)
 	}
 }
 
@@ -952,6 +1036,10 @@ func (vm *VM) Reset() {
 			if js := vm.frames[i].joinState; js != nil {
 				vm.frames[i].joinState = nil
 				vm.releaseStrJoinState(js)
+			}
+			if cs := vm.frames[i].collectState; cs != nil {
+				vm.frames[i].collectState = nil
+				vm.releaseCollectState(cs)
 			}
 		}
 		clear(vm.frames[:fLimit])
@@ -1287,6 +1375,7 @@ func (vm *VM) LastException() val.Value {
 	if vm.lastException.HeaderPtr() == nil {
 		return val.NoneVal()
 	}
+	val.ClearEphemeral(vm.lastException)
 	return vm.lastException
 }
 

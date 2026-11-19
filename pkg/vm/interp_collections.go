@@ -273,10 +273,16 @@ func (vm *VM) opBinarySlice(st *loopState, ip, sp int) (int, int, loopCtl) {
 		items := container.AsTuple().Items
 		start, stop, _, sliceLen, err := val.NormalizeSliceIndices(startVal, stopVal, val.NoneVal(), len(items))
 		if err == nil {
-			if sliceLen == 0 {
-				stack[sp-3] = val.NewTupleVal()
-			} else {
-				stack[sp-3] = val.NewTupleVal(items[start:stop]...)
+			switch {
+			case sliceLen == 0:
+				stack[sp-3] = val.EmptyTupleVal()
+			case start == 0 && stop == len(items) && container.Type() == val.TupleType:
+				stack[sp-3] = container
+			case sliceLen > 2 && (len(items) <= 32 || sliceLen*2 >= len(items)):
+				val.ClearEphemeral(container)
+				stack[sp-3] = val.NewTupleView(items[start:stop:stop])
+			default:
+				stack[sp-3] = val.NewTupleFromSlice(items[start:stop])
 			}
 			sp -= 2
 			ip++
@@ -374,6 +380,9 @@ func (vm *VM) opUnpackSequence(st *loopState, inst uint32, ip, sp int) (int, int
 	for i := count - 1; i >= 0; i-- {
 		stack[sp] = items[i]
 		sp++
+	}
+	if seq.IsTuple() {
+		vm.releaseEphemeralTupleVal(seq)
 	}
 	ip++
 	return ip, sp, ctlReload
@@ -698,10 +707,7 @@ func (vm *VM) opListToTuple(st *loopState, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
 	listVal := stack[sp-1]
 	if listVal.IsList() {
-		items := listVal.AsList().Items
-		copied := make([]val.Value, len(items))
-		copy(copied, items)
-		stack[sp-1] = val.NewTupleVal(copied...)
+		stack[sp-1] = val.NewTupleFromSlice(listVal.AsList().Items)
 	}
 	ip++
 	return ip, sp, ctlNext
@@ -789,6 +795,13 @@ func (vm *VM) opBuildTuple(st *loopState, inst uint32, ip, sp int) (int, int, lo
 		val.ClearEphemeral(stack[i])
 		val.DetachStringBuf(stack[i])
 		markViewEscaped(stack[i])
+	}
+	if count <= 2 && ip+1 < st.codeLen && !val.MultiThreadedFlag.Load() {
+		opNext := DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4)))
+		if opNext == OP_CALL_FUNCTION_EX || opNext == OP_UNPACK_SEQUENCE {
+			stack[base] = vm.acquireEphemeralTuple(stack[base:sp])
+			return ip + 1, base + 1, ctlNext
+		}
 	}
 	stack[base] = val.NewTupleFromSlice(stack[base:sp])
 	return ip + 1, base + 1, ctlNext

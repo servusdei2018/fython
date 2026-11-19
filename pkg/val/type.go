@@ -17,12 +17,13 @@ var ErrInconsistentMRO = errors.New("val: Cannot create a consistent method reso
 // ExecContext bridges TypeSlots and descriptor execution back to the active VM
 // without circular package imports or interface/slice heap escapes.
 type ExecContext struct {
-	Stack           []Value
-	SP              int
-	CallHook        func(ctx *ExecContext, callable Value, argBase int, nargs int, kwnames []Value) Value
-	ActiveException Value
-	VM              any
-	ThreadID        int64
+	Stack               []Value
+	SP                  int
+	CallHook            func(ctx *ExecContext, callable Value, argBase int, nargs int, kwnames []Value) Value
+	ActiveException     Value
+	VM                  any
+	ThreadID            int64
+	LazyAttrErrFreeList []*PyInstance
 }
 
 // AcquireExecContextHook allows standalone comparison/hashing helpers in pkg/val
@@ -661,6 +662,11 @@ var (
 	DunderOrigBases    Value
 	DunderSlots        Value
 )
+
+// HasCustomGetAttrOrGetAttribute reports whether t overrides __getattribute__ or __getattr__.
+func (t *PyType) HasCustomGetAttrOrGetAttribute() bool {
+	return (t.Flags&FlagCustomGetAttribute) != 0 || t.dunderGetAttribute.ptr != nil || t.dunderGetAttr.ptr != nil
+}
 
 // TypeVal wraps a *PyType as a Value of KindType.
 func TypeVal(t *PyType) Value {
@@ -1760,7 +1766,7 @@ func clearAttrError(ctx *ExecContext) {
 	if ctx != nil && ctx.HasException() && IsInstance(ctx.ActiveException, AttributeErrorType) {
 		exc := ctx.ActiveException
 		ctx.ClearException()
-		ReleaseLazyAttributeError(exc)
+		ReleaseLazyAttributeErrorCtx(ctx, exc)
 	}
 }
 
@@ -1921,7 +1927,7 @@ func defaultObjectGetAttr(ctx *ExecContext, obj, name Value) Value {
 	if !ok {
 		if ctx != nil {
 			if !ctx.HasException() {
-				ctx.Raise(NewLazyAttributeError(obj.Type(), InternValue(name)))
+				ctx.Raise(NewLazyAttributeErrorCtx(ctx, obj.Type(), InternValue(name)))
 			}
 			return NoneVal()
 		}
@@ -2268,7 +2274,7 @@ func typeGetAttr(ctx *ExecContext, typeObj, name Value) Value {
 	if !ok {
 		if ctx != nil {
 			if !ctx.HasException() {
-				ctx.Raise(NewLazyAttributeError(typeObj.AsType(), InternValue(name)))
+				ctx.Raise(NewLazyAttributeErrorCtx(ctx, typeObj.AsType(), InternValue(name)))
 			}
 			return NoneVal()
 		}
@@ -2426,7 +2432,7 @@ func LoadMethodNoBind(ctx *ExecContext, obj, name Value) (Value, Value) {
 		descr, _, ok := selfType.LookupMROAfter(sup.ThisClass, interned)
 		if !ok {
 			if ctx != nil {
-				ctx.Raise(NewLazyAttributeError(obj.Type(), interned))
+				ctx.Raise(NewLazyAttributeErrorCtx(ctx, obj.Type(), interned))
 			}
 			return UnboundVal(), NoneVal()
 		}
@@ -2654,7 +2660,7 @@ func defaultModuleGetAttr(ctx *ExecContext, obj, interned Value) Value {
 	if !ok {
 		if ctx != nil {
 			if !ctx.HasException() {
-				ctx.Raise(NewLazyAttributeError(obj.Type(), interned))
+				ctx.Raise(NewLazyAttributeErrorCtx(ctx, obj.Type(), interned))
 			}
 			return NoneVal()
 		}

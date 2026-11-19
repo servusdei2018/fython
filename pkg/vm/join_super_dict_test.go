@@ -327,3 +327,114 @@ def bench_step():
 		t.Fatalf("VarKWSafe wrapper->target allocated %v times, want 0", allocs)
 	}
 }
+
+func TestInLoopCollectGeneratorDrain(t *testing.T) {
+	eng, v := runPySource(t, `
+def gen_items(n):
+    for i in range(n):
+        yield "v" + str(i)
+
+# 1. Direct list(gen), tuple(gen), set(gen), and list.extend(gen)
+assert list(gen_items(5)) == ["v0", "v1", "v2", "v3", "v4"]
+assert tuple(gen_items(4)) == ("v0", "v1", "v2", "v3")
+assert tuple(gen_items(2)) == ("v0", "v1")
+assert set(gen_items(3)) == {"v0", "v1", "v2"}
+
+lst = ["a"]
+lst.extend(gen_items(3))
+assert lst == ["a", "v0", "v1", "v2"]
+
+ext = lst.extend
+ext(gen_items(2))
+assert lst == ["a", "v0", "v1", "v2", "v0", "v1"]
+
+list.extend(lst, gen_items(1))
+assert lst == ["a", "v0", "v1", "v2", "v0", "v1", "v0"]
+
+# 2. Empty and already-exhausted generators
+def empty_gen():
+    if False:
+        yield 1
+
+g_empty = empty_gen()
+assert list(g_empty) == []
+assert list(g_empty) == []
+assert tuple(empty_gen()) == ()
+assert set(empty_gen()) == set()
+ext_empty = []
+ext_empty.extend(empty_gen())
+assert ext_empty == []
+
+# 3. Partially consumed generators
+def partial():
+    yield 10
+    yield 20
+    yield 30
+
+gp = partial()
+assert next(gp) == 10
+assert list(gp) == [20, 30]
+gp2 = partial()
+assert next(gp2) == 10
+assert tuple(gp2) == (20, 30)
+
+# 4. Nested yield from (generator + non-generator iterable) and drain isolation
+def sub(n):
+    yield n
+    yield n + 1
+
+def delegator():
+    yield from sub(1)
+    yield from [3, 4]
+    yield from range(5, 7)
+
+assert list(delegator()) == [1, 2, 3, 4, 5, 6]
+assert tuple(delegator()) == (1, 2, 3, 4, 5, 6)
+assert set(delegator()) == {1, 2, 3, 4, 5, 6}
+
+def outer_for_join():
+    yield "-".join(str(x) for x in list(delegator()))
+    yield "|"
+    yield ",".join(str(x) for x in tuple(sub(8)))
+
+assert "".join(outer_for_join()) == "1-2-3-4-5-6|8,9"
+
+# 5. Unhashable item in set(gen) raises TypeError at caller, not inside gen's try/except
+def bad_set_gen(log):
+    try:
+        yield 1
+        yield [2, 3]
+    except TypeError:
+        yield 99
+    finally:
+        log.append("done")
+
+events = []
+g_bad_set = bad_set_gen(events)
+caught = False
+try:
+    set(g_bad_set)
+except TypeError:
+    caught = True
+assert caught and events == []
+g_bad_set.close()
+assert events == ["done"]
+
+# 6. Exception raised inside list(gen) runs finally cleanup
+def cleanup_list_gen(log):
+    try:
+        yield 1
+        raise ValueError("boom")
+    finally:
+        log.append("cleaned")
+
+clean_events = []
+threw = False
+try:
+    list(cleanup_list_gen(clean_events))
+except ValueError:
+    threw = True
+assert threw and clean_events == ["cleaned"]
+`)
+	defer eng.ReleaseVM(v)
+}
