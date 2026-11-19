@@ -168,6 +168,14 @@ func (st *loopState) reloadWindow(vm *VM, co *CodeObject) unsafe.Pointer {
 	return ptr
 }
 
+// flushActiveFrame materializes the currently active loopState into vm.frames
+// on demand when frame inspection, nested execution, or error reporting needs it.
+func (vm *VM) flushActiveFrame() {
+	if st := vm.activeState; st != nil {
+		vm.syncActiveFrame(st, st.ip)
+	}
+}
+
 // syncActiveFrameFromState persists hot registers ip and current frame metadata
 // into vm.frames[st.frameIdx] before invoking Go runtime helpers that may inspect
 // frames or trigger tracebacks.

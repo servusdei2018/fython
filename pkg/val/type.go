@@ -346,6 +346,9 @@ type PyType struct {
 	// metaclass gate is checked live at call sites, so this flag only
 	// tracks __new__ and stays fresh via syncDunderSlots.
 	UsesDefaultNew bool
+	// UsesDefaultTpCall reports whether Slots.TpCall is nil or typeTpCall
+	// (no custom native TpCall or Python __call__ override).
+	UsesDefaultTpCall bool
 
 	// Resolved dunder callables cached at class creation/mutation time
 	// so slot trampolines execute with 0 dictionary lookups.
@@ -947,6 +950,7 @@ func NewTypeWithMeta(name string, bases []*PyType, dict *PyDict, meta *PyType) (
 		// Metaclasses inherit type.__call__ unless they override __call__ (synced below).
 		if TypeType != nil && TypeType.Slots.TpCall != nil {
 			t.Slots.TpCall = TypeType.Slots.TpCall
+			t.UsesDefaultTpCall = true
 		}
 	} else {
 		isModuleSubclass := ModuleType != nil && slices.Contains(t.MRO, ModuleType)
@@ -1342,9 +1346,24 @@ func (t *PyType) syncDunderSlots() {
 		t.Slots.SqAssItem = dunderSetItemSlot
 		t.Slots.MpAssSubscript = dunderSetItemSlot
 	}
-	if fn, _, ok := t.lookupMROUncached(DunderCall); ok {
-		t.dunderCall = fn
-		t.Slots.TpCall = dunderTpCallSlot
+	if fn, owner, ok := t.lookupMROUncached(DunderCall); ok {
+		if owner == TypeType {
+			t.dunderCall = Value{}
+			if TypeType != nil && TypeType.Slots.TpCall != nil {
+				t.Slots.TpCall = TypeType.Slots.TpCall
+			}
+			t.UsesDefaultTpCall = true
+		} else {
+			t.dunderCall = fn
+			t.Slots.TpCall = dunderTpCallSlot
+			t.UsesDefaultTpCall = false
+		}
+	} else {
+		if t.dunderCall.ptr != nil {
+			t.dunderCall = Value{}
+			t.Slots.TpCall = nil
+		}
+		t.UsesDefaultTpCall = t.Slots.TpCall == nil
 	}
 	if fn, _, ok := t.lookupMROUncached(DunderGet); ok {
 		t.dunderGet = fn
@@ -1714,6 +1733,17 @@ func (t *PyType) HasInit() bool {
 // DunderInitVal returns the cached __init__ callable for t.
 func (t *PyType) DunderInitVal() Value {
 	return t.dunderInit
+}
+
+// DunderCallVal returns the cached __call__ callable for t.
+func (t *PyType) DunderCallVal() Value {
+	return t.dunderCall
+}
+
+// UsesDefaultTypeCall reports whether this metaclass uses standard type.__call__
+// instantiation without a custom __call__ or native TpCall override.
+func (t *PyType) UsesDefaultTypeCall() bool {
+	return t == nil || t == TypeType || (t.dunderCall.ptr == nil && t.UsesDefaultTpCall)
 }
 
 // objectGetAttr implements the standard Python object.__getattribute__ protocol,

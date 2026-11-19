@@ -31,6 +31,7 @@ var (
 	nameDunderDict       = val.InternString("__dict__")
 	nameLen              = val.InternString("len")
 	nameIsInstance       = val.InternString("isinstance")
+	nameBuiltinNext      = val.InternString("next")
 	namePackage          = val.InternString("__package__")
 	namePath             = val.InternString("__path__")
 	nameAll              = val.InternString("__all__")

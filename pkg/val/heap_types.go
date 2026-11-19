@@ -380,7 +380,6 @@ type PyGenerator struct {
 	LastSent    Value
 	ResumeHook  func(ctx *ExecContext, gen *PyGenerator, val Value) (Value, IterStatus)
 	ReleaseHook func(gen *PyGenerator)
-	Iters       [8]PyIter
 }
 
 // CoroutineState classifies the lifecycle state of a PyCoroutine.

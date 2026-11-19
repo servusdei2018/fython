@@ -129,6 +129,16 @@ type ExceptionEntry struct {
 	PushLasti        bool
 }
 
+// Inline generator resumption modes stored on the caller CallFrame.
+const (
+	genModeNone uint8 = iota
+	genModeForIter
+	genModeYieldFrom
+	genModeNext        // next(gen): raise StopIteration(retVal) on exhaustion
+	genModeNextDefault // next(gen, default): return genDefault on exhaustion
+	genModeSend        // gen.send(v): raise StopIteration(retVal) on exhaustion
+)
+
 // CallFrame is an unboxed value struct stored in the contiguous VM.frames slab.
 // It is never heap-allocated per function call.
 type CallFrame struct {
@@ -147,15 +157,15 @@ type CallFrame struct {
 	shadowFrame *val.PyFrame
 	excStackLen int
 	stackIsVM   bool
-	// Inline generator linkage (Section 5b). When genForIter or genYieldFrom is
-	// true, the child frame is a generator executing on its own stack slice, and
-	// stack holds the caller's stack slice to restore on yield/return/unwind.
-	stack        []val.Value
-	activeGen    *val.PyGenerator
-	genFrameIdx  int
-	genForIter   bool
-	genYieldFrom bool
-	genExitIP    int
+	// Inline generator linkage. When genMode != genModeNone, the child frame
+	// is a generator executing on its own stack slice, and stack holds the
+	// caller's stack slice to restore on yield/return/unwind.
+	stack       []val.Value
+	activeGen   *val.PyGenerator
+	genFrameIdx int
+	genMode     uint8
+	genDefault  val.Value
+	genExitIP   int
 	// initInstance holds the freshly allocated receiver for an in-loop
 	// __init__ call. When set, OP_RETURN substitutes it for a None
 	// return and raises TypeError otherwise.
@@ -233,6 +243,10 @@ type CodeObject struct {
 	PosParamCount        int
 	VarArgsIdx           int
 	VarKWIdx             int
+	EffectiveLocals      int
+	FrameStackNeed       int
+	HasCells             bool
+	HasCellVars          bool
 	ParamShapeComputed   bool
 	// stream publishes the instruction slice the VM executes. It is created
 	// together with the code object, before the object is shared between VMs.
@@ -285,17 +299,6 @@ func (co *CodeObject) publish(code []uint32) {
 	atomic.AddInt32(&co.StreamGen, 1)
 }
 
-// refreshCode returns the instruction slice that must be executed for co.
-//
-// The stream is only reloaded when the Tier-2 optimizer published a newer
-// one; the generation counter makes that check a single atomic load.
-func refreshCode(co *CodeObject, cache *VMCodeCache) []uint32 {
-	if gen := atomic.LoadInt32(&co.StreamGen); gen != cache.streamGen {
-		return reloadCode(co, cache, gen)
-	}
-	return cache.active
-}
-
 // reloadCode installs the instruction stream that the code object published.
 //
 //go:noinline
@@ -306,7 +309,7 @@ func reloadCode(co *CodeObject, cache *VMCodeCache, gen int32) []uint32 {
 		copy(priv, newStream)
 		for i, oldInst := range cache.active {
 			switch DecodeOpcode(oldInst) {
-			case OP_CALL_PY_EXACT_ARGS, OP_CALL_BUILTIN_FAST, OP_CALL_LEN, OP_CALL_ISINSTANCE:
+			case OP_CALL_PY_EXACT_ARGS, OP_CALL_BUILTIN_FAST, OP_CALL_LEN, OP_CALL_ISINSTANCE, OP_CALL_TYPE_INIT:
 				if DecodeOpcode(priv[i]) == OP_CALL {
 					priv[i] = oldInst
 				}
@@ -321,11 +324,15 @@ func reloadCode(co *CodeObject, cache *VMCodeCache, gen int32) []uint32 {
 			}
 		}
 		cache.active = priv
+		cache.codePtr = unsafe.Pointer(unsafe.SliceData(priv))
+		cache.codeLen = len(priv)
 		cache.streamGen = gen
 		return cache.active
 	}
 	cache.streamGen = gen
 	cache.active = newStream
+	cache.codePtr = unsafe.Pointer(unsafe.SliceData(newStream))
+	cache.codeLen = len(newStream)
 	cache.privateActive = false
 	return cache.active
 }
@@ -396,6 +403,8 @@ type VMCodeCache struct {
 	// up a stream published by the Tier-2 optimizer without loading it on
 	// every frame switch.
 	active        []uint32
+	codePtr       unsafe.Pointer
+	codeLen       int
 	streamGen     int32
 	privateActive bool
 }
@@ -431,10 +440,12 @@ func (c *VMCodeCache) quickenAt(ip int, newInst uint32) unsafe.Pointer {
 		priv := make([]uint32, len(c.active))
 		copy(priv, c.active)
 		c.active = priv
+		c.codePtr = unsafe.Pointer(unsafe.SliceData(priv))
+		c.codeLen = len(priv)
 		c.privateActive = true
 	}
 	c.active[ip] = newInst
-	return unsafe.Pointer(unsafe.SliceData(c.active))
+	return c.codePtr
 }
 
 // ensureKwPIC lazily allocates the OP_CALL_KW PIC slab for this code object.
@@ -492,6 +503,9 @@ func (co *CodeObject) Init() *CodeObject {
 	co.InitCellParamIndices()
 	co.computeParamShape()
 	co.initStream()
+	if len(co.Code) < 4 || co.IsGenerator || co.IsCoroutine {
+		co.IsTier2Optimized = 1
+	}
 	return co
 }
 
@@ -573,6 +587,7 @@ type VM struct {
 	builtinLen           val.Value
 	builtinOpen          val.Value
 	builtinIsInstance    val.Value
+	builtinNext          val.Value
 	strScratch           []byte
 	internPool           *val.InternPool
 	execCtx              val.ExecContext
@@ -581,6 +596,7 @@ type VM struct {
 	activeBaseOffset     int
 	activeCells          []val.Value
 	activeCellPtrs       []*val.PyCell
+	activeState          *loopState
 	kwScratch            [64]val.Value
 	kwSet                [64]bool
 	kwNamesScratch       [16]val.Value
@@ -594,6 +610,7 @@ type VM struct {
 	bindingOSPath        bool
 	pendingVirtualenvPth bool
 	coroFreeList         []*val.PyCoroutine
+	genFreeList          []*val.PyGenerator
 	loopStatePool        []*loopState
 	genStackPools        [4][][]val.Value
 	genCellValPools      [8][][]val.Value
@@ -631,8 +648,10 @@ type VM struct {
 // length. The window is refreshed when the Tier-2 optimizer published a newer
 // instruction stream for the code object.
 func (vm *VM) loadWindow(co *CodeObject, cache *VMCodeCache) (unsafe.Pointer, int) {
-	stream := refreshCode(co, cache)
-	return unsafe.Pointer(unsafe.SliceData(stream)), len(stream)
+	if gen := atomic.LoadInt32(&co.StreamGen); gen != cache.streamGen {
+		reloadCode(co, cache, gen)
+	}
+	return cache.codePtr, cache.codeLen
 }
 
 // cacheFor returns this VM's inline cache for co using a single owner-checked
@@ -666,6 +685,8 @@ func (vm *VM) getCodeCacheSlow(co *CodeObject) *VMCodeCache {
 			// instruction stream is always fetched anew.
 			cache.streamGen = atomic.LoadInt32(&co.StreamGen)
 			cache.active = co.Active()
+			cache.codePtr = unsafe.Pointer(unsafe.SliceData(cache.active))
+			cache.codeLen = len(cache.active)
 			cache.privateActive = false
 		}
 		return cache
@@ -688,6 +709,8 @@ func (vm *VM) getCodeCacheSlow(co *CodeObject) *VMCodeCache {
 		// happens in between is picked up by the next refresh.
 		cache.streamGen = atomic.LoadInt32(&co.StreamGen)
 		cache.active = co.Active()
+		cache.codePtr = unsafe.Pointer(unsafe.SliceData(cache.active))
+		cache.codeLen = len(cache.active)
 		cache.privateActive = false
 	}
 	if len(cache.ic) < len(co.Code) {
@@ -849,6 +872,7 @@ func (vm *VM) Reset() {
 	vm.activeBaseOffset = 0
 	vm.activeCells = nil
 	vm.activeCellPtrs = nil
+	vm.activeState = nil
 	vm.lastException = val.NoneVal()
 	vm.unhandledException = val.NoneVal()
 	if vm.context == nil || vm.context.Len() > 0 {
@@ -888,8 +912,12 @@ func (vm *VM) materializeFrame(targetIdx int) val.Value {
 	if targetIdx < 0 || targetIdx >= len(vm.frames) {
 		return val.NoneVal()
 	}
+	if vm.activeState != nil && targetIdx == vm.activeState.frameIdx {
+		vm.syncActiveFrame(vm.activeState, vm.activeState.ip)
+	}
 	fSlot := &vm.frames[targetIdx]
 	if fSlot.shadowFrame != nil {
+		fSlot.shadowFrame.IP = fSlot.ip
 		return val.NewFrameVal(fSlot.shadowFrame)
 	}
 	co := fSlot.co
@@ -1275,4 +1303,8 @@ func (co *CodeObject) computeParamShape() {
 	}
 	co.PosParamCount = posCount
 	co.SimplePositionalOnly = simple && co.PositionalParamCount == len(co.ParamNames)
+	co.EffectiveLocals = max(co.NumLocals, co.NumParams)
+	co.FrameStackNeed = max(256, co.NumLocals+64)
+	co.HasCellVars = len(co.CellVars) > 0
+	co.HasCells = co.HasCellVars || len(co.FreeVars) > 0
 }

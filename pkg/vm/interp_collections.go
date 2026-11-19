@@ -61,7 +61,7 @@ func (vm *VM) opStoreSubscr(st *loopState, ip, sp int) (int, int, loopCtl) {
 		}
 	default:
 		st.stack = stack
-		vm.syncActiveFrame(st, ip)
+		st.ip = ip
 		vm.execCtx.SP = sp
 		vm.setItemSafe(obj, key, valToStore)
 		st.syncStackFromVM(vm, stack)
@@ -314,7 +314,7 @@ func (vm *VM) opBinarySlice(st *loopState, ip, sp int) (int, int, loopCtl) {
 	}
 
 	st.stack = stack
-	vm.syncActiveFrame(st, ip)
+	st.ip = ip
 	vm.execCtx.SP = sp
 	sl := val.NewSliceVal(startVal, stopVal, val.NoneVal())
 	res := vm.getItemSafe(container, sl)
@@ -351,7 +351,7 @@ func (vm *VM) opUnpackSequence(st *loopState, inst uint32, ip, sp int) (int, int
 		}
 	default:
 		st.stack = stack
-		vm.syncActiveFrame(st, ip)
+		st.ip = ip
 		vm.execCtx.SP = sp
 		items = vm.extractIterableSafe(seq)
 		stack = st.syncStackFromVM(vm, stack)
@@ -396,7 +396,7 @@ func (vm *VM) opFormatValue(st *loopState, inst uint32, ip, sp int) (int, int, l
 		return ip, sp, ctlReload
 	}
 	st.stack = stack
-	vm.syncActiveFrame(st, ip)
+	st.ip = ip
 	vm.execCtx.SP = sp
 	fres := vm.formatValueSafe(valToFormat, specStr, conversion)
 	stack = st.syncStackFromExecCtx(vm, stack)
@@ -477,7 +477,7 @@ func (vm *VM) opUnpackEx(st *loopState, inst uint32, ip, sp int) (int, int, loop
 		items = seq.AsList().Items
 	default:
 		st.stack = stack
-		vm.syncActiveFrame(st, ip)
+		st.ip = ip
 		vm.execCtx.SP = sp
 		items = vm.extractIterableSafe(seq)
 		stack = st.syncStackFromVM(vm, stack)
@@ -552,7 +552,7 @@ func (vm *VM) opDeleteSubscr(st *loopState, ip, sp int) (int, int, loopCtl) {
 	obj := stack[sp-2]
 	sp -= 2
 	st.stack = stack
-	vm.syncActiveFrame(st, ip)
+	st.ip = ip
 	vm.execCtx.SP = sp
 	vm.delSubscrSafe(obj, key)
 	st.syncStackFromExecCtx(vm, stack)
@@ -574,7 +574,7 @@ func (vm *VM) opBuildMapUnpack(st *loopState, inst uint32, ip, sp int) (int, int
 	resVal := val.NewDictVal(4)
 	resDict := resVal.AsDict()
 	st.stack = stack
-	vm.syncActiveFrame(st, ip)
+	st.ip = ip
 	vm.execCtx.SP = sp
 	for i := range count {
 		d := stack[sp+i]
@@ -618,7 +618,7 @@ func (vm *VM) opListExtend(st *loopState, inst uint32, ip, sp int) (int, int, lo
 			lst.Items = append(lst.Items, iterVal.AsSet().Items()...)
 		default:
 			st.stack = stack
-			vm.syncActiveFrame(st, ip)
+			st.ip = ip
 			vm.execCtx.SP = sp
 			items := vm.extractIterableSafe(iterVal)
 			st.syncStackFromVM(vm, stack)

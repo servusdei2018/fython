@@ -13,6 +13,10 @@ import (
 	"unsafe"
 )
 
+// GenSendBuiltin is the cached PyBuiltinFunc Value for generator.send,
+// enabling O(1) pointer-equality interception in the VM call handlers.
+var GenSendBuiltin Value
+
 // PyTuple represents an immutable sequence of Values on the heap (used for kwnames and tuple constants).
 // Tuples with up to 2 elements store their backing array inline inside the same allocation (80 B size class).
 // Header MUST be at byte offset 0.
@@ -3262,6 +3266,7 @@ func initTypes() {
 	TypeType.Slots.TpGetAttr = typeGetAttr
 	TypeType.Slots.TpSetAttr = typeSetAttr
 	TypeType.Slots.TpCall = typeTpCall
+	TypeType.UsesDefaultTpCall = true
 	TypeType.Slots.MpSubscript = typeMpSubscript
 
 	// 3. Construct built-in primitive and heap object types.
@@ -6540,7 +6545,7 @@ func initTypes() {
 		}
 		return v
 	}))
-	GeneratorType.Dict.Set(InternString("send"), NewBuiltinFuncVal("send", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+	GenSendBuiltin = NewBuiltinFuncVal("send", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
 			ctx.Raise(NewException(TypeErrorType, "send() takes exactly one argument"))
 			return NoneVal()
@@ -6551,7 +6556,8 @@ func initTypes() {
 			ctx.Raise(NewStopIteration(v))
 		}
 		return v
-	}))
+	})
+	GeneratorType.Dict.Set(InternString("send"), GenSendBuiltin)
 	GeneratorType.Dict.Set(InternString("close"), NewBuiltinFuncVal("close", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
 			ctx.Raise(NewException(TypeErrorType, "close() takes at least 1 argument"))
@@ -8467,6 +8473,7 @@ func initTypes() {
 	ObjectType.syncDunderSlots()
 	TypeType.syncDunderSlots()
 	TypeType.Slots.TpCall = typeTpCall
+	TypeType.UsesDefaultTpCall = true
 }
 
 type PyDictKeys struct {

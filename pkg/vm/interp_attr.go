@@ -11,7 +11,7 @@ import (
 // for simple Python functions, or via a zero-alloc stack-slice call for builtins.
 func (vm *VM) dispatchPropertyGet(st *loopState, fget val.Value, cc *VMCodeCache, stack []val.Value, ip, sp int) (int, int, loopCtl) {
 	if fget.IsBuiltinFunc() {
-		vm.syncActiveFrame(st, ip)
+		st.ip = ip
 		vm.execCtx.SP = sp
 		res := fget.AsBuiltinFunc().Fn(&vm.execCtx, fget, stack[sp-1:sp], nil)
 		stack = st.syncStackFromExecCtx(vm, stack)
@@ -38,7 +38,7 @@ func (vm *VM) dispatchPropertyGet(st *loopState, fget val.Value, cc *VMCodeCache
 			if callee.NumParams == 1 && len(fgetFn.Defaults) == 0 && fgetFn.KwDefaults == nil && callee.KWOnlyArgCount == 0 && (callee.Flags&(CO_VARARGS|CO_VARKEYWORDS)) == 0 && len(callee.CellVars) == 0 {
 				nextSP = newBase + max(callee.NumLocals, 1)
 			} else {
-				vm.syncActiveFrame(st, ip)
+				st.ip = ip
 				var okBind bool
 				nextSP, okBind = vm.bindFunctionArgsSafe(callee, fgetFn.Defaults, fgetFn.KwDefaults, stack, newBase, 1, nil)
 				if !okBind {
@@ -48,10 +48,10 @@ func (vm *VM) dispatchPropertyGet(st *loopState, fget val.Value, cc *VMCodeCache
 					return ip, sp, ctlRaise
 				}
 			}
-			return vm.pushCalleeFrame(st, callee, fget, fgetFn, stack, newBase, retSP, 1, nextSP, ip+1, val.Value{}, fgetFn.Globals, cc)
+			return vm.pushCalleeFrame(st, callee, fgetFn, cc, newBase, retSP, nextSP, ip+1)
 		}
 	}
-	vm.syncActiveFrame(st, ip)
+	st.ip = ip
 	vm.execCtx.SP = sp
 	res := vm.callFromHookSafe(fget, sp-1, 1, nil)
 	stack = st.syncStackFromExecCtx(vm, stack)
@@ -96,7 +96,7 @@ func (vm *VM) opLoadAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 		instType := instObj.Header.Type
 		if instObj.Shape != nil && instType != nil {
 			if instType.Flags&val.FlagCustomGetAttribute != 0 {
-				vm.syncActiveFrame(st, ip)
+				st.ip = ip
 				vm.execCtx.SP = sp
 				attrRes = vm.getAttrSafe(obj, consts[uint16(inst)])
 				goto loadAttrDone
@@ -151,7 +151,7 @@ func (vm *VM) opLoadAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 					}
 				case ICKindDataDescriptor:
 					recordICSlowHit(ICKindDataDescriptor)
-					vm.syncActiveFrame(st, ip)
+					st.ip = ip
 					vm.execCtx.SP = sp
 					attrRes = vm.descrGetSafe(entry.CachedVal, obj, instType)
 					goto loadAttrDone
@@ -177,12 +177,12 @@ func (vm *VM) opLoadAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 					}
 				}
 			}
-			vm.syncActiveFrame(st, ip)
+			st.ip = ip
 			vm.execCtx.SP = sp
 			attrRes = vm.loadAttrInstanceSlowSafe(instObj, obj, consts[uint16(inst)], ip, sp, st.frameIdx, st.cache.ic, st.cache.ensureAttrPIC())
 			goto loadAttrDone
 		}
-		vm.syncActiveFrame(st, ip)
+		st.ip = ip
 		vm.execCtx.SP = sp
 		attrRes = vm.getAttrSafe(obj, consts[uint16(inst)])
 
@@ -278,7 +278,7 @@ func (vm *VM) opLoadAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 				}
 			}
 		}
-		vm.syncActiveFrame(st, ip)
+		st.ip = ip
 		vm.execCtx.SP = sp
 		attrRes = vm.getAttrSafe(obj, consts[uint16(inst)])
 
@@ -331,7 +331,7 @@ func (vm *VM) opLoadAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 				}
 			}
 		}
-		vm.syncActiveFrame(st, ip)
+		st.ip = ip
 		vm.execCtx.SP = sp
 		attrRes = vm.getAttrSafe(obj, attrName)
 
@@ -399,7 +399,7 @@ func (vm *VM) opLoadAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 				return ip + 1, sp, ctlNext
 			}
 		}
-		vm.syncActiveFrame(st, ip)
+		st.ip = ip
 		vm.execCtx.SP = sp
 		attrRes = vm.getAttrSafe(obj, attrName)
 
@@ -417,12 +417,12 @@ func (vm *VM) opLoadAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 			stack[sp-1] = v
 			return ip + 1, sp, ctlNext
 		}
-		vm.syncActiveFrame(st, ip)
+		st.ip = ip
 		vm.execCtx.SP = sp
 		attrRes = vm.getAttrSafe(obj, attrName)
 
 	default:
-		vm.syncActiveFrame(st, ip)
+		st.ip = ip
 		vm.execCtx.SP = sp
 		attrRes = vm.getAttrSafe(obj, consts[uint16(inst)])
 	}
@@ -449,7 +449,7 @@ func (vm *VM) opStoreAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int,
 	obj := stack[sp-1]
 	if instObj, instType, ok := vm.prepareStoreAttr(obj, v); ok {
 		if instType.Flags&val.FlagCustomSetAttr != 0 {
-			vm.syncActiveFrame(st, ip)
+			st.ip = ip
 			vm.execCtx.SP = sp
 			vm.setAttrSafe(obj, consts[uint16(inst)], v)
 		} else {
@@ -493,7 +493,7 @@ func (vm *VM) opStoreAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int,
 				case ICKindPropertySet:
 					fset := entry.CachedVal
 					recordICSlowHit(ICKindPropertySet)
-					vm.syncActiveFrame(st, ip)
+					st.ip = ip
 					vm.execCtx.SP = sp
 					stack[sp-2] = obj
 					stack[sp-1] = v
@@ -516,7 +516,7 @@ func (vm *VM) opStoreAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int,
 					}
 				case ICKindDataDescriptor:
 					recordICSlowHit(ICKindDataDescriptor)
-					vm.syncActiveFrame(st, ip)
+					st.ip = ip
 					vm.execCtx.SP = sp
 					vm.descrSetSafe(entry.CachedVal, obj, v)
 					goto storeAttrDone
@@ -550,12 +550,12 @@ func (vm *VM) opStoreAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int,
 					}
 				}
 			}
-			vm.syncActiveFrame(st, ip)
+			st.ip = ip
 			vm.execCtx.SP = sp
 			vm.storeAttrInstanceSlowSafe(instObj, obj, consts[uint16(inst)], v, ip, sp, st.frameIdx, st.cache)
 		}
 	} else {
-		vm.syncActiveFrame(st, ip)
+		st.ip = ip
 		vm.execCtx.SP = sp
 		vm.setAttrSafe(obj, consts[uint16(inst)], v)
 	}
@@ -738,7 +738,7 @@ func (vm *VM) opLoadMethodSlow(st *loopState, inst uint32, ip, sp int) (int, int
 		}
 	}
 
-	vm.syncActiveFrame(st, ip)
+	st.ip = ip
 	vm.execCtx.SP = sp
 	var methodPIC [][4]val.MethodPICEntry
 	if obj.IsInstance() {
@@ -767,7 +767,7 @@ func (vm *VM) opLoadGlobalSlow(st *loopState, inst uint32, ip, sp int) (int, int
 			return ip + 1, sp + 1, ctlNext
 		}
 		if _, _, has := st.globals.Header.Type.LookupMRO(val.DunderMissing); has {
-			vm.syncActiveFrame(st, ip)
+			st.ip = ip
 			vm.execCtx.SP = sp
 			res := vm.getItemSafe(val.ObjectVal(&st.globals.Header), nameVal)
 			stack = st.syncStackFromVM(vm, stack)

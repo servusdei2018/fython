@@ -37,7 +37,7 @@ func (vm *VM) opPrintExpr(st *loopState, ip, sp int) (int, int, loopCtl) {
 	sp--
 	if !v.IsNone() && v.HeaderPtr() != nil {
 		st.stack = stack
-		vm.syncActiveFrame(st, ip)
+		st.ip = ip
 		vm.execCtx.SP = sp
 		if hook, ok := vm.getDisplayhook(); ok {
 			_, panicValue := vm.invokeDisplayhook(hook, v)
@@ -64,7 +64,7 @@ func (vm *VM) opLoadFromDictOr(st *loopState, inst uint32, ip, sp int) (int, int
 	sp--
 	mapping := stack[sp]
 	st.stack = stack
-	vm.syncActiveFrame(st, ip)
+	st.ip = ip
 	vm.execCtx.SP = sp
 	res, found := vm.mappingGetOptional(mapping, nameVal)
 	if !found && !vm.execCtx.HasException() {
@@ -123,7 +123,7 @@ func (vm *VM) opLoadName(st *loopState, inst uint32, ip, sp int) (int, int, loop
 			}
 		} else {
 			st.stack = stack
-			vm.syncActiveFrame(st, ip)
+			st.ip = ip
 			vm.execCtx.SP = sp
 			v := val.GetItemCtx(&vm.execCtx, st.curLocals, nameVal)
 			if vm.execCtx.HasException() {
@@ -280,7 +280,7 @@ func (vm *VM) opFastStreamWriteLocalConst(st *loopState, inst uint32, ip, sp int
 		}
 	}
 	st.stack = stack
-	vm.syncActiveFrame(st, ip)
+	st.ip = ip
 	methVal := vm.getAttrSafe(receiver, nameWrite)
 	if !methVal.IsNone() {
 		vm.Vectorcall(methVal, []val.Value{arg}, nil)
@@ -365,7 +365,7 @@ func (vm *VM) opDeleteAttr(st *loopState, inst uint32, ip, sp int) (int, int, lo
 	sp--
 	obj := stack[sp]
 	st.stack = stack
-	vm.syncActiveFrame(st, ip)
+	st.ip = ip
 	vm.execCtx.SP = sp
 	vm.delAttrSafe(obj, attrName)
 	st.syncStackFromExecCtx(vm, stack)

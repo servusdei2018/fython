@@ -153,7 +153,7 @@ func (vm *VM) opJumpSlow(st *loopState, target, ip, sp int) (int, int, loopCtl) 
 		}
 	}
 	if vm.signalsPending() {
-		vm.syncActiveFrame(st, ip)
+		st.ip = ip
 		vm.execCtx.SP = sp
 		vm.deliverSignalsSafe()
 		st.syncStackFromVM(vm, st.stack)
@@ -220,7 +220,7 @@ func (vm *VM) opBinarySubscrSlow(st *loopState, ip, sp int) (int, int, loopCtl) 
 		}
 		stack[sp-2] = v
 	default:
-		vm.syncActiveFrame(st, ip)
+		st.ip = ip
 		vm.execCtx.SP = sp
 		res := vm.getItemSafe(obj, key)
 		stack = st.syncStackFromVM(vm, stack)
@@ -244,7 +244,7 @@ func (vm *VM) opBinarySubscrSlow(st *loopState, ip, sp int) (int, int, loopCtl) 
 func (vm *VM) opGetIterSlow(st *loopState, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
 	top := stack[sp-1]
-	vm.syncActiveFrame(st, ip)
+	st.ip = ip
 	vm.execCtx.SP = sp
 	itVal := vm.getIterSafe(top)
 	stack = st.syncStackFromVM(vm, stack)
@@ -270,7 +270,7 @@ func (vm *VM) opForIterSlow(st *loopState, inst uint32, ip, sp int) (int, int, l
 			st.raiseExc = val.NewTypeError(fmt.Sprintf("'%s' object is not iterable", pyIter.Obj.Type().Name))
 			return ip, sp, ctlRaise
 		}
-		vm.syncActiveFrame(st, ip)
+		st.ip = ip
 		vm.execCtx.SP = sp
 		nextVal, ok := pyIter.Next()
 		stack = st.syncStackFromVM(vm, stack)
@@ -291,13 +291,14 @@ func (vm *VM) opForIterSlow(st *loopState, inst uint32, ip, sp int) (int, int, l
 		return jumpTarget, sp, ctlReload
 	}
 	if it.IsGenerator() {
+		gen := it.AsGenerator()
 		if vm.activeJoinGen == nil {
 			st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_FOR_ITER_GEN))
-			return vm.pushInlineGenerator(st, it.AsGenerator(), ip, sp, sp, jumpTarget, false, val.NoneVal())
+			return vm.pushInlineGenerator(st, gen, ip, sp, sp, jumpTarget, genModeForIter, val.Value{}, val.NoneVal())
 		}
-		vm.syncActiveFrame(st, ip)
+		st.ip = ip
 		vm.execCtx.SP = sp
-		nextVal, status := vm.resumeGenerator(&vm.execCtx, it.AsGenerator(), val.NoneVal())
+		nextVal, status := vm.resumeGenerator(&vm.execCtx, gen, val.NoneVal())
 		stack = st.syncStackFromVM(vm, stack)
 		if status == val.IterYielded {
 			stack[sp] = nextVal
@@ -306,6 +307,7 @@ func (vm *VM) opForIterSlow(st *loopState, inst uint32, ip, sp int) (int, int, l
 			return ip, sp, ctlReload
 		}
 		if status == val.IterExhausted {
+			vm.releaseGenerator(gen)
 			sp--
 			return jumpTarget, sp, ctlReload
 		}
@@ -319,7 +321,7 @@ func (vm *VM) opForIterSlow(st *loopState, inst uint32, ip, sp int) (int, int, l
 		return jumpTarget, sp, ctlReload
 	}
 	if tpIterNext := it.Type().Slots.TpIterNext; tpIterNext != nil {
-		vm.syncActiveFrame(st, ip)
+		st.ip = ip
 		vm.execCtx.SP = sp
 		nextVal, status := vm.iterNextSafe(tpIterNext, it)
 		stack = st.syncStackFromVM(vm, stack)
@@ -549,7 +551,7 @@ func (vm *VM) opCompareLtSlow(st *loopState, ip, sp int) (int, int, loopCtl) {
 			}
 		}
 	}
-	vm.syncActiveFrame(st, ip)
+	st.ip = ip
 	vm.execCtx.SP = sp
 	res := vm.compareOpSafe(a, b, CMP_LT)
 	stack = st.syncStackFromVM(vm, stack)
@@ -613,7 +615,7 @@ func (vm *VM) opCompareSlow(st *loopState, inst uint32, ip, sp int) (int, int, l
 			}
 		}
 	}
-	vm.syncActiveFrame(st, ip)
+	st.ip = ip
 	vm.execCtx.SP = sp
 	res := vm.compareOpSafe(a, b, cmpOp)
 	stack = st.syncStackFromExecCtx(vm, stack)
@@ -641,7 +643,7 @@ func (vm *VM) opFastSubscrPushSlow(st *loopState, inst uint32, ip, sp int) (int,
 	} else if int(cellIdx) < len(st.cells) {
 		cVal = (*val.PyCell)(unsafe.Pointer(st.cells[cellIdx].HeaderPtr())).Value
 	}
-	vm.syncActiveFrame(st, ip)
+	st.ip = ip
 	vm.execCtx.SP = sp
 	res := vm.getItemSafe(cVal, locals[uint8(localIdx)])
 	stack = st.syncStackFromVM(vm, stack)
@@ -775,8 +777,8 @@ func (vm *VM) opFastSelfRecurseSlow(st *loopState, inst uint32, ip, sp int) (int
 				saved.stack = st.stack
 				saved.activeGen = st.activeGen
 				saved.genFrameIdx = st.genFrameIdx
-				saved.genForIter = false
-				saved.genYieldFrom = false
+				saved.genMode = genModeNone
+				saved.genDefault = val.Value{}
 				saved.initInstance = val.Value{}
 				saved.cmpActive = false
 				st.curLocals = val.NoneVal()

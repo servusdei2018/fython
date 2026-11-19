@@ -104,7 +104,7 @@ func (vm *VM) opBuildClass(st *loopState, inst uint32, ip, sp int) (int, int, lo
 	}
 
 	st.stack = stack
-	vm.syncActiveFrame(st, ip)
+	st.ip = ip
 	vm.execCtx.SP = sp
 
 	newClsVal := vm.buildClassSafe(classBody, nameVal, origBases, kwdsVal, st.globals)

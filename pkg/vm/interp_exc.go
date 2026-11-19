@@ -134,10 +134,11 @@ func (vm *VM) opReturnSlow(st *loopState, ip, sp int, retVal val.Value) (int, in
 		vm.frames[st.frameIdx].shadowFrame = nil
 	}
 	if st.activeGen != nil && st.frameIdx == st.genFrameIdx {
-		st.activeGen.RetVal = retVal
-		st.activeGen.State = val.GenClosed
-		st.activeGen.SP = sp
-		vm.releaseGeneratorStack(st.activeGen)
+		gen := st.activeGen
+		gen.RetVal = retVal
+		gen.State = val.GenClosed
+		gen.SP = sp
+		vm.releaseGeneratorStack(gen)
 		if st.frameIdx == st.startFrameIdx {
 			st.result = retVal
 			return ip, sp, ctlExit
@@ -147,14 +148,27 @@ func (vm *VM) opReturnSlow(st *loopState, ip, sp int, retVal val.Value) (int, in
 		if len(vm.excStack) > caller.excStackLen {
 			vm.excStack = vm.excStack[:caller.excStackLen]
 		}
-		wasYieldFrom := caller.genYieldFrom
+		mode := caller.genMode
+		defVal := caller.genDefault
 		exitIP := caller.genExitIP
 		callerIP := caller.ip
 		retSP := caller.retSP
 		vm.restoreCallerFrame(st, caller)
-		if wasYieldFrom {
+		if mode == genModeForIter || mode == genModeYieldFrom {
+			vm.releaseGenerator(gen)
+		}
+		switch mode {
+		case genModeYieldFrom:
 			st.stack[retSP-1] = retVal
 			return callerIP + 1, retSP, ctlReload
+		case genModeForIter:
+			return exitIP, retSP - 1, ctlReload
+		case genModeNextDefault:
+			st.stack[retSP] = defVal
+			return callerIP, retSP + 1, ctlReload
+		case genModeNext, genModeSend:
+			st.raiseExc = val.NewStopIteration(retVal)
+			return callerIP - 1, retSP, ctlRaise
 		}
 		return exitIP, retSP - 1, ctlReload
 	}
@@ -211,7 +225,7 @@ func (vm *VM) opReturnSlow(st *loopState, ip, sp int, retVal val.Value) (int, in
 			} else {
 				st.cache = vm.cacheFor(st.curCO)
 			}
-			vm.syncActiveFrame(st, ip)
+			st.ip = ip
 			vm.execCtx.SP = sp
 			res := vm.compareOpSafe(cmpLeft, cmpRight, cmpOp)
 			stack = st.syncStackFromExecCtx(vm, stack)

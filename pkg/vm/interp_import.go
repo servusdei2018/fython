@@ -14,7 +14,7 @@ func (vm *VM) opImportName(st *loopState, inst uint32, ip, sp int) (int, int, lo
 	returnLeaf := (argA & 0x80) != 0
 
 	st.stack = stack
-	vm.syncActiveFrame(st, ip)
+	st.ip = ip
 	vm.execCtx.SP = sp
 	modVal, err := vm.ImportModule(nameVal.AsString(), level, returnLeaf, st.globals)
 	stack = st.syncStackFromExecCtx(vm, stack)
@@ -43,7 +43,7 @@ func (vm *VM) opImportFrom(st *loopState, inst uint32, ip, sp int) (int, int, lo
 	modVal := stack[sp-1]
 
 	st.stack = stack
-	vm.syncActiveFrame(st, ip)
+	st.ip = ip
 	vm.execCtx.SP = sp
 	v, err := vm.ImportFrom(modVal, symVal.AsString(), st.globals)
 	stack = st.syncStackFromExecCtx(vm, stack)
@@ -70,7 +70,7 @@ func (vm *VM) opImportStar(st *loopState, ip, sp int) (int, int, loopCtl) {
 	sp--
 	modVal := stack[sp]
 	st.stack = stack
-	vm.syncActiveFrame(st, ip)
+	st.ip = ip
 	vm.execCtx.SP = sp
 	err := vm.ImportStar(modVal, st.globals)
 	st.syncStackFromExecCtx(vm, stack)

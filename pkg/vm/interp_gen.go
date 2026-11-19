@@ -33,8 +33,8 @@ func (vm *VM) restoreCallerFrame(st *loopState, caller *CallFrame) {
 	vm.execCtx.Stack = caller.stack
 	st.activeGen = caller.activeGen
 	st.genFrameIdx = caller.genFrameIdx
-	caller.genForIter = false
-	caller.genYieldFrom = false
+	caller.genMode = genModeNone
+	caller.genDefault = val.Value{}
 	caller.stack = nil
 	caller.activeGen = nil
 	vm.activeCO = st.curCO
@@ -48,12 +48,22 @@ func (vm *VM) restoreCallerFrame(st *loopState, caller *CallFrame) {
 // runLoopWithGlobals without recursing into resumeGenerator/runFrame.
 //
 //go:noinline
-func (vm *VM) pushInlineGenerator(st *loopState, gen *val.PyGenerator, callerIP, callerSP, retSP, jumpTarget int, isYieldFrom bool, sentVal val.Value) (int, int, loopCtl) {
+func (vm *VM) pushInlineGenerator(st *loopState, gen *val.PyGenerator, callerIP, callerSP, retSP, jumpTarget int, mode uint8, defaultVal, sentVal val.Value) (int, int, loopCtl) {
 	switch gen.State {
 	case val.GenClosed:
-		if isYieldFrom {
+		switch mode {
+		case genModeYieldFrom:
 			st.stack[callerSP-1] = gen.RetVal
 			return callerIP + 1, callerSP, ctlReload
+		case genModeForIter:
+			vm.releaseGenerator(gen)
+			return jumpTarget, callerSP - 1, ctlNext
+		case genModeNextDefault:
+			st.stack[retSP] = defaultVal
+			return callerIP + 1, retSP + 1, ctlReload
+		case genModeNext, genModeSend:
+			st.raiseExc = val.NewStopIteration(val.NoneVal())
+			return callerIP, callerSP, ctlRaise
 		}
 		return jumpTarget, callerSP - 1, ctlNext
 	case val.GenRunning:
@@ -95,7 +105,7 @@ func (vm *VM) pushInlineGenerator(st *loopState, gen *val.PyGenerator, callerIP,
 	saved.codePtr = st.codePtr
 	saved.codeLen = st.codeLen
 	saved.consts = st.consts
-	if isYieldFrom {
+	if mode == genModeYieldFrom {
 		saved.ip = callerIP
 	} else {
 		saved.ip = callerIP + 1
@@ -112,8 +122,8 @@ func (vm *VM) pushInlineGenerator(st *loopState, gen *val.PyGenerator, callerIP,
 	saved.stack = st.stack
 	saved.activeGen = st.activeGen
 	saved.genFrameIdx = st.genFrameIdx
-	saved.genForIter = !isYieldFrom
-	saved.genYieldFrom = isYieldFrom
+	saved.genMode = mode
+	saved.genDefault = defaultVal
 	saved.genExitIP = jumpTarget
 	saved.initInstance = val.Value{}
 	saved.cmpActive = false
@@ -159,10 +169,11 @@ func (vm *VM) opForIterGen(st *loopState, inst uint32, ip, sp int) (int, int, lo
 		jumpTarget := int(uint16(inst))
 		gen := it.AsGenerator()
 		if gen.State == val.GenClosed {
+			vm.releaseGenerator(gen)
 			return jumpTarget, sp - 1, ctlNext
 		}
 		if vm.activeJoinGen == nil {
-			return vm.pushInlineGenerator(st, gen, ip, sp, sp, jumpTarget, false, val.NoneVal())
+			return vm.pushInlineGenerator(st, gen, ip, sp, sp, jumpTarget, genModeForIter, val.Value{}, val.NoneVal())
 		}
 	}
 	st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_FOR_ITER))
@@ -185,14 +196,14 @@ func (vm *VM) suspendActiveGen(st *loopState, yieldVal val.Value, resumeIP, resu
 		if len(vm.excStack) > caller.excStackLen {
 			vm.excStack = vm.excStack[:caller.excStackLen]
 		}
-		if caller.genForIter {
+		switch caller.genMode {
+		case genModeForIter, genModeNext, genModeNextDefault, genModeSend:
 			retSP := caller.retSP
 			callerIP := caller.ip
 			vm.restoreCallerFrame(st, caller)
 			st.stack[retSP] = yieldVal
 			return callerIP, retSP + 1, ctlReload
-		}
-		if caller.genYieldFrom {
+		case genModeYieldFrom:
 			retSP := caller.retSP
 			callerIP := caller.ip
 			vm.restoreCallerFrame(st, caller)
@@ -276,7 +287,9 @@ func (vm *VM) opYieldFrom(st *loopState, ip, sp int) (int, int, loopCtl) {
 			if status == val.IterExhausted {
 				retVal := val.NoneVal()
 				if subiter.IsGenerator() {
-					retVal = subiter.AsGenerator().RetVal
+					subGen := subiter.AsGenerator()
+					retVal = subGen.RetVal
+					vm.releaseGenerator(subGen)
 				} else if subiter.IsCoroutine() {
 					retVal = subiter.AsCoroutine().RetVal
 					vm.releaseCoroutine(subiter.AsCoroutine())
@@ -296,7 +309,7 @@ func (vm *VM) opYieldFrom(st *loopState, ip, sp int) (int, int, loopCtl) {
 		return ip, sp, ctlReload
 	}
 	if subiter.IsGenerator() && vm.activeJoinGen == nil {
-		return vm.pushInlineGenerator(st, subiter.AsGenerator(), ip, sp, sp, 0, true, sentVal)
+		return vm.pushInlineGenerator(st, subiter.AsGenerator(), ip, sp, sp, 0, genModeYieldFrom, val.Value{}, sentVal)
 	}
 	var nextVal val.Value
 	var status val.IterStatus
@@ -327,7 +340,9 @@ func (vm *VM) opYieldFrom(st *loopState, ip, sp int) (int, int, loopCtl) {
 	case status == val.IterExhausted:
 		retVal := val.NoneVal()
 		if subiter.IsGenerator() {
-			retVal = subiter.AsGenerator().RetVal
+			subGen := subiter.AsGenerator()
+			retVal = subGen.RetVal
+			vm.releaseGenerator(subGen)
 		} else if subiter.IsCoroutine() {
 			retVal = subiter.AsCoroutine().RetVal
 			vm.releaseCoroutine(subiter.AsCoroutine())

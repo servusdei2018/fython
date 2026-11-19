@@ -239,10 +239,16 @@ func callerModuleName(ctx *val.ExecContext) string {
 		return "typing"
 	}
 	vm, ok := ctx.VM.(*VM)
-	if !ok || vm.activeFrameIdx < 0 || vm.activeFrameIdx >= len(vm.frames) {
+	if !ok {
 		return "typing"
 	}
-	g := vm.frames[vm.activeFrameIdx].globals
+	var g *val.PyDict
+	if vm.activeState != nil && vm.activeFrameIdx == vm.activeState.frameIdx {
+		g = vm.activeState.globals
+	}
+	if g == nil && vm.activeFrameIdx >= 0 && vm.activeFrameIdx < len(vm.frames) {
+		g = vm.frames[vm.activeFrameIdx].globals
+	}
 	if g == nil {
 		return "typing"
 	}

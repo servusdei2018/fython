@@ -70,6 +70,9 @@ const (
 	// FlagDataDescriptor marks a descriptor object (such as @property or custom __set__)
 	// as a data descriptor that takes precedence over instance attributes.
 	FlagDataDescriptor uint8 = 1 << 1
+	// FlagEphemeralGen marks a pooled PyGenerator owned exclusively by a directly
+	// following OP_GET_ITER + OP_FOR_ITER[_GEN] or OP_YIELD_FROM.
+	FlagEphemeralGen uint8 = 1 << 6
 	// FlagEphemeralIter marks a pooled PyIter owned exclusively by OP_GET_ITER -> OP_FOR_ITER.
 	FlagEphemeralIter uint8 = 1 << 7
 )

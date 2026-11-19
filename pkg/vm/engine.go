@@ -791,6 +791,9 @@ func (e *Engine) newVMInternal(stackCap, frameCap int) *VM {
 	if isInstVal, ok := e.builtins.Get(nameIsInstance); ok {
 		v.builtinIsInstance = isInstVal
 	}
+	if nextVal, ok := e.builtins.Get(nameBuiltinNext); ok {
+		v.builtinNext = nextVal
+	}
 	v.execCtx.Stack = v.stack
 	v.execCtx.CallHook = v.callFromHook
 	v.execCtx.VM = v
