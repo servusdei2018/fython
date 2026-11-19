@@ -2213,7 +2213,12 @@ func InitArenaDict(d *PyDict, capHint int, entries []DictEntry) {
 	for int(tableCap)*2 < capHint*3 {
 		tableCap <<= 1
 	}
-	d.indices = make([]byte, int(tableCap))
+	if tableCap == 8 {
+		clear(d.inlineIndices[:])
+		d.indices = d.inlineIndices[:]
+	} else {
+		d.indices = make([]byte, int(tableCap))
+	}
 	d.mask = tableCap - 1
 	d.indexShift = 0
 	d.Entries = entries[:0]

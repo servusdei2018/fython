@@ -616,6 +616,7 @@ type VM struct {
 	pendingVirtualenvPth bool
 	coroFreeList         []*val.PyCoroutine
 	genFreeList          []*val.PyGenerator
+	iterFreeList         []*val.PyIter
 	loopStatePool        []*loopState
 	genStackPools        [4][][]val.Value
 	genCellValPools      [8][][]val.Value
@@ -767,6 +768,47 @@ func (vm *VM) releaseStackSlice(s []val.Value) {
 			}
 			return
 		}
+	}
+}
+
+func (vm *VM) acquireForIter(obj val.Value) val.Value {
+	var it *val.PyIter
+	if n := len(vm.iterFreeList); n > 0 {
+		it = vm.iterFreeList[n-1]
+		vm.iterFreeList[n-1] = nil
+		vm.iterFreeList = vm.iterFreeList[:n-1]
+	} else {
+		it = &val.PyIter{}
+	}
+	it.Header = val.ObjectHeader{Kind: val.KindIter, Flags: val.FlagEphemeralIter, Type: val.IterType}
+	it.Obj = obj
+	it.Idx = 0
+	switch {
+	case obj.IsList():
+		it.Kind = val.IterKindList
+	case obj.IsTuple():
+		it.Kind = val.IterKindTuple
+	case obj.IsDict():
+		it.Kind = val.IterKindDict
+	default:
+		it.Kind = val.IterKindInvalid
+	}
+	return val.ObjectVal(&it.Header)
+}
+
+func (vm *VM) releaseForIter(it *val.PyIter) {
+	if it == nil || (it.Header.Flags&val.FlagEphemeralIter) == 0 {
+		return
+	}
+	it.Header.Flags = 0
+	it.Obj = val.Value{}
+	it.NextFn = nil
+	it.Idx = 0
+	it.Cur = 0
+	it.Stop = 0
+	it.Step = 0
+	if len(vm.iterFreeList) < 128 {
+		vm.iterFreeList = append(vm.iterFreeList, it)
 	}
 }
 

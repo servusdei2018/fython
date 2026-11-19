@@ -2564,10 +2564,7 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 		codePtr       = st.codePtr
 		ctl           loopCtl
 		pushFn        *val.PyFunction
-		pushCallee    *CodeObject
 		pushCache     *VMCodeCache
-		pushNewBase   int
-		pushRetSP     int
 		pushTotalArgs int
 	)
 
@@ -2722,11 +2719,9 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 						st.frameIdx+2 <= len(vm.frames) &&
 						newBase+max(256, callee.NumLocals+64) <= len(st.stack) {
 						pushFn = fn
-						pushCallee = callee
 						pushCache = cc
-						pushNewBase = newBase
-						pushRetSP = retSP
-						pushTotalArgs = argc
+						// Negative bitwise-complement encodes retSP = newBase - 1 (popping callable slot).
+						pushTotalArgs = ^argc
 						goto pushFrame
 					}
 				}
@@ -2842,10 +2837,7 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 						}
 						if pc != nil && pc.owner == vm && atomic.LoadInt32(&callee.StreamGen) == pc.streamGen {
 							pushFn = targetFn
-							pushCallee = callee
 							pushCache = pc
-							pushNewBase = newBase
-							pushRetSP = newBase
 							pushTotalArgs = totalArgs
 							goto pushFrame
 						}
@@ -3051,10 +3043,7 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 							newBase+max(256, callee.NumLocals+64) <= len(st.stack) {
 							recordLoadAttrInlinePropHit()
 							pushFn = fn
-							pushCallee = callee
 							pushCache = cc
-							pushNewBase = newBase
-							pushRetSP = newBase
 							pushTotalArgs = 1
 							goto pushFrame
 						}
@@ -3179,7 +3168,7 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				continue
 			}
 			if top.IsList() || top.IsTuple() || top.IsDict() {
-				*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)) = val.AcquireForIterVal(top)
+				*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)) = vm.acquireForIter(top)
 				ip++
 				continue
 			}
@@ -3223,7 +3212,7 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 						ip++
 						continue
 					}
-					val.ReleaseForIter(pyIter)
+					vm.releaseForIter(pyIter)
 					sp--
 					ip = jumpTarget
 					continue
@@ -3237,7 +3226,7 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 						ip++
 						continue
 					}
-					val.ReleaseForIter(pyIter)
+					vm.releaseForIter(pyIter)
 					sp--
 					ip = jumpTarget
 					continue
@@ -3387,10 +3376,7 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 						saved.cmpOp = cmpOp
 						saved.cmpActive = true
 						pushFn = fn
-						pushCallee = callee
 						pushCache = cc
-						pushNewBase = newBase
-						pushRetSP = newBase
 						pushTotalArgs = 2
 						goto pushFrame
 					}
@@ -3636,70 +3622,89 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 		locals = (*[256]val.Value)(unsafe.Add(stackPtr, uintptr(st.base)*16))
 		continue
 	pushFrame:
-		saved := &vm.frames[st.frameIdx]
-		saved.co = st.curCO
-		saved.codePtr = codePtr
-		saved.codeLen = st.codeLen
-		saved.consts = st.consts
-		saved.ip = ip + 1
-		saved.baseOffset = st.base
-		saved.retSP = pushRetSP
-		if saved.cells != nil || st.cells != nil {
-			saved.cells = st.cells
-		}
-		if saved.cellPtrs != nil || st.cellPtrs != nil {
-			saved.cellPtrs = st.cellPtrs
-		}
-		saved.globals = st.globals
-		if saved.locals != st.curLocals {
-			saved.locals = st.curLocals
-		}
-		saved.cache = st.cache
-		saved.excStackLen = len(vm.excStack)
-		saved.stackIsVM = st.stackIsVM
-		if !st.curLocals.IsNone() {
-			st.curLocals = val.NoneVal()
-		}
-		st.frameIdx++
-		if st.frameIdx > vm.maxFrameIdx {
-			vm.maxFrameIdx = st.frameIdx
-		}
-		if st.stackIsVM {
-			if hw := pushNewBase + pushCallee.FrameStackNeed; hw > vm.maxSP {
-				vm.maxSP = hw
-			}
-		}
-		st.curCO = pushCallee
-		st.cache = pushCache
-		codePtr = pushCache.codePtr
-		st.codePtr = codePtr
-		st.codeLen = pushCache.codeLen
-		st.consts = pushCallee.Consts
+		ip, sp = vm.pushFrameFast(st, pushFn, pushCache, sp, pushTotalArgs, ip)
+		stackPtr = unsafe.Pointer(unsafe.SliceData(st.stack))
 		constsPtr = unsafe.Pointer(unsafe.SliceData(st.consts))
-		st.base = pushNewBase
-		locals = (*[256]val.Value)(unsafe.Add(stackPtr, uintptr(pushNewBase)*16))
-		if !pushCallee.HasCells {
-			if st.cells != nil || st.cellPtrs != nil {
-				st.cells = nil
-				st.cellPtrs = nil
-			}
-		} else {
-			st.cells = pushFn.Closure
-			st.cellPtrs = pushFn.CellPtrs
-		}
-		if pushFn.Globals != nil {
-			st.globals = pushFn.Globals
-		}
-		vm.activeCO = pushCallee
-		vm.activeBaseOffset = pushNewBase
-		if vm.activeCellPtrs != nil || st.cellPtrs != nil {
-			vm.activeCells = st.cells
-			vm.activeCellPtrs = st.cellPtrs
-		}
-		vm.activeFrameIdx = st.frameIdx
-		sp = pushNewBase + max(pushCallee.NumLocals, pushTotalArgs)
-		ip = 0
+		codePtr = st.codePtr
+		locals = (*[256]val.Value)(unsafe.Add(stackPtr, uintptr(st.base)*16))
 	}
+}
+
+//go:noinline
+func (vm *VM) pushFrameFast(
+	st *loopState,
+	pushFn *val.PyFunction,
+	pushCache *VMCodeCache,
+	sp, encodedTotalArgs, ip int,
+) (int, int) {
+	pushCallee := pushCache.co
+	pushTotalArgs := encodedTotalArgs
+	popCallable := 0
+	if pushTotalArgs < 0 {
+		pushTotalArgs = ^pushTotalArgs
+		popCallable = 1
+	}
+	pushNewBase := sp - pushTotalArgs
+	pushRetSP := pushNewBase - popCallable
+	saved := &vm.frames[st.frameIdx]
+	saved.co = st.curCO
+	saved.codePtr = st.codePtr
+	saved.codeLen = st.codeLen
+	saved.consts = st.consts
+	saved.ip = ip + 1
+	saved.baseOffset = st.base
+	saved.retSP = pushRetSP
+	if saved.cells != nil || st.cells != nil {
+		saved.cells = st.cells
+	}
+	if saved.cellPtrs != nil || st.cellPtrs != nil {
+		saved.cellPtrs = st.cellPtrs
+	}
+	saved.globals = st.globals
+	if saved.locals != st.curLocals {
+		saved.locals = st.curLocals
+	}
+	saved.cache = st.cache
+	saved.excStackLen = len(vm.excStack)
+	saved.stackIsVM = st.stackIsVM
+	if !st.curLocals.IsNone() {
+		st.curLocals = val.NoneVal()
+	}
+	st.frameIdx++
+	if st.frameIdx > vm.maxFrameIdx {
+		vm.maxFrameIdx = st.frameIdx
+	}
+	if st.stackIsVM {
+		if hw := pushNewBase + pushCallee.FrameStackNeed; hw > vm.maxSP {
+			vm.maxSP = hw
+		}
+	}
+	st.curCO = pushCallee
+	st.cache = pushCache
+	st.codePtr = pushCache.codePtr
+	st.codeLen = pushCache.codeLen
+	st.consts = pushCallee.Consts
+	st.base = pushNewBase
+	if !pushCallee.HasCells {
+		if st.cells != nil || st.cellPtrs != nil {
+			st.cells = nil
+			st.cellPtrs = nil
+		}
+	} else {
+		st.cells = pushFn.Closure
+		st.cellPtrs = pushFn.CellPtrs
+	}
+	if pushFn.Globals != nil {
+		st.globals = pushFn.Globals
+	}
+	vm.activeCO = pushCallee
+	vm.activeBaseOffset = pushNewBase
+	if vm.activeCellPtrs != nil || st.cellPtrs != nil {
+		vm.activeCells = st.cells
+		vm.activeCellPtrs = st.cellPtrs
+	}
+	vm.activeFrameIdx = st.frameIdx
+	return 0, pushNewBase + max(pushCallee.NumLocals, pushTotalArgs)
 }
 
 func isCallableConst(v val.Value) bool {
