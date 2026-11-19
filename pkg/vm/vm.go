@@ -676,7 +676,11 @@ func (vm *VM) bindFunctionArgs(co *CodeObject, defaults []val.Value, kwDefaults 
 			panic(fmt.Sprintf("vm: TypeError: %s() takes %d positional arguments but %d were given", co.Name, posParamCount, nargs))
 		}
 		if varKWIdx >= 0 {
-			stack[argBase+varKWIdx] = val.NewDictVal(0)
+			if co.VarKWSafe {
+				stack[argBase+varKWIdx] = vm.acquireSmallDictFlags(0, val.FlagEphemeralFrameDict)
+			} else {
+				stack[argBase+varKWIdx] = val.NewDictVal(0)
+			}
 		}
 		if nargs < posParamCount && len(defaults) > 0 {
 			defStart := posParamCount - len(defaults)
@@ -742,7 +746,11 @@ func (vm *VM) bindFunctionArgs(co *CodeObject, defaults []val.Value, kwDefaults 
 			vm.kwSet[foundIdx] = true
 		case varKWIdx >= 0:
 			if kwDict == nil {
-				kwDict = val.NewDictVal(4).AsDict()
+				if co.VarKWSafe {
+					kwDict = vm.acquireSmallDictFlags(4, val.FlagEphemeralFrameDict).AsDict()
+				} else {
+					kwDict = val.NewDictVal(4).AsDict()
+				}
 			}
 			kwDict.Set(kwName, kwVal)
 		default:
@@ -752,7 +760,11 @@ func (vm *VM) bindFunctionArgs(co *CodeObject, defaults []val.Value, kwDefaults 
 
 	if varKWIdx >= 0 {
 		if kwDict == nil {
-			stack[argBase+varKWIdx] = val.NewDictVal(0)
+			if co.VarKWSafe {
+				stack[argBase+varKWIdx] = vm.acquireSmallDictFlags(0, val.FlagEphemeralFrameDict)
+			} else {
+				stack[argBase+varKWIdx] = val.NewDictVal(0)
+			}
 		} else {
 			stack[argBase+varKWIdx] = val.DictVal(kwDict)
 		}
@@ -1029,7 +1041,7 @@ func (vm *VM) initBuiltins() {
 	vm.builtins.Set(val.InternString("staticmethod"), val.TypeVal(val.StaticMethodType))
 	vm.builtins.Set(val.InternString("NotImplemented"), val.NotImplementedVal())
 
-	vm.builtins.Set(val.InternString("super"), val.NewBuiltinFuncVal("super", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+	superVal := val.NewBuiltinFuncVal("super", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) == 2 {
 			if !args[0].IsType() {
 				ctx.Raise(val.NewException(val.TypeErrorType, "super() argument 1 must be type, not"+args[0].Type().Name))
@@ -1070,16 +1082,25 @@ func (vm *VM) initBuiltins() {
 
 			var thisClass *val.PyType
 			found := false
+			if co.ClassCellIdx >= 0 && int(co.ClassCellIdx) < len(activeCells) {
+				c := activeCells[co.ClassCellIdx]
+				if c.IsCell() && !c.AsCell().Value.IsUnbound() && c.AsCell().Value.IsType() {
+					thisClass = c.AsCell().Value.AsType()
+					found = true
+				}
+			}
 
-			for i, fv := range co.FreeVars {
-				if fv.StringEquals("__class__") {
-					idx := len(co.CellVars) + i
-					if idx < len(activeCells) {
-						c := activeCells[idx]
-						if c.IsCell() && !c.AsCell().Value.IsUnbound() && c.AsCell().Value.IsType() {
-							thisClass = c.AsCell().Value.AsType()
-							found = true
-							break
+			if !found {
+				for i, fv := range co.FreeVars {
+					if fv.StringEquals("__class__") {
+						idx := len(co.CellVars) + i
+						if idx < len(activeCells) {
+							c := activeCells[idx]
+							if c.IsCell() && !c.AsCell().Value.IsUnbound() && c.AsCell().Value.IsType() {
+								thisClass = c.AsCell().Value.AsType()
+								found = true
+								break
+							}
 						}
 					}
 				}
@@ -1108,7 +1129,9 @@ func (vm *VM) initBuiltins() {
 		}
 		ctx.Raise(val.NewException(val.TypeErrorType, fmt.Sprintf("super() takes at most 2 arguments (%d given)", len(args))))
 		return val.NoneVal()
-	}))
+	})
+	vm.builtinSuper = superVal
+	vm.builtins.Set(val.InternString("super"), superVal)
 
 	vm.builtins.Set(val.InternString("__build_class__"), val.NewBuiltinFuncVal("__build_class__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {
@@ -1461,6 +1484,102 @@ func (vm *VM) releaseGenerator(gen *val.PyGenerator) {
 	}
 }
 
+func (vm *VM) acquireSuper(thisClass *val.PyType, self val.Value, ephemeral bool) val.Value {
+	if ephemeral && !val.MultiThreadedFlag.Load() && len(vm.superFreeList) > 0 {
+		n := len(vm.superFreeList) - 1
+		sup := vm.superFreeList[n]
+		vm.superFreeList[n] = nil
+		vm.superFreeList = vm.superFreeList[:n]
+		sup.Header = val.ObjectHeader{Kind: val.KindSuper, Flags: val.FlagEphemeralSuper, Type: val.SuperType}
+		sup.ThisClass = thisClass
+		sup.Self = self
+		return val.ObjectVal(&sup.Header)
+	}
+	v := val.NewSuperVal(thisClass, self)
+	if ephemeral && !val.MultiThreadedFlag.Load() {
+		v.HeaderPtr().Flags |= val.FlagEphemeralSuper
+	}
+	return v
+}
+
+//go:noinline
+func (vm *VM) releaseSuper(sup *val.PySuper) {
+	if sup == nil || (sup.Header.Flags&val.FlagEphemeralSuper) == 0 || val.MultiThreadedFlag.Load() {
+		return
+	}
+	sup.Header.Flags &^= val.FlagEphemeralSuper
+	sup.ThisClass = nil
+	sup.Self = val.Value{}
+	if len(vm.superFreeList) < 64 {
+		vm.superFreeList = append(vm.superFreeList, sup)
+	}
+}
+
+func (vm *VM) acquireSmallDict(capacity int, ephemeral bool) val.Value {
+	var flags uint8
+	if ephemeral {
+		flags = val.FlagEphemeralDict
+	}
+	return vm.acquireSmallDictFlags(capacity, flags)
+}
+
+func (vm *VM) acquireSmallDictFlags(capacity int, flags uint8) val.Value {
+	if !val.MultiThreadedFlag.Load() && capacity <= 5 {
+		if n := len(vm.dictFreeList); n > 0 {
+			d := vm.dictFreeList[n-1]
+			vm.dictFreeList[n-1] = nil
+			vm.dictFreeList = vm.dictFreeList[:n-1]
+			d.Header = val.ObjectHeader{Kind: val.KindDict, Flags: flags, Type: val.DictType}
+			if capacity > 0 {
+				d.InitSmallInlineTable()
+			}
+			return val.DictVal(d)
+		}
+		v := val.NewDictVal(capacity)
+		if flags != 0 {
+			v.HeaderPtr().Flags |= flags
+		}
+		return v
+	}
+	return val.NewDictVal(capacity)
+}
+
+func (vm *VM) releaseSmallDict(d *val.PyDict) {
+	vm.releaseSmallDictFlag(d, val.FlagEphemeralDict)
+}
+
+func (vm *VM) releaseSmallDictFlag(d *val.PyDict, flag uint8) {
+	if d == nil || (d.Header.Flags&flag) == 0 || val.MultiThreadedFlag.Load() {
+		return
+	}
+	if d.Shared || d.Live != nil || d.Attrs != nil || d.Header.Type != val.DictType {
+		d.Header.Flags &^= val.FlagEphemeralDict | val.FlagEphemeralFrameDict
+		return
+	}
+	if !d.IsSmallInline() {
+		d.Header.Flags &^= val.FlagEphemeralDict | val.FlagEphemeralFrameDict
+		return
+	}
+	d.ResetForPool()
+	if len(vm.dictFreeList) < 128 {
+		vm.dictFreeList = append(vm.dictFreeList, d)
+	}
+}
+
+//go:noinline
+func (vm *VM) releaseSmallDictVal(v val.Value) {
+	if v.IsDict() {
+		vm.releaseSmallDictFlag(v.AsDict(), val.FlagEphemeralDict)
+	}
+}
+
+//go:noinline
+func (vm *VM) releaseFrameSmallDictVal(v val.Value) {
+	if v.IsDict() {
+		vm.releaseSmallDictFlag(v.AsDict(), val.FlagEphemeralFrameDict)
+	}
+}
+
 func (vm *VM) instantiateGenerator(co *CodeObject, callable val.Value, defaults []val.Value, kwDefaults *val.PyDict, callerStack []val.Value, argBase int, nargs int, kwnames []val.Value, globals *val.PyDict, ephemeral bool) val.Value {
 	need := max(256, co.NumLocals+co.MaxStackSize+64)
 	if hint := int(co.GenStackHint.Load()); hint > need {
@@ -1686,7 +1805,11 @@ func (vm *VM) bindFunctionArgsToSlice(co *CodeObject, defaults []val.Value, kwDe
 			}
 		}
 		if varKWIdx >= 0 {
-			dst[varKWIdx] = val.NewDictVal(0)
+			if co.VarKWSafe {
+				dst[varKWIdx] = vm.acquireSmallDictFlags(0, val.FlagEphemeralFrameDict)
+			} else {
+				dst[varKWIdx] = val.NewDictVal(0)
+			}
 		}
 		if nargs < posParamCount && len(defaults) > 0 {
 			defStart := posParamCount - len(defaults)
@@ -1745,7 +1868,11 @@ func (vm *VM) bindFunctionArgsToSlice(co *CodeObject, defaults []val.Value, kwDe
 			vm.kwSet[foundIdx] = true
 		case varKWIdx >= 0:
 			if kwDict == nil {
-				kwDict = val.NewDictVal(4).AsDict()
+				if co.VarKWSafe {
+					kwDict = vm.acquireSmallDictFlags(4, val.FlagEphemeralFrameDict).AsDict()
+				} else {
+					kwDict = val.NewDictVal(4).AsDict()
+				}
 			}
 			kwDict.Set(kwName, kwVal)
 		default:
@@ -1755,7 +1882,11 @@ func (vm *VM) bindFunctionArgsToSlice(co *CodeObject, defaults []val.Value, kwDe
 
 	if varKWIdx >= 0 {
 		if kwDict == nil {
-			dst[varKWIdx] = val.NewDictVal(0)
+			if co.VarKWSafe {
+				dst[varKWIdx] = vm.acquireSmallDictFlags(0, val.FlagEphemeralFrameDict)
+			} else {
+				dst[varKWIdx] = val.NewDictVal(0)
+			}
 		} else {
 			dst[varKWIdx] = val.DictVal(kwDict)
 		}
@@ -2212,10 +2343,19 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 			}
 		}
 
+		if st.curCO != nil && st.curCO.VarKWSafe && st.frameIdx != st.genFrameIdx && vm.frames[st.frameIdx].shadowFrame == nil {
+			idx := st.base + st.curCO.VarKWIdx
+			if idx >= 0 && idx < len(st.stack) {
+				vm.releaseFrameSmallDictVal(st.stack[idx])
+			}
+		}
+
+		var finishedGen *val.PyGenerator
 		var finishedCoro *val.PyCoroutine
 		if st.activeGen != nil && st.frameIdx == st.genFrameIdx {
-			st.activeGen.State = val.GenClosed
-			vm.releaseGeneratorStack(st.activeGen)
+			finishedGen = st.activeGen
+			finishedGen.State = val.GenClosed
+			vm.releaseGeneratorStack(finishedGen)
 		} else if st.activeCoro != nil && st.frameIdx == st.genFrameIdx {
 			finishedCoro = st.activeCoro
 			finishedCoro.State = val.CoroClosed
@@ -2256,6 +2396,13 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 				caller.stack = nil
 				caller.activeGen = nil
 				caller.activeCoro = nil
+				if caller.joinState != nil {
+					vm.releaseStrJoinState(caller.joinState)
+					caller.joinState = nil
+				}
+				if finishedGen != nil && (mode == genModeForIter || mode == genModeYieldFrom || mode == genModeAwait || mode == genModeStrJoin) {
+					vm.releaseGenerator(finishedGen)
+				}
 				if finishedCoro != nil && (mode == genModeAwait || mode == genModeYieldFrom) {
 					vm.releaseEphemeralCoroutine(finishedCoro)
 				}
@@ -2354,6 +2501,7 @@ var (
 // separate calls for this, which cost more in call overhead than the checks
 // themselves.
 func (vm *VM) prepareStoreAttr(obj, v val.Value) (*val.PyInstance, *val.PyType, bool) {
+	val.ClearEphemeral(v)
 	if v.IsString() {
 		val.DetachStringBuf(v)
 	}
@@ -2892,7 +3040,7 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 			}
 			if st.frameIdx > st.startFrameIdx && st.frameIdx != st.genFrameIdx && vm.frames[st.frameIdx].shadowFrame == nil {
 				caller := &vm.frames[st.frameIdx-1]
-				if caller.initInstance.HeaderPtr() == nil &&
+				if caller.initInstance.HeaderPtr() == nil && !st.curCO.VarKWSafe &&
 					(!caller.cmpActive || (caller.cmpOp <= CMP_GTE && !retVal.IsNotImplemented())) &&
 					len(vm.excStack) <= caller.excStackLen && caller.cache != nil {
 					if caller.cmpActive {
@@ -3159,8 +3307,8 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 			top := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
 			if top.IsString() || top.Kind() == val.KindMemoryView {
 				vm.opDetachDupTop(top)
-			} else if top.IsIter() || top.IsGenerator() || top.IsCoroutine() {
-				top.HeaderPtr().Flags &^= val.FlagEphemeralIter | val.FlagEphemeralGen | val.FlagEphemeralCoro
+			} else if hdr := top.HeaderPtr(); hdr != nil && (hdr.Flags&val.FlagEphemeralAll) != 0 {
+				hdr.Flags &^= val.FlagEphemeralAll
 			}
 			*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16)) = top
 			sp++
@@ -4584,7 +4732,17 @@ func (vm *VM) delSubscrSafe(obj, key val.Value) {
 
 func (vm *VM) unpackMapIntoSafe(resDict *val.PyDict, mapping val.Value) {
 	if mapping.IsDict() {
-		for _, item := range mapping.AsDict().Items() {
+		d := mapping.AsDict()
+		if !d.Shared && d.Live == nil && !val.MultiThreadedFlag.Load() {
+			for i := range d.Entries {
+				e := &d.Entries[i]
+				if e.Active {
+					resDict.Set(e.Key, e.Value)
+				}
+			}
+			return
+		}
+		for _, item := range d.Items() {
 			resDict.Set(item.Key, item.Value)
 		}
 		return

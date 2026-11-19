@@ -141,7 +141,16 @@ const (
 	genModeSend        // gen.send(v): raise StopIteration(retVal) on exhaustion
 	genModeAwait       // await aw: store retVal at stack[retSP-1] on completion
 	genModeCoroSend    // coro.send(v): store retVal at stack[retSP] on completion
+	genModeStrJoin     // sep.join(gen): drain yielded strings directly into CallFrame.joinState
 )
+
+type strJoinState struct {
+	buf    strings.Builder
+	sep    val.Value
+	sepLen uint8
+	first  bool
+	count  int
+}
 
 // CallFrame is an unboxed value struct stored in the contiguous VM.frames slab.
 // It is never heap-allocated per function call.
@@ -171,6 +180,7 @@ type CallFrame struct {
 	genMode     uint8
 	genDefault  val.Value
 	genExitIP   int
+	joinState   *strJoinState
 	// initInstance holds the freshly allocated receiver for an in-loop
 	// __init__ call. When set, OP_RETURN substitutes it for a None
 	// return and raises TypeError otherwise.
@@ -248,6 +258,8 @@ type CodeObject struct {
 	PosParamCount        int
 	VarArgsIdx           int
 	VarKWIdx             int
+	ClassCellIdx         int16
+	VarKWSafe            bool
 	EffectiveLocals      int
 	FrameStackNeed       int
 	HasCells             bool
@@ -597,6 +609,7 @@ type VM struct {
 	builtinOpen          val.Value
 	builtinIsInstance    val.Value
 	builtinNext          val.Value
+	builtinSuper         val.Value
 	strScratch           []byte
 	internPool           *val.InternPool
 	execCtx              val.ExecContext
@@ -621,6 +634,9 @@ type VM struct {
 	coroFreeList         []*val.PyCoroutine
 	genFreeList          []*val.PyGenerator
 	iterFreeList         []*val.PyIter
+	superFreeList        []*val.PySuper
+	dictFreeList         []*val.PyDict
+	strJoinPool          []*strJoinState
 	loopStatePool        []*loopState
 	genStackPools        [4][][]val.Value
 	genCellValPools      [8][][]val.Value
@@ -932,6 +948,12 @@ func (vm *VM) Reset() {
 
 	fLimit := min(vm.maxFrameIdx+1, len(vm.frames))
 	if fLimit > 0 {
+		for i := range fLimit {
+			if js := vm.frames[i].joinState; js != nil {
+				vm.frames[i].joinState = nil
+				vm.releaseStrJoinState(js)
+			}
+		}
 		clear(vm.frames[:fLimit])
 	}
 	vm.maxFrameIdx = 0
@@ -1380,4 +1402,126 @@ func (co *CodeObject) computeParamShape() {
 	co.FrameStackNeed = max(256, co.NumLocals+64)
 	co.HasCellVars = len(co.CellVars) > 0
 	co.HasCells = co.HasCellVars || len(co.FreeVars) > 0
+	co.ClassCellIdx = -1
+	for i, cv := range co.CellVars {
+		if cv.StringEquals("__class__") {
+			co.ClassCellIdx = int16(i)
+			break
+		}
+	}
+	if co.ClassCellIdx < 0 {
+		for i, fv := range co.FreeVars {
+			if fv.StringEquals("__class__") {
+				co.ClassCellIdx = int16(len(co.CellVars) + i)
+				break
+			}
+		}
+	}
+	co.VarKWSafe = computeVarKWSafe(co)
+}
+
+func computeVarKWSafe(co *CodeObject) bool {
+	if co.VarKWIdx < 0 || co.VarKWIdx >= 256 || co.IsGenerator || co.IsCoroutine || co.HasCells || len(co.Code) == 0 {
+		return false
+	}
+	n := len(co.Code)
+	isJumpTarget := make([]bool, n+1)
+	for _, inst := range co.Code {
+		switch DecodeOpcode(inst) {
+		case OP_JUMP, OP_JUMP_IF_FALSE, OP_JUMP_IF_TRUE, OP_JUMP_IF_FALSE_OR_POP, OP_JUMP_IF_TRUE_OR_POP, OP_FOR_ITER, OP_FOR_ITER_GEN:
+			t := int(DecodeArgBx(inst))
+			if t >= 0 && t < len(isJumpTarget) {
+				isJumpTarget[t] = true
+			}
+		}
+	}
+	for _, e := range co.ExceptionTable {
+		if e.StartIP >= 0 && e.StartIP < len(isJumpTarget) {
+			isJumpTarget[e.StartIP] = true
+		}
+		if e.EndIP >= 0 && e.EndIP < len(isJumpTarget) {
+			isJumpTarget[e.EndIP] = true
+		}
+		if e.TargetIP >= 0 && e.TargetIP < len(isJumpTarget) {
+			isJumpTarget[e.TargetIP] = true
+		}
+	}
+	kwIdx := uint16(co.VarKWIdx)
+	for i := range n {
+		inst := co.Code[i]
+		op := DecodeOpcode(inst)
+		bx := DecodeArgBx(inst)
+		switch op {
+		case OP_STORE_FAST, OP_DELETE_FAST:
+			if bx == kwIdx {
+				return false
+			}
+		case OP_LOAD_FAST_ATTR, OP_STORE_FAST_ATTR, OP_LOAD_FAST_ATTR_MUL_SELF:
+			if uint16(DecodeArgA(inst)) == kwIdx {
+				return false
+			}
+		case OP_LOAD_FAST:
+			if bx != kwIdx {
+				continue
+			}
+			if i+1 >= n || isJumpTarget[i+1] {
+				return false
+			}
+			w1 := co.Code[i+1]
+			op1 := DecodeOpcode(w1)
+			switch op1 {
+			case OP_JUMP_IF_FALSE, OP_JUMP_IF_TRUE, OP_POP_TOP:
+				continue
+			case OP_CALL_FUNCTION_EX:
+				if DecodeArgA(w1) == 1 {
+					continue
+				}
+				return false
+			case OP_BUILD_MAP_UNPACK:
+				if i+2 < n && !isJumpTarget[i+2] && DecodeOpcode(co.Code[i+2]) == OP_CALL_FUNCTION_EX && DecodeArgA(co.Code[i+2]) == 1 {
+					continue
+				}
+				return false
+			}
+			if i > 0 && !isJumpTarget[i] && DecodeOpcode(co.Code[i-1]) == OP_LOAD_GLOBAL {
+				gIdx := int(DecodeArgBx(co.Code[i-1]))
+				if gIdx < len(co.Consts) && co.Consts[gIdx].StringEquals("len") && op1 == OP_CALL && DecodeArgA(w1) == 1 {
+					continue
+				}
+			}
+			depth := 0
+			safe := false
+			limit := min(n, i+12)
+			for k := i + 1; k < limit; k++ {
+				if isJumpTarget[k] {
+					break
+				}
+				wk := co.Code[k]
+				opk := DecodeOpcode(wk)
+				if opk == OP_CALL_METHOD_PIC || opk == OP_CALL_METHOD_DESCR || opk == OP_CALL_METHOD_DESCR_FAST {
+					argc := int(DecodeArgA(wk))
+					if depth == argc {
+						mIdx := int(DecodeArgBx(wk))
+						if mIdx < len(co.Consts) {
+							mName := co.Consts[mIdx]
+							if mName.StringEquals("get") || mName.StringEquals("pop") || mName.StringEquals("__contains__") || mName.StringEquals("__len__") {
+								safe = true
+							}
+						}
+					}
+					break
+				}
+				switch opk {
+				case OP_LOAD_FAST, OP_LOAD_CONST, OP_LOAD_GLOBAL, OP_LOAD_DEREF:
+					depth++
+				default:
+					k = limit
+				}
+			}
+			if !safe {
+				return false
+			}
+		}
+	}
+	return true
 }

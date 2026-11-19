@@ -795,6 +795,9 @@ func (e *Engine) newVMInternal(stackCap, frameCap int) *VM {
 	if nextVal, ok := e.builtins.Get(nameBuiltinNext); ok {
 		v.builtinNext = nextVal
 	}
+	if superVal, ok := e.builtins.Get(nameSuper); ok {
+		v.builtinSuper = superVal
+	}
 	v.execCtx.Stack = v.stack
 	v.execCtx.CallHook = v.callFromHook
 	v.execCtx.VM = v

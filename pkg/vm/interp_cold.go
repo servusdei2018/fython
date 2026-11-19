@@ -221,6 +221,7 @@ func (vm *VM) dispatchColdOpcode(st *loopState, op Opcode, inst uint32, ip, sp i
 		bx := int(uint16(inst))
 		sp--
 		valToStore := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16))
+		val.ClearEphemeral(valToStore)
 		if valToStore.IsString() {
 			vm.opDetachStoreDeref(valToStore)
 		}

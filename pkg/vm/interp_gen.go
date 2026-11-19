@@ -126,6 +126,165 @@ func (vm *VM) saveAndPushInlineFrame(
 	vm.activeFrameIdx = st.frameIdx
 }
 
+func (vm *VM) acquireStrJoinState(sep val.Value) *strJoinState {
+	var js *strJoinState
+	if n := len(vm.strJoinPool); n > 0 {
+		js = vm.strJoinPool[n-1]
+		vm.strJoinPool[n-1] = nil
+		vm.strJoinPool = vm.strJoinPool[:n-1]
+	} else {
+		js = &strJoinState{}
+	}
+	js.buf.Reset()
+	js.sep = sep
+	js.sepLen = uint8(min(sep.StringByteLen(), 255))
+	js.first = true
+	js.count = 0
+	return js
+}
+
+func (vm *VM) releaseStrJoinState(js *strJoinState) {
+	if js == nil {
+		return
+	}
+	js.buf.Reset()
+	js.sep = val.Value{}
+	js.sepLen = 0
+	js.first = true
+	js.count = 0
+	if len(vm.strJoinPool) < 32 {
+		vm.strJoinPool = append(vm.strJoinPool, js)
+	}
+}
+
+func (js *strJoinState) appendValue(v val.Value) bool {
+	if !v.IsAnyString() {
+		return false
+	}
+	if js.buf.Cap() == 0 {
+		js.buf.Grow(8192)
+	}
+	if !js.first && js.sepLen > 0 {
+		js.sep.WriteToBuilder(&js.buf)
+	}
+	js.first = false
+	js.count++
+	v.WriteToBuilder(&js.buf)
+	return true
+}
+
+func (js *strJoinState) materialize() val.Value {
+	n := js.buf.Len()
+	if n == 0 {
+		return val.NewStringVal("")
+	}
+	if n <= 7 {
+		return val.SmallStringVal(js.buf.String())
+	}
+	return val.NewStringVal(js.buf.String())
+}
+
+// pushStrJoinGenerator pushes gen onto vm.frames in genModeStrJoin so all
+// yielded strings drain directly into a pooled strings.Builder inside runLoopWithGlobals.
+//
+//go:noinline
+func (vm *VM) pushStrJoinGenerator(st *loopState, sepVal val.Value, gen *val.PyGenerator, callerIP, callerSP, retSP int) (int, int, loopCtl) {
+	switch gen.State {
+	case val.GenClosed:
+		st.stack[retSP] = val.NewStringVal("")
+		vm.releaseGenerator(gen)
+		return callerIP + 1, retSP + 1, ctlReload
+	case val.GenRunning:
+		st.raiseExc = val.NewValueError("generator already executing")
+		return callerIP, callerSP, ctlRaise
+	}
+	js := vm.acquireStrJoinState(sepVal)
+	ip, sp, ctl := vm.pushInlineGenerator(st, gen, callerIP, callerSP, retSP, 0, genModeStrJoin, val.Value{}, val.NoneVal())
+	if ctl == ctlRaise {
+		vm.releaseStrJoinState(js)
+		return ip, sp, ctl
+	}
+	if st.frameIdx > st.startFrameIdx {
+		vm.frames[st.frameIdx-1].joinState = js
+	} else {
+		vm.releaseStrJoinState(js)
+	}
+	return ip, sp, ctl
+}
+
+func (vm *VM) findStrJoinCaller(st *loopState) (int, bool) {
+	if st.frameIdx != st.genFrameIdx || st.frameIdx <= st.startFrameIdx {
+		return -1, false
+	}
+	k := st.frameIdx - 1
+	for {
+		mode := vm.frames[k].genMode
+		if mode == genModeStrJoin {
+			return k, true
+		}
+		if (mode == genModeYieldFrom || mode == genModeAwait) && k > st.startFrameIdx {
+			k--
+			continue
+		}
+		return -1, false
+	}
+}
+
+func (vm *VM) failStrJoinNonString(st *loopState, js *strJoinState, callerIdx int, badVal val.Value, ip, sp int) (int, int, loopCtl) {
+	errMsg := fmt.Sprintf("sequence item %d: expected str instance, %s found", js.count, badVal.Type().Name)
+	if st.activeGen != nil {
+		gen := st.activeGen
+		if (gen.Header.Flags & val.FlagEphemeralGen) != 0 {
+			gen.State = val.GenClosed
+			vm.releaseGeneratorStack(gen)
+		} else {
+			gen.YieldVal = badVal
+			gen.State = val.GenSuspended
+			gen.Stack = st.stack
+			gen.SP = sp
+			gen.IP = ip + 1
+		}
+	}
+	for st.frameIdx > callerIdx {
+		if curShadow := vm.frames[st.frameIdx].shadowFrame; curShadow != nil {
+			curShadow.Detach()
+			vm.frames[st.frameIdx].shadowFrame = nil
+		}
+		st.frameIdx--
+		caller := &vm.frames[st.frameIdx]
+		if len(vm.excStack) > caller.excStackLen {
+			vm.excStack = vm.excStack[:caller.excStackLen]
+		}
+		if st.frameIdx == callerIdx {
+			callerIP := caller.ip
+			caller.joinState = nil
+			vm.restoreCallerFrame(st, caller)
+			vm.releaseStrJoinState(js)
+			st.raiseExc = val.NewTypeError(errMsg)
+			return callerIP - 1, caller.retSP, ctlRaise
+		}
+		retSP := caller.retSP
+		callerIP := caller.ip
+		vm.restoreCallerFrame(st, caller)
+		if st.activeGen != nil {
+			st.activeGen.YieldVal = badVal
+			st.activeGen.State = val.GenSuspended
+			st.activeGen.Stack = st.stack
+			st.activeGen.SP = retSP
+			st.activeGen.IP = callerIP
+		} else if st.activeCoro != nil {
+			st.activeCoro.YieldVal = badVal
+			st.activeCoro.State = val.CoroSuspended
+			st.activeCoro.Stack = st.stack
+			st.activeCoro.SP = retSP
+			st.activeCoro.IP = callerIP
+		}
+	}
+	vm.releaseStrJoinState(js)
+	st.raiseExc = val.NewTypeError(errMsg)
+	return ip, sp, ctlRaise
+}
+
 // pushInlineGenerator pushes gen onto vm.frames directly inside the active
 // runLoopWithGlobals without recursing into resumeGenerator/runFrame.
 //
@@ -147,6 +306,10 @@ func (vm *VM) pushInlineGenerator(st *loopState, gen *val.PyGenerator, callerIP,
 		case genModeNext, genModeSend:
 			st.raiseExc = val.NewStopIteration(val.NoneVal())
 			return callerIP, callerSP, ctlRaise
+		case genModeStrJoin:
+			st.stack[retSP] = val.NewStringVal("")
+			vm.releaseGenerator(gen)
+			return callerIP + 1, retSP + 1, ctlReload
 		}
 		return jumpTarget, callerSP - 1, ctlNext
 	case val.GenRunning:
@@ -260,9 +423,7 @@ func (vm *VM) opForIterGen(st *loopState, inst uint32, ip, sp int) (int, int, lo
 			vm.releaseGenerator(gen)
 			return jumpTarget, sp - 1, ctlNext
 		}
-		if vm.activeJoinGen == nil {
-			return vm.pushInlineGenerator(st, gen, ip, sp, sp, jumpTarget, genModeForIter, val.Value{}, val.NoneVal())
-		}
+		return vm.pushInlineGenerator(st, gen, ip, sp, sp, jumpTarget, genModeForIter, val.Value{}, val.NoneVal())
 	}
 	st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_FOR_ITER))
 	return vm.opForIterSlow(st, ReplaceOpcode(inst, OP_FOR_ITER), ip, sp)
@@ -332,6 +493,14 @@ func (vm *VM) opYieldValue(st *loopState, ip, sp int) (int, int, loopCtl) {
 	sp--
 	yieldVal := stack[sp]
 	if st.activeGen != nil {
+		if callerIdx, ok := vm.findStrJoinCaller(st); ok {
+			js := vm.frames[callerIdx].joinState
+			if !js.appendValue(yieldVal) {
+				return vm.failStrJoinNonString(st, js, callerIdx, yieldVal, ip, sp)
+			}
+			stack[sp] = val.NoneVal()
+			return ip + 1, sp + 1, ctlNext
+		}
 		if vm.activeJoinGen == st.activeGen && st.frameIdx == st.startFrameIdx {
 			vm.appendJoinItem(yieldVal)
 			stack[sp] = val.NoneVal()
@@ -404,11 +573,42 @@ func (vm *VM) opYieldFrom(st *loopState, ip, sp int) (int, int, loopCtl) {
 		ip++
 		return ip, sp, ctlReload
 	}
-	if subiter.IsGenerator() && vm.activeJoinGen == nil {
+	if subiter.IsGenerator() {
 		return vm.pushInlineGenerator(st, subiter.AsGenerator(), ip, sp, sp, 0, genModeYieldFrom, val.Value{}, sentVal)
 	}
-	if subiter.IsCoroutine() && vm.activeJoinGen == nil {
+	if subiter.IsCoroutine() {
 		return vm.pushInlineCoroutine(st, subiter.AsCoroutine(), ip, sp, sp, genModeYieldFrom, sentVal)
+	}
+	if callerIdx, ok := vm.findStrJoinCaller(st); ok {
+		js := vm.frames[callerIdx].joinState
+		for {
+			var nextVal val.Value
+			var status val.IterStatus
+			if tpIterNext := subiter.Type().Slots.TpIterNext; tpIterNext != nil {
+				nextVal, status = tpIterNext(&vm.execCtx, subiter)
+			} else {
+				break
+			}
+			if status == val.IterYielded {
+				if !js.appendValue(nextVal) {
+					return vm.failStrJoinNonString(st, js, callerIdx, nextVal, ip, sp)
+				}
+				continue
+			}
+			if status == val.IterExhausted {
+				stack[sp-1] = val.NoneVal()
+				break
+			}
+			if vm.execCtx.HasException() {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				st.raiseExc = exc
+				return ip, sp, ctlRaise
+			}
+			break
+		}
+		ip++
+		return ip, sp, ctlReload
 	}
 	var nextVal val.Value
 	var status val.IterStatus

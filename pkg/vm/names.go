@@ -32,6 +32,7 @@ var (
 	nameLen              = val.InternString("len")
 	nameIsInstance       = val.InternString("isinstance")
 	nameBuiltinNext      = val.InternString("next")
+	nameSuper            = val.InternString("super")
 	namePackage          = val.InternString("__package__")
 	namePath             = val.InternString("__path__")
 	nameAll              = val.InternString("__all__")

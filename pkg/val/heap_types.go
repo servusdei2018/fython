@@ -1936,6 +1936,7 @@ func (d *PyDict) initTable(minEntries int) {
 			d.Entries = d.inlineEntries[:0]
 		}
 	} else {
+		d.Header.Flags &^= FlagEphemeralDict | FlagEphemeralFrameDict
 		d.indices = make([]byte, int(tableCap)<<shift)
 		d.mask = tableCap - 1
 		d.indexShift = shift
@@ -1994,6 +1995,7 @@ func (d *PyDict) maxIndexValue() int {
 }
 
 func (d *PyDict) resize(minEntries int) {
+	d.Header.Flags &^= FlagEphemeralDict | FlagEphemeralFrameDict
 	tableCap := uint32(8)
 	for int(tableCap)*2 <= minEntries*3 {
 		tableCap <<= 1
@@ -2034,6 +2036,40 @@ func (d *PyDict) resize(minEntries int) {
 		clear(d.inlineEntries[:])
 	}
 	d.Entries = newEntries
+}
+
+// IsSmallInline reports whether d has no external owner and still fits within
+// its inline entries and indices buffers for safe freelist recycling.
+func (d *PyDict) IsSmallInline() bool {
+	return d.owner == nil &&
+		len(d.Entries) <= len(d.inlineEntries) &&
+		cap(d.Entries) <= len(d.inlineEntries) &&
+		len(d.indices) <= len(d.inlineIndices)
+}
+
+// InitSmallInlineTable configures d to use its inline indices and inlineEntries
+// storage without heap-allocating backing slices.
+func (d *PyDict) InitSmallInlineTable() {
+	clear(d.inlineIndices[:])
+	d.indices = d.inlineIndices[:]
+	d.mask = 7
+	d.indexShift = 0
+	d.Entries = d.inlineEntries[:0]
+}
+
+// ResetForPool clears all entries and metadata on a pooled small PyDict before
+// returning it to a VM freelist.
+func (d *PyDict) ResetForPool() {
+	clear(d.inlineEntries[:])
+	clear(d.inlineIndices[:])
+	d.Entries = nil
+	d.indices = nil
+	d.mask = 0
+	d.used = 0
+	d.filled = 0
+	d.indexShift = 0
+	d.VersionTag = 0
+	d.Header.Flags &^= FlagEphemeralDict | FlagEphemeralFrameDict
 }
 
 // Set inserts or updates a key-value pair in PyDict while preserving insertion order

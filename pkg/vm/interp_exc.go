@@ -129,6 +129,12 @@ func (vm *VM) opCheckExcMatchStar(st *loopState, ip, sp int) (int, int, loopCtl)
 //go:noinline
 func (vm *VM) opReturnSlow(st *loopState, ip, sp int, retVal val.Value) (int, int, loopCtl) {
 	stack := st.stack
+	if st.curCO != nil && st.curCO.VarKWSafe && st.frameIdx != st.genFrameIdx && vm.frames[st.frameIdx].shadowFrame == nil {
+		idx := st.base + st.curCO.VarKWIdx
+		if idx >= 0 && idx < len(stack) {
+			vm.releaseFrameSmallDictVal(stack[idx])
+		}
+	}
 	if curShadow := vm.frames[st.frameIdx].shadowFrame; curShadow != nil {
 		curShadow.Detach()
 		vm.frames[st.frameIdx].shadowFrame = nil
@@ -153,11 +159,23 @@ func (vm *VM) opReturnSlow(st *loopState, ip, sp int, retVal val.Value) (int, in
 		exitIP := caller.genExitIP
 		callerIP := caller.ip
 		retSP := caller.retSP
+		js := caller.joinState
+		caller.joinState = nil
 		vm.restoreCallerFrame(st, caller)
-		if mode == genModeForIter || mode == genModeYieldFrom || mode == genModeAwait {
+		if mode == genModeForIter || mode == genModeYieldFrom || mode == genModeAwait || mode == genModeStrJoin {
 			vm.releaseGenerator(gen)
 		}
 		switch mode {
+		case genModeStrJoin:
+			var out val.Value
+			if js != nil {
+				out = js.materialize()
+				vm.releaseStrJoinState(js)
+			} else {
+				out = val.NewStringVal("")
+			}
+			st.stack[retSP] = out
+			return callerIP, retSP + 1, ctlReload
 		case genModeYieldFrom, genModeAwait:
 			st.stack[retSP-1] = retVal
 			return callerIP + 1, retSP, ctlReload

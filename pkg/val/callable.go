@@ -21,6 +21,10 @@ var GenSendBuiltin Value
 // enabling O(1) pointer-equality interception in the VM call handlers.
 var CoroSendBuiltin Value
 
+// StrJoinBuiltin is the cached PyBuiltinFunc Value for str.join,
+// enabling O(1) pointer-equality interception in the VM call handlers.
+var StrJoinBuiltin Value
+
 // PyTuple represents an immutable sequence of Values on the heap (used for kwnames and tuple constants).
 // Tuples with up to 2 elements store their backing array inline inside the same allocation (80 B size class).
 // Header MUST be at byte offset 0.
@@ -4643,7 +4647,7 @@ func initTypes() {
 		return typeTpCall(ctx, cls, args[1:], kwnames)
 	}))
 
-	StrType.Dict.Set(InternString("join"), NewBuiltinFuncVal("join", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+	StrJoinBuiltin = NewBuiltinFuncVal("join", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
 			ctx.Raise(NewException(TypeErrorType, "join() takes exactly one argument"))
 			return NoneVal()
@@ -4736,7 +4740,8 @@ func initTypes() {
 			return joinItems(ExtractIterableItems(ctx, iterable))
 		}
 		return NewStringVal(b.String())
-	}))
+	})
+	StrType.Dict.Set(InternString("join"), StrJoinBuiltin)
 
 	StrType.Dict.Set(InternString("encode"), NewBuiltinFuncVal("encode", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {

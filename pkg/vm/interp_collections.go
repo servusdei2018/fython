@@ -13,6 +13,7 @@ func (vm *VM) opStoreSubscr(st *loopState, ip, sp int) (int, int, loopCtl) {
 	key := stack[sp-1]
 	obj := stack[sp-2]
 	valToStore := stack[sp-3]
+	val.ClearEphemeral(valToStore)
 	val.DetachStringBuf(valToStore)
 	markViewEscaped(valToStore)
 	if obj.Kind() == val.KindMemoryView && key.IsInt64() && valToStore.IsInt64() && obj.AsMemoryView().ItemSize <= 1 && obj.AsMemoryView().NDim <= 1 {
@@ -522,6 +523,7 @@ func (vm *VM) opBuildSet(st *loopState, inst uint32, ip, sp int) (int, int, loop
 	count := int(uint16(inst))
 	sp -= count
 	for i := range count {
+		val.ClearEphemeral(stack[sp+i])
 		val.DetachStringBuf(stack[sp+i])
 	}
 	setVal := val.NewSetVal(stack[sp : sp+count]...)
@@ -537,6 +539,7 @@ func (vm *VM) opSetAdd(st *loopState, inst uint32, ip, sp int) (int, int, loopCt
 	offset := int(uint16(inst))
 	item := stack[sp-1]
 	sp--
+	val.ClearEphemeral(item)
 	val.DetachStringBuf(item)
 	markViewEscaped(item)
 	setVal := stack[sp-offset]
@@ -566,12 +569,61 @@ func (vm *VM) opDeleteSubscr(st *loopState, ip, sp int) (int, int, loopCtl) {
 	return ip, sp, ctlReload
 }
 
+func isEphemeralMapSite(st *loopState, ip int) bool {
+	limit := min(st.codeLen, ip+16)
+	depth := 1
+	for k := ip + 1; k < limit; k++ {
+		wk := *(*uint32)(unsafe.Add(st.codePtr, uintptr(k)*4))
+		opk := DecodeOpcode(wk)
+		if depth == 1 && opk == OP_CALL_FUNCTION_EX && DecodeArgA(wk) == 1 {
+			return true
+		}
+		if opk == OP_BUILD_MAP_UNPACK && depth <= int(DecodeArgBx(wk)) {
+			return k+1 < st.codeLen &&
+				DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(k+1)*4))) == OP_CALL_FUNCTION_EX &&
+				DecodeArgA(*(*uint32)(unsafe.Add(st.codePtr, uintptr(k+1)*4))) == 1
+		}
+		switch opk {
+		case OP_LOAD_FAST, OP_LOAD_CONST, OP_LOAD_GLOBAL, OP_LOAD_DEREF:
+			depth++
+		case OP_BUILD_MAP:
+			depth = depth - int(DecodeArgBx(wk))*2 + 1
+			if depth <= 1 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return false
+}
+
 //go:noinline
 func (vm *VM) opBuildMapUnpack(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
 	count := int(uint16(inst))
 	sp -= count
-	resVal := val.NewDictVal(4)
+	isCallEx := ip+1 < st.codeLen &&
+		DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4))) == OP_CALL_FUNCTION_EX &&
+		DecodeArgA(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4))) == 1
+	if isCallEx {
+		allEmpty := true
+		for i := range count {
+			d := stack[sp+i]
+			if !d.IsDict() || d.AsDict().Live != nil || d.AsDict().Len() != 0 {
+				allEmpty = false
+				break
+			}
+		}
+		if allEmpty {
+			for i := range count {
+				vm.releaseSmallDictVal(stack[sp+i])
+			}
+			stack[sp] = val.NoneVal()
+			return ip + 1, sp + 1, ctlNext
+		}
+	}
+	resVal := vm.acquireSmallDict(4, isCallEx)
 	resDict := resVal.AsDict()
 	st.stack = stack
 	st.ip = ip
@@ -579,12 +631,14 @@ func (vm *VM) opBuildMapUnpack(st *loopState, inst uint32, ip, sp int) (int, int
 	for i := range count {
 		d := stack[sp+i]
 		vm.unpackMapIntoSafe(resDict, d)
+		vm.releaseSmallDictVal(d)
 		stack = st.syncStackFromVM(vm, stack)
 		if vm.execCtx.HasException() {
 			break
 		}
 	}
 	if vm.execCtx.HasException() {
+		vm.releaseSmallDictVal(resVal)
 		exc := vm.execCtx.ActiveException
 		vm.execCtx.ClearException()
 		st.raiseExc = exc
@@ -671,6 +725,7 @@ func (vm *VM) opBuildList(st *loopState, inst uint32, ip, sp int) (int, int, loo
 	items := make([]val.Value, count)
 	copy(items, stack[sp-count:sp])
 	for i := range items {
+		val.ClearEphemeral(items[i])
 		val.DetachStringBuf(items[i])
 		markViewEscaped(items[i])
 	}
@@ -688,6 +743,7 @@ func (vm *VM) opListAppend(st *loopState, inst uint32, ip, sp int) (int, int, lo
 	listVal := stack[sp-depth-1]
 	item := stack[sp-1]
 	sp--
+	val.ClearEphemeral(item)
 	val.DetachStringBuf(item)
 	markViewEscaped(item)
 	listVal.AsList().Append(item)
@@ -699,9 +755,16 @@ func (vm *VM) opListAppend(st *loopState, inst uint32, ip, sp int) (int, int, lo
 func (vm *VM) opBuildMap(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
 	count := int(uint16(inst))
-	dictVal := val.NewDictVal(count)
+	var dictVal val.Value
+	if count <= 5 && isEphemeralMapSite(st, ip) {
+		dictVal = vm.acquireSmallDict(count, true)
+	} else {
+		dictVal = val.NewDictVal(count)
+	}
 	d := dictVal.AsDict()
 	for i := sp - count*2; i < sp; i += 2 {
+		val.ClearEphemeral(stack[i])
+		val.ClearEphemeral(stack[i+1])
 		val.DetachStringBuf(stack[i])
 		val.DetachStringBuf(stack[i+1])
 		d.Set(stack[i], stack[i+1])
@@ -723,6 +786,7 @@ func (vm *VM) opBuildTuple(st *loopState, inst uint32, ip, sp int) (int, int, lo
 	}
 	base := sp - count
 	for i := base; i < sp; i++ {
+		val.ClearEphemeral(stack[i])
 		val.DetachStringBuf(stack[i])
 		markViewEscaped(stack[i])
 	}

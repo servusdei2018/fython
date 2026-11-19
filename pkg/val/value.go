@@ -70,6 +70,15 @@ const (
 	// FlagDataDescriptor marks a descriptor object (such as @property or custom __set__)
 	// as a data descriptor that takes precedence over instance attributes.
 	FlagDataDescriptor uint8 = 1 << 1
+	// FlagEphemeralSuper marks a pooled PySuper owned exclusively by a consuming
+	// OP_LOAD_ATTR / OP_LOAD_METHOD / OP_CALL_METHOD_PIC site.
+	FlagEphemeralSuper uint8 = 1 << 2
+	// FlagEphemeralDict marks a pooled small PyDict whose ownership is bounded
+	// to transient expression-stack unpacking (OP_BUILD_MAP -> OP_BUILD_MAP_UNPACK -> OP_CALL_FUNCTION_EX).
+	FlagEphemeralDict uint8 = 1 << 3
+	// FlagEphemeralFrameDict marks a pooled small PyDict owned by a VarKWSafe frame's
+	// **kwargs local slot until that frame returns or unwinds.
+	FlagEphemeralFrameDict uint8 = 1 << 4
 	// FlagEphemeralCoro marks a pooled PyCoroutine owned exclusively by an await
 	// or yield-from consumer.
 	FlagEphemeralCoro uint8 = 1 << 5
@@ -78,7 +87,18 @@ const (
 	FlagEphemeralGen uint8 = 1 << 6
 	// FlagEphemeralIter marks a pooled PyIter owned exclusively by OP_GET_ITER -> OP_FOR_ITER.
 	FlagEphemeralIter uint8 = 1 << 7
+	// FlagEphemeralAll masks all ephemeral ownership flags cleared when a value
+	// escapes via stack duplication or container/variable storage.
+	FlagEphemeralAll uint8 = FlagEphemeralSuper | FlagEphemeralDict | FlagEphemeralFrameDict | FlagEphemeralCoro | FlagEphemeralGen | FlagEphemeralIter
 )
+
+// ClearEphemeral clears any ephemeral ownership flags on v when v is stored
+// into a variable or container or duplicated on the evaluation stack.
+func ClearEphemeral(v Value) {
+	if hdr := v.HeaderPtr(); hdr != nil && (hdr.Flags&FlagEphemeralAll) != 0 {
+		hdr.Flags &^= FlagEphemeralAll
+	}
+}
 
 const (
 	// FlagForbidDynamicAttrs marks a type whose instances forbid dynamic attribute addition (due to __slots__).

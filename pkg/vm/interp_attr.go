@@ -367,8 +367,10 @@ func (vm *VM) opLoadAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 		thisVer := sup.ThisClass.Version()
 		if entry.Kind == ICKindSuperMethod && entry.ExpectedTypeVer == typeVer && entry.ExpectedAuxVer == thisVer {
 			recordICSlowHit(ICKindSuperMethod)
+			selfVal := sup.Self
+			vm.releaseSuper(sup)
 			if entry.SlotIndex == 1 {
-				stack[sp-1] = val.NewBoundMethodVal(sup.Self, entry.CachedVal)
+				stack[sp-1] = val.NewBoundMethodVal(selfVal, entry.CachedVal)
 			} else {
 				stack[sp-1] = entry.CachedVal
 			}
@@ -380,10 +382,11 @@ func (vm *VM) opLoadAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 			case descr.IsFunction() || (descr.IsBuiltinFunc() && !descr.AsBuiltinFunc().NoBind):
 				bind := int32(1)
 				res := descr
+				selfVal := sup.Self
 				if isClassSuper {
 					bind = 0
 				} else {
-					res = val.NewBoundMethodVal(sup.Self, descr)
+					res = val.NewBoundMethodVal(selfVal, descr)
 				}
 				*entry = ICSlot{
 					Kind:            ICKindSuperMethod,
@@ -392,6 +395,7 @@ func (vm *VM) opLoadAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 					SlotIndex:       bind,
 					CachedVal:       descr,
 				}
+				vm.releaseSuper(sup)
 				stack[sp-1] = res
 				return ip + 1, sp, ctlNext
 			case descr.Kind() == val.KindStaticMethod:
@@ -403,6 +407,7 @@ func (vm *VM) opLoadAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 					SlotIndex:       0,
 					CachedVal:       smVal,
 				}
+				vm.releaseSuper(sup)
 				stack[sp-1] = smVal
 				return ip + 1, sp, ctlNext
 			case descr.Type().Slots.TpDescrGet == nil || (descr.IsBuiltinFunc() && descr.AsBuiltinFunc().NoBind):
@@ -413,6 +418,7 @@ func (vm *VM) opLoadAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 					SlotIndex:       0,
 					CachedVal:       descr,
 				}
+				vm.releaseSuper(sup)
 				stack[sp-1] = descr
 				return ip + 1, sp, ctlNext
 			}
@@ -421,6 +427,7 @@ func (vm *VM) opLoadAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 		st.ip = ip
 		vm.execCtx.SP = sp
 		attrRes = vm.getAttrSafe(obj, attrName)
+		vm.releaseSuper(sup)
 
 	case obj.IsModule() && obj.Type() == val.ModuleType:
 		recordLoadAttrSlowRecv(icRecvModule)
@@ -717,8 +724,10 @@ func (vm *VM) opLoadMethodSlow(st *loopState, inst uint32, ip, sp int) (int, int
 		thisVer := sup.ThisClass.Version()
 		if entry.Kind == ICKindSuperMethod && entry.ExpectedTypeVer == typeVer && entry.ExpectedAuxVer == thisVer {
 			recordICSlowHit(ICKindSuperMethod)
+			selfVal := sup.Self
+			vm.releaseSuper(sup)
 			if entry.SlotIndex == 1 {
-				stack[sp-1] = sup.Self
+				stack[sp-1] = selfVal
 			} else {
 				stack[sp-1] = val.UnboundVal()
 			}
@@ -742,6 +751,7 @@ func (vm *VM) opLoadMethodSlow(st *loopState, inst uint32, ip, sp int) (int, int
 					SlotIndex:       bind,
 					CachedVal:       descr,
 				}
+				vm.releaseSuper(sup)
 				stack[sp-1] = rec
 				stack[sp] = descr
 				return ip + 1, sp + 1, ctlNext
@@ -754,6 +764,7 @@ func (vm *VM) opLoadMethodSlow(st *loopState, inst uint32, ip, sp int) (int, int
 					SlotIndex:       0,
 					CachedVal:       smVal,
 				}
+				vm.releaseSuper(sup)
 				stack[sp-1] = val.UnboundVal()
 				stack[sp] = smVal
 				return ip + 1, sp + 1, ctlNext

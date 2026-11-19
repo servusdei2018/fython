@@ -100,6 +100,7 @@ func (vm *VM) opStoreGlobal(st *loopState, inst uint32, ip, sp int) (int, int, l
 	nameVal := st.consts[bx]
 	sp--
 	valToStore := stack[sp]
+	val.ClearEphemeral(valToStore)
 	val.DetachStringBuf(valToStore)
 	markViewEscaped(valToStore)
 	st.globals.Set(nameVal, valToStore)
@@ -188,6 +189,7 @@ func (vm *VM) opStoreName(st *loopState, inst uint32, ip, sp int) (int, int, loo
 	nameVal := st.consts[bx]
 	sp--
 	valToStore := stack[sp]
+	val.ClearEphemeral(valToStore)
 	val.DetachStringBuf(valToStore)
 	markViewEscaped(valToStore)
 
