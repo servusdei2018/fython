@@ -205,6 +205,7 @@ const (
 	OP_CALL_TYPE_INIT
 	OP_CALL_METHOD_DESCR
 	OP_FOR_ITER_GEN
+	OP_COMPARE_DUNDER
 )
 
 // Comparison operation codes for OP_COMPARE_OP (passed in ArgA field).
@@ -509,6 +510,8 @@ func (op Opcode) String() string {
 		return "OP_CALL_METHOD_DESCR"
 	case OP_FOR_ITER_GEN:
 		return "OP_FOR_ITER_GEN"
+	case OP_COMPARE_DUNDER:
+		return "OP_COMPARE_DUNDER"
 	default:
 		return "OP_UNKNOWN"
 	}

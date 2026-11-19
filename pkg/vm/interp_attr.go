@@ -92,10 +92,12 @@ func (vm *VM) opLoadAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 
 	switch {
 	case obj.IsInstance():
+		recordLoadAttrSlowRecv(icRecvInstance)
 		instObj := obj.AsInstance()
 		instType := instObj.Header.Type
 		if instObj.Shape != nil && instType != nil {
 			if instType.Flags&val.FlagCustomGetAttribute != 0 {
+				recordLoadAttrSlowCold(icRecvInstance, obj, consts[uint16(inst)])
 				st.ip = ip
 				vm.execCtx.SP = sp
 				attrRes = vm.getAttrSafe(obj, consts[uint16(inst)])
@@ -177,16 +179,19 @@ func (vm *VM) opLoadAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 					}
 				}
 			}
+			recordLoadAttrSlowCold(icRecvInstance, obj, consts[uint16(inst)])
 			st.ip = ip
 			vm.execCtx.SP = sp
 			attrRes = vm.loadAttrInstanceSlowSafe(instObj, obj, consts[uint16(inst)], ip, sp, st.frameIdx, st.cache.ic, st.cache.ensureAttrPIC())
 			goto loadAttrDone
 		}
+		recordLoadAttrSlowCold(icRecvInstance, obj, consts[uint16(inst)])
 		st.ip = ip
 		vm.execCtx.SP = sp
 		attrRes = vm.getAttrSafe(obj, consts[uint16(inst)])
 
 	case obj.IsTuple():
+		recordLoadAttrSlowRecv(icRecvTuple)
 		tp := obj.HeaderPtr().Type
 		if tp == nil {
 			tp = val.TupleType
@@ -278,11 +283,13 @@ func (vm *VM) opLoadAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 				}
 			}
 		}
+		recordLoadAttrSlowCold(icRecvTuple, obj, consts[uint16(inst)])
 		st.ip = ip
 		vm.execCtx.SP = sp
 		attrRes = vm.getAttrSafe(obj, consts[uint16(inst)])
 
 	case obj.IsType():
+		recordLoadAttrSlowRecv(icRecvType)
 		cls := obj.AsType()
 		meta := cls.Header.Type
 		if meta == nil {
@@ -331,11 +338,13 @@ func (vm *VM) opLoadAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 				}
 			}
 		}
+		recordLoadAttrSlowCold(icRecvType, obj, attrName)
 		st.ip = ip
 		vm.execCtx.SP = sp
 		attrRes = vm.getAttrSafe(obj, attrName)
 
 	case obj.IsSuper():
+		recordLoadAttrSlowRecv(icRecvSuper)
 		sup := obj.AsSuper()
 		var selfType *val.PyType
 		var isClassSuper bool
@@ -399,11 +408,13 @@ func (vm *VM) opLoadAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 				return ip + 1, sp, ctlNext
 			}
 		}
+		recordLoadAttrSlowCold(icRecvSuper, obj, attrName)
 		st.ip = ip
 		vm.execCtx.SP = sp
 		attrRes = vm.getAttrSafe(obj, attrName)
 
 	case obj.IsModule() && obj.Type() == val.ModuleType:
+		recordLoadAttrSlowRecv(icRecvModule)
 		mod := obj.AsModule()
 		modVer := atomic.LoadUint64(&mod.Dict.VersionTag)
 		attrName := val.InternValue(consts[uint16(inst)])
@@ -417,11 +428,30 @@ func (vm *VM) opLoadAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 			stack[sp-1] = v
 			return ip + 1, sp, ctlNext
 		}
+		recordLoadAttrSlowCold(icRecvModule, obj, attrName)
+		st.ip = ip
+		vm.execCtx.SP = sp
+		attrRes = vm.getAttrSafe(obj, attrName)
+
+	case obj.Kind() == val.KindBoundMethod:
+		recordLoadAttrSlowRecv(icRecvOther)
+		attrName := val.InternValue(consts[uint16(inst)])
+		if bm := obj.AsBoundMethod(); bm.Func.IsFunction() && !attrName.StringStartsWithTwoBytes('_', '_') {
+			if fn := bm.Func.AsFunction(); fn.Dict != nil {
+				if v, ok := fn.Dict.Get(attrName); ok {
+					stack[sp-1] = v
+					return ip + 1, sp, ctlNext
+				}
+			}
+		}
+		recordLoadAttrSlowCold(icRecvOther, obj, attrName)
 		st.ip = ip
 		vm.execCtx.SP = sp
 		attrRes = vm.getAttrSafe(obj, attrName)
 
 	default:
+		recordLoadAttrSlowRecv(icRecvOther)
+		recordLoadAttrSlowCold(icRecvOther, obj, consts[uint16(inst)])
 		st.ip = ip
 		vm.execCtx.SP = sp
 		attrRes = vm.getAttrSafe(obj, consts[uint16(inst)])

@@ -262,6 +262,18 @@ func initAsyncIOTypes() {
 		// Server type
 		ServerType = val.MustNewType("Server", []*val.PyType{val.ObjectType}, nil)
 
+		ServerType.Dict.Set(val.InternString("sockets"), val.NewPropertyVal(
+			val.NewBuiltinFuncVal("sockets", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+				if len(args) < 1 {
+					return val.NoneVal()
+				}
+				srv := (*pyServer)(val.AsPointer(args[0]))
+				return srv.sockets
+			}),
+			val.NoneVal(),
+			val.NoneVal(),
+		))
+
 		ServerType.Dict.Set(val.InternString("close"), val.NewBuiltinFuncVal("close", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
 				ctx.Raise(val.NewException(val.TypeErrorType, "close() takes at least 1 argument"))

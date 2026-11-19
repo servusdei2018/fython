@@ -1828,12 +1828,92 @@ func LookupAttrOptional(ctx *ExecContext, obj, name Value) (Value, bool) {
 		}
 		return v, true
 	}
+	if obj.Kind() == KindBoundMethod {
+		interned := name
+		if !interned.IsInterned() {
+			interned = InternValue(name)
+		}
+		if bm := obj.AsBoundMethod(); bm.Func.IsFunction() && !interned.StringStartsWithTwoBytes('_', '_') {
+			if fn := bm.Func.AsFunction(); fn.Dict != nil {
+				if v, ok := fn.Dict.Get(interned); ok {
+					return v, true
+				}
+			}
+			return NoneVal(), false
+		}
+	}
 	v := GetAttrCtx(ctx, obj, name)
 	if ctx != nil && ctx.HasException() {
 		clearAttrError(ctx)
 		return NoneVal(), false
 	}
 	return v, true
+}
+
+// HasAttrFast checks whether obj has attribute interned (which must already be
+// interned) without allocating BoundMethod wrappers for plain class methods or
+// constructing AttributeError instances on misses. Non-AttributeError exceptions
+// from descriptors or __getattr__ are left pending on ctx.
+func HasAttrFast(ctx *ExecContext, obj, interned Value) bool {
+	if obj.Kind() == KindBoundMethod {
+		if bm := obj.AsBoundMethod(); bm.Func.IsFunction() && !interned.StringStartsWithTwoBytes('_', '_') {
+			if fn := bm.Func.AsFunction(); fn.Dict != nil {
+				_, ok := fn.Dict.Get(interned)
+				return ok
+			}
+			return false
+		}
+	}
+	if !obj.IsType() && !obj.IsSuper() && !obj.IsModule() {
+		tp := obj.Type()
+		if (tp.Flags&FlagCustomGetAttribute) == 0 && tp.dunderGetAttribute.ptr == nil {
+			isStd := tp.Slots.TpGetAttr == nil || (obj.Kind() != KindNative && ((tp.Flags&FlagHeapType) != 0 ||
+				tp == DictType || tp == ListType || tp == TupleType || tp == StrType ||
+				tp == IntType || tp == BigIntType || tp == FloatType || tp == BoolType ||
+				tp == NoneType || tp == BytesType || tp == ByteArrayType || tp == SetType ||
+				tp == RangeType))
+			if isStd {
+				if interned == strClass {
+					return true
+				}
+				descr, _, foundInClass := tp.LookupMRO(interned)
+				if foundInClass {
+					if descr.IsFunction() || descr.IsBuiltinFunc() ||
+						descr.Kind() == KindStaticMethod || descr.Kind() == KindClassMethod {
+						return true
+					}
+					descrType := descr.Type()
+					if descrType.Slots.TpDescrGet == nil {
+						return true
+					}
+					if descr.IsDataDescriptor() || descrType.Slots.TpDescrSet != nil {
+						_ = descrType.Slots.TpDescrGet(ctx, descr, obj, tp)
+						if ctx != nil && ctx.HasException() {
+							clearAttrError(ctx)
+							return false
+						}
+						return true
+					}
+				}
+				if obj.IsInstance() {
+					if inst := obj.AsInstance(); inst.Shape != nil {
+						if _, ok := inst.GetAttr(interned); ok {
+							return true
+						}
+					}
+					if !foundInClass && tp.dunderGetAttr.ptr == nil &&
+						interned != strDict && interned != strAnnotations && interned != strDoc {
+						return false
+					}
+				} else if !foundInClass && (tp == StrType || tp == IntType || tp == DictType ||
+					tp == ListType || tp == TupleType || tp == FloatType || tp == BoolType || tp == NoneType) {
+					return interned == strDoc
+				}
+			}
+		}
+	}
+	_, ok := LookupAttrOptional(ctx, obj, interned)
+	return ok
 }
 
 func defaultObjectGetAttr(ctx *ExecContext, obj, name Value) Value {
@@ -1853,7 +1933,10 @@ func defaultObjectGetAttr(ctx *ExecContext, obj, name Value) Value {
 }
 
 func defaultObjectGetAttrOptional(ctx *ExecContext, obj, name Value) (Value, bool) {
-	interned := InternValue(name)
+	interned := name
+	if !interned.IsInterned() {
+		interned = InternValue(name)
+	}
 	tp := obj.Type()
 
 	if interned == strClass {
@@ -1868,6 +1951,12 @@ func defaultObjectGetAttrOptional(ctx *ExecContext, obj, name Value) (Value, boo
 				return descrType.Slots.TpDescrGet(ctx, descr, obj, tp), true
 			}
 		}
+	} else if tp == StrType || tp == IntType || tp == DictType || tp == ListType ||
+		tp == TupleType || tp == FloatType || tp == BoolType || tp == NoneType {
+		if interned == strDoc {
+			return NoneVal(), true
+		}
+		return NoneVal(), false
 	}
 
 	if obj.IsInstance() {
@@ -1966,13 +2055,13 @@ func defaultObjectGetAttrOptional(ctx *ExecContext, obj, name Value) (Value, boo
 		return descr, true
 	}
 
-	if interned.StringEquals("__dict__") && obj.IsInstance() && (tp.Flags&FlagForbidDynamicAttrs) == 0 {
+	if interned == strDict && obj.IsInstance() && (tp.Flags&FlagForbidDynamicAttrs) == 0 {
 		inst := obj.AsInstance()
 		if inst.Shape != nil {
 			return NewInstanceDictProxy(inst), true
 		}
 	}
-	if interned.StringEquals("__dict__") && obj.IsCInstance() && (tp.Flags&FlagForbidDynamicAttrs) == 0 {
+	if interned == strDict && obj.IsCInstance() && (tp.Flags&FlagForbidDynamicAttrs) == 0 {
 		ci := obj.AsCInstance()
 		if ci != nil {
 			if ci.Dict == nil {
@@ -1986,25 +2075,24 @@ func defaultObjectGetAttrOptional(ctx *ExecContext, obj, name Value) (Value, boo
 		return ctx.Invoke2(tp.dunderGetAttr, obj, interned), true
 	}
 
-	if interned.StringEquals("__func__") || interned.StringEquals("__wrapped__") {
-		if obj.Kind() == KindStaticMethod {
-			return obj.AsStaticMethod().Callable, true
-		}
-		if obj.Kind() == KindClassMethod {
-			return obj.AsClassMethod().Callable, true
-		}
-		if obj.Kind() == KindBoundMethod {
+	if k := obj.Kind(); k == KindStaticMethod || k == KindClassMethod || k == KindBoundMethod {
+		if interned.StringEquals("__func__") || interned.StringEquals("__wrapped__") {
+			if k == KindStaticMethod {
+				return obj.AsStaticMethod().Callable, true
+			}
+			if k == KindClassMethod {
+				return obj.AsClassMethod().Callable, true
+			}
 			return obj.AsBoundMethod().Func, true
 		}
-	}
-
-	if obj.Kind() == KindBoundMethod {
-		if interned.StringEquals("__self__") {
-			return obj.AsBoundMethod().Self, true
-		}
-		bm := obj.AsBoundMethod()
-		if bm.Func.HeaderPtr() != nil {
-			return defaultObjectGetAttrOptional(ctx, bm.Func, name)
+		if k == KindBoundMethod {
+			if interned.StringEquals("__self__") {
+				return obj.AsBoundMethod().Self, true
+			}
+			bm := obj.AsBoundMethod()
+			if bm.Func.HeaderPtr() != nil {
+				return defaultObjectGetAttrOptional(ctx, bm.Func, interned)
+			}
 		}
 	}
 
@@ -2032,7 +2120,7 @@ func defaultObjectGetAttrOptional(ctx *ExecContext, obj, name Value) (Value, boo
 		}
 	}
 
-	if interned.StringEquals("__annotations__") {
+	if interned == strAnnotations {
 		if obj.IsType() {
 			return TypeAnnotations(ctx, obj.AsType()), true
 		}
@@ -2056,7 +2144,7 @@ func defaultObjectGetAttrOptional(ctx *ExecContext, obj, name Value) (Value, boo
 		}
 	}
 
-	if interned.StringEquals("__doc__") {
+	if interned == strDoc {
 		return NoneVal(), true
 	}
 

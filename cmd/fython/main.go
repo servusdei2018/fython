@@ -9,6 +9,7 @@ import (
 	"runtime/pprof"
 
 	"github.com/servusdei2018/fython/internal/cli"
+	"github.com/servusdei2018/fython/pkg/vm"
 )
 
 func main() {
@@ -16,6 +17,12 @@ func main() {
 }
 
 func run() int {
+	if os.Getenv("FYTHON_ICSTATS") != "" {
+		defer vm.DumpICStats(os.Stderr)
+	}
+	if os.Getenv("FYTHON_OPSTATS") != "" {
+		defer vm.DumpOpStats(os.Stderr)
+	}
 	if os.Getenv("GOGC") == "" {
 		debug.SetGCPercent(500)
 	}

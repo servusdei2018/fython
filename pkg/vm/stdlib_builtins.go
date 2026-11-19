@@ -408,6 +408,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		if ctx != nil && ctx.HasException() {
 			return val.NoneVal()
 		}
+		recordGetAttrCall(obj, interned, ok, hasDefault)
 		if ok {
 			return res
 		}
@@ -423,10 +424,12 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			ctx.Raise(val.NewTypeError("hasattr(): not enough arguments"))
 			return val.NoneVal()
 		}
-		_, ok := val.LookupAttrOptional(ctx, args[0], val.InternValue(args[1]))
+		interned := val.InternValue(args[1])
+		ok := val.HasAttrFast(ctx, args[0], interned)
 		if ctx != nil && ctx.HasException() {
 			return val.NoneVal()
 		}
+		recordHasAttrCall(args[0], interned, ok)
 		return val.BoolVal(ok)
 	}))
 

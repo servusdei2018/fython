@@ -802,6 +802,26 @@ func RichCompare(ctx *ExecContext, a, b Value, op uint8) Value {
 	return raiseTypeError(ctx, "'"+symbol+"' not supported between instances of '"+aType.Name+"' and '"+bType.Name+"'")
 }
 
+// CompareTuplesFast compares two exact PyTuple values (Header.Type == TupleType)
+// for op <= CmpGTE without entering RichCompare's dunder lookup.
+func CompareTuplesFast(ctx *ExecContext, a, b Value, op uint8) Value {
+	return compareSliceRich(ctx, a.AsTuple().Items, b.AsTuple().Items, op)
+}
+
+func cmpOrderedInt(c int, op uint8) bool {
+	switch op {
+	case CmpLT:
+		return c < 0
+	case CmpLTE:
+		return c <= 0
+	case CmpGT:
+		return c > 0
+	case CmpGTE:
+		return c >= 0
+	}
+	return false
+}
+
 func compareSliceRich(ctx *ExecContext, ia, ib []Value, op uint8) Value {
 	switch op {
 	case CmpEQ:
@@ -809,18 +829,114 @@ func compareSliceRich(ctx *ExecContext, ia, ib []Value, op uint8) Value {
 			return BoolVal(false)
 		}
 		for i := range ia {
-			if !RichCompare(ctx, ia[i], ib[i], CmpEQ).IsTruthy() {
+			ea, eb := ia[i], ib[i]
+			if ea == eb && ea.ptr != &tagFloat64 {
+				continue
+			}
+			if ea.ptr == &tagInt64 && eb.ptr == &tagInt64 {
+				return BoolVal(false)
+			}
+			if ea.ptr == &tagFloat64 && eb.ptr == &tagFloat64 {
+				if math.Float64frombits(ea.num) != math.Float64frombits(eb.num) {
+					return BoolVal(false)
+				}
+				continue
+			}
+			if (ea.ptr == &tagInlineStr || (ea.ptr.Kind == KindString && ea.ptr.Type == StrType)) &&
+				(eb.ptr == &tagInlineStr || (eb.ptr.Kind == KindString && eb.ptr.Type == StrType)) {
+				if !StringEquals(ea, eb) {
+					return BoolVal(false)
+				}
+				continue
+			}
+			if (ea.ptr == &tagNone || ea.ptr == &tagBool) && (eb.ptr == &tagNone || eb.ptr == &tagBool) {
+				return BoolVal(false)
+			}
+			if ea.ptr.Kind == KindTuple && eb.ptr.Kind == KindTuple && ea.ptr.Type == TupleType && eb.ptr.Type == TupleType {
+				res := compareSliceRich(ctx, ea.AsTuple().Items, eb.AsTuple().Items, CmpEQ)
+				if ctx != nil && ctx.HasException() {
+					return Value{}
+				}
+				if !res.IsTruthy() {
+					return BoolVal(false)
+				}
+				continue
+			}
+			res := RichCompare(ctx, ea, eb, CmpEQ)
+			if ctx != nil && ctx.HasException() {
+				return Value{}
+			}
+			if !res.IsTruthy() {
 				return BoolVal(false)
 			}
 		}
 		return BoolVal(true)
 	case CmpNEQ:
-		return BoolVal(!compareSliceRich(ctx, ia, ib, CmpEQ).IsTruthy())
+		eq := compareSliceRich(ctx, ia, ib, CmpEQ)
+		if ctx != nil && ctx.HasException() {
+			return Value{}
+		}
+		return BoolVal(!eq.IsTruthy())
 	case CmpLT, CmpLTE, CmpGT, CmpGTE:
 		minLen := min(len(ia), len(ib))
 		for i := range minLen {
-			if !RichCompare(ctx, ia[i], ib[i], CmpEQ).IsTruthy() {
-				return RichCompare(ctx, ia[i], ib[i], op)
+			ea, eb := ia[i], ib[i]
+			if ea == eb && ea.ptr != &tagFloat64 {
+				continue
+			}
+			if ea.ptr == &tagInt64 && eb.ptr == &tagInt64 {
+				ai, bi := int64(ea.num), int64(eb.num)
+				switch op {
+				case CmpLT:
+					return BoolVal(ai < bi)
+				case CmpLTE:
+					return BoolVal(ai <= bi)
+				case CmpGT:
+					return BoolVal(ai > bi)
+				case CmpGTE:
+					return BoolVal(ai >= bi)
+				}
+			}
+			if ea.ptr == &tagFloat64 && eb.ptr == &tagFloat64 {
+				af, bf := math.Float64frombits(ea.num), math.Float64frombits(eb.num)
+				if af == bf {
+					continue
+				}
+				switch op {
+				case CmpLT:
+					return BoolVal(af < bf)
+				case CmpLTE:
+					return BoolVal(af <= bf)
+				case CmpGT:
+					return BoolVal(af > bf)
+				case CmpGTE:
+					return BoolVal(af >= bf)
+				}
+			}
+			if (ea.ptr == &tagInlineStr || (ea.ptr.Kind == KindString && ea.ptr.Type == StrType)) &&
+				(eb.ptr == &tagInlineStr || (eb.ptr.Kind == KindString && eb.ptr.Type == StrType)) {
+				c := StringCompare(ea, eb)
+				if c == 0 {
+					continue
+				}
+				return BoolVal(cmpOrderedInt(c, op))
+			}
+			if ea.ptr.Kind == KindTuple && eb.ptr.Kind == KindTuple && ea.ptr.Type == TupleType && eb.ptr.Type == TupleType {
+				eq := compareSliceRich(ctx, ea.AsTuple().Items, eb.AsTuple().Items, CmpEQ)
+				if ctx != nil && ctx.HasException() {
+					return Value{}
+				}
+				if !eq.IsTruthy() {
+					return compareSliceRich(ctx, ea.AsTuple().Items, eb.AsTuple().Items, op)
+				}
+				continue
+			}
+			eq := RichCompare(ctx, ea, eb, CmpEQ)
+			if ctx != nil && ctx.HasException() {
+				return Value{}
+			}
+			if !eq.IsTruthy() {
+				return RichCompare(ctx, ea, eb, op)
 			}
 		}
 		switch op {

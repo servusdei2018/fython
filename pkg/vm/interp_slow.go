@@ -535,26 +535,12 @@ func (vm *VM) opUnarySlow(st *loopState, op Opcode, ip, sp int) (int, int, loopC
 
 //go:noinline
 func (vm *VM) opCompareLtSlow(st *loopState, ip, sp int) (int, int, loopCtl) {
-	stack := st.stack
-	b := stack[sp-1]
-	a := stack[sp-2]
-	if a.IsInstance() && b.IsInstance() {
-		ta := a.Type()
-		if ta != nil && ta == b.Type() {
-			if dunder := ta.DunderLtVal(); dunder.IsFunction() {
-				dfn := dunder.AsFunction()
-				dcallee := AsCodeObject(dfn.Code)
-				if !dcallee.IsGenerator && !dcallee.IsCoroutine && dcallee.SimplePositionalOnly && dcallee.PositionalParamCount == 2 && dcallee.NumParams == 2 && len(dfn.Defaults) == 0 && dfn.KwDefaults == nil && dcallee.KWOnlyArgCount == 0 && (dcallee.Flags&(CO_VARARGS|CO_VARKEYWORDS)) == 0 {
-					newIP, newSP := vm.inlineDunderCompare(dunder, sp-2, sp-2, a, b, CMP_LT, st, ip)
-					return newIP, newSP, ctlReload
-				}
-			}
-		}
-	}
-	st.ip = ip
-	vm.execCtx.SP = sp
-	res := vm.compareOpSafe(a, b, CMP_LT)
-	stack = st.syncStackFromVM(vm, stack)
+	return vm.opCompareSlow(st, Encode(OP_COMPARE_OP, CMP_LT, 0), ip, sp)
+}
+
+//go:noinline
+func (vm *VM) finishCompareTupleSlow(st *loopState, ip, sp int, res val.Value) (int, int, loopCtl) {
+	stack := st.syncStackFromExecCtx(vm, st.stack)
 	if vm.execCtx.HasException() {
 		exc := vm.execCtx.ActiveException
 		vm.execCtx.ClearException()
@@ -562,9 +548,80 @@ func (vm *VM) opCompareLtSlow(st *loopState, ip, sp int) (int, int, loopCtl) {
 		return ip, sp, ctlRaise
 	}
 	stack[sp-2] = res
-	sp--
-	ip++
-	return ip, sp, ctlReload
+	return ip + 1, sp - 1, ctlReload
+}
+
+func compareDunderForType(tp *val.PyType, cmpOp uint8) val.Value {
+	switch cmpOp {
+	case CMP_EQ:
+		return tp.DunderEqVal()
+	case CMP_NEQ:
+		return tp.DunderNeVal()
+	case CMP_LT:
+		return tp.DunderLtVal()
+	case CMP_LTE:
+		return tp.DunderLeVal()
+	case CMP_GT:
+		return tp.DunderGtVal()
+	case CMP_GTE:
+		return tp.DunderGeVal()
+	}
+	return val.Value{}
+}
+
+func reflectedCmpOp(cmpOp uint8) uint8 {
+	switch cmpOp {
+	case CMP_LT:
+		return CMP_GT
+	case CMP_LTE:
+		return CMP_GTE
+	case CMP_GT:
+		return CMP_LT
+	case CMP_GTE:
+		return CMP_LTE
+	default:
+		return cmpOp
+	}
+}
+
+func isSimpleCompareDunder(dunder val.Value) (*val.PyFunction, *CodeObject, bool) {
+	if !dunder.IsFunction() {
+		return nil, nil, false
+	}
+	dfn := dunder.AsFunction()
+	dcallee := AsCodeObject(dfn.Code)
+	if !dcallee.IsGenerator && !dcallee.IsCoroutine &&
+		dcallee.SimplePositionalOnly && dcallee.PositionalParamCount == 2 && dcallee.NumParams == 2 &&
+		len(dfn.Defaults) == 0 && dfn.KwDefaults == nil &&
+		dcallee.KWOnlyArgCount == 0 && (dcallee.Flags&(CO_VARARGS|CO_VARKEYWORDS)) == 0 {
+		return dfn, dcallee, true
+	}
+	return nil, nil, false
+}
+
+func (vm *VM) quickenCompareDunder(st *loopState, inst uint32, ip int, dunder val.Value, dfn *val.PyFunction, dcallee *CodeObject, taVer, tbVer uint64, mode int32) {
+	if st.cache == nil || uint(ip) >= uint(len(st.cache.ic)) || vm.hasTrackedViews {
+		return
+	}
+	if len(dcallee.CellVars) != 0 || (dcallee.HasCells && dfn.Closure == nil) {
+		return
+	}
+	cc := vm.cacheFor(dcallee)
+	if len(dcallee.ExceptionTable) == 0 && atomic.LoadInt32(&dcallee.IsTier2Optimized) == 0 {
+		maybeOptimizeCodeObject(vm, dcallee, cc)
+	}
+	_, _ = vm.loadWindow(dcallee, cc)
+	st.cache.ic[ip] = ICSlot{
+		CachedVal:       dunder,
+		CalleeCache:     cc,
+		ExpectedTypeVer: taVer,
+		ExpectedAuxVer:  tbVer,
+		SlotIndex:       mode,
+		Kind:            ICKindCompareDunder,
+	}
+	if DecodeOpcode(inst) != OP_COMPARE_DUNDER {
+		st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_COMPARE_DUNDER))
+	}
 }
 
 //go:noinline
@@ -573,28 +630,39 @@ func (vm *VM) opCompareSlow(st *loopState, inst uint32, ip, sp int) (int, int, l
 	cmpOp := uint8(inst >> 16)
 	b := stack[sp-1]
 	a := stack[sp-2]
-	if cmpOp <= CMP_GTE && a.IsInstance() && b.IsInstance() {
+	if cmpOp <= CMP_GTE && (a.IsInstance() || b.IsInstance()) &&
+		a.Kind() != val.KindMappingProxy && b.Kind() != val.KindMappingProxy &&
+		a.Kind() != val.KindComplex && b.Kind() != val.KindComplex {
 		ta := a.Type()
-		if ta != nil && ta == b.Type() {
+		tb := b.Type()
+		if ta != nil && tb != nil {
 			var dunder val.Value
-			switch cmpOp {
-			case CMP_EQ:
-				dunder = ta.DunderEqVal()
-			case CMP_NEQ:
-				dunder = ta.DunderNeVal()
-			case CMP_LT:
-				dunder = ta.DunderLtVal()
-			case CMP_LTE:
-				dunder = ta.DunderLeVal()
-			case CMP_GT:
-				dunder = ta.DunderGtVal()
-			case CMP_GTE:
-				dunder = ta.DunderGeVal()
+			var mode int32
+			isStrictSub := ta != tb && val.IsSubclass(tb, ta)
+			if isStrictSub {
+				if rFn := compareDunderForType(tb, reflectedCmpOp(cmpOp)); rFn.HeaderPtr() != nil {
+					dunder = rFn
+					mode = 1
+				}
 			}
-			if dunder.IsFunction() {
-				dfn := dunder.AsFunction()
-				dcallee := AsCodeObject(dfn.Code)
-				if !dcallee.IsGenerator && !dcallee.IsCoroutine && dcallee.SimplePositionalOnly && dcallee.PositionalParamCount == 2 && dcallee.NumParams == 2 && len(dfn.Defaults) == 0 && dfn.KwDefaults == nil && dcallee.KWOnlyArgCount == 0 && (dcallee.Flags&(CO_VARARGS|CO_VARKEYWORDS)) == 0 {
+			if dunder.HeaderPtr() == nil {
+				if fn := compareDunderForType(ta, cmpOp); fn.HeaderPtr() != nil {
+					dunder = fn
+					mode = 0
+				} else if !isStrictSub {
+					if rFn := compareDunderForType(tb, reflectedCmpOp(cmpOp)); rFn.HeaderPtr() != nil {
+						dunder = rFn
+						mode = 1
+					}
+				}
+			}
+			if dunder.HeaderPtr() != nil {
+				if dfn, dcallee, ok := isSimpleCompareDunder(dunder); ok {
+					vm.quickenCompareDunder(st, inst, ip, dunder, dfn, dcallee, ta.Version(), tb.Version(), mode)
+					if mode != 0 {
+						stack[sp-2] = b
+						stack[sp-1] = a
+					}
 					newIP, newSP := vm.inlineDunderCompare(dunder, sp-2, sp-2, a, b, cmpOp, st, ip)
 					return newIP, newSP, ctlReload
 				}
@@ -603,10 +671,9 @@ func (vm *VM) opCompareSlow(st *loopState, inst uint32, ip, sp int) (int, int, l
 	}
 	if (cmpOp == CMP_IN || cmpOp == CMP_NOT_IN) && b.IsInstance() {
 		if bt := b.Type(); bt != nil {
-			if dunder := bt.DunderContainsVal(); dunder.IsFunction() {
-				dfn := dunder.AsFunction()
-				dcallee := AsCodeObject(dfn.Code)
-				if !dcallee.IsGenerator && !dcallee.IsCoroutine && dcallee.SimplePositionalOnly && dcallee.PositionalParamCount == 2 && dcallee.NumParams == 2 && len(dfn.Defaults) == 0 && dfn.KwDefaults == nil && dcallee.KWOnlyArgCount == 0 && (dcallee.Flags&(CO_VARARGS|CO_VARKEYWORDS)) == 0 {
+			if dunder := bt.DunderContainsVal(); dunder.HeaderPtr() != nil {
+				if dfn, dcallee, ok := isSimpleCompareDunder(dunder); ok {
+					vm.quickenCompareDunder(st, inst, ip, dunder, dfn, dcallee, 0, bt.Version(), 2)
 					stack[sp-2] = b
 					stack[sp-1] = a
 					newIP, newSP := vm.inlineDunderCompare(dunder, sp-2, sp-2, a, b, cmpOp, st, ip)

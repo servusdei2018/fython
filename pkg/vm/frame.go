@@ -42,6 +42,7 @@ const (
 	ICKindSuperMethod               // super(ThisClass, Self) MRO resolution guarded by selfType + ThisClass versions
 	ICKindPropertySet               // @property setter (CachedVal holds fset) dispatched without descriptor machinery
 	ICKindInstanceTransition        // Shape-transitioning attribute store (OldShape -> NewShape via transitionIC)
+	ICKindCompareDunder             // Quickened comparison dunder (CachedVal=*PyFunction, CalleeCache=*VMCodeCache, ExpectedTypeVer=left, ExpectedAuxVer=right, SlotIndex=mode)
 )
 
 // AttrPICEntry represents a single slot in a 4-way polymorphic inline cache for attribute access.
@@ -319,6 +320,10 @@ func reloadCode(co *CodeObject, cache *VMCodeCache, gen int32) []uint32 {
 				}
 			case OP_FOR_ITER_GEN:
 				if DecodeOpcode(priv[i]) == OP_FOR_ITER {
+					priv[i] = oldInst
+				}
+			case OP_COMPARE_DUNDER:
+				if op := DecodeOpcode(priv[i]); op == OP_COMPARE_OP || op == OP_COMPARE_LT {
 					priv[i] = oldInst
 				}
 			}

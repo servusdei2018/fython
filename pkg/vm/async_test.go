@@ -390,10 +390,11 @@ async def handle_echo(reader, writer):
     await writer.wait_closed()
 
 async def main():
-    server = await asyncio.start_server(handle_echo, "127.0.0.1", 19876)
-    
+    server = await asyncio.start_server(handle_echo, "127.0.0.1", 0)
+    port = server.sockets[0][1]
+
     async def client():
-        reader, writer = await asyncio.open_connection("127.0.0.1", 19876)
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
         writer.write(b"fython netpoll echo")
         await writer.drain()
         data = await reader.read(100)

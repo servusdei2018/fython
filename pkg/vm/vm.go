@@ -2574,6 +2574,7 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 	for {
 		inst := *(*uint32)(unsafe.Add(codePtr, uintptr(ip)*4))
 		op := Opcode(inst >> 24)
+		recordOpcode(op)
 
 		switch op {
 		case OP_LOAD_CONST:
@@ -2622,30 +2623,6 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				continue
 			}
 			ip, sp, ctl = vm.opBinarySlow(st, OP_BINARY_ADD, ip, sp)
-		case OP_BINARY_ADD_INT:
-			b := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
-			a := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
-			if a.IsInt64() && b.IsInt64() {
-				ai, bi := a.AsInt64(), b.AsInt64()
-				sum := ai + bi
-				if ((ai ^ sum) & (bi ^ sum)) >= 0 {
-					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.Int64Val(sum)
-					sp--
-					ip++
-					continue
-				}
-			}
-			ip, sp, ctl = vm.opBinarySlow(st, OP_BINARY_ADD_INT, ip, sp)
-		case OP_BINARY_ADD_FLOAT:
-			b := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
-			a := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
-			if a.IsFloat64() && b.IsFloat64() {
-				*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.Float64Val(a.AsFloat64() + b.AsFloat64())
-				sp--
-				ip++
-				continue
-			}
-			ip, sp, ctl = vm.opBinarySlow(st, OP_BINARY_ADD_FLOAT, ip, sp)
 		case OP_BINARY_SUB:
 			b := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
 			a := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
@@ -2660,33 +2637,6 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				}
 			}
 			ip, sp, ctl = vm.opBinarySlow(st, OP_BINARY_SUB, ip, sp)
-		case OP_BINARY_SUB_INT:
-			b := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
-			a := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
-			if a.IsInt64() && b.IsInt64() {
-				ai, bi := a.AsInt64(), b.AsInt64()
-				diff := ai - bi
-				if ((ai ^ bi) & (ai ^ diff)) >= 0 {
-					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.Int64Val(diff)
-					sp--
-					ip++
-					continue
-				}
-			}
-			ip, sp, ctl = vm.opBinarySlow(st, OP_BINARY_SUB_INT, ip, sp)
-		case OP_BINARY_MUL:
-			b := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
-			a := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
-			if a.IsInt64() && b.IsInt64() {
-				ai, bi := a.AsInt64(), b.AsInt64()
-				if int64(int32(ai)) == ai && int64(int32(bi)) == bi {
-					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.Int64Val(ai * bi)
-					sp--
-					ip++
-					continue
-				}
-			}
-			ip, sp, ctl = vm.opBinarySlow(st, OP_BINARY_MUL, ip, sp)
 		case OP_BINARY_SUBSCR:
 			key := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
 			obj := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
@@ -2725,28 +2675,8 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				}
 			}
 			ip, sp, ctl = vm.opBinarySubscrSlow(st, ip, sp)
-		case OP_STORE_SUBSCR:
-			ip, sp, ctl = vm.opStoreSubscr(st, ip, sp)
-		case OP_COMPARE_LT:
-			b := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
-			a := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
-			if a.IsInt64() && b.IsInt64() {
-				*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.BoolVal(a.AsInt64() < b.AsInt64())
-				sp--
-				ip++
-				continue
-			}
-			ip, sp, ctl = vm.opCompareLtSlow(st, ip, sp)
-		case OP_COMPARE_LT_INT:
-			b := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
-			a := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
-			if a.IsInt64() && b.IsInt64() {
-				*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.BoolVal(a.AsInt64() < b.AsInt64())
-				sp--
-				ip++
-				continue
-			}
-			ip, sp, ctl = vm.opCompareLtSlow(st, ip, sp)
+		case OP_BINARY_SLICE:
+			ip, sp, ctl = vm.opBinarySlice(st, ip, sp)
 		case OP_JUMP_IF_FALSE:
 			sp--
 			cond := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16))
@@ -2806,34 +2736,26 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 			target := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
 			if target == vm.builtinLen {
 				arg := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
+				var n int
+				ok := true
 				switch arg.Kind() {
 				case val.KindString, val.KindInlineStr:
-					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.Int64Val(int64(arg.StringLen()))
-					sp--
-					ip++
-					continue
+					n = arg.StringLen()
 				case val.KindList:
-					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.Int64Val(int64(len(arg.AsList().Items)))
-					sp--
-					ip++
-					continue
+					n = len(arg.AsList().Items)
 				case val.KindTuple:
-					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.Int64Val(int64(len(arg.AsTuple().Items)))
-					sp--
-					ip++
-					continue
+					n = len(arg.AsTuple().Items)
 				case val.KindDict:
-					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.Int64Val(int64(arg.AsDict().Len()))
-					sp--
-					ip++
-					continue
+					n = arg.AsDict().Len()
 				case val.KindSet:
-					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.Int64Val(int64(arg.AsSet().Len()))
-					sp--
-					ip++
-					continue
+					n = arg.AsSet().Len()
 				case val.KindBytes:
-					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.Int64Val(int64(len(arg.AsBytes().Data)))
+					n = len(arg.AsBytes().Data)
+				default:
+					ok = false
+				}
+				if ok {
+					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.Int64Val(int64(n))
 					sp--
 					ip++
 					continue
@@ -2877,96 +2799,14 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				}
 			}
 			ip, sp, ctl = vm.opCallBuiltinFast(st, inst, ip, sp)
-		case OP_CALL_TYPE_INIT:
-			ip, sp, ctl = vm.opCallTypeInit(st, inst, ip, sp)
 		case OP_CALL_METHOD_DESCR:
 			ip, sp, ctl = vm.opCallMethodDescr(st, inst, ip, sp)
+		case OP_CALL_TYPE_INIT:
+			ip, sp, ctl = vm.opCallTypeInit(st, inst, ip, sp)
 		case OP_CALL_KW:
 			ip, sp, ctl = vm.opCallKw(st, inst, ip, sp)
-		case OP_LOAD_METHOD:
-			obj := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
-			if obj.IsInstance() {
-				instObj := obj.AsInstance()
-				instShape := instObj.Shape
-				instType := instObj.Header.Type
-				if uint(ip) < uint(len(st.cache.methodPIC)) {
-					pic := &st.cache.methodPIC[ip]
-					for k := range 4 {
-						if pic[k].Shape == instShape && instType.Version() == pic[k].TypeVersion {
-							*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16)) = pic[k].TargetVal
-							sp++
-							ip++
-							goto loadMethodHit
-						}
-					}
-				}
-				entry := st.cache.ic[ip]
-				if instShape.ID == entry.ExpectedShapeID && instType.Version() == entry.ExpectedTypeVer && entry.Kind == ICKindClassMethod {
-					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16)) = entry.CachedVal
-					sp++
-					ip++
-					continue
-				}
-			} else if obj.IsModule() && obj.AsModule().Header.Type == val.ModuleType {
-				mod := obj.AsModule()
-				entry := &st.cache.ic[ip]
-				if entry.Kind == ICKindModuleAttr && entry.ExpectedTypeVer == atomic.LoadUint64(&mod.Dict.VersionTag) {
-					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)) = val.UnboundVal()
-					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16)) = entry.CachedVal
-					sp++
-					ip++
-					continue
-				}
-			}
-			ip, sp, ctl = vm.opLoadMethodSlow(st, inst, ip, sp)
-			break
-		loadMethodHit:
-			continue
-		case OP_CALL_METHOD:
-			argc := int(uint8(inst >> 16))
-			retSP := sp - argc - 2
-			receiver := *(*val.Value)(unsafe.Add(stackPtr, uintptr(retSP)*16))
-			callable := *(*val.Value)(unsafe.Add(stackPtr, uintptr(retSP+1)*16))
-			if callable.IsFunction() && !vm.hasTrackedViews {
-				newBase := retSP + 2
-				totalArgs := argc
-				if !receiver.IsUnbound() {
-					newBase = retSP
-					totalArgs = argc + 1
-				}
-				fn := callable.AsFunction()
-				callee := AsCodeObject(fn.Code)
-				if !callee.IsGenerator && !callee.IsCoroutine &&
-					callee.SimplePositionalOnly && totalArgs == callee.PositionalParamCount &&
-					len(callee.CellVars) == 0 && (len(callee.FreeVars) == 0 || fn.Closure != nil) &&
-					st.frameIdx+2 <= len(vm.frames) &&
-					newBase+max(256, callee.NumLocals+64) <= len(st.stack) &&
-					(len(callee.ExceptionTable) > 0 || atomic.LoadInt32(&callee.IsTier2Optimized) != 0) {
-					pc := st.cache
-					if callee != st.curCO {
-						pc = (*VMCodeCache)(atomic.LoadPointer(&callee.primary))
-					}
-					if pc != nil && pc.owner == vm && atomic.LoadInt32(&callee.StreamGen) == pc.streamGen {
-						if !receiver.IsUnbound() {
-							if argc == 1 {
-								*(*val.Value)(unsafe.Add(stackPtr, uintptr(retSP+1)*16)) = *(*val.Value)(unsafe.Add(stackPtr, uintptr(retSP+2)*16))
-							} else if argc > 1 {
-								for i := range argc {
-									*(*val.Value)(unsafe.Add(stackPtr, uintptr(retSP+1+i)*16)) = *(*val.Value)(unsafe.Add(stackPtr, uintptr(retSP+2+i)*16))
-								}
-							}
-						}
-						pushFn = fn
-						pushCallee = callee
-						pushCache = pc
-						pushNewBase = newBase
-						pushRetSP = retSP
-						pushTotalArgs = totalArgs
-						goto pushFrame
-					}
-				}
-			}
-			ip, sp, ctl = vm.opCallMethodSlow(st, inst, ip, sp)
+		case OP_CALL_FUNCTION_EX:
+			ip, sp, ctl = vm.opCallFunctionEx(st, inst, ip, sp)
 		case OP_CALL_METHOD_PIC:
 			argc := int(uint8(inst >> 16))
 			newBase := sp - argc - 1
@@ -3021,7 +2861,14 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 			}
 			if st.frameIdx > st.startFrameIdx && st.frameIdx != st.genFrameIdx && vm.frames[st.frameIdx].shadowFrame == nil {
 				caller := &vm.frames[st.frameIdx-1]
-				if caller.initInstance.HeaderPtr() == nil && !caller.cmpActive && len(vm.excStack) <= caller.excStackLen && caller.cache != nil {
+				if caller.initInstance.HeaderPtr() == nil &&
+					(!caller.cmpActive || (caller.cmpOp <= CMP_GTE && !retVal.IsNotImplemented())) &&
+					len(vm.excStack) <= caller.excStackLen && caller.cache != nil {
+					if caller.cmpActive {
+						caller.cmpActive = false
+						caller.cmpLeft = val.Value{}
+						caller.cmpRight = val.Value{}
+					}
 					st.frameIdx--
 					if caller.co == st.curCO {
 						ip = caller.ip
@@ -3060,33 +2907,6 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				}
 			}
 			ip, sp, ctl = vm.opReturnSlow(st, ip, sp, retVal)
-		case OP_LOAD_FAST_ATTR_MUL_SELF:
-			reg := uint8(inst >> 16)
-			obj := locals[reg]
-			if instObj := obj.AsInstanceChecked(); instObj != nil {
-				instShape := instObj.Shape
-				instType := instObj.Header.Type
-				if instShape != nil && instType != nil && (instType.Flags&val.FlagCustomGetAttribute) == 0 && !val.MultiThreadedFlag.Load() && uint(ip+1) < uint(len(st.cache.attrPIC)) {
-					pic := &st.cache.attrPIC[ip+1]
-					if pic[0].Shape == instShape && pic[0].TypeVer == uint32(instType.Version()) {
-						slotIdx := pic[0].SlotIndex
-						if uint(slotIdx) < uint(len(instObj.Slots)) {
-							v := instObj.Slots[slotIdx]
-							if v.IsInt64() {
-								vi := v.AsInt64()
-								if int64(int32(vi)) == vi {
-									*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16)) = val.Int64Val(vi * vi)
-									sp++
-									ip += 5
-									continue
-								}
-							}
-						}
-					}
-				}
-			}
-			ip, sp, ctl = vm.opFastAttrSlow(st, inst, ip, sp)
-
 		case OP_LOAD_FAST_ATTR:
 			reg := uint8(inst >> 16)
 			obj := locals[reg]
@@ -3111,46 +2931,36 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 			}
 			ip, sp, ctl = vm.opFastAttrSlow(st, inst, ip, sp)
 
-		case OP_STORE_FAST_ATTR:
-			reg := uint8(inst >> 16)
-			obj := locals[reg]
-			v := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
-			if !v.IsString() && v.Kind() != val.KindMemoryView && !val.MultiThreadedFlag.Load() {
-				if instObj := obj.AsInstanceChecked(); instObj != nil {
-					instShape := instObj.Shape
-					instType := instObj.Header.Type
-					if instShape != nil && instType != nil && (instType.Flags&val.FlagCustomSetAttr) == 0 && uint(ip+1) < uint(len(st.cache.attrPIC)) {
-						pic := &st.cache.attrPIC[ip+1]
-						if pic[0].Shape == instShape && pic[0].TypeVer == uint32(instType.Version()) {
-							slotIdx := pic[0].SlotIndex
-							if uint(slotIdx) < uint(len(instObj.Slots)) {
-								instObj.Slots[slotIdx] = v
-								sp--
-								ip += 2
-								continue
-							}
-						}
-					}
-				}
-			}
-			ip, sp, ctl = vm.opFastAttrSlow(st, inst, ip, sp)
-
 		case OP_LOAD_ATTR:
 			obj := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
-			if instObj := obj.AsInstanceChecked(); instObj != nil {
+			var attrRes val.Value
+			instObj := obj.AsInstanceChecked()
+			switch {
+			case instObj != nil:
 				instShape := instObj.Shape
 				instType := instObj.Header.Type
 				if instShape != nil && instType != nil && (instType.Flags&val.FlagCustomGetAttribute) == 0 && !val.MultiThreadedFlag.Load() {
 					typeVer := instType.Version()
 					entry := &st.cache.ic[ip]
-					if entry.Kind == ICKindSlotMember && entry.ExpectedTypeVer == typeVer {
-						slotIdx := entry.SlotIndex
-						if uint(slotIdx) < uint(len(instObj.Slots)) {
-							v := instObj.Slots[slotIdx]
-							if !v.IsUnbound() {
-								*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)) = v
-								ip++
-								continue
+					if entry.ExpectedTypeVer == typeVer {
+						switch entry.Kind {
+						case ICKindSlotMember:
+							slotIdx := entry.SlotIndex
+							if uint(slotIdx) < uint(len(instObj.Slots)) {
+								v := instObj.Slots[slotIdx]
+								if !v.IsUnbound() {
+									recordICSlowHit(ICKindSlotMember)
+									attrRes = v
+									goto loadAttrHit
+								}
+							}
+						case ICKindProperty:
+							goto loadAttrProp
+						case ICKindClassAttr:
+							if instShape.ID == entry.ExpectedShapeID {
+								recordICSlowHit(ICKindClassAttr)
+								attrRes = entry.CachedVal
+								goto loadAttrHit
 							}
 						}
 					}
@@ -3162,8 +2972,7 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 								if uint(slotIdx) < uint(len(instObj.Slots)) {
 									v := instObj.Slots[slotIdx]
 									if !v.IsUnbound() {
-										*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)) = v
-										ip++
+										attrRes = v
 										goto loadAttrHit
 									}
 								}
@@ -3175,25 +2984,88 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 						if uint(slotIdx) < uint(len(instObj.Slots)) {
 							v := instObj.Slots[slotIdx]
 							if !v.IsUnbound() {
-								*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)) = v
-								ip++
-								continue
+								attrRes = v
+								goto loadAttrHit
 							}
 						}
 					}
 				}
-			} else if obj.IsModule() && obj.AsModule().Header.Type == val.ModuleType {
+			case obj.IsTuple():
+				tp := obj.HeaderPtr().Type
+				if tp != nil && (tp.Flags&val.FlagCustomGetAttribute) == 0 && !val.MultiThreadedFlag.Load() {
+					entry := &st.cache.ic[ip]
+					if entry.ExpectedTypeVer == tp.Version() {
+						switch entry.Kind {
+						case ICKindTupleGetter:
+							t := obj.AsTuple()
+							if uint(entry.SlotIndex) < uint(len(t.Items)) {
+								recordICSlowHit(ICKindTupleGetter)
+								attrRes = t.Items[entry.SlotIndex]
+								goto loadAttrHit
+							}
+						case ICKindProperty:
+							goto loadAttrProp
+						}
+					}
+				}
+			case obj.IsType():
+				cls := obj.AsType()
+				meta := cls.Header.Type
+				if meta == nil {
+					meta = val.TypeType
+				}
+				entry := &st.cache.ic[ip]
+				if entry.Kind == ICKindTypeAttr && entry.ExpectedTypeVer == cls.Version() && entry.ExpectedAuxVer == meta.Version() {
+					recordICSlowHit(ICKindTypeAttr)
+					attrRes = entry.CachedVal
+					goto loadAttrHit
+				}
+			case obj.IsModule() && obj.AsModule().Header.Type == val.ModuleType:
 				mod := obj.AsModule()
 				entry := &st.cache.ic[ip]
 				if entry.Kind == ICKindModuleAttr && entry.ExpectedTypeVer == atomic.LoadUint64(&mod.Dict.VersionTag) {
-					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)) = entry.CachedVal
-					ip++
-					continue
+					attrRes = entry.CachedVal
+					goto loadAttrHit
+				}
+			}
+			ip, sp, ctl = vm.opLoadAttrSlow(st, inst, ip, sp)
+			break
+		loadAttrProp:
+			{
+				entry := &st.cache.ic[ip]
+				fget := entry.CachedVal
+				if fget.IsFunction() && !vm.hasTrackedViews {
+					fn := fget.AsFunction()
+					cc := entry.CalleeCache
+					if cc != nil && cc.owner == vm && cc.co != nil &&
+						fn.Code.HeaderPtr() == &cc.co.Header &&
+						cc.co.SimplePositionalOnly && cc.co.NumParams == 1 &&
+						len(fn.Defaults) == 0 && fn.KwDefaults == nil &&
+						len(cc.co.CellVars) == 0 &&
+						atomic.LoadInt32(&cc.co.StreamGen) == cc.streamGen {
+						callee := cc.co
+						newBase := sp - 1
+						st.periodicTick++
+						if (st.periodicTick&0xFF) != 0 &&
+							st.frameIdx+2 <= len(vm.frames) &&
+							newBase+max(256, callee.NumLocals+64) <= len(st.stack) {
+							recordLoadAttrInlinePropHit()
+							pushFn = fn
+							pushCallee = callee
+							pushCache = cc
+							pushNewBase = newBase
+							pushRetSP = newBase
+							pushTotalArgs = 1
+							goto pushFrame
+						}
+					}
 				}
 			}
 			ip, sp, ctl = vm.opLoadAttrSlow(st, inst, ip, sp)
 			break
 		loadAttrHit:
+			*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)) = attrRes
+			ip++
 			continue
 		case OP_STORE_ATTR:
 			v := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
@@ -3253,8 +3125,6 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 			ip++
 			continue
 
-		case OP_PRINT_EXPR:
-			ip, sp, ctl = vm.opPrintExpr(st, ip, sp)
 		case OP_DUP_TOP:
 			// The duplicated value is now reachable from two stack slots, so it
 			// must not be extendable in place any more.
@@ -3289,16 +3159,6 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				}
 			}
 			ip, sp, ctl = vm.opLoadGlobalSlow(st, inst, ip, sp)
-		case OP_LOAD_LOCALS:
-			ip, sp, ctl = vm.opLoadLocals(st, ip, sp)
-		case OP_LOAD_FROM_DICT_OR_GLOBALS, OP_LOAD_FROM_DICT_OR_DEREF:
-			ip, sp, ctl = vm.opLoadFromDictOr(st, inst, ip, sp)
-		case OP_STORE_GLOBAL:
-			ip, sp, ctl = vm.opStoreGlobal(st, inst, ip, sp)
-		case OP_LOAD_NAME:
-			ip, sp, ctl = vm.opLoadName(st, inst, ip, sp)
-		case OP_STORE_NAME:
-			ip, sp, ctl = vm.opStoreName(st, inst, ip, sp)
 		case OP_LOAD_DEREF:
 			bx := int(uint16(inst))
 			activePtrs := vm.activeCellPtrs
@@ -3312,49 +3172,6 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 			ip++
 			continue
 
-		case OP_STORE_DEREF:
-			bx := int(uint16(inst))
-			sp--
-			valToStore := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16))
-			if valToStore.IsString() {
-				vm.opDetachStoreDeref(valToStore)
-			}
-			activePtrs := vm.activeCellPtrs
-			if uint(bx) < uint(len(activePtrs)) && activePtrs[bx] != nil {
-				activePtrs[bx].Value = valToStore
-			} else {
-				cell := (*val.PyCell)(unsafe.Pointer(st.cells[bx].HeaderPtr()))
-				cell.Value = valToStore
-			}
-			ip++
-			continue
-
-		case OP_INC_DEREF_INT:
-			bx := int(uint16(inst))
-			var cell *val.PyCell
-			activePtrs := vm.activeCellPtrs
-			if uint(bx) < uint(len(activePtrs)) && activePtrs[bx] != nil {
-				cell = activePtrs[bx]
-			} else {
-				cell = (*val.PyCell)(unsafe.Pointer(st.cells[bx].HeaderPtr()))
-			}
-			if cell.Value.IsInt64() {
-				cell.Value = val.Int64Val(cell.Value.AsInt64() + 1)
-				ip += 4
-				continue
-			}
-			ip, sp, ctl = vm.opIncDerefSlow(st, cell, ip, sp)
-
-		case OP_LOAD_CLOSURE:
-			ip, sp, ctl = vm.opLoadClosure(st, inst, ip, sp)
-		case OP_IMPORT_NAME:
-			ip, sp, ctl = vm.opImportName(st, inst, ip, sp)
-		case OP_IMPORT_FROM:
-			ip, sp, ctl = vm.opImportFrom(st, inst, ip, sp)
-		case OP_IMPORT_STAR:
-			ip, sp, ctl = vm.opImportStar(st, ip, sp)
-		case OP_MAKE_FUNCTION:
-			ip, sp, ctl = vm.opMakeFunction(st, inst, ip, sp)
 		case OP_GET_ITER:
 			top := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
 			if top.IsRange() || top.IsIter() || top.IsGenerator() {
@@ -3427,129 +3244,159 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				}
 			}
 			ip, sp, ctl = vm.opForIterSlow(st, inst, ip, sp)
-		case OP_FOR_ITER_GEN:
-			ip, sp, ctl = vm.opForIterGen(st, inst, ip, sp)
 		case OP_BUILD_LIST:
 			ip, sp, ctl = vm.opBuildList(st, inst, ip, sp)
-		case OP_LIST_APPEND:
-			ip, sp, ctl = vm.opListAppend(st, inst, ip, sp)
 		case OP_BUILD_MAP:
 			ip, sp, ctl = vm.opBuildMap(st, inst, ip, sp)
-		case OP_MAP_ADD:
-			ip, sp, ctl = vm.opMapAdd(st, inst, ip, sp)
 		case OP_BUILD_TUPLE:
 			ip, sp, ctl = vm.opBuildTuple(st, inst, ip, sp)
 
-		case OP_BUILD_SLICE:
-			ip, sp, ctl = vm.opBuildSlice(st, inst, ip, sp)
-		case OP_BINARY_SLICE:
-			ip, sp, ctl = vm.opBinarySlice(st, ip, sp)
-		case OP_BUILD_CLASS:
-			ip, sp, ctl = vm.opBuildClass(st, inst, ip, sp)
 		case OP_UNPACK_SEQUENCE:
 			ip, sp, ctl = vm.opUnpackSequence(st, inst, ip, sp)
 		case OP_COMPARE_OP:
 			cmpOp := uint8(inst >> 16)
 			b := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
 			a := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
+			var cmpRes bool
 			if a.IsInt64() && b.IsInt64() && cmpOp <= CMP_GTE {
 				ai, bi := a.AsInt64(), b.AsInt64()
-				var res bool
 				switch cmpOp {
 				case CMP_EQ:
-					res = ai == bi
+					cmpRes = ai == bi
 				case CMP_NEQ:
-					res = ai != bi
+					cmpRes = ai != bi
 				case CMP_LT:
-					res = ai < bi
+					cmpRes = ai < bi
 				case CMP_LTE:
-					res = ai <= bi
+					cmpRes = ai <= bi
 				case CMP_GT:
-					res = ai > bi
+					cmpRes = ai > bi
 				case CMP_GTE:
-					res = ai >= bi
+					cmpRes = ai >= bi
 				}
-				*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.BoolVal(res)
-				sp--
-				ip++
-				continue
+				goto cmpBoolHit
+			}
+			if a.IsFloat64() && b.IsFloat64() && cmpOp <= CMP_GTE {
+				af, bf := a.AsFloat64(), b.AsFloat64()
+				switch cmpOp {
+				case CMP_EQ:
+					cmpRes = af == bf
+				case CMP_NEQ:
+					cmpRes = af != bf
+				case CMP_LT:
+					cmpRes = af < bf
+				case CMP_LTE:
+					cmpRes = af <= bf
+				case CMP_GT:
+					cmpRes = af > bf
+				case CMP_GTE:
+					cmpRes = af >= bf
+				}
+				goto cmpBoolHit
 			}
 			if cmpOp == CMP_IS {
-				*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.BoolVal(a == b)
-				sp--
-				ip++
-				continue
+				cmpRes = a == b
+				goto cmpBoolHit
 			}
 			if cmpOp == CMP_IS_NOT {
-				*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.BoolVal(a != b)
-				sp--
-				ip++
-				continue
+				cmpRes = a != b
+				goto cmpBoolHit
 			}
-			if (a.IsInlineStr() || (a.IsString() && a.AsStringObj().Header.Type == val.StrType)) &&
+			if cmpOp <= CMP_GTE &&
+				(a.IsInlineStr() || (a.IsString() && a.AsStringObj().Header.Type == val.StrType)) &&
 				(b.IsInlineStr() || (b.IsString() && b.AsStringObj().Header.Type == val.StrType)) {
-				if cmpOp == CMP_EQ {
-					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.BoolVal(val.StringEquals(a, b))
+				switch cmpOp {
+				case CMP_EQ:
+					cmpRes = val.StringEquals(a, b)
+				case CMP_NEQ:
+					cmpRes = !val.StringEquals(a, b)
+				case CMP_LT:
+					cmpRes = val.StringCompare(a, b) < 0
+				case CMP_LTE:
+					cmpRes = val.StringCompare(a, b) <= 0
+				case CMP_GT:
+					cmpRes = val.StringCompare(a, b) > 0
+				case CMP_GTE:
+					cmpRes = val.StringCompare(a, b) >= 0
+				}
+				goto cmpBoolHit
+			}
+			if cmpOp <= CMP_GTE && a.IsTuple() && b.IsTuple() &&
+				a.HeaderPtr().Type == val.TupleType && b.HeaderPtr().Type == val.TupleType {
+				st.ip = ip
+				vm.execCtx.SP = sp
+				res := val.CompareTuplesFast(&vm.execCtx, a, b, cmpOp)
+				if !vm.execCtx.HasException() && unsafe.Pointer(unsafe.SliceData(vm.execCtx.Stack)) == stackPtr &&
+					(!st.stackIsVM || unsafe.Pointer(unsafe.SliceData(vm.stack)) == stackPtr) {
+					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = res
 					sp--
 					ip++
 					continue
 				}
-				if cmpOp == CMP_NEQ {
-					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.BoolVal(!val.StringEquals(a, b))
-					sp--
-					ip++
-					continue
+				ip, sp, ctl = vm.finishCompareTupleSlow(st, ip, sp, res)
+				break
+			}
+			if (cmpOp == CMP_IN || cmpOp == CMP_NOT_IN) &&
+				(a.IsInlineStr() || (a.IsString() && a.AsStringObj().Header.Type == val.StrType) || a.IsInt64()) {
+				if b.IsDict() && b.HeaderPtr().Type == val.DictType {
+					_, ok := b.AsDict().Get(a)
+					cmpRes = ok == (cmpOp == CMP_IN)
+					goto cmpBoolHit
+				}
+				if b.IsSet() && b.HeaderPtr().Type == val.SetType {
+					ok := b.AsSet().Contains(a)
+					cmpRes = ok == (cmpOp == CMP_IN)
+					goto cmpBoolHit
 				}
 			}
 			ip, sp, ctl = vm.opCompareSlow(st, inst, ip, sp)
-		case OP_BINARY_TRUE_DIV:
-			ip, sp, ctl = vm.opBinarySlow(st, OP_BINARY_TRUE_DIV, ip, sp)
-		case OP_BINARY_FLOOR_DIV:
-			ip, sp, ctl = vm.opBinarySlow(st, OP_BINARY_FLOOR_DIV, ip, sp)
-		case OP_BINARY_MOD:
-			b := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
-			a := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
-			if a.IsInt64() && b.IsInt64() {
-				ai, bi := a.AsInt64(), b.AsInt64()
-				if bi != 0 {
-					rem := ai % bi
-					if rem != 0 && (rem < 0) != (bi < 0) {
-						rem += bi
-					}
-					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.Int64Val(rem)
-					sp--
-					ip++
-					continue
-				}
-			}
-			ip, sp, ctl = vm.opBinarySlow(st, OP_BINARY_MOD, ip, sp)
-		case OP_BINARY_POW:
-			ip, sp, ctl = vm.opBinarySlow(st, OP_BINARY_POW, ip, sp)
-		case OP_UNARY_NEGATIVE:
-			v := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
-			if v.IsInt64() {
-				*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)) = val.Int64Val(-v.AsInt64())
-				ip++
-				continue
-			}
-			if v.IsFloat64() {
-				*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)) = val.Float64Val(-v.AsFloat64())
-				ip++
-				continue
-			}
-			ip, sp, ctl = vm.opUnarySlow(st, OP_UNARY_NEGATIVE, ip, sp)
-		case OP_UNARY_POSITIVE:
-			v := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
-			if v.IsInt64() || v.IsFloat64() || v.IsComplex() {
-				ip++
-				continue
-			}
-			ip, sp, ctl = vm.opUnarySlow(st, OP_UNARY_POSITIVE, ip, sp)
-		case OP_UNARY_NOT:
-			*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)) = val.BoolVal(!(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)).IsTruthy())
+			break
+		cmpBoolHit:
+			*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.BoolVal(cmpRes)
+			sp--
 			ip++
 			continue
-
+		case OP_COMPARE_DUNDER:
+			cmpOp := uint8(inst >> 16)
+			b := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
+			a := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
+			entry := &st.cache.ic[ip]
+			if entry.Kind == ICKindCompareDunder && !vm.hasTrackedViews &&
+				b.Type().Version() == entry.ExpectedAuxVer &&
+				(entry.SlotIndex == 2 || a.Type().Version() == entry.ExpectedTypeVer) {
+				fn := entry.CachedVal.AsFunction()
+				cc := entry.CalleeCache
+				if cc != nil && cc.owner == vm && cc.co != nil &&
+					fn.Code.HeaderPtr() == &cc.co.Header &&
+					len(fn.Defaults) == 0 && fn.KwDefaults == nil &&
+					len(cc.co.CellVars) == 0 && (!cc.co.HasCells || fn.Closure != nil) &&
+					atomic.LoadInt32(&cc.co.StreamGen) == cc.streamGen {
+					callee := cc.co
+					newBase := sp - 2
+					st.periodicTick++
+					if (st.periodicTick&0xFF) != 0 &&
+						st.frameIdx+2 <= len(vm.frames) &&
+						newBase+max(256, callee.NumLocals+64) <= len(st.stack) {
+						if entry.SlotIndex != 0 {
+							*(*val.Value)(unsafe.Add(stackPtr, uintptr(newBase)*16)) = b
+							*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)) = a
+						}
+						saved := &vm.frames[st.frameIdx]
+						saved.cmpLeft = a
+						saved.cmpRight = b
+						saved.cmpOp = cmpOp
+						saved.cmpActive = true
+						pushFn = fn
+						pushCallee = callee
+						pushCache = cc
+						pushNewBase = newBase
+						pushRetSP = newBase
+						pushTotalArgs = 2
+						goto pushFrame
+					}
+				}
+			}
+			ip, sp, ctl = vm.opCompareSlow(st, inst, ip, sp)
 		case OP_JUMP_IF_TRUE:
 			sp--
 			cond := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16))
@@ -3578,24 +3425,8 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 			}
 			continue
 
-		case OP_RAISE:
-			ip, sp, ctl = vm.opRaise(st, inst, ip, sp)
 		case OP_YIELD_VALUE:
 			ip, sp, ctl = vm.opYieldValue(st, ip, sp)
-		case OP_YIELD_FROM:
-			ip, sp, ctl = vm.opYieldFrom(st, ip, sp)
-		case OP_GET_AWAITABLE:
-			ip, sp, ctl = vm.opGetAwaitable(st, ip, sp)
-		case OP_AWAIT:
-			ip, sp, ctl = vm.opAwait(st, ip, sp)
-		case OP_CHECK_EXC_MATCH:
-			ip, sp, ctl = vm.opCheckExcMatch(st, ip, sp)
-		case OP_CLEANUP_EXC:
-			ip, sp, ctl = vm.opCleanupExc(st, ip, sp)
-		case OP_PUSH_EXC_INFO:
-			ip, sp, ctl = vm.opPushExcInfo(st, ip, sp)
-		case OP_POP_EXCEPT:
-			ip, sp, ctl = vm.opPopExcept(st, ip, sp)
 		case OP_NOP:
 			ip++
 			continue
@@ -3614,283 +3445,6 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 			}
 			codePtr = vm.deoptInst(st, ip, inst)
 			continue
-		case OP_FAST_INC_INT_LOCAL_CONST:
-			v := locals[uint8(inst>>16)]
-			c := *(*val.Value)(unsafe.Add(constsPtr, uintptr(uint16(inst))*16))
-			if v.IsInt64() && c.IsInt64() {
-				vi, ci := v.AsInt64(), c.AsInt64()
-				sum := vi + ci
-				if ((vi ^ sum) & (ci ^ sum)) >= 0 {
-					locals[uint8(inst>>16)] = val.Int64Val(sum)
-					ip += 4
-					continue
-				}
-			}
-			codePtr = vm.deoptInst(st, ip, inst)
-			continue
-		case OP_FAST_LOOP_CMP_LT_CONST_JUMP:
-			reg := uint8(inst >> 16)
-			exitTarget := uint16(inst)
-			constIdx := uint16(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+1)*4)))
-			v := locals[reg]
-			c := *(*val.Value)(unsafe.Add(constsPtr, uintptr(constIdx)*16))
-			if !v.IsInt64() || !c.IsInt64() {
-				codePtr = vm.deoptInst(st, ip, inst)
-				continue
-			}
-			limit := c.AsInt64()
-			cur := v.AsInt64()
-
-			// Hot-Loop Register Optimizer:
-			// If followed by OP_FAST_INC_INT_LOCAL_CONST (same reg) and back-edge OP_JUMP back to this instruction
-			if ip+8 < st.codeLen {
-				inst4 := *(*uint32)(unsafe.Add(codePtr, uintptr(ip+4)*4))
-				inst8 := *(*uint32)(unsafe.Add(codePtr, uintptr(ip+8)*4))
-				if DecodeOpcode(inst4) == OP_FAST_INC_INT_LOCAL_CONST &&
-					DecodeArgA(inst4) == reg &&
-					DecodeOpcode(inst8) == OP_JUMP &&
-					int(DecodeArgBx(inst8)) == ip {
-
-					stepConstIdx := DecodeArgBx(inst4)
-					stepVal := *(*val.Value)(unsafe.Add(constsPtr, uintptr(stepConstIdx)*16))
-					if stepVal.IsInt64() {
-						step := stepVal.AsInt64()
-						if step > 0 && cur < limit {
-							for cur < limit {
-								next := cur + step
-								if next < cur {
-									break
-								}
-								cur = next
-							}
-							locals[reg] = val.Int64Val(cur)
-							if cur >= limit {
-								ip = int(exitTarget)
-								continue
-							}
-						}
-					}
-				}
-			}
-
-			if cur < limit {
-				ip += 4
-			} else {
-				ip = int(exitTarget)
-			}
-			continue
-
-		case OP_FAST_SUB_INT_LOCAL_TO_LOCAL:
-			va := locals[uint8(inst>>8)]
-			vb := locals[uint8(inst)]
-			if va.IsInt64() && vb.IsInt64() {
-				ai, bi := va.AsInt64(), vb.AsInt64()
-				diff := ai - bi
-				if ((ai ^ bi) & (ai ^ diff)) >= 0 {
-					locals[uint8(inst>>16)] = val.Int64Val(diff)
-					ip += 4
-					continue
-				}
-			}
-			codePtr = vm.deoptInst(st, ip, inst)
-			continue
-		case OP_FAST_ADD_INT_LOCALS:
-			va := locals[uint8(inst>>16)]
-			vb := locals[uint8(inst)]
-			if va.IsInt64() && vb.IsInt64() {
-				ai, bi := va.AsInt64(), vb.AsInt64()
-				sum := ai + bi
-				if ((ai ^ sum) & (bi ^ sum)) >= 0 {
-					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16)) = val.Int64Val(sum)
-					sp++
-					ip += 3
-					continue
-				}
-			}
-			codePtr = vm.deoptInst(st, ip, inst)
-			continue
-		case OP_FAST_SUB_INT_LOCALS:
-			va := locals[uint8(inst>>16)]
-			vb := locals[uint8(inst)]
-			if va.IsInt64() && vb.IsInt64() {
-				ai, bi := va.AsInt64(), vb.AsInt64()
-				diff := ai - bi
-				if ((ai ^ bi) & (ai ^ diff)) >= 0 {
-					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16)) = val.Int64Val(diff)
-					sp++
-					ip += 3
-					continue
-				}
-			}
-			codePtr = vm.deoptInst(st, ip, inst)
-			continue
-		case OP_FAST_CMP_EQ_JUMP_IF_FALSE:
-			srcA := uint8(inst >> 16)
-			exitTarget := uint16(inst)
-			srcB := uint8(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+1)*4)) >> 16)
-			va := locals[srcA]
-			vb := locals[srcB]
-			if va.IsInt64() && vb.IsInt64() {
-				if va.AsInt64() != vb.AsInt64() {
-					ip = int(exitTarget)
-					continue
-				}
-				ip += 4
-				continue
-			}
-			codePtr = vm.deoptInst(st, ip, inst)
-			continue
-
-		case OP_FAST_SUBSCR_DEREF_LIST_LOCAL:
-			dstReg := uint8(inst >> 16)
-			cellIdx := uint8(inst >> 8)
-			idxReg := uint8(inst)
-			if int(cellIdx) < len(st.cells) {
-				cell := (*val.PyCell)(unsafe.Pointer(st.cells[cellIdx].HeaderPtr()))
-				cVal := cell.Value
-				if cVal.IsList() {
-					iv := locals[idxReg]
-					if iv.IsInt64() {
-						idx := iv.AsInt64()
-						items := cVal.AsList().Items
-						if idx >= 0 && idx < int64(len(items)) {
-							locals[dstReg] = items[idx]
-							ip += 4
-							continue
-						}
-					}
-				}
-			}
-			codePtr = vm.deoptInst(st, ip, inst)
-			continue
-
-		case OP_FAST_NEG_INT_LOCAL:
-			reg := uint8(inst >> 16)
-			v := locals[reg]
-			if v.IsInt64() {
-				locals[reg] = val.Int64Val(-v.AsInt64())
-				ip += 3
-				continue
-			}
-			codePtr = vm.deoptInst(st, ip, inst)
-			continue
-
-		case OP_FORMAT_VALUE:
-			ip, sp, ctl = vm.opFormatValue(st, inst, ip, sp)
-		case OP_BUILD_STRING:
-			ip, sp, ctl = vm.opBuildString(st, inst, ip, sp)
-		case OP_BUILD_TEMPLATE:
-			ip, sp, ctl = vm.opBuildTemplate(st, inst, ip, sp)
-		case OP_MATCH_SEQUENCE:
-			ip, sp, ctl = vm.opMatchSequence(st, ip, sp)
-		case OP_MATCH_MAPPING:
-			ip, sp, ctl = vm.opMatchMapping(st, ip, sp)
-		case OP_MATCH_KEYS:
-			ip, sp, ctl = vm.opMatchKeys(st, ip, sp)
-		case OP_MATCH_CLASS:
-			ip, sp, ctl = vm.opMatchClass(st, inst, ip, sp)
-		case OP_UNPACK_EX:
-			ip, sp, ctl = vm.opUnpackEx(st, inst, ip, sp)
-		case OP_BINARY_AND:
-			b := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
-			a := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
-			if a.IsInt64() && b.IsInt64() {
-				*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.Int64Val(a.AsInt64() & b.AsInt64())
-				sp--
-				ip++
-				continue
-			}
-			ip, sp, ctl = vm.opBinarySlow(st, OP_BINARY_AND, ip, sp)
-		case OP_BINARY_OR:
-			b := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
-			a := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
-			if a.IsInt64() && b.IsInt64() {
-				*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.Int64Val(a.AsInt64() | b.AsInt64())
-				sp--
-				ip++
-				continue
-			}
-			ip, sp, ctl = vm.opBinarySlow(st, OP_BINARY_OR, ip, sp)
-		case OP_BINARY_XOR:
-			b := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
-			a := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
-			if a.IsInt64() && b.IsInt64() {
-				*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.Int64Val(a.AsInt64() ^ b.AsInt64())
-				sp--
-				ip++
-				continue
-			}
-			ip, sp, ctl = vm.opBinarySlow(st, OP_BINARY_XOR, ip, sp)
-		case OP_BINARY_LSHIFT:
-			b := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
-			a := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
-			if a.IsInt64() && b.IsInt64() {
-				sh := b.AsInt64()
-				if sh >= 0 && sh < 63 {
-					va := a.AsInt64()
-					res := va << uint(sh)
-					if (res >> uint(sh)) == va {
-						*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.Int64Val(res)
-						sp--
-						ip++
-						continue
-					}
-				}
-			}
-			ip, sp, ctl = vm.opBinarySlow(st, OP_BINARY_LSHIFT, ip, sp)
-		case OP_BINARY_RSHIFT:
-			b := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
-			a := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
-			if a.IsInt64() && b.IsInt64() {
-				sh := b.AsInt64()
-				if sh >= 0 {
-					if sh >= 64 {
-						if a.AsInt64() >= 0 {
-							*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.Int64Val(0)
-						} else {
-							*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.Int64Val(-1)
-						}
-					} else {
-						*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.Int64Val(a.AsInt64() >> uint(sh))
-					}
-					sp--
-					ip++
-					continue
-				}
-			}
-			ip, sp, ctl = vm.opBinarySlow(st, OP_BINARY_RSHIFT, ip, sp)
-		case OP_BINARY_MATMUL:
-			ip, sp, ctl = vm.opBinarySlow(st, OP_BINARY_MATMUL, ip, sp)
-		case OP_UNARY_INVERT:
-			a := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
-			if a.IsInt64() {
-				*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)) = val.Int64Val(^a.AsInt64())
-				ip++
-				continue
-			}
-			ip, sp, ctl = vm.opUnarySlow(st, OP_UNARY_INVERT, ip, sp)
-		case OP_SETUP_RANGE:
-			count := int(uint16(inst))
-			if count == 1 {
-				stopVal := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
-				if stopVal.IsInt64() {
-					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)) = val.RangeVal(0, int32(stopVal.AsInt64()))
-					ip++
-					continue
-				}
-			} else if count == 2 {
-				stopVal := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
-				startVal := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
-				if startVal.IsInt64() && stopVal.IsInt64() {
-					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.RangeVal(int32(startVal.AsInt64()), int32(stopVal.AsInt64()))
-					sp--
-					ip++
-					continue
-				}
-			}
-			ip++
-			continue
-
 		case OP_FOR_ITER_RANGE:
 			targetReg := uint8(inst >> 16)
 			jumpTarget := int(uint16(inst))
@@ -3916,146 +3470,6 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 			sp--
 			ip = jumpTarget
 			continue
-		case OP_FAST_AND_INT_LOCAL_TO_LOCAL:
-			vA := locals[uint8(inst>>8)]
-			vB := locals[uint8(inst)]
-			if vA.IsInt64() && vB.IsInt64() {
-				locals[uint8(inst>>16)] = val.Int64Val(vA.AsInt64() & vB.AsInt64())
-				ip++
-				continue
-			}
-			ip, sp, ctl = vm.opFastBitSlow(st, OP_FAST_AND_INT_LOCAL_TO_LOCAL, inst, ip, sp)
-		case OP_FAST_OR_INT_LOCAL_TO_LOCAL:
-			vA := locals[uint8(inst>>8)]
-			vB := locals[uint8(inst)]
-			if vA.IsInt64() && vB.IsInt64() {
-				locals[uint8(inst>>16)] = val.Int64Val(vA.AsInt64() | vB.AsInt64())
-				ip++
-				continue
-			}
-			ip, sp, ctl = vm.opFastBitSlow(st, OP_FAST_OR_INT_LOCAL_TO_LOCAL, inst, ip, sp)
-		case OP_FAST_XOR_INT_LOCAL_TO_LOCAL:
-			vA := locals[uint8(inst>>8)]
-			vB := locals[uint8(inst)]
-			if vA.IsInt64() && vB.IsInt64() {
-				locals[uint8(inst>>16)] = val.Int64Val(vA.AsInt64() ^ vB.AsInt64())
-				ip++
-				continue
-			}
-			ip, sp, ctl = vm.opFastBitSlow(st, OP_FAST_XOR_INT_LOCAL_TO_LOCAL, inst, ip, sp)
-		case OP_FAST_LSHIFT_INT_LOCAL_TO_LOCAL:
-			vA := locals[uint8(inst>>8)]
-			vB := locals[uint8(inst)]
-			if vA.IsInt64() && vB.IsInt64() {
-				sh := vB.AsInt64()
-				if sh >= 0 && sh < 63 {
-					locals[uint8(inst>>16)] = val.Int64Val(vA.AsInt64() << uint(sh))
-					ip++
-					continue
-				}
-			}
-			ip, sp, ctl = vm.opFastBitSlow(st, OP_FAST_LSHIFT_INT_LOCAL_TO_LOCAL, inst, ip, sp)
-		case OP_FAST_RSHIFT_INT_LOCAL_TO_LOCAL:
-			vA := locals[uint8(inst>>8)]
-			vB := locals[uint8(inst)]
-			if vA.IsInt64() && vB.IsInt64() {
-				sh := vB.AsInt64()
-				if sh >= 0 && sh < 64 {
-					locals[uint8(inst>>16)] = val.Int64Val(vA.AsInt64() >> uint(sh))
-					ip++
-					continue
-				}
-			}
-			ip, sp, ctl = vm.opFastBitSlow(st, OP_FAST_RSHIFT_INT_LOCAL_TO_LOCAL, inst, ip, sp)
-		case OP_FAST_AND_INT_LOCALS:
-			vA := locals[uint8(inst>>16)]
-			vB := locals[uint8(inst)]
-			if vA.IsInt64() && vB.IsInt64() {
-				*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16)) = val.Int64Val(vA.AsInt64() & vB.AsInt64())
-				sp++
-				ip++
-				continue
-			}
-			ip, sp, ctl = vm.opFastBitSlow(st, OP_FAST_AND_INT_LOCALS, inst, ip, sp)
-		case OP_FAST_OR_INT_LOCALS:
-			vA := locals[uint8(inst>>16)]
-			vB := locals[uint8(inst)]
-			if vA.IsInt64() && vB.IsInt64() {
-				*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16)) = val.Int64Val(vA.AsInt64() | vB.AsInt64())
-				sp++
-				ip++
-				continue
-			}
-			ip, sp, ctl = vm.opFastBitSlow(st, OP_FAST_OR_INT_LOCALS, inst, ip, sp)
-		case OP_FAST_XOR_INT_LOCALS:
-			vA := locals[uint8(inst>>16)]
-			vB := locals[uint8(inst)]
-			if vA.IsInt64() && vB.IsInt64() {
-				*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16)) = val.Int64Val(vA.AsInt64() ^ vB.AsInt64())
-				sp++
-				ip++
-				continue
-			}
-			ip, sp, ctl = vm.opFastBitSlow(st, OP_FAST_XOR_INT_LOCALS, inst, ip, sp)
-		case OP_FAST_LSHIFT_INT_LOCALS:
-			vA := locals[uint8(inst>>16)]
-			vB := locals[uint8(inst)]
-			if vA.IsInt64() && vB.IsInt64() {
-				sh := vB.AsInt64()
-				if sh >= 0 && sh < 63 {
-					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16)) = val.Int64Val(vA.AsInt64() << uint(sh))
-					sp++
-					ip++
-					continue
-				}
-			}
-			ip, sp, ctl = vm.opFastBitSlow(st, OP_FAST_LSHIFT_INT_LOCALS, inst, ip, sp)
-		case OP_FAST_RSHIFT_INT_LOCALS:
-			vA := locals[uint8(inst>>16)]
-			vB := locals[uint8(inst)]
-			if vA.IsInt64() && vB.IsInt64() {
-				sh := vB.AsInt64()
-				if sh >= 0 && sh < 64 {
-					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16)) = val.Int64Val(vA.AsInt64() >> uint(sh))
-					sp++
-					ip++
-					continue
-				}
-			}
-			ip, sp, ctl = vm.opFastBitSlow(st, OP_FAST_RSHIFT_INT_LOCALS, inst, ip, sp)
-		case OP_FAST_SUBSCR_DEREF_LIST_LOCAL_PUSH:
-			cellIdx := uint8(inst >> 16)
-			localIdx := uint16(inst)
-			if int(cellIdx) < len(st.cellPtrs) && st.cellPtrs[cellIdx] != nil {
-				cVal := st.cellPtrs[cellIdx].Value
-				if cVal.IsList() && localIdx < 256 {
-					kVal := locals[uint8(localIdx)]
-					if kVal.IsInt64() {
-						k := kVal.AsInt64()
-						items := cVal.AsList().Items
-						if uint64(k) < uint64(len(items)) {
-							*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16)) = items[k]
-							sp++
-							ip++
-							continue
-						}
-					}
-				}
-			}
-			ip, sp, ctl = vm.opFastSubscrPushSlow(st, inst, ip, sp)
-		case OP_JUMP_IF_BITAND_ZERO:
-			b := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
-			a := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
-			if a.IsInt64() && b.IsInt64() {
-				sp -= 2
-				if (a.AsInt64() & b.AsInt64()) == 0 {
-					ip = int(uint16(inst))
-					continue
-				}
-				ip++
-				continue
-			}
-			ip, sp, ctl = vm.opFastBitSlow(st, OP_JUMP_IF_BITAND_ZERO, inst, ip, sp)
 		case OP_FAST_JUMP_IF_DEREF_LIST_SUBSCR_TRUE:
 			cellIdx := uint8(inst >> 16)
 			exitTarget := int(uint16(inst))
@@ -4099,25 +3513,6 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				}
 			}
 			ip, sp, ctl = vm.opFastStoreSubscrSlow(st, inst, ip, sp)
-		case OP_FAST_STREAM_WRITE_LOCAL_CONST:
-			ip, sp, ctl = vm.opFastStreamWriteLocalConst(st, inst, ip, sp)
-		case OP_FAST_CMP_EQ_LOCAL_DEREF_JUMP_IF_FALSE:
-			localIdx := uint8(inst >> 16)
-			exitTarget := int(uint16(inst))
-			cellIdx := uint16(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+1)*4)))
-			if int(cellIdx) < len(st.cellPtrs) && st.cellPtrs[cellIdx] != nil {
-				cVal := st.cellPtrs[cellIdx].Value
-				lVal := locals[localIdx]
-				if lVal.IsInt64() && cVal.IsInt64() {
-					if lVal.AsInt64() != cVal.AsInt64() {
-						ip = exitTarget
-						continue
-					}
-					ip += 4
-					continue
-				}
-			}
-			ip, sp, ctl = vm.opFastCmpEqDerefSlow(st, inst, ip, sp)
 		case OP_FAST_SUB_LOCAL_ADD_DEREF_TO_LOCAL:
 			cellIdx := uint16(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+1)*4)))
 			if int(cellIdx) < len(st.cellPtrs) && st.cellPtrs[cellIdx] != nil {
@@ -4131,80 +3526,98 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				}
 			}
 			ip, sp, ctl = vm.opFastSubAddDerefSlow(st, inst, ip, sp)
-		case OP_FAST_SELF_RECURSE_INC_LOCAL:
-			localReg := uint8(inst >> 16)
-			cellIdx := uint16(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+1)*4)))
-			constIdx := uint16(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+2)*4)))
-			if int(cellIdx) < len(st.cellPtrs) && st.cellPtrs[cellIdx] != nil && st.frameIdx+2 <= len(vm.frames) && sp+256 <= len(st.stack) {
-				fnVal := st.cellPtrs[cellIdx].Value
-				if fnVal.IsFunction() {
-					callee := AsCodeObject(fnVal.AsFunction().Code)
-					argVal := locals[localReg]
-					cVal := *(*val.Value)(unsafe.Add(constsPtr, uintptr(constIdx)*16))
-					if callee == st.curCO && argVal.IsInt64() && cVal.IsInt64() {
-						ai, ci := argVal.AsInt64(), cVal.AsInt64()
-						sum := ai + ci
-						if ((ai ^ sum) & (ci ^ sum)) >= 0 {
-							saved := &vm.frames[st.frameIdx]
-							saved.co = st.curCO
-							saved.codePtr = codePtr
-							saved.codeLen = st.codeLen
-							saved.consts = st.consts
-							saved.ip = ip + 6
-							saved.baseOffset = st.base
-							saved.retSP = sp
-							saved.cells = st.cells
-							saved.cellPtrs = st.cellPtrs
-							saved.globals = st.globals
-							saved.locals = st.curLocals
-							saved.cache = st.cache
-							saved.excStackLen = len(vm.excStack)
-							saved.stackIsVM = st.stackIsVM
-							saved.initInstance = val.Value{}
-							saved.cmpActive = false
-							st.curLocals = val.NoneVal()
-							st.frameIdx++
-							st.base = sp
-							*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16)) = val.Int64Val(sum)
-							locals = (*[256]val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16))
-							sp += st.curCO.NumLocals
-							vm.activeBaseOffset = st.base
-							vm.activeFrameIdx = st.frameIdx
-							ip = 0
-							continue
-						}
-					}
+		case OP_BINARY_MUL:
+			b := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
+			a := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
+			if a.IsInt64() && b.IsInt64() {
+				ai, bi := a.AsInt64(), b.AsInt64()
+				if int64(int32(ai)) == ai && int64(int32(bi)) == bi {
+					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.Int64Val(ai * bi)
+					sp--
+					ip++
+					continue
 				}
 			}
-			ip, sp, ctl = vm.opFastSelfRecurseSlow(st, inst, ip, sp)
-		case OP_BUILD_SET:
-			ip, sp, ctl = vm.opBuildSet(st, inst, ip, sp)
-		case OP_SET_ADD:
-			ip, sp, ctl = vm.opSetAdd(st, inst, ip, sp)
-		case OP_DELETE_FAST:
-			ip, sp, ctl = vm.opDeleteFast(st, inst, ip, sp)
-		case OP_DELETE_GLOBAL:
-			ip, sp, ctl = vm.opDeleteGlobal(st, inst, ip, sp)
-		case OP_DELETE_NAME:
-			ip, sp, ctl = vm.opDeleteName(st, inst, ip, sp)
-		case OP_DELETE_ATTR:
-			ip, sp, ctl = vm.opDeleteAttr(st, inst, ip, sp)
-		case OP_DELETE_SUBSCR:
-			ip, sp, ctl = vm.opDeleteSubscr(st, ip, sp)
-		case OP_CHECK_EXC_MATCH_STAR:
-			ip, sp, ctl = vm.opCheckExcMatchStar(st, ip, sp)
-		case OP_BUILD_MAP_UNPACK:
-			ip, sp, ctl = vm.opBuildMapUnpack(st, inst, ip, sp)
-		case OP_LIST_EXTEND:
-			ip, sp, ctl = vm.opListExtend(st, inst, ip, sp)
-		case OP_LIST_TO_TUPLE:
-			ip, sp, ctl = vm.opListToTuple(st, ip, sp)
-		case OP_LIST_TO_SET:
-			ip, sp, ctl = vm.opListToSet(st, ip, sp)
-		case OP_CALL_FUNCTION_EX:
-			ip, sp, ctl = vm.opCallFunctionEx(st, inst, ip, sp)
+			ip, sp, ctl = vm.dispatchColdOpcode(st, op, inst, ip, sp)
+		case OP_BINARY_MOD:
+			b := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
+			a := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
+			if a.IsInt64() && b.IsInt64() {
+				ai, bi := a.AsInt64(), b.AsInt64()
+				if bi != 0 {
+					rem := ai % bi
+					if rem != 0 && (rem < 0) != (bi < 0) {
+						rem += bi
+					}
+					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.Int64Val(rem)
+					sp--
+					ip++
+					continue
+				}
+			}
+			ip, sp, ctl = vm.dispatchColdOpcode(st, op, inst, ip, sp)
+		case OP_COMPARE_LT:
+			b := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
+			a := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
+			if a.IsInt64() && b.IsInt64() {
+				*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.BoolVal(a.AsInt64() < b.AsInt64())
+				sp--
+				ip++
+				continue
+			}
+			ip, sp, ctl = vm.dispatchColdOpcode(st, op, inst, ip, sp)
+		case OP_FAST_ADD_INT_LOCALS:
+			va := locals[uint8(inst>>16)]
+			vb := locals[uint8(inst)]
+			if va.IsInt64() && vb.IsInt64() {
+				ai, bi := va.AsInt64(), vb.AsInt64()
+				sum := ai + bi
+				if ((ai ^ sum) & (bi ^ sum)) >= 0 {
+					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16)) = val.Int64Val(sum)
+					sp++
+					ip += 3
+					continue
+				}
+			}
+			ip, sp, ctl = vm.dispatchColdOpcode(st, op, inst, ip, sp)
+		case OP_SETUP_RANGE:
+			count := int(uint16(inst))
+			if count == 1 {
+				stopVal := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
+				if stopVal.IsInt64() {
+					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)) = val.RangeVal(0, int32(stopVal.AsInt64()))
+					ip++
+					continue
+				}
+			} else if count == 2 {
+				stopVal := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
+				startVal := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
+				if startVal.IsInt64() && stopVal.IsInt64() {
+					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.RangeVal(int32(startVal.AsInt64()), int32(stopVal.AsInt64()))
+					sp--
+					ip++
+					continue
+				}
+			}
+			ip++
+			continue
+		case OP_FAST_CMP_EQ_LOCAL_DEREF_JUMP_IF_FALSE:
+			cellIdx := uint16(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+1)*4)))
+			if int(cellIdx) < len(st.cellPtrs) && st.cellPtrs[cellIdx] != nil {
+				cVal := st.cellPtrs[cellIdx].Value
+				lVal := locals[uint8(inst>>16)]
+				if lVal.IsInt64() && cVal.IsInt64() {
+					if lVal.AsInt64() != cVal.AsInt64() {
+						ip = int(uint16(inst))
+						continue
+					}
+					ip += 4
+					continue
+				}
+			}
+			ip, sp, ctl = vm.dispatchColdOpcode(st, op, inst, ip, sp)
 		default:
-			panic("vm: unknown opcode")
+			ip, sp, ctl = vm.dispatchColdOpcode(st, op, inst, ip, sp)
 		}
 		switch ctl {
 		case ctlNext:
