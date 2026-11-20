@@ -1570,6 +1570,16 @@ func (vm *VM) acquireSmallDictFlags(capacity int, flags uint8) val.Value {
 			return v
 		}
 		if capacity <= 16 {
+			if capacity <= 10 {
+				if n := len(vm.dict16FreeList); n > 0 {
+					d := vm.dict16FreeList[n-1]
+					vm.dict16FreeList[n-1] = nil
+					vm.dict16FreeList = vm.dict16FreeList[:n-1]
+					d.Header = val.ObjectHeader{Kind: val.KindDict, Flags: flags, Type: val.DictType}
+					d.InitDict16Table()
+					return val.DictVal(d)
+				}
+			}
 			if n := len(vm.mediumDictFreeList); n > 0 {
 				d := vm.mediumDictFreeList[n-1]
 				vm.mediumDictFreeList[n-1] = nil
@@ -1605,6 +1615,11 @@ func (vm *VM) releaseSmallDictFlag(d *val.PyDict, flag uint8) {
 		d.ResetForPool()
 		if len(vm.dictFreeList) < 128 {
 			vm.dictFreeList = append(vm.dictFreeList, d)
+		}
+	case d.IsDict16Poolable():
+		d.ResetDict16ForPool()
+		if len(vm.dict16FreeList) < 64 {
+			vm.dict16FreeList = append(vm.dict16FreeList, d)
 		}
 	case d.IsMediumPoolable():
 		d.ResetMediumForPool()

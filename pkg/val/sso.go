@@ -90,6 +90,25 @@ func inlineStrSlice(v Value, buf *[7]byte) []byte {
 	return buf[:n]
 }
 
+// InlineStrBytes unpacks a KindInlineStr Value into buf and returns buf[:n].
+// It returns nil when v is not a KindInlineStr. The caller retains buf, so
+// the result must not outlive the call frame. Zero allocations.
+func (v Value) InlineStrBytes(buf *[7]byte) []byte {
+	if v.ptr != &tagInlineStr {
+		return nil
+	}
+	return inlineStrSlice(v, buf)
+}
+
+// AsBytesScratch returns the UTF-8 bytes of a string-like Value without
+// allocating: heap KindString payloads are viewed via unsafe.Slice, inline
+// strings are unpacked into buf, and str-subclass instances recurse into
+// their slot-0 payload. It returns nil for non-string Values. The result
+// aliases heap memory or buf and must be consumed before the caller returns.
+func (v Value) AsBytesScratch(buf *[7]byte) []byte {
+	return valueStringBytes(v, buf)
+}
+
 // AppendValueBytes appends the UTF-8 bytes of string-like Value v into dst without heap allocations.
 // If v is KindInlineStr, it unpacks the 1–7 bytes directly from v.num using bit shifts.
 // If v is KindString (*PyString), it views the underlying bytes via unsafe.Slice without copying.
@@ -759,9 +778,15 @@ func ConcatStrings(a, b Value) Value {
 		copy(buf, data)
 		pos = len(data)
 	default:
-		s := a.AsString()
-		copy(buf, s)
-		pos = len(s)
+		var abuf [7]byte
+		if ab := a.AsBytesScratch(&abuf); ab != nil {
+			copy(buf, ab)
+			pos = len(ab)
+		} else {
+			s := a.AsString()
+			copy(buf, s)
+			pos = len(s)
+		}
 	}
 	switch {
 	case b.ptr == &tagInlineStr:
@@ -773,8 +798,13 @@ func ConcatStrings(a, b Value) Value {
 		data := (*PyString)(unsafe.Pointer(b.ptr)).Data
 		copy(buf[pos:], data)
 	default:
-		s := b.AsString()
-		copy(buf[pos:], s)
+		var bbuf [7]byte
+		if bb := b.AsBytesScratch(&bbuf); bb != nil {
+			copy(buf[pos:], bb)
+		} else {
+			s := b.AsString()
+			copy(buf[pos:], s)
+		}
 	}
 	s := unsafe.String(unsafe.SliceData(buf), totalLen)
 	ps := &PyString{

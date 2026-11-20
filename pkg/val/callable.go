@@ -4751,7 +4751,7 @@ func initTypes() {
 			gen := iterable.AsGenerator()
 			sep := sepStr
 			if sepInline {
-				sep = args[0].AsString()
+				sep = unsafe.String(unsafe.SliceData(sepBytes), len(sepBytes))
 			}
 			if JoinGeneratorHook != nil {
 				if res, ok := JoinGeneratorHook(ctx, sep, gen); ok {
@@ -4774,8 +4774,14 @@ func initTypes() {
 					}
 					break
 				}
-				if !first && len(sep) > 0 {
-					b.WriteString(sep)
+				if !first {
+					if sepInline {
+						if len(sepBytes) > 0 {
+							b.Write(sepBytes)
+						}
+					} else if len(sep) > 0 {
+						b.WriteString(sep)
+					}
 				}
 				first = false
 				if !v.WriteToBuilder(&b) {

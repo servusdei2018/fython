@@ -562,6 +562,57 @@ func NewListFromOwnedSlice(items []Value) Value {
 	return Value{num: 0, ptr: &obj.Header}
 }
 
+// NewListWithCap constructs an empty KindList Value with preallocated capacity.
+// Used for comprehension targets where the first append would otherwise grow
+// through 1 -> 2 -> 4 -> 8. The 8-slot floor skips that churn in one shot.
+func NewListWithCap(capHint int) Value {
+	var items []Value
+	if capHint > 0 {
+		if capHint < 8 {
+			capHint = 8
+		}
+		items = make([]Value, 0, capHint)
+	}
+	obj := &PyList{
+		Header: ObjectHeader{Kind: KindList, Type: ListType},
+		Items:  items,
+	}
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+// ListLenHint returns the exact length of a known-length iterable without
+// materializing it. It covers PyList, PyTuple, PyRange, PyDict, PySet,
+// PyString and PyBytes, unwrapping PyIter to its source object. ok is false
+// for iterators, generators and unknown shapes where pre-sizing is unsafe.
+func ListLenHint(v Value) (int, bool) {
+	if v.ptr == nil {
+		return 0, false
+	}
+	if v.ptr == &tagRange {
+		n := int(int64(v.RangeStop()) - int64(v.RangeStart()))
+		return max(n, 0), true
+	}
+	switch v.ptr.Kind {
+	case KindList:
+		return len(v.AsList().Items), true
+	case KindTuple:
+		return len(v.AsTuple().Items), true
+	case KindDict:
+		return v.AsDict().Len(), true
+	case KindSet:
+		return v.AsSet().Len(), true
+	case KindString:
+		return len(v.AsStringObj().Data), true
+	case KindBytes:
+		return len(v.AsBytes().Data), true
+	case KindIter:
+		it := v.AsIter()
+		return ListLenHint(it.Obj)
+	default:
+		return 0, false
+	}
+}
+
 // NewDictVal constructs an empty heap-allocated KindDict Value with initial capacity.
 func NewDictVal(capacity int) Value {
 	obj := &PyDict{
@@ -1086,10 +1137,41 @@ func (v Value) AsCell() *PyCell {
 }
 
 // Append adds a Value to the end of the PyList in a thread-safe manner.
+// The first allocation lands on an 8-slot floor so comprehensions and tight
+// append loops skip the 1 -> 2 -> 4 -> 8 geometric churn.
 func (l *PyList) Append(v Value) {
 	ClearEphemeral(v)
 	l.mu.Lock()
+	if cap(l.Items) == 0 {
+		l.Items = make([]Value, 0, 8)
+	} else if len(l.Items) == cap(l.Items) && cap(l.Items) < 8 {
+		grown := make([]Value, len(l.Items), 8)
+		copy(grown, l.Items)
+		l.Items = grown
+	}
 	l.Items = append(l.Items, v)
+	l.mu.Unlock()
+}
+
+// EnsureCap grows l.Items in one shot so at least n additional slots are
+// available without further allocation. No-op when capacity suffices.
+func (l *PyList) EnsureCap(n int) {
+	if n <= 0 {
+		return
+	}
+	l.mu.Lock()
+	need := len(l.Items) + n
+	if need <= cap(l.Items) {
+		l.mu.Unlock()
+		return
+	}
+	size := max(cap(l.Items), 8)
+	for size < need {
+		size <<= 1
+	}
+	grown := make([]Value, len(l.Items), size)
+	copy(grown, l.Items)
+	l.Items = grown
 	l.mu.Unlock()
 }
 
@@ -2243,7 +2325,8 @@ func (d *PyDict) initTable(minEntries int) {
 	} else if tableCap > 256 {
 		shift = 1
 	}
-	if tableCap == 8 {
+	switch {
+	case tableCap == 8:
 		clear(d.inlineIndices[:])
 		d.indices = d.inlineIndices[:]
 		d.mask = 7
@@ -2251,7 +2334,25 @@ func (d *PyDict) initTable(minEntries int) {
 		if cap(d.Entries) < len(d.inlineEntries) {
 			d.Entries = d.inlineEntries[:0]
 		}
-	} else {
+	case tableCap == 16 && shift == 0 && AcquireDictTable16Hook != nil:
+		d.Header.Flags &^= FlagEphemeralDict | FlagEphemeralFrameDict
+		if entries, indices, ok := AcquireDictTable16Hook(); ok &&
+			cap(entries) == Dict16EntryCap && len(indices) == 16 {
+			d.Entries = entries[:0]
+			d.indices = indices
+			clear(d.indices)
+			d.mask = 15
+			d.indexShift = 0
+		} else {
+			d.indices = make([]byte, 16)
+			d.mask = 15
+			d.indexShift = 0
+			maxDense := Dict16EntryCap
+			if cap(d.Entries) < maxDense {
+				d.Entries = make([]DictEntry, 0, maxDense)
+			}
+		}
+	default:
 		d.Header.Flags &^= FlagEphemeralDict | FlagEphemeralFrameDict
 		d.indices = make([]byte, int(tableCap)<<shift)
 		d.mask = tableCap - 1
@@ -2324,9 +2425,24 @@ func (d *PyDict) resize(minEntries int) {
 	}
 
 	oldEntries := d.Entries
+	oldIndices := d.indices
+	oldIsInline := len(oldEntries) > 0 && &oldEntries[0] == &d.inlineEntries[0]
 	maxDense := int(tableCap) * 2 / 3
-	newEntries := make([]DictEntry, 0, maxDense)
-	d.indices = make([]byte, int(tableCap)<<shift)
+	var newEntries []DictEntry
+	if tableCap == 16 && shift == 0 && AcquireDictTable16Hook != nil {
+		if entries, indices, ok := AcquireDictTable16Hook(); ok &&
+			cap(entries) == Dict16EntryCap && len(indices) == 16 {
+			newEntries = entries[:0]
+			d.indices = indices
+			clear(d.indices)
+		} else {
+			newEntries = make([]DictEntry, 0, maxDense)
+			d.indices = make([]byte, int(tableCap)<<shift)
+		}
+	} else {
+		newEntries = make([]DictEntry, 0, maxDense)
+		d.indices = make([]byte, int(tableCap)<<shift)
+	}
 	d.mask = tableCap - 1
 	d.indexShift = shift
 	d.used = 0
@@ -2350,6 +2466,12 @@ func (d *PyDict) resize(minEntries int) {
 	}
 	if len(oldEntries) > 0 && &oldEntries[0] == &d.inlineEntries[0] {
 		clear(d.inlineEntries[:])
+	} else if !oldIsInline && ReleaseDictTable16Hook != nil &&
+		len(oldIndices) == 16 && cap(oldEntries) == Dict16EntryCap &&
+		tableCap != 16 {
+		clear(oldEntries[:cap(oldEntries)])
+		clear(oldIndices)
+		ReleaseDictTable16Hook(oldEntries[:0], oldIndices)
 	}
 	d.Entries = newEntries
 }
@@ -2418,6 +2540,56 @@ func (d *PyDict) ResetMediumForPool() {
 	d.VersionTag = 0
 	d.Header.Flags &^= FlagEphemeralDict | FlagEphemeralFrameDict
 }
+
+// Dict16EntryCap is the dense-entry capacity of a 16-slot table
+// (16 * 2 / 3 truncated). Dicts with 6-10 entries live here after growing
+// past the 5-entry inline store.
+const Dict16EntryCap = 10
+
+// IsDict16Poolable reports whether d holds a 16-slot table with no external
+// owner for 16-entry freelist reuse.
+func (d *PyDict) IsDict16Poolable() bool {
+	return d.owner == nil && len(d.indices) == 16 && cap(d.Entries) == Dict16EntryCap
+}
+
+// InitDict16Table prepares a pooled 16-slot PyDict for reuse.
+func (d *PyDict) InitDict16Table() {
+	clear(d.indices)
+	d.mask = 15
+	d.indexShift = 0
+	d.used = 0
+	d.filled = 0
+	d.Entries = d.Entries[:0]
+}
+
+// ResetDict16ForPool zeroes entries/indices while retaining the 16-slot table.
+// Clearing the Value slots keeps pooled slabs invisible to the collector,
+// which matters for GODEBUG=gccheckmark=1.
+func (d *PyDict) ResetDict16ForPool() {
+	if cap(d.Entries) > 0 {
+		clear(d.Entries[:cap(d.Entries)])
+		d.Entries = d.Entries[:0]
+	}
+	if len(d.indices) > 0 {
+		clear(d.indices)
+	}
+	d.mask = 0
+	d.used = 0
+	d.filled = 0
+	d.indexShift = 0
+	d.VersionTag = 0
+	d.Header.Flags &^= FlagEphemeralDict | FlagEphemeralFrameDict
+}
+
+// AcquireDictTable16Hook, when set, returns a cleared 16-slot table slab:
+// entries with len 0 cap Dict16EntryCap and indices with len 16. The VM
+// registers a per-VM pool; val falls back to make when the hook is nil or
+// reports a miss. Guarded by !MultiThreadedFlag.Load() by the provider.
+var AcquireDictTable16Hook func() (entries []DictEntry, indices []byte, ok bool)
+
+// ReleaseDictTable16Hook, when set, accepts a cleared 16-slot table slab for
+// reuse. Providers must clear Value slots before retaining.
+var ReleaseDictTable16Hook func(entries []DictEntry, indices []byte)
 
 // Set inserts or updates a key-value pair in PyDict while preserving insertion order
 // and keeping the first-inserted key on value updates (Python dict invariant) in a thread-safe manner.
@@ -3308,6 +3480,10 @@ func FormatValueCtx(ctx *ExecContext, v Value, spec string, conversion uint8) Va
 	case v.IsFloat64():
 		return NewStringVal(FormatFloatSpecCtx(ctx, v.AsFloat64(), spec))
 	case v.IsAnyString():
+		var vbuf [7]byte
+		if vb := v.AsBytesScratch(&vbuf); vb != nil {
+			return NewStringVal(FormatStrSpecCtx(ctx, unsafe.String(unsafe.SliceData(vb), len(vb)), spec))
+		}
 		return NewStringVal(FormatStrSpecCtx(ctx, v.AsString(), spec))
 	}
 	return RaiseTypeError(ctx, "unsupported format string passed to "+v.Type().Name+".__format__")

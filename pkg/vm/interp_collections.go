@@ -436,10 +436,15 @@ func (vm *VM) opFormatValue(st *loopState, inst uint32, ip, sp int) (int, int, l
 	conversion := uint8(inst >> 16)
 	hasSpec := uint16(inst) != 0
 	var specStr string
+	var specBuf [7]byte
 	if hasSpec {
 		specVal := stack[sp-1]
 		sp--
-		specStr = specVal.AsString()
+		if sb := specVal.AsBytesScratch(&specBuf); sb != nil {
+			specStr = unsafe.String(unsafe.SliceData(sb), len(sb))
+		} else {
+			specStr = specVal.AsString()
+		}
 	}
 	valToFormat := stack[sp-1]
 	if conversion == 0 && (valToFormat.IsInt64() || valToFormat.IsAnyString() || valToFormat.IsFloat64()) {
@@ -479,9 +484,14 @@ func (vm *VM) opBuildString(st *loopState, inst uint32, ip, sp int) (int, int, l
 		var ok bool
 		vm.strScratch, ok = val.AppendValueBytes(vm.strScratch, stack[sp+i])
 		if !ok {
-			s := stack[sp+i].AsString()
-			view := unsafe.Slice(unsafe.StringData(s), len(s))
-			vm.strScratch = append(vm.strScratch, view...)
+			var sbuf [7]byte
+			if sb := stack[sp+i].AsBytesScratch(&sbuf); sb != nil {
+				vm.strScratch = append(vm.strScratch, sb...)
+			} else {
+				s := stack[sp+i].AsString()
+				view := unsafe.Slice(unsafe.StringData(s), len(s))
+				vm.strScratch = append(vm.strScratch, view...)
+			}
 		}
 	}
 	stack[sp] = val.NewStringVal(string(vm.strScratch))
@@ -770,6 +780,14 @@ func (vm *VM) opListToSet(st *loopState, ip, sp int) (int, int, loopCtl) {
 func (vm *VM) opBuildList(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
 	count := int(uint16(inst))
+	if count == 0 {
+		// Leave Items nil: the first append allocates the 8-slot floor,
+		// or the hinted capacity directly when the source length is known.
+		stack[sp] = val.NewListVal()
+		sp++
+		ip++
+		return ip, sp, ctlNext
+	}
 	items := make([]val.Value, count)
 	copy(items, stack[sp-count:sp])
 	for i := range items {
@@ -784,6 +802,26 @@ func (vm *VM) opBuildList(st *loopState, inst uint32, ip, sp int) (int, int, loo
 	return ip, sp, ctlNext
 }
 
+// listAppendHint scans the stack window between a comprehension target list
+// and the appended item for a known-length iterable (post-GET_ITER iterator
+// or range) and reports its length for one-shot pre-sizing.
+func listAppendHint(stack []val.Value, sp, depth int) (int, bool) {
+	lo := max(sp-depth+1, 0)
+	hi := sp
+	if hi < lo {
+		return 0, false
+	}
+	if hi-lo > 8 {
+		lo = hi - 8
+	}
+	for i := lo; i < hi; i++ {
+		if n, ok := val.ListLenHint(stack[i]); ok && n >= 0 && n <= 1<<20 {
+			return n, true
+		}
+	}
+	return 0, false
+}
+
 //go:noinline
 func (vm *VM) opListAppend(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
@@ -794,7 +832,13 @@ func (vm *VM) opListAppend(st *loopState, inst uint32, ip, sp int) (int, int, lo
 	val.ClearEphemeral(item)
 	val.DetachStringBuf(item)
 	markViewEscaped(item)
-	listVal.AsList().Append(item)
+	lst := listVal.AsList()
+	if len(lst.Items) == 0 {
+		if n, ok := listAppendHint(stack, sp, depth); ok && n > cap(lst.Items) {
+			lst.EnsureCap(n)
+		}
+	}
+	lst.Append(item)
 	ip++
 	return ip, sp, ctlNext
 }

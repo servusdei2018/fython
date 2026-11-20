@@ -780,6 +780,7 @@ type VM struct {
 	superFreeList        []*val.PySuper
 	dictFreeList         []*val.PyDict
 	mediumDictFreeList   []*val.PyDict
+	dict16FreeList       []*val.PyDict
 	strJoinPool          []*strJoinState
 	collectPool          []*collectState
 	loopStatePool        []*loopState
@@ -1506,6 +1507,60 @@ func init() {
 			standaloneVMPool.Put(v)
 		}
 	}
+	val.AcquireDictTable16Hook = acquireDictTable16
+	val.ReleaseDictTable16Hook = releaseDictTable16
+}
+
+// dictTable16Slab pairs a cleared 16-slot index table with its dense entry
+// slice so growing past the 5-entry inline store reuses both arrays at once.
+type dictTable16Slab struct {
+	entries []val.DictEntry
+	indices []byte
+}
+
+var dictTable16Pool struct {
+	mu   sync.Mutex
+	free []dictTable16Slab
+}
+
+// acquireDictTable16 returns a pooled 16-slot table or reports a miss.
+// Single-threaded use only; multi-threaded runs bypass pooling entirely.
+func acquireDictTable16() ([]val.DictEntry, []byte, bool) {
+	if val.MultiThreadedFlag.Load() {
+		return nil, nil, false
+	}
+	dictTable16Pool.mu.Lock()
+	n := len(dictTable16Pool.free)
+	if n == 0 {
+		dictTable16Pool.mu.Unlock()
+		return nil, nil, false
+	}
+	slab := dictTable16Pool.free[n-1]
+	dictTable16Pool.free[n-1] = dictTable16Slab{}
+	dictTable16Pool.free = dictTable16Pool.free[:n-1]
+	dictTable16Pool.mu.Unlock()
+	if cap(slab.entries) != val.Dict16EntryCap || len(slab.indices) != 16 {
+		return nil, nil, false
+	}
+	return slab.entries[:0], slab.indices, true
+}
+
+// releaseDictTable16 returns cleared 16-slot tables to the pool. Value slots
+// are zeroed so pooled slabs stay invisible to the collector.
+func releaseDictTable16(entries []val.DictEntry, indices []byte) {
+	if val.MultiThreadedFlag.Load() {
+		return
+	}
+	if cap(entries) != val.Dict16EntryCap || len(indices) != 16 {
+		return
+	}
+	clear(entries[:cap(entries)])
+	clear(indices)
+	dictTable16Pool.mu.Lock()
+	if len(dictTable16Pool.free) < 64 {
+		dictTable16Pool.free = append(dictTable16Pool.free, dictTable16Slab{entries: entries[:0], indices: indices})
+	}
+	dictTable16Pool.mu.Unlock()
 }
 
 // UnhandledException returns the uncaught Python exception from the most recent execution, or NoneVal.
