@@ -9,7 +9,7 @@ import (
 //go:noinline
 func (vm *VM) opStoreFastView(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
-	locals := (*[256]val.Value)(unsafe.Pointer(&stack[st.base]))
+	locals := stack[st.base:]
 	bx := uint16(inst)
 	sp--
 	valToStore := stack[sp]
@@ -214,7 +214,7 @@ func (vm *VM) opStoreName(st *loopState, inst uint32, ip, sp int) (int, int, loo
 //go:noinline
 func (vm *VM) opFastStreamWriteLocalConst(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
-	locals := (*[256]val.Value)(unsafe.Pointer(&stack[st.base]))
+	locals := stack[st.base:]
 	localIdx := uint8(inst >> 16)
 	constIdx := uint16(inst)
 	receiver := locals[localIdx]
@@ -302,7 +302,7 @@ func (vm *VM) opFastStreamWriteLocalConst(st *loopState, inst uint32, ip, sp int
 //go:noinline
 func (vm *VM) opDeleteFast(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
-	locals := (*[256]val.Value)(unsafe.Pointer(&stack[st.base]))
+	locals := stack[st.base:]
 	reg := uint16(inst)
 	if reg < 256 {
 		if vm.hasTrackedViews {

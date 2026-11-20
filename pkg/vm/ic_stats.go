@@ -263,6 +263,7 @@ var icKindNames = [...]string{
 	ICKindClassFunc:          "ClassFunc",
 	ICKindTupleGetter:        "TupleGetter",
 	ICKindTypeAttr:           "TypeAttr",
+	ICKindTypeMethod:         "TypeMethod",
 	ICKindSuperMethod:        "SuperMethod",
 	ICKindPropertySet:        "PropertySet",
 	ICKindInstanceTransition: "InstanceTransition",

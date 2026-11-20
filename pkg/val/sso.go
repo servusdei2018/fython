@@ -304,9 +304,61 @@ func StringContains(container, item Value) bool {
 	return bytes.Contains(valueStringBytes(container, &bufA), valueStringBytes(item, &bufB))
 }
 
+// ContainsSeqOrStrFast checks containment for plain strings and small (<= 8) plain
+// tuples/lists of scalars/strings. ok is false when full CompareSlow is required.
+//
+//go:noinline
+func ContainsSeqOrStrFast(a, b Value) (found bool, ok bool) {
+	aIsStr := a.IsInlineStr() || (a.IsString() && a.AsStringObj().Header.Type == StrType)
+	if aIsStr && (b.IsInlineStr() || (b.IsString() && b.AsStringObj().Header.Type == StrType)) {
+		return StringContains(b, a), true
+	}
+	if !aIsStr && !a.IsInt64() {
+		return false, false
+	}
+	var seqItems []Value
+	if b.IsTuple() && b.HeaderPtr().Type == TupleType {
+		seqItems = b.AsTuple().Items
+	} else if b.IsList() && b.HeaderPtr().Type == ListType {
+		seqItems = b.AsList().Items
+	}
+	if len(seqItems) == 0 || len(seqItems) > 8 {
+		return false, len(seqItems) == 0 && (b.HeaderPtr() != nil && (b.HeaderPtr().Type == TupleType || b.HeaderPtr().Type == ListType))
+	}
+	allExact := true
+	for _, it := range seqItems {
+		if a == it {
+			return true, true
+		}
+		if aIsStr && (it.IsInlineStr() || (it.IsString() && it.AsStringObj().Header.Type == StrType)) {
+			if StringEquals(a, it) {
+				return true, true
+			}
+			continue
+		}
+		if (!a.IsInt64() || !it.IsInt64()) && (!aIsStr || (!it.IsNone() && !it.IsInt64())) {
+			allExact = false
+		}
+	}
+	return false, allExact
+}
+
 // IsInlineStrASCII reports whether v is a KindInlineStr containing only ASCII bytes (< 0x80).
 func IsInlineStrASCII(v Value) bool {
 	return v.ptr == &tagInlineStr && (v.num&0x8080808080808000) == 0
+}
+
+// InlineByteCharVal packs a single byte into a KindInlineStr Value with 0 allocations.
+func InlineByteCharVal(b byte) Value {
+	return Value{num: 1 | (uint64(b) << 8), ptr: &tagInlineStr}
+}
+
+// RuneVal returns a 1-rune Python string Value, zero-alloc for ASCII runes.
+func RuneVal(r rune) Value {
+	if uint32(r) < 0x80 {
+		return InlineByteCharVal(byte(r))
+	}
+	return NewStringVal(string(r))
 }
 
 // SliceInlineStrASCII returns the byte slice [start:stop] of an ASCII KindInlineStr directly

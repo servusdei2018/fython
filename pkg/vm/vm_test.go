@@ -6,6 +6,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/servusdei2018/fython/pkg/val"
 )
@@ -1287,4 +1288,314 @@ func TestConcurrentTier2Execution(t *testing.T) {
 		})
 	}
 	wg.Wait()
+}
+
+func TestCompactSuperinstructionFusionAndDeopt(t *testing.T) {
+	// Exercises OP_LOAD_CONST+OP_POP_TOP->OP_JUMP, OP_LOAD_FAST_2, OP_LOAD_FAST_CONST,
+	// OP_STORE_LOAD_FAST, OP_COMPARE_JUMP_IF_FALSE/TRUE, OP_CMP_CONST_JUMP_IF_FALSE/TRUE,
+	// OP_POP_LOAD_FAST, OP_SUBSCR_FAST_FAST, OP_SUBSCR_FAST_CONST, OP_RETURN_CONST, OP_RETURN_FAST.
+	consts := []val.Value{
+		val.NewStringVal("docstring"), // 0
+		val.Int64Val(10),              // 1
+		val.Int64Val(20),              // 2
+		val.NoneVal(),                 // 3
+		val.Int64Val(0),               // 4
+		val.Int64Val(99),              // 5
+		val.NewStringVal("k"),         // 6
+	}
+	code := []uint32{
+		/* 00 */ Encode(OP_LOAD_CONST, 0, 0),
+		/* 01 */ Encode(OP_POP_TOP, 0, 0),
+		/* 02 */ Encode(OP_LOAD_CONST, 0, 1),
+		/* 03 */ Encode(OP_STORE_FAST, 0, 0), // local[0] = 10
+		/* 04 */ Encode(OP_LOAD_FAST, 0, 0),
+		/* 05 */ Encode(OP_LOAD_CONST, 0, 3),
+		/* 06 */ Encode(OP_COMPARE_OP, CMP_IS_NOT, 0),
+		/* 07 */ Encode(OP_JUMP_IF_FALSE, 0, 22),
+		/* 08 */ Encode(OP_LOAD_FAST, 0, 0),
+		/* 09 */ Encode(OP_LOAD_CONST, 0, 2),
+		/* 10 */ Encode(OP_BINARY_ADD, 0, 0),
+		/* 11 */ Encode(OP_POP_TOP, 0, 0),
+		/* 12 */ Encode(OP_LOAD_CONST, 0, 2),
+		/* 13 */ Encode(OP_STORE_FAST, 0, 1), // local[1] = 20
+		/* 14 */ Encode(OP_LOAD_FAST, 0, 1),
+		/* 15 */ Encode(OP_LOAD_FAST, 0, 0),
+		/* 16 */ Encode(OP_COMPARE_OP, CMP_GT, 0),
+		/* 17 */ Encode(OP_JUMP_IF_TRUE, 0, 24),
+		/* 18 */ Encode(OP_LOAD_FAST, 0, 0),
+		/* 19 */ Encode(OP_LOAD_FAST, 0, 1),
+		/* 20 */ Encode(OP_COMPARE_LT, 0, 0),
+		/* 21 */ Encode(OP_JUMP_IF_FALSE, 0, 24),
+		/* 22 */ Encode(OP_LOAD_CONST, 0, 4),
+		/* 23 */ Encode(OP_RETURN, 0, 0),
+		/* 24 */ Encode(OP_LOAD_FAST, 0, 1),
+		/* 25 */ Encode(OP_RETURN, 0, 0),
+	}
+	co := &CodeObject{Code: code, Consts: consts, NumLocals: 2}
+	co.Init()
+	OptimizeCodeObject(co)
+	fused := co.Active()
+
+	if co.EntryIP != 2 {
+		t.Fatalf("expected co.EntryIP == 2 for docstring prologue, got %d", co.EntryIP)
+	}
+	if DecodeOpcode(fused[0]) != OP_LOAD_CONST || DecodeOpcode(fused[1]) != OP_POP_TOP {
+		t.Fatalf("expected untouched docstring prologue at 0..1 when EntryIP==2, got %v, %v", DecodeOpcode(fused[0]), DecodeOpcode(fused[1]))
+	}
+	if DecodeOpcode(fused[2]) != OP_LOAD_CONST {
+		t.Fatalf("expected OP_LOAD_CONST at 2 (jump target boundary preserved), got %v", DecodeOpcode(fused[2]))
+	}
+	if DecodeOpcode(fused[3]) != OP_STORE_LOAD_FAST {
+		t.Fatalf("expected OP_STORE_LOAD_FAST at 3, got %v", DecodeOpcode(fused[3]))
+	}
+	if DecodeOpcode(fused[5]) != OP_CMP_CONST_JUMP_IF_FALSE {
+		t.Fatalf("expected OP_CMP_CONST_JUMP_IF_FALSE at 5, got %v", DecodeOpcode(fused[5]))
+	}
+	if DecodeOpcode(fused[8]) != OP_LOAD_FAST_CONST {
+		t.Fatalf("expected OP_LOAD_FAST_CONST at 8, got %v", DecodeOpcode(fused[8]))
+	}
+	if DecodeOpcode(fused[13]) != OP_STORE_LOAD_FAST {
+		t.Fatalf("expected OP_STORE_LOAD_FAST at 13, got %v", DecodeOpcode(fused[13]))
+	}
+	if DecodeOpcode(fused[16]) != OP_COMPARE_JUMP_IF_TRUE {
+		t.Fatalf("expected OP_COMPARE_JUMP_IF_TRUE at 16, got %v", DecodeOpcode(fused[16]))
+	}
+	if DecodeOpcode(fused[18]) != OP_LOAD_FAST_2 {
+		t.Fatalf("expected OP_LOAD_FAST_2 at 18, got %v", DecodeOpcode(fused[18]))
+	}
+	if DecodeOpcode(fused[20]) != OP_COMPARE_JUMP_IF_FALSE {
+		t.Fatalf("expected OP_COMPARE_JUMP_IF_FALSE at 20, got %v", DecodeOpcode(fused[20]))
+	}
+	if DecodeOpcode(fused[22]) != OP_RETURN_CONST {
+		t.Fatalf("expected OP_RETURN_CONST at 22, got %v", DecodeOpcode(fused[22]))
+	}
+	if DecodeOpcode(fused[24]) != OP_RETURN_FAST {
+		t.Fatalf("expected OP_RETURN_FAST at 24, got %v", DecodeOpcode(fused[24]))
+	}
+
+	v := NewVM()
+	res := v.RunCode(co)
+	if !res.IsInt64() || res.AsInt64() != 20 {
+		t.Fatalf("expected 20, got %v", res)
+	}
+
+	// Verify deoptInst restores exact original instructions for every fused slot.
+	st := &loopState{curCO: co, codePtr: unsafe.Pointer(unsafe.SliceData(fused)), codeLen: len(fused)}
+	for _, idx := range []int{3, 5, 8, 13, 16, 18, 20, 22, 24} {
+		ptr := v.deoptInst(st, idx, fused[idx])
+		cur := unsafe.Slice((*uint32)(ptr), len(code))
+		want := code[idx]
+		if idx == 20 {
+			want = Encode(OP_COMPARE_OP, CMP_LT, 0)
+		}
+		if cur[idx] != want {
+			t.Fatalf("deoptInst at %d did not restore original word: got %#x want %#x", idx, cur[idx], want)
+		}
+	}
+}
+
+func TestSuperinstructionMultilineTracebackAndSubscr(t *testing.T) {
+	// Verify LineAt maps faults inside fused 2-op and 3-op superinstructions to the exact sub-op line.
+	v := NewVM()
+	d := val.NewDictVal(0)
+	d.AsDict().Set(val.NewStringVal("ok"), val.Int64Val(42))
+	consts := []val.Value{
+		d,                         // 0
+		val.NewStringVal("ok"),    // 1
+		val.NewStringVal("miss"),  // 2
+		val.NewStringVal("undef"), // 3
+	}
+
+	// Case 1: OP_SUBSCR_FAST_CONST (LOAD_FAST line 10, LOAD_CONST line 10, BINARY_SUBSCR line 11)
+	codeSubscr := []uint32{
+		Encode(OP_LOAD_CONST, 0, 0),
+		Encode(OP_STORE_FAST, 0, 0),
+		Encode(OP_NOP, 0, 0),
+		Encode(OP_LOAD_FAST, 0, 0),
+		Encode(OP_LOAD_CONST, 0, 2),
+		Encode(OP_BINARY_SUBSCR, 0, 0),
+		Encode(OP_RETURN, 0, 0),
+	}
+	coSubscr := &CodeObject{
+		Code:      codeSubscr,
+		Consts:    consts,
+		NumLocals: 1,
+		Name:      "subscr_fn",
+		FileName:  "test.py",
+		LineSpans: []LineSpanEntry{
+			{StartIP: 0, EndIP: 5, Line: 10},
+			{StartIP: 5, EndIP: 7, Line: 11},
+		},
+	}
+	coSubscr.Init()
+	OptimizeCodeObject(coSubscr)
+	if DecodeOpcode(coSubscr.Active()[3]) != OP_SUBSCR_FAST_CONST {
+		t.Fatalf("expected OP_SUBSCR_FAST_CONST, got %v", DecodeOpcode(coSubscr.Active()[3]))
+	}
+	_ = v.RunCode(coSubscr)
+	if v.unhandledException.IsNone() {
+		t.Fatal("expected KeyError from OP_SUBSCR_FAST_CONST")
+	}
+	tb, _ := v.unhandledException.AsInstance().GetAttr(nameTraceback)
+	if tb.IsNone() || tb.AsTraceback().LineNo != 11 {
+		t.Fatalf("expected traceback line 11 for OP_BINARY_SUBSCR fault, got %v", tb)
+	}
+
+	// Case 2: OP_LOAD_FAST_ATTR on __slots__, @property, and multiline AttributeError fault
+	codeAttr := []uint32{
+		Encode(OP_LOAD_CONST, 0, 0),
+		Encode(OP_STORE_FAST, 0, 0),
+		Encode(OP_NOP, 0, 0),
+		Encode(OP_LOAD_FAST, 0, 0), // line 20
+		Encode(OP_LOAD_ATTR, 0, 2), // line 21 ('miss')
+		Encode(OP_RETURN, 0, 0),
+	}
+	coAttr := &CodeObject{
+		Code:      codeAttr,
+		Consts:    consts,
+		NumLocals: 1,
+		Name:      "attr_fn",
+		FileName:  "test.py",
+		LineSpans: []LineSpanEntry{
+			{StartIP: 0, EndIP: 4, Line: 20},
+			{StartIP: 4, EndIP: 6, Line: 21},
+		},
+	}
+	coAttr.Init()
+	OptimizeCodeObject(coAttr)
+	if DecodeOpcode(coAttr.Active()[3]) != OP_LOAD_FAST_ATTR {
+		t.Fatalf("expected OP_LOAD_FAST_ATTR, got %v", DecodeOpcode(coAttr.Active()[3]))
+	}
+	_ = v.RunCode(coAttr)
+	if v.unhandledException.IsNone() {
+		t.Fatal("expected AttributeError from OP_LOAD_FAST_ATTR")
+	}
+	tbAttr, _ := v.unhandledException.AsInstance().GetAttr(nameTraceback)
+	if tbAttr.IsNone() || tbAttr.AsTraceback().LineNo != 21 {
+		t.Fatalf("expected traceback line 21 for OP_LOAD_ATTR fault, got %v", tbAttr)
+	}
+}
+
+func TestSuperinstructionReloadCodeCompareDunder(t *testing.T) {
+	// Verify reloadCode preserves pre-Tier-2 OP_COMPARE_DUNDER quickening when
+	// OptimizeCodeObject fuses OP_COMPARE_OP + OP_JUMP_IF_FALSE or
+	// OP_LOAD_CONST + OP_COMPARE_OP + OP_JUMP_IF_FALSE.
+	code := []uint32{
+		/* 00 */ Encode(OP_LOAD_FAST, 0, 0),
+		/* 01 */ Encode(OP_LOAD_FAST, 0, 1),
+		/* 02 */ Encode(OP_COMPARE_OP, CMP_LT, 0),
+		/* 03 */ Encode(OP_JUMP_IF_FALSE, 0, 11),
+		/* 04 */ Encode(OP_LOAD_FAST, 0, 0),
+		/* 05 */ Encode(OP_NOP, 0, 0),
+		/* 06 */ Encode(OP_LOAD_CONST, 0, 0),
+		/* 07 */ Encode(OP_COMPARE_OP, CMP_EQ, 0),
+		/* 08 */ Encode(OP_JUMP_IF_FALSE, 0, 11),
+		/* 09 */ Encode(OP_LOAD_CONST, 0, 1),
+		/* 10 */ Encode(OP_RETURN, 0, 0),
+		/* 11 */ Encode(OP_LOAD_CONST, 0, 0),
+		/* 12 */ Encode(OP_RETURN, 0, 0),
+	}
+	co := &CodeObject{
+		Code:      code,
+		Consts:    []val.Value{val.NoneVal(), val.Int64Val(1)},
+		NumLocals: 2,
+	}
+	co.Init()
+
+	v := NewVM()
+	cache := v.cacheFor(co)
+	cache.active = append([]uint32(nil), co.Code...)
+	cache.privateActive = true
+	cache.active[2] = ReplaceOpcode(code[2], OP_COMPARE_DUNDER)
+	cache.active[7] = ReplaceOpcode(code[7], OP_COMPARE_DUNDER)
+
+	OptimizeCodeObject(co)
+	reloaded := reloadCode(co, cache, co.StreamGen)
+
+	if DecodeOpcode(reloaded[2]) != OP_COMPARE_DUNDER || DecodeOpcode(reloaded[3]) != OP_JUMP_IF_FALSE || DecodeArgBx(reloaded[3]) != 11 {
+		t.Fatalf("expected OP_COMPARE_DUNDER + OP_JUMP_IF_FALSE 11 at 2..3, got %v + %v(%d)",
+			DecodeOpcode(reloaded[2]), DecodeOpcode(reloaded[3]), DecodeArgBx(reloaded[3]))
+	}
+	if DecodeOpcode(reloaded[6]) != OP_LOAD_CONST || DecodeOpcode(reloaded[7]) != OP_COMPARE_DUNDER ||
+		DecodeOpcode(reloaded[8]) != OP_JUMP_IF_FALSE || DecodeArgBx(reloaded[8]) != 11 {
+		t.Fatalf("expected LOAD_CONST + COMPARE_DUNDER + JUMP_IF_FALSE 11 at 6..8, got %v + %v + %v(%d)",
+			DecodeOpcode(reloaded[6]), DecodeOpcode(reloaded[7]), DecodeOpcode(reloaded[8]), DecodeArgBx(reloaded[8]))
+	}
+}
+
+func TestEntryIPBytecodeAndGuards(t *testing.T) {
+	// Backward jump targeting ip=0 must keep EntryIP == 0.
+	loopCO := &CodeObject{
+		Code: []uint32{
+			Encode(OP_LOAD_CONST, 0, 0),
+			Encode(OP_POP_TOP, 0, 0),
+			Encode(OP_JUMP, 0, 0),
+			Encode(OP_RETURN, 0, 0),
+		},
+		Consts: []val.Value{val.NewStringVal("x")},
+	}
+	loopCO.Init()
+	if loopCO.EntryIP != 0 {
+		t.Fatalf("expected EntryIP == 0 when ip=0 is a jump target, got %d", loopCO.EntryIP)
+	}
+
+	// Exception table covering ip=0 must keep EntryIP == 0.
+	excCO := &CodeObject{
+		Code: []uint32{
+			Encode(OP_LOAD_CONST, 0, 0),
+			Encode(OP_POP_TOP, 0, 0),
+			Encode(OP_RETURN_CONST, 0, 0),
+		},
+		Consts:         []val.Value{val.NoneVal()},
+		ExceptionTable: []ExceptionEntry{{StartIP: 0, EndIP: 2, TargetIP: 2}},
+	}
+	excCO.Init()
+	if excCO.EntryIP != 0 {
+		t.Fatalf("expected EntryIP == 0 when exception entry starts at 0, got %d", excCO.EntryIP)
+	}
+
+	// Docstring prologue with no jump/exception targets sets EntryIP == 2 and skips 0..1.
+	docCO := &CodeObject{
+		Code: []uint32{
+			Encode(OP_LOAD_CONST, 0, 0),
+			Encode(OP_POP_TOP, 0, 0),
+			Encode(OP_LOAD_CONST, 0, 1),
+			Encode(OP_RETURN, 0, 0),
+		},
+		Consts: []val.Value{val.NewStringVal("doc"), val.Int64Val(99)},
+	}
+	docCO.Init()
+	if docCO.EntryIP != 2 {
+		t.Fatalf("expected EntryIP == 2, got %d", docCO.EntryIP)
+	}
+	v := NewVM()
+	if got := v.RunCode(docCO); !got.IsInt64() || got.AsInt64() != 99 {
+		t.Fatalf("RunCode(docCO) = %v, want 99", got)
+	}
+}
+
+func TestUnpack2And3FastFusion(t *testing.T) {
+	code := []uint32{
+		Encode(OP_LOAD_FAST, 0, 0),
+		Encode(OP_UNPACK_SEQUENCE, 0, 2),
+		Encode(OP_STORE_FAST, 0, 1),
+		Encode(OP_STORE_FAST, 0, 2),
+		Encode(OP_LOAD_FAST, 0, 3),
+		Encode(OP_UNPACK_SEQUENCE, 0, 3),
+		Encode(OP_STORE_FAST, 0, 4),
+		Encode(OP_STORE_FAST, 0, 5),
+		Encode(OP_STORE_FAST, 0, 6),
+		Encode(OP_LOAD_FAST, 0, 6),
+		Encode(OP_RETURN, 0, 0),
+	}
+	co := &CodeObject{Code: code, NumLocals: 7}
+	co.Init()
+	OptimizeCodeObject(co)
+	fused := co.Active()
+	if DecodeOpcode(fused[1]) != OP_UNPACK_2_FAST {
+		t.Fatalf("expected OP_UNPACK_2_FAST at 1, got %v", DecodeOpcode(fused[1]))
+	}
+	if DecodeOpcode(fused[5]) != OP_UNPACK_3_FAST {
+		t.Fatalf("expected OP_UNPACK_3_FAST at 5, got %v", DecodeOpcode(fused[5]))
+	}
 }

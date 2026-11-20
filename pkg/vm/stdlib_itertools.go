@@ -34,20 +34,13 @@ func (e *Engine) createItertoolsModule() val.Value {
 			ctx.Raise(val.NewException(val.TypeErrorType, "repeat() takes at least 1 argument"))
 			return val.NoneVal()
 		}
-		obj := args[0]
-		hasTimes := len(args) > 1 && args[1].IsInt64()
-		times := int64(0)
-		if hasTimes {
-			times = args[1].AsInt64()
-		}
-		count := int64(0)
-		return val.NewIterValWithNext(func() (val.Value, bool) {
-			if hasTimes && count >= times {
-				return val.NoneVal(), false
+		times := int64(-1)
+		if len(args) > 1 && !args[1].IsNone() {
+			if args[1].IsInt64() {
+				times = max(args[1].AsInt64(), 0)
 			}
-			count++
-			return obj, true
-		})
+		}
+		return val.NewRepeatIterVal(args[0], times)
 	}))
 
 	// 3. cycle(iterable)
@@ -82,45 +75,22 @@ func (e *Engine) createItertoolsModule() val.Value {
 	// 4. chain(*iterables) & chain.from_iterable(iterable)
 	chainType := val.MustNewType("chain", []*val.PyType{val.ObjectType}, nil)
 	chainType.Slots.TpCall = func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		iters := make([]*val.PyIter, len(args))
-		for i, a := range args {
-			iters[i] = iterFor(ctx, a)
-		}
-		curIdx := 0
-		return val.NewIterValWithNext(func() (val.Value, bool) {
-			for curIdx < len(iters) {
-				v, ok := iters[curIdx].Next()
-				if ok {
-					return v, true
-				}
-				curIdx++
-			}
-			return val.NoneVal(), false
-		})
+		iterables := make([]val.Value, len(args))
+		copy(iterables, args)
+		return val.NewChainIterVal(iterables)
 	}
 	chainType.Dict.Set(val.InternString("from_iterable"), val.NewBuiltinFuncVal("from_iterable", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
 			ctx.Raise(val.NewException(val.TypeErrorType, "from_iterable() takes exactly one argument"))
 			return val.NoneVal()
 		}
-		outerIt := iterFor(ctx, args[0])
-		var curSubIt *val.PyIter
-		return val.NewIterValWithNext(func() (val.Value, bool) {
-			for {
-				if curSubIt != nil {
-					v, ok := curSubIt.Next()
-					if ok {
-						return v, true
-					}
-					curSubIt = nil
-				}
-				subIterable, ok := outerIt.Next()
-				if !ok {
-					return val.NoneVal(), false
-				}
-				curSubIt = iterFor(ctx, subIterable)
-			}
-		})
+		var outer val.Value
+		if args[0].IsGenerator() {
+			outer = args[0]
+		} else {
+			outer = val.ObjectVal(&iterFor(ctx, args[0]).Header)
+		}
+		return val.NewChainFromIterableVal(outer)
 	}))
 	mod.Dict.Set(val.InternString("chain"), val.TypeVal(chainType))
 
@@ -130,7 +100,12 @@ func (e *Engine) createItertoolsModule() val.Value {
 			ctx.Raise(val.NewException(val.TypeErrorType, "islice expected at least 2 arguments"))
 			return val.NoneVal()
 		}
-		it := iterFor(ctx, args[0])
+		var iterObj val.Value
+		if args[0].IsGenerator() {
+			iterObj = args[0]
+		} else {
+			iterObj = val.ObjectVal(&iterFor(ctx, args[0]).Header)
+		}
 		start := int64(0)
 		stop := int64(-1) // -1 means until end / infinite
 		step := int64(1)
@@ -138,13 +113,25 @@ func (e *Engine) createItertoolsModule() val.Value {
 		if len(args) == 2 {
 			if !args[1].IsNone() && args[1].IsInt64() {
 				stop = args[1].AsInt64()
+				if stop < 0 {
+					ctx.Raise(val.NewException(val.ValueErrorType, "Stop argument for islice() must be None or an integer: 0 <= x <= sys.maxsize."))
+					return val.NoneVal()
+				}
 			}
 		} else {
 			if !args[1].IsNone() && args[1].IsInt64() {
 				start = args[1].AsInt64()
+				if start < 0 {
+					ctx.Raise(val.NewException(val.ValueErrorType, "Indices for islice() must be None or an integer: 0 <= x <= sys.maxsize."))
+					return val.NoneVal()
+				}
 			}
 			if !args[2].IsNone() && args[2].IsInt64() {
 				stop = args[2].AsInt64()
+				if stop < 0 {
+					ctx.Raise(val.NewException(val.ValueErrorType, "Stop argument for islice() must be None or an integer: 0 <= x <= sys.maxsize."))
+					return val.NoneVal()
+				}
 			}
 			if len(args) > 3 && !args[3].IsNone() && args[3].IsInt64() {
 				step = args[3].AsInt64()
@@ -154,39 +141,7 @@ func (e *Engine) createItertoolsModule() val.Value {
 				}
 			}
 		}
-
-		curIdx := int64(0)
-		// Advance to start
-		for curIdx < start {
-			_, ok := it.Next()
-			if !ok {
-				return val.NewIterValWithNext(func() (val.Value, bool) { return val.NoneVal(), false })
-			}
-			curIdx++
-		}
-
-		return val.NewIterValWithNext(func() (val.Value, bool) {
-			if stop >= 0 && curIdx >= stop {
-				return val.NoneVal(), false
-			}
-			v, ok := it.Next()
-			if !ok {
-				return val.NoneVal(), false
-			}
-			curIdx++
-			// Skip step - 1 items
-			for skip := int64(1); skip < step; skip++ {
-				if stop >= 0 && curIdx >= stop {
-					break
-				}
-				_, okSkip := it.Next()
-				if !okSkip {
-					break
-				}
-				curIdx++
-			}
-			return v, true
-		})
+		return val.NewISliceIterVal(iterObj, start, stop, step)
 	}))
 
 	// 6. product(*iterables, repeat=1)

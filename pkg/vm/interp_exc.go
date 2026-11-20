@@ -174,7 +174,8 @@ func (vm *VM) opReturnSlow(st *loopState, ip, sp int, retVal val.Value) (int, in
 		caller.collectState = nil
 		vm.restoreCallerFrame(st, caller)
 		if mode == genModeForIter || mode == genModeYieldFrom || mode == genModeAwait || mode == genModeStrJoin ||
-			mode == genModeCollectList || mode == genModeCollectTuple || mode == genModeCollectSet || mode == genModeListExtend {
+			mode == genModeCollectList || mode == genModeCollectTuple || mode == genModeCollectSet || mode == genModeListExtend ||
+			mode == genModeCollectDict || mode == genModeAny || mode == genModeAll || mode == genModeSum || mode == genModeMin || mode == genModeMax {
 			vm.releaseGenerator(gen)
 		}
 		switch mode {
@@ -188,11 +189,21 @@ func (vm *VM) opReturnSlow(st *loopState, ip, sp int, retVal val.Value) (int, in
 			}
 			st.stack[retSP] = out
 			return callerIP, retSP + 1, ctlReload
-		case genModeCollectList, genModeCollectTuple, genModeCollectSet, genModeListExtend:
+		case genModeCollectList, genModeCollectTuple, genModeCollectSet, genModeListExtend,
+			genModeCollectDict, genModeAny, genModeAll, genModeSum, genModeMin, genModeMax:
 			var out val.Value
 			if cs != nil {
-				out = cs.materialize(mode)
+				if cs.isliceIter != nil && cs.isliceIter.Stop >= 0 {
+					cs.isliceIter.Cur = cs.isliceIter.Stop
+				}
+				var errExc val.Value
+				var ok bool
+				out, errExc, ok = cs.materializeChecked(mode)
 				vm.releaseCollectState(cs)
+				if !ok {
+					st.raiseExc = errExc
+					return callerIP - 1, retSP, ctlRaise
+				}
 			} else {
 				switch mode {
 				case genModeCollectList:
@@ -201,6 +212,20 @@ func (vm *VM) opReturnSlow(st *loopState, ip, sp int, retVal val.Value) (int, in
 					out = val.EmptyTupleVal()
 				case genModeCollectSet:
 					out = val.NewSetVal()
+				case genModeCollectDict:
+					out = val.NewDictVal(0)
+				case genModeAny:
+					out = val.BoolVal(false)
+				case genModeAll:
+					out = val.BoolVal(true)
+				case genModeSum:
+					out = defVal
+				case genModeMin:
+					st.raiseExc = val.NewValueError("min() iterable argument is empty")
+					return callerIP - 1, retSP, ctlRaise
+				case genModeMax:
+					st.raiseExc = val.NewValueError("max() iterable argument is empty")
+					return callerIP - 1, retSP, ctlRaise
 				default:
 					out = val.NoneVal()
 				}

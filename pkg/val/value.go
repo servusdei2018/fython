@@ -93,6 +93,9 @@ const (
 	// FlagEphemeralTuple shares bit 3 on KindTuple for short-lived opBuildTuple
 	// results consumed immediately by OP_CALL_FUNCTION_EX or OP_UNPACK_SEQUENCE.
 	FlagEphemeralTuple uint8 = FlagEphemeralDict
+	// FlagEphemeralMatch shares bit 3 on KindNative/KindInstance MatchType objects
+	// created for short-lived consumers; FlagEphemeralAll clears it via ClearEphemeral.
+	FlagEphemeralMatch uint8 = FlagEphemeralDict
 	// FlagEphemeralAll masks all ephemeral ownership flags cleared when a value
 	// escapes via stack duplication or container/variable storage.
 	FlagEphemeralAll uint8 = FlagEphemeralSuper | FlagEphemeralDict | FlagEphemeralFrameDict | FlagEphemeralCoro | FlagEphemeralGen | FlagEphemeralIter
@@ -946,9 +949,6 @@ func HashValue(v Value) uint32 {
 		v.ptr.Hash = h
 		return h
 	}
-	if v.IsAnyString() {
-		return HashString(v.AsString())
-	}
 	if v.ptr == &tagFloat64 {
 		f := math.Float64frombits(v.num)
 		if f == 0.0 {
@@ -959,70 +959,135 @@ func HashValue(v Value) uint32 {
 	if v.ptr == &tagNone {
 		return 0x4e6f6e65
 	}
+	h, exc, ok := hashValueSlowCtx(nil, v)
+	if !ok {
+		panic(exc)
+	}
+	return h
+}
+
+// TryHashValue computes the 32-bit hash of v without panicking on unhashable
+// types or exceptions raised by custom __hash__ methods.
+func TryHashValue(ctx *ExecContext, v Value) (uint32, Value, bool) {
+	if v.ptr == &tagInt64 || v.ptr == &tagBool {
+		f := float64(int64(v.num))
+		if f == 0.0 {
+			return mix64To32(0), Value{}, true
+		}
+		return mix64To32(math.Float64bits(f)), Value{}, true
+	}
+	if v.ptr == &tagInlineStr {
+		return InlineStrHash(v), Value{}, true
+	}
+	if v.ptr.Kind == KindString {
+		if v.ptr.Hash != 0 {
+			return v.ptr.Hash, Value{}, true
+		}
+		h := HashString((*PyString)(unsafe.Pointer(v.ptr)).Data)
+		v.ptr.Hash = h
+		return h, Value{}, true
+	}
+	if v.ptr == &tagFloat64 {
+		f := math.Float64frombits(v.num)
+		if f == 0.0 {
+			return mix64To32(0), Value{}, true
+		}
+		return mix64To32(v.num), Value{}, true
+	}
+	if v.ptr == &tagNone {
+		return 0x4e6f6e65, Value{}, true
+	}
+	return hashValueSlowCtx(ctx, v)
+}
+
+//go:noinline
+func hashValueSlowCtx(ctx *ExecContext, v Value) (uint32, Value, bool) {
+	if v.IsAnyString() {
+		return HashString(v.AsString()), Value{}, true
+	}
 	if v.ptr.Kind == KindBigInt {
 		bi := &v.AsBigInt().Val
 		if bi.IsInt64() {
 			f := float64(bi.Int64())
 			if f == 0.0 {
-				return mix64To32(0)
+				return mix64To32(0), Value{}, true
 			}
-			return mix64To32(math.Float64bits(f))
+			return mix64To32(math.Float64bits(f)), Value{}, true
 		}
 		f, _ := bi.Float64()
-		return mix64To32(math.Float64bits(f))
+		return mix64To32(math.Float64bits(f)), Value{}, true
 	}
 	if v.ptr.Kind == KindComplex {
-		return hashComplex(v.AsComplex())
+		return hashComplex(v.AsComplex()), Value{}, true
 	}
 	if v.ptr.Kind == KindTuple && (v.ptr.Type == nil || v.ptr.Type == TupleType || v.ptr.Type.dunderHash.ptr == nil) {
 		if v.ptr.Hash != 0 {
-			return v.ptr.Hash
+			return v.ptr.Hash, Value{}, true
 		}
 		items := v.AsTuple().Items
 		var acc uint64 = 0x345678
 		for _, it := range items {
-			acc = (acc ^ uint64(HashValue(it))) * 1000003
+			ih, exc, ok := TryHashValue(ctx, it)
+			if !ok {
+				return 0, exc, false
+			}
+			acc = (acc ^ uint64(ih)) * 1000003
 		}
 		acc ^= uint64(len(items))
 		h := mix64To32(acc)
 		v.ptr.Hash = h
-		return h
+		return h, Value{}, true
 	}
 	if v.ptr.Kind == KindBytes {
 		if v.ptr.Hash != 0 {
-			return v.ptr.Hash
+			return v.ptr.Hash, Value{}, true
 		}
 		h := HashBytes(v.AsBytes().Data)
 		v.ptr.Hash = h
-		return h
+		return h, Value{}, true
 	}
 	tp := v.Type()
 	if tp != nil && tp.dunderHash.ptr != nil {
 		if tp.dunderHash.IsNone() {
-			panic(NewTypeError("unhashable type: '" + tp.Name + "'"))
+			return 0, NewTypeError("unhashable type: '" + tp.Name + "'"), false
 		}
-		var ctx *ExecContext
-		res := ctx.Invoke1(tp.dunderHash, v)
+		callCtx := ctx
+		var release func()
+		if callCtx == nil && AcquireExecContextHook != nil {
+			callCtx, release = AcquireExecContextHook()
+		}
+		res := callCtx.Invoke1(tp.dunderHash, v)
+		if callCtx != nil && callCtx.HasException() {
+			exc := callCtx.ActiveException
+			callCtx.ClearException()
+			if release != nil {
+				release()
+			}
+			return 0, exc, false
+		}
+		if release != nil {
+			release()
+		}
 		if res.ptr == &tagInt64 || res.ptr == &tagBool {
 			f := float64(int64(res.num))
 			if f == 0.0 {
-				return mix64To32(0)
+				return mix64To32(0), Value{}, true
 			}
-			return mix64To32(math.Float64bits(f))
+			return mix64To32(math.Float64bits(f)), Value{}, true
 		}
 		if res.ptr != nil && res.ptr.Kind == KindBigInt {
-			return HashValue(res)
+			return TryHashValue(ctx, res)
 		}
-		panic(NewTypeError("__hash__ method should return an integer"))
+		return 0, NewTypeError("__hash__ method should return an integer"), false
 	}
 	if v.ptr.Kind == KindList || v.ptr.Kind == KindDict || v.ptr.Kind == KindSet || v.ptr.Kind == KindByteArray {
 		typeName := v.Kind().String()
 		if tp != nil {
 			typeName = tp.Name
 		}
-		panic(NewTypeError("unhashable type: '" + typeName + "'"))
+		return 0, NewTypeError("unhashable type: '" + typeName + "'"), false
 	}
-	return mix64To32(uint64(uintptr(unsafe.Pointer(v.ptr))))
+	return mix64To32(uint64(uintptr(unsafe.Pointer(v.ptr)))), Value{}, true
 }
 
 // String returns the Python string representation of Value.

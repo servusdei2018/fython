@@ -96,6 +96,87 @@ func (vm *VM) deoptInst(st *loopState, ip int, inst uint32) unsafe.Pointer {
 		ptr, length = deoptimizeAt(st.curCO, ip, func(c []uint32) {
 			DeoptimizeFastNeg(c, ip, reg)
 		})
+	case OP_COMPARE_JUMP_IF_FALSE, OP_COMPARE_JUMP_IF_TRUE:
+		cmpOp := uint8(inst >> 16)
+		target := uint16(inst)
+		jumpOp := OP_JUMP_IF_FALSE
+		if op == OP_COMPARE_JUMP_IF_TRUE {
+			jumpOp = OP_JUMP_IF_TRUE
+		}
+		ptr, length = deoptimizeAt(st.curCO, ip, func(c []uint32) {
+			c[ip] = Encode(OP_COMPARE_OP, cmpOp, 0)
+			c[ip+1] = Encode(jumpOp, 0, target)
+		})
+	case OP_CMP_CONST_JUMP_IF_FALSE, OP_CMP_CONST_JUMP_IF_TRUE:
+		cmpOp := uint8(inst >> 16)
+		constIdx := uint16(uint8(inst >> 8))
+		target := uint16(ip) + uint16(uint8(inst))
+		jumpOp := OP_JUMP_IF_FALSE
+		if op == OP_CMP_CONST_JUMP_IF_TRUE {
+			jumpOp = OP_JUMP_IF_TRUE
+		}
+		ptr, length = deoptimizeAt(st.curCO, ip, func(c []uint32) {
+			c[ip] = Encode(OP_LOAD_CONST, 0, constIdx)
+			c[ip+1] = Encode(OP_COMPARE_OP, cmpOp, 0)
+			c[ip+2] = Encode(jumpOp, 0, target)
+		})
+	case OP_RETURN_CONST:
+		constIdx := uint16(inst)
+		ptr, length = deoptimizeAt(st.curCO, ip, func(c []uint32) {
+			c[ip] = Encode(OP_LOAD_CONST, 0, constIdx)
+			c[ip+1] = Encode(OP_RETURN, 0, 0)
+		})
+	case OP_RETURN_FAST:
+		reg := uint16(inst)
+		ptr, length = deoptimizeAt(st.curCO, ip, func(c []uint32) {
+			c[ip] = Encode(OP_LOAD_FAST, 0, reg)
+			c[ip+1] = Encode(OP_RETURN, 0, 0)
+		})
+	case OP_LOAD_FAST_CONST:
+		reg := uint16(uint8(inst >> 16))
+		constIdx := uint16(inst)
+		ptr, length = deoptimizeAt(st.curCO, ip, func(c []uint32) {
+			c[ip] = Encode(OP_LOAD_FAST, 0, reg)
+			c[ip+1] = Encode(OP_LOAD_CONST, 0, constIdx)
+		})
+	case OP_LOAD_FAST_2:
+		r1, r2 := uint16(uint8(inst>>8)), uint16(uint8(inst))
+		ptr, length = deoptimizeAt(st.curCO, ip, func(c []uint32) {
+			c[ip] = Encode(OP_LOAD_FAST, 0, r1)
+			c[ip+1] = Encode(OP_LOAD_FAST, 0, r2)
+		})
+	case OP_STORE_LOAD_FAST:
+		dst, srcReg := uint16(uint8(inst>>8)), uint16(uint8(inst))
+		ptr, length = deoptimizeAt(st.curCO, ip, func(c []uint32) {
+			c[ip] = Encode(OP_STORE_FAST, 0, dst)
+			c[ip+1] = Encode(OP_LOAD_FAST, 0, srcReg)
+		})
+	case OP_LOAD_GLOBAL_FAST:
+		gIdx, reg := uint16(uint8(inst>>8)), uint16(uint8(inst))
+		ptr, length = deoptimizeAt(st.curCO, ip, func(c []uint32) {
+			c[ip] = Encode(OP_LOAD_GLOBAL, 0, gIdx)
+			c[ip+1] = Encode(OP_LOAD_FAST, 0, reg)
+		})
+	case OP_POP_LOAD_FAST:
+		reg := uint16(inst)
+		ptr, length = deoptimizeAt(st.curCO, ip, func(c []uint32) {
+			c[ip] = Encode(OP_POP_TOP, 0, 0)
+			c[ip+1] = Encode(OP_LOAD_FAST, 0, reg)
+		})
+	case OP_SUBSCR_FAST_FAST:
+		r1, r2 := uint16(uint8(inst>>8)), uint16(uint8(inst))
+		ptr, length = deoptimizeAt(st.curCO, ip, func(c []uint32) {
+			c[ip] = Encode(OP_LOAD_FAST, 0, r1)
+			c[ip+1] = Encode(OP_LOAD_FAST, 0, r2)
+			c[ip+2] = Encode(OP_BINARY_SUBSCR, 0, 0)
+		})
+	case OP_SUBSCR_FAST_CONST:
+		reg, constIdx := uint16(uint8(inst>>8)), uint16(uint8(inst))
+		ptr, length = deoptimizeAt(st.curCO, ip, func(c []uint32) {
+			c[ip] = Encode(OP_LOAD_FAST, 0, reg)
+			c[ip+1] = Encode(OP_LOAD_CONST, 0, constIdx)
+			c[ip+2] = Encode(OP_BINARY_SUBSCR, 0, 0)
+		})
 	}
 	st.codePtr = ptr
 	st.codeLen = length
@@ -350,7 +431,7 @@ func (vm *VM) opForIterSlow(st *loopState, inst uint32, ip, sp int) (int, int, l
 //go:noinline
 func (vm *VM) opForIterRangeWriteLoop(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
-	locals := (*[256]val.Value)(unsafe.Pointer(&stack[st.base]))
+	locals := stack[st.base:]
 	targetReg := uint8(inst >> 16)
 	jumpTarget := int(uint16(inst))
 	it := stack[sp-1]
@@ -365,15 +446,22 @@ func (vm *VM) opForIterRangeWriteLoop(st *loopState, inst uint32, ip, sp int) (i
 		localIdx = uint32(uint8(writeInst >> 16))
 		constIdx = uint32(uint16(writeInst))
 		isWriteLoop = true
-	} else if op1 == OP_LOAD_FAST && DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+2)*4))) == OP_LOAD_CONST &&
+	} else if (op1 == OP_LOAD_FAST || op1 == OP_LOAD_FAST_CONST) &&
+		(op1 == OP_LOAD_FAST_CONST || DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+2)*4))) == OP_LOAD_CONST) &&
 		(DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+3)*4))) == OP_CALL_METHOD_PIC || DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+3)*4))) == OP_CALL_METHOD) &&
 		DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+4)*4))) == OP_POP_TOP {
 		w3 := *(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+3)*4))
 		methIdx := DecodeArgBx(w3)
 		argc := DecodeArgA(w3)
 		if argc == 1 && int(methIdx) < len(st.consts) && st.consts[methIdx] == nameWrite {
-			localIdx = uint32(DecodeArgBx(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4))))
-			constIdx = uint32(DecodeArgBx(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+2)*4))))
+			w1 := *(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4))
+			if op1 == OP_LOAD_FAST_CONST {
+				localIdx = uint32(DecodeArgA(w1))
+				constIdx = uint32(DecodeArgBx(w1))
+			} else {
+				localIdx = uint32(DecodeArgBx(w1))
+				constIdx = uint32(DecodeArgBx(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+2)*4))))
+			}
 			isWriteLoop = true
 		}
 	}
@@ -701,7 +789,7 @@ func (vm *VM) opCompareSlow(st *loopState, inst uint32, ip, sp int) (int, int, l
 //go:noinline
 func (vm *VM) opFastSubscrPushSlow(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
-	locals := (*[256]val.Value)(unsafe.Pointer(&stack[st.base]))
+	locals := stack[st.base:]
 	cellIdx := uint8(inst >> 16)
 	localIdx := uint16(inst)
 	var cVal val.Value
@@ -729,7 +817,7 @@ func (vm *VM) opFastSubscrPushSlow(st *loopState, inst uint32, ip, sp int) (int,
 //go:noinline
 func (vm *VM) opFastJumpSubscrSlow(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
-	locals := (*[256]val.Value)(unsafe.Pointer(&stack[st.base]))
+	locals := stack[st.base:]
 	cellIdx := uint8(inst >> 16)
 	exitTarget := int(uint16(inst))
 	localIdx := uint16(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4)))
@@ -749,7 +837,7 @@ func (vm *VM) opFastJumpSubscrSlow(st *loopState, inst uint32, ip, sp int) (int,
 //go:noinline
 func (vm *VM) opFastStoreSubscrSlow(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
-	locals := (*[256]val.Value)(unsafe.Pointer(&stack[st.base]))
+	locals := stack[st.base:]
 	cellIdx := uint8(inst >> 16)
 	localIdx := uint16(inst)
 	constIdx := uint16(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4)))
@@ -766,7 +854,7 @@ func (vm *VM) opFastStoreSubscrSlow(st *loopState, inst uint32, ip, sp int) (int
 //go:noinline
 func (vm *VM) opFastCmpEqDerefSlow(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
-	locals := (*[256]val.Value)(unsafe.Pointer(&stack[st.base]))
+	locals := stack[st.base:]
 	localIdx := uint8(inst >> 16)
 	exitTarget := int(uint16(inst))
 	cellIdx := uint16(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4)))
@@ -785,7 +873,7 @@ func (vm *VM) opFastCmpEqDerefSlow(st *loopState, inst uint32, ip, sp int) (int,
 //go:noinline
 func (vm *VM) opFastSubAddDerefSlow(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
-	locals := (*[256]val.Value)(unsafe.Pointer(&stack[st.base]))
+	locals := stack[st.base:]
 	dst := uint8(inst >> 16)
 	srcA := uint8(inst >> 8)
 	srcB := uint8(inst)
@@ -804,7 +892,7 @@ func (vm *VM) opFastSubAddDerefSlow(st *loopState, inst uint32, ip, sp int) (int
 //go:noinline
 func (vm *VM) opFastSelfRecurseSlow(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
-	locals := (*[256]val.Value)(unsafe.Pointer(&stack[st.base]))
+	locals := stack[st.base:]
 	localReg := uint8(inst >> 16)
 	cellIdx := uint16(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4)))
 	constIdx := uint16(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+2)*4)))
@@ -869,7 +957,7 @@ func (vm *VM) opFastSelfRecurseSlow(st *loopState, inst uint32, ip, sp int) (int
 //go:noinline
 func (vm *VM) opFastBitSlow(st *loopState, op Opcode, inst uint32, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
-	locals := (*[256]val.Value)(unsafe.Pointer(&stack[st.base]))
+	locals := stack[st.base:]
 	switch op {
 	case OP_JUMP_IF_BITAND_ZERO:
 		jumpTarget := int(uint16(inst))
@@ -917,10 +1005,27 @@ func (vm *VM) opFastBitSlow(st *loopState, op Opcode, inst uint32, ip, sp int) (
 	}
 }
 
+// recordAttrPICMRU inserts or promotes an attribute PIC entry into slot 0 for fast-path hits.
+func recordAttrPICMRU(pic *[4]AttrPICEntry, shape *val.Shape, slotIdx int, tv uint32) {
+	for k := range 4 {
+		if pic[k].Shape == nil || pic[k].Shape == shape {
+			pic[k] = AttrPICEntry{Shape: shape, SlotIndex: int32(slotIdx), TypeVer: tv}
+			if k > 0 {
+				pic[0], pic[k] = pic[k], pic[0]
+			}
+			return
+		}
+	}
+	pic[3] = pic[2]
+	pic[2] = pic[1]
+	pic[1] = pic[0]
+	pic[0] = AttrPICEntry{Shape: shape, SlotIndex: int32(slotIdx), TypeVer: tv}
+}
+
 //go:noinline
 func (vm *VM) opFastAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
-	locals := (*[256]val.Value)(unsafe.Pointer(&stack[st.base]))
+	locals := stack[st.base:]
 	op := Opcode(inst >> 24)
 	reg := uint8(inst >> 16)
 	obj := locals[reg]
@@ -955,15 +1060,31 @@ func (vm *VM) opFastAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 			instShape := instObj.Shape
 			instType := instObj.Header.Type
 			if instShape != nil && instType != nil && (instType.Flags&val.FlagCustomGetAttribute) == 0 && !val.MultiThreadedFlag.Load() {
+				tv := uint32(instType.Version())
+				if uint(ip+1) < uint(len(st.cache.attrPIC)) {
+					pic := &st.cache.attrPIC[ip+1]
+					for k := 1; k < 4; k++ {
+						if pic[k].Shape == instShape && pic[k].TypeVer == tv {
+							slotIdx := pic[k].SlotIndex
+							if uint(slotIdx) < uint(len(instObj.Slots)) {
+								v := instObj.Slots[slotIdx]
+								if !v.IsUnbound() {
+									pic[0], pic[k] = pic[k], pic[0]
+									stack[sp] = v
+									return ip + 2, sp + 1, ctlNext
+								}
+							}
+						}
+					}
+				}
 				if slotIdx, ok := instShape.Lookup(st.consts[uint16(inst)]); ok {
-					if _, _, foundInClass := instType.LookupMRO(st.consts[uint16(inst)]); !foundInClass {
+					descr, _, foundInClass := instType.LookupMRO(st.consts[uint16(inst)])
+					if !foundInClass || descr.Kind() == val.KindMemberDescr {
 						if uint(slotIdx) < uint(len(instObj.Slots)) {
 							v := instObj.Slots[slotIdx]
 							if !v.IsUnbound() {
 								pic := &st.cache.ensureAttrPIC()[ip+1]
-								if pic[0].Shape == nil || pic[0].Shape == instShape {
-									pic[0] = AttrPICEntry{Shape: instShape, SlotIndex: int32(slotIdx), TypeVer: uint32(instType.Version())}
-								}
+								recordAttrPICMRU(pic, instShape, slotIdx, tv)
 								stack[sp] = v
 								return ip + 2, sp + 1, ctlNext
 							}
@@ -972,21 +1093,50 @@ func (vm *VM) opFastAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 				}
 			}
 		}
+		stack[sp] = obj
+		newIP, newSP, ctl := vm.opLoadAttrSlow(st, ReplaceOpcode(inst, OP_LOAD_ATTR), ip+1, sp+1)
+		// Restore OP_LOAD_FAST + OP_LOAD_ATTR per-VM for tuples/modules/types
+		// so subsequent hits use runLoopWithGlobals's inline tuple/module fast paths.
+		// @property sites stay fused and dispatch directly from OP_LOAD_FAST_ATTR.
+		if st.cache != nil && uint(ip+1) < uint(len(st.cache.ic)) {
+			k := st.cache.ic[ip+1].Kind
+			if k == ICKindTupleGetter || k == ICKindModuleAttr || k == ICKindTypeAttr {
+				st.cache.quickenAt(ip, Encode(OP_LOAD_FAST, 0, uint16(reg)))
+				ptr := st.cache.quickenAt(ip+1, ReplaceOpcode(inst, OP_LOAD_ATTR))
+				if st.curCO == st.cache.co {
+					st.codePtr = ptr
+				}
+			}
+		}
+		return newIP, newSP, ctl
 	case OP_STORE_FAST_ATTR:
 		v := stack[sp-1]
-		if !v.IsString() && v.Kind() != val.KindMemoryView {
+		if !v.IsString() && v.Kind() != val.KindMemoryView && !val.MultiThreadedFlag.Load() {
 			if instObj := obj.AsInstanceChecked(); instObj != nil {
 				instShape := instObj.Shape
 				instType := instObj.Header.Type
-				if instShape != nil && instType != nil && (instType.Flags&val.FlagCustomSetAttr) == 0 && !val.MultiThreadedFlag.Load() {
+				if instShape != nil && instType != nil && (instType.Flags&val.FlagCustomSetAttr) == 0 {
+					tv := uint32(instType.Version())
+					if uint(ip+1) < uint(len(st.cache.attrPIC)) {
+						pic := &st.cache.attrPIC[ip+1]
+						for k := 1; k < 4; k++ {
+							if pic[k].Shape == instShape && pic[k].TypeVer == tv {
+								slotIdx := pic[k].SlotIndex
+								if uint(slotIdx) < uint(len(instObj.Slots)) {
+									instObj.Slots[slotIdx] = v
+									pic[0], pic[k] = pic[k], pic[0]
+									return ip + 2, sp - 1, ctlNext
+								}
+							}
+						}
+					}
 					if slotIdx, ok := instShape.Lookup(st.consts[uint16(inst)]); ok {
-						if _, _, foundInClass := instType.LookupMRO(st.consts[uint16(inst)]); !foundInClass {
+						descr, _, foundInClass := instType.LookupMRO(st.consts[uint16(inst)])
+						if !foundInClass || descr.Kind() == val.KindMemberDescr {
 							if uint(slotIdx) < uint(len(instObj.Slots)) {
 								instObj.Slots[slotIdx] = v
 								pic := &st.cache.ensureAttrPIC()[ip+1]
-								if pic[0].Shape == nil || pic[0].Shape == instShape {
-									pic[0] = AttrPICEntry{Shape: instShape, SlotIndex: int32(slotIdx), TypeVer: uint32(instType.Version())}
-								}
+								recordAttrPICMRU(pic, instShape, slotIdx, tv)
 								return ip + 2, sp - 1, ctlNext
 							}
 						}
@@ -994,9 +1144,212 @@ func (vm *VM) opFastAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 				}
 			}
 		}
+		stack[sp] = obj
+		newIP, newSP, ctl := vm.opStoreAttrSlow(st, ReplaceOpcode(inst, OP_STORE_ATTR), ip+1, sp+1)
+		if st.cache != nil && uint(ip+1) < uint(len(st.cache.ic)) && st.cache.ic[ip+1].Kind == ICKindPropertySet {
+			st.cache.quickenAt(ip, Encode(OP_LOAD_FAST, 0, uint16(reg)))
+			ptr := st.cache.quickenAt(ip+1, ReplaceOpcode(inst, OP_STORE_ATTR))
+			if st.curCO == st.cache.co {
+				st.codePtr = ptr
+			}
+		}
+		return newIP, newSP, ctl
 	}
 	vm.deoptInst(st, ip, inst)
 	return ip, sp, ctlReload
+}
+
+//go:noinline
+func (vm *VM) opLoadGlobalFastSlow(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
+	gIdx := uint16(uint8(inst >> 8))
+	reg := uint8(inst)
+	newIP, newSP, ctl := vm.opLoadGlobalSlow(st, Encode(OP_LOAD_GLOBAL, 0, gIdx), ip, sp)
+	if ctl == ctlRaise || ctl == ctlExit {
+		return newIP, newSP, ctl
+	}
+	st.stack[newSP] = st.stack[st.base+int(reg)]
+	return newIP + 1, newSP + 1, ctl
+}
+
+//go:noinline
+func (vm *VM) opCompareJumpSlow(st *loopState, op Opcode, inst uint32, ip, sp int) (int, int, loopCtl) {
+	cmpOp := uint8(inst >> 16)
+	target := uint16(inst)
+	jumpOp := OP_JUMP_IF_FALSE
+	wantTrue := op == OP_COMPARE_JUMP_IF_TRUE
+	if wantTrue {
+		jumpOp = OP_JUMP_IF_TRUE
+	}
+	cmpInst := Encode(OP_COMPARE_OP, cmpOp, 0)
+	b := st.stack[sp-1]
+	a := st.stack[sp-2]
+	if cmpOp <= CMP_GTE &&
+		(a.IsInlineStr() || (a.IsString() && a.AsStringObj().Header.Type == val.StrType)) &&
+		(b.IsInlineStr() || (b.IsString() && b.AsStringObj().Header.Type == val.StrType)) {
+		var cmpRes bool
+		switch cmpOp {
+		case CMP_EQ:
+			cmpRes = val.StringEquals(a, b)
+		case CMP_NEQ:
+			cmpRes = !val.StringEquals(a, b)
+		case CMP_LT:
+			cmpRes = val.StringCompare(a, b) < 0
+		case CMP_LTE:
+			cmpRes = val.StringCompare(a, b) <= 0
+		case CMP_GT:
+			cmpRes = val.StringCompare(a, b) > 0
+		case CMP_GTE:
+			cmpRes = val.StringCompare(a, b) >= 0
+		}
+		sp -= 2
+		if cmpRes == wantTrue {
+			return int(target), sp, ctlNext
+		}
+		return ip + 2, sp, ctlNext
+	}
+	if cmpOp <= CMP_GTE && a.IsTuple() && b.IsTuple() &&
+		a.HeaderPtr().Type == val.TupleType && b.HeaderPtr().Type == val.TupleType {
+		st.ip = ip
+		vm.execCtx.SP = sp
+		res := val.CompareTuplesFast(&vm.execCtx, a, b, cmpOp)
+		if !vm.execCtx.HasException() &&
+			len(vm.execCtx.Stack) > 0 && len(st.stack) > 0 &&
+			&vm.execCtx.Stack[0] == &st.stack[0] {
+			sp -= 2
+			if res.IsTruthy() == wantTrue {
+				return int(target), sp, ctlNext
+			}
+			return ip + 2, sp, ctlNext
+		}
+		newIP, newSP, ctl := vm.finishCompareTupleSlow(st, ip, sp, res)
+		if ctl == ctlRaise || ctl == ctlExit {
+			return newIP, newSP, ctl
+		}
+		cond := st.stack[newSP-1]
+		newSP--
+		if cond.IsTruthy() == wantTrue {
+			return int(target), newSP, ctl
+		}
+		return ip + 2, newSP, ctl
+	}
+	callerCache := st.cache
+	newIP, newSP, ctl := vm.opCompareSlow(st, cmpInst, ip, sp)
+	if ctl == ctlRaise || ctl == ctlExit {
+		return newIP, newSP, ctl
+	}
+	if callerCache != nil && callerCache.privateActive && ip+1 < len(callerCache.active) &&
+		DecodeOpcode(callerCache.active[ip]) == OP_COMPARE_DUNDER {
+		ptr := callerCache.quickenAt(ip+1, Encode(jumpOp, 0, target))
+		if st.cache == callerCache {
+			st.codePtr = ptr
+		}
+		if newIP == 0 {
+			return newIP, newSP, ctl
+		}
+	} else if newIP == 0 {
+		return newIP, newSP, ctl
+	}
+	cond := st.stack[newSP-1]
+	newSP--
+	if cond.IsTruthy() == wantTrue {
+		return int(target), newSP, ctl
+	}
+	return ip + 2, newSP, ctl
+}
+
+//go:noinline
+func (vm *VM) opCmpConstJumpSlow(st *loopState, op Opcode, inst uint32, ip, sp int) (int, int, loopCtl) {
+	cmpOp := uint8(inst >> 16)
+	constIdx := uint16(uint8(inst >> 8))
+	target := ip + int(uint8(inst))
+	jumpOp := OP_JUMP_IF_FALSE
+	wantTrue := op == OP_CMP_CONST_JUMP_IF_TRUE
+	if wantTrue {
+		jumpOp = OP_JUMP_IF_TRUE
+	}
+	a := st.stack[sp-1]
+	b := st.consts[constIdx]
+	if cmpOp <= CMP_GTE &&
+		(a.IsInlineStr() || (a.IsString() && a.AsStringObj().Header.Type == val.StrType)) &&
+		(b.IsInlineStr() || (b.IsString() && b.AsStringObj().Header.Type == val.StrType)) {
+		var cmpRes bool
+		switch cmpOp {
+		case CMP_EQ:
+			cmpRes = val.StringEquals(a, b)
+		case CMP_NEQ:
+			cmpRes = !val.StringEquals(a, b)
+		case CMP_LT:
+			cmpRes = val.StringCompare(a, b) < 0
+		case CMP_LTE:
+			cmpRes = val.StringCompare(a, b) <= 0
+		case CMP_GT:
+			cmpRes = val.StringCompare(a, b) > 0
+		case CMP_GTE:
+			cmpRes = val.StringCompare(a, b) >= 0
+		}
+		sp--
+		if cmpRes == wantTrue {
+			return target, sp, ctlNext
+		}
+		return ip + 3, sp, ctlNext
+	}
+	st.stack[sp] = b
+	callerCache := st.cache
+	cmpInst := Encode(OP_COMPARE_OP, cmpOp, 0)
+	newIP, newSP, ctl := vm.opCompareSlow(st, cmpInst, ip+1, sp+1)
+	if ctl == ctlRaise || ctl == ctlExit {
+		return newIP, newSP, ctl
+	}
+	if callerCache != nil && callerCache.privateActive && ip+2 < len(callerCache.active) &&
+		DecodeOpcode(callerCache.active[ip+1]) == OP_COMPARE_DUNDER {
+		callerCache.quickenAt(ip, Encode(OP_LOAD_CONST, 0, constIdx))
+		ptr := callerCache.quickenAt(ip+2, Encode(jumpOp, 0, uint16(target)))
+		if st.cache == callerCache {
+			st.codePtr = ptr
+		}
+		if newIP == 0 {
+			return newIP, newSP, ctl
+		}
+	} else if newIP == 0 {
+		return newIP, newSP, ctl
+	}
+	cond := st.stack[newSP-1]
+	newSP--
+	if cond.IsTruthy() == wantTrue {
+		return target, newSP, ctl
+	}
+	return ip + 3, newSP, ctl
+}
+
+//go:noinline
+func (vm *VM) opSubscrFastSlow(st *loopState, op Opcode, inst uint32, ip, sp int) (int, int, loopCtl) {
+	stack := st.stack
+	obj := stack[st.base+int(uint8(inst>>8))]
+	var key val.Value
+	if op == OP_SUBSCR_FAST_CONST {
+		key = st.consts[uint8(inst)]
+	} else {
+		key = stack[st.base+int(uint8(inst))]
+	}
+	stack[sp] = obj
+	stack[sp+1] = key
+	newIP, newSP, ctl := vm.opBinarySubscrSlow(st, ip+2, sp+2)
+	if ctl == ctlRaise || ctl == ctlExit {
+		return newIP, newSP, ctl
+	}
+	return ip + 3, newSP, ctl
+}
+
+//go:noinline
+func (vm *VM) opPopLoadFastSlow(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
+	stack := st.stack
+	sp--
+	if vm.hasTrackedViews {
+		vm.opReclaimPopTop(stack[sp])
+	}
+	bx := int(uint16(inst))
+	stack[sp] = stack[st.base+bx]
+	return ip + 2, sp + 1, ctlNext
 }
 
 //go:noinline

@@ -441,3 +441,159 @@ assert res[-1] == (10, 20)
 `)
 	defer eng.ReleaseVM(v)
 }
+
+func TestFusedLoadFastAttrProperty(t *testing.T) {
+	eng, v := runPySource(t, `
+class Holder:
+    def __init__(self, v):
+        self._v = v
+    @property
+    def val(self):
+        return self._v * 2
+
+def read_prop(h):
+    total = 0
+    for _ in range(20):
+        x = h.val
+        total += x
+    return total
+
+h = Holder(5)
+for _ in range(10):
+    assert read_prop(h) == 200
+
+Holder.val = property(lambda self: self._v * 3)
+for _ in range(5):
+    assert read_prop(h) == 300
+
+Holder.val = 7
+for _ in range(5):
+    assert read_prop(h) == 140
+`)
+	defer eng.ReleaseVM(v)
+
+	fnVal, ok := v.Globals().Get(val.InternString("read_prop"))
+	if !ok || !fnVal.IsFunction() {
+		t.Fatal("missing read_prop")
+	}
+	co := vm.AsCodeObject(fnVal.AsFunction().Code)
+	hasFused := false
+	for _, inst := range co.Active() {
+		if vm.DecodeOpcode(inst) == vm.OP_LOAD_FAST_ATTR {
+			hasFused = true
+			break
+		}
+	}
+	if !hasFused {
+		t.Fatal("expected OP_LOAD_FAST_ATTR to remain fused for @property site")
+	}
+}
+
+func TestEntryIPDocstringSkipPython(t *testing.T) {
+	eng, v := runPySource(t, `
+import asyncio
+
+def with_doc(x):
+    """Docstring prologue."""
+    return x + 1
+
+def doc_only():
+    """Only a docstring."""
+
+def gen_doc(n):
+    """Generator docstring."""
+    for i in range(n):
+        yield i * 2
+
+async def coro_doc(x):
+    """Coroutine docstring."""
+    return x * 3
+
+assert with_doc.__doc__ == "Docstring prologue."
+assert doc_only.__doc__ == "Only a docstring."
+assert [with_doc(i) for i in range(12)] == list(range(1, 13))
+assert [doc_only() for _ in range(12)] == [None] * 12
+assert list(gen_doc(4)) == [0, 2, 4, 6]
+assert asyncio.run(coro_doc(7)) == 21
+`)
+	defer eng.ReleaseVM(v)
+
+	for _, name := range []string{"with_doc", "doc_only", "gen_doc", "coro_doc"} {
+		fnVal, ok := v.Globals().Get(val.InternString(name))
+		if !ok || !fnVal.IsFunction() {
+			t.Fatalf("missing function %s", name)
+		}
+		co := vm.AsCodeObject(fnVal.AsFunction().Code)
+		if co.EntryIP != 2 {
+			t.Fatalf("%s EntryIP = %d, want 2", name, co.EntryIP)
+		}
+	}
+}
+
+func TestUnpackSequenceInLoopAndFusedStoreFast(t *testing.T) {
+	eng, v := runPySource(t, `
+g_a = 0
+g_b = 0
+
+def unpack_pairs_and_triples(pairs, triples):
+    total = 0
+    for a, b in pairs:
+        total += a + b
+    for x, y, z in triples:
+        total += x * y + z
+    p, q = 10, 20
+    p, q = q, p
+    return total + p - q
+
+pairs = [(i, i + 1) for i in range(15)]
+triples = [(i, i + 1, i + 2) for i in range(15)]
+list_pairs = [[i, i + 2] for i in range(5)]
+list_triples = [[i, i + 1, i + 3] for i in range(5)]
+
+res1 = unpack_pairs_and_triples(pairs, triples)
+res2 = unpack_pairs_and_triples(list_pairs, list_triples)
+assert res1 == sum(2 * i + 1 for i in range(15)) + sum(i * (i + 1) + i + 2 for i in range(15)) + 10
+assert res2 == sum(2 * i + 2 for i in range(5)) + sum(i * (i + 1) + i + 3 for i in range(5)) + 10
+
+for i in range(12):
+    g_a, g_b = (i, i + 3)
+assert (g_a, g_b) == (11, 14)
+
+err_count = 0
+for seq in [(1,), (1, 2, 3)]:
+    try:
+        u1, u2 = seq
+    except ValueError:
+        err_count += 1
+assert err_count == 2
+
+def unpack_with_view(buf):
+    mv = memoryview(buf)
+    items = [(mv[0:2], 5) for _ in range(6)]
+    s = 0
+    for sub, tag in items:
+        s += sub[0] + tag
+    return s
+
+assert unpack_with_view(bytearray(b"abcd")) == 6 * (ord("a") + 5)
+`)
+	defer eng.ReleaseVM(v)
+
+	fnVal, ok := v.Globals().Get(val.InternString("unpack_pairs_and_triples"))
+	if !ok || !fnVal.IsFunction() {
+		t.Fatal("missing unpack_pairs_and_triples")
+	}
+	co := vm.AsCodeObject(fnVal.AsFunction().Code)
+	has2, has3 := false, false
+	for _, inst := range co.Active() {
+		switch vm.DecodeOpcode(inst) {
+		case vm.OP_UNPACK_2_FAST:
+			has2 = true
+		case vm.OP_UNPACK_3_FAST:
+			has3 = true
+		}
+	}
+	if !has2 || !has3 {
+		t.Fatalf("expected OP_UNPACK_2_FAST and OP_UNPACK_3_FAST in fused stream, got has2=%v has3=%v", has2, has3)
+	}
+}

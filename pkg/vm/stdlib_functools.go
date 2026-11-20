@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"slices"
 	"strings"
 	"sync"
 	"unsafe"
@@ -12,6 +13,8 @@ var (
 	PartialType   *val.PyType
 	CacheWrapper  *val.PyType
 	functoolsOnce sync.Once
+	lruKwdMarkHdr = val.ObjectHeader{Kind: val.KindNative}
+	lruKwdMark    = val.ObjectVal(&lruKwdMarkHdr)
 )
 
 type pyPartial struct {
@@ -21,22 +24,169 @@ type pyPartial struct {
 	Keywords *val.PyDict
 }
 
-type lruEntry struct {
-	key   string
-	value val.Value
+type lruNode struct {
+	key  val.Value
+	val  val.Value
+	prev int32
+	next int32
 }
 
 type pyLRUCache struct {
 	Header       val.ObjectHeader
 	UserFunction val.Value
 	Maxsize      int // -1 for unbounded
+	Typed        bool
 	Hits         int64
 	Misses       int64
 	CacheInfoCls val.Value
-	Cache        map[string]*lruEntry
-	Order        []string
+	Cache        *val.PyDict
+	nodes        []lruNode // nodes[0] is sentinel root: next=MRU, prev=LRU
+	free         []int32
+	clearGen     uint64
 	Attrs        *val.PyDict
 	Mu           sync.Mutex
+}
+
+func isFastHashableValue(v val.Value) bool {
+	return v.IsInt64() || v.IsAnyString() || v.IsBool() || v.IsFloat64() || v.IsNone()
+}
+
+func makeLRUCacheKey(ctx *val.ExecContext, args []val.Value, kwnames []val.Value, typed bool) (val.Value, bool) {
+	if len(kwnames) == 0 && !typed {
+		if len(args) == 1 {
+			k := args[0]
+			if !isFastHashableValue(k) {
+				if _, exc, ok := val.TryHashValue(ctx, k); !ok {
+					ctx.Raise(exc)
+					return val.Value{}, false
+				}
+			}
+			return k, true
+		}
+		if len(args) == 0 {
+			return val.EmptyTupleVal(), true
+		}
+	}
+	posCount := len(args) - len(kwnames)
+	extra := 0
+	if len(kwnames) > 0 {
+		extra = 1 + 2*len(kwnames)
+	}
+	var stackBuf [8]val.Value
+	totalCap := posCount + extra
+	if typed {
+		totalCap += len(args)
+	}
+	var keyParts []val.Value
+	if totalCap <= len(stackBuf) {
+		keyParts = stackBuf[:0]
+	} else {
+		keyParts = make([]val.Value, 0, totalCap)
+	}
+	keyParts = append(keyParts, args[:posCount]...)
+	if len(kwnames) > 0 {
+		keyParts = append(keyParts, lruKwdMark)
+		if len(kwnames) == 1 {
+			keyParts = append(keyParts, kwnames[0], args[posCount])
+		} else {
+			type kwPair struct {
+				k val.Value
+				v val.Value
+			}
+			pairs := make([]kwPair, len(kwnames))
+			for i, kn := range kwnames {
+				pairs[i] = kwPair{k: kn, v: args[posCount+i]}
+			}
+			slices.SortFunc(pairs, func(a, b kwPair) int {
+				return strings.Compare(a.k.AsString(), b.k.AsString())
+			})
+			for _, p := range pairs {
+				keyParts = append(keyParts, p.k, p.v)
+			}
+		}
+	}
+	if typed {
+		for _, a := range args[:posCount] {
+			keyParts = append(keyParts, val.TypeVal(a.Type()))
+		}
+		if len(kwnames) > 0 {
+			for _, a := range args[posCount:] {
+				keyParts = append(keyParts, val.TypeVal(a.Type()))
+			}
+		}
+	}
+	key := val.NewTupleVal(keyParts...)
+	if _, exc, ok := val.TryHashValue(ctx, key); !ok {
+		ctx.Raise(exc)
+		return val.Value{}, false
+	}
+	return key, true
+}
+
+func (c *pyLRUCache) unlinkNode(idx int32) {
+	p := c.nodes[idx].prev
+	n := c.nodes[idx].next
+	c.nodes[p].next = n
+	c.nodes[n].prev = p
+}
+
+func (c *pyLRUCache) linkMRU(idx int32) {
+	first := c.nodes[0].next
+	c.nodes[idx].prev = 0
+	c.nodes[idx].next = first
+	c.nodes[first].prev = idx
+	c.nodes[0].next = idx
+}
+
+func (c *pyLRUCache) probeLocked(cacheKey val.Value) (val.Value, bool) {
+	if c.Maxsize == 0 || c.Cache == nil {
+		return val.Value{}, false
+	}
+	if idxVal, ok := c.Cache.Get(cacheKey); ok {
+		c.Hits++
+		idx := int32(idxVal.AsInt64())
+		if c.nodes[0].next != idx {
+			c.unlinkNode(idx)
+			c.linkMRU(idx)
+		}
+		return c.nodes[idx].val, true
+	}
+	return val.Value{}, false
+}
+
+func (c *pyLRUCache) insertAfterMiss(cacheKey, res val.Value, startGen uint64) {
+	if c.clearGen != startGen || c.Maxsize == 0 || c.Cache == nil {
+		return
+	}
+	// If a recursive call during the miss already cached this key, keep ring consistent.
+	if _, exists := c.Cache.Get(cacheKey); exists {
+		return
+	}
+	var idx int32
+	if c.Maxsize > 0 && c.Cache.Len() >= c.Maxsize {
+		lruIdx := c.nodes[0].prev
+		if lruIdx != 0 {
+			c.Cache.Delete(c.nodes[lruIdx].key)
+			c.unlinkNode(lruIdx)
+			idx = lruIdx
+			c.nodes[idx].key = cacheKey
+			c.nodes[idx].val = res
+			c.linkMRU(idx)
+			c.Cache.Set(cacheKey, val.Int64Val(int64(idx)))
+			return
+		}
+	}
+	if nf := len(c.free); nf > 0 {
+		idx = c.free[nf-1]
+		c.free = c.free[:nf-1]
+	} else {
+		idx = int32(len(c.nodes))
+		c.nodes = append(c.nodes, lruNode{})
+	}
+	c.nodes[idx].key = cacheKey
+	c.nodes[idx].val = res
+	c.linkMRU(idx)
+	c.Cache.Set(cacheKey, val.Int64Val(int64(idx)))
 }
 
 func initFunctoolsTypes() {
@@ -160,60 +310,51 @@ func initFunctoolsTypes() {
 		// 2. CacheWrapper. Instances are KindNative so attribute writes do not
 		// go through PyInstance's shape lock (this struct is not a PyInstance).
 		CacheWrapper = val.MustNewType("_lru_cache_wrapper", []*val.PyType{val.ObjectType}, nil)
-		cacheCall := func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		cacheCallTp := func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			cache := (*pyLRUCache)(unsafe.Pointer(callable.HeaderPtr()))
+			cacheKey, ok := makeLRUCacheKey(ctx, args, kwnames, cache.Typed)
+			if !ok {
+				return val.NoneVal()
+			}
+			locked := val.MultiThreadedFlag.Load()
+			if locked {
+				cache.Mu.Lock()
+			}
+			if res, hit := cache.probeLocked(cacheKey); hit {
+				if locked {
+					cache.Mu.Unlock()
+				}
+				return res
+			}
+			cache.Misses++
+			startGen := cache.clearGen
+			if locked {
+				cache.Mu.Unlock()
+			}
+
+			res := ctx.Call(cache.UserFunction, args, kwnames)
+			if ctx != nil && ctx.HasException() {
+				return val.NoneVal()
+			}
+
+			locked = val.MultiThreadedFlag.Load()
+			if locked {
+				cache.Mu.Lock()
+			}
+			cache.insertAfterMiss(cacheKey, res, startGen)
+			if locked {
+				cache.Mu.Unlock()
+			}
+			return res
+		}
+		CacheWrapper.Slots.TpCall = cacheCallTp
+		CacheWrapper.Dict.Set(val.DunderCall, val.NewBuiltinFuncVal("__call__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			if len(args) < 1 {
 				ctx.Raise(val.NewException(val.TypeErrorType, "_lru_cache_wrapper expected an instance"))
 				return val.NoneVal()
 			}
-			cache := (*pyLRUCache)(unsafe.Pointer(args[0].HeaderPtr()))
-			args = args[1:]
-			cache.Mu.Lock()
-
-			// Build cache key
-			var keyParts []string
-			for _, a := range args {
-				keyParts = append(keyParts, a.String())
-			}
-			for _, kn := range kwnames {
-				keyParts = append(keyParts, kn.AsString())
-			}
-			cacheKey := strings.Join(keyParts, ":")
-
-			if entry, ok := cache.Cache[cacheKey]; ok {
-				cache.Hits++
-				// Move to end of order (most recently used)
-				for i, k := range cache.Order {
-					if k == cacheKey {
-						copy(cache.Order[i:], cache.Order[i+1:])
-						cache.Order[len(cache.Order)-1] = cacheKey
-						break
-					}
-				}
-				cache.Mu.Unlock()
-				return entry.value
-			}
-
-			cache.Misses++
-			cache.Mu.Unlock()
-
-			// Compute result
-			res := ctx.Call(cache.UserFunction, args, kwnames)
-
-			cache.Mu.Lock()
-			defer cache.Mu.Unlock()
-
-			if cache.Maxsize > 0 && len(cache.Cache) >= cache.Maxsize {
-				// Evict oldest
-				oldestKey := cache.Order[0]
-				cache.Order = cache.Order[1:]
-				delete(cache.Cache, oldestKey)
-			}
-			cache.Cache[cacheKey] = &lruEntry{key: cacheKey, value: res}
-			cache.Order = append(cache.Order, cacheKey)
-
-			return res
-		}
-		CacheWrapper.Dict.Set(val.DunderCall, val.NewBuiltinFuncVal("__call__", cacheCall))
+			return cacheCallTp(ctx, args[0], args[1:], kwnames)
+		}))
 		cacheGet := func(ctx *val.ExecContext, descr, obj val.Value, owner *val.PyType) val.Value {
 			if obj.IsNone() || obj.IsUnbound() {
 				return descr
@@ -266,12 +407,20 @@ func initFunctoolsTypes() {
 				return val.NoneVal()
 			}
 			cache := (*pyLRUCache)(unsafe.Pointer(args[0].HeaderPtr()))
-			cache.Mu.Lock()
+			locked := val.MultiThreadedFlag.Load()
+			if locked {
+				cache.Mu.Lock()
+			}
 			hits := cache.Hits
 			misses := cache.Misses
 			maxsize := cache.Maxsize
-			currsize := len(cache.Cache)
-			cache.Mu.Unlock()
+			currsize := 0
+			if cache.Cache != nil {
+				currsize = cache.Cache.Len()
+			}
+			if locked {
+				cache.Mu.Unlock()
+			}
 
 			maxVal := val.NoneVal()
 			if maxsize >= 0 {
@@ -289,12 +438,20 @@ func initFunctoolsTypes() {
 				return val.NoneVal()
 			}
 			cache := (*pyLRUCache)(unsafe.Pointer(args[0].HeaderPtr()))
-			cache.Mu.Lock()
+			locked := val.MultiThreadedFlag.Load()
+			if locked {
+				cache.Mu.Lock()
+			}
 			cache.Hits = 0
 			cache.Misses = 0
-			cache.Cache = make(map[string]*lruEntry)
-			cache.Order = nil
-			cache.Mu.Unlock()
+			cache.clearGen++
+			clear(cache.nodes)
+			cache.nodes = append(cache.nodes[:0], lruNode{prev: 0, next: 0})
+			cache.free = cache.free[:0]
+			cache.Cache = val.NewDictVal(16).AsDict()
+			if locked {
+				cache.Mu.Unlock()
+			}
 			return val.NoneVal()
 		}))
 		CacheWrapper.InvalidateVersion()
@@ -351,10 +508,17 @@ func (e *Engine) createFunctoolsModule() val.Value {
 		userFn := args[0]
 		maxsize := -1
 		if args[1].IsInt64() {
-			maxsize = int(args[1].AsInt64())
+			maxsize = max(int(args[1].AsInt64()), 0)
 		}
+		typed := args[2].IsTruthy()
 		cacheInfoCls := args[3]
 
+		nodesCap := 16
+		if maxsize >= 0 && maxsize < 16 {
+			nodesCap = maxsize + 1
+		}
+		nodes := make([]lruNode, 1, nodesCap)
+		nodes[0] = lruNode{prev: 0, next: 0}
 		cache := &pyLRUCache{
 			Header: val.ObjectHeader{
 				Kind: val.KindNative,
@@ -362,8 +526,10 @@ func (e *Engine) createFunctoolsModule() val.Value {
 			},
 			UserFunction: userFn,
 			Maxsize:      maxsize,
+			Typed:        typed,
 			CacheInfoCls: cacheInfoCls,
-			Cache:        make(map[string]*lruEntry),
+			Cache:        val.NewDictVal(nodesCap).AsDict(),
+			nodes:        nodes,
 		}
 		return val.ObjectVal((*val.ObjectHeader)(unsafe.Pointer(&cache.Header)))
 	}))

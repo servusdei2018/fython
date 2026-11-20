@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"unsafe"
@@ -34,11 +35,81 @@ type pyBytesIO struct {
 	mu   sync.RWMutex
 }
 
+type strIOBufBox struct {
+	b []byte
+}
+
 type pyStringIO struct {
-	inst val.PyInstance // must be first: Header lives at offset 0
-	buf  []byte
-	pos  int
-	mu   sync.RWMutex
+	inst    val.PyInstance // must be first: Header lives at offset 0
+	buf     []byte
+	pos     int
+	mu      sync.RWMutex
+	box     *strIOBufBox
+	cleanup runtime.Cleanup
+}
+
+var stringIOBufPool = sync.Pool{
+	New: func() any {
+		return &strIOBufBox{b: make([]byte, 0, 131072)}
+	},
+}
+
+func releaseStrIOBox(box *strIOBufBox) {
+	if box == nil || box.b == nil {
+		return
+	}
+	if cap(box.b) >= 131072 && cap(box.b) <= 4<<20 {
+		box.b = box.b[:0]
+		stringIOBufPool.Put(box)
+		return
+	}
+	box.b = nil
+}
+
+func newStringIO(cls *val.PyType) *pyStringIO {
+	box := stringIOBufPool.Get().(*strIOBufBox)
+	sio := &pyStringIO{
+		inst: val.PyInstance{
+			Header: val.ObjectHeader{Kind: val.KindInstance, Type: cls},
+			Shape:  cls.RootShape,
+		},
+		buf: box.b[:0],
+		box: box,
+	}
+	sio.cleanup = runtime.AddCleanup(sio, releaseStrIOBox, box)
+	return sio
+}
+
+func appendStringIOWrite(sio *pyStringIO, arg val.Value) int {
+	oldLen := len(sio.buf)
+	var ok bool
+	sio.buf, ok = val.AppendValueBytes(sio.buf, arg)
+	if !ok {
+		s := arg.AsString()
+		view := unsafe.Slice(unsafe.StringData(s), len(s))
+		sio.buf = append(sio.buf, view...)
+	}
+	if sio.box != nil && cap(sio.buf) != cap(sio.box.b) {
+		sio.box.b = sio.buf[:0]
+	}
+	sio.pos = len(sio.buf)
+	return sio.pos - oldLen
+}
+
+func releaseStringIOBuf(sio *pyStringIO) {
+	sio.cleanup.Stop()
+	if sio.box != nil {
+		box := sio.box
+		sio.box = nil
+		if sio.buf != nil && cap(sio.buf) > cap(box.b) {
+			box.b = sio.buf[:0]
+		} else {
+			box.b = box.b[:0]
+		}
+		releaseStrIOBox(box)
+	}
+	sio.buf = nil
+	sio.pos = 0
 }
 
 type pyFile struct {
@@ -349,32 +420,26 @@ func initIOTypes() {
 			v := args[1]
 			oldLen := len(sio.buf)
 			if sio.pos == oldLen {
-				var ok bool
-				sio.buf, ok = val.AppendValueBytes(sio.buf, v)
-				if !ok {
-					s := v.AsString()
-					view := unsafe.Slice(unsafe.StringData(s), len(s))
-					sio.buf = append(sio.buf, view...)
-				}
-				written := len(sio.buf) - oldLen
-				sio.pos = len(sio.buf)
+				written := appendStringIOWrite(sio, v)
 				if isMT {
 					sio.mu.Unlock()
 				}
 				return val.Int64Val(int64(written))
 			} else {
-				var tmp []byte
-				var ok bool
-				tmp, ok = val.AppendValueBytes(tmp, v)
+				var stackTmp [64]byte
+				tmp, ok := val.AppendValueBytes(stackTmp[:0], v)
 				if !ok {
 					s := v.AsString()
 					view := unsafe.Slice(unsafe.StringData(s), len(s))
-					tmp = append(tmp, view...)
+					tmp = append(stackTmp[:0], view...)
 				}
 				if sio.pos+len(tmp) <= len(sio.buf) {
 					copy(sio.buf[sio.pos:], tmp)
 				} else {
 					sio.buf = append(sio.buf[:sio.pos], tmp...)
+				}
+				if sio.box != nil && cap(sio.buf) != cap(sio.box.b) {
+					sio.box.b = sio.buf[:0]
 				}
 				sio.pos += len(tmp)
 				if isMT {
@@ -464,6 +529,12 @@ func initIOTypes() {
 				return args[0]
 			})
 			exit := val.NewBuiltinFuncVal("__exit__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+				if t == StringIOType && len(args) > 0 && args[0].IsInstance() {
+					sio := (*pyStringIO)(val.AsPointer(args[0]))
+					sio.mu.Lock()
+					releaseStringIOBuf(sio)
+					sio.mu.Unlock()
+				}
 				return val.NoneVal()
 			})
 			t.Dict.Set(val.InternString("flush"), noop)
@@ -580,8 +651,7 @@ func initIOTypes() {
 		StringIOType.Dict.Set(val.InternString("close"), val.NewBuiltinFuncVal("close", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			sio := (*pyStringIO)(val.AsPointer(args[0]))
 			sio.mu.Lock()
-			sio.buf = nil
-			sio.pos = 0
+			releaseStringIOBuf(sio)
 			sio.mu.Unlock()
 			return val.NoneVal()
 		}))
@@ -591,13 +661,7 @@ func initIOTypes() {
 			if len(args) > 0 && args[0].IsType() {
 				cls = args[0].AsType()
 			}
-			sio := &pyStringIO{
-				inst: val.PyInstance{
-					Header: val.ObjectHeader{Kind: val.KindInstance, Type: cls},
-					Shape:  cls.RootShape,
-				},
-				buf: make([]byte, 0, 131072),
-			}
+			sio := newStringIO(cls)
 			return val.ObjectVal(&sio.inst.Header)
 		}))
 		StringIOType.Dict.Set(val.DunderInit, val.NewBuiltinFuncVal("__init__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {

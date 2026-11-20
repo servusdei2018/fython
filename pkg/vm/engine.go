@@ -797,6 +797,21 @@ func (e *Engine) newVMInternal(stackCap, frameCap int) *VM {
 	if nextVal, ok := e.builtins.Get(nameBuiltinNext); ok {
 		v.builtinNext = nextVal
 	}
+	if anyVal, ok := e.builtins.Get(val.InternString("any")); ok {
+		v.builtinAny = anyVal
+	}
+	if allVal, ok := e.builtins.Get(val.InternString("all")); ok {
+		v.builtinAll = allVal
+	}
+	if sumVal, ok := e.builtins.Get(val.InternString("sum")); ok {
+		v.builtinSum = sumVal
+	}
+	if minVal, ok := e.builtins.Get(val.InternString("min")); ok {
+		v.builtinMin = minVal
+	}
+	if maxVal, ok := e.builtins.Get(val.InternString("max")); ok {
+		v.builtinMax = maxVal
+	}
 	if superVal, ok := e.builtins.Get(nameSuper); ok {
 		v.builtinSuper = superVal
 	}

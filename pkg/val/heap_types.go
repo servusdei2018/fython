@@ -334,19 +334,26 @@ const (
 	IterKindBytes
 	IterKindByteArray
 	IterKindSet
+	IterKindRepeat
+	IterKindISlice
+	IterKindChain
+	IterKindChainFromIterable
 )
 
-// PyIter represents a zero-allocation iterator over lists, tuples, dicts, or ranges.
+// PyIter represents a zero-allocation iterator over lists, tuples, dicts, ranges, or itertools streams.
 // Header MUST be at offset 0.
 type PyIter struct {
-	Header ObjectHeader
-	Kind   IterKind
-	Obj    Value
-	Idx    int
-	Cur    int64
-	Stop   int64
-	Step   int64
-	NextFn func() (Value, bool)
+	Header  ObjectHeader
+	Kind    IterKind
+	Obj     Value
+	Sub     Value
+	Seq     []Value
+	Idx     int
+	Cur     int64
+	NextIdx int64
+	Stop    int64
+	Step    int64
+	NextFn  func() (Value, bool)
 }
 
 // GenState classifies the lifecycle state of a PyGenerator.
@@ -1078,6 +1085,7 @@ func (v Value) AsCell() *PyCell {
 
 // Append adds a Value to the end of the PyList in a thread-safe manner.
 func (l *PyList) Append(v Value) {
+	ClearEphemeral(v)
 	l.mu.Lock()
 	l.Items = append(l.Items, v)
 	l.mu.Unlock()
@@ -1263,16 +1271,130 @@ func NewIterValWithNext(nextFn func() (Value, bool)) Value {
 	return Value{num: 0, ptr: &it.Header}
 }
 
+// NewRepeatIterVal constructs a concrete PyIter for itertools.repeat(obj[, times]).
+// times < 0 encodes an infinite repeat stream.
+func NewRepeatIterVal(obj Value, times int64) Value {
+	it := &PyIter{
+		Header: ObjectHeader{Kind: KindIter, Type: IterType},
+		Kind:   IterKindRepeat,
+		Obj:    obj,
+		Stop:   times,
+	}
+	return Value{num: 0, ptr: &it.Header}
+}
+
+// NewISliceIterVal constructs a concrete PyIter for itertools.islice(it, start, stop, step).
+// stop < 0 encodes an unbounded slice end.
+func NewISliceIterVal(iterObj Value, start, stop, step int64) Value {
+	it := &PyIter{
+		Header:  ObjectHeader{Kind: KindIter, Type: IterType},
+		Kind:    IterKindISlice,
+		Obj:     iterObj,
+		NextIdx: start,
+		Stop:    stop,
+		Step:    step,
+	}
+	return Value{num: 0, ptr: &it.Header}
+}
+
+// NewChainIterVal constructs a concrete PyIter for itertools.chain(*iterables).
+func NewChainIterVal(iterables []Value) Value {
+	it := &PyIter{
+		Header: ObjectHeader{Kind: KindIter, Type: IterType},
+		Kind:   IterKindChain,
+		Seq:    iterables,
+	}
+	return Value{num: 0, ptr: &it.Header}
+}
+
+// NewChainFromIterableVal constructs a concrete PyIter for itertools.chain.from_iterable(iterable).
+func NewChainFromIterableVal(outerIter Value) Value {
+	it := &PyIter{
+		Header: ObjectHeader{Kind: KindIter, Type: IterType},
+		Kind:   IterKindChainFromIterable,
+		Obj:    outerIter,
+	}
+	return Value{num: 0, ptr: &it.Header}
+}
+
 // AsIter performs a zero-cost offset-0 downcast from Value to *PyIter.
 func (v Value) AsIter() *PyIter {
 	return (*PyIter)(unsafe.Pointer(v.ptr))
 }
 
+func advanceIterNext(ctx *ExecContext, obj Value) (Value, bool) {
+	if obj.IsIter() {
+		return obj.AsIter().NextCtx(ctx)
+	}
+	if obj.IsGenerator() {
+		v, status := obj.AsGenerator().Send(ctx, NoneVal())
+		if status == IterYielded {
+			return v, true
+		}
+		return NoneVal(), false
+	}
+	if tp := obj.Type(); tp != nil && tp.Slots.TpIterNext != nil {
+		v, status := tp.Slots.TpIterNext(ctx, obj)
+		if status == IterYielded {
+			return v, true
+		}
+		return NoneVal(), false
+	}
+	if ctx != nil {
+		if nextFn, _, ok := obj.Type().LookupMRO(DunderNext); ok {
+			v := ctx.Invoke1(nextFn, obj)
+			if !ctx.HasException() {
+				return v, true
+			}
+			if ctx.ActiveException.Type() == StopIterationType {
+				ctx.ClearException()
+			}
+		}
+	}
+	return NoneVal(), false
+}
+
+func resolveChainSubIter(ctx *ExecContext, obj Value) Value {
+	if obj.IsIter() || obj.IsGenerator() {
+		return obj
+	}
+	if tp := obj.Type(); tp != nil {
+		if tpIter := tp.Slots.TpIter; tpIter != nil {
+			res := tpIter(ctx, obj)
+			if !res.IsNone() || (ctx == nil || !ctx.HasException()) {
+				return res
+			}
+			return NoneVal()
+		}
+		if iterFn, _, ok := tp.LookupMRO(DunderIter); ok && !iterFn.IsNone() && ctx != nil {
+			res := ctx.Invoke1(iterFn, obj)
+			if !ctx.HasException() {
+				return res
+			}
+			return NoneVal()
+		}
+	}
+	return NewIterVal(obj)
+}
+
 // Next advances the iterator and returns the next Value and true, or NoneVal() and false when exhausted.
 func (it *PyIter) Next() (Value, bool) {
+	return it.NextCtx(nil)
+}
+
+// NextCtx advances the iterator using ctx when resuming generators or calling custom dunder hooks.
+func (it *PyIter) NextCtx(ctx *ExecContext) (Value, bool) {
 	switch it.Kind {
 	case IterKindList:
 		list := it.Obj.AsList()
+		if !MultiThreadedFlag.Load() {
+			if it.Idx >= len(list.Items) {
+				return NoneVal(), false
+			}
+			res := list.Items[it.Idx]
+			it.Idx++
+			return res, true
+		}
 		res, ok := list.Get(it.Idx)
 		if !ok {
 			return NoneVal(), false
@@ -1286,6 +1408,13 @@ func (it *PyIter) Next() (Value, bool) {
 		}
 		res := tuple.Items[it.Idx]
 		it.Idx++
+		return res, true
+	case IterKindRange:
+		if (it.Step > 0 && it.Cur >= it.Stop) || (it.Step < 0 && it.Cur <= it.Stop) {
+			return NoneVal(), false
+		}
+		res := Int64Val(it.Cur)
+		it.Cur += it.Step
 		return res, true
 	case IterKindDict:
 		dict := it.Obj.AsDict()
@@ -1318,20 +1447,89 @@ func (it *PyIter) Next() (Value, bool) {
 			}
 		}
 		return NoneVal(), false
-	case IterKindRange:
-		if (it.Step > 0 && it.Cur >= it.Stop) || (it.Step < 0 && it.Cur <= it.Stop) {
-			return NoneVal(), false
-		}
-		res := Int64Val(it.Cur)
-		it.Cur += it.Step
-		return res, true
 	case IterKindGenerator:
 		gen := it.Obj.AsGenerator()
-		v, status := gen.Send(nil, NoneVal())
-		if status == IterExhausted {
+		v, status := gen.Send(ctx, NoneVal())
+		if status == IterExhausted || status == IterError {
 			return NoneVal(), false
 		}
 		return v, true
+	case IterKindRepeat:
+		if it.Stop >= 0 {
+			if it.Cur >= it.Stop {
+				return NoneVal(), false
+			}
+			it.Cur++
+		}
+		return it.Obj, true
+	case IterKindISlice:
+		if it.Stop >= 0 && it.NextIdx >= it.Stop {
+			return NoneVal(), false
+		}
+		for it.Cur < it.NextIdx {
+			if _, ok := advanceIterNext(ctx, it.Obj); !ok {
+				it.Stop = it.Cur
+				return NoneVal(), false
+			}
+			it.Cur++
+		}
+		v, ok := advanceIterNext(ctx, it.Obj)
+		if !ok {
+			it.Stop = it.Cur
+			return NoneVal(), false
+		}
+		it.Cur++
+		const maxInt64 = int64(^uint64(0) >> 1)
+		if it.NextIdx > maxInt64-it.Step {
+			it.NextIdx = maxInt64
+			it.Stop = it.Cur
+		} else {
+			it.NextIdx += it.Step
+		}
+		return v, true
+	case IterKindChain:
+		for {
+			if !it.Sub.IsNone() && it.Sub.ptr != nil {
+				if v, ok := advanceIterNext(ctx, it.Sub); ok {
+					return v, true
+				}
+				it.Sub = Value{}
+				if ctx != nil && ctx.HasException() {
+					return NoneVal(), false
+				}
+			}
+			if it.Idx >= len(it.Seq) {
+				return NoneVal(), false
+			}
+			subObj := it.Seq[it.Idx]
+			it.Idx++
+			sub := resolveChainSubIter(ctx, subObj)
+			if ctx != nil && ctx.HasException() {
+				return NoneVal(), false
+			}
+			it.Sub = sub
+		}
+	case IterKindChainFromIterable:
+		for {
+			if !it.Sub.IsNone() && it.Sub.ptr != nil {
+				if v, ok := advanceIterNext(ctx, it.Sub); ok {
+					return v, true
+				}
+				it.Sub = Value{}
+				if ctx != nil && ctx.HasException() {
+					return NoneVal(), false
+				}
+			}
+			subIterable, ok := advanceIterNext(ctx, it.Obj)
+			if !ok {
+				return NoneVal(), false
+			}
+			sub := resolveChainSubIter(ctx, subIterable)
+			if ctx != nil && ctx.HasException() {
+				return NoneVal(), false
+			}
+			it.Sub = sub
+		}
 	case IterKindFunc:
 		if it.NextFn != nil {
 			return it.NextFn()
@@ -2072,6 +2270,37 @@ func (d *PyDict) ResetForPool() {
 	d.Header.Flags &^= FlagEphemeralDict | FlagEphemeralFrameDict
 }
 
+// IsMediumPoolable reports whether d has no external owner and holds a 32-slot
+// hash table (up to 16 entries / maxDense 21) for medium dict freelist reuse.
+func (d *PyDict) IsMediumPoolable() bool {
+	return d.owner == nil && len(d.indices) == 32 && cap(d.Entries) == 21
+}
+
+// InitMediumTable prepares a pooled medium PyDict for reuse without reallocating.
+func (d *PyDict) InitMediumTable() {
+	clear(d.indices)
+	d.mask = 31
+	d.indexShift = 0
+	d.used = 0
+	d.filled = 0
+	d.Entries = d.Entries[:0]
+}
+
+// ResetMediumForPool zeroes all entries/indices while retaining the 32-slot table.
+func (d *PyDict) ResetMediumForPool() {
+	if cap(d.Entries) > 0 {
+		clear(d.Entries[:cap(d.Entries)])
+		d.Entries = d.Entries[:0]
+	}
+	clear(d.indices)
+	d.mask = 0
+	d.used = 0
+	d.filled = 0
+	d.indexShift = 0
+	d.VersionTag = 0
+	d.Header.Flags &^= FlagEphemeralDict | FlagEphemeralFrameDict
+}
+
 // Set inserts or updates a key-value pair in PyDict while preserving insertion order
 // and keeping the first-inserted key on value updates (Python dict invariant) in a thread-safe manner.
 // lockDict takes the dictionary lock when the runtime is multi-threaded.
@@ -2131,6 +2360,19 @@ func dictKeyEqual(a, b Value) bool {
 func (d *PyDict) setLocked(key, value Value) {
 	if len(d.indices) == 0 {
 		d.initTable(4)
+	}
+	if d.Live == nil && d.mask == 7 && d.indexShift == 0 {
+		for i := range d.Entries {
+			e := &d.Entries[i]
+			if e.Active && (e.Key == key || dictKeyEqual(e.Key, key)) {
+				e.Value = value
+				atomic.AddUint64(&d.VersionTag, 1)
+				if d.owner != nil {
+					d.owner.bumpVersion()
+				}
+				return
+			}
+		}
 	}
 
 	h := HashValue(key)
@@ -2315,6 +2557,15 @@ func (d *PyDict) getWithSlotLocked(key Value) (Value, int, bool) {
 	if d.used == 0 {
 		return NoneVal(), -1, false
 	}
+	if d.Live == nil && d.mask == 7 && d.indexShift == 0 {
+		for i := range d.Entries {
+			e := &d.Entries[i]
+			if e.Active && (e.Key == key || dictKeyEqual(e.Key, key)) {
+				return e.Value, i, true
+			}
+		}
+		return NoneVal(), -1, false
+	}
 
 	h := HashValue(key)
 	mask := d.mask
@@ -2355,6 +2606,15 @@ func (d *PyDict) getWithSlotLocked(key Value) (Value, int, bool) {
 
 func (d *PyDict) getLocked(key Value) (Value, bool) {
 	if d.used == 0 {
+		return NoneVal(), false
+	}
+	if d.Live == nil && d.mask == 7 && d.indexShift == 0 {
+		for i := range d.Entries {
+			e := &d.Entries[i]
+			if e.Active && (e.Key == key || dictKeyEqual(e.Key, key)) {
+				return e.Value, true
+			}
+		}
 		return NoneVal(), false
 	}
 
@@ -2569,6 +2829,11 @@ func (s *PySet) Add(v Value) {
 // DictEntries returns the underlying dict entry slice for direct iteration.
 func (s *PySet) DictEntries() []DictEntry {
 	return s.dict.Entries
+}
+
+// IsUnhashableValue reports whether v contains an unhashable type name.
+func IsUnhashableValue(v Value) (string, bool) {
+	return isUnhashableValue(v)
 }
 
 func isUnhashableValue(v Value) (string, bool) {

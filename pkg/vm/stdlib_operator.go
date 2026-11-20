@@ -64,11 +64,17 @@ func initOperatorTypes() {
 			if len(ig.items) == 1 {
 				return val.GetItemCtx(ctx, args[0], ig.items[0])
 			}
-			res := make([]val.Value, len(ig.items))
+			var buf [4]val.Value
+			var res []val.Value
+			if len(ig.items) <= len(buf) {
+				res = buf[:len(ig.items)]
+			} else {
+				res = make([]val.Value, len(ig.items))
+			}
 			for i, it := range ig.items {
 				res[i] = val.GetItemCtx(ctx, args[0], it)
 			}
-			return val.NewTupleVal(res...)
+			return val.NewTupleFromSlice(res)
 		}
 		itemgetterType.Dict.Set(val.InternString("__call__"), val.NewBuiltinFuncVal("__call__", itemgetterType.Slots.TpCall))
 

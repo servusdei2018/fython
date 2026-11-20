@@ -323,3 +323,79 @@ for _ in range(5):
 `)
 	eng.ReleaseVM(v)
 }
+
+func TestSuperinstructionSlotsPropertyAndEndToEnd(t *testing.T) {
+	eng, v := runPySource(t, `
+class Slotted:
+    __slots__ = ("x", "y")
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+    @property
+    def total(self):
+        return self.x + self.y
+    @total.setter
+    def total(self, v):
+        self.x = v - self.y
+    def __lt__(self, other):
+        if isinstance(other, Slotted):
+            return self.x < other.x
+        return NotImplemented
+
+class PolyA:
+    def __init__(self, v):
+        self.v = v
+class PolyB:
+    def __init__(self, k, v):
+        self.k = k
+        self.v = v
+
+def poly_sum(items):
+    tot = 0
+    for it in items:
+        tot = tot + it.v
+    return tot
+
+def run_loop(a, b):
+    s = 0
+    for i in range(25):
+        a.x = i
+        if a < b:
+            s += a.total + b.y
+        if a.x is not None:
+            s += 1
+        if i == 10:
+            a.total = 15
+            assert a.x == 13
+    return s
+
+assert run_loop(Slotted(1, 2), Slotted(10, 3)) == 120
+assert poly_sum([PolyA(1), PolyB(0, 2), PolyA(3), PolyB(0, 4)] * 5) == 50
+
+# Verify multiline traceback inside fused attribute/subscr/compare sites after Tier-2 warmup
+def fail_attr(obj):
+    x = 1
+    return obj.missing_attr
+
+def fail_subscr(d):
+    x = 1
+    return d["missing_key"]
+
+for _ in range(15):
+    try:
+        fail_attr(PolyA(1))
+    except AttributeError as e:
+        tb = e.__traceback__
+        while tb.tb_next is not None:
+            tb = tb.tb_next
+        assert tb.tb_lineno == fail_attr.__code__.co_firstlineno + 2, tb.tb_lineno
+    try:
+        fail_subscr({"a": 1})
+    except KeyError as e:
+        tb = e.__traceback__
+        while tb.tb_next is not None:
+            tb = tb.tb_next
+        assert tb.tb_lineno == fail_subscr.__code__.co_firstlineno + 2, tb.tb_lineno
+`)
+	eng.ReleaseVM(v)
+}

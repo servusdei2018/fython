@@ -210,9 +210,59 @@ func (p *pyPattern) subject(v val.Value) []rune {
 	panic("TypeError: expected string or bytes-like object, got '" + typeNameOf(v) + "'")
 }
 
-// subjectInto converts v into runes using buf on the caller's stack for ASCII
-// KindInlineStr values without allocating a string or rune slice.
-// Callers must ensure the returned slice is not stored in heap structs outliving buf.
+// subjectMatchFast decodes strVal for non-reentrant match calls into per-VM
+// reusable rune storage so repeated matches never allocate heap buffers.
+func (vm *VM) subjectMatchFast(v val.Value) []rune {
+	if val.IsInlineStrASCII(v) {
+		raw := v.RawNum()
+		n := int(raw & 0xFF)
+		for i := range n {
+			vm.reInlineBuf[i] = rune((raw >> ((uint(i) + 1) * 8)) & 0xFF)
+		}
+		return vm.reInlineBuf[:n]
+	}
+	if v.IsString() {
+		ps := v.AsStringObj()
+		if ps.Buf == nil {
+			s := ps.Data
+			n := len(s)
+			if ps == vm.lastReStr && n == vm.lastReStrLen {
+				return vm.lastReRunes
+			}
+			if n == 0 {
+				return vm.reInlineBuf[:0]
+			}
+			if cap(vm.lastReRunes) < n {
+				capNeed := max(n, 64)
+				vm.lastReRunes = make([]rune, n, capNeed)
+			} else {
+				vm.lastReRunes = vm.lastReRunes[:n]
+			}
+			dst := vm.lastReRunes
+			ascii := true
+			for i := range n {
+				b := s[i]
+				if b >= 0x80 {
+					ascii = false
+					break
+				}
+				dst[i] = rune(b)
+			}
+			if !ascii {
+				dst = dst[:0]
+				for _, r := range s {
+					dst = append(dst, r)
+				}
+				vm.lastReRunes = dst
+			}
+			vm.lastReStr = ps
+			vm.lastReStrLen = n
+			return dst
+		}
+	}
+	return nil
+}
+
 func (p *pyPattern) subjectInto(v val.Value, buf *[7]rune) []rune {
 	if !p.IsBytes && val.IsInlineStrASCII(v) {
 		raw := v.RawNum()
@@ -382,16 +432,23 @@ func purgeCache() {
 	patCacheMu.Unlock()
 }
 
-func newMatch(p *pyPattern, strVal val.Value, caps []int32, lastIndex, pos, endpos int) val.Value {
-	m := &pyMatch{
-		Header:    val.ObjectHeader{Kind: val.KindNative, Type: MatchType},
-		Pat:       p,
-		StringVal: strVal,
-		Pos:       int32(pos),
-		EndPos:    int32(endpos),
-		LastIndex: int32(lastIndex),
-		numCaps:   int32(len(caps)),
+func newMatch(ctx *val.ExecContext, p *pyPattern, strVal val.Value, caps []int32, lastIndex, pos, endpos int, flags uint8) val.Value {
+	var m *pyMatch
+	if ctx != nil && !val.MultiThreadedFlag.Load() {
+		if vm, ok := ctx.VM.(*VM); ok && vm != nil {
+			m = vm.acquireMatch()
+		}
 	}
+	if m == nil {
+		m = &pyMatch{}
+	}
+	m.Header = val.ObjectHeader{Kind: val.KindNative, Flags: flags, Type: MatchType}
+	m.Pat = p
+	m.StringVal = strVal
+	m.Pos = int32(pos)
+	m.EndPos = int32(endpos)
+	m.LastIndex = int32(lastIndex)
+	m.numCaps = int32(len(caps))
 	if len(caps) <= len(m.inlineCaps) {
 		copy(m.inlineCaps[:], caps)
 	} else {
@@ -466,15 +523,23 @@ func (p *pyPattern) posArgs(ctx *val.ExecContext, in []rune, posV, endV val.Valu
 }
 
 func (p *pyPattern) doMatch(ctx *val.ExecContext, mode sre.Mode, strVal, posV, endV val.Value) val.Value {
-	var buf [7]rune
-	in := p.subjectInto(strVal, &buf)
+	var in []rune
+	if !p.IsBytes && ctx != nil && !val.MultiThreadedFlag.Load() &&
+		(posV.IsNone() || posV.IsInt64()) && (endV.IsNone() || endV.IsInt64()) {
+		if vm, ok := ctx.VM.(*VM); ok && vm != nil {
+			in = vm.subjectMatchFast(strVal)
+		}
+	}
+	if in == nil {
+		in = p.subject(strVal)
+	}
 	pos, end := p.posArgs(ctx, in, posV, endV)
 	var capsBuf [32]int32
 	caps, last, ok := p.Re.ExecInto(in, pos, end, mode, false, capsBuf[:0])
 	if !ok {
 		return val.NoneVal()
 	}
-	return newMatch(p, strVal, caps, last, pos, end)
+	return newMatch(ctx, p, strVal, caps, last, pos, end, 0)
 }
 
 // iterate drives the CPython 3.7+ iteration protocol used by findall,
@@ -622,8 +687,14 @@ func (p *pyPattern) sub(ctx *val.ExecContext, repl, strVal, countV val.Value) (v
 		out = append(out, in[lastPos:int(caps[0])]...)
 		switch {
 		case isCallable:
-			mv := newMatch(p, strVal, caps, last, 0, len(in))
+			mv := newMatch(ctx, p, strVal, caps, last, 0, len(in), val.FlagEphemeralMatch)
 			res := ctx.Invoke1(repl, mv)
+			if vm, ok := ctx.VM.(*VM); ok && vm != nil && !val.MultiThreadedFlag.Load() {
+				m := (*pyMatch)(unsafe.Pointer(mv.HeaderPtr()))
+				if (m.Header.Flags&val.FlagEphemeralMatch) != 0 && res.HeaderPtr() != &m.Header {
+					vm.releaseMatch(m)
+				}
+			}
 			out = append(out, p.valueRunes(res)...)
 		case isLiteral:
 			out = append(out, literal...)
@@ -676,7 +747,7 @@ func (sc *pyScanner) step(ctx *val.ExecContext, mode sre.Mode) val.Value {
 	}
 	sc.mustAdv = caps[1] == caps[0]
 	sc.next = int(caps[1])
-	return newMatch(sc.Pat, sc.StringVal, caps, last, sc.Pos, sc.EndPos)
+	return newMatch(ctx, sc.Pat, sc.StringVal, caps, last, sc.Pos, sc.EndPos, 0)
 }
 
 func (p *pyPattern) newScanner(ctx *val.ExecContext, patVal, strVal, posV, endV val.Value) *pyScanner {
@@ -831,10 +902,16 @@ func initSRETypes() {
 		offsetFn := func(name string, f func(s, e int) val.Value) {
 			method(MatchType, name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 				m := asMatch(args[0])
-				b := bindArgs(name, args[1:], kwnames, "group")
 				g := 0
-				if !b[0].IsUnbound() {
-					g = m.group(ctx, b[0])
+				if len(kwnames) == 0 && len(args) <= 2 {
+					if len(args) == 2 {
+						g = m.group(ctx, args[1])
+					}
+				} else {
+					b := bindArgs(name, args[1:], kwnames, "group")
+					if !b[0].IsUnbound() {
+						g = m.group(ctx, b[0])
+					}
 				}
 				s, e := m.capBounds(g)
 				return f(s, e)
@@ -927,10 +1004,22 @@ func initSRETypes() {
 			name string
 			mode sre.Mode
 		}{{"match", sre.ModeMatch}, {"prefixmatch", sre.ModeMatch}, {"fullmatch", sre.ModeFullMatch}, {"search", sre.ModeSearch}} {
-			method(PatternType, spec.name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			mode := spec.mode
+			name := spec.name
+			method(PatternType, name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 				p := asPattern(args[0])
-				b := bindArgs(spec.name, args[1:], kwnames, "string", "pos", "endpos")
-				return p.doMatch(ctx, spec.mode, required(spec.name, b[0], "string"), b[1], b[2])
+				if len(kwnames) == 0 && len(args) >= 2 && len(args) <= 4 {
+					var posV, endV val.Value
+					if len(args) >= 3 {
+						posV = args[2]
+					}
+					if len(args) == 4 {
+						endV = args[3]
+					}
+					return p.doMatch(ctx, mode, args[1], posV, endV)
+				}
+				b := bindArgs(name, args[1:], kwnames, "string", "pos", "endpos")
+				return p.doMatch(ctx, mode, required(name, b[0], "string"), b[1], b[2])
 			})
 		}
 		method(PatternType, "findall", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {

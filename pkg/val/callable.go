@@ -30,25 +30,25 @@ var StrJoinBuiltin Value
 var ListExtendBuiltin Value
 
 // PyTuple represents an immutable sequence of Values on the heap (used for kwnames and tuple constants).
-// Tuples with up to 2 elements store their backing array inline inside the same allocation (80 B size class).
+// Tuples with up to 4 elements store their backing array inline inside the same allocation (112 B size class).
 // Header MUST be at byte offset 0.
 type PyTuple struct {
 	Header ObjectHeader
 	Items  []Value
 	Attrs  *PyDict
-	inline [2]Value
+	inline [4]Value
 }
 
-// SetInline copies up to 2 elements into t's inline storage and binds t.Items.
+// SetInline copies up to 4 elements into t's inline storage and binds t.Items.
 func (t *PyTuple) SetInline(src []Value) {
 	n := len(src)
 	copy(t.inline[:n], src)
 	t.Items = t.inline[:n]
 }
 
-// ClearInline zeroes t's inline storage and clears t.Items for freelist reuse.
+// ClearInline zeroes all 4 slots of t's inline storage and clears t.Items for freelist reuse.
 func (t *PyTuple) ClearInline() {
-	t.inline = [2]Value{}
+	t.inline = [4]Value{}
 	t.Items = nil
 }
 
@@ -130,13 +130,13 @@ func NewTupleVal(items ...Value) Value {
 }
 
 // NewTupleFromSlice constructs a tuple copying elements from src.
-// For 1..2 elements, it performs a single allocation with no separate slice backing array.
+// For 1..4 elements, it performs a single allocation with no separate slice backing array.
 func NewTupleFromSlice(src []Value) Value {
 	n := len(src)
 	if n == 0 && TupleType != nil {
 		return EmptyTupleVal()
 	}
-	if n <= 2 {
+	if n <= len(PyTuple{}.inline) {
 		obj := &PyTuple{
 			Header: ObjectHeader{
 				Kind: KindTuple,
@@ -192,7 +192,7 @@ func NewTuple2(a, b Value) Value {
 			Kind: KindTuple,
 			Type: TupleType,
 		},
-		inline: [2]Value{a, b},
+		inline: [4]Value{a, b},
 	}
 	obj.Items = obj.inline[:2]
 	return Value{num: 0, ptr: &obj.Header}
@@ -3029,9 +3029,34 @@ func ExtractIterableItems(ctx *ExecContext, arg Value) []Value {
 			ctx.Raise(NewException(TypeErrorType, "'"+it.Obj.Type().Name+"' object is not iterable"))
 			return nil
 		}
+		if ctx == nil && AcquireExecContextHook != nil &&
+			(it.Kind == IterKindGenerator || it.Kind == IterKindISlice || it.Kind == IterKindChain || it.Kind == IterKindChainFromIterable) {
+			var release func()
+			ctx, release = AcquireExecContextHook()
+			defer release()
+		}
 		var res []Value
+		switch it.Kind {
+		case IterKindRepeat:
+			if it.Stop >= 0 && it.Cur < it.Stop {
+				rem := int(it.Stop - it.Cur)
+				res = make([]Value, rem)
+				for i := range res {
+					res[i] = it.Obj
+				}
+				it.Cur = it.Stop
+				return res
+			}
+		case IterKindISlice:
+			if it.Stop >= 0 && it.NextIdx < it.Stop {
+				est := min((it.Stop-it.NextIdx+it.Step-1)/it.Step, 4096)
+				if est > 0 {
+					res = make([]Value, 0, int(est))
+				}
+			}
+		}
 		for {
-			v, ok := it.Next()
+			v, ok := it.NextCtx(ctx)
 			if !ok {
 				break
 			}
@@ -4206,7 +4231,9 @@ func initTypes() {
 		inst := NewInstanceOfType(cls)
 		instInst := inst.AsInstance()
 		if len(instInst.Slots) == 0 {
-			instInst.Slots = []Value{s}
+			if !instInst.ExtendBootstrapSlot(0, s) {
+				instInst.Slots = []Value{s}
+			}
 		} else {
 			instInst.Slots[0] = s
 		}
@@ -4919,17 +4946,49 @@ func initTypes() {
 		l.mu.Lock()
 		items := append([]Value(nil), l.Items...)
 		l.mu.Unlock()
-		sort.SliceStable(items, func(i, j int) bool {
-			a, b := items[i], items[j]
-			if keyFn.ptr != nil && !keyFn.IsNone() {
-				a = ctx.Call(keyFn, []Value{a}, nil)
-				b = ctx.Call(keyFn, []Value{b}, nil)
+		origLen := len(items)
+		if keyFn.ptr != nil && !keyFn.IsNone() {
+			type sortPair struct {
+				val Value
+				key Value
 			}
-			if reverse {
-				return LessThan(b, a).IsTruthy()
+			pairs := make([]sortPair, origLen)
+			for i, itm := range items {
+				k := ctx.Invoke1(keyFn, itm)
+				if ctx != nil && ctx.HasException() {
+					clear(pairs)
+					return NoneVal()
+				}
+				pairs[i] = sortPair{val: itm, key: k}
 			}
-			return LessThan(a, b).IsTruthy()
-		})
+			l.mu.Lock()
+			modified := len(l.Items) != origLen
+			l.mu.Unlock()
+			if modified {
+				clear(pairs)
+				if ctx != nil {
+					ctx.Raise(NewException(ValueErrorType, "list modified during sort"))
+				}
+				return NoneVal()
+			}
+			sort.SliceStable(pairs, func(i, j int) bool {
+				if reverse {
+					return LessThan(pairs[j].key, pairs[i].key).IsTruthy()
+				}
+				return LessThan(pairs[i].key, pairs[j].key).IsTruthy()
+			})
+			for i, p := range pairs {
+				items[i] = p.val
+			}
+			clear(pairs)
+		} else {
+			sort.SliceStable(items, func(i, j int) bool {
+				if reverse {
+					return LessThan(items[j], items[i]).IsTruthy()
+				}
+				return LessThan(items[i], items[j]).IsTruthy()
+			})
+		}
 		l.mu.Lock()
 		l.Items = items
 		l.mu.Unlock()
@@ -5579,8 +5638,14 @@ func initTypes() {
 			}
 			var buf [8]Value
 			items := buf[:0]
+			if it.Kind == IterKindISlice && it.Stop >= 0 && it.NextIdx < it.Stop {
+				est := (it.Stop - it.NextIdx + it.Step - 1) / it.Step
+				if est > 8 && est <= 4096 {
+					items = make([]Value, 0, int(est))
+				}
+			}
 			for {
-				v, ok := it.Next()
+				v, ok := it.NextCtx(ctx)
 				if !ok {
 					break
 				}
@@ -6467,7 +6532,7 @@ func initTypes() {
 	IterType.Slots.TpIter = func(ctx *ExecContext, o Value) Value { return o }
 	IterType.Slots.TpIterNext = func(ctx *ExecContext, o Value) (Value, IterStatus) {
 		it := o.AsIter()
-		v, ok := it.Next()
+		v, ok := it.NextCtx(ctx)
 		if ok {
 			return v, IterYielded
 		}

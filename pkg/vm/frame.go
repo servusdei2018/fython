@@ -39,6 +39,7 @@ const (
 	ICKindClassFunc                 // Plain function found on the class: bind to the receiver without an MRO walk
 	ICKindTupleGetter               // namedtuple field: read Items[SlotIndex] of a tuple-kind receiver
 	ICKindTypeAttr                  // Receiver is a type; CachedVal holds the already-resolved class attribute
+	ICKindTypeMethod                // Receiver is a type; CachedVal/CalleeCache/NativeFn holds resolved method call target
 	ICKindSuperMethod               // super(ThisClass, Self) MRO resolution guarded by selfType + ThisClass versions
 	ICKindPropertySet               // @property setter (CachedVal holds fset) dispatched without descriptor machinery
 	ICKindInstanceTransition        // Shape-transitioning attribute store (OldShape -> NewShape via transitionIC)
@@ -165,6 +166,12 @@ const (
 	genModeCollectTuple // tuple(gen): drain yielded values directly into CallFrame.collectState
 	genModeCollectSet   // set(gen): drain yielded values directly into CallFrame.collectState
 	genModeListExtend   // list.extend(gen): drain yielded values directly into CallFrame.collectState.list
+	genModeCollectDict  // dict(gen): drain 2-item yielded pairs directly into CallFrame.collectState.dict
+	genModeAny          // any(gen): short-circuit True on first truthy yield
+	genModeAll          // all(gen): short-circuit False on first falsy yield
+	genModeSum          // sum(gen[, start]): accumulate yielded numbers inline
+	genModeMin          // min(gen): track minimum yielded item inline
+	genModeMax          // max(gen): track maximum yielded item inline
 )
 
 type strJoinState struct {
@@ -176,9 +183,18 @@ type strJoinState struct {
 }
 
 type collectState struct {
-	items []val.Value
-	set   *val.PySet
-	list  *val.PyList
+	items      []val.Value
+	set        *val.PySet
+	list       *val.PyList
+	dict       *val.PyDict
+	acc        val.Value
+	hasAcc     bool
+	isSlice    bool
+	sliceCur   int64
+	sliceNext  int64
+	sliceStop  int64
+	sliceStep  int64
+	isliceIter *val.PyIter
 }
 
 // CallFrame is an unboxed value struct stored in the contiguous VM.frames slab.
@@ -295,6 +311,7 @@ type CodeObject struct {
 	HasCells             bool
 	HasCellVars          bool
 	ParamShapeComputed   bool
+	EntryIP              int
 	// stream publishes the instruction slice the VM executes. It is created
 	// together with the code object, before the object is shared between VMs.
 	stream *codeStream
@@ -357,7 +374,7 @@ func reloadCode(co *CodeObject, cache *VMCodeCache, gen int32) []uint32 {
 		for i, oldInst := range cache.active {
 			switch DecodeOpcode(oldInst) {
 			case OP_CALL_PY_EXACT_ARGS, OP_CALL_BUILTIN_FAST, OP_CALL_LEN, OP_CALL_ISINSTANCE, OP_CALL_TYPE_INIT,
-				OP_CALL_HASATTR, OP_CALL_GETATTR:
+				OP_CALL_HASATTR, OP_CALL_GETATTR, OP_CALL_BOUND_NATIVE:
 				if DecodeOpcode(priv[i]) == OP_CALL {
 					priv[i] = oldInst
 				}
@@ -371,6 +388,39 @@ func reloadCode(co *CodeObject, cache *VMCodeCache, gen int32) []uint32 {
 				}
 			case OP_COMPARE_DUNDER:
 				if op := DecodeOpcode(priv[i]); op == OP_COMPARE_OP || op == OP_COMPARE_LT {
+					priv[i] = oldInst
+				} else if op == OP_COMPARE_JUMP_IF_FALSE || op == OP_COMPARE_JUMP_IF_TRUE {
+					jumpOp := OP_JUMP_IF_FALSE
+					if op == OP_COMPARE_JUMP_IF_TRUE {
+						jumpOp = OP_JUMP_IF_TRUE
+					}
+					target := DecodeArgBx(priv[i])
+					priv[i] = oldInst
+					if i+1 < len(priv) {
+						priv[i+1] = Encode(jumpOp, 0, target)
+					}
+				} else if i > 0 {
+					if prevOp := DecodeOpcode(priv[i-1]); prevOp == OP_CMP_CONST_JUMP_IF_FALSE || prevOp == OP_CMP_CONST_JUMP_IF_TRUE {
+						jumpOp := OP_JUMP_IF_FALSE
+						if prevOp == OP_CMP_CONST_JUMP_IF_TRUE {
+							jumpOp = OP_JUMP_IF_TRUE
+						}
+						constIdx := uint16(DecodeArgB(priv[i-1]))
+						target := uint16(i-1) + uint16(DecodeArgC(priv[i-1]))
+						priv[i-1] = Encode(OP_LOAD_CONST, 0, constIdx)
+						priv[i] = oldInst
+						if i+1 < len(priv) {
+							priv[i+1] = Encode(jumpOp, 0, target)
+						}
+					}
+				}
+			case OP_LOAD_FAST:
+				if (DecodeOpcode(priv[i]) == OP_LOAD_FAST_ATTR || DecodeOpcode(priv[i]) == OP_STORE_FAST_ATTR) && i+1 < len(priv) {
+					attrOp := OP_LOAD_ATTR
+					if DecodeOpcode(priv[i]) == OP_STORE_FAST_ATTR {
+						attrOp = OP_STORE_ATTR
+					}
+					priv[i+1] = Encode(attrOp, 0, DecodeArgBx(priv[i]))
 					priv[i] = oldInst
 				}
 			}
@@ -549,6 +599,43 @@ func (s *codeStream) Publish(code []uint32) {
 	s.active.Store(&code)
 }
 
+// computeEntryIP detects a leading docstring prologue (OP_LOAD_CONST + OP_POP_TOP
+// or OP_JUMP 2) that is never a branch target or covered by an exception entry
+// and sets EntryIP = 2 so frame entry jumps straight to the first live opcode.
+func (co *CodeObject) computeEntryIP() {
+	if co == nil || co.EntryIP != 0 || len(co.Code) < 3 {
+		return
+	}
+	w0 := co.Code[0]
+	w1 := co.Code[1]
+	op0 := DecodeOpcode(w0)
+	op1 := DecodeOpcode(w1)
+	isDocPrologue := (op0 == OP_LOAD_CONST && op1 == OP_POP_TOP &&
+		int(DecodeArgBx(w0)) < len(co.Consts) &&
+		co.Consts[DecodeArgBx(w0)].Kind() != val.KindMemoryView) ||
+		(op0 == OP_JUMP && DecodeArgBx(w0) == 2)
+	if !isDocPrologue {
+		return
+	}
+	for _, e := range co.ExceptionTable {
+		if e.StartIP < 2 || e.TargetIP < 2 {
+			return
+		}
+	}
+	for _, inst := range co.Code {
+		switch DecodeOpcode(inst) {
+		case OP_JUMP, OP_JUMP_IF_FALSE, OP_JUMP_IF_TRUE, OP_JUMP_IF_FALSE_OR_POP, OP_JUMP_IF_TRUE_OR_POP,
+			OP_FOR_ITER, OP_FOR_ITER_GEN, OP_FOR_ITER_RANGE, OP_COMPARE_JUMP_IF_FALSE, OP_COMPARE_JUMP_IF_TRUE,
+			OP_FAST_LOOP_CMP_LT_CONST_JUMP, OP_FAST_CMP_EQ_JUMP_IF_FALSE, OP_FAST_JUMP_IF_DEREF_LIST_SUBSCR_TRUE,
+			OP_JUMP_IF_BITAND_ZERO, OP_FAST_CMP_EQ_LOCAL_DEREF_JUMP_IF_FALSE:
+			if DecodeArgBx(inst) < 2 {
+				return
+			}
+		}
+	}
+	co.EntryIP = 2
+}
+
 // Compile-time check that CodeObject.Header is at byte offset 0.
 var _ [0 - unsafe.Offsetof(CodeObject{}.Header)]byte
 
@@ -562,6 +649,7 @@ func (co *CodeObject) Init() *CodeObject {
 	co.initID()
 	co.InitCellParamIndices()
 	co.computeParamShape()
+	co.computeEntryIP()
 	co.initStream()
 	if len(co.Code) < 4 || co.IsGenerator || co.IsCoroutine {
 		co.IsTier2Optimized = 1
@@ -611,6 +699,7 @@ func NewCodeVal(co *CodeObject) val.Value {
 	}
 	co.initID()
 	co.computeParamShape()
+	co.computeEntryIP()
 	// The publication stream has to exist before the code object is shared
 	// between VMs, and a code object becomes shareable as soon as it is
 	// turned into a value.
@@ -648,6 +737,11 @@ type VM struct {
 	builtinOpen          val.Value
 	builtinIsInstance    val.Value
 	builtinNext          val.Value
+	builtinAny           val.Value
+	builtinAll           val.Value
+	builtinSum           val.Value
+	builtinMin           val.Value
+	builtinMax           val.Value
 	builtinSuper         val.Value
 	builtinHasattr       val.Value
 	builtinGetattr       val.Value
@@ -678,10 +772,11 @@ type VM struct {
 	tupleFreeList        []*val.PyTuple
 	superFreeList        []*val.PySuper
 	dictFreeList         []*val.PyDict
+	mediumDictFreeList   []*val.PyDict
 	strJoinPool          []*strJoinState
 	collectPool          []*collectState
 	loopStatePool        []*loopState
-	genStackPools        [4][][]val.Value
+	genStackPools        [5][][]val.Value
 	genCellValPools      [8][][]val.Value
 	genCellPtrPools      [8][][]*val.PyCell
 	genResumeHook        func(ctx *val.ExecContext, gen *val.PyGenerator, val val.Value) (val.Value, val.IterStatus)
@@ -706,6 +801,11 @@ type VM struct {
 	// mvFree holds the memory views that are no longer referenced and can
 	// be handed out again by the next slice.
 	mvFree          []*val.PyMemoryView
+	matchFreeList   []*pyMatch
+	lastReStr       *val.PyString
+	lastReStrLen    int
+	lastReRunes     []rune
+	reInlineBuf     [7]rune
 	hasTrackedViews bool
 	rootCO          CodeObject
 	rootCache       VMCodeCache
@@ -798,11 +898,11 @@ func (vm *VM) Engine() *Engine {
 	return vm.engine
 }
 
-var genStackSizes = [4]int{256, 512, 1024, 2048}
+var genStackSizes = [5]int{64, 256, 512, 1024, 2048}
 
 func (vm *VM) acquireGeneratorStack(minSize int) ([]val.Value, uint8) {
-	if minSize <= 256 {
-		minSize = 256
+	if minSize <= 64 {
+		minSize = 64
 	}
 	for cls, sz := range genStackSizes {
 		if minSize <= sz {
@@ -869,13 +969,45 @@ func (vm *VM) releaseForIter(it *val.PyIter) {
 	}
 	it.Header.Flags = 0
 	it.Obj = val.Value{}
+	it.Sub = val.Value{}
+	it.Seq = nil
 	it.NextFn = nil
 	it.Idx = 0
 	it.Cur = 0
+	it.NextIdx = 0
 	it.Stop = 0
 	it.Step = 0
 	if len(vm.iterFreeList) < 256 {
 		vm.iterFreeList = append(vm.iterFreeList, it)
+	}
+}
+
+func (vm *VM) acquireMatch() *pyMatch {
+	if n := len(vm.matchFreeList); n > 0 {
+		m := vm.matchFreeList[n-1]
+		vm.matchFreeList[n-1] = nil
+		vm.matchFreeList = vm.matchFreeList[:n-1]
+		return m
+	}
+	return &pyMatch{}
+}
+
+func (vm *VM) releaseMatch(m *pyMatch) {
+	if m == nil {
+		return
+	}
+	m.Header.Flags = 0
+	m.Header.Hash = 0
+	m.Pat = nil
+	m.StringVal = val.Value{}
+	m.extCaps = nil
+	m.inlineCaps = [4]int32{}
+	m.Pos = 0
+	m.EndPos = 0
+	m.LastIndex = 0
+	m.numCaps = 0
+	if len(vm.matchFreeList) < 128 {
+		vm.matchFreeList = append(vm.matchFreeList, m)
 	}
 }
 
@@ -904,6 +1036,7 @@ func (vm *VM) acquireEphemeralTuple(src []val.Value) val.Value {
 	return val.ObjectVal(&t.Header)
 }
 
+//go:noinline
 func (vm *VM) releaseEphemeralTupleVal(v val.Value) {
 	if !v.IsTuple() || (v.HeaderPtr().Flags&val.FlagEphemeralTuple) == 0 {
 		return
@@ -1058,6 +1191,9 @@ func (vm *VM) Reset() {
 	vm.lastException = val.NoneVal()
 	vm.unhandledException = val.NoneVal()
 	vm.jsonParser = nil
+	vm.lastReStr = nil
+	vm.lastReStrLen = 0
+	vm.lastReRunes = nil
 	if vm.context == nil || vm.context.Len() > 0 {
 		vm.context = val.NewPyContext()
 	}

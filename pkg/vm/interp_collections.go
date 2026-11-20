@@ -118,7 +118,7 @@ func (vm *VM) opBuildSlice(st *loopState, inst uint32, ip, sp int) (int, int, lo
 //go:noinline
 func (vm *VM) opBinarySlice(st *loopState, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
-	locals := (*[256]val.Value)(unsafe.Pointer(&stack[st.base]))
+	locals := stack[st.base:]
 	stopVal := stack[sp-1]
 	startVal := stack[sp-2]
 	container := stack[sp-3]
@@ -146,7 +146,7 @@ func (vm *VM) opBinarySlice(st *loopState, ip, sp int) (int, int, loopCtl) {
 		// the view that slot already holds, so the loop allocates no
 		// view at all and touches no pointer field it does not have
 		// to change.
-		newMv := reusableViewFor(st.codePtr, ip, locals[:])
+		newMv := reusableViewFor(st.codePtr, ip, locals)
 		if newMv == nil {
 			newMv = vm.allocMemoryView()
 			newMv.Header = val.ObjectHeader{Kind: val.KindMemoryView, Type: val.MemoryViewType}
@@ -386,6 +386,45 @@ func (vm *VM) opUnpackSequence(st *loopState, inst uint32, ip, sp int) (int, int
 	}
 	ip++
 	return ip, sp, ctlReload
+}
+
+//go:noinline
+func (vm *VM) opUnpackStoreFastSlow(st *loopState, op Opcode, inst uint32, ip, sp int) (int, int, loopCtl) {
+	count := 2
+	step := 3
+	if op == OP_UNPACK_3_FAST {
+		count = 3
+		step = 4
+	}
+	newIP, newSP, ctl := vm.opUnpackSequence(st, Encode(OP_UNPACK_SEQUENCE, 0, uint16(count)), ip, sp)
+	if ctl == ctlRaise || ctl == ctlExit {
+		return newIP, newSP, ctl
+	}
+	stack := st.stack
+	locals := stack[st.base:]
+	if count == 2 {
+		v0 := stack[newSP-1]
+		v1 := stack[newSP-2]
+		if vm.hasTrackedViews {
+			vm.reclaimViewSlot(locals[uint8(inst>>16)], v0)
+			vm.reclaimViewSlot(locals[uint8(inst>>8)], v1)
+		}
+		locals[uint8(inst>>16)] = v0
+		locals[uint8(inst>>8)] = v1
+	} else {
+		v0 := stack[newSP-1]
+		v1 := stack[newSP-2]
+		v2 := stack[newSP-3]
+		if vm.hasTrackedViews {
+			vm.reclaimViewSlot(locals[uint8(inst>>16)], v0)
+			vm.reclaimViewSlot(locals[uint8(inst>>8)], v1)
+			vm.reclaimViewSlot(locals[uint8(inst)], v2)
+		}
+		locals[uint8(inst>>16)] = v0
+		locals[uint8(inst>>8)] = v1
+		locals[uint8(inst)] = v2
+	}
+	return ip + step, newSP - count, ctl
 }
 
 //go:noinline
@@ -762,7 +801,7 @@ func (vm *VM) opBuildMap(st *loopState, inst uint32, ip, sp int) (int, int, loop
 	stack := st.stack
 	count := int(uint16(inst))
 	var dictVal val.Value
-	if count <= 5 && isEphemeralMapSite(st, ip) {
+	if count <= 16 && isEphemeralMapSite(st, ip) {
 		dictVal = vm.acquireSmallDict(count, true)
 	} else {
 		dictVal = val.NewDictVal(count)
@@ -796,9 +835,10 @@ func (vm *VM) opBuildTuple(st *loopState, inst uint32, ip, sp int) (int, int, lo
 		val.DetachStringBuf(stack[i])
 		markViewEscaped(stack[i])
 	}
-	if count <= 2 && ip+1 < st.codeLen && !val.MultiThreadedFlag.Load() {
+	if count <= 4 && ip+1 < st.codeLen && !val.MultiThreadedFlag.Load() {
 		opNext := DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4)))
-		if opNext == OP_CALL_FUNCTION_EX || opNext == OP_UNPACK_SEQUENCE {
+		if opNext == OP_CALL_FUNCTION_EX || opNext == OP_UNPACK_SEQUENCE ||
+			opNext == OP_UNPACK_2_FAST || opNext == OP_UNPACK_3_FAST {
 			stack[base] = vm.acquireEphemeralTuple(stack[base:sp])
 			return ip + 1, base + 1, ctlNext
 		}

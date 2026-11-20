@@ -193,10 +193,15 @@ func (vm *VM) acquireCollectState(mode uint8) *collectState {
 	} else {
 		cs = &collectState{}
 	}
-	if mode == genModeCollectSet {
+	switch mode {
+	case genModeCollectSet:
 		cs.set = val.NewSetVal().AsSet()
-	} else if (mode == genModeCollectList || mode == genModeCollectTuple) && cap(cs.items) == 0 {
-		cs.items = make([]val.Value, 0, 16)
+	case genModeCollectDict:
+		cs.dict = val.NewDictVal(8).AsDict()
+	case genModeCollectList, genModeCollectTuple:
+		if cap(cs.items) == 0 {
+			cs.items = make([]val.Value, 0, 16)
+		}
 	}
 	return cs
 }
@@ -207,6 +212,15 @@ func (vm *VM) releaseCollectState(cs *collectState) {
 	}
 	cs.set = nil
 	cs.list = nil
+	cs.dict = nil
+	cs.acc = val.Value{}
+	cs.hasAcc = false
+	cs.isSlice = false
+	cs.sliceCur = 0
+	cs.sliceNext = 0
+	cs.sliceStop = 0
+	cs.sliceStep = 0
+	cs.isliceIter = nil
 	if cs.items != nil {
 		if cap(cs.items) <= 4096 {
 			clear(cs.items[:cap(cs.items)])
@@ -220,49 +234,233 @@ func (vm *VM) releaseCollectState(cs *collectState) {
 	}
 }
 
-func (cs *collectState) appendValue(v val.Value, mode uint8, hasTrackedViews bool) (val.Value, bool) {
-	val.ClearEphemeral(v)
-	val.DetachStringBuf(v)
-	if hasTrackedViews {
-		markViewEscaped(v)
+func (cs *collectState) appendValue(ctx *val.ExecContext, v val.Value, mode uint8, hasTrackedViews bool) (val.Value, val.Value, bool, bool) {
+	if cs.isSlice {
+		if cs.sliceCur < cs.sliceNext {
+			cs.sliceCur++
+			if cs.isliceIter != nil {
+				cs.isliceIter.Cur = cs.sliceCur
+			}
+			return val.Value{}, val.Value{}, false, true
+		}
+		cs.sliceCur++
+		const maxInt64 = int64(^uint64(0) >> 1)
+		if cs.sliceNext > maxInt64-cs.sliceStep {
+			cs.sliceNext = maxInt64
+			cs.sliceStop = cs.sliceCur
+		} else {
+			cs.sliceNext += cs.sliceStep
+		}
+		if cs.isliceIter != nil {
+			cs.isliceIter.Cur = cs.sliceCur
+			cs.isliceIter.NextIdx = cs.sliceNext
+		}
 	}
+
 	switch mode {
+	case genModeAny:
+		if v.IsTruthy() {
+			if cs.isliceIter != nil && cs.sliceStop >= 0 && cs.sliceNext >= cs.sliceStop {
+				cs.isliceIter.Cur = cs.isliceIter.Stop
+			}
+			return val.Value{}, val.BoolVal(true), true, true
+		}
+	case genModeAll:
+		if !v.IsTruthy() {
+			if cs.isliceIter != nil && cs.sliceStop >= 0 && cs.sliceNext >= cs.sliceStop {
+				cs.isliceIter.Cur = cs.isliceIter.Stop
+			}
+			return val.Value{}, val.BoolVal(false), true, true
+		}
+	case genModeSum:
+		if cs.acc.IsInt64() && v.IsInt64() {
+			ai, bi := cs.acc.AsInt64(), v.AsInt64()
+			sum := ai + bi
+			if ((ai ^ sum) & (bi ^ sum)) >= 0 {
+				cs.acc = val.Int64Val(sum)
+				break
+			}
+		} else if (cs.acc.IsFloat64() || cs.acc.IsInt64()) && (v.IsFloat64() || v.IsInt64()) {
+			var af, bf float64
+			if cs.acc.IsFloat64() {
+				af = cs.acc.AsFloat64()
+			} else {
+				af = float64(cs.acc.AsInt64())
+			}
+			if v.IsFloat64() {
+				bf = v.AsFloat64()
+			} else {
+				bf = float64(v.AsInt64())
+			}
+			cs.acc = val.Float64Val(af + bf)
+			break
+		}
+		res := val.AddCtx(ctx, cs.acc, v)
+		if ctx.HasException() {
+			exc := ctx.ActiveException
+			ctx.ClearException()
+			return exc, val.Value{}, false, false
+		}
+		cs.acc = res
+	case genModeMin, genModeMax:
+		switch {
+		case !cs.hasAcc:
+			val.ClearEphemeral(v)
+			cs.acc = v
+			cs.hasAcc = true
+		case v.IsInt64() && cs.acc.IsInt64():
+			if (mode == genModeMin && v.AsInt64() < cs.acc.AsInt64()) ||
+				(mode == genModeMax && v.AsInt64() > cs.acc.AsInt64()) {
+				cs.acc = v
+			}
+		case v.IsFloat64() && cs.acc.IsFloat64():
+			if (mode == genModeMin && v.AsFloat64() < cs.acc.AsFloat64()) ||
+				(mode == genModeMax && v.AsFloat64() > cs.acc.AsFloat64()) {
+				cs.acc = v
+			}
+		default:
+			cmpOp := val.CmpLT
+			if mode == genModeMax {
+				cmpOp = val.CmpGT
+			}
+			cmp := val.RichCompare(ctx, v, cs.acc, cmpOp)
+			if ctx.HasException() {
+				exc := ctx.ActiveException
+				ctx.ClearException()
+				return exc, val.Value{}, false, false
+			}
+			if cmp.IsTruthy() {
+				val.ClearEphemeral(v)
+				cs.acc = v
+			}
+		}
+	case genModeCollectDict:
+		var k, valItem val.Value
+		if v.IsTuple() {
+			items := v.AsTuple().Items
+			if len(items) != 2 {
+				return val.NewValueError(fmt.Sprintf("dictionary update sequence element #%d has length %d; 2 is required", cs.dict.Len(), len(items))), val.Value{}, false, false
+			}
+			k, valItem = items[0], items[1]
+		} else {
+			items := val.ExtractIterableItems(ctx, v)
+			if ctx.HasException() {
+				exc := ctx.ActiveException
+				ctx.ClearException()
+				return exc, val.Value{}, false, false
+			}
+			if len(items) != 2 {
+				return val.NewValueError(fmt.Sprintf("dictionary update sequence element #%d has length %d; 2 is required", cs.dict.Len(), len(items))), val.Value{}, false, false
+			}
+			k, valItem = items[0], items[1]
+		}
+		if !k.IsInt64() && !k.IsAnyString() && !k.IsBool() && !k.IsFloat64() && !k.IsNone() {
+			if badType, bad := val.IsUnhashableValue(k); bad {
+				return val.NewTypeError("unhashable type: '" + badType + "'"), val.Value{}, false, false
+			}
+		}
+		val.ClearEphemeral(k)
+		val.DetachStringBuf(k)
+		val.ClearEphemeral(valItem)
+		val.DetachStringBuf(valItem)
+		if hasTrackedViews {
+			markViewEscaped(k)
+			markViewEscaped(valItem)
+		}
+		cs.dict.Set(k, valItem)
 	case genModeCollectSet:
-		return cs.set.AddChecked(v)
+		val.ClearEphemeral(v)
+		val.DetachStringBuf(v)
+		if hasTrackedViews {
+			markViewEscaped(v)
+		}
+		if errExc, ok := cs.set.AddChecked(v); !ok {
+			return errExc, val.Value{}, false, false
+		}
 	case genModeListExtend:
+		val.ClearEphemeral(v)
+		val.DetachStringBuf(v)
+		if hasTrackedViews {
+			markViewEscaped(v)
+		}
 		cs.list.Append(v)
-		return val.Value{}, true
+	default:
+		val.ClearEphemeral(v)
+		val.DetachStringBuf(v)
+		if hasTrackedViews {
+			markViewEscaped(v)
+		}
+		cs.items = append(cs.items, v)
 	}
-	cs.items = append(cs.items, v)
-	return val.Value{}, true
+
+	if cs.isSlice && cs.sliceStop >= 0 && cs.sliceNext >= cs.sliceStop {
+		if cs.isliceIter != nil {
+			cs.isliceIter.Cur = cs.isliceIter.Stop
+		}
+		out, errExc, ok := cs.materializeChecked(mode)
+		if !ok {
+			return errExc, val.Value{}, false, false
+		}
+		return val.Value{}, out, true, true
+	}
+	return val.Value{}, val.Value{}, false, true
 }
 
-func (cs *collectState) materialize(mode uint8) val.Value {
+func (cs *collectState) materializeChecked(mode uint8) (val.Value, val.Value, bool) {
 	switch mode {
 	case genModeCollectList:
 		if len(cs.items) == 0 {
-			return val.NewListVal()
+			return val.NewListVal(), val.Value{}, true
 		}
 		items := cs.items
 		cs.items = nil
-		return val.NewListFromOwnedSlice(items)
+		return val.NewListFromOwnedSlice(items), val.Value{}, true
 	case genModeCollectTuple:
 		if len(cs.items) == 0 {
-			return val.EmptyTupleVal()
+			return val.EmptyTupleVal(), val.Value{}, true
 		}
-		return val.NewTupleFromSlice(cs.items)
+		return val.NewTupleFromSlice(cs.items), val.Value{}, true
 	case genModeCollectSet:
 		if cs.set == nil {
-			return val.NewSetVal()
+			return val.NewSetVal(), val.Value{}, true
 		}
 		out := val.SetVal(cs.set)
 		cs.set = nil
-		return out
+		return out, val.Value{}, true
+	case genModeCollectDict:
+		if cs.dict == nil {
+			return val.NewDictVal(0), val.Value{}, true
+		}
+		out := val.ObjectVal(&cs.dict.Header)
+		cs.dict = nil
+		return out, val.Value{}, true
 	case genModeListExtend:
 		cs.list = nil
-		return val.NoneVal()
+		return val.NoneVal(), val.Value{}, true
+	case genModeAny:
+		return val.BoolVal(false), val.Value{}, true
+	case genModeAll:
+		return val.BoolVal(true), val.Value{}, true
+	case genModeSum:
+		out := cs.acc
+		cs.acc = val.Value{}
+		return out, val.Value{}, true
+	case genModeMin:
+		if !cs.hasAcc {
+			return val.Value{}, val.NewValueError("min() iterable argument is empty"), false
+		}
+		out := cs.acc
+		cs.acc = val.Value{}
+		return out, val.Value{}, true
+	case genModeMax:
+		if !cs.hasAcc {
+			return val.Value{}, val.NewValueError("max() iterable argument is empty"), false
+		}
+		out := cs.acc
+		cs.acc = val.Value{}
+		return out, val.Value{}, true
 	}
-	return val.NoneVal()
+	return val.NoneVal(), val.Value{}, true
 }
 
 // pushListExtendGenerator pushes gen onto vm.frames in genModeListExtend so all
@@ -294,14 +492,15 @@ func (vm *VM) pushListExtendGenerator(st *loopState, targetList *val.PyList, gen
 	return ip, sp, ctl
 }
 
-// pushCollectGenerator pushes gen onto vm.frames in genModeCollectList,
-// genModeCollectTuple, or genModeCollectSet so yielded values drain directly
-// inside runLoopWithGlobals without host-stack re-entrancy.
+// pushCollectGenerator pushes gen onto vm.frames in a collection or reduction
+// genMode so yielded values drain directly inside runLoopWithGlobals without
+// host-stack re-entrancy. If isliceIt != nil, it configures bounded/stepped
+// islice(gen, ...) draining inline as well.
 //
 //go:noinline
-func (vm *VM) pushCollectGenerator(st *loopState, mode uint8, gen *val.PyGenerator, callerIP, callerSP, retSP int) (int, int, loopCtl) {
-	switch gen.State {
-	case val.GenClosed:
+func (vm *VM) pushCollectGenerator(st *loopState, mode uint8, gen *val.PyGenerator, callerIP, callerSP, retSP int, defaultVal val.Value, isliceIt *val.PyIter) (int, int, loopCtl) {
+	if isliceIt != nil && isliceIt.Stop >= 0 && isliceIt.NextIdx >= isliceIt.Stop {
+		isliceIt.Cur = isliceIt.Stop
 		switch mode {
 		case genModeCollectList:
 			st.stack[retSP] = val.NewListVal()
@@ -309,6 +508,49 @@ func (vm *VM) pushCollectGenerator(st *loopState, mode uint8, gen *val.PyGenerat
 			st.stack[retSP] = val.EmptyTupleVal()
 		case genModeCollectSet:
 			st.stack[retSP] = val.NewSetVal()
+		case genModeCollectDict:
+			st.stack[retSP] = val.NewDictVal(0)
+		case genModeAny:
+			st.stack[retSP] = val.BoolVal(false)
+		case genModeAll:
+			st.stack[retSP] = val.BoolVal(true)
+		case genModeSum:
+			st.stack[retSP] = defaultVal
+		case genModeMin:
+			st.raiseExc = val.NewValueError("min() iterable argument is empty")
+			return callerIP, callerSP, ctlRaise
+		case genModeMax:
+			st.raiseExc = val.NewValueError("max() iterable argument is empty")
+			return callerIP, callerSP, ctlRaise
+		}
+		return callerIP + 1, retSP + 1, ctlReload
+	}
+	switch gen.State {
+	case val.GenClosed:
+		if isliceIt != nil && isliceIt.Stop >= 0 {
+			isliceIt.Cur = isliceIt.Stop
+		}
+		switch mode {
+		case genModeCollectList:
+			st.stack[retSP] = val.NewListVal()
+		case genModeCollectTuple:
+			st.stack[retSP] = val.EmptyTupleVal()
+		case genModeCollectSet:
+			st.stack[retSP] = val.NewSetVal()
+		case genModeCollectDict:
+			st.stack[retSP] = val.NewDictVal(0)
+		case genModeAny:
+			st.stack[retSP] = val.BoolVal(false)
+		case genModeAll:
+			st.stack[retSP] = val.BoolVal(true)
+		case genModeSum:
+			st.stack[retSP] = defaultVal
+		case genModeMin:
+			st.raiseExc = val.NewValueError("min() iterable argument is empty")
+			return callerIP, callerSP, ctlRaise
+		case genModeMax:
+			st.raiseExc = val.NewValueError("max() iterable argument is empty")
+			return callerIP, callerSP, ctlRaise
 		}
 		vm.releaseGenerator(gen)
 		return callerIP + 1, retSP + 1, ctlReload
@@ -317,7 +559,19 @@ func (vm *VM) pushCollectGenerator(st *loopState, mode uint8, gen *val.PyGenerat
 		return callerIP, callerSP, ctlRaise
 	}
 	cs := vm.acquireCollectState(mode)
-	ip, sp, ctl := vm.pushInlineGenerator(st, gen, callerIP, callerSP, retSP, 0, mode, val.Value{}, val.NoneVal())
+	if mode == genModeSum {
+		cs.acc = defaultVal
+		cs.hasAcc = true
+	}
+	if isliceIt != nil {
+		cs.isSlice = true
+		cs.sliceCur = isliceIt.Cur
+		cs.sliceNext = isliceIt.NextIdx
+		cs.sliceStop = isliceIt.Stop
+		cs.sliceStep = isliceIt.Step
+		cs.isliceIter = isliceIt
+	}
+	ip, sp, ctl := vm.pushInlineGenerator(st, gen, callerIP, callerSP, retSP, 0, mode, defaultVal, val.NoneVal())
 	if ctl == ctlRaise {
 		vm.releaseCollectState(cs)
 		return ip, sp, ctl
@@ -366,7 +620,8 @@ func (vm *VM) findGenDrainCaller(st *loopState) (int, uint8) {
 	for {
 		mode := vm.frames[k].genMode
 		switch mode {
-		case genModeStrJoin, genModeCollectList, genModeCollectTuple, genModeCollectSet, genModeListExtend:
+		case genModeStrJoin, genModeCollectList, genModeCollectTuple, genModeCollectSet, genModeListExtend,
+			genModeCollectDict, genModeAny, genModeAll, genModeSum, genModeMin, genModeMax:
 			return k, mode
 		case genModeYieldFrom, genModeAwait:
 			if k > st.startFrameIdx {
@@ -376,6 +631,72 @@ func (vm *VM) findGenDrainCaller(st *loopState) (int, uint8) {
 		}
 		return -1, genModeNone
 	}
+}
+
+func (vm *VM) earlyStopGenDrainCaller(st *loopState, callerIdx int, resultVal val.Value, ip, sp, ipDelta int) (int, int, loopCtl) {
+	outermostGen := st.activeGen
+	if st.frameIdx-1 > callerIdx && vm.frames[callerIdx+1].activeGen != nil {
+		outermostGen = vm.frames[callerIdx+1].activeGen
+	}
+	releaseChain := outermostGen != nil && (outermostGen.Header.Flags&val.FlagEphemeralGen) != 0
+	if st.activeGen != nil {
+		gen := st.activeGen
+		if releaseChain && (gen.Header.Flags&val.FlagEphemeralGen) != 0 {
+			gen.State = val.GenClosed
+			vm.releaseGeneratorStack(gen)
+			vm.releaseGenerator(gen)
+		} else {
+			gen.YieldVal = val.NoneVal()
+			gen.State = val.GenSuspended
+			gen.Stack = st.stack
+			gen.SP = sp
+			gen.IP = ip + ipDelta
+		}
+	}
+	for st.frameIdx > callerIdx {
+		if curShadow := vm.frames[st.frameIdx].shadowFrame; curShadow != nil {
+			curShadow.Detach()
+			vm.frames[st.frameIdx].shadowFrame = nil
+		}
+		st.frameIdx--
+		caller := &vm.frames[st.frameIdx]
+		if len(vm.excStack) > caller.excStackLen {
+			vm.excStack = vm.excStack[:caller.excStackLen]
+		}
+		if st.frameIdx == callerIdx {
+			callerIP := caller.ip
+			retSP := caller.retSP
+			if caller.joinState != nil {
+				vm.releaseStrJoinState(caller.joinState)
+				caller.joinState = nil
+			}
+			if caller.collectState != nil {
+				vm.releaseCollectState(caller.collectState)
+				caller.collectState = nil
+			}
+			vm.restoreCallerFrame(st, caller)
+			st.stack[retSP] = resultVal
+			return callerIP, retSP + 1, ctlReload
+		}
+		retSP := caller.retSP
+		callerIP := caller.ip
+		vm.restoreCallerFrame(st, caller)
+		if st.activeGen != nil {
+			st.activeGen.YieldVal = val.NoneVal()
+			st.activeGen.State = val.GenSuspended
+			st.activeGen.Stack = st.stack
+			st.activeGen.SP = retSP
+			st.activeGen.IP = callerIP
+		} else if st.activeCoro != nil {
+			st.activeCoro.YieldVal = val.NoneVal()
+			st.activeCoro.State = val.CoroSuspended
+			st.activeCoro.Stack = st.stack
+			st.activeCoro.SP = retSP
+			st.activeCoro.IP = callerIP
+		}
+	}
+	st.stack[sp] = resultVal
+	return ip + 1, sp + 1, ctlReload
 }
 
 func (vm *VM) failGenDrainCaller(st *loopState, callerIdx int, badVal, errExc val.Value, ip, sp int) (int, int, loopCtl) {
@@ -483,6 +804,28 @@ func (vm *VM) pushInlineGenerator(st *loopState, gen *val.PyGenerator, callerIP,
 			st.stack[retSP] = val.NoneVal()
 			vm.releaseGenerator(gen)
 			return callerIP + 1, retSP + 1, ctlReload
+		case genModeCollectDict:
+			st.stack[retSP] = val.NewDictVal(0)
+			vm.releaseGenerator(gen)
+			return callerIP + 1, retSP + 1, ctlReload
+		case genModeAny:
+			st.stack[retSP] = val.BoolVal(false)
+			vm.releaseGenerator(gen)
+			return callerIP + 1, retSP + 1, ctlReload
+		case genModeAll:
+			st.stack[retSP] = val.BoolVal(true)
+			vm.releaseGenerator(gen)
+			return callerIP + 1, retSP + 1, ctlReload
+		case genModeSum:
+			st.stack[retSP] = defaultVal
+			vm.releaseGenerator(gen)
+			return callerIP + 1, retSP + 1, ctlReload
+		case genModeMin:
+			st.raiseExc = val.NewValueError("min() iterable argument is empty")
+			return callerIP, callerSP, ctlRaise
+		case genModeMax:
+			st.raiseExc = val.NewValueError("max() iterable argument is empty")
+			return callerIP, callerSP, ctlRaise
 		}
 		return jumpTarget, callerSP - 1, ctlNext
 	case val.GenRunning:
@@ -492,6 +835,9 @@ func (vm *VM) pushInlineGenerator(st *loopState, gen *val.PyGenerator, callerIP,
 		if !sentVal.IsNone() && sentVal.HeaderPtr() != nil {
 			st.raiseExc = val.NewTypeError("can't send non-None value to a just-started generator")
 			return callerIP, callerSP, ctlRaise
+		}
+		if gen.IP == 0 {
+			gen.IP = AsCodeObject(gen.Code).EntryIP
 		}
 	case val.GenSuspended:
 		gen.LastSent = sentVal
@@ -504,9 +850,14 @@ func (vm *VM) pushInlineGenerator(st *loopState, gen *val.PyGenerator, callerIP,
 
 	gen.State = val.GenRunning
 	callee := AsCodeObject(gen.Code)
-	minCap := max(gen.Base+256, gen.Base+callee.NumLocals+callee.MaxStackSize+64)
+	minCap := max(gen.Base+64, gen.Base+callee.NumLocals+callee.MaxStackSize+16)
 	if minCap > len(gen.Stack) {
-		gen.Stack = ensureStack(gen.Stack, minCap)
+		s, newCls := vm.acquireGeneratorStack(minCap)
+		copy(s, gen.Stack)
+		old := gen.Stack
+		gen.Stack = s
+		gen.PoolClass = newCls
+		vm.releaseStackSlice(old)
 	}
 	if len(gen.Cells) > 0 && len(gen.CellPtrs) == 0 {
 		ptrs := vm.acquireGenCellPtrs(len(gen.Cells))
@@ -547,6 +898,9 @@ func (vm *VM) pushInlineCoroutine(st *loopState, coro *val.PyCoroutine, callerIP
 		if !sentVal.IsNone() && sentVal.HeaderPtr() != nil {
 			st.raiseExc = val.NewTypeError("can't send non-None value to a just-started coroutine")
 			return callerIP, callerSP, ctlRaise
+		}
+		if coro.IP == 0 {
+			coro.IP = AsCodeObject(coro.Code).EntryIP
 		}
 	case val.CoroSuspended:
 		coro.LastSent = sentVal
@@ -673,10 +1027,25 @@ func (vm *VM) opYieldValue(st *loopState, ip, sp int) (int, int, loopCtl) {
 					return vm.failStrJoinNonString(st, js, callerIdx, yieldVal, ip, sp)
 				}
 			} else {
+				origData := unsafe.SliceData(stack)
+				st.stack = stack
+				st.ip = ip
+				vm.frames[st.frameIdx].ip = ip
+				vm.execCtx.SP = sp
 				cs := vm.frames[callerIdx].collectState
-				if errExc, ok := cs.appendValue(yieldVal, mode, vm.hasTrackedViews); !ok {
+				errExc, earlyRes, doneEarly, ok := cs.appendValue(&vm.execCtx, yieldVal, mode, vm.hasTrackedViews)
+				stack = st.syncStackFromExecCtx(vm, stack)
+				if !ok {
 					return vm.failGenDrainCaller(st, callerIdx, yieldVal, errExc, ip, sp)
 				}
+				if doneEarly {
+					return vm.earlyStopGenDrainCaller(st, callerIdx, earlyRes, ip, sp, 1)
+				}
+				stack[sp] = val.NoneVal()
+				if unsafe.SliceData(stack) != origData {
+					return ip + 1, sp + 1, ctlReload
+				}
+				return ip + 1, sp + 1, ctlNext
 			}
 			stack[sp] = val.NoneVal()
 			return ip + 1, sp + 1, ctlNext
@@ -775,8 +1144,19 @@ func (vm *VM) opYieldFrom(st *loopState, ip, sp int) (int, int, loopCtl) {
 					if !js.appendValue(nextVal) {
 						return vm.failStrJoinNonString(st, js, callerIdx, nextVal, ip, sp)
 					}
-				} else if errExc, ok := cs.appendValue(nextVal, mode, vm.hasTrackedViews); !ok {
-					return vm.failGenDrainCaller(st, callerIdx, nextVal, errExc, ip, sp)
+				} else {
+					st.stack = stack
+					st.ip = ip
+					vm.frames[st.frameIdx].ip = ip
+					vm.execCtx.SP = sp
+					errExc, earlyRes, doneEarly, ok := cs.appendValue(&vm.execCtx, nextVal, mode, vm.hasTrackedViews)
+					stack = st.syncStackFromExecCtx(vm, stack)
+					if !ok {
+						return vm.failGenDrainCaller(st, callerIdx, nextVal, errExc, ip, sp)
+					}
+					if doneEarly {
+						return vm.earlyStopGenDrainCaller(st, callerIdx, earlyRes, ip, sp, 0)
+					}
 				}
 				continue
 			}

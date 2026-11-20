@@ -133,7 +133,7 @@ func (vm *VM) pushCalleeFrame(
 	vm.activeCO = callee
 	vm.activeBaseOffset = newBase
 	vm.activeFrameIdx = nextFrame
-	return 0, nextSP, ctlReload
+	return callee.EntryIP, nextSP, ctlReload
 }
 
 func canFastInstantiate(tp *val.PyType) bool {
@@ -194,7 +194,7 @@ func isEphemeralSuperCallSite(st *loopState, ip int) bool {
 			}
 		case OP_CALL_PY_EXACT_ARGS, OP_CALL_BUILTIN_FAST, OP_CALL_TYPE_INIT,
 			OP_CALL_METHOD_PIC, OP_CALL_METHOD_DESCR, OP_CALL_METHOD_DESCR_FAST,
-			OP_CALL_HASATTR, OP_CALL_GETATTR:
+			OP_CALL_HASATTR, OP_CALL_GETATTR, OP_CALL_BOUND_NATIVE:
 			depth -= int(DecodeArgA(wk))
 			if depth <= 1 {
 				return false
@@ -752,6 +752,9 @@ unwrapKw:
 					continue
 				}
 			}
+			if CacheWrapper != nil && target.Type() == CacheWrapper {
+				return vm.callLRUCacheSlow(st, target, ip, sp, newBase, retSP, totalArgs, kwnames)
+			}
 			break unwrapKw
 		default:
 			break unwrapKw
@@ -985,6 +988,9 @@ unwrapKw:
 		stack[retSP] = res
 		return ip + 1, retSP + 1, ctlReload
 	default:
+		if target.Kind() == val.KindNative {
+			return vm.callNativeSlow(st, target, ip, sp, newBase, retSP, totalArgs, kwnames)
+		}
 		if target.IsInstance() {
 			if dc := target.Type().DunderCallVal(); dc.IsFunction() {
 				fn := dc.AsFunction()
@@ -1603,15 +1609,8 @@ func (vm *VM) opCallBuiltinFast(st *loopState, inst uint32, ip, sp int) (int, in
 	if target == val.ListExtendBuiltin && argc == 2 && stack[newBase].IsList() && stack[newBase+1].IsGenerator() {
 		return vm.pushListExtendGenerator(st, stack[newBase].AsList(), stack[newBase+1].AsGenerator(), ip, sp, retSP)
 	}
-	if argc == 1 && stack[newBase].IsGenerator() && target.IsType() {
-		switch target.AsType() {
-		case val.ListType:
-			return vm.pushCollectGenerator(st, genModeCollectList, stack[newBase].AsGenerator(), ip, sp, retSP)
-		case val.TupleType:
-			return vm.pushCollectGenerator(st, genModeCollectTuple, stack[newBase].AsGenerator(), ip, sp, retSP)
-		case val.SetType:
-			return vm.pushCollectGenerator(st, genModeCollectSet, stack[newBase].AsGenerator(), ip, sp, retSP)
-		}
+	if mode, defVal, gen, isliceIt, _, matched := vm.matchInlineGenConsumer(target, stack, newBase, argc); matched {
+		return vm.pushCollectGenerator(st, mode, gen, ip, sp, retSP, defVal, isliceIt)
 	}
 	if target == val.TypeVal(val.StrType) && argc == 1 {
 		arg := stack[newBase]
@@ -1811,6 +1810,74 @@ func (vm *VM) opCallMethodDescr(st *loopState, inst uint32, ip, sp int) (int, in
 }
 
 //go:noinline
+func (vm *VM) finishMethodDescrFast(st *loopState, ip, sp, newBase int, res val.Value) (int, int, loopCtl) {
+	stack := st.syncStackFromExecCtx(vm, st.stack)
+	if vm.execCtx.HasException() {
+		exc := vm.execCtx.ActiveException
+		vm.execCtx.ClearException()
+		st.raiseExc = exc
+		return ip, sp, ctlRaise
+	}
+	stack[newBase] = res
+	return ip + 1, newBase + 1, ctlReload
+}
+
+//go:noinline
+func (vm *VM) finishBoundNativeFast(st *loopState, ip, sp, retSP int, origTarget, res val.Value) (int, int, loopCtl) {
+	stack := st.syncStackFromExecCtx(vm, st.stack)
+	if vm.execCtx.HasException() {
+		stack[retSP] = origTarget
+		exc := vm.execCtx.ActiveException
+		vm.execCtx.ClearException()
+		st.raiseExc = exc
+		return ip, sp, ctlRaise
+	}
+	stack[retSP] = res
+	return ip + 1, retSP + 1, ctlReload
+}
+
+//go:noinline
+func (vm *VM) opCallBoundNative(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
+	stack := st.stack
+	argc := int(uint8(inst >> 16))
+	retSP := sp - argc - 1
+	target := stack[retSP]
+	entry := &st.cache.ic[ip]
+	if target.Kind() == val.KindBoundMethod && entry.NativeFn != nil {
+		bm := target.AsBoundMethod()
+		if bm.Func == entry.CachedVal && bm.Self.Type().Version() == entry.ExpectedTypeVer {
+			if vm.hasTrackedViews && argc > 0 {
+				markViewsEscaped(stack[retSP+1 : retSP+1+argc])
+			}
+			origTarget := target
+			origData := unsafe.SliceData(stack)
+			stack[retSP] = bm.Self
+			st.stack = stack
+			st.ip = ip
+			vm.frames[st.frameIdx].ip = ip
+			vm.execCtx.SP = sp
+			res := entry.NativeFn(&vm.execCtx, bm.Func, stack[retSP:sp], nil)
+			stack = st.syncStackFromExecCtx(vm, stack)
+			if vm.execCtx.HasException() {
+				stack[retSP] = origTarget
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				st.raiseExc = exc
+				return ip, sp, ctlRaise
+			}
+			stack[retSP] = res
+			if unsafe.SliceData(stack) == origData {
+				return ip + 1, retSP + 1, ctlNext
+			}
+			return ip + 1, retSP + 1, ctlReload
+		}
+	}
+	deoptInst := ReplaceOpcode(inst, OP_CALL)
+	st.codePtr = st.cache.quickenAt(ip, deoptInst)
+	return vm.opCallSlow(st, deoptInst, ip, sp)
+}
+
+//go:noinline
 func (vm *VM) opCallMethodDescrFast(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
 	argc := int(uint8(inst >> 16))
@@ -1901,6 +1968,42 @@ unwrapCall:
 			unwrapped = true
 		case val.KindBoundMethod:
 			bm := target.AsBoundMethod()
+			if !unwrapped && uint16(inst) == CallFromStack && !vm.hasTrackedViews && bm.Func.IsBuiltinFunc() {
+				bf := bm.Func.AsBuiltinFunc()
+				if bf.Fn != nil && bm.Func != val.GenSendBuiltin && bm.Func != val.CoroSendBuiltin &&
+					bm.Func != val.StrJoinBuiltin && bm.Func != val.ListExtendBuiltin {
+					if selfType := bm.Self.Type(); selfType != nil {
+						st.cache.ic[ip] = ICSlot{
+							Kind:            ICKindMethodDescr,
+							ExpectedTypeVer: selfType.Version(),
+							CachedVal:       bm.Func,
+							NativeFn:        bf.Fn,
+						}
+						st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL_BOUND_NATIVE))
+						origTarget := target
+						origData := unsafe.SliceData(stack)
+						stack[retSP] = bm.Self
+						st.stack = stack
+						st.ip = ip
+						vm.frames[st.frameIdx].ip = ip
+						vm.execCtx.SP = sp
+						res := bf.Fn(&vm.execCtx, bm.Func, stack[retSP:sp], nil)
+						stack = st.syncStackFromExecCtx(vm, stack)
+						if vm.execCtx.HasException() {
+							stack[retSP] = origTarget
+							exc := vm.execCtx.ActiveException
+							vm.execCtx.ClearException()
+							st.raiseExc = exc
+							return ip, sp, ctlRaise
+						}
+						stack[retSP] = res
+						if unsafe.SliceData(stack) == origData {
+							return ip + 1, retSP + 1, ctlNext
+						}
+						return ip + 1, retSP + 1, ctlReload
+					}
+				}
+			}
 			if newBase+1+argc+64 > len(stack) {
 				stack = vm.growStack(st, stack, newBase+1+argc+256)
 			}
@@ -1925,6 +2028,9 @@ unwrapCall:
 					unwrapped = true
 					continue
 				}
+			}
+			if CacheWrapper != nil && target.Type() == CacheWrapper {
+				return vm.callLRUCacheSlow(st, target, ip, sp, newBase, retSP, argc, nil)
 			}
 			break unwrapCall
 		default:
@@ -2063,24 +2169,14 @@ unwrapCall:
 		return vm.pushListExtendGenerator(st, stack[newBase].AsList(), stack[newBase+1].AsGenerator(), ip, sp, retSP)
 	}
 
-	// Builtin list(gen) / tuple(gen) / set(gen) fast-path: drain generator inline in runLoopWithGlobals.
-	if argc == 1 && stack[newBase].IsGenerator() && target.IsType() {
-		var collectMode uint8
-		switch target.AsType() {
-		case val.ListType:
-			collectMode = genModeCollectList
-		case val.TupleType:
-			collectMode = genModeCollectTuple
-		case val.SetType:
-			collectMode = genModeCollectSet
+	// Builtin list/tuple/set/dict/any/all/sum/min/max over generators and islice(gen, ...):
+	// drain yielded values directly inside runLoopWithGlobals without resumeGenerator re-entry.
+	if mode, defVal, gen, isliceIt, nativeFn, matched := vm.matchInlineGenConsumer(target, stack, newBase, argc); matched {
+		if canQuicken {
+			st.cache.ic[ip] = ICSlot{CachedVal: target, NativeFn: nativeFn}
+			st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL_BUILTIN_FAST))
 		}
-		if collectMode != genModeNone {
-			if canQuicken {
-				st.cache.ic[ip] = ICSlot{CachedVal: target, NativeFn: target.AsType().Slots.TpCall}
-				st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL_BUILTIN_FAST))
-			}
-			return vm.pushCollectGenerator(st, collectMode, stack[newBase].AsGenerator(), ip, sp, retSP)
-		}
+		return vm.pushCollectGenerator(st, mode, gen, ip, sp, retSP, defVal, isliceIt)
 	}
 
 	// Builtin str fast-path: 0 allocations for int64 and strings
@@ -2383,6 +2479,9 @@ unwrapCall:
 		stack[retSP] = res
 		return ip + 1, retSP + 1, ctlReload
 	default:
+		if target.Kind() == val.KindNative {
+			return vm.callNativeSlow(st, target, ip, sp, newBase, retSP, argc, nil)
+		}
 		if target.IsInstance() {
 			if dc := target.Type().DunderCallVal(); dc.IsFunction() {
 				fn := dc.AsFunction()
@@ -2492,17 +2591,8 @@ func (vm *VM) opCallMethodSlow(st *loopState, inst uint32, ip, sp int) (int, int
 		case StringIOType:
 			sio := (*pyStringIO)(val.AsPointer(receiver))
 			arg := stack[retSP+1]
-			oldLen := len(sio.buf)
-			if sio.pos == oldLen {
-				var ok bool
-				sio.buf, ok = val.AppendValueBytes(sio.buf, arg)
-				if !ok {
-					s := arg.AsString()
-					view := unsafe.Slice(unsafe.StringData(s), len(s))
-					sio.buf = append(sio.buf, view...)
-				}
-				written := len(sio.buf) - oldLen
-				sio.pos = len(sio.buf)
+			if sio.pos == len(sio.buf) {
+				written := appendStringIOWrite(sio, arg)
 				stack[retSP] = val.Int64Val(int64(written))
 				sp = retSP + 1
 				ip++
@@ -2594,7 +2684,7 @@ func (vm *VM) opCallMethodSlow(st *loopState, inst uint32, ip, sp int) (int, int
 			sp = newBase + numLocalsCallee
 			vm.activeBaseOffset = st.base
 			vm.activeFrameIdx = st.frameIdx
-			ip = 0
+			ip = callee.EntryIP
 			return ip, sp, ctlReload
 		}
 		if callee.IsGenerator {
@@ -2745,17 +2835,8 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 		case StringIOType:
 			sio := (*pyStringIO)(val.AsPointer(receiver))
 			arg := stack[newBase+1]
-			oldLen := len(sio.buf)
-			if sio.pos == oldLen {
-				var ok bool
-				sio.buf, ok = val.AppendValueBytes(sio.buf, arg)
-				if !ok {
-					s := arg.AsString()
-					view := unsafe.Slice(unsafe.StringData(s), len(s))
-					sio.buf = append(sio.buf, view...)
-				}
-				written := len(sio.buf) - oldLen
-				sio.pos = len(sio.buf)
+			if sio.pos == len(sio.buf) {
+				written := appendStringIOWrite(sio, arg)
 				stack[retSP] = val.Int64Val(int64(written))
 				sp = retSP + 1
 				ip++
@@ -2792,13 +2873,7 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 	case argc == 0 && methIdx < uint16(len(st.consts)):
 		mName := st.consts[methIdx]
 		if mName == nameStringIO && (receiver.IsModule() || receiver.IsType()) {
-			sio := &pyStringIO{
-				inst: val.PyInstance{
-					Header: val.ObjectHeader{Kind: val.KindInstance, Type: StringIOType},
-					Shape:  StringIOType.RootShape,
-				},
-				buf: make([]byte, 0, 131072),
-			}
+			sio := newStringIO(StringIOType)
 			stack[retSP] = val.ObjectVal(&sio.inst.Header)
 			sp = retSP + 1
 			ip++
@@ -2943,13 +3018,15 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 
 	if !receiver.IsInstance() && !receiver.IsSuper() && !receiver.IsModule() && !receiver.IsType() {
 		tp := receiver.Type()
-		attrName := st.consts[methIdx]
+		attrName := val.InternValue(st.consts[methIdx])
 		pic := &methodPIC[ip]
+		var targetFn *val.PyFunction
 		var nativeFn val.VectorcallFunc
 		var targetVal val.Value
 		found := false
 		for k := range 4 {
-			if pic[k].ReceiverType == tp && pic[k].NativeFn != nil {
+			if pic[k].ReceiverType == tp && (pic[k].NativeFn != nil || pic[k].TargetFn != nil) {
+				targetFn = pic[k].TargetFn
 				nativeFn = pic[k].NativeFn
 				targetVal = pic[k].TargetVal
 				found = true
@@ -2958,11 +3035,15 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 		}
 		if !found {
 			descr, _, ok := tp.LookupMRO(attrName)
-			if ok && descr.IsBuiltinFunc() {
+			switch {
+			case ok && descr.IsBuiltinFunc() && !descr.AsBuiltinFunc().NoBind:
 				bf := descr.AsBuiltinFunc()
 				nativeFn = bf.Fn
 				targetVal = descr
-			} else {
+			case ok && descr.IsFunction():
+				targetFn = descr.AsFunction()
+				targetVal = descr
+			default:
 				st.stack = stack
 				st.ip = ip
 				vm.execCtx.SP = newBase + totalArgs
@@ -2982,7 +3063,7 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 			inserted := false
 			for k := range 4 {
 				if pic[k].ReceiverType == nil || pic[k].ReceiverType == tp {
-					pic[k] = val.MethodPICEntry{ReceiverType: tp, NativeFn: nativeFn, TargetVal: targetVal}
+					pic[k] = val.MethodPICEntry{ReceiverType: tp, TargetFn: targetFn, NativeFn: nativeFn, TargetVal: targetVal}
 					inserted = true
 					break
 				}
@@ -2991,7 +3072,12 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 				pic[0] = pic[1]
 				pic[1] = pic[2]
 				pic[2] = pic[3]
-				pic[3] = val.MethodPICEntry{ReceiverType: tp, NativeFn: nativeFn, TargetVal: targetVal}
+				pic[3] = val.MethodPICEntry{ReceiverType: tp, TargetFn: targetFn, NativeFn: nativeFn, TargetVal: targetVal}
+			}
+		}
+		if targetFn != nil {
+			if rIP, rSP, rCtl, handled := vm.pushFuncPositional(st, targetFn, nil, stack, ip, sp, newBase, retSP, totalArgs, ip+1); handled {
+				return rIP, rSP, rCtl
 			}
 		}
 		if nativeFn != nil {
@@ -3004,7 +3090,7 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 				return vm.pushInlineCoroutine(st, receiver.AsCoroutine(), ip, sp, retSP, genModeCoroSend, stack[newBase+1])
 			}
 			if methIdx >= uint16(len(st.consts)) || (attrName != nameExists && attrName != nameRemove && attrName != nameUnlink) {
-				if pic[0].ReceiverType == tp && pic[1].ReceiverType == nil {
+				if pic[0].ReceiverType == tp && pic[1].ReceiverType == nil && pic[1].Shape == nil {
 					st.cache.ic[ip] = ICSlot{
 						Kind:            ICKindMethodDescr,
 						ExpectedTypeVer: tp.Version(),
@@ -3098,6 +3184,128 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 					return ip + 1, retSP + 1, ctlNext
 				}
 				return ip + 1, retSP + 1, ctlReload
+			case val.KindNative:
+				return vm.callNativeSlow(st, callable, ip, sp, argBase, retSP, argc, nil)
+			}
+		}
+	}
+
+	if receiver.IsType() {
+		tp := receiver.AsType()
+		typeVer := tp.Version()
+		tpPtr := uint64(uintptr(unsafe.Pointer(tp)))
+		entry := &st.cache.ic[ip]
+		var callable val.Value
+		var cc *VMCodeCache
+		var nativeFn val.VectorcallFunc
+		var bind bool
+		found := false
+		if entry.Kind == ICKindTypeMethod && entry.ExpectedTypeVer == typeVer && entry.ExpectedAuxVer == tpPtr {
+			callable = entry.CachedVal
+			cc = entry.CalleeCache
+			nativeFn = entry.NativeFn
+			bind = entry.SlotIndex == 1
+			found = true
+		} else if methIdx < uint16(len(st.consts)) && (tp.Header.Type == nil || (tp.Header.Type.Flags&val.FlagCustomGetAttribute) == 0) {
+			attrName := val.InternValue(st.consts[methIdx])
+			if descr, _, ok := tp.LookupMRO(attrName); ok {
+				switch {
+				case descr.Kind() == val.KindClassMethod:
+					bind = true
+					callable = descr.AsClassMethod().Callable
+					if callable.IsFunction() {
+						cc = vm.fastCalleeCache(AsCodeObject(callable.AsFunction().Code))
+					} else if callable.IsBuiltinFunc() {
+						nativeFn = callable.AsBuiltinFunc().Fn
+					}
+					found = true
+				case descr.Kind() == val.KindStaticMethod:
+					bind = false
+					callable = descr.AsStaticMethod().Callable
+					if callable.IsFunction() {
+						cc = vm.fastCalleeCache(AsCodeObject(callable.AsFunction().Code))
+					} else if callable.IsBuiltinFunc() {
+						nativeFn = callable.AsBuiltinFunc().Fn
+					}
+					found = true
+				case descr.IsFunction():
+					bind = false
+					callable = descr
+					cc = vm.fastCalleeCache(AsCodeObject(descr.AsFunction().Code))
+					found = true
+				case descr.IsBuiltinFunc():
+					bf := descr.AsBuiltinFunc()
+					// Class-bound builtin descriptors on Type.Dict (like dict.fromkeys) are unbound in LookupMRO
+					// unless wrapped as ClassMethod, so bind=false passes explicit args after cls.
+					bind = false
+					callable = descr
+					nativeFn = bf.Fn
+					found = true
+				case descr.Type() != nil && descr.Type().Slots.TpDescrGet == nil:
+					bind = false
+					callable = descr
+					found = true
+				}
+				if found {
+					var bindFlag int32
+					if bind {
+						bindFlag = 1
+					}
+					*entry = ICSlot{
+						Kind:            ICKindTypeMethod,
+						ExpectedTypeVer: typeVer,
+						ExpectedAuxVer:  tpPtr,
+						SlotIndex:       bindFlag,
+						CachedVal:       callable,
+						CalleeCache:     cc,
+						NativeFn:        nativeFn,
+					}
+				}
+			}
+		}
+		if found {
+			argBase := newBase + 1
+			argCount := argc
+			if bind {
+				argBase = newBase
+				argCount = totalArgs
+			}
+			switch callable.Kind() {
+			case val.KindFunction:
+				if rIP, rSP, rCtl, handled := vm.pushFuncPositional(st, callable.AsFunction(), cc, stack, ip, sp, argBase, retSP, argCount, ip+1); handled {
+					return rIP, rSP, rCtl
+				}
+			case val.KindType:
+				if rIP, rSP, rCtl, handled := vm.pushTypeInitPositional(st, callable.AsType(), stack, ip, sp, argBase, retSP, argCount, !bind); handled {
+					return rIP, rSP, rCtl
+				}
+			case val.KindBuiltinFunc:
+				if callable == val.StrJoinBuiltin && argCount == 2 && stack[argBase].IsAnyString() && stack[argBase+1].IsGenerator() {
+					return vm.pushStrJoinGenerator(st, stack[argBase], stack[argBase+1].AsGenerator(), ip, sp, retSP)
+				}
+				origData := unsafe.SliceData(stack)
+				st.stack = stack
+				st.ip = ip
+				vm.frames[st.frameIdx].ip = ip
+				vm.execCtx.SP = argBase + argCount
+				res := vm.invokeBuiltinSafe(nativeFn, callable, stack[argBase:argBase+argCount], nil)
+				stack = st.syncStackFromExecCtx(vm, stack)
+				if vm.execCtx.HasException() {
+					exc := vm.execCtx.ActiveException
+					vm.execCtx.ClearException()
+					st.raiseExc = exc
+					return ip, sp, ctlRaise
+				}
+				stack[retSP] = res
+				if unsafe.SliceData(stack) == origData {
+					return ip + 1, retSP + 1, ctlNext
+				}
+				return ip + 1, retSP + 1, ctlReload
+			case val.KindNative:
+				return vm.callNativeSlow(st, callable, ip, sp, argBase, retSP, argCount, nil)
+			}
+			if bind {
+				stack[newBase] = receiver
 			}
 		}
 	}
@@ -3139,7 +3347,7 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 			if methIdx >= uint16(len(st.consts)) || (st.consts[methIdx] != nameWrite && st.consts[methIdx] != nameEnter &&
 				st.consts[methIdx] != nameGetValue && st.consts[methIdx] != nameRead && st.consts[methIdx] != nameExit &&
 				st.consts[methIdx] != nameExists && st.consts[methIdx] != nameRemove && st.consts[methIdx] != nameUnlink) {
-				if pic[0].Shape == instShape && pic[1].Shape == nil && instShape != nil && instShape.ID != 0 {
+				if pic[0].Shape == instShape && pic[1].Shape == nil && pic[1].ReceiverType == nil && instShape != nil && instShape.ID != 0 {
 					st.cache.ic[ip] = ICSlot{
 						Kind:            ICKindMethodDescr,
 						ExpectedTypeVer: instVer,
@@ -3199,15 +3407,79 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 							hasCallable = true
 						}
 					}
-				} else if descr, _, foundInClass := instType.LookupMRO(attrName); foundInClass && !descr.IsFunction() && !descr.IsBuiltinFunc() && descr.Type().Slots.TpDescrGet == nil {
-					*entry = ICSlot{
-						Kind:            ICKindClassAttr,
-						ExpectedShapeID: instShape.ID,
-						ExpectedTypeVer: instVer,
-						CachedVal:       descr,
+				} else if descr, _, foundInClass := instType.LookupMRO(attrName); foundInClass {
+					switch {
+					case descr.IsFunction() || (descr.IsBuiltinFunc() && !descr.AsBuiltinFunc().NoBind):
+						var tFn *val.PyFunction
+						var nFn val.VectorcallFunc
+						if descr.IsFunction() {
+							tFn = descr.AsFunction()
+						} else {
+							nFn = descr.AsBuiltinFunc().Fn
+						}
+						newPic := val.MethodPICEntry{
+							Shape:       instShape,
+							TypeVersion: instVer,
+							TargetFn:    tFn,
+							NativeFn:    nFn,
+							TargetVal:   descr,
+						}
+						inserted := false
+						for k := range 4 {
+							if pic[k].Shape == nil || pic[k].Shape == instShape {
+								pic[k] = newPic
+								inserted = true
+								break
+							}
+						}
+						if !inserted {
+							pic[0] = pic[1]
+							pic[1] = pic[2]
+							pic[2] = pic[3]
+							pic[3] = newPic
+						}
+						if tFn != nil {
+							if rIP, rSP, rCtl, handled := vm.pushFuncPositional(st, tFn, nil, stack, ip, sp, newBase, retSP, totalArgs, ip+1); handled {
+								return rIP, rSP, rCtl
+							}
+						} else {
+							origData := unsafe.SliceData(stack)
+							st.stack = stack
+							st.ip = ip
+							vm.frames[st.frameIdx].ip = ip
+							vm.execCtx.SP = newBase + totalArgs
+							res := vm.invokeBuiltinSafe(nFn, descr, stack[newBase:newBase+totalArgs], nil)
+							stack = st.syncStackFromVM(vm, stack)
+							if vm.execCtx.HasException() {
+								exc := vm.execCtx.ActiveException
+								vm.execCtx.ClearException()
+								st.raiseExc = exc
+								return ip, sp, ctlRaise
+							}
+							stack[retSP] = res
+							if unsafe.SliceData(stack) == origData {
+								return ip + 1, retSP + 1, ctlNext
+							}
+							return ip + 1, retSP + 1, ctlReload
+						}
+					case descr.Kind() == val.KindStaticMethod:
+						callable = descr.AsStaticMethod().Callable
+						hasCallable = true
+					case descr.Kind() == val.KindClassMethod:
+						callable = val.NewBoundMethodVal(val.TypeVal(instType), descr.AsClassMethod().Callable)
+						hasCallable = true
+					case descr.Kind() == val.KindNative && CacheWrapper != nil && descr.Type() == CacheWrapper:
+						return vm.callLRUCacheSlow(st, descr, ip, sp, newBase, retSP, totalArgs, nil)
+					case descr.Type().Slots.TpDescrGet == nil || (descr.IsBuiltinFunc() && descr.AsBuiltinFunc().NoBind):
+						*entry = ICSlot{
+							Kind:            ICKindClassAttr,
+							ExpectedShapeID: instShape.ID,
+							ExpectedTypeVer: instVer,
+							CachedVal:       descr,
+						}
+						callable = descr
+						hasCallable = true
 					}
-					callable = descr
-					hasCallable = true
 				}
 			}
 			if hasCallable {
@@ -3251,6 +3523,8 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 						return ip + 1, retSP + 1, ctlNext
 					}
 					return ip + 1, retSP + 1, ctlReload
+				case val.KindNative:
+					return vm.callNativeSlow(st, callable, ip, sp, argBase, retSP, argCount, nil)
 				}
 				stack[newBase] = receiver
 			}
@@ -3271,30 +3545,34 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 		var callable val.Value
 		var cc *VMCodeCache
 		var nativeFn val.VectorcallFunc
-		var bind bool
+		var bind int32
 		found := false
 		if entry.Kind == ICKindSuperMethod && entry.ExpectedTypeVer == typeVer && entry.ExpectedAuxVer == thisVer {
 			callable = entry.CachedVal
 			cc = entry.CalleeCache
 			nativeFn = entry.NativeFn
-			bind = entry.SlotIndex == 1
+			bind = entry.SlotIndex
 			found = true
 		} else if methIdx < uint16(len(st.consts)) {
 			attrName := val.InternValue(st.consts[methIdx])
 			if descr, _, ok := selfType.LookupMROAfter(sup.ThisClass, attrName); ok {
 				switch {
 				case descr.IsFunction():
-					bind = !isClassSuper
+					if !isClassSuper {
+						bind = 1
+					}
 					callable = descr
 					cc = vm.fastCalleeCache(AsCodeObject(descr.AsFunction().Code))
 					found = true
 				case descr.IsBuiltinFunc() && !descr.AsBuiltinFunc().NoBind:
-					bind = !isClassSuper
+					if !isClassSuper {
+						bind = 1
+					}
 					callable = descr
 					nativeFn = descr.AsBuiltinFunc().Fn
 					found = true
 				case descr.Kind() == val.KindStaticMethod:
-					bind = false
+					bind = 0
 					callable = descr.AsStaticMethod().Callable
 					if callable.IsFunction() {
 						cc = vm.fastCalleeCache(AsCodeObject(callable.AsFunction().Code))
@@ -3302,8 +3580,17 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 						nativeFn = callable.AsBuiltinFunc().Fn
 					}
 					found = true
+				case descr.Kind() == val.KindClassMethod:
+					bind = 2
+					callable = descr.AsClassMethod().Callable
+					if callable.IsFunction() {
+						cc = vm.fastCalleeCache(AsCodeObject(callable.AsFunction().Code))
+					} else if callable.IsBuiltinFunc() {
+						nativeFn = callable.AsBuiltinFunc().Fn
+					}
+					found = true
 				case descr.Type().Slots.TpDescrGet == nil || (descr.IsBuiltinFunc() && descr.AsBuiltinFunc().NoBind):
-					bind = false
+					bind = 0
 					callable = descr
 					if callable.IsBuiltinFunc() {
 						nativeFn = callable.AsBuiltinFunc().Fn
@@ -3311,15 +3598,11 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 					found = true
 				}
 				if found {
-					var bindFlag int32
-					if bind {
-						bindFlag = 1
-					}
 					*entry = ICSlot{
 						Kind:            ICKindSuperMethod,
 						ExpectedTypeVer: typeVer,
 						ExpectedAuxVer:  thisVer,
-						SlotIndex:       bindFlag,
+						SlotIndex:       bind,
 						CachedVal:       callable,
 						CalleeCache:     cc,
 						NativeFn:        nativeFn,
@@ -3329,10 +3612,13 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 		}
 		if found {
 			selfVal := sup.Self
+			if bind == 2 {
+				selfVal = val.TypeVal(selfType)
+			}
 			vm.releaseSuper(sup)
 			argBase := newBase + 1
 			argCount := argc
-			if bind {
+			if bind != 0 {
 				stack[newBase] = selfVal
 				argBase = newBase
 				argCount = argc + 1
@@ -3343,7 +3629,7 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 					return rIP, rSP, rCtl
 				}
 			case val.KindType:
-				if rIP, rSP, rCtl, handled := vm.pushTypeInitPositional(st, callable.AsType(), stack, ip, sp, argBase, retSP, argCount, !bind); handled {
+				if rIP, rSP, rCtl, handled := vm.pushTypeInitPositional(st, callable.AsType(), stack, ip, sp, argBase, retSP, argCount, bind == 0); handled {
 					return rIP, rSP, rCtl
 				}
 			case val.KindBuiltinFunc:
@@ -3368,6 +3654,8 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 					return ip + 1, retSP + 1, ctlNext
 				}
 				return ip + 1, retSP + 1, ctlReload
+			case val.KindNative:
+				return vm.callNativeSlow(st, callable, ip, sp, argBase, retSP, argCount, nil)
 			}
 			st.stack = stack
 			st.ip = ip
@@ -3403,5 +3691,150 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 	sp = retSP + 1
 	ip++
 	return ip, sp, ctlReload
+}
 
+func (vm *VM) matchInlineGenConsumer(target val.Value, stack []val.Value, newBase, argc int) (uint8, val.Value, *val.PyGenerator, *val.PyIter, val.VectorcallFunc, bool) {
+	if argc == 1 {
+		arg := stack[newBase]
+		var gen *val.PyGenerator
+		var isliceIt *val.PyIter
+		if arg.IsGenerator() {
+			gen = arg.AsGenerator()
+		} else if arg.IsIter() {
+			it := arg.AsIter()
+			if it.Kind == val.IterKindISlice && it.Obj.IsGenerator() {
+				isliceIt = it
+				gen = it.Obj.AsGenerator()
+			}
+		}
+		if gen == nil {
+			return genModeNone, val.Value{}, nil, nil, nil, false
+		}
+		switch {
+		case target == val.TypeVal(val.ListType):
+			return genModeCollectList, val.Value{}, gen, isliceIt, val.ListType.Slots.TpCall, true
+		case target == val.TypeVal(val.TupleType):
+			return genModeCollectTuple, val.Value{}, gen, isliceIt, val.TupleType.Slots.TpCall, true
+		case target == val.TypeVal(val.SetType):
+			return genModeCollectSet, val.Value{}, gen, isliceIt, val.SetType.Slots.TpCall, true
+		case target == val.TypeVal(val.DictType):
+			return genModeCollectDict, val.Value{}, gen, isliceIt, val.DictType.Slots.TpCall, true
+		case target == vm.builtinAny:
+			return genModeAny, val.Value{}, gen, isliceIt, vm.builtinAny.AsBuiltinFunc().Fn, true
+		case target == vm.builtinAll:
+			return genModeAll, val.Value{}, gen, isliceIt, vm.builtinAll.AsBuiltinFunc().Fn, true
+		case target == vm.builtinSum:
+			return genModeSum, val.Int64Val(0), gen, isliceIt, vm.builtinSum.AsBuiltinFunc().Fn, true
+		case target == vm.builtinMin:
+			return genModeMin, val.Value{}, gen, isliceIt, vm.builtinMin.AsBuiltinFunc().Fn, true
+		case target == vm.builtinMax:
+			return genModeMax, val.Value{}, gen, isliceIt, vm.builtinMax.AsBuiltinFunc().Fn, true
+		}
+		return genModeNone, val.Value{}, nil, nil, nil, false
+	}
+	if argc == 2 && target == vm.builtinSum {
+		arg := stack[newBase]
+		startVal := stack[newBase+1]
+		if startVal.IsAnyString() || startVal.IsBytes() || startVal.IsByteArray() {
+			return genModeNone, val.Value{}, nil, nil, nil, false
+		}
+		var gen *val.PyGenerator
+		var isliceIt *val.PyIter
+		if arg.IsGenerator() {
+			gen = arg.AsGenerator()
+		} else if arg.IsIter() {
+			it := arg.AsIter()
+			if it.Kind == val.IterKindISlice && it.Obj.IsGenerator() {
+				isliceIt = it
+				gen = it.Obj.AsGenerator()
+			}
+		}
+		if gen != nil {
+			return genModeSum, startVal, gen, isliceIt, vm.builtinSum.AsBuiltinFunc().Fn, true
+		}
+	}
+	return genModeNone, val.Value{}, nil, nil, nil, false
+}
+
+//go:noinline
+func (vm *VM) callLRUCacheSlow(st *loopState, target val.Value, ip, sp, newBase, retSP, argc int, kwnames []val.Value) (int, int, loopCtl) {
+	stack := st.stack
+	origData := unsafe.SliceData(stack)
+	st.stack = stack
+	st.ip = ip
+	vm.frames[st.frameIdx].ip = ip
+	vm.execCtx.SP = newBase + argc
+	cache := (*pyLRUCache)(unsafe.Pointer(target.HeaderPtr()))
+	cacheKey, ok := makeLRUCacheKey(&vm.execCtx, stack[newBase:newBase+argc], kwnames, cache.Typed)
+	stack = st.syncStackFromExecCtx(vm, stack)
+	if !ok {
+		exc := vm.execCtx.ActiveException
+		vm.execCtx.ClearException()
+		st.raiseExc = exc
+		return ip, sp, ctlRaise
+	}
+	locked := val.MultiThreadedFlag.Load()
+	if locked {
+		cache.Mu.Lock()
+	}
+	if res, hit := cache.probeLocked(cacheKey); hit {
+		if locked {
+			cache.Mu.Unlock()
+		}
+		stack[retSP] = res
+		if unsafe.SliceData(stack) == origData {
+			return ip + 1, retSP + 1, ctlNext
+		}
+		return ip + 1, retSP + 1, ctlReload
+	}
+	cache.Misses++
+	startGen := cache.clearGen
+	if locked {
+		cache.Mu.Unlock()
+	}
+
+	vm.execCtx.SP = newBase + argc
+	res := vm.callFromHookSafe(cache.UserFunction, newBase, argc, kwnames)
+	stack = st.syncStackFromExecCtx(vm, stack)
+	if vm.execCtx.HasException() {
+		exc := vm.execCtx.ActiveException
+		vm.execCtx.ClearException()
+		st.raiseExc = exc
+		return ip, sp, ctlRaise
+	}
+	locked = val.MultiThreadedFlag.Load()
+	if locked {
+		cache.Mu.Lock()
+	}
+	cache.insertAfterMiss(cacheKey, res, startGen)
+	if locked {
+		cache.Mu.Unlock()
+	}
+	stack[retSP] = res
+	if unsafe.SliceData(stack) == origData {
+		return ip + 1, retSP + 1, ctlNext
+	}
+	return ip + 1, retSP + 1, ctlReload
+}
+
+//go:noinline
+func (vm *VM) callNativeSlow(st *loopState, target val.Value, ip, sp, newBase, retSP, argc int, kwnames []val.Value) (int, int, loopCtl) {
+	if CacheWrapper != nil && target.Type() == CacheWrapper {
+		return vm.callLRUCacheSlow(st, target, ip, sp, newBase, retSP, argc, kwnames)
+	}
+	stack := st.stack
+	st.stack = stack
+	st.ip = ip
+	vm.frames[st.frameIdx].ip = ip
+	vm.execCtx.SP = newBase + argc
+	res := vm.callFromHookSafe(target, newBase, argc, kwnames)
+	stack = st.syncStackFromExecCtx(vm, stack)
+	if vm.execCtx.HasException() {
+		exc := vm.execCtx.ActiveException
+		vm.execCtx.ClearException()
+		st.raiseExc = exc
+		return ip, sp, ctlRaise
+	}
+	stack[retSP] = res
+	return ip + 1, retSP + 1, ctlReload
 }

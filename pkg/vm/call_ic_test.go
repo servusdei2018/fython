@@ -185,3 +185,41 @@ assert "failing_gen" in tb_text and "boom" in tb_text
 	defer eng.ReleaseVM(v)
 	_ = strings.Contains
 }
+
+func TestCallMethodDescrFastExceptionAndReentrancy(t *testing.T) {
+	eng, v := runPySource(t, `
+def pop_from(xs):
+    return xs.pop()
+
+xs = list(range(15))
+popped = [pop_from(xs) for _ in range(15)]
+assert popped == list(range(14, -1, -1))
+
+caught_empty = False
+try:
+    pop_from(xs)
+except IndexError:
+    caught_empty = True
+assert caught_empty
+
+def split_inline(s):
+    return s.split(":")
+
+for _ in range(20):
+    assert split_inline("a:b") == ["a", "b"]
+
+def key_grow(x):
+    acc = 0
+    for i in range(10):
+        acc += i
+    return -x
+
+def sort_desc(items):
+    items.sort(key=key_grow)
+    return items
+
+for _ in range(15):
+    assert sort_desc([1, 3, 2, 4]) == [4, 3, 2, 1]
+`)
+	defer eng.ReleaseVM(v)
+}
