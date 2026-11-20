@@ -1,6 +1,7 @@
 package val
 
 import (
+	"bytes"
 	"math"
 	"math/big"
 	"strconv"
@@ -452,6 +453,93 @@ func FloatRepr(f float64) string {
 		return "-" + body
 	}
 	return body
+}
+
+// AppendFloatRepr appends Python's repr() of a finite float to dst without heap allocations.
+func AppendFloatRepr(dst []byte, f float64) []byte {
+	if math.IsNaN(f) {
+		return append(dst, "nan"...)
+	}
+	if math.IsInf(f, 1) {
+		return append(dst, "inf"...)
+	}
+	if math.IsInf(f, -1) {
+		return append(dst, "-inf"...)
+	}
+	if math.Signbit(f) {
+		dst = append(dst, '-')
+		f = -f
+	}
+	if f == 0 {
+		return append(dst, "0.0"...)
+	}
+	var buf [32]byte
+	s := strconv.AppendFloat(buf[:0], f, 'e', -1, 64)
+	ei := bytes.IndexByte(s, 'e')
+	exp := 0
+	expNeg := false
+	for i := ei + 1; i < len(s); i++ {
+		c := s[i]
+		if c == '-' {
+			expNeg = true
+		} else if c != '+' {
+			exp = exp*10 + int(c-'0')
+		}
+	}
+	if expNeg {
+		exp = -exp
+	}
+	decpt := exp + 1
+	// Strip '.' from s[:ei] in place to get pure digits.
+	var digsBuf [24]byte
+	dn := 0
+	for i := range ei {
+		if s[i] != '.' {
+			digsBuf[dn] = s[i]
+			dn++
+		}
+	}
+	for dn > 1 && digsBuf[dn-1] == '0' {
+		dn--
+	}
+	digs := digsBuf[:dn]
+	if decpt <= -4 || decpt > 16 {
+		dst = append(dst, digs[0])
+		if len(digs) > 1 {
+			dst = append(dst, '.')
+			dst = append(dst, digs[1:]...)
+		}
+		e := decpt - 1
+		dst = append(dst, 'e')
+		if e < 0 {
+			dst = append(dst, '-')
+			e = -e
+		} else {
+			dst = append(dst, '+')
+		}
+		if e < 10 {
+			dst = append(dst, '0')
+		}
+		return strconv.AppendInt(dst, int64(e), 10)
+	}
+	switch {
+	case decpt <= 0:
+		dst = append(dst, "0."...)
+		for range -decpt {
+			dst = append(dst, '0')
+		}
+		return append(dst, digs...)
+	case decpt >= len(digs):
+		dst = append(dst, digs...)
+		for range decpt - len(digs) {
+			dst = append(dst, '0')
+		}
+		return append(dst, ".0"...)
+	default:
+		dst = append(dst, digs[:decpt]...)
+		dst = append(dst, '.')
+		return append(dst, digs[decpt:]...)
+	}
 }
 
 // splitE returns the significant digits and decimal point position

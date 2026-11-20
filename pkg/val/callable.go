@@ -5408,9 +5408,10 @@ func initTypes() {
 		}
 		d := args[0].AsDict()
 		newD := NewDictVal(d.Len()).AsDict()
-		for _, e := range d.ActiveEntries() {
-			newD.Set(e.Key, e.Value)
-		}
+		d.ForEachActive(func(k, v Value) bool {
+			newD.Set(k, v)
+			return true
+		})
 		return Value{ptr: &newD.Header}
 	}))
 
@@ -5482,19 +5483,19 @@ func initTypes() {
 		if posCount > 1 {
 			other := args[1]
 			if other.IsDict() {
-				od := other.AsDict()
-				entries := od.ActiveEntries()
-				for _, e := range entries {
-					d.Set(e.Key, e.Value)
+				if od := other.AsDict(); od != d {
+					od.ForEachActive(func(k, v Value) bool {
+						d.Set(k, v)
+						return true
+					})
 				}
 			} else if other.IsMappingProxy() {
 				mp := other.AsMappingProxy()
 				if mp.Mapping.IsDict() {
-					od := mp.Mapping.AsDict()
-					entries := od.ActiveEntries()
-					for _, e := range entries {
-						d.Set(e.Key, e.Value)
-					}
+					mp.Mapping.AsDict().ForEachActive(func(k, v Value) bool {
+						d.Set(k, v)
+						return true
+					})
 				}
 			} else if keysFn, _, ok := other.Type().LookupMRO(strKeys); ok {
 				keysVal := ctx.Invoke1(keysFn, other)

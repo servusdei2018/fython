@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"unicode/utf16"
+	"unicode/utf8"
 	"unsafe"
 
 	"github.com/servusdei2018/fython/pkg/val"
@@ -617,167 +618,30 @@ func (p *jsonParser) parseLiteral(literal string, result val.Value) (val.Value, 
 	return val.NoneVal(), p.errNow("Expecting value")
 }
 
-// jsonDumps serializes a Value directly to JSON string without reflection.
-func jsonDumps(v val.Value, indent int) (string, error) {
-	var sb strings.Builder
-	err := writeJSONValue(&sb, v, indent, 0)
-	if err != nil {
-		return "", err
-	}
-	return sb.String(), nil
-}
-
-func writeJSONValue(sb *strings.Builder, v val.Value, indent int, level int) error {
-	if v.IsNone() {
-		sb.WriteString("null")
-		return nil
-	}
-	if v.IsBool() {
-		if v.AsBool() {
-			sb.WriteString("true")
-		} else {
-			sb.WriteString("false")
-		}
-		return nil
-	}
-	if v.IsInt64() {
-		sb.WriteString(strconv.FormatInt(v.AsInt64(), 10))
-		return nil
-	}
-	if v.IsFloat64() {
-		f := v.AsFloat64()
-		if math.IsNaN(f) || math.IsInf(f, 0) {
-			return errors.New("ValueError: Out of range float values are not JSON compliant")
-		}
-		sb.WriteString(val.FloatRepr(f))
-		return nil
-	}
-	if v.IsAnyString() {
-		writeJSONString(sb, v.AsString())
-		return nil
-	}
-	if v.IsBytes() || v.IsByteArray() || v.IsMemoryView() {
-		return fmt.Errorf("TypeError: Object of type %s is not JSON serializable", v.Type().Name)
-	}
-	if v.IsList() {
-		items := v.AsList().Items
-		if len(items) == 0 {
-			sb.WriteString("[]")
-			return nil
-		}
-		sb.WriteString("[")
-		if indent > 0 {
-			sb.WriteString("\n")
-		}
-		for i, item := range items {
-			if indent > 0 {
-				writeIndent(sb, indent, level+1)
-			}
-			if err := writeJSONValue(sb, item, indent, level+1); err != nil {
-				return err
-			}
-			if i+1 < len(items) {
-				sb.WriteString(",")
-			}
-			if indent > 0 {
-				sb.WriteString("\n")
-			} else if i+1 < len(items) {
-				sb.WriteString(" ")
-			}
-		}
-		if indent > 0 {
-			writeIndent(sb, indent, level)
-		}
-		sb.WriteString("]")
-		return nil
-	}
-	if v.IsTuple() {
-		items := v.AsTuple().Items
-		if len(items) == 0 {
-			sb.WriteString("[]")
-			return nil
-		}
-		sb.WriteString("[")
-		if indent > 0 {
-			sb.WriteString("\n")
-		}
-		for i, item := range items {
-			if indent > 0 {
-				writeIndent(sb, indent, level+1)
-			}
-			if err := writeJSONValue(sb, item, indent, level+1); err != nil {
-				return err
-			}
-			if i+1 < len(items) {
-				sb.WriteString(",")
-			}
-			if indent > 0 {
-				sb.WriteString("\n")
-			} else if i+1 < len(items) {
-				sb.WriteString(" ")
-			}
-		}
-		if indent > 0 {
-			writeIndent(sb, indent, level)
-		}
-		sb.WriteString("]")
-		return nil
-	}
-	if v.IsDict() {
-		d := v.AsDict()
-		first := true
-		sb.WriteString("{")
-		entries := d.ActiveEntries()
-		for _, e := range entries {
-			if !e.Active {
-				continue
-			}
-			if first {
-				first = false
-				if indent > 0 {
-					sb.WriteString("\n")
-				}
-			} else {
-				sb.WriteString(",")
-				if indent > 0 {
-					sb.WriteString("\n")
-				} else {
-					sb.WriteString(" ")
-				}
-			}
-			if indent > 0 {
-				writeIndent(sb, indent, level+1)
-			}
-			writeJSONString(sb, e.Key.AsString())
-			sb.WriteString(": ")
-			if err := writeJSONValue(sb, e.Value, indent, level+1); err != nil {
-				return err
-			}
-		}
-		if !first && indent > 0 {
-			sb.WriteString("\n")
-			writeIndent(sb, indent, level)
-		}
-		sb.WriteString("}")
-		return nil
-	}
-
-	return fmt.Errorf("TypeError: Object of type %s is not JSON serializable", v.Type().Name)
-}
+const jsonHexDigits = "0123456789abcdef"
 
 type jsonDumpOpts struct {
-	indentStr string
-	hasIndent bool
-	sortKeys  bool
-	itemSep   string
-	keySep    string
+	indentStr   string
+	hasIndent   bool
+	sortKeys    bool
+	ensureASCII bool
+	allowNaN    bool
+	itemSep     string
+	keySep      string
+	defaultFn   val.Value
+}
+
+func defaultJSONDumpOpts() jsonDumpOpts {
+	return jsonDumpOpts{
+		ensureASCII: true,
+		allowNaN:    true,
+		itemSep:     ", ",
+		keySep:      ": ",
+	}
 }
 
 func extractJSONDumpOpts(posArgs []val.Value, allArgs []val.Value, kwnames []val.Value, indentPosIdx int) jsonDumpOpts {
-	opts := jsonDumpOpts{
-		itemSep: ", ",
-		keySep:  ": ",
-	}
+	opts := defaultJSONDumpOpts()
 	indentVal := val.NoneVal()
 	if len(posArgs) > indentPosIdx {
 		indentVal = posArgs[indentPosIdx]
@@ -785,12 +649,17 @@ func extractJSONDumpOpts(posArgs []val.Value, allArgs []val.Value, kwnames []val
 	if v, ok := kwArg(allArgs, kwnames, "indent"); ok {
 		indentVal = v
 	}
+	hasSepArg := false
 	if !indentVal.IsNone() {
 		if indentVal.IsInt64() {
 			n := int(indentVal.AsInt64())
 			if n >= 0 {
 				opts.hasIndent = true
 				opts.indentStr = strings.Repeat(" ", n)
+				opts.itemSep = ","
+			} else {
+				opts.hasIndent = true
+				opts.indentStr = ""
 				opts.itemSep = ","
 			}
 		} else if indentVal.IsAnyString() {
@@ -802,7 +671,17 @@ func extractJSONDumpOpts(posArgs []val.Value, allArgs []val.Value, kwnames []val
 	if v, ok := kwArg(allArgs, kwnames, "sort_keys"); ok && v.IsTruthy() {
 		opts.sortKeys = true
 	}
-	if v, ok := kwArg(allArgs, kwnames, "separators"); ok {
+	if v, ok := kwArg(allArgs, kwnames, "ensure_ascii"); ok {
+		opts.ensureASCII = v.IsTruthy()
+	}
+	if v, ok := kwArg(allArgs, kwnames, "allow_nan"); ok {
+		opts.allowNaN = v.IsTruthy()
+	}
+	if v, ok := kwArg(allArgs, kwnames, "default"); ok && !v.IsNone() {
+		opts.defaultFn = v
+	}
+	if v, ok := kwArg(allArgs, kwnames, "separators"); ok && !v.IsNone() {
+		hasSepArg = true
 		if v.IsTuple() && len(v.AsTuple().Items) == 2 {
 			opts.itemSep = v.AsTuple().Items[0].AsString()
 			opts.keySep = v.AsTuple().Items[1].AsString()
@@ -811,29 +690,99 @@ func extractJSONDumpOpts(posArgs []val.Value, allArgs []val.Value, kwnames []val
 			opts.keySep = v.AsList().Items[1].AsString()
 		}
 	}
+	_ = hasSepArg
 	return opts
 }
 
-func jsonDumpsWithOpts(v val.Value, opts jsonDumpOpts) (string, error) {
-	if !opts.hasIndent && !opts.sortKeys && opts.itemSep == ", " && opts.keySep == ": " {
-		return jsonDumps(v, 0)
+func raiseJSONError(ctx *val.ExecContext, err error) {
+	if ctx == nil || ctx.HasException() || err == nil {
+		return
 	}
-	var sb strings.Builder
-	sb.Grow(64)
-	if err := writeJSONValueWithOpts(&sb, v, opts, 0); err != nil {
-		return "", err
+	msg := err.Error()
+	if rest, ok := strings.CutPrefix(msg, "ValueError: "); ok {
+		ctx.Raise(val.NewException(val.ValueErrorType, rest))
+		return
 	}
-	return sb.String(), nil
+	if rest, ok := strings.CutPrefix(msg, "TypeError: "); ok {
+		ctx.Raise(val.NewException(val.TypeErrorType, rest))
+		return
+	}
+	ctx.Raise(val.NewException(val.ValueErrorType, msg))
 }
 
-func writeJSONValueWithOpts(sb *strings.Builder, v val.Value, opts jsonDumpOpts, level int) error {
-	if v.IsNone() || v.IsBool() || v.IsInt64() || v.IsFloat64() || v.IsAnyString() || v.IsBytes() || v.IsByteArray() || v.IsMemoryView() {
-		return writeJSONValue(sb, v, 0, level)
-	}
-	writeLvlIndent := func(lvl int) {
-		for range lvl {
-			sb.WriteString(opts.indentStr)
+func jsonDumpsValue(ctx *val.ExecContext, v val.Value, opts jsonDumpOpts) (val.Value, error) {
+	var vmPtr *VM
+	var buf []byte
+	if ctx != nil && ctx.VM != nil && !val.MultiThreadedFlag.Load() {
+		if vm, ok := ctx.VM.(*VM); ok && vm != nil {
+			vmPtr = vm
+			if vm.jsonDumpBuf != nil {
+				buf = vm.jsonDumpBuf[:0]
+				vm.jsonDumpBuf = nil
+			}
 		}
+	}
+	if buf == nil {
+		var stackBuf [256]byte
+		buf = stackBuf[:0]
+	}
+	var out []byte
+	if vmPtr != nil {
+		defer func() {
+			if vmPtr.jsonDumpBuf == nil {
+				if out != nil && cap(out) <= 65536 {
+					vmPtr.jsonDumpBuf = out[:0]
+				} else if cap(buf) <= 65536 && cap(buf) > 0 {
+					vmPtr.jsonDumpBuf = buf[:0]
+				}
+			}
+		}()
+	}
+	var err error
+	out, err = appendJSONValue(ctx, buf, v, opts, 0)
+	if err != nil {
+		return val.NoneVal(), err
+	}
+	if len(out) <= 7 {
+		return val.SmallStringFromBytes(out), nil
+	}
+	return val.NewStringVal(string(out)), nil
+}
+
+func appendJSONValue(ctx *val.ExecContext, dst []byte, v val.Value, opts jsonDumpOpts, level int) ([]byte, error) {
+	if v.IsNone() {
+		return append(dst, "null"...), nil
+	}
+	if v.IsBool() {
+		if v.AsBool() {
+			return append(dst, "true"...), nil
+		}
+		return append(dst, "false"...), nil
+	}
+	if v.IsInt64() {
+		return strconv.AppendInt(dst, v.AsInt64(), 10), nil
+	}
+	if v.IsFloat64() {
+		f := v.AsFloat64()
+		if math.IsNaN(f) {
+			if !opts.allowNaN {
+				return dst, errors.New("ValueError: Out of range float values are not JSON compliant")
+			}
+			return append(dst, "NaN"...), nil
+		}
+		if math.IsInf(f, 0) {
+			if !opts.allowNaN {
+				return dst, errors.New("ValueError: Out of range float values are not JSON compliant")
+			}
+			if f < 0 {
+				return append(dst, "-Infinity"...), nil
+			}
+			return append(dst, "Infinity"...), nil
+		}
+		return val.AppendFloatRepr(dst, f), nil
+	}
+	if v.IsAnyString() {
+		return appendJSONStringVal(dst, v, opts.ensureASCII), nil
 	}
 	if v.IsList() || v.IsTuple() {
 		var items []val.Value
@@ -843,77 +792,249 @@ func writeJSONValueWithOpts(sb *strings.Builder, v val.Value, opts jsonDumpOpts,
 			items = v.AsTuple().Items
 		}
 		if len(items) == 0 {
-			sb.WriteString("[]")
-			return nil
+			return append(dst, "[]"...), nil
 		}
-		sb.WriteString("[")
+		dst = append(dst, '[')
 		if opts.hasIndent {
-			sb.WriteString("\n")
+			dst = append(dst, '\n')
 		}
 		for i, item := range items {
 			if opts.hasIndent {
-				writeLvlIndent(level + 1)
+				for range level + 1 {
+					dst = append(dst, opts.indentStr...)
+				}
 			}
-			if err := writeJSONValueWithOpts(sb, item, opts, level+1); err != nil {
-				return err
+			var err error
+			dst, err = appendJSONValue(ctx, dst, item, opts, level+1)
+			if err != nil {
+				return dst, err
 			}
 			if i+1 < len(items) {
-				sb.WriteString(opts.itemSep)
+				dst = append(dst, opts.itemSep...)
 			}
 			if opts.hasIndent {
-				sb.WriteString("\n")
+				dst = append(dst, '\n')
 			}
 		}
 		if opts.hasIndent {
-			writeLvlIndent(level)
+			for range level {
+				dst = append(dst, opts.indentStr...)
+			}
 		}
-		sb.WriteString("]")
-		return nil
+		return append(dst, ']'), nil
 	}
 	if v.IsDict() {
 		d := v.AsDict()
-		var active []val.DictEntry
-		for _, e := range d.ActiveEntries() {
-			if e.Active {
-				active = append(active, e)
-			}
-		}
 		if opts.sortKeys {
-			sort.Slice(active, func(i, j int) bool {
-				return active[i].Key.AsString() < active[j].Key.AsString()
-			})
-		}
-		if len(active) == 0 {
-			sb.WriteString("{}")
-			return nil
-		}
-		sb.WriteString("{")
-		if opts.hasIndent {
-			sb.WriteString("\n")
-		}
-		for i, e := range active {
-			if opts.hasIndent {
-				writeLvlIndent(level + 1)
+			entries := d.ActiveEntries()
+			if len(entries) == 0 {
+				return append(dst, "{}"...), nil
 			}
-			writeJSONString(sb, e.Key.AsString())
-			sb.WriteString(opts.keySep)
-			if err := writeJSONValueWithOpts(sb, e.Value, opts, level+1); err != nil {
+			sort.Slice(entries, func(i, j int) bool {
+				return entries[i].Key.AsString() < entries[j].Key.AsString()
+			})
+			dst = append(dst, '{')
+			if opts.hasIndent {
+				dst = append(dst, '\n')
+			}
+			for i, e := range entries {
+				if opts.hasIndent {
+					for range level + 1 {
+						dst = append(dst, opts.indentStr...)
+					}
+				}
+				var err error
+				dst, err = appendJSONDictKey(dst, e.Key, opts)
+				if err != nil {
+					return dst, err
+				}
+				dst = append(dst, opts.keySep...)
+				dst, err = appendJSONValue(ctx, dst, e.Value, opts, level+1)
+				if err != nil {
+					return dst, err
+				}
+				if i+1 < len(entries) {
+					dst = append(dst, opts.itemSep...)
+				}
+				if opts.hasIndent {
+					dst = append(dst, '\n')
+				}
+			}
+			if opts.hasIndent {
+				for range level {
+					dst = append(dst, opts.indentStr...)
+				}
+			}
+			return append(dst, '}'), nil
+		}
+
+		first := true
+		dst = append(dst, '{')
+		err := d.ForEachActiveErr(func(k, elem val.Value) error {
+			if first {
+				first = false
+				if opts.hasIndent {
+					dst = append(dst, '\n')
+				}
+			} else {
+				dst = append(dst, opts.itemSep...)
+				if opts.hasIndent {
+					dst = append(dst, '\n')
+				}
+			}
+			if opts.hasIndent {
+				for range level + 1 {
+					dst = append(dst, opts.indentStr...)
+				}
+			}
+			var err error
+			dst, err = appendJSONDictKey(dst, k, opts)
+			if err != nil {
 				return err
 			}
-			if i+1 < len(active) {
-				sb.WriteString(opts.itemSep)
-			}
-			if opts.hasIndent {
-				sb.WriteString("\n")
+			dst = append(dst, opts.keySep...)
+			dst, err = appendJSONValue(ctx, dst, elem, opts, level+1)
+			return err
+		})
+		if err != nil {
+			return dst, err
+		}
+		if !first && opts.hasIndent {
+			dst = append(dst, '\n')
+			for range level {
+				dst = append(dst, opts.indentStr...)
 			}
 		}
-		if opts.hasIndent {
-			writeLvlIndent(level)
-		}
-		sb.WriteString("}")
-		return nil
+		return append(dst, '}'), nil
 	}
-	return fmt.Errorf("TypeError: Object of type %s is not JSON serializable", v.Type().Name)
+	if ctx != nil && !opts.defaultFn.IsUnbound() && !opts.defaultFn.IsNone() {
+		converted := ctx.Invoke1(opts.defaultFn, v)
+		if ctx.HasException() {
+			return dst, errors.New("TypeError: default() failed")
+		}
+		return appendJSONValue(ctx, dst, converted, opts, level)
+	}
+	return dst, fmt.Errorf("TypeError: Object of type %s is not JSON serializable", v.Type().Name)
+}
+
+func appendJSONDictKey(dst []byte, k val.Value, opts jsonDumpOpts) ([]byte, error) {
+	if k.IsAnyString() {
+		return appendJSONStringVal(dst, k, opts.ensureASCII), nil
+	}
+	if k.IsNone() {
+		return append(dst, `"null"`...), nil
+	}
+	if k.IsBool() {
+		if k.AsBool() {
+			return append(dst, `"true"`...), nil
+		}
+		return append(dst, `"false"`...), nil
+	}
+	if k.IsInt64() {
+		dst = append(dst, '"')
+		dst = strconv.AppendInt(dst, k.AsInt64(), 10)
+		return append(dst, '"'), nil
+	}
+	if k.IsFloat64() {
+		f := k.AsFloat64()
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			if !opts.allowNaN {
+				return dst, errors.New("ValueError: Out of range float values are not JSON compliant")
+			}
+			if math.IsNaN(f) {
+				return append(dst, `"NaN"`...), nil
+			}
+			if f < 0 {
+				return append(dst, `"-Infinity"`...), nil
+			}
+			return append(dst, `"Infinity"`...), nil
+		}
+		dst = append(dst, '"')
+		dst = val.AppendFloatRepr(dst, f)
+		return append(dst, '"'), nil
+	}
+	return dst, fmt.Errorf("TypeError: keys must be str, int, float, bool or None, not %s", k.Type().Name)
+}
+
+func appendJSONStringVal(dst []byte, v val.Value, ensureASCII bool) []byte {
+	if v.IsInlineStr() {
+		raw := v.RawNum()
+		n := int(raw & 0xFF)
+		var inlineBuf [7]byte
+		for i := range n {
+			inlineBuf[i] = byte(raw >> ((uint(i) + 1) * 8))
+		}
+		return appendJSONStringBytes(dst, inlineBuf[:n], ensureASCII)
+	}
+	if v.IsString() {
+		s := v.AsString()
+		return appendJSONStringBytes(dst, unsafe.Slice(unsafe.StringData(s), len(s)), ensureASCII)
+	}
+	s := v.AsString()
+	return appendJSONStringBytes(dst, unsafe.Slice(unsafe.StringData(s), len(s)), ensureASCII)
+}
+
+func appendJSONHex4(dst []byte, u uint16) []byte {
+	return append(dst, '\\', 'u',
+		jsonHexDigits[(u>>12)&0xF],
+		jsonHexDigits[(u>>8)&0xF],
+		jsonHexDigits[(u>>4)&0xF],
+		jsonHexDigits[u&0xF],
+	)
+}
+
+func appendJSONStringBytes(dst []byte, b []byte, ensureASCII bool) []byte {
+	dst = append(dst, '"')
+	i := 0
+	n := len(b)
+	for i < n {
+		var span int
+		if ensureASCII {
+			span = val.FindJSONEscapeASCII(b[i:])
+		} else {
+			span = val.FindJSONEscape(b[i:])
+		}
+		if span > 0 {
+			dst = append(dst, b[i:i+span]...)
+			i += span
+			if i >= n {
+				break
+			}
+		}
+		c := b[i]
+		if c >= 0x80 && ensureASCII {
+			r, sz := utf8.DecodeRune(b[i:])
+			if r <= 0xFFFF {
+				dst = appendJSONHex4(dst, uint16(r))
+			} else {
+				r1, r2 := utf16.EncodeRune(r)
+				dst = appendJSONHex4(dst, uint16(r1))
+				dst = appendJSONHex4(dst, uint16(r2))
+			}
+			i += sz
+			continue
+		}
+		i++
+		switch c {
+		case '"':
+			dst = append(dst, `\"`...)
+		case '\\':
+			dst = append(dst, `\\`...)
+		case '\n':
+			dst = append(dst, `\n`...)
+		case '\r':
+			dst = append(dst, `\r`...)
+		case '\t':
+			dst = append(dst, `\t`...)
+		case '\b':
+			dst = append(dst, `\b`...)
+		case '\f':
+			dst = append(dst, `\f`...)
+		default:
+			dst = appendJSONHex4(dst, uint16(c))
+		}
+	}
+	return append(dst, '"')
 }
 
 func applyJSONObjectHook(ctx *val.ExecContext, v val.Value, hook val.Value) val.Value {
@@ -937,43 +1058,6 @@ func applyJSONObjectHook(ctx *val.ExecContext, v val.Value, hook val.Value) val.
 		return ctx.Invoke1(hook, v)
 	}
 	return v
-}
-
-func writeIndent(sb *strings.Builder, indent, level int) {
-	total := indent * level
-	for range total {
-		sb.WriteByte(' ')
-	}
-}
-
-func writeJSONString(sb *strings.Builder, s string) {
-	sb.WriteByte('"')
-	for i := range len(s) {
-		b := s[i]
-		switch b {
-		case '"':
-			sb.WriteString(`\"`)
-		case '\\':
-			sb.WriteString(`\\`)
-		case '\n':
-			sb.WriteString(`\n`)
-		case '\r':
-			sb.WriteString(`\r`)
-		case '\t':
-			sb.WriteString(`\t`)
-		case '\b':
-			sb.WriteString(`\b`)
-		case '\f':
-			sb.WriteString(`\f`)
-		default:
-			if b < 0x20 {
-				fmt.Fprintf(sb, `\u%04x`, b)
-			} else {
-				sb.WriteByte(b)
-			}
-		}
-	}
-	sb.WriteByte('"')
 }
 
 // createJSONModule builds the native json PyModule Value.
@@ -1035,11 +1119,12 @@ func (e *Engine) createJSONModule() val.Value {
 			}
 		}
 		opts := extractJSONDumpOpts(pa, args, kwnames, 1)
-		res, err := jsonDumpsWithOpts(pa[0], opts)
+		res, err := jsonDumpsValue(ctx, pa[0], opts)
 		if err != nil {
-			panic(err.Error())
+			raiseJSONError(ctx, err)
+			return val.NoneVal()
 		}
-		return val.NewStringVal(res)
+		return res
 	}))
 
 	mod.Dict.Set(val.InternString("load"), val.NewBuiltinFuncVal("load", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -1084,13 +1169,14 @@ func (e *Engine) createJSONModule() val.Value {
 			return val.NoneVal()
 		}
 		opts := extractJSONDumpOpts(pa, args, kwnames, 2)
-		resStr, err := jsonDumpsWithOpts(pa[0], opts)
+		resVal, err := jsonDumpsValue(ctx, pa[0], opts)
 		if err != nil {
-			panic(err.Error())
+			raiseJSONError(ctx, err)
+			return val.NoneVal()
 		}
 		fp := pa[1]
 		writeMethod := val.GetAttrCtx(ctx, fp, nameWrite)
-		ctx.Invoke1(writeMethod, val.NewStringVal(resStr))
+		ctx.Invoke1(writeMethod, resVal)
 		return val.NoneVal()
 	}))
 

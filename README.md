@@ -28,7 +28,7 @@ $ ./bin/fython --version
 Fython 3.15.0
 ```
 
-Benchmarks live in [`benchmarks/`](benchmarks/) — `python3 benchmarks/run_comparison.py` builds `fython` and compares it against `python3` across seven workloads (Jinja2, ASGI, JSON ETL, Rich, Packaging, N-Queens, `memoryview`; detailed profiling and results in [`OPTIM.md`](OPTIM.md)).
+Benchmarks live in [`benchmarks/`](benchmarks/).
 
 ## Features
 

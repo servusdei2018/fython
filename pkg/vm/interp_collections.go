@@ -278,6 +278,9 @@ func (vm *VM) opBinarySlice(st *loopState, ip, sp int) (int, int, loopCtl) {
 				stack[sp-3] = val.EmptyTupleVal()
 			case start == 0 && stop == len(items) && container.Type() == val.TupleType:
 				stack[sp-3] = container
+			case sliceLen <= 4 && ip+1 < st.codeLen && !val.MultiThreadedFlag.Load() &&
+				isEphemeralTupleNextOp(DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4)))):
+				stack[sp-3] = vm.acquireEphemeralTuple(items[start:stop])
 			case sliceLen > 2 && (len(items) <= 32 || sliceLen*2 >= len(items)):
 				val.ClearEphemeral(container)
 				stack[sp-3] = val.NewTupleView(items[start:stop:stop])
@@ -821,6 +824,11 @@ func (vm *VM) opBuildMap(st *loopState, inst uint32, ip, sp int) (int, int, loop
 	return ip, sp, ctlNext
 }
 
+func isEphemeralTupleNextOp(op Opcode) bool {
+	return op == OP_CALL_FUNCTION_EX || op == OP_UNPACK_SEQUENCE ||
+		op == OP_UNPACK_2_FAST || op == OP_UNPACK_3_FAST
+}
+
 //go:noinline
 func (vm *VM) opBuildTuple(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
@@ -837,8 +845,7 @@ func (vm *VM) opBuildTuple(st *loopState, inst uint32, ip, sp int) (int, int, lo
 	}
 	if count <= 4 && ip+1 < st.codeLen && !val.MultiThreadedFlag.Load() {
 		opNext := DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4)))
-		if opNext == OP_CALL_FUNCTION_EX || opNext == OP_UNPACK_SEQUENCE ||
-			opNext == OP_UNPACK_2_FAST || opNext == OP_UNPACK_3_FAST {
+		if isEphemeralTupleNextOp(opNext) {
 			stack[base] = vm.acquireEphemeralTuple(stack[base:sp])
 			return ip + 1, base + 1, ctlNext
 		}

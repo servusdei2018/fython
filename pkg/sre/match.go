@@ -215,8 +215,8 @@ func (re *Regexp) ExecInto(input []rune, pos, endpos int, mode Mode, mustAdvance
 					}
 				default:
 					want := re.firstLit
-					for s < endpos && input[s] != want {
-						s++
+					if s < endpos {
+						s += indexRuneFast(input[s:endpos], want)
 					}
 				}
 				if s >= endpos {
@@ -603,19 +603,7 @@ func (m *matcher) run(pc, pos int) (int, bool) {
 			case opAnyNL:
 				n = len(subSlice)
 			case opSet:
-				cs := in.set
-				tbl := &cs.table
-				for n < len(subSlice) {
-					r := subSlice[n]
-					if uint32(r) < 128 {
-						if !tbl[r] {
-							break
-						}
-					} else if !cs.slow(r) {
-						break
-					}
-					n++
-				}
+				n = scanCharSetRunes(subSlice, in.set)
 			}
 			if n < in.min {
 				ok = false

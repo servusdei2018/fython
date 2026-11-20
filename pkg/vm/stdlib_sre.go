@@ -23,6 +23,8 @@ var (
 	sreOnce          sync.Once
 )
 
+const flagMatchASCII uint8 = 1 << 1
+
 type pyPattern struct {
 	Header  val.ObjectHeader
 	Source  val.Value
@@ -49,16 +51,18 @@ var (
 )
 
 type pyScanner struct {
-	Header     val.ObjectHeader
-	PatternVal val.Value
-	Pat        *pyPattern
-	StringVal  val.Value
-	In         []rune
-	Pos        int
-	EndPos     int
-	next       int
-	mustAdv    bool
-	done       bool
+	Header      val.ObjectHeader
+	PatternVal  val.Value
+	Pat         *pyPattern
+	StringVal   val.Value
+	In          []rune
+	InASCII     []byte
+	inlineASCII [7]byte
+	Pos         int
+	EndPos      int
+	next        int
+	mustAdv     bool
+	done        bool
 }
 
 func asPattern(v val.Value) *pyPattern {
@@ -261,6 +265,69 @@ func (vm *VM) subjectMatchFast(v val.Value) []rune {
 		}
 	}
 	return nil
+}
+
+func (vm *VM) isPyStringASCII(ps *val.PyString) bool {
+	n := len(ps.Data)
+	for i := range vm.reASCIICache {
+		e := &vm.reASCIICache[i]
+		if e.ps == ps && e.strLen == n {
+			return e.isASCII
+		}
+	}
+	ascii := val.IsASCII(ps.Data)
+	idx := vm.reASCIICachePos & 3
+	vm.reASCIICache[idx] = reASCIIEntry{ps: ps, strLen: n, isASCII: ascii}
+	vm.reASCIICachePos = idx + 1
+	return ascii
+}
+
+func asciiSubjectBytesCtx(ctx *val.ExecContext, v val.Value, inlineBuf *[7]byte) ([]byte, bool) {
+	if val.IsInlineStrASCII(v) {
+		raw := v.RawNum()
+		n := int(raw & 0xFF)
+		for i := range n {
+			inlineBuf[i] = byte((raw >> ((uint(i) + 1) * 8)) & 0xFF)
+		}
+		return inlineBuf[:n], true
+	}
+	if v.IsString() {
+		ps := v.AsStringObj()
+		if ps.Buf == nil {
+			if ctx != nil && !val.MultiThreadedFlag.Load() {
+				if vm, ok := ctx.VM.(*VM); ok && vm != nil {
+					if vm.isPyStringASCII(ps) {
+						return unsafe.Slice(unsafe.StringData(ps.Data), len(ps.Data)), true
+					}
+					return nil, false
+				}
+			}
+			if val.IsASCII(ps.Data) {
+				return unsafe.Slice(unsafe.StringData(ps.Data), len(ps.Data)), true
+			}
+		}
+		return nil, false
+	}
+	if v.IsInstance() && val.IsSubclass(v.Type(), val.StrType) {
+		inst := v.AsInstance()
+		if len(inst.Slots) > 0 && inst.Slots[0].IsAnyString() {
+			return asciiSubjectBytesCtx(ctx, inst.Slots[0], inlineBuf)
+		}
+	}
+	return nil, false
+}
+
+func sliceASCIIVal(strVal val.Value, in []byte, s, e int) val.Value {
+	if val.IsInlineStrASCII(strVal) {
+		return val.SliceInlineStrASCII(strVal, s, e)
+	}
+	if s == 0 && e == len(in) && strVal.IsAnyString() && strVal.Type() == val.StrType {
+		return strVal
+	}
+	if e-s <= 7 {
+		return val.SmallStringFromBytes(in[s:e])
+	}
+	return val.NewStringVal(string(in[s:e]))
 }
 
 func (p *pyPattern) subjectInto(v val.Value, buf *[7]rune) []rune {
@@ -500,8 +567,17 @@ func (m *pyMatch) groupVal(idx int, def val.Value) val.Value {
 	if s < 0 || e < 0 {
 		return def
 	}
-	if !m.Pat.IsBytes && val.IsInlineStrASCII(m.StringVal) {
-		return val.SliceInlineStrASCII(m.StringVal, s, e)
+	if !m.Pat.IsBytes {
+		if val.IsInlineStrASCII(m.StringVal) {
+			return val.SliceInlineStrASCII(m.StringVal, s, e)
+		}
+		if (m.Header.Flags&flagMatchASCII) != 0 && m.StringVal.IsString() {
+			ps := m.StringVal.AsStringObj()
+			if s == 0 && e == len(ps.Data) && m.StringVal.Type() == val.StrType {
+				return m.StringVal
+			}
+			return val.NewStringVal(ps.Data[s:e])
+		}
 	}
 	return m.Pat.sliceSubject(m.StringVal, m.Pat.subject(m.StringVal), s, e)
 }
@@ -523,6 +599,23 @@ func (p *pyPattern) posArgs(ctx *val.ExecContext, in []rune, posV, endV val.Valu
 }
 
 func (p *pyPattern) doMatch(ctx *val.ExecContext, mode sre.Mode, strVal, posV, endV val.Value) val.Value {
+	if !p.IsBytes {
+		var inlineBuf [7]byte
+		if inBytes, ok := asciiSubjectBytesCtx(ctx, strVal, &inlineBuf); ok {
+			pos := clampInt(intArg(ctx, posV, 0), 0, len(inBytes))
+			end := clampInt(intArg(ctx, endV, int64(len(inBytes))), 0, len(inBytes))
+			var capsBuf [32]int32
+			caps, last, matched := p.Re.ExecASCIIInto(inBytes, pos, end, mode, false, capsBuf[:0])
+			if !matched {
+				return val.NoneVal()
+			}
+			var flags uint8
+			if strVal.IsString() {
+				flags = flagMatchASCII
+			}
+			return newMatch(ctx, p, strVal, caps, last, pos, end, flags)
+		}
+	}
 	var in []rune
 	if !p.IsBytes && ctx != nil && !val.MultiThreadedFlag.Load() &&
 		(posV.IsNone() || posV.IsInt64()) && (endV.IsNone() || endV.IsInt64()) {
@@ -540,6 +633,22 @@ func (p *pyPattern) doMatch(ctx *val.ExecContext, mode sre.Mode, strVal, posV, e
 		return val.NoneVal()
 	}
 	return newMatch(ctx, p, strVal, caps, last, pos, end, 0)
+}
+
+func (p *pyPattern) iterateASCII(in []byte, pos, end int, fn func(caps []int32, last int) bool) {
+	var capsBuf [32]int32
+	mustAdv := false
+	for {
+		caps, last, ok := p.Re.ExecASCIIInto(in, pos, end, sre.ModeSearch, mustAdv, capsBuf[:0])
+		if !ok {
+			return
+		}
+		if !fn(caps, last) {
+			return
+		}
+		pos = int(caps[1])
+		mustAdv = caps[1] == caps[0]
+	}
 }
 
 // iterate drives the CPython 3.7+ iteration protocol used by findall,
@@ -561,6 +670,38 @@ func (p *pyPattern) iterate(in []rune, pos, end int, fn func(caps []int32, last 
 }
 
 func (p *pyPattern) findall(ctx *val.ExecContext, strVal, posV, endV val.Value) val.Value {
+	if !p.IsBytes {
+		var inlineBuf [7]byte
+		if inBytes, ok := asciiSubjectBytesCtx(ctx, strVal, &inlineBuf); ok {
+			pos := clampInt(intArg(ctx, posV, 0), 0, len(inBytes))
+			end := clampInt(intArg(ctx, endV, int64(len(inBytes))), 0, len(inBytes))
+			var list []val.Value
+			ng := p.Re.NumGroups
+			grp := func(caps []int32, i int) val.Value {
+				s, e := int(caps[2*i]), int(caps[2*i+1])
+				if s < 0 || e < 0 {
+					return val.SmallStringVal("")
+				}
+				return sliceASCIIVal(strVal, inBytes, s, e)
+			}
+			p.iterateASCII(inBytes, pos, end, func(caps []int32, last int) bool {
+				switch ng {
+				case 0:
+					list = append(list, sliceASCIIVal(strVal, inBytes, int(caps[0]), int(caps[1])))
+				case 1:
+					list = append(list, grp(caps, 1))
+				default:
+					items := make([]val.Value, ng)
+					for i := 1; i <= ng; i++ {
+						items[i-1] = grp(caps, i)
+					}
+					list = append(list, val.NewTupleFromSlice(items))
+				}
+				return true
+			})
+			return val.NewListVal(list...)
+		}
+	}
 	var buf [7]rune
 	in := p.subjectInto(strVal, &buf)
 	pos, end := p.posArgs(ctx, in, posV, endV)
@@ -592,6 +733,38 @@ func (p *pyPattern) findall(ctx *val.ExecContext, strVal, posV, endV val.Value) 
 }
 
 func (p *pyPattern) split(ctx *val.ExecContext, strVal, maxV val.Value) val.Value {
+	if !p.IsBytes {
+		var inlineBuf [7]byte
+		if inBytes, ok := asciiSubjectBytesCtx(ctx, strVal, &inlineBuf); ok {
+			maxsplit := intArg(ctx, maxV, 0)
+			if maxsplit < 0 {
+				ctx.Raise(val.NewException(val.ValueErrorType, "maxsplit must be non-negative"))
+				return val.NoneVal()
+			}
+			var out []val.Value
+			lastPos := 0
+			n := int64(0)
+			p.iterateASCII(inBytes, 0, len(inBytes), func(caps []int32, last int) bool {
+				if maxsplit > 0 && n >= maxsplit {
+					return false
+				}
+				out = append(out, sliceASCIIVal(strVal, inBytes, lastPos, int(caps[0])))
+				for i := 1; i <= p.Re.NumGroups; i++ {
+					s, e := int(caps[2*i]), int(caps[2*i+1])
+					if s < 0 || e < 0 {
+						out = append(out, val.NoneVal())
+					} else {
+						out = append(out, sliceASCIIVal(strVal, inBytes, s, e))
+					}
+				}
+				n++
+				lastPos = int(caps[1])
+				return true
+			})
+			out = append(out, sliceASCIIVal(strVal, inBytes, lastPos, len(inBytes)))
+			return val.NewListVal(out...)
+		}
+	}
 	var buf [7]rune
 	in := p.subjectInto(strVal, &buf)
 	maxsplit := intArg(ctx, maxV, 0)
@@ -740,17 +913,45 @@ func (sc *pyScanner) step(ctx *val.ExecContext, mode sre.Mode) val.Value {
 		return val.NoneVal()
 	}
 	var capsBuf [32]int32
-	caps, last, ok := sc.Pat.Re.ExecInto(sc.In, sc.next, sc.EndPos, mode, sc.mustAdv, capsBuf[:0])
+	var caps []int32
+	var last int
+	var ok bool
+	if sc.InASCII != nil {
+		caps, last, ok = sc.Pat.Re.ExecASCIIInto(sc.InASCII, sc.next, sc.EndPos, mode, sc.mustAdv, capsBuf[:0])
+	} else {
+		caps, last, ok = sc.Pat.Re.ExecInto(sc.In, sc.next, sc.EndPos, mode, sc.mustAdv, capsBuf[:0])
+	}
 	if !ok {
 		sc.done = true
 		return val.NoneVal()
 	}
 	sc.mustAdv = caps[1] == caps[0]
 	sc.next = int(caps[1])
-	return newMatch(ctx, sc.Pat, sc.StringVal, caps, last, sc.Pos, sc.EndPos, 0)
+	var flags uint8
+	if sc.InASCII != nil && sc.StringVal.IsString() {
+		flags = flagMatchASCII
+	}
+	return newMatch(ctx, sc.Pat, sc.StringVal, caps, last, sc.Pos, sc.EndPos, flags)
 }
 
 func (p *pyPattern) newScanner(ctx *val.ExecContext, patVal, strVal, posV, endV val.Value) *pyScanner {
+	if !p.IsBytes {
+		sc := &pyScanner{
+			Header:     val.ObjectHeader{Kind: val.KindNative, Type: ScannerType},
+			PatternVal: patVal,
+			Pat:        p,
+			StringVal:  strVal,
+		}
+		if inBytes, ok := asciiSubjectBytesCtx(ctx, strVal, &sc.inlineASCII); ok {
+			pos := clampInt(intArg(ctx, posV, 0), 0, len(inBytes))
+			end := clampInt(intArg(ctx, endV, int64(len(inBytes))), 0, len(inBytes))
+			sc.InASCII = inBytes
+			sc.Pos = pos
+			sc.EndPos = end
+			sc.next = pos
+			return sc
+		}
+	}
 	in := p.subject(strVal)
 	pos, end := p.posArgs(ctx, in, posV, endV)
 	return &pyScanner{

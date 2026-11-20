@@ -2884,6 +2884,36 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				}
 			}
 			ip, sp, ctl = vm.opBinarySlow(st, OP_BINARY_SUB, ip, sp)
+		case OP_BINARY_MUL:
+			b := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
+			a := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
+			if a.IsInt64() && b.IsInt64() {
+				ai, bi := a.AsInt64(), b.AsInt64()
+				if int64(int32(ai)) == ai && int64(int32(bi)) == bi {
+					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.Int64Val(ai * bi)
+					sp--
+					ip++
+					continue
+				}
+			}
+			ip, sp, ctl = vm.dispatchColdOpcode(st, op, inst, ip, sp)
+		case OP_BINARY_MOD:
+			b := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
+			a := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
+			if a.IsInt64() && b.IsInt64() {
+				ai, bi := a.AsInt64(), b.AsInt64()
+				if bi != 0 {
+					rem := ai % bi
+					if rem != 0 && (rem < 0) != (bi < 0) {
+						rem += bi
+					}
+					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.Int64Val(rem)
+					sp--
+					ip++
+					continue
+				}
+			}
+			ip, sp, ctl = vm.dispatchColdOpcode(st, op, inst, ip, sp)
 		case OP_BINARY_SUBSCR:
 			key := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
 			obj := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
@@ -3108,31 +3138,6 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 			}
 			ip, sp, ctl = vm.opCallMethodDescrFast(st, inst, ip, sp)
 		case OP_CALL_BOUND_NATIVE:
-			argc := int(uint8(inst >> 16))
-			retSP := sp - argc - 1
-			target := *(*val.Value)(unsafe.Add(stackPtr, uintptr(retSP)*16))
-			entry := &st.cache.ic[ip]
-			if !vm.hasTrackedViews && target.Kind() == val.KindBoundMethod && entry.NativeFn != nil {
-				bm := target.AsBoundMethod()
-				if bm.Func == entry.CachedVal && bm.Self.Type().Version() == entry.ExpectedTypeVer {
-					origTarget := target
-					*(*val.Value)(unsafe.Add(stackPtr, uintptr(retSP)*16)) = bm.Self
-					st.ip = ip
-					vm.frames[st.frameIdx].ip = ip
-					vm.execCtx.SP = sp
-					res := entry.NativeFn(&vm.execCtx, bm.Func, unsafe.Slice((*val.Value)(unsafe.Add(stackPtr, uintptr(retSP)*16)), argc+1), nil)
-					if !vm.execCtx.HasException() &&
-						unsafe.Pointer(unsafe.SliceData(vm.execCtx.Stack)) == stackPtr &&
-						(!st.stackIsVM || unsafe.Pointer(unsafe.SliceData(vm.stack)) == stackPtr) {
-						*(*val.Value)(unsafe.Add(stackPtr, uintptr(retSP)*16)) = res
-						sp = retSP + 1
-						ip++
-						continue
-					}
-					ip, sp, ctl = vm.finishBoundNativeFast(st, ip, sp, retSP, origTarget, res)
-					break
-				}
-			}
 			ip, sp, ctl = vm.opCallBoundNative(st, inst, ip, sp)
 		case OP_CALL_TYPE_INIT:
 			argc := int(uint8(inst >> 16))

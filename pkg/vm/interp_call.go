@@ -1823,20 +1823,6 @@ func (vm *VM) finishMethodDescrFast(st *loopState, ip, sp, newBase int, res val.
 }
 
 //go:noinline
-func (vm *VM) finishBoundNativeFast(st *loopState, ip, sp, retSP int, origTarget, res val.Value) (int, int, loopCtl) {
-	stack := st.syncStackFromExecCtx(vm, st.stack)
-	if vm.execCtx.HasException() {
-		stack[retSP] = origTarget
-		exc := vm.execCtx.ActiveException
-		vm.execCtx.ClearException()
-		st.raiseExc = exc
-		return ip, sp, ctlRaise
-	}
-	stack[retSP] = res
-	return ip + 1, retSP + 1, ctlReload
-}
-
-//go:noinline
 func (vm *VM) opCallBoundNative(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
 	argc := int(uint8(inst >> 16))

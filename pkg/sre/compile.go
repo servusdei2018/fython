@@ -63,16 +63,19 @@ type Regexp struct {
 	GroupIndex map[string]int
 	GroupNames []string // indexed by group number, "" when unnamed
 
-	prog         []inst
-	nregs        int
-	prefix       []rune
-	hasFirst     bool
-	firstLit     rune
-	firstFold    bool
-	hasFirstMask bool
-	firstMask    [4]uint64
-	bosOnly      bool
-	matcherPool  sync.Pool
+	prog             []inst
+	nregs            int
+	prefix           []rune
+	asciiPrefix      []byte
+	nonASCIIPrefix   bool
+	hasFirst         bool
+	firstLit         rune
+	firstFold        bool
+	hasFirstMask     bool
+	firstMask        [4]uint64
+	bosOnly          bool
+	matcherPool      sync.Pool
+	asciiMatcherPool sync.Pool
 }
 
 // Compile parses and compiles a pattern. For bytes patterns every rune must
@@ -133,6 +136,20 @@ func Compile(pattern []rune, flags int, isBytes bool) (*Regexp, error) {
 				}
 				if len(pref) > 1 {
 					re.prefix = pref
+					ap := make([]byte, len(pref))
+					asciiPref := true
+					for i, r := range pref {
+						if uint32(r) >= 128 {
+							asciiPref = false
+							break
+						}
+						ap[i] = byte(r)
+					}
+					if asciiPref {
+						re.asciiPrefix = ap
+					} else {
+						re.nonASCIIPrefix = true
+					}
 				}
 			case first.op == opCharFold:
 				re.hasFirst = true
@@ -647,14 +664,22 @@ func (cs *charSet) slow(r rune) bool {
 }
 
 func (cs *charSet) init() {
-	for i := range rune(128) {
-		cs.table[i] = cs.slow(i)
+	for i := range rune(256) {
+		if cs.slow(i) {
+			if i < 128 {
+				cs.table[i] = true
+			}
+			cs.latinBits[i>>3] |= 1 << (uint(i) & 7)
+		}
 	}
 }
 
 func (cs *charSet) has(r rune) bool {
-	if r < 128 && r >= 0 {
+	if uint32(r) < 128 {
 		return cs.table[r]
+	}
+	if uint32(r) < 256 {
+		return (cs.latinBits[r>>3]>>(uint(r)&7))&1 != 0
 	}
 	return cs.slow(r)
 }

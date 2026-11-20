@@ -6,7 +6,6 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf8"
-	"unsafe"
 )
 
 // strMethodArg extracts the underlying Go string from a str or str-subclass instance.
@@ -642,23 +641,7 @@ func strFindImpl(s, sub string, extra []Value, last bool) int {
 }
 
 func isASCII(s string) bool {
-	n := len(s)
-	if n == 0 {
-		return true
-	}
-	p := unsafe.Pointer(unsafe.StringData(s))
-	i := 0
-	for ; i+8 <= n; i += 8 {
-		if *(*uint64)(unsafe.Add(p, i))&0x8080808080808080 != 0 {
-			return false
-		}
-	}
-	for ; i < n; i++ {
-		if s[i] >= 0x80 {
-			return false
-		}
-	}
-	return true
+	return IsASCII(s)
 }
 
 func strPad(s string, width int, fill rune, align byte) string {

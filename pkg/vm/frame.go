@@ -725,6 +725,12 @@ func AsCodeObject(v val.Value) *CodeObject {
 	return (*CodeObject)(unsafe.Pointer(v.HeaderPtr()))
 }
 
+type reASCIIEntry struct {
+	ps      *val.PyString
+	strLen  int
+	isASCII bool
+}
+
 // VM represents a single execution thread with contiguous Value, CallFrame, and ICSlot slabs,
 // plus a VM-managed string interning pool and zero-allocation Vectorcall execution context.
 type VM struct {
@@ -784,6 +790,7 @@ type VM struct {
 	coroResumeHook       func(ctx *val.ExecContext, coro *val.PyCoroutine, val val.Value) (val.Value, val.IterStatus)
 	coroReleaseHook      func(coro *val.PyCoroutine)
 	jsonParser           *jsonParser
+	jsonDumpBuf          []byte
 	maxSP                int
 	maxFrameIdx          int
 	// Continuous join drain state. While activeJoinGen is set, a generator
@@ -806,6 +813,8 @@ type VM struct {
 	lastReStrLen    int
 	lastReRunes     []rune
 	reInlineBuf     [7]rune
+	reASCIICache    [4]reASCIIEntry
+	reASCIICachePos int
 	hasTrackedViews bool
 	rootCO          CodeObject
 	rootCache       VMCodeCache
@@ -1191,9 +1200,14 @@ func (vm *VM) Reset() {
 	vm.lastException = val.NoneVal()
 	vm.unhandledException = val.NoneVal()
 	vm.jsonParser = nil
+	if cap(vm.jsonDumpBuf) > 65536 {
+		vm.jsonDumpBuf = nil
+	}
 	vm.lastReStr = nil
 	vm.lastReStrLen = 0
 	vm.lastReRunes = nil
+	vm.reASCIICache = [4]reASCIIEntry{}
+	vm.reASCIICachePos = 0
 	if vm.context == nil || vm.context.Len() > 0 {
 		vm.context = val.NewPyContext()
 	}
@@ -1645,6 +1659,12 @@ func (co *CodeObject) computeParamShape() {
 	co.VarKWSafe = computeVarKWSafe(co)
 }
 
+func isSafeScalarKeyConst(v val.Value) bool {
+	return v.IsInlineStr() ||
+		(v.IsString() && v.HeaderPtr().Type == val.StrType) ||
+		v.IsInt64()
+}
+
 func computeVarKWSafe(co *CodeObject) bool {
 	if co.VarKWIdx < 0 || co.VarKWIdx >= 256 || co.IsGenerator || co.IsCoroutine || co.HasCells || len(co.Code) == 0 {
 		return false
@@ -1653,7 +1673,7 @@ func computeVarKWSafe(co *CodeObject) bool {
 	isJumpTarget := make([]bool, n+1)
 	for _, inst := range co.Code {
 		switch DecodeOpcode(inst) {
-		case OP_JUMP, OP_JUMP_IF_FALSE, OP_JUMP_IF_TRUE, OP_JUMP_IF_FALSE_OR_POP, OP_JUMP_IF_TRUE_OR_POP, OP_FOR_ITER, OP_FOR_ITER_GEN:
+		case OP_JUMP, OP_JUMP_IF_FALSE, OP_JUMP_IF_TRUE, OP_JUMP_IF_FALSE_OR_POP, OP_JUMP_IF_TRUE_OR_POP, OP_FOR_ITER, OP_FOR_ITER_GEN, OP_FOR_ITER_RANGE, OP_COMPARE_JUMP_IF_FALSE, OP_COMPARE_JUMP_IF_TRUE:
 			t := int(DecodeArgBx(inst))
 			if t >= 0 && t < len(isJumpTarget) {
 				isJumpTarget[t] = true
@@ -1685,6 +1705,13 @@ func computeVarKWSafe(co *CodeObject) bool {
 			if uint16(DecodeArgA(inst)) == kwIdx {
 				return false
 			}
+		case OP_SUBSCR_FAST_CONST:
+			if uint16(uint8(inst>>8)) == kwIdx {
+				cIdx := int(bx)
+				if cIdx >= len(co.Consts) || !isSafeScalarKeyConst(co.Consts[cIdx]) {
+					return false
+				}
+			}
 		case OP_LOAD_FAST:
 			if bx != kwIdx {
 				continue
@@ -1695,8 +1722,23 @@ func computeVarKWSafe(co *CodeObject) bool {
 			w1 := co.Code[i+1]
 			op1 := DecodeOpcode(w1)
 			switch op1 {
-			case OP_JUMP_IF_FALSE, OP_JUMP_IF_TRUE, OP_POP_TOP:
+			case OP_JUMP_IF_FALSE, OP_JUMP_IF_TRUE, OP_POP_TOP, OP_UNARY_NOT:
 				continue
+			case OP_LOAD_CONST:
+				cIdx := int(DecodeArgBx(w1))
+				if i+2 < n && !isJumpTarget[i+2] && DecodeOpcode(co.Code[i+2]) == OP_BINARY_SUBSCR &&
+					cIdx < len(co.Consts) && isSafeScalarKeyConst(co.Consts[cIdx]) {
+					continue
+				}
+			case OP_COMPARE_OP:
+				cmpOp := DecodeArgA(w1)
+				if (cmpOp == CMP_IN || cmpOp == CMP_NOT_IN) && i > 0 && !isJumpTarget[i] &&
+					DecodeOpcode(co.Code[i-1]) == OP_LOAD_CONST {
+					cIdx := int(DecodeArgBx(co.Code[i-1]))
+					if cIdx < len(co.Consts) && isSafeScalarKeyConst(co.Consts[cIdx]) {
+						continue
+					}
+				}
 			case OP_CALL_FUNCTION_EX:
 				if DecodeArgA(w1) == 1 {
 					continue

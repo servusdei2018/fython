@@ -3573,6 +3573,74 @@ func (d *PyDict) ActiveEntries() []DictEntry {
 	return out
 }
 
+// ForEachActive invokes fn for each live entry in insertion order without
+// allocating a []DictEntry snapshot on unshared single-threaded dicts.
+// No lock is held while fn executes so callers may safely mutate d (e.g. d.update(d)).
+func (d *PyDict) ForEachActive(fn func(key, value Value) bool) {
+	if d == nil {
+		return
+	}
+	if d.Live != nil {
+		for _, it := range d.liveItems() {
+			if !fn(it.Key, it.Value) {
+				return
+			}
+		}
+		return
+	}
+	if d.Shared || MultiThreadedFlag.Load() {
+		for _, e := range d.ActiveEntries() {
+			if !fn(e.Key, e.Value) {
+				return
+			}
+		}
+		return
+	}
+	for i := range len(d.Entries) {
+		e := d.Entries[i]
+		if e.Active && !fn(e.Key, e.Value) {
+			return
+		}
+	}
+}
+
+// ForEachActiveErr invokes fn for each live entry in insertion order without
+// allocating a []DictEntry snapshot on unshared single-threaded dicts.
+// Unlike ForEachActive, no lock is held while fn executes.
+func (d *PyDict) ForEachActiveErr(fn func(key, value Value) error) error {
+	if d == nil {
+		return nil
+	}
+	if d.Live != nil {
+		for _, it := range d.liveItems() {
+			if err := fn(it.Key, it.Value); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if d.Shared || MultiThreadedFlag.Load() {
+		for _, e := range d.ActiveEntries() {
+			if err := fn(e.Key, e.Value); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for i := 0; ; i++ {
+		if i >= len(d.Entries) {
+			break
+		}
+		e := d.Entries[i]
+		if e.Active {
+			if err := fn(e.Key, e.Value); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // Clear removes every entry, preserving the live-instance mode if set.
 func (d *PyDict) Clear() {
 	if d.Live != nil {
