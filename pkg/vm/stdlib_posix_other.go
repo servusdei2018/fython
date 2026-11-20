@@ -1,11 +1,19 @@
-//go:build !linux
+//go:build unix && !linux
 
 package vm
 
 import (
 	"io/fs"
 	"runtime"
+
+	"golang.org/x/sys/unix"
 )
+
+// dup2Impl implements POSIX dup2 on BSD-family systems. unix.Dup2 performs the
+// equal-descriptor validation internally.
+func dup2Impl(oldfd, newfd int) error {
+	return unix.Dup2(oldfd, newfd)
+}
 
 // sysStatInfo has no kernel-specific data off Linux; the portable fields
 // filled by fileInfoToStat are used as is.

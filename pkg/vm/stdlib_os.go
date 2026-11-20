@@ -1,9 +1,10 @@
+//go:build unix
+
 package vm
 
 import (
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -25,11 +26,7 @@ func (e *Engine) createOSModule() val.Value {
 	osMod.Dict.Set(val.InternString("sep"), val.NewStringVal(string(filepath.Separator)))
 	osMod.Dict.Set(val.InternString("linesep"), val.NewStringVal("\n"))
 	osMod.Dict.Set(val.InternString("pathsep"), val.NewStringVal(string(filepath.ListSeparator)))
-	if runtime.GOOS == "windows" {
-		osMod.Dict.Set(val.InternString("name"), val.NewStringVal("nt"))
-	} else {
-		osMod.Dict.Set(val.InternString("name"), val.NewStringVal("posix"))
-	}
+	osMod.Dict.Set(val.InternString("name"), val.NewStringVal("posix"))
 
 	// Environment
 	envDictVal := val.NewDictVal(32)

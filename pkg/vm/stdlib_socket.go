@@ -1,3 +1,5 @@
+//go:build unix
+
 package vm
 
 import (
@@ -9,6 +11,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/servusdei2018/fython/pkg/val"
 )
@@ -52,11 +56,11 @@ func (e *Engine) createSocketModule() val.Value {
 
 	// Socket options
 	mod.Dict.Set(val.InternString("SOL_SOCKET"), val.Int64Val(syscall.SOL_SOCKET))
-	mod.Dict.Set(val.InternString("SOL_TCP"), val.Int64Val(syscall.SOL_TCP))
+	mod.Dict.Set(val.InternString("SOL_TCP"), val.Int64Val(unix.IPPROTO_TCP))
 	mod.Dict.Set(val.InternString("SO_REUSEADDR"), val.Int64Val(syscall.SO_REUSEADDR))
 	mod.Dict.Set(val.InternString("SO_REUSEPORT"), val.Int64Val(0x0f))
-	mod.Dict.Set(val.InternString("SO_TYPE"), val.Int64Val(syscall.SO_TYPE))
-	mod.Dict.Set(val.InternString("SO_ERROR"), val.Int64Val(syscall.SO_ERROR))
+	mod.Dict.Set(val.InternString("SO_TYPE"), val.Int64Val(unix.SO_TYPE))
+	mod.Dict.Set(val.InternString("SO_ERROR"), val.Int64Val(unix.SO_ERROR))
 	mod.Dict.Set(val.InternString("SO_KEEPALIVE"), val.Int64Val(syscall.SO_KEEPALIVE))
 	mod.Dict.Set(val.InternString("SO_BROADCAST"), val.Int64Val(syscall.SO_BROADCAST))
 	mod.Dict.Set(val.InternString("SO_RCVBUF"), val.Int64Val(syscall.SO_RCVBUF))
@@ -559,21 +563,21 @@ func (e *Engine) createSocketModule() val.Value {
 		if timeout <= 0 {
 			return nil
 		}
-		var rSet, wSet syscall.FdSet
+		var rSet, wSet unix.FdSet
 		if forWriting {
 			wSet.Bits[fd/64] |= 1 << (uint(fd) % 64)
 		} else {
 			rSet.Bits[fd/64] |= 1 << (uint(fd) % 64)
 		}
 		dur := time.Duration(timeout * float64(time.Second))
-		tv := syscall.NsecToTimeval(dur.Nanoseconds())
-		var rPtr, wPtr *syscall.FdSet
+		tv := unix.NsecToTimeval(dur.Nanoseconds())
+		var rPtr, wPtr *unix.FdSet
 		if forWriting {
 			wPtr = &wSet
 		} else {
 			rPtr = &rSet
 		}
-		n, err := syscall.Select(fd+1, rPtr, wPtr, nil, &tv)
+		n, err := unix.Select(fd+1, rPtr, wPtr, nil, &tv)
 		if err != nil {
 			return err
 		}
@@ -792,7 +796,7 @@ func (e *Engine) createSocketModule() val.Value {
 				return raiseOSError(ctx, waitErr, "")
 			}
 			// Check socket error
-			soErr, getsockErr := syscall.GetsockoptInt(st.fd, syscall.SOL_SOCKET, syscall.SO_ERROR)
+			soErr, getsockErr := syscall.GetsockoptInt(st.fd, syscall.SOL_SOCKET, unix.SO_ERROR)
 			if getsockErr != nil {
 				return raiseOSError(ctx, getsockErr, "")
 			}
@@ -827,7 +831,7 @@ func (e *Engine) createSocketModule() val.Value {
 			if waitErr != nil {
 				return val.Int64Val(110) // ETIMEDOUT
 			}
-			soErr, _ := syscall.GetsockoptInt(st.fd, syscall.SOL_SOCKET, syscall.SO_ERROR)
+			soErr, _ := syscall.GetsockoptInt(st.fd, syscall.SOL_SOCKET, unix.SO_ERROR)
 			return val.Int64Val(int64(soErr))
 		}
 		if errno, ok := err.(syscall.Errno); ok {

@@ -10,7 +10,6 @@ import (
 
 	"github.com/ebitengine/purego"
 
-	"github.com/servusdei2018/fython/pkg/dynload"
 	"github.com/servusdei2018/fython/pkg/val"
 )
 
@@ -29,7 +28,7 @@ func dlopenForCTypes(name string) (uintptr, error) {
 		}
 		return h, nil
 	}
-	h, err := dynload.Open(name)
+	h, err := ctypesDlopen(name)
 	if err != nil {
 		return 0, fmt.Errorf("cannot load library %s: %v", name, err)
 	}
@@ -38,16 +37,13 @@ func dlopenForCTypes(name string) (uintptr, error) {
 
 func libcHandleOrOpen() (uintptr, error) {
 	libcHandleOnce.Do(func() {
-		for _, cand := range []string{"libc.so.6", "libc.so", "/lib/libc.so", "libSystem.dylib"} {
-			h, err := dynload.Open(cand)
+		// dynload wraps dlopen on Unix and LoadLibrary on Windows.
+		for _, cand := range []string{"libc.so.6", "libc.so", "/lib/libc.so", "libSystem.dylib", "kernel32.dll"} {
+			h, err := ctypesDlopen(cand)
 			if err == nil {
 				libcHandle = h
 				return
 			}
-		}
-		h, err := purego.Dlopen("libc.so.6", purego.RTLD_NOW|purego.RTLD_GLOBAL)
-		if err == nil {
-			libcHandle = h
 		}
 	})
 	if libcHandle == 0 {
@@ -67,15 +63,11 @@ func libcFuncAddr(name string) uintptr {
 	if err != nil {
 		return 0
 	}
-	addr, err := dynload.Sym(h, name)
-	if err == nil {
-		return addr
+	addr, err := ctypesDlsym(h, name)
+	if err != nil {
+		return 0
 	}
-	addr2, err2 := purego.Dlsym(h, name)
-	if err2 == nil {
-		return addr2
-	}
-	return 0
+	return addr
 }
 
 func dlsymIn(handle uintptr, name string) (uintptr, error) {
@@ -83,11 +75,7 @@ func dlsymIn(handle uintptr, name string) (uintptr, error) {
 		h, _ := libcHandleOrOpen()
 		handle = h
 	}
-	addr, err := dynload.Sym(handle, name)
-	if err == nil {
-		return addr, nil
-	}
-	return purego.Dlsym(handle, name)
+	return ctypesDlsym(handle, name)
 }
 
 func simpleBufPtr(buf []byte) unsafe.Pointer {

@@ -1,8 +1,11 @@
+//go:build unix
+
 package vm
 
 import (
-	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/servusdei2018/fython/pkg/val"
 )
@@ -58,7 +61,7 @@ func (e *Engine) createSelectModule() val.Value {
 		wItems := getList(args[1])
 		xItems := getList(args[2])
 
-		var rSet, wSet, xSet syscall.FdSet
+		var rSet, wSet, xSet unix.FdSet
 		hasR, hasW, hasX := false, false, false
 		maxFd := -1
 
@@ -111,7 +114,7 @@ func (e *Engine) createSelectModule() val.Value {
 			xEntries = append(xEntries, fdEntry{fd: fd, val: item})
 		}
 
-		var tv *syscall.Timeval
+		var tv *unix.Timeval
 		if len(args) > 3 && !args[3].IsNone() {
 			var dur time.Duration
 			if args[3].IsFloat64() {
@@ -119,11 +122,11 @@ func (e *Engine) createSelectModule() val.Value {
 			} else if args[3].IsInt64() {
 				dur = time.Duration(args[3].AsInt64()) * time.Second
 			}
-			tVal := syscall.NsecToTimeval(dur.Nanoseconds())
+			tVal := unix.NsecToTimeval(dur.Nanoseconds())
 			tv = &tVal
 		}
 
-		var rPtr, wPtr, xPtr *syscall.FdSet
+		var rPtr, wPtr, xPtr *unix.FdSet
 		if hasR {
 			rPtr = &rSet
 		}
@@ -134,9 +137,9 @@ func (e *Engine) createSelectModule() val.Value {
 			xPtr = &xSet
 		}
 
-		n, err := syscall.Select(maxFd+1, rPtr, wPtr, xPtr, tv)
+		n, err := unix.Select(maxFd+1, rPtr, wPtr, xPtr, tv)
 		_ = n
-		if err != nil && err != syscall.EINTR {
+		if err != nil && err != unix.EINTR {
 			return raiseOSError(ctx, err, "")
 		}
 

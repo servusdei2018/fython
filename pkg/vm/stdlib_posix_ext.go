@@ -1,3 +1,5 @@
+//go:build unix
+
 package vm
 
 import (
@@ -29,26 +31,10 @@ func pyFD(ctx *val.ExecContext, v val.Value) int {
 	return 0
 }
 
-// pyInt extracts a Python integer argument.
-func pyInt(args []val.Value, i int, name string) int {
-	if len(args) <= i {
-		panic("TypeError: " + name + "() takes more arguments")
-	}
-	if !args[i].IsInt64() {
-		panic("TypeError: " + name + "() argument must be an integer")
-	}
-	return int(args[i].AsInt64())
-}
-
-// pySeqItems returns the elements of a list or a tuple.
-func pySeqItems(v val.Value) []val.Value {
-	if v.IsList() {
-		return v.AsList().Items
-	}
-	if v.IsTuple() {
-		return v.AsTuple().Items
-	}
-	return nil
+// termiosAttrs is the platform-neutral form of a termios attribute list.
+type termiosAttrs struct {
+	Iflag, Oflag, Cflag, Lflag, Ispeed, Ospeed int64
+	Cc                                         []byte
 }
 
 // createTermiosModule builds the POSIX terminal interface module.
@@ -107,43 +93,11 @@ func (e *Engine) createTermiosModule() val.Value {
 	set("PARODD", int64(unix.PARODD))
 	set("HUPCL", int64(unix.HUPCL))
 	set("CLOCAL", int64(unix.CLOCAL))
-	set("CBAUD", int64(unix.CBAUD))
-	set("B0", int64(unix.B0))
-	set("B50", int64(unix.B50))
-	set("B75", int64(unix.B75))
-	set("B110", int64(unix.B110))
-	set("B134", int64(unix.B134))
-	set("B150", int64(unix.B150))
-	set("B200", int64(unix.B200))
-	set("B300", int64(unix.B300))
-	set("B600", int64(unix.B600))
-	set("B1200", int64(unix.B1200))
-	set("B1800", int64(unix.B1800))
-	set("B2400", int64(unix.B2400))
-	set("B4800", int64(unix.B4800))
-	set("B9600", int64(unix.B9600))
-	set("B19200", int64(unix.B19200))
-	set("B38400", int64(unix.B38400))
-	set("B57600", int64(unix.B57600))
-	set("B115200", int64(unix.B115200))
-	set("B230400", int64(unix.B230400))
-	set("B460800", int64(unix.B460800))
-	set("B500000", int64(unix.B500000))
-	set("B576000", int64(unix.B576000))
-	set("B921600", int64(unix.B921600))
-	set("B1000000", int64(unix.B1000000))
-	set("B1152000", int64(unix.B1152000))
-	set("B1500000", int64(unix.B1500000))
-	set("B2000000", int64(unix.B2000000))
-	set("B2500000", int64(unix.B2500000))
-	set("B3000000", int64(unix.B3000000))
-	set("B3500000", int64(unix.B3500000))
-	set("B4000000", int64(unix.B4000000))
+	termiosSetConstants(set)
 
 	// Local flags.
 	set("ISIG", int64(unix.ISIG))
 	set("ICANON", int64(unix.ICANON))
-	set("XCASE", int64(unix.XCASE))
 	set("ECHO", int64(unix.ECHO))
 	set("ECHOE", int64(unix.ECHOE))
 	set("ECHOK", int64(unix.ECHOK))
@@ -185,22 +139,22 @@ func (e *Engine) createTermiosModule() val.Value {
 
 	mod.Dict.Set(val.InternString("tcgetattr"), val.NewBuiltinFuncVal("tcgetattr", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		fd := pyFD(ctx, args[0])
-		t, err := unix.IoctlGetTermios(fd, unix.TCGETS)
+		a, err := termiosGet(fd)
 		if err != nil {
 			ctx.Raise(val.NewException(val.OSErrorType, err.Error()))
 			return val.NoneVal()
 		}
-		cc := make([]val.Value, len(t.Cc))
-		for i, b := range t.Cc {
+		cc := make([]val.Value, len(a.Cc))
+		for i, b := range a.Cc {
 			cc[i] = val.Int64Val(int64(b))
 		}
 		return val.NewListVal(
-			val.Int64Val(int64(t.Iflag)),
-			val.Int64Val(int64(t.Oflag)),
-			val.Int64Val(int64(t.Cflag)),
-			val.Int64Val(int64(t.Lflag)),
-			val.Int64Val(int64(t.Ispeed)),
-			val.Int64Val(int64(t.Ospeed)),
+			val.Int64Val(a.Iflag),
+			val.Int64Val(a.Oflag),
+			val.Int64Val(a.Cflag),
+			val.Int64Val(a.Lflag),
+			val.Int64Val(a.Ispeed),
+			val.Int64Val(a.Ospeed),
 			val.NewListVal(cc...),
 		)
 	}))
@@ -221,32 +175,23 @@ func (e *Engine) createTermiosModule() val.Value {
 			ctx.Raise(val.NewException(val.ValueErrorType, "tcsetattr() attribute list must have 7 elements"))
 			return val.NoneVal()
 		}
-		t := &unix.Termios{}
-		t.Iflag = uint32(items[0].AsInt64())
-		t.Oflag = uint32(items[1].AsInt64())
-		t.Cflag = uint32(items[2].AsInt64())
-		t.Lflag = uint32(items[3].AsInt64())
-		t.Ispeed = uint32(items[4].AsInt64())
-		t.Ospeed = uint32(items[5].AsInt64())
-		cc := pySeqItems(items[6])
-		for i := range t.Cc {
-			if i < len(cc) {
-				t.Cc[i] = byte(cc[i].AsInt64())
-			}
+		a := &termiosAttrs{
+			Iflag:  items[0].AsInt64(),
+			Oflag:  items[1].AsInt64(),
+			Cflag:  items[2].AsInt64(),
+			Lflag:  items[3].AsInt64(),
+			Ispeed: items[4].AsInt64(),
+			Ospeed: items[5].AsInt64(),
 		}
-		var err error
-		switch when {
-		case 0:
-			err = unix.IoctlSetTermios(fd, unix.TCSETS, t)
-		case 1:
-			err = unix.IoctlSetTermios(fd, unix.TCSETSW, t)
-		case 2:
-			err = unix.IoctlSetTermios(fd, unix.TCSETSF, t)
-		default:
+		cc := pySeqItems(items[6])
+		for _, c := range cc {
+			a.Cc = append(a.Cc, byte(c.AsInt64()))
+		}
+		if when < 0 || when > 2 {
 			ctx.Raise(val.NewException(val.ValueErrorType, "tcsetattr() when must be TCSANOW, TCSADRAIN or TCSAFLUSH"))
 			return val.NoneVal()
 		}
-		if err != nil {
+		if err := termiosSetAttr(fd, when, a); err != nil {
 			ctx.Raise(val.NewException(val.OSErrorType, err.Error()))
 			return val.NoneVal()
 		}
@@ -255,12 +200,12 @@ func (e *Engine) createTermiosModule() val.Value {
 
 	mod.Dict.Set(val.InternString("tcgetwinsize"), val.NewBuiltinFuncVal("tcgetwinsize", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		fd := pyFD(ctx, args[0])
-		ws, err := unix.IoctlGetWinsize(fd, unix.TIOCGWINSZ)
+		rows, cols, err := winsizeGet(fd)
 		if err != nil {
 			ctx.Raise(val.NewException(val.OSErrorType, err.Error()))
 			return val.NoneVal()
 		}
-		return val.NewTupleVal(val.Int64Val(int64(ws.Row)), val.Int64Val(int64(ws.Col)))
+		return val.NewTupleVal(val.Int64Val(int64(rows)), val.Int64Val(int64(cols)))
 	}))
 
 	mod.Dict.Set(val.InternString("tcsetwinsize"), val.NewBuiltinFuncVal("tcsetwinsize", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -271,7 +216,7 @@ func (e *Engine) createTermiosModule() val.Value {
 		fd := pyFD(ctx, args[0])
 		rows := uint16(pyInt(args, 1, "tcsetwinsize"))
 		cols := uint16(pyInt(args, 2, "tcsetwinsize"))
-		if err := unix.IoctlSetWinsize(fd, unix.TIOCSWINSZ, &unix.Winsize{Row: rows, Col: cols}); err != nil {
+		if err := winsizeSet(fd, rows, cols); err != nil {
 			ctx.Raise(val.NewException(val.OSErrorType, err.Error()))
 			return val.NoneVal()
 		}

@@ -6,7 +6,20 @@ import (
 	"io/fs"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
+
+// dup2Impl implements POSIX dup2 on Linux. Raw syscall.Dup2 is only defined on
+// amd64; Dup3 is available on both amd64 and arm64. When the descriptors are
+// equal, validate the descriptor and succeed without an ioctl, matching dup2.
+func dup2Impl(oldfd, newfd int) error {
+	if oldfd == newfd {
+		_, err := unix.FcntlInt(uintptr(oldfd), unix.F_GETFD, 0)
+		return err
+	}
+	return unix.Dup3(oldfd, newfd, 0)
+}
 
 // sysStatInfo fills the fields only the kernel knows.
 func sysStatInfo(info fs.FileInfo, si *statInfo) {

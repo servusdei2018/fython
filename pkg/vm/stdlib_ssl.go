@@ -1,3 +1,5 @@
+//go:build unix
+
 package vm
 
 import (
@@ -12,6 +14,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/servusdei2018/fython/pkg/val"
 )
@@ -742,10 +746,10 @@ func (c *netSocketConn) Read(b []byte) (n int, err error) {
 				timeout = c.st.timeout
 			}
 			dur := time.Duration(timeout * float64(time.Second))
-			tv := syscall.NsecToTimeval(dur.Nanoseconds())
-			var rSet syscall.FdSet
+			tv := unix.NsecToTimeval(dur.Nanoseconds())
+			var rSet unix.FdSet
 			rSet.Bits[c.fd/64] |= 1 << (uint(c.fd) % 64)
-			sn, sErr := syscall.Select(c.fd+1, &rSet, nil, nil, &tv)
+			sn, sErr := unix.Select(c.fd+1, &rSet, nil, nil, &tv)
 			if sErr != nil {
 				return 0, sErr
 			}
@@ -776,10 +780,10 @@ func (c *netSocketConn) Write(b []byte) (n int, err error) {
 				timeout = c.st.timeout
 			}
 			dur := time.Duration(timeout * float64(time.Second))
-			tv := syscall.NsecToTimeval(dur.Nanoseconds())
-			var wSet syscall.FdSet
+			tv := unix.NsecToTimeval(dur.Nanoseconds())
+			var wSet unix.FdSet
 			wSet.Bits[c.fd/64] |= 1 << (uint(c.fd) % 64)
-			sn, sErr := syscall.Select(c.fd+1, nil, &wSet, nil, &tv)
+			sn, sErr := unix.Select(c.fd+1, nil, &wSet, nil, &tv)
 			if sErr != nil {
 				return total, sErr
 			}
