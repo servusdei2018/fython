@@ -3025,6 +3025,39 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				}
 			}
 			ip, sp, ctl = vm.opCallSlow(st, inst, ip, sp)
+		case OP_CALL_PY_DEFAULTS:
+			argc := int(uint8(inst >> 16))
+			newBase := sp - argc
+			retSP := newBase - 1
+			target := *(*val.Value)(unsafe.Add(stackPtr, uintptr(retSP)*16))
+			entry := &st.cache.ic[ip]
+			if target == entry.CachedVal && !vm.hasTrackedViews {
+				fn := target.AsFunction()
+				cc := entry.CalleeCache
+				if cc != nil && cc.owner == vm && cc.co != nil &&
+					fn.Code.HeaderPtr() == &cc.co.Header &&
+					len(fn.Defaults) > 0 && fn.KwDefaults == nil &&
+					atomic.LoadInt32(&cc.co.StreamGen) == cc.streamGen {
+					callee := cc.co
+					if argc >= callee.PositionalParamCount-len(fn.Defaults) &&
+						argc <= callee.PositionalParamCount {
+						st.periodicTick++
+						if (st.periodicTick&0xFF) != 0 &&
+							st.frameIdx+2 <= len(vm.frames) &&
+							newBase+max(256, callee.NumLocals+64) <= len(st.stack) {
+							if argc < callee.PositionalParamCount {
+								defStart := callee.PositionalParamCount - len(fn.Defaults)
+								copy(st.stack[newBase+argc:newBase+callee.PositionalParamCount], fn.Defaults[argc-defStart:])
+							}
+							pushFn = fn
+							pushCache = cc
+							pushTotalArgs = ^argc
+							goto pushFrame
+						}
+					}
+				}
+			}
+			ip, sp, ctl = vm.opCallPyDefaults(st, inst, ip, sp)
 		case OP_CALL_LEN:
 			target := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
 			if target == vm.builtinLen {
@@ -3197,15 +3230,14 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				instType := instObj.Header.Type
 				pic := &st.cache.methodPIC[ip]
 				var targetFn *val.PyFunction
-				switch {
-				case pic[0].Shape == instShape && instType.Version() == pic[0].TypeVersion:
-					targetFn = pic[0].TargetFn
-				case pic[1].Shape == instShape && instType.Version() == pic[1].TypeVersion:
-					targetFn = pic[1].TargetFn
-				case pic[2].Shape == instShape && instType.Version() == pic[2].TypeVersion:
-					targetFn = pic[2].TargetFn
-				case pic[3].Shape == instShape && instType.Version() == pic[3].TypeVersion:
-					targetFn = pic[3].TargetFn
+				if instShape != nil {
+					instID := instShape.ID
+					instVer := instType.Version()
+					if e := &pic[0]; e.Shape != nil && e.Shape.ID == instID && instVer == e.TypeVersion && e.TargetFn != nil {
+						targetFn = e.TargetFn
+					} else if e := &pic[1]; e.Shape != nil && e.Shape.ID == instID && instVer == e.TypeVersion && e.TargetFn != nil {
+						targetFn = e.TargetFn
+					}
 				}
 				if targetFn != nil {
 					callee := AsCodeObject(targetFn.Code)

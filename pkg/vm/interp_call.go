@@ -192,7 +192,7 @@ func isEphemeralSuperCallSite(st *loopState, ip int) bool {
 			if depth <= 1 {
 				return false
 			}
-		case OP_CALL_PY_EXACT_ARGS, OP_CALL_BUILTIN_FAST, OP_CALL_TYPE_INIT,
+		case OP_CALL_PY_EXACT_ARGS, OP_CALL_PY_DEFAULTS, OP_CALL_BUILTIN_FAST, OP_CALL_TYPE_INIT,
 			OP_CALL_METHOD_PIC, OP_CALL_METHOD_DESCR, OP_CALL_METHOD_DESCR_FAST,
 			OP_CALL_HASATTR, OP_CALL_GETATTR, OP_CALL_BOUND_NATIVE:
 			depth -= int(DecodeArgA(wk))
@@ -792,8 +792,38 @@ unwrapKw:
 		}
 
 		// Fast path: OP_CALL_KW PIC hit writes kwargs directly into callee slots with 0 allocations.
+		// Monomorphic entry uses pushFrameFast setup without pushCalleeFrame dispatch.
 		if ip < len(st.cache.kwPIC) {
 			pic := &st.cache.kwPIC[ip]
+			if e := &pic[0]; e.TargetCo == callee && e.TargetFn == fn && e.TargetType == nil &&
+				e.PosCount == posCount && e.TotalArgs == totalArgs && e.DefaultsLen == len(fn.Defaults) &&
+				e.CalleeCache != nil && e.CalleeCache.owner == vm &&
+				((fn.KwDefaults == nil && !e.HasKwDefaults) || (fn.KwDefaults != nil && e.HasKwDefaults && atomic.LoadUint64(&fn.KwDefaults.VersionTag) == e.KwDefaultsVer)) &&
+				!callee.IsGenerator && !callee.IsCoroutine &&
+				!callee.HasCellVars && (!callee.HasCells || fn.Closure != nil) &&
+				callee.NumLocals >= callee.NumParams &&
+				atomic.LoadInt32(&callee.StreamGen) == e.CalleeCache.streamGen {
+				minCap := max(newBase+256, newBase+e.NumLocals+64)
+				if minCap > len(stack) {
+					stack = vm.growStack(st, stack, minCap)
+				}
+				copy(vm.kwScratch[:kwCount], stack[newBase+posCount:newBase+totalArgs])
+				for i := range kwCount {
+					stack[newBase+int(e.KwSlots[i])] = vm.kwScratch[i]
+				}
+				for _, df := range e.DefaultsFill {
+					if df.DefIdx >= 0 {
+						stack[newBase+int(df.Slot)] = fn.Defaults[df.DefIdx]
+					} else {
+						stack[newBase+int(df.Slot)] = df.Val
+					}
+				}
+				if st.frameIdx+2 <= len(vm.frames) {
+					newIP, newSP := vm.pushFrameFast(st, fn, e.CalleeCache, newBase+totalArgs, ^totalArgs, ip)
+					return newIP, newSP, ctlReload
+				}
+				return vm.pushCalleeFrame(st, callee, fn, e.CalleeCache, newBase, retSP, newBase+e.NumLocals, retIP)
+			}
 			for k := range 2 {
 				e := &pic[k]
 				if e.TargetCo == callee && e.TargetFn == fn && e.TargetType == nil &&
@@ -2246,6 +2276,7 @@ unwrapCall:
 		}
 		var nextSP int
 		exactArgs := callee.SimplePositionalOnly && argc == callee.PositionalParamCount && len(fn.Defaults) == 0 && fn.KwDefaults == nil
+		defaultsArgs := !exactArgs && callee.SimplePositionalOnly && fn.KwDefaults == nil && len(fn.Defaults) > 0 && argc >= callee.PositionalParamCount-len(fn.Defaults) && argc <= callee.PositionalParamCount
 		switch {
 		case exactArgs:
 			nextSP = newBase + callee.EffectiveLocals
@@ -2269,13 +2300,22 @@ unwrapCall:
 		}
 		cc := vm.cacheFor(callee)
 		if canQuicken && !vm.hasTrackedViews && !callee.IsGenerator && !callee.IsCoroutine &&
-			exactArgs && !callee.HasCellVars && (!callee.HasCells || fn.Closure != nil) {
-			if len(callee.ExceptionTable) == 0 && atomic.LoadInt32(&callee.IsTier2Optimized) == 0 {
-				maybeOptimizeCodeObject(vm, callee, cc)
+			!callee.HasCellVars && (!callee.HasCells || fn.Closure != nil) {
+			if exactArgs {
+				if len(callee.ExceptionTable) == 0 && atomic.LoadInt32(&callee.IsTier2Optimized) == 0 {
+					maybeOptimizeCodeObject(vm, callee, cc)
+				}
+				_, _ = vm.loadWindow(callee, cc)
+				st.cache.ic[ip] = ICSlot{CachedVal: target, CalleeCache: cc}
+				st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL_PY_EXACT_ARGS))
+			} else if defaultsArgs && callee.NumLocals >= callee.PositionalParamCount {
+				if len(callee.ExceptionTable) == 0 && atomic.LoadInt32(&callee.IsTier2Optimized) == 0 {
+					maybeOptimizeCodeObject(vm, callee, cc)
+				}
+				_, _ = vm.loadWindow(callee, cc)
+				st.cache.ic[ip] = ICSlot{CachedVal: target, CalleeCache: cc}
+				st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL_PY_DEFAULTS))
 			}
-			_, _ = vm.loadWindow(callee, cc)
-			st.cache.ic[ip] = ICSlot{CachedVal: target, CalleeCache: cc}
-			st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL_PY_EXACT_ARGS))
 		}
 		retIP := ip + 1
 		if isDirectAwait && callee.IsCoroutine {
@@ -2521,6 +2561,66 @@ unwrapCall:
 		stack[retSP] = res
 		return ip + 1, retSP + 1, ctlReload
 	}
+}
+
+//go:noinline
+func (vm *VM) opCallPyDefaults(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
+	stack := st.stack
+	argc := int(uint8(inst >> 16))
+	bx := int(uint16(inst))
+	isDirectAwait := isDirectAwaitCallSite(st, ip)
+	var target val.Value
+	var newBase int
+	var retSP int
+	if bx < len(st.consts) && isCallableConst(st.consts[bx]) {
+		target = st.consts[bx]
+		newBase = sp - argc
+		retSP = newBase
+	} else {
+		target = stack[sp-argc-1]
+		newBase = sp - argc
+		retSP = sp - argc - 1
+	}
+	if vm.hasTrackedViews && argc > 0 {
+		markViewsEscaped(stack[newBase : newBase+argc])
+	}
+	entry := &st.cache.ic[ip]
+	if target == entry.CachedVal && entry.CalleeCache != nil && entry.CalleeCache.owner == vm {
+		if target.IsFunction() {
+			fn := target.AsFunction()
+			cc := entry.CalleeCache
+			if cc.co != nil && fn.Code.HeaderPtr() == &cc.co.Header &&
+				atomic.LoadInt32(&cc.co.StreamGen) == cc.streamGen {
+				callee := cc.co
+				if !callee.IsGenerator && !callee.IsCoroutine &&
+					callee.SimplePositionalOnly && fn.KwDefaults == nil &&
+					len(fn.Defaults) > 0 && argc >= callee.PositionalParamCount-len(fn.Defaults) &&
+					argc <= callee.PositionalParamCount && !callee.HasCellVars &&
+					(!callee.HasCells || fn.Closure != nil) &&
+					callee.NumLocals >= callee.PositionalParamCount {
+					if vm.hasTrackedViews && argc > 0 {
+						markViewsEscaped(stack[newBase : newBase+argc])
+					}
+					minCap := max(newBase+256, newBase+callee.NumLocals+64)
+					if minCap > len(stack) {
+						stack = vm.growStack(st, stack, minCap)
+					}
+					if argc < callee.PositionalParamCount {
+						defStart := callee.PositionalParamCount - len(fn.Defaults)
+						copy(stack[newBase+argc:newBase+callee.PositionalParamCount], fn.Defaults[argc-defStart:])
+					}
+					nextSP := newBase + callee.EffectiveLocals
+					retIP := ip + 1
+					if isDirectAwait && callee.IsCoroutine {
+						retIP = ip + 3
+					}
+					return vm.pushCalleeFrame(st, callee, fn, cc, newBase, retSP, nextSP, retIP)
+				}
+			}
+		}
+	}
+	st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL))
+	return vm.opCallSlow(st, ReplaceOpcode(inst, OP_CALL), ip, sp)
 }
 
 //go:noinline

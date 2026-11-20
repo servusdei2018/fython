@@ -374,7 +374,7 @@ func reloadCode(co *CodeObject, cache *VMCodeCache, gen int32) []uint32 {
 		copy(priv, newStream)
 		for i, oldInst := range cache.active {
 			switch DecodeOpcode(oldInst) {
-			case OP_CALL_PY_EXACT_ARGS, OP_CALL_BUILTIN_FAST, OP_CALL_LEN, OP_CALL_ISINSTANCE, OP_CALL_TYPE_INIT,
+			case OP_CALL_PY_EXACT_ARGS, OP_CALL_PY_DEFAULTS, OP_CALL_BUILTIN_FAST, OP_CALL_LEN, OP_CALL_ISINSTANCE, OP_CALL_TYPE_INIT,
 				OP_CALL_HASATTR, OP_CALL_GETATTR, OP_CALL_BOUND_NATIVE:
 				if DecodeOpcode(priv[i]) == OP_CALL {
 					priv[i] = oldInst
