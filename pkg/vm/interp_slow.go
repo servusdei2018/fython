@@ -2,6 +2,7 @@ package vm
 
 import (
 	"fmt"
+	"strconv"
 	"sync/atomic"
 	"unsafe"
 
@@ -340,6 +341,94 @@ func (vm *VM) opGetIterSlow(st *loopState, ip, sp int) (int, int, loopCtl) {
 	return ip, sp, ctlReload
 }
 
+// nextZipEnumeratePooled advances a concrete zip/enumerate iterator by one
+// step, allocating the 2-4 element result tuple from the VM freelist when the
+// step tuple is short-lived. Each step acquires a fresh tuple; the consumer
+// returns it via releaseEphemeralTupleVal (unpack paths) or strips the marker
+// via ClearEphemeral when retained, so no iterator-held reference ever shares
+// ownership with tupleFreeList.
+func (vm *VM) nextZipEnumeratePooled(pyIter *val.PyIter) (val.Value, bool) {
+	ctx := &vm.execCtx
+	if pyIter.Kind == val.IterKindEnumerate {
+		v, ok := pyIter.Obj.AsIter().NextCtx(ctx)
+		if !ok {
+			return val.NoneVal(), false
+		}
+		idx := pyIter.Cur
+		pyIter.Cur++
+		var buf [2]val.Value
+		buf[0] = val.Int64Val(idx)
+		buf[1] = v
+		if !val.MultiThreadedFlag.Load() {
+			return vm.acquireEphemeralTuple(buf[:]), true
+		}
+		return val.NewTupleFromSlice(buf[:]), true
+	}
+	if pyIter.Stop != 0 {
+		return val.NoneVal(), false
+	}
+	n := len(pyIter.Seq)
+	if n == 0 {
+		pyIter.Stop = 1
+		return val.NoneVal(), false
+	}
+	if n <= 4 {
+		var buf [4]val.Value
+		for i := 0; i < n; i++ {
+			v, ok := pyIter.Seq[i].AsIter().NextCtx(ctx)
+			if !ok {
+				pyIter.Stop = 1
+				if pyIter.Step != 0 {
+					raiseZipStrict(ctx, pyIter.Seq, i)
+				}
+				return val.NoneVal(), false
+			}
+			buf[i] = v
+		}
+		if !val.MultiThreadedFlag.Load() {
+			return vm.acquireEphemeralTuple(buf[:n]), true
+		}
+		return val.NewTupleFromSlice(buf[:n]), true
+	}
+	items := make([]val.Value, n)
+	for i := 0; i < n; i++ {
+		v, ok := pyIter.Seq[i].AsIter().NextCtx(ctx)
+		if !ok {
+			pyIter.Stop = 1
+			if pyIter.Step != 0 {
+				raiseZipStrict(ctx, pyIter.Seq, i)
+			}
+			return val.NoneVal(), false
+		}
+		items[i] = v
+	}
+	return val.NewTupleFromSlice(items), true
+}
+
+// raiseZipStrict records the strict=True length-mismatch error for a zip step
+// that exhausted argument i, mirroring the exact CPython-compatible messages.
+func raiseZipStrict(ctx *val.ExecContext, seq []val.Value, i int) {
+	n := len(seq)
+	if i > 0 {
+		plural := " "
+		if i > 1 {
+			plural = "s 1-"
+		}
+		val.RaiseValueError(ctx, "zip() argument "+strconv.Itoa(i+1)+" is shorter than argument"+plural+strconv.Itoa(i))
+		return
+	}
+	for j := 1; j < n; j++ {
+		if _, more := seq[j].AsIter().NextCtx(ctx); more {
+			plural := " "
+			if j > 1 {
+				plural = "s 1-"
+			}
+			val.RaiseValueError(ctx, "zip() argument "+strconv.Itoa(j+1)+" is longer than argument"+plural+strconv.Itoa(j))
+			return
+		}
+	}
+}
+
 //go:noinline
 func (vm *VM) opForIterSlow(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
@@ -350,6 +439,27 @@ func (vm *VM) opForIterSlow(st *loopState, inst uint32, ip, sp int) (int, int, l
 		if pyIter.Kind == val.IterKindInvalid {
 			st.raiseExc = val.NewTypeError(fmt.Sprintf("'%s' object is not iterable", pyIter.Obj.Type().Name))
 			return ip, sp, ctlRaise
+		}
+		if pyIter.Kind == val.IterKindZip || pyIter.Kind == val.IterKindEnumerate {
+			st.ip = ip
+			vm.execCtx.SP = sp
+			nextVal, ok := vm.nextZipEnumeratePooled(pyIter)
+			stack = st.syncStackFromVM(vm, stack)
+			if vm.execCtx.HasException() {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				st.raiseExc = exc
+				return ip, sp, ctlRaise
+			}
+			if ok {
+				stack[sp] = nextVal
+				sp++
+				ip++
+				return ip, sp, ctlReload
+			}
+			vm.releaseForIter(pyIter)
+			sp--
+			return jumpTarget, sp, ctlReload
 		}
 		st.ip = ip
 		vm.execCtx.SP = sp

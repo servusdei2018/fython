@@ -814,17 +814,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		if it == nil {
 			return val.NoneVal()
 		}
-		var tuples []val.Value
-		idx := start
-		for {
-			item, ok := it.Next()
-			if !ok {
-				break
-			}
-			tuples = append(tuples, val.NewTupleVal(val.Int64Val(idx), item))
-			idx++
-		}
-		return val.NewIterVal(val.NewListVal(tuples...))
+		return val.NewEnumerateIterVal(val.ObjectVal(&it.Header), start)
 	}))
 
 	d.Set(val.InternString("zip"), val.NewBuiltinFuncVal("zip", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -842,50 +832,15 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		if len(args) == 0 {
 			return val.NewIterVal(val.NewListVal())
 		}
-		iters := make([]*val.PyIter, len(args))
+		subs := make([]val.Value, len(args))
 		for i, a := range args {
 			it := iterFor(ctx, a)
 			if it == nil {
 				return val.NoneVal()
 			}
-			iters[i] = it
+			subs[i] = val.ObjectVal(&it.Header)
 		}
-		done := false
-		return val.NewIterValWithNext(func() (val.Value, bool) {
-			if done {
-				return val.NoneVal(), false
-			}
-			items := make([]val.Value, len(iters))
-			for i, it := range iters {
-				v, ok := it.Next()
-				if !ok {
-					done = true
-					if strict {
-						if i > 0 {
-							plural := " "
-							if i > 1 {
-								plural = "s 1-"
-							}
-							val.RaiseValueError(ctx, "zip() argument "+strconv.Itoa(i+1)+" is shorter than argument"+plural+strconv.Itoa(i))
-							return val.NoneVal(), false
-						}
-						for j := 1; j < len(iters); j++ {
-							if _, more := iters[j].Next(); more {
-								plural := " "
-								if j > 1 {
-									plural = "s 1-"
-								}
-								val.RaiseValueError(ctx, "zip() argument "+strconv.Itoa(j+1)+" is longer than argument"+plural+strconv.Itoa(j))
-								return val.NoneVal(), false
-							}
-						}
-					}
-					return val.NoneVal(), false
-				}
-				items[i] = v
-			}
-			return val.NewTupleVal(items...), true
-		})
+		return val.NewZipIterVal(subs, strict)
 	}))
 
 	d.Set(val.InternString("reversed"), val.NewBuiltinFuncVal("reversed", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {

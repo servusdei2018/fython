@@ -338,6 +338,8 @@ const (
 	IterKindISlice
 	IterKindChain
 	IterKindChainFromIterable
+	IterKindZip
+	IterKindEnumerate
 )
 
 // PyIter represents a zero-allocation iterator over lists, tuples, dicts, ranges, or itertools streams.
@@ -1317,6 +1319,40 @@ func NewChainFromIterableVal(outerIter Value) Value {
 	return Value{num: 0, ptr: &it.Header}
 }
 
+// NewZipIterVal constructs a concrete PyIter for zip(*iterables, strict=...).
+// subIters holds one iterator Value per argument (each IsIter); strict records
+// the strict flag; Stop is the latch recording exhaustion.
+func NewZipIterVal(subIters []Value, strict bool) Value {
+	step := int64(0)
+	if strict {
+		step = 1
+	}
+	done := int64(0)
+	if len(subIters) == 0 {
+		done = 1
+	}
+	it := &PyIter{
+		Header: ObjectHeader{Kind: KindIter, Type: IterType},
+		Kind:   IterKindZip,
+		Seq:    subIters,
+		Stop:   done,
+		Step:   step,
+	}
+	return Value{num: 0, ptr: &it.Header}
+}
+
+// NewEnumerateIterVal constructs a concrete PyIter for enumerate(iterable, start).
+// subIter is the underlying iterator Value; Cur holds the next index to emit.
+func NewEnumerateIterVal(subIter Value, start int64) Value {
+	it := &PyIter{
+		Header: ObjectHeader{Kind: KindIter, Type: IterType},
+		Kind:   IterKindEnumerate,
+		Obj:    subIter,
+		Cur:    start,
+	}
+	return Value{num: 0, ptr: &it.Header}
+}
+
 // AsIter performs a zero-cost offset-0 downcast from Value to *PyIter.
 func (v Value) AsIter() *PyIter {
 	return (*PyIter)(unsafe.Pointer(v.ptr))
@@ -1530,6 +1566,88 @@ func (it *PyIter) NextCtx(ctx *ExecContext) (Value, bool) {
 			}
 			it.Sub = sub
 		}
+	case IterKindZip:
+		if it.Stop != 0 {
+			return NoneVal(), false
+		}
+		n := len(it.Seq)
+		if n == 0 {
+			it.Stop = 1
+			return NoneVal(), false
+		}
+		if n <= 4 {
+			var buf [4]Value
+			for i := 0; i < n; i++ {
+				v, ok := advanceIterNext(ctx, it.Seq[i])
+				if !ok {
+					it.Stop = 1
+					if ctx != nil && it.Step != 0 {
+						if i > 0 {
+							plural := " "
+							if i > 1 {
+								plural = "s 1-"
+							}
+							RaiseValueError(ctx, "zip() argument "+strconv.Itoa(i+1)+" is shorter than argument"+plural+strconv.Itoa(i))
+						} else {
+							for j := 1; j < n; j++ {
+								if _, more := advanceIterNext(ctx, it.Seq[j]); more {
+									plural := " "
+									if j > 1 {
+										plural = "s 1-"
+									}
+									RaiseValueError(ctx, "zip() argument "+strconv.Itoa(j+1)+" is longer than argument"+plural+strconv.Itoa(j))
+									break
+								}
+							}
+						}
+					}
+					return NoneVal(), false
+				}
+				buf[i] = v
+			}
+			return NewTupleFromSlice(buf[:n]), true
+		}
+		items := make([]Value, n)
+		for i := 0; i < n; i++ {
+			v, ok := advanceIterNext(ctx, it.Seq[i])
+			if !ok {
+				it.Stop = 1
+				if ctx != nil && it.Step != 0 {
+					if i > 0 {
+						plural := " "
+						if i > 1 {
+							plural = "s 1-"
+						}
+						RaiseValueError(ctx, "zip() argument "+strconv.Itoa(i+1)+" is shorter than argument"+plural+strconv.Itoa(i))
+					} else {
+						for j := 1; j < n; j++ {
+							if _, more := advanceIterNext(ctx, it.Seq[j]); more {
+								plural := " "
+								if j > 1 {
+									plural = "s 1-"
+								}
+								RaiseValueError(ctx, "zip() argument "+strconv.Itoa(j+1)+" is longer than argument"+plural+strconv.Itoa(j))
+								break
+							}
+						}
+					}
+				}
+				return NoneVal(), false
+			}
+			items[i] = v
+		}
+		return NewTupleFromSlice(items), true
+	case IterKindEnumerate:
+		v, ok := advanceIterNext(ctx, it.Obj)
+		if !ok {
+			return NoneVal(), false
+		}
+		idx := it.Cur
+		it.Cur++
+		var buf [2]Value
+		buf[0] = Int64Val(idx)
+		buf[1] = v
+		return NewTupleFromSlice(buf[:]), true
 	case IterKindFunc:
 		if it.NextFn != nil {
 			return it.NextFn()

@@ -3030,7 +3030,7 @@ func ExtractIterableItems(ctx *ExecContext, arg Value) []Value {
 			return nil
 		}
 		if ctx == nil && AcquireExecContextHook != nil &&
-			(it.Kind == IterKindGenerator || it.Kind == IterKindISlice || it.Kind == IterKindChain || it.Kind == IterKindChainFromIterable) {
+			(it.Kind == IterKindGenerator || it.Kind == IterKindISlice || it.Kind == IterKindChain || it.Kind == IterKindChainFromIterable || it.Kind == IterKindZip || it.Kind == IterKindEnumerate) {
 			var release func()
 			ctx, release = AcquireExecContextHook()
 			defer release()
