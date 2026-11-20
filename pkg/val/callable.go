@@ -4404,7 +4404,9 @@ func initTypes() {
 			instInst := inst.AsInstance()
 			s := NewStringVal(a.AsString())
 			if len(instInst.Slots) == 0 {
-				instInst.Slots = []Value{s}
+				if !instInst.ExtendBootstrapSlot(0, s) {
+					instInst.Slots = []Value{s}
+				}
 			} else {
 				instInst.Slots[0] = s
 			}

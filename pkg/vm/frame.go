@@ -306,6 +306,7 @@ type CodeObject struct {
 	VarKWIdx             int
 	ClassCellIdx         int16
 	VarKWSafe            bool
+	MapTempSafe          []bool
 	EffectiveLocals      int
 	FrameStackNeed       int
 	HasCells             bool
@@ -1657,6 +1658,7 @@ func (co *CodeObject) computeParamShape() {
 		}
 	}
 	co.VarKWSafe = computeVarKWSafe(co)
+	co.MapTempSafe = computeLocalDictSafe(co)
 }
 
 func isSafeScalarKeyConst(v val.Value) bool {
@@ -1791,4 +1793,105 @@ func computeVarKWSafe(co *CodeObject) bool {
 		}
 	}
 	return true
+}
+
+// computeLocalDictSafe marks BUILD_MAP sites whose result flows through a
+// single fast-local slot into a single releasing kwargs consumer. A site ip
+// qualifies only when the map holds at most 8 entries, ip+1 stores the fresh
+// dict into slot r exactly once, r is loaded exactly once by an instruction
+// that directly feeds OP_CALL_FUNCTION_EX with kwargs, the whole window is
+// free of jump targets, and no exception range overlaps the window. Consumers
+// already return pooled dicts to the freelist, so no new release sites are
+// needed; early exits simply leave the flagged dict for collection.
+func computeLocalDictSafe(co *CodeObject) []bool {
+	if co.IsGenerator || co.IsCoroutine || co.HasCells || len(co.Code) == 0 {
+		return nil
+	}
+	n := len(co.Code)
+	isJumpTarget := make([]bool, n+1)
+	for _, inst := range co.Code {
+		switch DecodeOpcode(inst) {
+		case OP_JUMP, OP_JUMP_IF_FALSE, OP_JUMP_IF_TRUE, OP_JUMP_IF_FALSE_OR_POP, OP_JUMP_IF_TRUE_OR_POP, OP_FOR_ITER, OP_FOR_ITER_GEN, OP_FOR_ITER_RANGE, OP_COMPARE_JUMP_IF_FALSE, OP_COMPARE_JUMP_IF_TRUE:
+			t := int(DecodeArgBx(inst))
+			if t >= 0 && t < len(isJumpTarget) {
+				isJumpTarget[t] = true
+			}
+		}
+	}
+	for _, e := range co.ExceptionTable {
+		if e.StartIP >= 0 && e.StartIP < len(isJumpTarget) {
+			isJumpTarget[e.StartIP] = true
+		}
+		if e.EndIP >= 0 && e.EndIP < len(isJumpTarget) {
+			isJumpTarget[e.EndIP] = true
+		}
+		if e.TargetIP >= 0 && e.TargetIP < len(isJumpTarget) {
+			isJumpTarget[e.TargetIP] = true
+		}
+	}
+	const maxReg = 256
+	storeCount := make([]int, maxReg)
+	loadCount := make([]int, maxReg)
+	loadPos := make([]int, maxReg)
+	for i, inst := range co.Code {
+		switch DecodeOpcode(inst) {
+		case OP_STORE_FAST, OP_DELETE_FAST:
+			if r := int(DecodeArgBx(inst)); r < maxReg {
+				storeCount[r]++
+			}
+		case OP_LOAD_FAST:
+			if r := int(DecodeArgBx(inst)); r < maxReg {
+				loadCount[r]++
+				loadPos[r] = i
+			}
+		}
+	}
+	var safe []bool
+	for ip, inst := range co.Code {
+		if DecodeOpcode(inst) != OP_BUILD_MAP {
+			continue
+		}
+		if int(uint16(inst)) > 8 {
+			continue
+		}
+		if ip+1 >= n || DecodeOpcode(co.Code[ip+1]) != OP_STORE_FAST {
+			continue
+		}
+		r := int(DecodeArgBx(co.Code[ip+1]))
+		if r >= maxReg || storeCount[r] != 1 || loadCount[r] != 1 {
+			continue
+		}
+		j := loadPos[r]
+		if j <= ip+1 || j+1 >= n {
+			continue
+		}
+		if DecodeOpcode(co.Code[j+1]) != OP_CALL_FUNCTION_EX || DecodeArgA(co.Code[j+1]) != 1 {
+			continue
+		}
+		end := j + 1
+		blocked := false
+		for k := ip + 1; k <= end; k++ {
+			if isJumpTarget[k] {
+				blocked = true
+				break
+			}
+		}
+		if blocked {
+			continue
+		}
+		for _, e := range co.ExceptionTable {
+			if e.StartIP < end+1 && e.EndIP > ip {
+				blocked = true
+				break
+			}
+		}
+		if blocked {
+			continue
+		}
+		if safe == nil {
+			safe = make([]bool, n)
+		}
+		safe[ip] = true
+	}
+	return safe
 }

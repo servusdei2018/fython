@@ -374,7 +374,7 @@ func (vm *VM) nextZipEnumeratePooled(pyIter *val.PyIter) (val.Value, bool) {
 	}
 	if n <= 4 {
 		var buf [4]val.Value
-		for i := 0; i < n; i++ {
+		for i := range n {
 			v, ok := pyIter.Seq[i].AsIter().NextCtx(ctx)
 			if !ok {
 				pyIter.Stop = 1
@@ -391,7 +391,7 @@ func (vm *VM) nextZipEnumeratePooled(pyIter *val.PyIter) (val.Value, bool) {
 		return val.NewTupleFromSlice(buf[:n]), true
 	}
 	items := make([]val.Value, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		v, ok := pyIter.Seq[i].AsIter().NextCtx(ctx)
 		if !ok {
 			pyIter.Stop = 1

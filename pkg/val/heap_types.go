@@ -1577,7 +1577,7 @@ func (it *PyIter) NextCtx(ctx *ExecContext) (Value, bool) {
 		}
 		if n <= 4 {
 			var buf [4]Value
-			for i := 0; i < n; i++ {
+			for i := range n {
 				v, ok := advanceIterNext(ctx, it.Seq[i])
 				if !ok {
 					it.Stop = 1
@@ -1608,7 +1608,7 @@ func (it *PyIter) NextCtx(ctx *ExecContext) (Value, bool) {
 			return NewTupleFromSlice(buf[:n]), true
 		}
 		items := make([]Value, n)
-		for i := 0; i < n; i++ {
+		for i := range n {
 			v, ok := advanceIterNext(ctx, it.Seq[i])
 			if !ok {
 				it.Stop = 1

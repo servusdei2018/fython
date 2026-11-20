@@ -804,9 +804,12 @@ func (vm *VM) opBuildMap(st *loopState, inst uint32, ip, sp int) (int, int, loop
 	stack := st.stack
 	count := int(uint16(inst))
 	var dictVal val.Value
-	if count <= 16 && isEphemeralMapSite(st, ip) {
+	switch {
+	case count <= 16 && isEphemeralMapSite(st, ip):
 		dictVal = vm.acquireSmallDict(count, true)
-	} else {
+	case count <= 8 && st.curCO != nil && ip < len(st.curCO.MapTempSafe) && st.curCO.MapTempSafe[ip]:
+		dictVal = vm.acquireSmallDict(count, true)
+	default:
 		dictVal = val.NewDictVal(count)
 	}
 	d := dictVal.AsDict()
