@@ -194,7 +194,7 @@ func isEphemeralSuperCallSite(st *loopState, ip int) bool {
 			}
 		case OP_CALL_PY_EXACT_ARGS, OP_CALL_PY_DEFAULTS, OP_CALL_BUILTIN_FAST, OP_CALL_TYPE_INIT,
 			OP_CALL_METHOD_PIC, OP_CALL_METHOD_DESCR, OP_CALL_METHOD_DESCR_FAST,
-			OP_CALL_HASATTR, OP_CALL_GETATTR, OP_CALL_BOUND_NATIVE:
+			OP_CALL_HASATTR, OP_CALL_GETATTR, OP_CALL_BOUND_NATIVE, OP_CALL_INSTANCE_DUNDER:
 			depth -= int(DecodeArgA(wk))
 			if depth <= 1 {
 				return false
@@ -1321,6 +1321,60 @@ func (vm *VM) opCallIsInstanceSlow(st *loopState, inst uint32, ip, sp int) (int,
 			return ip + 1, sp - 2, ctlNext
 		}
 	}
+	if cls.IsTuple() {
+		tup := cls.AsTuple()
+		if (tup.Header.Flags&val.FlagEphemeralTuple) == 0 && (tup.Header.Type == nil || tup.Header.Type == val.TupleType) {
+			cacheable := true
+			for _, item := range tup.Items {
+				if !item.IsType() {
+					cacheable = false
+					break
+				}
+				meta := item.AsType().Header.Type
+				if meta != nil && meta != val.TypeType {
+					cacheable = false
+					break
+				}
+			}
+			if cacheable {
+				hasSpoof := false
+				if inst := obj.AsInstanceChecked(); inst != nil {
+					if _, ok := inst.GetAttr(nameClass); ok {
+						hasSpoof = true
+					}
+				}
+				if !hasSpoof {
+					lhs := obj.Type()
+					if lhs != nil {
+						matched := false
+						for _, item := range tup.Items {
+							if val.IsSubclass(lhs, item.AsType()) {
+								matched = true
+								break
+							}
+						}
+						var sid uint32
+						if inst := obj.AsInstanceChecked(); inst != nil && inst.Shape != nil {
+							sid = inst.Shape.ID
+						}
+						var slot int32
+						if matched {
+							slot = 1
+						}
+						st.cache.ic[ip] = ICSlot{
+							Kind:            ICKindIsinstanceTuple,
+							CachedVal:       cls,
+							ExpectedTypeVer: lhs.Version(),
+							ExpectedShapeID: sid,
+							SlotIndex:       slot,
+						}
+						stack[sp-3] = val.BoolVal(matched)
+						return ip + 1, sp - 2, ctlNext
+					}
+				}
+			}
+		}
+	}
 	st.stack = stack
 	st.ip = ip
 	vm.execCtx.SP = sp
@@ -1334,6 +1388,49 @@ func (vm *VM) opCallIsInstanceSlow(st *loopState, inst uint32, ip, sp int) (int,
 	}
 	stack[sp-3] = val.BoolVal(res)
 	return ip + 1, sp - 2, ctlReload
+}
+
+//go:noinline
+func (vm *VM) opCallInstanceDunderSlow(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
+	argc := int(uint8(inst >> 16))
+	retSP := sp - argc - 1
+	stack := st.stack
+	obj := stack[retSP]
+	if !obj.IsInstance() {
+		st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL))
+		return vm.opCallSlow(st, ReplaceOpcode(inst, OP_CALL), ip, sp)
+	}
+	instObj := obj.AsInstance()
+	if instObj == nil || instObj.Shape == nil {
+		st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL))
+		return vm.opCallSlow(st, ReplaceOpcode(inst, OP_CALL), ip, sp)
+	}
+	tp := instObj.Header.Type
+	if tp == nil {
+		st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL))
+		return vm.opCallSlow(st, ReplaceOpcode(inst, OP_CALL), ip, sp)
+	}
+	attr, _, ok := tp.LookupMRO(val.DunderCall)
+	if !ok || !attr.IsFunction() {
+		st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL))
+		return vm.opCallSlow(st, ReplaceOpcode(inst, OP_CALL), ip, sp)
+	}
+	fn := attr.AsFunction()
+	co := AsCodeObject(fn.Code)
+	if co == nil || !co.SimplePositionalOnly || co.NumParams != argc+1 || co.HasCellVars || co.IsGenerator || co.IsCoroutine || (len(co.FreeVars) != 0 && fn.Closure == nil) {
+		st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL))
+		return vm.opCallSlow(st, ReplaceOpcode(inst, OP_CALL), ip, sp)
+	}
+	cc := vm.fastCalleeCache(co)
+	st.cache.ic[ip] = ICSlot{
+		Kind:            ICKindInstanceCall,
+		CachedVal:       attr,
+		CalleeCache:     cc,
+		ExpectedTypeVer: tp.Version(),
+		ExpectedShapeID: instObj.Shape.ID,
+		SlotIndex:       int32(argc + 1),
+	}
+	return vm.opCallSlow(st, ReplaceOpcode(inst, OP_CALL), ip, sp)
 }
 
 func (vm *VM) lookupAttrQueryPIC(st *loopState, ip int, obj, rawName val.Value, wantVal bool) (res val.Value, found bool, handled bool, interned val.Value) {
@@ -2509,6 +2606,28 @@ unwrapCall:
 			return vm.callNativeSlow(st, target, ip, sp, newBase, retSP, argc, nil)
 		}
 		if target.IsInstance() {
+			if canQuicken && !val.MultiThreadedFlag.Load() && !vm.hasTrackedViews {
+				if instQ := target.AsInstance(); instQ != nil && instQ.Shape != nil {
+					if tpQ := instQ.Header.Type; tpQ != nil {
+						if dcQ := tpQ.DunderCallVal(); dcQ.IsFunction() {
+							fnQ := dcQ.AsFunction()
+							coQ := AsCodeObject(fnQ.Code)
+							if coQ != nil && coQ.SimplePositionalOnly && coQ.NumParams == argc+1 && !coQ.HasCellVars && !coQ.IsGenerator && !coQ.IsCoroutine && (len(coQ.FreeVars) == 0 || fnQ.Closure != nil) {
+								ccQ := vm.fastCalleeCache(coQ)
+								st.cache.ic[ip] = ICSlot{
+									Kind:            ICKindInstanceCall,
+									CachedVal:       dcQ,
+									CalleeCache:     ccQ,
+									ExpectedTypeVer: tpQ.Version(),
+									ExpectedShapeID: instQ.Shape.ID,
+									SlotIndex:       int32(argc + 1),
+								}
+								st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL_INSTANCE_DUNDER))
+							}
+						}
+					}
+				}
+			}
 			if dc := target.Type().DunderCallVal(); dc.IsFunction() {
 				fn := dc.AsFunction()
 				callee := AsCodeObject(fn.Code)

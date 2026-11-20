@@ -45,6 +45,10 @@ const (
 	ICKindInstanceTransition        // Shape-transitioning attribute store (OldShape -> NewShape via transitionIC)
 	ICKindCompareDunder             // Quickened comparison dunder (CachedVal=*PyFunction, CalleeCache=*VMCodeCache, ExpectedTypeVer=left, ExpectedAuxVer=right, SlotIndex=mode)
 	ICKindMethodDescr               // Monomorphic native method descriptor (CachedVal=BuiltinFunc, NativeFn=fn, ExpectedTypeVer=type ver, ExpectedShapeID=shape ID or 0)
+	ICKindGetItemDunder             // Custom __getitem__ on PyInstance (CachedVal=fn Value, CalleeCache=CC, ExpectedTypeVer=type ver, ExpectedShapeID=shape ID)
+	ICKindInstanceCall              // Callable PyInstance.__call__ (CachedVal=fn Value, CalleeCache=CC, ExpectedTypeVer=type ver, ExpectedShapeID=shape ID, SlotIndex=argc+1)
+	ICKindIterDunder                // Custom __iter__ on PyInstance (CachedVal=fn Value, CalleeCache=CC, ExpectedTypeVer=type ver, ExpectedShapeID=shape ID, SlotIndex=gen flag)
+	ICKindIsinstanceTuple           // isinstance(x, (T1, ...)) (CachedVal=tuple Value, ExpectedTypeVer=lhs ver, ExpectedShapeID=shape ID or 0, SlotIndex=bool result)
 )
 
 const (
@@ -375,7 +379,7 @@ func reloadCode(co *CodeObject, cache *VMCodeCache, gen int32) []uint32 {
 		for i, oldInst := range cache.active {
 			switch DecodeOpcode(oldInst) {
 			case OP_CALL_PY_EXACT_ARGS, OP_CALL_PY_DEFAULTS, OP_CALL_BUILTIN_FAST, OP_CALL_LEN, OP_CALL_ISINSTANCE, OP_CALL_TYPE_INIT,
-				OP_CALL_HASATTR, OP_CALL_GETATTR, OP_CALL_BOUND_NATIVE:
+				OP_CALL_HASATTR, OP_CALL_GETATTR, OP_CALL_BOUND_NATIVE, OP_CALL_INSTANCE_DUNDER:
 				if DecodeOpcode(priv[i]) == OP_CALL {
 					priv[i] = oldInst
 				}

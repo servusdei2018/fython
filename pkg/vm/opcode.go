@@ -228,6 +228,7 @@ const (
 	OP_UNPACK_2_FAST
 	OP_UNPACK_3_FAST
 	OP_CALL_PY_DEFAULTS
+	OP_CALL_INSTANCE_DUNDER
 )
 
 // Comparison operation codes for OP_COMPARE_OP (passed in ArgA field).
@@ -574,6 +575,8 @@ func (op Opcode) String() string {
 		return "OP_UNPACK_3_FAST"
 	case OP_CALL_PY_DEFAULTS:
 		return "OP_CALL_PY_DEFAULTS"
+	case OP_CALL_INSTANCE_DUNDER:
+		return "OP_CALL_INSTANCE_DUNDER"
 	default:
 		return "OP_UNKNOWN"
 	}

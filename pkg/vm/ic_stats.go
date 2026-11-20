@@ -269,6 +269,10 @@ var icKindNames = [...]string{
 	ICKindInstanceTransition: "InstanceTransition",
 	ICKindCompareDunder:      "CompareDunder",
 	ICKindMethodDescr:        "MethodDescr",
+	ICKindGetItemDunder:      "GetItemDunder",
+	ICKindInstanceCall:       "InstanceCall",
+	ICKindIterDunder:         "IterDunder",
+	ICKindIsinstanceTuple:    "IsinstanceTuple",
 }
 
 func dumpTopMap(w io.Writer, title string, m map[string]uint64, limit int) {

@@ -272,6 +272,26 @@ func (vm *VM) opBinarySubscrSlow(st *loopState, ip, sp int) (int, int, loopCtl) 
 			return ip, sp, ctlNext
 		}
 	}
+	if obj.IsInstance() && !vm.hasTrackedViews {
+		if inst := obj.AsInstance(); inst != nil && inst.Shape != nil {
+			if tp := inst.Header.Type; tp != nil {
+				if attr, _, ok := tp.LookupMRO(val.DunderGetItem); ok && attr.IsFunction() {
+					fn := attr.AsFunction()
+					co := AsCodeObject(fn.Code)
+					if co != nil && co.SimplePositionalOnly && co.NumParams == 2 && !co.HasCellVars && !co.IsGenerator && !co.IsCoroutine && (len(co.FreeVars) == 0 || fn.Closure != nil) {
+						cc := vm.cacheFor(co)
+						st.cache.ic[ip] = ICSlot{
+							Kind:            ICKindGetItemDunder,
+							CachedVal:       attr,
+							CalleeCache:     cc,
+							ExpectedTypeVer: tp.Version(),
+							ExpectedShapeID: inst.Shape.ID,
+						}
+					}
+				}
+			}
+		}
+	}
 	switch {
 	case obj.IsList() && key.IsInt64() && obj.Type() == val.ListType:
 		lst := obj.AsList()
@@ -326,6 +346,59 @@ func (vm *VM) opBinarySubscrSlow(st *loopState, ip, sp int) (int, int, loopCtl) 
 func (vm *VM) opGetIterSlow(st *loopState, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
 	top := stack[sp-1]
+	if top.IsInstance() && !vm.hasTrackedViews {
+		if inst := top.AsInstance(); inst != nil && inst.Shape != nil {
+			if tp := inst.Header.Type; tp != nil {
+				if entry := &st.cache.ic[ip]; entry.Kind == ICKindIterDunder && entry.ExpectedShapeID == inst.Shape.ID && entry.ExpectedTypeVer == tp.Version() {
+					if entry.SlotIndex == 1 && entry.CachedVal.IsFunction() {
+						fn := entry.CachedVal.AsFunction()
+						co := AsCodeObject(fn.Code)
+						if co != nil {
+							ephemeral := false
+							if ip+1 < st.codeLen {
+								if nextOp := DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4))); nextOp == OP_FOR_ITER || nextOp == OP_FOR_ITER_GEN {
+									ephemeral = true
+								}
+							}
+							fnGlobals := fn.Globals
+							if fnGlobals == nil {
+								fnGlobals = st.globals
+							}
+							genVal, ok := vm.instantiateGeneratorSafe(co, entry.CachedVal, fn.Defaults, fn.KwDefaults, stack, sp-1, 1, nil, fnGlobals, ephemeral)
+							if !ok {
+								exc := vm.execCtx.ActiveException
+								vm.execCtx.ClearException()
+								st.raiseExc = exc
+								return ip, sp, ctlRaise
+							}
+							stack[sp-1] = genVal
+							ip++
+							return ip, sp, ctlReload
+						}
+					}
+				}
+				if attr, _, ok := tp.LookupMRO(val.DunderIter); ok && attr.IsFunction() {
+					fn := attr.AsFunction()
+					co := AsCodeObject(fn.Code)
+					if co != nil && co.SimplePositionalOnly && co.NumParams == 1 && !co.HasCellVars && !co.IsCoroutine && (len(co.FreeVars) == 0 || fn.Closure != nil) {
+						var slot int32
+						if co.IsGenerator {
+							slot = 1
+						}
+						cc := vm.cacheFor(co)
+						st.cache.ic[ip] = ICSlot{
+							Kind:            ICKindIterDunder,
+							CachedVal:       attr,
+							CalleeCache:     cc,
+							ExpectedTypeVer: tp.Version(),
+							ExpectedShapeID: inst.Shape.ID,
+							SlotIndex:       slot,
+						}
+					}
+				}
+			}
+		}
+	}
 	st.ip = ip
 	vm.execCtx.SP = sp
 	itVal := vm.getIterSafe(top)
