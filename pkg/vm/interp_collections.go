@@ -479,27 +479,49 @@ func (vm *VM) opBuildString(st *loopState, inst uint32, ip, sp int) (int, int, l
 	count := int(uint16(inst))
 	sp -= count
 	if count == 0 {
-		stack[sp] = val.NewStringVal("")
+		stack[sp] = val.SmallStringVal("")
 		sp++
 		ip++
 		return ip, sp, ctlNext
 	}
-	vm.strScratch = vm.strScratch[:0]
+	if count == 1 {
+		v := stack[sp]
+		if v.IsInlineStr() || (v.IsString() && v.AsStringObj().Header.Type == val.StrType) {
+			sp++
+			ip++
+			return ip, sp, ctlNext
+		}
+	}
+	buf := vm.strBuildBuf[:0]
+	if count >= 3 {
+		totalLen := 0
+		for i := range count {
+			totalLen += stack[sp+i].StringByteLen()
+		}
+		if cap(buf) < totalLen {
+			buf = make([]byte, 0, totalLen)
+		}
+	}
 	for i := range count {
 		var ok bool
-		vm.strScratch, ok = val.AppendValueBytes(vm.strScratch, stack[sp+i])
+		buf, ok = val.AppendValueBytes(buf, stack[sp+i])
 		if !ok {
 			var sbuf [7]byte
 			if sb := stack[sp+i].AsBytesScratch(&sbuf); sb != nil {
-				vm.strScratch = append(vm.strScratch, sb...)
+				buf = append(buf, sb...)
 			} else {
 				s := stack[sp+i].AsString()
 				view := unsafe.Slice(unsafe.StringData(s), len(s))
-				vm.strScratch = append(vm.strScratch, view...)
+				buf = append(buf, view...)
 			}
 		}
 	}
-	stack[sp] = val.NewStringVal(string(vm.strScratch))
+	stack[sp] = val.NewStringFromBytes(buf)
+	if cap(buf) <= 65536 {
+		vm.strBuildBuf = buf[:0]
+	} else {
+		vm.strBuildBuf = make([]byte, 0, 1024)
+	}
 	sp++
 	ip++
 	return ip, sp, ctlNext

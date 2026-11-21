@@ -189,29 +189,16 @@ func (vm *VM) deoptInst(st *loopState, ip int, inst uint32) unsafe.Pointer {
 		})
 	case OP_CALL_FAST_ATTR_DESCR:
 		reg := uint8(inst >> 16)
-		attrIdx := uint16(uint8(inst >> 8))
+		methodIdx := uint16(uint8(inst >> 8))
 		argc := uint8(inst)
-		methodIdx := attrIdx
-		if ip+1 < len(st.cache.active) {
-			if nxt := st.cache.active[ip+1]; DecodeOpcode(nxt) == OP_CALL_METHOD_PIC {
-				methodIdx = DecodeArgBx(nxt)
-			}
-		}
-		isTriple := true
-		if ip+2 >= len(st.cache.active) || DecodeOpcode(st.cache.active[ip+2]) != OP_NOP {
-			isTriple = false
-		}
-		if isTriple {
+		if argc == 0 {
 			ptr, length = deoptimizeAt(st.curCO, ip, func(c []uint32) {
 				c[ip] = Encode(OP_LOAD_FAST, 0, uint16(reg))
-				c[ip+1] = Encode(OP_LOAD_ATTR, 0, attrIdx)
-				c[ip+2] = Encode(OP_CALL_METHOD_PIC, argc, methodIdx)
+				c[ip+1] = Encode(OP_CALL_METHOD_PIC, 0, methodIdx)
 			})
 		} else {
-			ptr, length = deoptimizeAt(st.curCO, ip, func(c []uint32) {
-				c[ip] = Encode(OP_LOAD_FAST_ATTR, reg, attrIdx)
-				c[ip+1] = Encode(OP_CALL_METHOD_PIC, argc, methodIdx)
-			})
+			ptr = st.codePtr
+			length = st.codeLen
 		}
 	}
 	st.codePtr = ptr

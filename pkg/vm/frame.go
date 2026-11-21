@@ -846,7 +846,7 @@ type VM struct {
 	builtinSuper         val.Value
 	builtinHasattr       val.Value
 	builtinGetattr       val.Value
-	strScratch           []byte
+	strBuildBuf          []byte
 	internPool           *val.InternPool
 	execCtx              val.ExecContext
 	activeFrameIdx       int

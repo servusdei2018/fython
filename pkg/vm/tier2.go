@@ -466,6 +466,23 @@ func OptimizeCodeObject(co *CodeObject) {
 					continue
 				}
 			}
+
+			// Fused receiver load + 2 pure arg loads + OP_CALL_METHOD_PIC(2) -> w1, w2, OP_CALL_FAST_ATTR_DESCR, OP_NOP.
+			if op0 == OP_LOAD_FAST && (op1 == OP_LOAD_FAST || op1 == OP_LOAD_CONST) &&
+				(op2 == OP_LOAD_FAST || op2 == OP_LOAD_CONST) && op3 == OP_CALL_METHOD_PIC &&
+				DecodeArgA(w3) == 2 {
+				reg := DecodeArgBx(w0)
+				methodIdx := DecodeArgBx(w3)
+				if reg < 256 && methodIdx < 256 && isFastAttrDescrEligible(co, int(methodIdx)) {
+					code = fusionCopy(co, code)
+					code[i] = w1
+					code[i+1] = w2
+					code[i+2] = EncodeABC(OP_CALL_FAST_ATTR_DESCR, uint8(reg), uint8(methodIdx), 2)
+					code[i+3] = Encode(OP_NOP, 0, 0)
+					i += 4
+					continue
+				}
+			}
 		}
 
 		if i+2 < len(src) && !isJumpTarget[i+1] && !isJumpTarget[i+2] {
@@ -661,17 +678,15 @@ func OptimizeCodeObject(co *CodeObject) {
 				}
 			}
 
-			// Fused receiver load plus descriptor call for zero-arg sites.
-			// Staged for later work: requires two indices in one word.
-			if op0 == OP_LOAD_FAST && op1 == OP_LOAD_ATTR && op2 == OP_CALL_METHOD_PIC {
+			// Fused receiver load + 1 pure arg load + OP_CALL_METHOD_PIC(1) -> w1, OP_CALL_FAST_ATTR_DESCR, OP_NOP.
+			if op0 == OP_LOAD_FAST && (op1 == OP_LOAD_FAST || op1 == OP_LOAD_CONST) &&
+				op2 == OP_CALL_METHOD_PIC && DecodeArgA(w2) == 1 {
 				reg := DecodeArgBx(w0)
-				attrIdx := DecodeArgBx(w1)
-				argc := int(DecodeArgA(w2))
 				methodIdx := DecodeArgBx(w2)
-				if reg < 256 && attrIdx < 256 && argc == 0 && methodIdx == 0xFFFF {
+				if reg < 256 && methodIdx < 256 && isFastAttrDescrEligible(co, int(methodIdx)) {
 					code = fusionCopy(co, code)
-					code[i] = EncodeABC(OP_CALL_FAST_ATTR_DESCR, uint8(reg), uint8(attrIdx), uint8(argc))
-					code[i+1] = Encode(OP_CALL_METHOD_PIC, uint8(argc), methodIdx)
+					code[i] = w1
+					code[i+1] = EncodeABC(OP_CALL_FAST_ATTR_DESCR, uint8(reg), uint8(methodIdx), 1)
 					code[i+2] = Encode(OP_NOP, 0, 0)
 					i += 3
 					continue
@@ -824,16 +839,14 @@ func OptimizeCodeObject(co *CodeObject) {
 				continue
 			}
 
-			// Fused fast-attr descriptor call for zero-arg sites (staged).
-			if op0 == OP_LOAD_FAST_ATTR && op1 == OP_CALL_METHOD_PIC {
-				reg := uint8(w0 >> 16)
-				attrIdx := int(uint16(w0))
-				argc := int(uint8(w1 >> 16))
+			// Fused receiver load + OP_CALL_METHOD_PIC(0) -> OP_CALL_FAST_ATTR_DESCR, OP_NOP.
+			if op0 == OP_LOAD_FAST && op1 == OP_CALL_METHOD_PIC && DecodeArgA(w1) == 0 {
+				reg := DecodeArgBx(w0)
 				methodIdx := DecodeArgBx(w1)
-				if attrIdx < 256 && argc == 0 && methodIdx == 0xFFFF {
+				if reg < 256 && methodIdx < 256 && isFastAttrDescrEligible(co, int(methodIdx)) {
 					code = fusionCopy(co, code)
-					code[i] = EncodeABC(OP_CALL_FAST_ATTR_DESCR, reg, uint8(attrIdx), uint8(argc))
-					code[i+1] = Encode(OP_CALL_METHOD_PIC, uint8(argc), methodIdx)
+					code[i] = EncodeABC(OP_CALL_FAST_ATTR_DESCR, uint8(reg), uint8(methodIdx), 0)
+					code[i+1] = Encode(OP_NOP, 0, 0)
 					i += 2
 					continue
 				}
@@ -864,6 +877,31 @@ func isPrimitiveCompareConst(v val.Value) bool {
 
 func isSimpleLoadOp(op Opcode) bool {
 	return op == OP_LOAD_FAST || op == OP_LOAD_CONST || op == OP_LOAD_DEREF || op == OP_LOAD_GLOBAL
+}
+
+// isFastAttrDescrEligible reports whether a method name constant is a hot
+// native descriptor method suitable for OP_CALL_FAST_ATTR_DESCR fusion.
+// Python methods stay on OP_CALL_METHOD_PIC so in-loop method PIC and
+// tryInlineMethod remain active, and stream-I/O names stay unfused to
+// preserve opForIterRangeWriteLoop.
+func isFastAttrDescrEligible(co *CodeObject, methodIdx int) bool {
+	if methodIdx < 0 || methodIdx >= len(co.Consts) {
+		return false
+	}
+	name := co.Consts[methodIdx]
+	if !name.IsAnyString() {
+		return false
+	}
+	switch name.AsString() {
+	case "startswith", "endswith", "split", "rsplit", "strip", "lstrip", "rstrip",
+		"lower", "upper", "replace", "join", "find", "rfind", "count", "encode", "decode",
+		"append", "extend", "pop", "copy", "clear", "insert",
+		"get", "keys", "values", "items", "update", "setdefault",
+		"add", "discard",
+		"group", "groups", "start", "end", "span", "match", "search", "sub":
+		return true
+	}
+	return false
 }
 
 // fusionCopy returns a private copy of the instruction stream of co, so that

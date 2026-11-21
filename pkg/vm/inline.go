@@ -7,9 +7,9 @@ import (
 	"github.com/servusdei2018/fython/pkg/val"
 )
 
-// canInlineCallee reports whether callee is a tiny leaf safe to splice into
-// a caller. The rule is deliberately narrow: straight-line Python code with
-// no extra locals, no jumps, no suspensions and no dynamic features.
+// canInlineCallee reports whether callee is a small leaf safe to splice into
+// a caller. Supports straight-line and forward-only branching Python code
+// (2 <= len <= 48, zero loops, zero exception handlers, no suspensions).
 func canInlineCallee(fn *val.PyFunction, callee *CodeObject, caller *CodeObject) bool {
 	if fn == nil || callee == nil || caller == nil {
 		return false
@@ -44,43 +44,53 @@ func canInlineCallee(fn *val.PyFunction, callee *CodeObject, caller *CodeObject)
 	if len(callee.ExceptionTable) != 0 {
 		return false
 	}
-	if len(callee.Code) < 2 || len(callee.Code) > 24 {
+	if len(callee.Code) < 2 || len(callee.Code) > 48 {
 		return false
 	}
-	if callee.NumLocals != callee.NumParams {
+	if callee.NumLocals < callee.NumParams || callee.NumLocals > 127 {
 		return false
 	}
 	if caller.NumLocals+callee.NumLocals > 220 {
 		return false
 	}
+	fused := callee.Active()
+	if len(fused) == 0 {
+		fused = callee.Code
+	}
 	start := callee.EntryIP
-	if start < 0 || start >= len(callee.Code) {
+	if start < 0 || start >= len(fused) {
 		start = 0
 	}
-	n := len(callee.Code)
-	returns := 0
-	end := n
-	for end > start && DecodeOpcode(callee.Code[end-1]) == OP_NOP {
+	end := len(fused)
+	for end > start && DecodeOpcode(fused[end-1]) == OP_NOP {
 		end--
 	}
-	if end-start < 2 || end-start > 24 {
+	if end-start < 2 || end-start > 48 {
 		return false
 	}
+	returns := 0
 	for i := start; i < end; i++ {
-		op := DecodeOpcode(callee.Code[i])
+		inst := fused[i]
+		op := DecodeOpcode(inst)
 		switch op {
 		case OP_RETURN, OP_RETURN_FAST, OP_RETURN_CONST:
 			returns++
-			if i != end-1 {
+		case OP_JUMP, OP_JUMP_IF_FALSE, OP_JUMP_IF_TRUE,
+			OP_JUMP_IF_FALSE_OR_POP, OP_JUMP_IF_TRUE_OR_POP,
+			OP_COMPARE_JUMP_IF_FALSE, OP_COMPARE_JUMP_IF_TRUE:
+			target := int(DecodeArgBx(inst))
+			if target <= i || target > end {
+				return false
+			}
+		case OP_CMP_CONST_JUMP_IF_FALSE, OP_CMP_CONST_JUMP_IF_TRUE:
+			rel := int(DecodeArgC(inst))
+			target := i + rel
+			if rel <= 0 || target <= i || target >= end {
 				return false
 			}
 		case OP_YIELD_VALUE, OP_YIELD_FROM, OP_GET_AWAITABLE, OP_AWAIT,
 			OP_SETUP_RANGE, OP_FOR_ITER, OP_FOR_ITER_RANGE, OP_FOR_ITER_GEN,
 			OP_LOAD_CLOSURE, OP_MAKE_FUNCTION,
-			OP_JUMP, OP_JUMP_IF_FALSE, OP_JUMP_IF_TRUE,
-			OP_JUMP_IF_FALSE_OR_POP, OP_JUMP_IF_TRUE_OR_POP,
-			OP_COMPARE_JUMP_IF_FALSE, OP_COMPARE_JUMP_IF_TRUE,
-			OP_CMP_CONST_JUMP_IF_FALSE, OP_CMP_CONST_JUMP_IF_TRUE,
 			OP_FAST_LOOP_CMP_LT_CONST_JUMP,
 			OP_FAST_CMP_EQ_JUMP_IF_FALSE,
 			OP_FAST_JUMP_IF_DEREF_LIST_SUBSCR_TRUE,
@@ -92,6 +102,7 @@ func canInlineCallee(fn *val.PyFunction, callee *CodeObject, caller *CodeObject)
 			OP_CALL_BUILTIN_FAST, OP_CALL_LEN, OP_CALL_ISINSTANCE,
 			OP_CALL_TYPE_INIT, OP_CALL_METHOD_PIC,
 			OP_CALL_METHOD_DESCR, OP_CALL_METHOD_DESCR_FAST,
+			OP_CALL_FAST_ATTR_DESCR,
 			OP_CALL_BOUND_NATIVE, OP_CALL_HASATTR, OP_CALL_GETATTR,
 			OP_CALL_INSTANCE_DUNDER, OP_COMPARE_DUNDER,
 			OP_GUARD_INLINE_METHOD, OP_GUARD_INLINE_FUNC, OP_INLINE_RETURN:
@@ -100,19 +111,24 @@ func canInlineCallee(fn *val.PyFunction, callee *CodeObject, caller *CodeObject)
 			if !allowDeref {
 				return false
 			}
-			idx := int(DecodeArgBx(callee.Code[i]))
+			idx := int(DecodeArgBx(inst))
 			if idx < 0 || idx >= len(callee.FreeVars) {
 				return false
 			}
 		}
 	}
-	return returns == 1
+	if returns < 1 {
+		return false
+	}
+	lastOp := DecodeOpcode(fused[end-1])
+	return lastOp == OP_RETURN || lastOp == OP_RETURN_FAST || lastOp == OP_RETURN_CONST || lastOp == OP_JUMP
 }
 
-// inlineConstUsesConst reports whether op reads its Bx field as a const index.
+// inlineConstUsesConst reports whether op reads a constant index from callee.Consts.
 func inlineConstUsesConst(op Opcode) bool {
 	switch op {
 	case OP_LOAD_CONST,
+		OP_RETURN_CONST,
 		OP_LOAD_GLOBAL,
 		OP_LOAD_ATTR, OP_STORE_ATTR,
 		OP_LOAD_FAST_ATTR, OP_STORE_FAST_ATTR,
@@ -121,6 +137,8 @@ func inlineConstUsesConst(op Opcode) bool {
 		OP_LOAD_GLOBAL_FAST,
 		OP_LOAD_FAST_CONST,
 		OP_SUBSCR_FAST_CONST,
+		OP_CMP_CONST_JUMP_IF_FALSE,
+		OP_CMP_CONST_JUMP_IF_TRUE,
 		OP_LOAD_FROM_DICT_OR_GLOBALS:
 		return true
 	}
@@ -147,11 +165,14 @@ func inlineRemapConsts(body []uint32, calleeConsts []val.Value, callerConsts []v
 			continue
 		}
 		var idx int
-		isABC := false
+		constField := 0 // 0=Bx, 1=B, 2=C
 		switch op {
-		case OP_LOAD_FAST_CONST, OP_LOAD_GLOBAL_FAST, OP_SUBSCR_FAST_CONST:
+		case OP_LOAD_GLOBAL_FAST, OP_CMP_CONST_JUMP_IF_FALSE, OP_CMP_CONST_JUMP_IF_TRUE:
+			idx = int(DecodeArgB(inst))
+			constField = 1
+		case OP_SUBSCR_FAST_CONST:
 			idx = int(DecodeArgC(inst))
-			isABC = true
+			constField = 2
 		default:
 			idx = int(DecodeArgBx(inst))
 		}
@@ -166,8 +187,13 @@ func inlineRemapConsts(body []uint32, calleeConsts []val.Value, callerConsts []v
 			newConsts = append(newConsts, calleeConsts[idx])
 			ni = len(newConsts) - 1
 		}
-		switch {
-		case isABC:
+		switch constField {
+		case 1:
+			if ni > 0xFF {
+				return nil, false
+			}
+			body[i] = EncodeABC(op, DecodeArgA(inst), uint8(ni), DecodeArgC(inst))
+		case 2:
 			if ni > 0xFF {
 				return nil, false
 			}
@@ -214,7 +240,7 @@ func (vm *VM) tryInlineMethod(st *loopState, ip, totalArgs int, fn *val.PyFuncti
 	if ip < 0 || ip >= len(st.cache.active) {
 		return false
 	}
-	if DecodeOpcode(st.cache.active[ip]) == OP_GUARD_INLINE_METHOD || DecodeOpcode(st.cache.active[ip]) == OP_GUARD_INLINE_FUNC {
+	if DecodeOpcode(st.cache.active[ip]) != OP_CALL_METHOD_PIC {
 		return false
 	}
 	instObj := recv.AsInstanceChecked()
@@ -255,7 +281,9 @@ func (vm *VM) tryInlineProperty(st *loopState, ip int, fn *val.PyFunction, recv 
 	if ip < 0 || ip >= len(st.cache.active) {
 		return false
 	}
-	if DecodeOpcode(st.cache.active[ip]) == OP_GUARD_INLINE_METHOD || DecodeOpcode(st.cache.active[ip]) == OP_GUARD_INLINE_FUNC {
+	// Only splice OP_LOAD_ATTR (receiver is on top of stack at sp-1).
+	// OP_LOAD_FAST_ATTR keeps the receiver in locals[reg], not on stack.
+	if DecodeOpcode(st.cache.active[ip]) != OP_LOAD_ATTR {
 		return false
 	}
 	instObj := recv.AsInstanceChecked()
@@ -296,7 +324,8 @@ func (vm *VM) tryInlineFunc(st *loopState, ip, totalArgs int, fn *val.PyFunction
 	if ip < 0 || ip >= len(st.cache.active) {
 		return false
 	}
-	if DecodeOpcode(st.cache.active[ip]) == OP_GUARD_INLINE_METHOD || DecodeOpcode(st.cache.active[ip]) == OP_GUARD_INLINE_FUNC {
+	curOp := DecodeOpcode(st.cache.active[ip])
+	if curOp != OP_CALL_PY_EXACT_ARGS && curOp != OP_CALL {
 		return false
 	}
 	callee := AsCodeObject(fn.Code)
@@ -370,7 +399,8 @@ func (vm *VM) tryInlineDunder(st *loopState, ip int, dunder val.Value, dfn *val.
 	if ip < 0 || ip >= len(st.cache.active) {
 		return false
 	}
-	if DecodeOpcode(st.cache.active[ip]) == OP_GUARD_INLINE_METHOD || DecodeOpcode(st.cache.active[ip]) == OP_GUARD_INLINE_FUNC {
+	curOp := DecodeOpcode(st.cache.active[ip])
+	if curOp != OP_COMPARE_DUNDER && curOp != OP_COMPARE_OP && curOp != OP_COMPARE_LT {
 		return false
 	}
 	if !canInlineCallee(dfn, dcallee, st.curCO) {
@@ -395,42 +425,50 @@ func (vm *VM) tryInlineDunder(st *loopState, ip int, dunder val.Value, dfn *val.
 	return true
 }
 
-// spliceInlineBody appends a straight-line callee body plus a deopt stub to
-// the private active stream and swaps the call site to a guard. It operates
-// only on the per-VM private copy, so no shared CodeObject mutation occurs
-// except reading shared callee bytecode.
+// spliceInlineBody appends a leaf callee body (straight-line or forward-only
+// branching) plus a deopt stub to the private active stream and swaps the call
+// site to a guard. It operates only on the per-VM private copy, so no shared
+// CodeObject mutation occurs except reading shared callee bytecode.
 func spliceInlineBody(vm *VM, st *loopState, guardIP int, guardOp Opcode, callee *CodeObject, fn *val.PyFunction, totalArgs, popCallable int, postCall int) bool {
 	cache := st.cache
 	if cache == nil || guardIP < 0 {
 		return false
 	}
-	start := callee.EntryIP
-	if start < 0 || start >= len(callee.Code) {
-		start = 0
-	}
 	fused := callee.Active()
 	if len(fused) == 0 {
 		fused = callee.Code
 	}
-	if start >= len(fused) {
-		return false
+	start := callee.EntryIP
+	if start < 0 || start >= len(fused) {
+		start = 0
 	}
 	fend := len(fused)
 	for fend > start && DecodeOpcode(fused[fend-1]) == OP_NOP {
 		fend--
 	}
 	bodyLen := fend - start
-	if bodyLen < 2 || bodyLen > 24 {
+	if bodyLen < 2 || bodyLen > 48 {
 		return false
 	}
 	body := make([]uint32, bodyLen)
-	copy(body, fused[start:])
-	// Last instruction must be a plain return; rewrite it to the restore hop.
+	copy(body, fused[start:fend])
 	lastOp := DecodeOpcode(body[bodyLen-1])
-	if lastOp != OP_RETURN && lastOp != OP_RETURN_FAST && lastOp != OP_RETURN_CONST {
+	if lastOp != OP_RETURN && lastOp != OP_RETURN_FAST && lastOp != OP_RETURN_CONST && lastOp != OP_JUMP {
 		return false
 	}
-	newConsts, ok := inlineRemapConsts(body, callee.Consts, st.consts)
+	if fn != nil && fn.Globals != nil && st.globals != nil && fn.Globals != st.globals {
+		for _, inst := range body {
+			switch DecodeOpcode(inst) {
+			case OP_LOAD_GLOBAL, OP_LOAD_GLOBAL_FAST, OP_LOAD_FROM_DICT_OR_GLOBALS:
+				return false
+			}
+		}
+	}
+	baseConsts := st.consts
+	if len(cache.inlineConsts) > len(baseConsts) {
+		baseConsts = cache.inlineConsts
+	}
+	newConsts, ok := inlineRemapConsts(body, callee.Consts, baseConsts)
 	if !ok {
 		return false
 	}
@@ -482,21 +520,92 @@ func spliceInlineBody(vm *VM, st *loopState, guardIP int, guardOp Opcode, callee
 			}
 		}
 	}
-	argA := uint8(totalArgs & 0x7F)
+	savedSlotOffset := max(totalArgs, callee.NumLocals)
+	if savedSlotOffset > 0x7F {
+		return false
+	}
+	argA := uint8(savedSlotOffset & 0x7F)
 	if popCallable != 0 {
 		argA |= 0x80
 	}
-	body[bodyLen-1] = Encode(OP_INLINE_RETURN, argA, uint16(postCall))
 	oldActive := cache.active
 	if guardIP >= len(oldActive) {
 		return false
 	}
 	origCall := oldActive[guardIP]
 	bodyStart := len(oldActive)
-	stubStart := bodyStart + bodyLen
-	newActive := make([]uint32, 0, len(oldActive)+bodyLen+2)
+
+	// Expand every return into OP_INLINE_RETURN (prepending LOAD_FAST /
+	// LOAD_CONST for fused returns) while recording oldToNew for jump relocation.
+	expanded := make([]uint32, 0, bodyLen+8)
+	oldToNew := make([]int, bodyLen+1)
+	for i, inst := range body {
+		oldToNew[i] = len(expanded)
+		switch DecodeOpcode(inst) {
+		case OP_RETURN:
+			expanded = append(expanded, Encode(OP_INLINE_RETURN, argA, uint16(postCall)))
+		case OP_RETURN_FAST:
+			expanded = append(expanded,
+				Encode(OP_LOAD_FAST, 0, DecodeArgBx(inst)),
+				Encode(OP_INLINE_RETURN, argA, uint16(postCall)),
+			)
+		case OP_RETURN_CONST:
+			expanded = append(expanded,
+				Encode(OP_LOAD_CONST, 0, DecodeArgBx(inst)),
+				Encode(OP_INLINE_RETURN, argA, uint16(postCall)),
+			)
+		default:
+			expanded = append(expanded, inst)
+		}
+	}
+	oldToNew[bodyLen] = len(expanded)
+	expandedLen := len(expanded)
+	if expandedLen > 255 {
+		return false
+	}
+
+	// Relocate all internal forward jump targets to the spliced tail.
+	for i := range body {
+		newIdx := oldToNew[i]
+		inst := expanded[newIdx]
+		op := DecodeOpcode(inst)
+		switch op {
+		case OP_JUMP, OP_JUMP_IF_FALSE, OP_JUMP_IF_TRUE,
+			OP_JUMP_IF_FALSE_OR_POP, OP_JUMP_IF_TRUE_OR_POP,
+			OP_COMPARE_JUMP_IF_FALSE, OP_COMPARE_JUMP_IF_TRUE:
+			origTarget := int(DecodeArgBx(inst))
+			relOrig := origTarget - start
+			if relOrig <= i || relOrig > bodyLen {
+				return false
+			}
+			var newTarget int
+			if relOrig == bodyLen {
+				newTarget = postCall
+			} else {
+				newTarget = bodyStart + oldToNew[relOrig]
+			}
+			if newTarget < 0 || newTarget > 0xFFFF {
+				return false
+			}
+			expanded[newIdx] = Encode(op, DecodeArgA(inst), uint16(newTarget))
+		case OP_CMP_CONST_JUMP_IF_FALSE, OP_CMP_CONST_JUMP_IF_TRUE:
+			origRel := int(DecodeArgC(inst))
+			relOrig := i + origRel
+			if origRel <= 0 || relOrig <= i || relOrig >= bodyLen {
+				return false
+			}
+			newRel := oldToNew[relOrig] - newIdx
+			if newRel <= 0 || newRel > 0xFF {
+				return false
+			}
+			expanded[newIdx] = EncodeABC(op, DecodeArgA(inst), DecodeArgB(inst), uint8(newRel))
+		}
+	}
+
+	stubStart := bodyStart + expandedLen
+	newActive := make([]uint32, 0, len(oldActive)+expandedLen+2)
 	newActive = append(newActive, oldActive...)
-	newActive = append(newActive, body...)
+	newActive = append(newActive, expanded...)
 	newActive = append(newActive, origCall, Encode(OP_JUMP, 0, uint16(postCall)))
 	if bodyStart > 0xFFFF || stubStart > 0xFFFF || postCall > 0xFFFF || postCall < 0 {
 		return false
@@ -549,11 +658,11 @@ func spliceInlineBody(vm *VM, st *loopState, guardIP int, guardOp Opcode, callee
 	cache.privateActive = true
 	cache.ensureInlineExpect(len(newActive))
 	cache.inlineConsts = newConsts
-	// Swap the call site to a guard. ArgA carries body length so the miss
-	// path derives the stub without extra state.
-	cache.active[guardIP] = Encode(OP_GUARD_INLINE_METHOD, uint8(bodyLen), uint16(bodyStart))
+	// Swap the call site to a guard. ArgA carries expanded body length so the
+	// miss path derives the stub without extra state.
+	cache.active[guardIP] = Encode(OP_GUARD_INLINE_METHOD, uint8(expandedLen), uint16(bodyStart))
 	if guardOp == OP_GUARD_INLINE_FUNC {
-		cache.active[guardIP] = Encode(OP_GUARD_INLINE_FUNC, uint8(bodyLen), uint16(bodyStart))
+		cache.active[guardIP] = Encode(OP_GUARD_INLINE_FUNC, uint8(expandedLen), uint16(bodyStart))
 	}
 	st.codePtr = cache.codePtr
 	st.codeLen = cache.codeLen
@@ -601,7 +710,8 @@ func (vm *VM) opGuardInline(st *loopState, op Opcode, inst uint32, ip, sp int) (
 		if newBase < 0 || newBase >= len(st.stack) {
 			return stubStart, sp, ctlNext
 		}
-		if DecodeOpcode(cache.active[stubStart]) == OP_COMPARE_DUNDER {
+		stubOp := DecodeOpcode(cache.active[stubStart])
+		if stubOp == OP_COMPARE_DUNDER || stubOp == OP_COMPARE_OP || stubOp == OP_COMPARE_LT {
 			// Dunder: check both operands.
 			if totalArgs != 2 || newBase+1 >= len(st.stack) {
 				return stubStart, sp, ctlNext
@@ -629,40 +739,35 @@ func (vm *VM) opGuardInline(st *loopState, op Opcode, inst uint32, ip, sp int) (
 		}
 	}
 	if !hit {
+		// Restore the original instruction at ip so polymorphic sites revert
+		// to their native PIC instead of paying guard-miss overhead repeatedly.
+		cache.active[ip] = cache.active[stubStart]
 		return stubStart, sp, ctlNext
 	}
 	newBase := sp - totalArgs
 	if newBase < 0 {
 		return stubStart, sp, ctlNext
 	}
-	// Reserve one slot for the saved caller base above the args.
-	need := sp + 1
+	savedSlotOffset := totalArgs
+	if !exp.Fn.IsNone() && exp.Fn.IsFunction() {
+		if callee := AsCodeObject(exp.Fn.AsFunction().Code); callee != nil && callee.NumLocals > savedSlotOffset {
+			savedSlotOffset = callee.NumLocals
+		}
+	}
+	// Reserve callee locals plus one slot for the saved caller base above them.
+	need := newBase + savedSlotOffset + 1
 	if need > len(st.stack) {
 		st.stack = vm.growStack(st, st.stack, need)
 	}
-	// Stash the caller base as an int-carrying value cell.
-	st.stack[sp] = val.Int64Val(int64(st.base))
-	sp++
-	savedBase := st.base
-	_ = savedBase
+	for i := newBase + totalArgs; i < newBase+savedSlotOffset; i++ {
+		st.stack[i] = val.NoneVal()
+	}
+	// Stash the caller base above all callee locals as an int-carrying value cell.
+	st.stack[newBase+savedSlotOffset] = val.Int64Val(int64(st.base))
+	sp = newBase + savedSlotOffset + 1
 	st.base = newBase
 	if cache.inlineConsts != nil {
 		st.consts = cache.inlineConsts
-	}
-	// Zero any extra locals beyond the bound args so spliced bodies never
-	// observe stale frame data.
-	if !exp.Fn.IsNone() && exp.Fn.IsFunction() {
-		if callee := AsCodeObject(exp.Fn.AsFunction().Code); callee != nil {
-			if callee.NumLocals > totalArgs {
-				needLocals := newBase + callee.NumLocals + 1
-				if needLocals > len(st.stack) {
-					st.stack = vm.growStack(st, st.stack, needLocals)
-				}
-				for i := newBase + totalArgs; i < newBase+callee.NumLocals; i++ {
-					st.stack[i] = val.NoneVal()
-				}
-			}
-		}
 	}
 	vm.activeBaseOffset = newBase
 	vm.activeFrameIdx = st.frameIdx
@@ -679,9 +784,13 @@ func inlineTotalArgsFromStub(stubCall uint32) int {
 		return int(uint8(stubCall>>16)) + 1
 	case OP_CALL_PY_EXACT_ARGS:
 		return int(uint8(stubCall >> 16))
-	case OP_COMPARE_DUNDER:
+	case OP_CALL:
+		if uint16(stubCall) == CallFromStack {
+			return int(uint8(stubCall >> 16))
+		}
+	case OP_COMPARE_DUNDER, OP_COMPARE_OP, OP_COMPARE_LT:
 		return 2
-	case OP_LOAD_FAST_ATTR:
+	case OP_LOAD_ATTR:
 		return 1
 	}
 	return 0

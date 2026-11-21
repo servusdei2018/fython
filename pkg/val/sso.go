@@ -174,6 +174,28 @@ func NewStringVal(s string) Value {
 	}
 }
 
+// NewStringFromBytes materializes a string Value from a scratch byte slice.
+// Lengths <= 7 pack directly into SmallStringFromBytes (0 allocations);
+// longer slices allocate a single Go string copy and *PyString without spare Buf.
+func NewStringFromBytes(b []byte) Value {
+	if len(b) <= 7 {
+		return SmallStringFromBytes(b)
+	}
+	s := string(b)
+	obj := &PyString{
+		Header: ObjectHeader{
+			Kind: KindString,
+			Hash: HashString(s),
+			Type: StrType,
+		},
+		Data: s,
+	}
+	return Value{
+		num: 0,
+		ptr: &obj.Header,
+	}
+}
+
 // StringEquals compares two string Values for equality.
 // Fast path: if both are KindInlineStr, returns a.num == b.num in a single 64-bit comparison (0 allocations).
 func StringEquals(a, b Value) bool {

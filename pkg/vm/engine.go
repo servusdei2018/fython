@@ -779,7 +779,7 @@ func (e *Engine) newVMInternal(stackCap, frameCap int) *VM {
 		modules:      modules,
 		context:      val.NewPyContext(),
 		builtinRange: val.TypeVal(val.RangeType),
-		strScratch:   make([]byte, 0, 1024),
+		strBuildBuf:  make([]byte, 0, 1024),
 	}
 	v.genResumeHook = v.resumeGenerator
 	v.genReleaseHook = v.releaseGeneratorStack

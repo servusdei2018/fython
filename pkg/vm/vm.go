@@ -1048,8 +1048,8 @@ func (vm *VM) initBuiltins() {
 	})
 	vm.builtinLen = lenVal
 	vm.builtins.Set(val.InternString("len"), lenVal)
-	if vm.strScratch == nil {
-		vm.strScratch = make([]byte, 0, 1024)
+	if vm.strBuildBuf == nil {
+		vm.strBuildBuf = make([]byte, 0, 1024)
 	}
 
 	vm.builtins.Set(val.InternString("int"), val.TypeVal(val.IntType))
@@ -2915,6 +2915,8 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				continue
 			}
 			ip, sp, ctl = vm.opStoreFastWide(st, inst, ip, sp)
+		case OP_STORE_FAST_VIEW:
+			ip, sp, ctl = vm.opStoreFastView(st, inst, ip, sp)
 		case OP_BINARY_ADD:
 			b := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
 			a := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
@@ -3131,15 +3133,24 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 					if haInst := haObj.AsInstanceChecked(); haInst != nil && haInst.Shape != nil {
 						if haTp := haInst.Header.Type; haTp != nil {
 							if uint(ip) < uint(len(st.cache.attrQueryPIC)) {
-								haE := &st.cache.attrQueryPIC[ip][0]
-								if haE.Kind != attrQueryNone && haE.TypeVer == haTp.Version() && haE.ShapeID == haInst.Shape.ID && haE.Name == haName {
+								haPIC := &st.cache.attrQueryPIC[ip]
+								haVer := haTp.Version()
+								haSID := haInst.Shape.ID
+								haE := &haPIC[0]
+								if haE.Kind == attrQueryNone || haE.TypeVer != haVer || haE.ShapeID != haSID || haE.Name != haName {
+									haE = &haPIC[1]
+									if haE.Kind == attrQueryNone || haE.TypeVer != haVer || haE.ShapeID != haSID || haE.Name != haName {
+										haE = nil
+									}
+								}
+								if haE != nil {
 									if haE.SlotIndex == attrQueryMissingSlot {
 										*(*val.Value)(unsafe.Add(stackPtr, uintptr(haRetSP)*16)) = val.BoolVal(false)
 										sp = haRetSP + 1
 										ip++
 										continue
 									}
-									if haE.SlotIndex >= 0 {
+									if haE.SlotIndex >= 0 && (haE.Kind != attrQuerySlot || (uint(haE.SlotIndex) < uint(len(haInst.Slots)) && !haInst.Slots[haE.SlotIndex].IsUnbound())) {
 										*(*val.Value)(unsafe.Add(stackPtr, uintptr(haRetSP)*16)) = val.BoolVal(true)
 										sp = haRetSP + 1
 										ip++
@@ -3172,12 +3183,23 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				}
 			}
 			ip, sp, ctl = vm.opCallBuiltinFast(st, inst, ip, sp)
-		case OP_CALL_METHOD_DESCR_FAST:
-			argc := int(uint8(inst >> 16))
-			newBase := sp - argc - 1
-			receiver := *(*val.Value)(unsafe.Add(stackPtr, uintptr(newBase)*16))
+		case OP_CALL_METHOD_DESCR_FAST, OP_CALL_FAST_ATTR_DESCR:
+			isFastAttr := op == OP_CALL_FAST_ATTR_DESCR
+			var argc, newBase int
+			var receiver val.Value
+			canRun := !vm.hasTrackedViews
+			if isFastAttr {
+				argc = int(uint8(inst))
+				canRun = canRun && argc <= 2 && sp < len(st.stack)
+				newBase = sp - argc
+				receiver = *(*val.Value)(unsafe.Add(locals, uintptr(uint8(inst>>16))*16))
+			} else {
+				argc = int(uint8(inst >> 16))
+				newBase = sp - argc - 1
+				receiver = *(*val.Value)(unsafe.Add(stackPtr, uintptr(newBase)*16))
+			}
 			entry := &st.cache.ic[ip]
-			if !vm.hasTrackedViews && entry.Kind == ICKindMethodDescr && entry.NativeFn != nil {
+			if canRun && entry.Kind == ICKindMethodDescr && entry.NativeFn != nil {
 				matched := false
 				if entry.ExpectedShapeID == 0 {
 					if hdr := receiver.HeaderPtr(); hdr != nil &&
@@ -3195,7 +3217,18 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 					matched = true
 				}
 				if matched && (argc != 1 || (entry.CachedVal != val.StrJoinBuiltin && entry.CachedVal != val.ListExtendBuiltin) ||
-					!(*val.Value)(unsafe.Add(stackPtr, uintptr(newBase+1)*16)).IsGenerator()) {
+					!(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)).IsGenerator()) {
+					if isFastAttr {
+						switch argc {
+						case 2:
+							*(*val.Value)(unsafe.Add(stackPtr, uintptr(newBase+2)*16)) = *(*val.Value)(unsafe.Add(stackPtr, uintptr(newBase+1)*16))
+							*(*val.Value)(unsafe.Add(stackPtr, uintptr(newBase+1)*16)) = *(*val.Value)(unsafe.Add(stackPtr, uintptr(newBase)*16))
+						case 1:
+							*(*val.Value)(unsafe.Add(stackPtr, uintptr(newBase+1)*16)) = *(*val.Value)(unsafe.Add(stackPtr, uintptr(newBase)*16))
+						}
+						*(*val.Value)(unsafe.Add(stackPtr, uintptr(newBase)*16)) = receiver
+						sp++
+					}
 					st.ip = ip
 					vm.frames[st.frameIdx].ip = ip
 					vm.execCtx.SP = sp
@@ -3205,56 +3238,22 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 						(!st.stackIsVM || unsafe.Pointer(unsafe.SliceData(vm.stack)) == stackPtr) {
 						*(*val.Value)(unsafe.Add(stackPtr, uintptr(newBase)*16)) = res
 						sp = newBase + 1
-						ip++
+						if isFastAttr {
+							ip += 2
+						} else {
+							ip++
+						}
 						continue
 					}
 					ip, sp, ctl = vm.finishMethodDescrFast(st, ip, sp, newBase, res)
 					break
 				}
 			}
-			ip, sp, ctl = vm.opCallMethodDescrFast(st, inst, ip, sp)
-		case OP_CALL_FAST_ATTR_DESCR:
-			if uint8(inst) == 0 && !vm.hasTrackedViews {
-				fadRecv := *(*val.Value)(unsafe.Add(locals, uintptr(uint8(inst>>16))*16))
-				fadEntry := &st.cache.ic[ip]
-				if fadEntry.Kind == ICKindMethodDescr && fadEntry.NativeFn != nil && fadEntry.ExpectedShapeID == 0 {
-					fadMatched := false
-					if hdr := fadRecv.HeaderPtr(); hdr != nil &&
-						hdr.Kind != val.KindInstance && hdr.Kind != val.KindSuper && hdr.Kind != val.KindModule && hdr.Kind != val.KindType {
-						tp := hdr.Type
-						if tp == nil && hdr.Kind == val.KindInlineStr {
-							tp = val.StrType
-						}
-						if tp != nil && tp.Version() == fadEntry.ExpectedTypeVer {
-							fadMatched = true
-						}
-					}
-					if fadMatched {
-						fadBase := sp
-						*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16)) = fadRecv
-						sp++
-						st.ip = ip
-						vm.frames[st.frameIdx].ip = ip
-						vm.execCtx.SP = sp
-						fadRes := fadEntry.NativeFn(&vm.execCtx, fadEntry.CachedVal, unsafe.Slice((*val.Value)(unsafe.Add(stackPtr, uintptr(fadBase)*16)), 1), nil)
-						if !vm.execCtx.HasException() &&
-							unsafe.Pointer(unsafe.SliceData(vm.execCtx.Stack)) == stackPtr &&
-							(!st.stackIsVM || unsafe.Pointer(unsafe.SliceData(vm.stack)) == stackPtr) {
-							*(*val.Value)(unsafe.Add(stackPtr, uintptr(fadBase)*16)) = fadRes
-							sp = fadBase + 1
-							if ip+2 >= st.codeLen || Opcode(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+2)*4))>>24) != OP_NOP {
-								ip += 2
-							} else {
-								ip += 3
-							}
-							continue
-						}
-						ip, sp, ctl = vm.finishMethodDescrFast(st, ip, sp, fadBase, fadRes)
-						break
-					}
-				}
+			if isFastAttr {
+				ip, sp, ctl = vm.dispatchColdOpcode(st, op, inst, ip, sp)
+			} else {
+				ip, sp, ctl = vm.opCallMethodDescrFast(st, inst, ip, sp)
 			}
-			ip, sp, ctl = vm.dispatchColdOpcode(st, op, inst, ip, sp)
 		case OP_CALL_BOUND_NATIVE:
 			ip, sp, ctl = vm.opCallBoundNative(st, inst, ip, sp)
 		case OP_CALL_INSTANCE_DUNDER:
@@ -3656,6 +3655,27 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				}
 			}
 			ip, sp, ctl = vm.opForIterSlow(st, inst, ip, sp)
+		case OP_FOR_ITER_RANGE:
+			targetReg := uint8(inst >> 16)
+			jumpTarget := int(uint16(inst))
+			it := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
+			if it.IsRange() {
+				cur := it.RangeStart()
+				stop := it.RangeStop()
+				if cur < stop {
+					if cur == 0 {
+						ip, sp, ctl = vm.dispatchColdOpcode(st, OP_FOR_ITER_RANGE, inst, ip, sp)
+						break
+					}
+					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)) = val.RangeVal(cur+1, stop)
+					*(*val.Value)(unsafe.Add(locals, uintptr(targetReg)*16)) = val.Int64Val(int64(cur))
+					ip++
+					continue
+				}
+			}
+			sp--
+			ip = jumpTarget
+			continue
 		case OP_UNPACK_SEQUENCE:
 			count := int(uint16(inst))
 			if (count == 2 || count == 3) && sp+18 <= len(st.stack) {
@@ -3719,8 +3739,11 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				}
 			}
 			ip, sp, ctl = vm.opUnpackStoreFastSlow(st, op, inst, ip, sp)
-		case OP_COMPARE_OP:
+		case OP_COMPARE_LT, OP_COMPARE_OP:
 			cmpOp := uint8(inst >> 16)
+			if op == OP_COMPARE_LT {
+				cmpOp = CMP_LT
+			}
 			b := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
 			a := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
 			var cmpRes bool
@@ -3741,6 +3764,10 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 					cmpRes = ai >= bi
 				}
 				goto cmpBoolHit
+			}
+			if op == OP_COMPARE_LT {
+				ip, sp, ctl = vm.dispatchColdOpcode(st, OP_COMPARE_LT, inst, ip, sp)
+				break
 			}
 			if cmpOp == CMP_IS {
 				cmpRes = a == b
