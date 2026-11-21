@@ -201,6 +201,90 @@ func (vm *VM) tryInlineDunderForCompare(st *loopState, ip int, dunder val.Value,
 	return vm.tryInlineDunder(st, ip, dunder, dfn, dcallee, lObj.Header.Type.Version(), rObj.Header.Type.Version(), lObj.Shape.ID, rObj.Shape.ID)
 }
 
+// tryInlineMethod attempts per-VM inlining of a monomorphic method call.
+// The guard checks KindInstance plus Type version and Shape ID so shadowing
+// deopts cleanly to the cold stub.
+func (vm *VM) tryInlineMethod(st *loopState, ip, totalArgs int, fn *val.PyFunction, recv val.Value) bool {
+	if st == nil || st.cache == nil || st.curCO == nil || fn == nil {
+		return false
+	}
+	if atomic.LoadInt32(&st.curCO.IsTier2Optimized) == 0 {
+		return false
+	}
+	if ip < 0 || ip >= len(st.cache.active) {
+		return false
+	}
+	if DecodeOpcode(st.cache.active[ip]) == OP_GUARD_INLINE_METHOD || DecodeOpcode(st.cache.active[ip]) == OP_GUARD_INLINE_FUNC {
+		return false
+	}
+	instObj := recv.AsInstanceChecked()
+	if instObj == nil || instObj.Shape == nil || instObj.Header.Type == nil {
+		return false
+	}
+	callee := AsCodeObject(fn.Code)
+	if !canInlineCallee(fn, callee, st.curCO) {
+		return false
+	}
+	if callee.NumParams != totalArgs {
+		return false
+	}
+	if callerHasExceptionRange(st.curCO, ip) {
+		return false
+	}
+	postCall := ip + 1
+	if postCall < 0 || postCall > 0xFFFF {
+		return false
+	}
+	if !spliceInlineBody(vm, st, ip, OP_GUARD_INLINE_METHOD, callee, fn, totalArgs, 0, postCall) {
+		return false
+	}
+	cache := st.cache
+	cache.ensureInlineExpect(ip + 1)
+	cache.inlineExpect[ip] = InlineExpectEntry{Fn: val.ObjectVal(&fn.Header), TypeVer: instObj.Header.Type.Version(), ShapeID: instObj.Shape.ID}
+	return true
+}
+
+// tryInlineProperty attempts per-VM inlining of a monomorphic property getter.
+func (vm *VM) tryInlineProperty(st *loopState, ip int, fn *val.PyFunction, recv val.Value) bool {
+	if st == nil || st.cache == nil || st.curCO == nil || fn == nil {
+		return false
+	}
+	if atomic.LoadInt32(&st.curCO.IsTier2Optimized) == 0 {
+		return false
+	}
+	if ip < 0 || ip >= len(st.cache.active) {
+		return false
+	}
+	if DecodeOpcode(st.cache.active[ip]) == OP_GUARD_INLINE_METHOD || DecodeOpcode(st.cache.active[ip]) == OP_GUARD_INLINE_FUNC {
+		return false
+	}
+	instObj := recv.AsInstanceChecked()
+	if instObj == nil || instObj.Shape == nil || instObj.Header.Type == nil {
+		return false
+	}
+	callee := AsCodeObject(fn.Code)
+	if !canInlineCallee(fn, callee, st.curCO) {
+		return false
+	}
+	if callee.NumParams != 1 {
+		return false
+	}
+	if callerHasExceptionRange(st.curCO, ip) {
+		return false
+	}
+	postCall := ip + 1
+	if postCall < 0 || postCall > 0xFFFF {
+		return false
+	}
+	if !spliceInlineBody(vm, st, ip, OP_GUARD_INLINE_METHOD, callee, fn, 1, 0, postCall) {
+		return false
+	}
+	cache := st.cache
+	cache.ensureInlineExpect(ip + 1)
+	cache.inlineExpect[ip] = InlineExpectEntry{Fn: val.ObjectVal(&fn.Header), TypeVer: instObj.Header.Type.Version(), ShapeID: instObj.Shape.ID}
+	return true
+}
+
 // tryInlineFunc attempts per-VM inlining of a monomorphic direct call.
 func (vm *VM) tryInlineFunc(st *loopState, ip, totalArgs int, fn *val.PyFunction) bool {
 	if st == nil || st.cache == nil || st.curCO == nil {
@@ -454,6 +538,11 @@ func spliceInlineBody(vm *VM, st *loopState, guardIP int, guardOp Opcode, callee
 		copy(n, cache.kwPIC)
 		cache.kwPIC = n
 	}
+	if len(cache.constKeyMaps) != 0 && len(cache.constKeyMaps) < needIC {
+		n := make([]ConstKeyMapTemplate, needIC)
+		copy(n, cache.constKeyMaps)
+		cache.constKeyMaps = n
+	}
 	cache.active = newActive
 	cache.codePtr = unsafe.Pointer(unsafe.SliceData(newActive))
 	cache.codeLen = len(newActive)
@@ -559,6 +648,21 @@ func (vm *VM) opGuardInline(st *loopState, op Opcode, inst uint32, ip, sp int) (
 	st.base = newBase
 	if cache.inlineConsts != nil {
 		st.consts = cache.inlineConsts
+	}
+	// Zero any extra locals beyond the bound args so spliced bodies never
+	// observe stale frame data.
+	if !exp.Fn.IsNone() && exp.Fn.IsFunction() {
+		if callee := AsCodeObject(exp.Fn.AsFunction().Code); callee != nil {
+			if callee.NumLocals > totalArgs {
+				needLocals := newBase + callee.NumLocals + 1
+				if needLocals > len(st.stack) {
+					st.stack = vm.growStack(st, st.stack, needLocals)
+				}
+				for i := newBase + totalArgs; i < newBase+callee.NumLocals; i++ {
+					st.stack[i] = val.NoneVal()
+				}
+			}
+		}
 	}
 	vm.activeBaseOffset = newBase
 	vm.activeFrameIdx = st.frameIdx

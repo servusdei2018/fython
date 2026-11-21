@@ -69,6 +69,9 @@ func (vm *VM) regCallEligible(st *loopState, callee *CodeObject) bool {
 	if !hasBackwardJump(callee.Code) {
 		return false
 	}
+	if hasRegTierRejectOp(callee.Code) {
+		return false
+	}
 	if st.activeGen != nil || st.activeCoro != nil || !st.stackIsVM {
 		return false
 	}

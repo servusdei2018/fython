@@ -2,6 +2,34 @@ package vm
 
 import "os"
 
+// regTierRejectOp reports whether op forces Tier-2 rejection so the
+// register tier executes pure computational kernels while call-heavy and
+// generator-heavy functions stay on Tier-1 fused superinstructions.
+func regTierRejectOp(op Opcode) bool {
+	switch op {
+	case OP_CALL, OP_CALL_KW, OP_CALL_FUNCTION_EX, OP_CALL_METHOD,
+		OP_CALL_METHOD_PIC, OP_CALL_PY_EXACT_ARGS, OP_CALL_PY_DEFAULTS,
+		OP_CALL_BUILTIN_FAST, OP_CALL_LEN, OP_CALL_ISINSTANCE,
+		OP_CALL_TYPE_INIT, OP_CALL_METHOD_DESCR, OP_CALL_METHOD_DESCR_FAST,
+		OP_CALL_BOUND_NATIVE, OP_CALL_HASATTR, OP_CALL_GETATTR,
+		OP_CALL_INSTANCE_DUNDER,
+		OP_GET_ITER, OP_FOR_ITER, OP_FOR_ITER_GEN, OP_FOR_ITER_RANGE,
+		OP_YIELD_VALUE, OP_YIELD_FROM:
+		return true
+	default:
+		return false
+	}
+}
+
+func hasRegTierRejectOp(code []uint32) bool {
+	for _, inst := range code {
+		if regTierRejectOp(DecodeOpcode(inst)) {
+			return true
+		}
+	}
+	return false
+}
+
 // TryCompileRegCode compiles the stack bytecode of co into 3-address
 // register form. It returns nil when co is ineligible for register
 // execution; the caller then keeps executing the stack stream.
@@ -58,6 +86,13 @@ func TryCompileRegCode(co *CodeObject) *RegCode {
 				}
 			}
 		}
+	}
+	// Keep the tier to call-free and generator-free loop kernels so
+	// call-heavy and generator-heavy workloads stay on Tier-1 in-loop
+	// drains and fused superinstructions.
+	if hasRegTierRejectOp(co.Code) {
+		recordRegReject(co, "has-call-or-iter-yield")
+		return nil
 	}
 	if !co.ParamShapeComputed {
 		co.computeParamShape()

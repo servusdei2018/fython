@@ -1109,7 +1109,186 @@ func (vm *VM) dispatchColdOpcode(st *loopState, op Opcode, inst uint32, ip, sp i
 		return vm.opGuardInline(st, op, inst, ip, sp)
 	case OP_INLINE_RETURN:
 		return vm.opInlineReturn(st, inst, ip, sp)
+	case OP_BUILD_CONST_KEY_MAP:
+		return vm.opBuildConstKeyMap(st, inst, ip, sp)
+	case OP_COMPARE_FAST_FAST:
+		return vm.opCompareFastFast(st, inst, ip, sp)
+	case OP_CALL_FAST_ATTR_DESCR:
+		return vm.opCallFastAttrDescr(st, inst, ip, sp)
 	default:
 		panic("vm: unknown opcode")
 	}
+}
+
+//go:noinline
+func (vm *VM) opCompareFastFast(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
+	cmpOp := uint8(inst >> 16)
+	regA := int(uint8(inst >> 8))
+	regB := int(uint8(inst))
+	base := st.base
+	if regA < 0 || regB < 0 || base+regA >= len(st.stack) || base+regB >= len(st.stack) {
+		return vm.opCompareFastFastSlow(st, inst, ip, sp)
+	}
+	a := st.stack[base+regA]
+	b := st.stack[base+regB]
+	var res bool
+	switch {
+	case cmpOp == CMP_IS:
+		res = a == b
+	case cmpOp == CMP_IS_NOT:
+		res = a != b
+	case a.IsInt64() && b.IsInt64() && cmpOp <= CMP_GTE:
+		ai, bi := a.AsInt64(), b.AsInt64()
+		switch cmpOp {
+		case CMP_EQ:
+			res = ai == bi
+		case CMP_NEQ:
+			res = ai != bi
+		case CMP_LT:
+			res = ai < bi
+		case CMP_LTE:
+			res = ai <= bi
+		case CMP_GT:
+			res = ai > bi
+		case CMP_GTE:
+			res = ai >= bi
+		}
+	case (cmpOp == CMP_EQ || cmpOp == CMP_NEQ) &&
+		(a.IsInlineStr() || (a.IsString() && a.AsStringObj().Header.Type == val.StrType)) &&
+		(b.IsInlineStr() || (b.IsString() && b.AsStringObj().Header.Type == val.StrType)):
+		res = val.StringEquals(a, b) == (cmpOp == CMP_EQ)
+	default:
+		return vm.opCompareFastFastSlow(st, inst, ip, sp)
+	}
+	if sp+1+16 > len(st.stack) {
+		st.stack = vm.growStack(st, st.stack, sp+1+64)
+	}
+	st.stack[sp] = val.BoolVal(res)
+	sp++
+	return ip + 3, sp, ctlNext
+}
+
+//go:noinline
+func (vm *VM) opCompareFastFastSlow(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
+	cmpOp := uint8(inst >> 16)
+	regA := int(uint8(inst >> 8))
+	regB := int(uint8(inst))
+	a := st.stack[st.base+regA]
+	b := st.stack[st.base+regB]
+	if sp+2+16 > len(st.stack) {
+		st.stack = vm.growStack(st, st.stack, sp+2+64)
+	}
+	st.stack[sp] = a
+	st.stack[sp+1] = b
+	sp += 2
+	newIP, newSP, ctl := vm.opCompareSlow(st, Encode(OP_COMPARE_OP, cmpOp, 0), ip, sp)
+	if ctl == ctlNext {
+		return ip + 3, newSP, ctlNext
+	}
+	if ctl == ctlReload {
+		st.codePtr = st.cache.codePtr
+		return ip + 3, newSP, ctlReload
+	}
+	return newIP, newSP, ctl
+}
+
+//go:noinline
+func (vm *VM) opCallFastAttrDescr(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
+	reg := int(uint8(inst >> 16))
+	attrIdx := int(uint8(inst >> 8))
+	argc := int(uint8(inst))
+	if reg < 0 || reg >= 256 || attrIdx < 0 || attrIdx >= len(st.consts) {
+		return vm.opCallFastAttrDescrSlow(st, inst, ip, sp)
+	}
+	if st.base+reg >= len(st.stack) {
+		return vm.opCallFastAttrDescrSlow(st, inst, ip, sp)
+	}
+	receiver := st.stack[st.base+reg]
+	if argc != 0 {
+		return vm.opCallFastAttrDescrSlow(st, inst, ip, sp)
+	}
+	entry := &st.cache.ic[ip]
+	if !vm.hasTrackedViews && entry.Kind == ICKindMethodDescr && entry.NativeFn != nil {
+		matched := false
+		if entry.ExpectedShapeID == 0 {
+			if hdr := receiver.HeaderPtr(); hdr != nil &&
+				hdr.Kind != val.KindInstance && hdr.Kind != val.KindSuper && hdr.Kind != val.KindModule && hdr.Kind != val.KindType {
+				if tp := receiver.Type(); tp != nil && tp.Version() == entry.ExpectedTypeVer {
+					matched = true
+				} else if hdr.Kind == val.KindInlineStr && val.StrType != nil && val.StrType.Version() == entry.ExpectedTypeVer {
+					matched = true
+				}
+			}
+		} else if instObj := receiver.AsInstanceChecked(); instObj != nil && instObj.Shape != nil &&
+			instObj.Shape.ID == entry.ExpectedShapeID && instObj.Header.Type.Version() == entry.ExpectedTypeVer {
+			matched = true
+		}
+		if matched {
+			if sp+1+16 > len(st.stack) {
+				st.stack = vm.growStack(st, st.stack, sp+1+64)
+			}
+			st.stack[sp] = receiver
+			sp++
+			st.ip = ip
+			vm.frames[st.frameIdx].ip = ip
+			vm.execCtx.SP = sp
+			res := entry.NativeFn(&vm.execCtx, entry.CachedVal, st.stack[sp-1:sp], nil)
+			if !vm.execCtx.HasException() {
+				st.stack[sp-1] = res
+				adv := 3
+				if ip+2 >= st.codeLen || DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+2)*4))) != OP_NOP {
+					adv = 2
+				}
+				_ = attrIdx
+				return ip + adv, sp, ctlReload
+			}
+			exc := vm.execCtx.ActiveException
+			vm.execCtx.ClearException()
+			st.raiseExc = exc
+			return ip, sp, ctlRaise
+		}
+	}
+	return vm.opCallFastAttrDescrSlow(st, inst, ip, sp)
+}
+
+//go:noinline
+func (vm *VM) opCallFastAttrDescrSlow(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
+	reg := int(uint8(inst >> 16))
+	attrIdx := int(uint8(inst >> 8))
+	argc := int(uint8(inst))
+	methodIdx := attrIdx
+	if ip+1 < st.codeLen {
+		if nxt := *(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4)); DecodeOpcode(nxt) == OP_CALL_METHOD_PIC {
+			methodIdx = int(DecodeArgBx(nxt))
+		}
+	}
+	receiver := st.stack[st.base+reg]
+	if sp+2+argc+16 > len(st.stack) {
+		st.stack = vm.growStack(st, st.stack, sp+2+argc+64)
+	}
+	st.stack[sp] = receiver
+	sp++
+	newIP, newSP, ctl := vm.opLoadAttrSlow(st, Encode(OP_LOAD_ATTR, 0, uint16(attrIdx)), ip, sp)
+	if ctl == ctlRaise || ctl == ctlExit {
+		return newIP, newSP, ctl
+	}
+	// opLoadAttrSlow consumed receiver and pushed attr; now emulate the
+	// original descriptor call via the generic method path.
+	callInst := Encode(OP_CALL_METHOD_DESCR_FAST, uint8(argc), uint16(methodIdx))
+	nip, nsp, nctl := vm.opCallMethodDescrFast(st, callInst, newIP, newSP)
+	if nctl == ctlNext {
+		adv := 3
+		if ip+2 >= st.codeLen || DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+2)*4))) != OP_NOP {
+			adv = 2
+		}
+		return ip + adv, nsp, ctlNext
+	}
+	if nctl == ctlReload {
+		adv := 3
+		if ip+2 >= st.codeLen || DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+2)*4))) != OP_NOP {
+			adv = 2
+		}
+		return ip + adv, nsp, ctlReload
+	}
+	return nip, nsp, nctl
 }

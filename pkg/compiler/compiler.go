@@ -481,6 +481,32 @@ func (c *Compiler) emitOp(op vm.Opcode, argA uint8, argBx uint16) int {
 	return c.emit(vm.Encode(op, argA, argBx))
 }
 
+func (c *Compiler) tryConstKeyTuple(start uint32, count uint32) (uint16, bool) {
+	keys := make([]val.Value, 0, count)
+	for i := range count {
+		pair := &c.arena.DictPairs[start+i]
+		if pair.Key == ExprNone {
+			return 0, false
+		}
+		ke := c.arena.GetExpr(pair.Key)
+		if ke == nil || ke.Kind != ExprKindString {
+			return 0, false
+		}
+		if ke.Op&1 != 0 {
+			return 0, false
+		}
+		rawStr := string(c.src[ke.Start:ke.End])
+		if isBytesToken(rawStr) {
+			return 0, false
+		}
+		parsed := parseStringLiteral(rawStr)
+		keys = append(keys, val.InternString(parsed))
+	}
+	tupleVal := val.NewTupleFromSlice(keys)
+	idx := c.constPool.Add(tupleVal)
+	return idx, true
+}
+
 // finalizedCode rewrites OP_STORE_FAST to OP_STORE_FAST_VIEW only when the
 // function contains slice operations that may produce a trackable memoryview.
 func (c *Compiler) finalizedCode() []uint32 {
@@ -2652,16 +2678,40 @@ func (c *Compiler) compileExpr(exprID ExprID) error {
 			}
 		}
 		if !hasUnpack {
-			for i := range count {
-				pair := &c.arena.DictPairs[start+i]
-				if err := c.compileExpr(pair.Key); err != nil {
-					return err
+			if count >= 2 && count <= 10 {
+				if keysTupleIdx, ok := c.tryConstKeyTuple(start, count); ok {
+					for i := range count {
+						pair := &c.arena.DictPairs[start+i]
+						if err := c.compileExpr(pair.Value); err != nil {
+							return err
+						}
+					}
+					c.emitOp(vm.OP_LOAD_CONST, 0, keysTupleIdx)
+					c.emitOp(vm.OP_BUILD_CONST_KEY_MAP, 0, uint16(count))
+				} else {
+					for i := range count {
+						pair := &c.arena.DictPairs[start+i]
+						if err := c.compileExpr(pair.Key); err != nil {
+							return err
+						}
+						if err := c.compileExpr(pair.Value); err != nil {
+							return err
+						}
+					}
+					c.emitOp(vm.OP_BUILD_MAP, 0, uint16(count))
 				}
-				if err := c.compileExpr(pair.Value); err != nil {
-					return err
+			} else {
+				for i := range count {
+					pair := &c.arena.DictPairs[start+i]
+					if err := c.compileExpr(pair.Key); err != nil {
+						return err
+					}
+					if err := c.compileExpr(pair.Value); err != nil {
+						return err
+					}
 				}
+				c.emitOp(vm.OP_BUILD_MAP, 0, uint16(count))
 			}
-			c.emitOp(vm.OP_BUILD_MAP, 0, uint16(count))
 		} else {
 			numDicts := uint16(0)
 			currentKeys := 0

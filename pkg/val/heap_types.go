@@ -3948,6 +3948,25 @@ func (d *PyDict) ForEachActiveErr(fn func(key, value Value) error) error {
 	return nil
 }
 
+// Indices exposes the sparse index table for pre-packed template copies.
+func (d *PyDict) Indices() []byte {
+	return d.indices
+}
+
+// SetUsedFilled sets the dense/sparse occupancy counters for template fills.
+func (d *PyDict) SetUsedFilled(used, filled int) {
+	d.used = used
+	d.filled = filled
+}
+
+// BumpVersion bumps the dict version tag for template fills.
+func (d *PyDict) BumpVersion() {
+	atomic.AddUint64(&d.VersionTag, 1)
+	if d.owner != nil {
+		d.owner.bumpVersion()
+	}
+}
+
 // Clear removes every entry, preserving the live-instance mode if set.
 func (d *PyDict) Clear() {
 	if d.Live != nil {

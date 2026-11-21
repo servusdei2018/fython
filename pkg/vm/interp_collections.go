@@ -281,6 +281,11 @@ func (vm *VM) opBinarySlice(st *loopState, ip, sp int) (int, int, loopCtl) {
 			case sliceLen <= 4 && ip+1 < st.codeLen && !val.MultiThreadedFlag.Load() &&
 				isEphemeralTupleNextOp(DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4)))):
 				stack[sp-3] = vm.acquireEphemeralTuple(items[start:stop])
+			case sliceLen >= 5:
+				// Tuples are immutable so sharing the backing slice is
+				// safe and avoids the Packaging copy path.
+				val.ClearEphemeral(container)
+				stack[sp-3] = val.NewTupleView(items[start:stop])
 			case sliceLen > 2 && (len(items) <= 32 || sliceLen*2 >= len(items)):
 				val.ClearEphemeral(container)
 				stack[sp-3] = val.NewTupleView(items[start:stop:stop])
@@ -869,6 +874,262 @@ func (vm *VM) opBuildMap(st *loopState, inst uint32, ip, sp int) (int, int, loop
 	sp++
 	ip++
 	return ip, sp, ctlNext
+}
+
+func constKeyIsTemplateable(k val.Value) bool {
+	if k.IsInlineStr() {
+		return true
+	}
+	if k.IsString() && k.AsStringObj().Header.Type == val.StrType && k.IsInterned() {
+		return true
+	}
+	return false
+}
+
+func constKeyMapsFor(cache *VMCodeCache, n int) []ConstKeyMapTemplate {
+	if cache == nil {
+		return nil
+	}
+	return cache.ensureConstKeyMaps(n)
+}
+
+//go:noinline
+func (vm *VM) opBuildConstKeyMap(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
+	stack := st.stack
+	count := int(uint16(inst))
+	if count < 2 || count > 10 {
+		return vm.opBuildConstKeyMapGeneric(st, inst, ip, sp)
+	}
+	if sp < count+1 {
+		st.raiseExc = val.NewException(val.SystemErrorType, "bad const key map stack")
+		return ip, sp, ctlRaise
+	}
+	keysVal := stack[sp-1]
+	if !keysVal.IsTuple() {
+		return vm.opBuildConstKeyMapGeneric(st, inst, ip, sp)
+	}
+	keys := keysVal.AsTuple().Items
+	if len(keys) != count {
+		return vm.opBuildConstKeyMapGeneric(st, inst, ip, sp)
+	}
+	for _, k := range keys {
+		if !constKeyIsTemplateable(k) {
+			return vm.opBuildConstKeyMapGeneric(st, inst, ip, sp)
+		}
+	}
+	for i := range count {
+		for j := i + 1; j < count; j++ {
+			if keys[i] == keys[j] {
+				return vm.opBuildConstKeyMapGeneric(st, inst, ip, sp)
+			}
+		}
+	}
+	base := sp - 1 - count
+	cache := st.cache
+	var tmpl *ConstKeyMapTemplate
+	if cache != nil && !val.MultiThreadedFlag.Load() {
+		maps := constKeyMapsFor(cache, st.codeLen)
+		if ip >= 0 && ip < len(maps) {
+			tmpl = &maps[ip]
+		}
+	}
+	if tmpl != nil && tmpl.Valid && tmpl.Count == count {
+		match := true
+		for i := range count {
+			if tmpl.Keys[i] != keys[i] {
+				match = false
+				break
+			}
+		}
+		if match {
+			d := vm.acquireConstKeyDict(count)
+			if d != nil {
+				if vm.fillConstKeyDict(d, tmpl, stack[base:base+count]) {
+					for i := base; i < base+count; i++ {
+						val.ClearEphemeral(stack[i])
+						val.DetachStringBuf(stack[i])
+					}
+					sp = base
+					stack[sp] = val.DictVal(d)
+					sp++
+					ip++
+					return ip, sp, ctlReload
+				}
+				vm.releaseSmallDictFlag(d, 0)
+			}
+		}
+	}
+	if tmpl != nil {
+		if vm.buildConstKeyTemplate(tmpl, keys, count) {
+			if ip >= 0 && ip < len(st.cache.ic) {
+				st.cache.ic[ip].Kind = ICKindConstKeyMap
+			}
+			d := vm.acquireConstKeyDict(count)
+			if d != nil && vm.fillConstKeyDict(d, tmpl, stack[base:base+count]) {
+				for i := base; i < base+count; i++ {
+					val.ClearEphemeral(stack[i])
+					val.DetachStringBuf(stack[i])
+				}
+				sp = base
+				stack[sp] = val.DictVal(d)
+				sp++
+				ip++
+				return ip, sp, ctlReload
+			}
+			if d != nil {
+				vm.releaseSmallDictFlag(d, 0)
+			}
+		} else {
+			tmpl.Valid = false
+		}
+	}
+	return vm.opBuildConstKeyMapGeneric(st, inst, ip, sp)
+}
+
+//go:noinline
+func (vm *VM) opBuildConstKeyMapGeneric(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
+	stack := st.stack
+	count := int(uint16(inst))
+	keysVal := stack[sp-1]
+	var keys []val.Value
+	if keysVal.IsTuple() {
+		keys = keysVal.AsTuple().Items
+	}
+	base := sp - 1 - count
+	var dictVal val.Value
+	switch {
+	case count <= 16 && isEphemeralMapSite(st, ip):
+		dictVal = vm.acquireSmallDict(count, true)
+	case count <= 8 && st.curCO != nil && ip < len(st.curCO.MapTempSafe) && st.curCO.MapTempSafe[ip]:
+		dictVal = vm.acquireSmallDict(count, true)
+	default:
+		dictVal = val.NewDictVal(count)
+	}
+	d := dictVal.AsDict()
+	if len(keys) == count {
+		for i := range count {
+			k := keys[i]
+			v := stack[base+i]
+			val.ClearEphemeral(k)
+			val.ClearEphemeral(v)
+			val.DetachStringBuf(k)
+			val.DetachStringBuf(v)
+			d.Set(k, v)
+		}
+	} else {
+		for i := range count {
+			v := stack[base+i]
+			val.ClearEphemeral(v)
+			val.DetachStringBuf(v)
+			d.Set(val.NoneVal(), v)
+		}
+	}
+	sp = base
+	stack[sp] = dictVal
+	sp++
+	ip++
+	return ip, sp, ctlNext
+}
+
+func (vm *VM) acquireConstKeyDict(count int) *val.PyDict {
+	if !val.MultiThreadedFlag.Load() {
+		if count <= 5 {
+			if n := len(vm.dictFreeList); n > 0 {
+				d := vm.dictFreeList[n-1]
+				vm.dictFreeList[n-1] = nil
+				vm.dictFreeList = vm.dictFreeList[:n-1]
+				d.Header = val.ObjectHeader{Kind: val.KindDict, Type: val.DictType}
+				d.InitSmallInlineTable()
+				return d
+			}
+		} else if count <= 10 {
+			if n := len(vm.dict16FreeList); n > 0 {
+				d := vm.dict16FreeList[n-1]
+				vm.dict16FreeList[n-1] = nil
+				vm.dict16FreeList = vm.dict16FreeList[:n-1]
+				d.Header = val.ObjectHeader{Kind: val.KindDict, Type: val.DictType}
+				d.InitDict16Table()
+				return d
+			}
+		}
+	}
+	return val.NewDictVal(count).AsDict()
+}
+
+func (vm *VM) buildConstKeyTemplate(tmpl *ConstKeyMapTemplate, keys []val.Value, count int) bool {
+	var hashes [10]uint64
+	for i := range count {
+		h := uint64(val.HashValue(keys[i]))
+		hashes[i] = h
+	}
+	var idx8 [8]byte
+	var idx16 [16]byte
+	if count <= 5 {
+		for i := range count {
+			slot := hashes[i] & 7
+			for idx8[slot] != 0 {
+				slot = (slot + 1) & 7
+			}
+			idx8[slot] = byte(i + 2)
+		}
+	} else {
+		for i := range count {
+			slot := hashes[i] & 15
+			for idx16[slot] != 0 {
+				slot = (slot + 1) & 15
+			}
+			idx16[slot] = byte(i + 2)
+		}
+	}
+	for i := range count {
+		tmpl.Keys[i] = keys[i]
+		tmpl.Hashes[i] = hashes[i]
+	}
+	tmpl.Indices8 = idx8
+	tmpl.Indices16 = idx16
+	tmpl.Count = count
+	tmpl.Valid = true
+	return true
+}
+
+func (vm *VM) fillConstKeyDict(d *val.PyDict, tmpl *ConstKeyMapTemplate, values []val.Value) bool {
+	count := tmpl.Count
+	if count < 2 || count > 10 || len(values) < count {
+		return false
+	}
+	if count <= 5 {
+		if len(d.Entries) != 0 {
+			return false
+		}
+		// Fresh inline tables hold up to 5 entries with an 8-byte index.
+		for i := range count {
+			d.Entries = append(d.Entries, val.DictEntry{
+				Hash:   uint32(tmpl.Hashes[i]),
+				Active: true,
+				Key:    tmpl.Keys[i],
+				Value:  values[i],
+			})
+		}
+		copy(d.Indices(), tmpl.Indices8[:])
+		d.SetUsedFilled(count, count)
+		d.BumpVersion()
+		return true
+	}
+	if len(d.Entries) != 0 {
+		return false
+	}
+	for i := range count {
+		d.Entries = append(d.Entries, val.DictEntry{
+			Hash:   uint32(tmpl.Hashes[i]),
+			Active: true,
+			Key:    tmpl.Keys[i],
+			Value:  values[i],
+		})
+	}
+	copy(d.Indices(), tmpl.Indices16[:])
+	d.SetUsedFilled(count, count)
+	d.BumpVersion()
+	return true
 }
 
 func isEphemeralTupleNextOp(op Opcode) bool {

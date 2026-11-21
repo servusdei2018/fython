@@ -232,6 +232,9 @@ const (
 	OP_GUARD_INLINE_METHOD
 	OP_GUARD_INLINE_FUNC
 	OP_INLINE_RETURN
+	OP_BUILD_CONST_KEY_MAP
+	OP_COMPARE_FAST_FAST
+	OP_CALL_FAST_ATTR_DESCR
 )
 
 // Comparison operation codes for OP_COMPARE_OP (passed in ArgA field).
@@ -586,6 +589,12 @@ func (op Opcode) String() string {
 		return "OP_GUARD_INLINE_FUNC"
 	case OP_INLINE_RETURN:
 		return "OP_INLINE_RETURN"
+	case OP_BUILD_CONST_KEY_MAP:
+		return "OP_BUILD_CONST_KEY_MAP"
+	case OP_COMPARE_FAST_FAST:
+		return "OP_COMPARE_FAST_FAST"
+	case OP_CALL_FAST_ATTR_DESCR:
+		return "OP_CALL_FAST_ATTR_DESCR"
 	default:
 		return "OP_UNKNOWN"
 	}

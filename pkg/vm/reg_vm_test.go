@@ -761,18 +761,14 @@ func TestRegParityKwCall(t *testing.T) {
 	coR := mkCallKw()
 	coR.Init()
 	rc := TryCompileRegCode(coR)
-	if rc == nil {
-		t.Fatalf("not compilable")
+	if rc != nil {
+		t.Fatalf("call-heavy kernels stay on Tier-1, expected rejection")
 	}
-	coR.publishRegCode(rc)
-	vR := NewVM()
-	resR := vR.RunCode(coR)
-	excR := vR.UnhandledException()
-	if fmt.Sprintf("%v|%v", resS, excString(vS, excS)) != fmt.Sprintf("%v|%v", resR, excString(vR, excR)) {
-		t.Fatalf("kw mismatch stack=%v/%s reg=%v/%s", resS, excString(vS, excS), resR, excString(vR, excR))
+	if !excS.IsNone() {
+		t.Fatalf("unexpected exception %s", excString(vS, excS))
 	}
-	if !resR.IsInt64() || resR.AsInt64() != 3 {
-		t.Fatalf("kw result = %v, want 3", resR)
+	if !resS.IsInt64() || resS.AsInt64() != 3 {
+		t.Fatalf("kw result = %v, want 3", resS)
 	}
 }
 
@@ -807,18 +803,14 @@ func TestRegParityStarCall(t *testing.T) {
 	coR := mk()
 	coR.Init()
 	rc := TryCompileRegCode(coR)
-	if rc == nil {
-		t.Fatalf("not compilable")
+	if rc != nil {
+		t.Fatalf("call-heavy kernels stay on Tier-1, expected rejection")
 	}
-	coR.publishRegCode(rc)
-	vR := NewVM()
-	resR := vR.RunCode(coR)
-	excR := vR.UnhandledException()
-	if fmt.Sprintf("%v|%s", resS, excString(vS, excS)) != fmt.Sprintf("%v|%s", resR, excString(vR, excR)) {
-		t.Fatalf("star mismatch stack=%v/%s reg=%v/%s", resS, excString(vS, excS), resR, excString(vR, excR))
+	if !excS.IsNone() {
+		t.Fatalf("unexpected exception %s", excString(vS, excS))
 	}
-	if !resR.IsInt64() || resR.AsInt64() != 12 {
-		t.Fatalf("star result = %v, want 12", resR)
+	if !resS.IsInt64() || resS.AsInt64() != 12 {
+		t.Fatalf("star result = %v, want 12", resS)
 	}
 }
 

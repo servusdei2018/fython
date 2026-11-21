@@ -3577,7 +3577,7 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 
 		switch {
 		case targetFn != nil:
-			_ = targetFn // inline deferred
+			vm.tryInlineMethod(st, ip, totalArgs, targetFn, receiver)
 			if rIP, rSP, rCtl, handled := vm.pushFuncPositional(st, targetFn, nil, stack, ip, sp, newBase, retSP, totalArgs, ip+1); handled {
 				return rIP, rSP, rCtl
 			}
@@ -3677,7 +3677,7 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 							pic[3] = newPic
 						}
 						if tFn != nil {
-							_ = tFn // inline deferred
+							vm.tryInlineMethod(st, ip, totalArgs, tFn, receiver)
 							if rIP, rSP, rCtl, handled := vm.pushFuncPositional(st, tFn, nil, stack, ip, sp, newBase, retSP, totalArgs, ip+1); handled {
 								return rIP, rSP, rCtl
 							}

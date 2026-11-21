@@ -49,6 +49,7 @@ const (
 	ICKindInstanceCall              // Callable PyInstance.__call__ (CachedVal=fn Value, CalleeCache=CC, ExpectedTypeVer=type ver, ExpectedShapeID=shape ID, SlotIndex=argc+1)
 	ICKindIterDunder                // Custom __iter__ on PyInstance (CachedVal=fn Value, CalleeCache=CC, ExpectedTypeVer=type ver, ExpectedShapeID=shape ID, SlotIndex=gen flag)
 	ICKindIsinstanceTuple           // isinstance(x, (T1, ...)) (CachedVal=tuple Value, ExpectedTypeVer=lhs ver, ExpectedShapeID=shape ID or 0, SlotIndex=bool result)
+	ICKindConstKeyMap               // Pre-hashed const-key dict template (template lives in constKeyMaps[ip])
 )
 
 const (
@@ -401,7 +402,13 @@ func reloadCode(co *CodeObject, cache *VMCodeCache, gen int32) []uint32 {
 					priv[i] = oldInst
 				}
 			case OP_COMPARE_DUNDER:
-				if op := DecodeOpcode(priv[i]); op == OP_COMPARE_OP || op == OP_COMPARE_LT {
+				if i >= 2 && DecodeOpcode(priv[i-2]) == OP_COMPARE_FAST_FAST && DecodeOpcode(priv[i-1]) == OP_NOP && DecodeOpcode(priv[i]) == OP_NOP {
+					regA := uint8(priv[i-2] >> 8)
+					regB := uint8(priv[i-2])
+					priv[i-2] = Encode(OP_LOAD_FAST, 0, uint16(regA))
+					priv[i-1] = Encode(OP_LOAD_FAST, 0, uint16(regB))
+					priv[i] = oldInst
+				} else if op := DecodeOpcode(priv[i]); op == OP_COMPARE_OP || op == OP_COMPARE_LT {
 					priv[i] = oldInst
 				} else if op == OP_COMPARE_JUMP_IF_FALSE || op == OP_COMPARE_JUMP_IF_TRUE {
 					jumpOp := OP_JUMP_IF_FALSE
@@ -500,6 +507,17 @@ func (co *CodeObject) LineTableBytes() []byte {
 	return buf
 }
 
+// ConstKeyMapTemplate caches a pre-hashed dict literal shape for
+// OP_BUILD_CONST_KEY_MAP sites with 2..10 interned-string keys.
+type ConstKeyMapTemplate struct {
+	Hashes    [10]uint64
+	Indices8  [8]byte
+	Indices16 [16]byte
+	Keys      [10]val.Value
+	Count     int
+	Valid     bool
+}
+
 // InlineExpectEntry records the expected callee identity for a spliced
 // guard site so later polymorphic changes miss safely.
 type InlineExpectEntry struct {
@@ -522,6 +540,7 @@ type VMCodeCache struct {
 	kwPIC        [][2]KwPICEntry
 	inlineExpect []InlineExpectEntry
 	inlineConsts []val.Value
+	constKeyMaps []ConstKeyMapTemplate
 	// hotness counts how often this VM executed the code object. It is
 	// VM-local, so it never shares a cache line with another VM.
 	hotness uint32
@@ -579,6 +598,15 @@ func (c *VMCodeCache) ensureInlineExpect(n int) []InlineExpectEntry {
 		c.inlineExpect = nw
 	}
 	return c.inlineExpect
+}
+
+func (c *VMCodeCache) ensureConstKeyMaps(n int) []ConstKeyMapTemplate {
+	if len(c.constKeyMaps) < n {
+		nw := make([]ConstKeyMapTemplate, n)
+		copy(nw, c.constKeyMaps)
+		c.constKeyMaps = nw
+	}
+	return c.constKeyMaps
 }
 
 // quickenAt writes a quickened instruction word into this VM's private copy of

@@ -20,6 +20,11 @@ func isNativeAttrCacheableType(tp *val.PyType) bool {
 // dispatchPropertyGet executes a cached @property getter directly in the VM loop
 // for simple Python functions, or via a zero-alloc stack-slice call for builtins.
 func (vm *VM) dispatchPropertyGet(st *loopState, fget val.Value, cc *VMCodeCache, stack []val.Value, ip, sp int) (int, int, loopCtl) {
+	if fget.IsFunction() && sp > 0 {
+		if fn := fget.AsFunction(); fn != nil {
+			vm.tryInlineProperty(st, ip, fn, stack[sp-1])
+		}
+	}
 	if fget.IsBuiltinFunc() {
 		st.ip = ip
 		vm.execCtx.SP = sp

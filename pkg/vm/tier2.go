@@ -645,6 +645,38 @@ func OptimizeCodeObject(co *CodeObject) {
 					continue
 				}
 			}
+
+			// Fused compare of two locals without stack traffic.
+			if op0 == OP_LOAD_FAST && op1 == OP_LOAD_FAST && op2 == OP_COMPARE_OP {
+				r1 := DecodeArgBx(w0)
+				r2 := DecodeArgBx(w1)
+				cmpOp := DecodeArgA(w2)
+				if r1 < 256 && r2 < 256 && cmpOp != CMP_IN && cmpOp != CMP_NOT_IN {
+					code = fusionCopy(co, code)
+					code[i] = EncodeABC(OP_COMPARE_FAST_FAST, cmpOp, uint8(r1), uint8(r2))
+					code[i+1] = Encode(OP_NOP, 0, 0)
+					code[i+2] = Encode(OP_NOP, 0, 0)
+					i += 3
+					continue
+				}
+			}
+
+			// Fused receiver load plus descriptor call for zero-arg sites.
+			// Staged for later work: requires two indices in one word.
+			if op0 == OP_LOAD_FAST && op1 == OP_LOAD_ATTR && op2 == OP_CALL_METHOD_PIC {
+				reg := DecodeArgBx(w0)
+				attrIdx := DecodeArgBx(w1)
+				argc := int(DecodeArgA(w2))
+				methodIdx := DecodeArgBx(w2)
+				if reg < 256 && attrIdx < 256 && argc == 0 && methodIdx == 0xFFFF {
+					code = fusionCopy(co, code)
+					code[i] = EncodeABC(OP_CALL_FAST_ATTR_DESCR, uint8(reg), uint8(attrIdx), uint8(argc))
+					code[i+1] = Encode(OP_CALL_METHOD_PIC, uint8(argc), methodIdx)
+					code[i+2] = Encode(OP_NOP, 0, 0)
+					i += 3
+					continue
+				}
+			}
 		}
 
 		if i+1 < len(src) && !isJumpTarget[i+1] {
@@ -791,6 +823,22 @@ func OptimizeCodeObject(co *CodeObject) {
 				i += 2
 				continue
 			}
+
+			// Fused fast-attr descriptor call for zero-arg sites (staged).
+			if op0 == OP_LOAD_FAST_ATTR && op1 == OP_CALL_METHOD_PIC {
+				reg := uint8(w0 >> 16)
+				attrIdx := int(uint16(w0))
+				argc := int(uint8(w1 >> 16))
+				methodIdx := DecodeArgBx(w1)
+				if attrIdx < 256 && argc == 0 && methodIdx == 0xFFFF {
+					code = fusionCopy(co, code)
+					code[i] = EncodeABC(OP_CALL_FAST_ATTR_DESCR, reg, uint8(attrIdx), uint8(argc))
+					code[i+1] = Encode(OP_CALL_METHOD_PIC, uint8(argc), methodIdx)
+					i += 2
+					continue
+				}
+			}
+
 		}
 
 		i++
