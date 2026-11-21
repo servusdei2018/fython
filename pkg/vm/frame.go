@@ -1154,9 +1154,11 @@ func (vm *VM) releaseEphemeralTupleVal(v val.Value) {
 	t.Header.Hash = 0
 	t.Attrs = nil
 	t.ClearInline()
-	if len(vm.tupleFreeList) < 128 {
+	if len(vm.tupleFreeList) < 64 {
 		vm.tupleFreeList = append(vm.tupleFreeList, t)
+		return
 	}
+	releaseEphemeralTuplePooled(t)
 }
 
 func (vm *VM) releaseGeneratorStack(gen *val.PyGenerator) {
@@ -1607,6 +1609,46 @@ func init() {
 	}
 	val.AcquireDictTable16Hook = acquireDictTable16
 	val.ReleaseDictTable16Hook = releaseDictTable16
+	val.AcquireEphemeralTupleHook = acquireEphemeralTuplePooled
+}
+
+// tuple4Pool caches cleared *val.PyTuple objects with inline [4]Value storage
+// for small tuple concatenations. Single-threaded use only.
+var tuple4Pool struct {
+	mu   sync.Mutex
+	free []*val.PyTuple
+}
+
+func acquireEphemeralTuplePooled() (*val.PyTuple, bool) {
+	if val.MultiThreadedFlag.Load() {
+		return nil, false
+	}
+	tuple4Pool.mu.Lock()
+	n := len(tuple4Pool.free)
+	if n == 0 {
+		tuple4Pool.mu.Unlock()
+		return nil, false
+	}
+	t := tuple4Pool.free[n-1]
+	tuple4Pool.free[n-1] = nil
+	tuple4Pool.free = tuple4Pool.free[:n-1]
+	tuple4Pool.mu.Unlock()
+	return t, true
+}
+
+func releaseEphemeralTuplePooled(t *val.PyTuple) {
+	if t == nil || val.MultiThreadedFlag.Load() {
+		return
+	}
+	t.Header.Flags = 0
+	t.Header.Hash = 0
+	t.Attrs = nil
+	t.ClearInline()
+	tuple4Pool.mu.Lock()
+	if len(tuple4Pool.free) < 64 {
+		tuple4Pool.free = append(tuple4Pool.free, t)
+	}
+	tuple4Pool.mu.Unlock()
 }
 
 // dictTable16Slab pairs a cleared 16-slot index table with its dense entry

@@ -822,6 +822,86 @@ func cmpOrderedInt(c int, op uint8) bool {
 	return false
 }
 
+// sentinelKind identifies no-slot ordering singletons used in version keys.
+// Returns 1 for the upper sentinel, -1 for the lower sentinel, 0 otherwise.
+func sentinelKind(v Value) int8 {
+	if v.ptr == nil || v.ptr.Kind != KindInstance {
+		return 0
+	}
+	t := v.Type()
+	if t == nil {
+		return 0
+	}
+	if t.Name != "InfinityType" && t.Name != "NegativeInfinityType" {
+		return 0
+	}
+	if len(v.AsInstance().Slots) != 0 {
+		return 0
+	}
+	if t.Name == "InfinityType" {
+		return 1
+	}
+	return -1
+}
+
+// sentinelCmp orders sentinels against each other and ordinary values without
+// invoking Python dunders. Upper sentinel sorts after everything except itself;
+// lower sentinel sorts before everything except itself.
+func sentinelCmp(aKind, bKind int8, op uint8) (bool, bool) {
+	if aKind == 0 && bKind == 0 {
+		return false, false
+	}
+	if aKind != 0 && bKind != 0 {
+		if aKind == bKind {
+			switch op {
+			case CmpEQ, CmpLTE, CmpGTE:
+				return true, true
+			case CmpNEQ, CmpLT, CmpGT:
+				return false, true
+			}
+			return false, false
+		}
+		switch op {
+		case CmpEQ:
+			return false, true
+		case CmpNEQ:
+			return true, true
+		case CmpLT, CmpLTE:
+			return aKind < bKind, true
+		case CmpGT, CmpGTE:
+			return aKind > bKind, true
+		}
+		return false, false
+	}
+	if aKind == 1 || bKind == -1 {
+		switch op {
+		case CmpEQ:
+			return false, true
+		case CmpNEQ:
+			return true, true
+		case CmpLT, CmpLTE:
+			return false, true
+		case CmpGT, CmpGTE:
+			return true, true
+		}
+		return false, false
+	}
+	if aKind == -1 || bKind == 1 {
+		switch op {
+		case CmpEQ:
+			return false, true
+		case CmpNEQ:
+			return true, true
+		case CmpLT, CmpLTE:
+			return true, true
+		case CmpGT, CmpGTE:
+			return false, true
+		}
+		return false, false
+	}
+	return false, false
+}
+
 func compareSliceRich(ctx *ExecContext, ia, ib []Value, op uint8) Value {
 	switch op {
 	case CmpEQ:
@@ -871,6 +951,16 @@ func compareSliceRich(ctx *ExecContext, ia, ib []Value, op uint8) Value {
 					return BoolVal(false)
 				}
 				continue
+			}
+			if (ea.ptr != nil && ea.ptr.Kind == KindInstance) || (eb.ptr != nil && eb.ptr.Kind == KindInstance) {
+				if ak, bk := sentinelKind(ea), sentinelKind(eb); ak != 0 || bk != 0 {
+					if res, ok := sentinelCmp(ak, bk, CmpEQ); ok {
+						if !res {
+							return BoolVal(false)
+						}
+						continue
+					}
+				}
 			}
 			res := RichCompare(ctx, ea, eb, CmpEQ)
 			if ctx != nil && ctx.HasException() {
@@ -943,6 +1033,13 @@ func compareSliceRich(ctx *ExecContext, ia, ib []Value, op uint8) Value {
 					return compareSliceRich(ctx, ea.AsTuple().Items, eb.AsTuple().Items, op)
 				}
 				continue
+			}
+			if (ea.ptr != nil && ea.ptr.Kind == KindInstance) || (eb.ptr != nil && eb.ptr.Kind == KindInstance) {
+				if ak, bk := sentinelKind(ea), sentinelKind(eb); ak != 0 || bk != 0 {
+					if res, ok := sentinelCmp(ak, bk, op); ok {
+						return BoolVal(res)
+					}
+				}
 			}
 			eq := RichCompare(ctx, ea, eb, CmpEQ)
 			if ctx != nil && ctx.HasException() {

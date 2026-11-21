@@ -2340,6 +2340,10 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 	if exc.IsInstance() {
 		curTB, _ = exc.AsInstance().GetAttr(nameTraceback)
 	}
+	// Frames popped for a caught handler skip the locals snapshot until the
+	// traceback is actually observed. Uncaught escapes to top-level callers
+	// keep the full snapshot so debuggers see locals.
+	var pendingDetach []*val.PyFrame
 
 	faultIP := ip
 	st.ip = faultIP
@@ -2430,8 +2434,12 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 
 		if st.frameIdx > st.startFrameIdx {
 			if curShadow := vm.frames[st.frameIdx].shadowFrame; curShadow != nil {
-				curShadow.Detach()
 				vm.frames[st.frameIdx].shadowFrame = nil
+				if !curShadow.LocalsProxy.IsNone() || curShadow.ExtraLocals != nil || !curShadow.Back.IsNone() {
+					curShadow.Detach()
+				} else {
+					pendingDetach = append(pendingDetach, curShadow)
+				}
 			}
 
 			st.frameIdx--
@@ -2508,6 +2516,9 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 		if curShadow := vm.frames[st.frameIdx].shadowFrame; curShadow != nil {
 			curShadow.Detach()
 			vm.frames[st.frameIdx].shadowFrame = nil
+		}
+		for _, f := range pendingDetach {
+			f.Detach()
 		}
 
 		vm.unhandledException = exc
@@ -2904,8 +2915,6 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				continue
 			}
 			ip, sp, ctl = vm.opStoreFastWide(st, inst, ip, sp)
-		case OP_STORE_FAST_VIEW:
-			ip, sp, ctl = vm.opStoreFastView(st, inst, ip, sp)
 		case OP_BINARY_ADD:
 			b := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
 			a := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
@@ -2939,10 +2948,6 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				}
 			}
 			ip, sp, ctl = vm.opBinarySlow(st, OP_BINARY_SUB, ip, sp)
-		case OP_BINARY_MUL:
-			ip, sp, ctl = vm.dispatchColdOpcode(st, op, inst, ip, sp)
-		case OP_BINARY_MOD:
-			ip, sp, ctl = vm.dispatchColdOpcode(st, op, inst, ip, sp)
 		case OP_BINARY_SUBSCR:
 			key := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
 			obj := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
@@ -3001,8 +3006,6 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				}
 			}
 			ip, sp, ctl = vm.opBinarySubscrSlow(st, ip, sp)
-		case OP_BINARY_SLICE:
-			ip, sp, ctl = vm.opBinarySlice(st, ip, sp)
 		case OP_JUMP_IF_FALSE:
 			sp--
 			cond := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16))
@@ -3089,30 +3092,6 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				}
 			}
 			ip, sp, ctl = vm.opCallPyDefaults(st, inst, ip, sp)
-		case OP_CALL_LEN:
-			target := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
-			if target == vm.builtinLen {
-				arg := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
-				var n int
-				ok := true
-				switch arg.Kind() {
-				case val.KindString, val.KindInlineStr:
-					n = arg.StringLen()
-				case val.KindList:
-					n = len(arg.AsList().Items)
-				case val.KindTuple:
-					n = len(arg.AsTuple().Items)
-				default:
-					ok = false
-				}
-				if ok {
-					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.Int64Val(int64(n))
-					sp--
-					ip++
-					continue
-				}
-			}
-			ip, sp, ctl = vm.opCallLenSlow(st, inst, ip, sp)
 		case OP_CALL_ISINSTANCE:
 			target := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-3)*16))
 			if target == vm.builtinIsInstance {
@@ -3143,6 +3122,35 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 			}
 			ip, sp, ctl = vm.opCallIsInstanceSlow(st, inst, ip, sp)
 		case OP_CALL_HASATTR:
+			if int(uint8(inst>>16)) == 2 && !vm.hasTrackedViews && !val.MultiThreadedFlag.Load() {
+				haNewBase := sp - 2
+				haRetSP := haNewBase - 1
+				if *(*val.Value)(unsafe.Add(stackPtr, uintptr(haRetSP)*16)) == vm.builtinHasattr {
+					haObj := *(*val.Value)(unsafe.Add(stackPtr, uintptr(haNewBase)*16))
+					haName := *(*val.Value)(unsafe.Add(stackPtr, uintptr(haNewBase+1)*16))
+					if haInst := haObj.AsInstanceChecked(); haInst != nil && haInst.Shape != nil {
+						if haTp := haInst.Header.Type; haTp != nil {
+							if uint(ip) < uint(len(st.cache.attrQueryPIC)) {
+								haE := &st.cache.attrQueryPIC[ip][0]
+								if haE.Kind != attrQueryNone && haE.TypeVer == haTp.Version() && haE.ShapeID == haInst.Shape.ID && haE.Name == haName {
+									if haE.SlotIndex == attrQueryMissingSlot {
+										*(*val.Value)(unsafe.Add(stackPtr, uintptr(haRetSP)*16)) = val.BoolVal(false)
+										sp = haRetSP + 1
+										ip++
+										continue
+									}
+									if haE.SlotIndex >= 0 {
+										*(*val.Value)(unsafe.Add(stackPtr, uintptr(haRetSP)*16)) = val.BoolVal(true)
+										sp = haRetSP + 1
+										ip++
+										continue
+									}
+								}
+							}
+						}
+					}
+				}
+			}
 			ip, sp, ctl = vm.opCallHasattr(st, inst, ip, sp)
 		case OP_CALL_GETATTR:
 			ip, sp, ctl = vm.opCallGetattr(st, inst, ip, sp)
@@ -3205,6 +3213,48 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				}
 			}
 			ip, sp, ctl = vm.opCallMethodDescrFast(st, inst, ip, sp)
+		case OP_CALL_FAST_ATTR_DESCR:
+			if uint8(inst) == 0 && !vm.hasTrackedViews {
+				fadRecv := *(*val.Value)(unsafe.Add(locals, uintptr(uint8(inst>>16))*16))
+				fadEntry := &st.cache.ic[ip]
+				if fadEntry.Kind == ICKindMethodDescr && fadEntry.NativeFn != nil && fadEntry.ExpectedShapeID == 0 {
+					fadMatched := false
+					if hdr := fadRecv.HeaderPtr(); hdr != nil &&
+						hdr.Kind != val.KindInstance && hdr.Kind != val.KindSuper && hdr.Kind != val.KindModule && hdr.Kind != val.KindType {
+						tp := hdr.Type
+						if tp == nil && hdr.Kind == val.KindInlineStr {
+							tp = val.StrType
+						}
+						if tp != nil && tp.Version() == fadEntry.ExpectedTypeVer {
+							fadMatched = true
+						}
+					}
+					if fadMatched {
+						fadBase := sp
+						*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16)) = fadRecv
+						sp++
+						st.ip = ip
+						vm.frames[st.frameIdx].ip = ip
+						vm.execCtx.SP = sp
+						fadRes := fadEntry.NativeFn(&vm.execCtx, fadEntry.CachedVal, unsafe.Slice((*val.Value)(unsafe.Add(stackPtr, uintptr(fadBase)*16)), 1), nil)
+						if !vm.execCtx.HasException() &&
+							unsafe.Pointer(unsafe.SliceData(vm.execCtx.Stack)) == stackPtr &&
+							(!st.stackIsVM || unsafe.Pointer(unsafe.SliceData(vm.stack)) == stackPtr) {
+							*(*val.Value)(unsafe.Add(stackPtr, uintptr(fadBase)*16)) = fadRes
+							sp = fadBase + 1
+							if ip+2 >= st.codeLen || Opcode(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+2)*4))>>24) != OP_NOP {
+								ip += 2
+							} else {
+								ip += 3
+							}
+							continue
+						}
+						ip, sp, ctl = vm.finishMethodDescrFast(st, ip, sp, fadBase, fadRes)
+						break
+					}
+				}
+			}
+			ip, sp, ctl = vm.dispatchColdOpcode(st, op, inst, ip, sp)
 		case OP_CALL_BOUND_NATIVE:
 			ip, sp, ctl = vm.opCallBoundNative(st, inst, ip, sp)
 		case OP_CALL_INSTANCE_DUNDER:
@@ -3271,10 +3321,6 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				}
 			}
 			ip, sp, ctl = vm.opCallTypeInit(st, inst, ip, sp)
-		case OP_CALL_KW:
-			ip, sp, ctl = vm.opCallKw(st, inst, ip, sp)
-		case OP_CALL_FUNCTION_EX:
-			ip, sp, ctl = vm.opCallFunctionEx(st, inst, ip, sp)
 		case OP_CALL_METHOD_PIC:
 			argc := int(uint8(inst >> 16))
 			newBase := sp - argc - 1
@@ -3529,26 +3575,6 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 			ip++
 			continue
 
-		case OP_DUP_TOP:
-			// The duplicated value is now reachable from two stack slots, so it
-			// must not be extendable in place any more.
-			top := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
-			if top.IsString() || top.Kind() == val.KindMemoryView {
-				vm.opDetachDupTop(top)
-				top = *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
-			} else if hdr := top.HeaderPtr(); hdr != nil {
-				if (hdr.Flags & val.FlagEphemeralAll) != 0 {
-					hdr.Flags &^= val.FlagEphemeralAll
-				}
-				if hdr.Kind == val.KindInstance && hdr == vm.lastException.HeaderPtr() {
-					hdr.Flags &^= val.FlagEphemeralAttrErr
-				}
-			}
-			*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16)) = top
-			sp++
-			ip++
-			continue
-
 		case OP_LOAD_DEREF:
 			bx := int(uint16(inst))
 			activePtrs := vm.activeCellPtrs
@@ -3568,23 +3594,6 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)) = vm.acquireForIter(top)
 				ip++
 				continue
-			}
-			if k := top.Kind(); k == val.KindInstance {
-				if entry := &st.cache.ic[ip]; entry.Kind == ICKindIterDunder && entry.SlotIndex == 0 && !vm.hasTrackedViews {
-					if oh := top.HeaderPtr(); oh != nil && oh.Type != nil {
-						if inst := (*val.PyInstance)(unsafe.Pointer(oh)); inst.Shape != nil && inst.Shape.ID == entry.ExpectedShapeID && oh.Type.Version() == entry.ExpectedTypeVer {
-							if cc := entry.CalleeCache; cc != nil && cc.co != nil && atomic.LoadInt32(&cc.co.StreamGen) == cc.streamGen {
-								if st.frameIdx+2 <= len(vm.frames) && sp-1+max(256, cc.co.NumLocals+64) <= len(st.stack) {
-									vm.frames[st.frameIdx].ip = ip
-									pushFn = (*val.PyFunction)(unsafe.Pointer(entry.CachedVal.HeaderPtr()))
-									pushCache = cc
-									pushTotalArgs = 1
-									goto pushFrame
-								}
-							}
-						}
-					}
-				}
 			}
 			ip, sp, ctl = vm.opGetIterSlow(st, ip, sp)
 		case OP_FOR_ITER:
@@ -3647,38 +3656,6 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				}
 			}
 			ip, sp, ctl = vm.opForIterSlow(st, inst, ip, sp)
-		case OP_FOR_ITER_RANGE:
-			targetReg := uint8(inst >> 16)
-			jumpTarget := int(uint16(inst))
-			it := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
-			if it.IsRange() {
-				cur := it.RangeStart()
-				stop := it.RangeStop()
-				if cur < stop {
-					if cur == 0 && ip+5 < st.codeLen && DecodeOpcode(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+5)*4))) == OP_JUMP && int(DecodeArgBx(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+5)*4)))) == ip {
-						op1 := DecodeOpcode(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+1)*4)))
-						if op1 == OP_FAST_STREAM_WRITE_LOCAL_CONST ||
-							(op1 == OP_LOAD_FAST && (DecodeOpcode(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+3)*4))) == OP_CALL_METHOD_PIC || DecodeOpcode(*(*uint32)(unsafe.Add(codePtr, uintptr(ip+3)*4))) == OP_CALL_METHOD)) {
-							ip, sp, ctl = vm.opForIterRangeWriteLoop(st, inst, ip, sp)
-							break
-						}
-					}
-					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)) = val.RangeVal(cur+1, stop)
-					*(*val.Value)(unsafe.Add(locals, uintptr(targetReg)*16)) = val.Int64Val(int64(cur))
-					ip++
-					continue
-				}
-			}
-			sp--
-			ip = jumpTarget
-			continue
-		case OP_BUILD_LIST:
-			ip, sp, ctl = vm.opBuildList(st, inst, ip, sp)
-		case OP_BUILD_MAP:
-			ip, sp, ctl = vm.opBuildMap(st, inst, ip, sp)
-		case OP_BUILD_TUPLE:
-			ip, sp, ctl = vm.opBuildTuple(st, inst, ip, sp)
-
 		case OP_UNPACK_SEQUENCE:
 			count := int(uint16(inst))
 			if (count == 2 || count == 3) && sp+18 <= len(st.stack) {
@@ -3742,16 +3719,6 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				}
 			}
 			ip, sp, ctl = vm.opUnpackStoreFastSlow(st, op, inst, ip, sp)
-		case OP_COMPARE_LT:
-			b := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
-			a := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
-			if a.IsInt64() && b.IsInt64() {
-				*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.BoolVal(a.AsInt64() < b.AsInt64())
-				sp--
-				ip++
-				continue
-			}
-			ip, sp, ctl = vm.dispatchColdOpcode(st, OP_COMPARE_LT, inst, ip, sp)
 		case OP_COMPARE_OP:
 			cmpOp := uint8(inst >> 16)
 			b := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
@@ -3789,29 +3756,63 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				cmpRes = val.StringEquals(a, b) == (cmpOp == CMP_EQ)
 				goto cmpBoolHit
 			}
-			if (cmpOp == CMP_IN || cmpOp == CMP_NOT_IN) &&
-				(a.IsInlineStr() || (a.IsString() && a.AsStringObj().Header.Type == val.StrType) || a.IsInt64()) {
-				if b.IsDict() && b.HeaderPtr().Type == val.DictType {
-					_, ok := b.AsDict().Get(a)
-					cmpRes = ok == (cmpOp == CMP_IN)
-					goto cmpBoolHit
-				}
-				if b.IsSet() && b.HeaderPtr().Type == val.SetType {
-					ok := b.AsSet().Contains(a)
-					cmpRes = ok == (cmpOp == CMP_IN)
-					goto cmpBoolHit
-				}
-				if found, handled := val.ContainsSeqOrStrFast(a, b); handled {
-					cmpRes = found == (cmpOp == CMP_IN)
-					goto cmpBoolHit
-				}
-			}
 			ip, sp, ctl = vm.opCompareSlow(st, inst, ip, sp)
 			break
 		cmpBoolHit:
 			*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.BoolVal(cmpRes)
 			sp--
 			ip++
+			continue
+		case OP_COMPARE_FAST_FAST:
+			cmpOp := uint8(inst >> 16)
+			ffa := *(*val.Value)(unsafe.Add(locals, uintptr(uint8(inst>>8))*16))
+			ffb := *(*val.Value)(unsafe.Add(locals, uintptr(uint8(inst))*16))
+			var ffRes bool
+			ffHit := true
+			switch {
+			case cmpOp == CMP_IS:
+				ffRes = ffa == ffb
+			case cmpOp == CMP_IS_NOT:
+				ffRes = ffa != ffb
+			case ffa.IsInt64() && ffb.IsInt64() && cmpOp <= CMP_GTE:
+				ai, bi := ffa.AsInt64(), ffb.AsInt64()
+				switch cmpOp {
+				case CMP_EQ:
+					ffRes = ai == bi
+				case CMP_NEQ:
+					ffRes = ai != bi
+				case CMP_LT:
+					ffRes = ai < bi
+				case CMP_LTE:
+					ffRes = ai <= bi
+				case CMP_GT:
+					ffRes = ai > bi
+				case CMP_GTE:
+					ffRes = ai >= bi
+				}
+			case (cmpOp == CMP_EQ || cmpOp == CMP_NEQ) && ffa.IsNone() && ffb.IsNone():
+				ffRes = cmpOp == CMP_EQ
+			case (cmpOp == CMP_EQ || cmpOp == CMP_NEQ) && (ffa.IsNone() || ffb.IsNone()):
+				ffRes = cmpOp == CMP_NEQ
+			case (cmpOp == CMP_EQ || cmpOp == CMP_NEQ) && ffa.IsInlineStr() && ffb.IsInlineStr():
+				ffRes = (ffa == ffb) == (cmpOp == CMP_EQ)
+			case (cmpOp == CMP_EQ || cmpOp == CMP_NEQ) && ffa.IsString() && ffb.IsString():
+				fah, fbh := ffa.HeaderPtr(), ffb.HeaderPtr()
+				if fah != nil && fbh != nil && (fah.Flags&val.FlagInterned) != 0 && (fbh.Flags&val.FlagInterned) != 0 {
+					ffRes = (fah == fbh) == (cmpOp == CMP_EQ)
+				} else {
+					ffHit = false
+				}
+			default:
+				ffHit = false
+			}
+			if !ffHit {
+				ip, sp, ctl = vm.dispatchColdOpcode(st, op, inst, ip, sp)
+				break
+			}
+			*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16)) = val.BoolVal(ffRes)
+			sp++
+			ip += 3
 			continue
 		case OP_COMPARE_JUMP_IF_FALSE:
 			cmpOp := uint8(inst >> 16)
@@ -3895,36 +3896,6 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 			continue
 		doneCmpConstJump:
 			break
-		case OP_JUMP_IF_TRUE:
-			sp--
-			cond := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16))
-			if cond.IsTruthy() {
-				ip = int(uint16(inst))
-			} else {
-				ip++
-			}
-			continue
-
-		case OP_JUMP_IF_FALSE_OR_POP:
-			if !(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)).IsTruthy() {
-				ip = int(uint16(inst))
-			} else {
-				sp--
-				ip++
-			}
-			continue
-
-		case OP_JUMP_IF_TRUE_OR_POP:
-			if (*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)).IsTruthy() {
-				ip = int(uint16(inst))
-			} else {
-				sp--
-				ip++
-			}
-			continue
-
-		case OP_YIELD_VALUE:
-			ip, sp, ctl = vm.opYieldValue(st, ip, sp)
 		case OP_NOP:
 			ip++
 			continue

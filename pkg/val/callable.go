@@ -52,6 +52,11 @@ func (t *PyTuple) ClearInline() {
 	t.Items = nil
 }
 
+// AcquireEphemeralTupleHook, when set, returns a cleared *PyTuple with inline
+// [4]Value storage for short-lived small concatenations. Providers guard with
+// !MultiThreadedFlag.Load().
+var AcquireEphemeralTupleHook func() (*PyTuple, bool)
+
 // PyBuiltinFunc represents a zero-allocation native Go built-in callable using the Vectorcall convention.
 // Header MUST be at byte offset 0.
 type PyBuiltinFunc struct {
@@ -2891,6 +2896,28 @@ func tupleNbAdd(ctx *ExecContext, a, b Value) Value {
 	if a.IsTuple() && b.IsTuple() {
 		ta := a.AsTuple().Items
 		tb := b.AsTuple().Items
+		if total := len(ta) + len(tb); total <= 4 && !MultiThreadedFlag.Load() {
+			if AcquireEphemeralTupleHook != nil {
+				if t, ok := AcquireEphemeralTupleHook(); ok && t != nil {
+					t.Header = ObjectHeader{Kind: KindTuple, Flags: FlagEphemeralTuple, Type: TupleType}
+					t.Attrs = nil
+					copy(t.inline[:len(ta)], ta)
+					copy(t.inline[len(ta):total], tb)
+					t.Items = t.inline[:total]
+					return Value{num: 0, ptr: &t.Header}
+				}
+			}
+			obj := &PyTuple{
+				Header: ObjectHeader{
+					Kind: KindTuple,
+					Type: TupleType,
+				},
+			}
+			copy(obj.inline[:len(ta)], ta)
+			copy(obj.inline[len(ta):total], tb)
+			obj.Items = obj.inline[:total]
+			return Value{num: 0, ptr: &obj.Header}
+		}
 		merged := make([]Value, len(ta)+len(tb))
 		copy(merged, ta)
 		copy(merged[len(ta):], tb)

@@ -194,6 +194,25 @@ func (vm *VM) dispatchColdOpcode(st *loopState, op Opcode, inst uint32, ip, sp i
 			ip += 2
 		}
 		return ip, sp, ctlNext
+	case OP_JUMP_IF_TRUE:
+		sp--
+		cond := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16))
+		if cond.IsTruthy() {
+			return int(uint16(inst)), sp, ctlNext
+		}
+		return ip + 1, sp, ctlNext
+	case OP_JUMP_IF_FALSE_OR_POP:
+		if !(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)).IsTruthy() {
+			return int(uint16(inst)), sp, ctlNext
+		}
+		return ip + 1, sp - 1, ctlNext
+	case OP_JUMP_IF_TRUE_OR_POP:
+		if (*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)).IsTruthy() {
+			return int(uint16(inst)), sp, ctlNext
+		}
+		return ip + 1, sp - 1, ctlNext
+	case OP_YIELD_VALUE:
+		return vm.opYieldValue(st, ip, sp)
 	case OP_SETUP_RANGE:
 		count := int(uint16(inst))
 		switch count {
@@ -306,6 +325,21 @@ func (vm *VM) dispatchColdOpcode(st *loopState, op Opcode, inst uint32, ip, sp i
 			return ip, sp, ctlNext
 		}
 		return vm.opPopLoadFastSlow(st, inst, ip, sp)
+	case OP_DUP_TOP:
+		top := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
+		if top.IsString() || top.Kind() == val.KindMemoryView {
+			vm.opDetachDupTop(top)
+			top = *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
+		} else if hdr := top.HeaderPtr(); hdr != nil {
+			if (hdr.Flags & val.FlagEphemeralAll) != 0 {
+				hdr.Flags &^= val.FlagEphemeralAll
+			}
+			if hdr.Kind == val.KindInstance && hdr == vm.lastException.HeaderPtr() {
+				hdr.Flags &^= val.FlagEphemeralAttrErr
+			}
+		}
+		*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16)) = top
+		return ip + 1, sp + 1, ctlNext
 	case OP_SUBSCR_FAST_FAST, OP_SUBSCR_FAST_CONST:
 		obj := locals[uint8(inst>>8)]
 		var key val.Value
@@ -1083,6 +1117,22 @@ func (vm *VM) dispatchColdOpcode(st *loopState, op Opcode, inst uint32, ip, sp i
 		return vm.opFastSelfRecurseSlow(st, inst, ip, sp)
 	case OP_BUILD_SET:
 		return vm.opBuildSet(st, inst, ip, sp)
+	case OP_BUILD_LIST:
+		return vm.opBuildList(st, inst, ip, sp)
+	case OP_BUILD_MAP:
+		return vm.opBuildMap(st, inst, ip, sp)
+	case OP_BUILD_TUPLE:
+		return vm.opBuildTuple(st, inst, ip, sp)
+	case OP_BINARY_SLICE:
+		return vm.opBinarySlice(st, ip, sp)
+	case OP_CALL_KW:
+		return vm.opCallKw(st, inst, ip, sp)
+	case OP_CALL_FUNCTION_EX:
+		return vm.opCallFunctionEx(st, inst, ip, sp)
+	case OP_CALL_LEN:
+		return vm.opCallLenSlow(st, inst, ip, sp)
+	case OP_STORE_FAST_VIEW:
+		return vm.opStoreFastView(st, inst, ip, sp)
 	case OP_SET_ADD:
 		return vm.opSetAdd(st, inst, ip, sp)
 	case OP_DELETE_FAST:

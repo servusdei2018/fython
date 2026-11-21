@@ -576,6 +576,9 @@ func (m *pyMatch) groupVal(idx int, def val.Value) val.Value {
 			if s == 0 && e == len(ps.Data) && m.StringVal.Type() == val.StrType {
 				return m.StringVal
 			}
+			if e-s >= 0 && e-s <= 7 {
+				return val.SmallStringVal(ps.Data[s:e])
+			}
 			return val.NewStringVal(ps.Data[s:e])
 		}
 	}
