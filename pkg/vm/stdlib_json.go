@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"sort"
 	"strconv"
 	"strings"
@@ -98,52 +99,96 @@ func newJSONDecodeError(err error, doc []byte) val.Value {
 	return val.ObjectVal(&inst.AsInstance().Header)
 }
 
-// jsonParser provides direct, allocation-optimized JSON parsing into fython Values.
+var errJSONHookRaised = errors.New("json hook raised python exception")
+
+type jsonLoadOpts struct {
+	objectHook      val.Value
+	objectPairsHook val.Value
+	parseFloat      val.Value
+	parseInt        val.Value
+	parseConstant   val.Value
+	strict          bool
+	hasHooks        bool
+}
+
+func defaultJSONLoadOpts() jsonLoadOpts {
+	return jsonLoadOpts{strict: true}
+}
+
+func extractJSONLoadOpts(args []val.Value, kwnames []val.Value) jsonLoadOpts {
+	opts := defaultJSONLoadOpts()
+	if len(kwnames) == 0 {
+		return opts
+	}
+	if v, ok := kwArg(args, kwnames, "object_hook"); ok && !v.IsNone() && !v.IsUnbound() {
+		opts.objectHook = v
+		opts.hasHooks = true
+	}
+	if v, ok := kwArg(args, kwnames, "object_pairs_hook"); ok && !v.IsNone() && !v.IsUnbound() {
+		opts.objectPairsHook = v
+		opts.hasHooks = true
+	}
+	if v, ok := kwArg(args, kwnames, "parse_float"); ok && !v.IsNone() && !v.IsUnbound() {
+		opts.parseFloat = v
+		opts.hasHooks = true
+	}
+	if v, ok := kwArg(args, kwnames, "parse_int"); ok && !v.IsNone() && !v.IsUnbound() {
+		opts.parseInt = v
+		opts.hasHooks = true
+	}
+	if v, ok := kwArg(args, kwnames, "parse_constant"); ok && !v.IsNone() && !v.IsUnbound() {
+		opts.parseConstant = v
+		opts.hasHooks = true
+	}
+	if v, ok := kwArg(args, kwnames, "strict"); ok {
+		opts.strict = v.IsTruthy()
+	}
+	return opts
+}
+
+// jsonParser provides single-pass, allocation-optimized JSON parsing into fython Values.
 type jsonParser struct {
 	src         []byte
 	pos         int
 	pool        *val.InternPool
 	scratch     []byte
-	dictCapHint int
-	entrySlab   []val.DictEntry
-	dictSlab    []val.PyDict
-	listSlab    []val.PyList
-	valSlab     []val.Value
-	strSlab     []val.PyString
-	byteSlab    []byte
+	kvScratch   []val.DictEntry
+	elemScratch []val.Value
 	vm          *VM
+	ctx         *val.ExecContext
+	opts        jsonLoadOpts
 }
 
-func acquireJSONParser(ctx *val.ExecContext, src []byte, pool *val.InternPool) *jsonParser {
+func acquireJSONParser(ctx *val.ExecContext, src []byte, pool *val.InternPool, opts jsonLoadOpts) *jsonParser {
+	var vm *VM
 	if ctx != nil && ctx.VM != nil && !val.MultiThreadedFlag.Load() {
-		if vm, ok := ctx.VM.(*VM); ok && vm.jsonParser != nil {
-			p := vm.jsonParser
-			vm.jsonParser = nil
-			p.src = src
-			p.pos = 0
-			p.pool = pool
-			p.scratch = p.scratch[:0]
-			p.dictCapHint = 5
-			p.vm = vm
-			return p
-		}
-		if vm, ok := ctx.VM.(*VM); ok {
-			return &jsonParser{
-				src:         src,
-				pos:         0,
-				pool:        pool,
-				scratch:     make([]byte, 0, 64),
-				dictCapHint: 5,
-				vm:          vm,
+		if v, ok := ctx.VM.(*VM); ok {
+			vm = v
+			if v.jsonParser != nil {
+				p := v.jsonParser
+				v.jsonParser = nil
+				p.src = src
+				p.pos = 0
+				p.pool = pool
+				p.scratch = p.scratch[:0]
+				p.kvScratch = p.kvScratch[:0]
+				p.elemScratch = p.elemScratch[:0]
+				p.vm = vm
+				p.ctx = ctx
+				p.opts = opts
+				return p
 			}
 		}
 	}
 	return &jsonParser{
 		src:         src,
-		pos:         0,
 		pool:        pool,
 		scratch:     make([]byte, 0, 64),
-		dictCapHint: 5,
+		kvScratch:   make([]val.DictEntry, 0, 32),
+		elemScratch: make([]val.Value, 0, 32),
+		vm:          vm,
+		ctx:         ctx,
+		opts:        opts,
 	}
 }
 
@@ -153,6 +198,25 @@ func releaseJSONParser(ctx *val.ExecContext, p *jsonParser) {
 	}
 	p.src = nil
 	p.pool = nil
+	p.ctx = nil
+	p.opts = jsonLoadOpts{}
+	if len(p.kvScratch) > 0 {
+		clear(p.kvScratch)
+		p.kvScratch = p.kvScratch[:0]
+	}
+	if len(p.elemScratch) > 0 {
+		clear(p.elemScratch)
+		p.elemScratch = p.elemScratch[:0]
+	}
+	if cap(p.scratch) > 65536 {
+		p.scratch = nil
+	}
+	if cap(p.kvScratch) > 4096 {
+		p.kvScratch = nil
+	}
+	if cap(p.elemScratch) > 8192 {
+		p.elemScratch = nil
+	}
 	if ctx != nil && ctx.VM != nil && !val.MultiThreadedFlag.Load() {
 		if vm, ok := ctx.VM.(*VM); ok && vm.jsonParser == nil {
 			vm.jsonParser = p
@@ -160,95 +224,22 @@ func releaseJSONParser(ctx *val.ExecContext, p *jsonParser) {
 	}
 }
 
-func (p *jsonParser) allocString(raw []byte) val.Value {
-	if len(raw) > 1024 {
-		return val.NewStringVal(string(raw))
+func (p *jsonParser) acquireSmallDict(n int) val.Value {
+	if p.vm != nil && !val.MultiThreadedFlag.Load() && n <= 20 {
+		return p.vm.acquireSmallDict(n, false)
 	}
-	if len(p.strSlab) >= cap(p.strSlab) {
-		p.strSlab = make([]val.PyString, 0, 256)
-	}
-	idx := len(p.strSlab)
-	p.strSlab = p.strSlab[:idx+1]
-	ps := &p.strSlab[idx]
-	if len(p.byteSlab)+len(raw) > cap(p.byteSlab) {
-		p.byteSlab = make([]byte, 0, 4096)
-	}
-	bStart := len(p.byteSlab)
-	p.byteSlab = append(p.byteSlab, raw...)
-	s := unsafe.String(&p.byteSlab[bStart], len(raw))
-	ps.Header = val.ObjectHeader{
-		Kind: val.KindString,
-		Hash: val.HashString(s),
-		Type: val.StrType,
-	}
-	ps.Data = s
-	return val.ObjectVal(&ps.Header)
+	return val.NewDictVal(n)
 }
 
-func (p *jsonParser) allocDict(capHint int) *val.PyDict {
-	if len(p.dictSlab) >= cap(p.dictSlab) {
-		p.dictSlab = make([]val.PyDict, 0, 256)
+func (p *jsonParser) invokeHook(hook val.Value, arg val.Value) (val.Value, error) {
+	if p.ctx == nil {
+		return arg, nil
 	}
-	idx := len(p.dictSlab)
-	p.dictSlab = p.dictSlab[:idx+1]
-	d := &p.dictSlab[idx]
-	tableCap := 8
-	for tableCap*2 < capHint*3 {
-		tableCap <<= 1
+	res := p.ctx.Invoke1(hook, arg)
+	if p.ctx.HasException() {
+		return val.NoneVal(), errJSONHookRaised
 	}
-	maxDense := tableCap * 2 / 3
-	val.InitArenaDict(d, capHint, p.allocEntries(maxDense))
-	return d
-}
-
-func (p *jsonParser) allocDictVal(capHint int) (*val.PyDict, val.Value) {
-	if p.vm != nil && !val.MultiThreadedFlag.Load() && capHint > 0 && capHint <= 10 {
-		hint := max(capHint, 1)
-		dv := p.vm.acquireSmallDict(hint, false)
-		if d := dv.AsDict(); d != nil {
-			return d, dv
-		}
-	}
-	d := p.allocDict(capHint)
-	return d, val.DictVal(d)
-}
-
-func (p *jsonParser) allocList(items []val.Value) val.Value {
-	if len(p.listSlab) >= cap(p.listSlab) {
-		p.listSlab = make([]val.PyList, 0, 256)
-	}
-	idx := len(p.listSlab)
-	p.listSlab = p.listSlab[:idx+1]
-	l := &p.listSlab[idx]
-	l.Header = val.ObjectHeader{Kind: val.KindList, Type: val.ListType}
-	l.Items = items
-	return val.ObjectVal(&l.Header)
-}
-
-func (p *jsonParser) allocValSlice(capNeeded int) []val.Value {
-	if capNeeded > 256 {
-		return make([]val.Value, 0, capNeeded)
-	}
-	if len(p.valSlab)+capNeeded > cap(p.valSlab) {
-		p.valSlab = make([]val.Value, 0, 1024)
-	}
-	start := len(p.valSlab)
-	end := start + capNeeded
-	p.valSlab = p.valSlab[:end]
-	return p.valSlab[start:start:end]
-}
-
-func (p *jsonParser) allocEntries(capNeeded int) []val.DictEntry {
-	if capNeeded > 256 {
-		return make([]val.DictEntry, 0, capNeeded)
-	}
-	if len(p.entrySlab)+capNeeded > cap(p.entrySlab) {
-		p.entrySlab = make([]val.DictEntry, 0, 1024)
-	}
-	start := len(p.entrySlab)
-	end := start + capNeeded
-	p.entrySlab = p.entrySlab[:end]
-	return p.entrySlab[start:start:end]
+	return res, nil
 }
 
 func (p *jsonParser) skipWhitespace() {
@@ -309,7 +300,34 @@ func (p *jsonParser) parseValue() (val.Value, error) {
 			return val.NoneVal(), nil
 		}
 		return p.parseLiteral("null", val.NoneVal())
-	case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+	case 'N':
+		if p.pos+3 <= len(p.src) && p.src[p.pos+1] == 'a' && p.src[p.pos+2] == 'N' {
+			p.pos += 3
+			if p.opts.hasHooks && !p.opts.parseConstant.IsUnbound() && !p.opts.parseConstant.IsNone() {
+				return p.invokeHook(p.opts.parseConstant, val.InternString("NaN"))
+			}
+			return val.Float64Val(math.NaN()), nil
+		}
+		return val.NoneVal(), p.errNow("Expecting value")
+	case 'I':
+		if p.pos+8 <= len(p.src) && string(p.src[p.pos:p.pos+8]) == "Infinity" {
+			p.pos += 8
+			if p.opts.hasHooks && !p.opts.parseConstant.IsUnbound() && !p.opts.parseConstant.IsNone() {
+				return p.invokeHook(p.opts.parseConstant, val.InternString("Infinity"))
+			}
+			return val.Float64Val(math.Inf(1)), nil
+		}
+		return val.NoneVal(), p.errNow("Expecting value")
+	case '-':
+		if p.pos+9 <= len(p.src) && p.src[p.pos+1] == 'I' && string(p.src[p.pos+1:p.pos+9]) == "Infinity" {
+			p.pos += 9
+			if p.opts.hasHooks && !p.opts.parseConstant.IsUnbound() && !p.opts.parseConstant.IsNone() {
+				return p.invokeHook(p.opts.parseConstant, val.InternString("-Infinity"))
+			}
+			return val.Float64Val(math.Inf(-1)), nil
+		}
+		return p.parseNumber()
+	case '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
 		return p.parseNumber()
 	default:
 		return val.NoneVal(), p.errNow("Expecting value")
@@ -318,47 +336,83 @@ func (p *jsonParser) parseValue() (val.Value, error) {
 
 func (p *jsonParser) parseObject() (val.Value, error) {
 	p.pos++ // consume '{'
-	dict, dictVal := p.allocDictVal(p.dictCapHint)
-
 	p.skipWhitespace()
 	if p.pos < len(p.src) && p.src[p.pos] == '}' {
 		p.pos++
-		return dictVal, nil
+		if p.opts.hasHooks {
+			if !p.opts.objectPairsHook.IsUnbound() && !p.opts.objectPairsHook.IsNone() {
+				return p.invokeHook(p.opts.objectPairsHook, val.NewListVal())
+			}
+			if !p.opts.objectHook.IsUnbound() && !p.opts.objectHook.IsNone() {
+				return p.invokeHook(p.opts.objectHook, p.acquireSmallDict(0))
+			}
+		}
+		return p.acquireSmallDict(0), nil
 	}
 
+	base := len(p.kvScratch)
 	for {
 		p.skipWhitespace()
 		if p.pos >= len(p.src) || p.src[p.pos] != '"' {
+			clear(p.kvScratch[base:])
+			p.kvScratch = p.kvScratch[:base]
 			return val.NoneVal(), p.errNow("Expecting property name enclosed in double quotes")
 		}
 
 		keyVal, err := p.parseString(true)
 		if err != nil {
+			clear(p.kvScratch[base:])
+			p.kvScratch = p.kvScratch[:base]
 			return val.NoneVal(), err
 		}
 
 		p.skipWhitespace()
 		if p.pos >= len(p.src) || p.src[p.pos] != ':' {
+			clear(p.kvScratch[base:])
+			p.kvScratch = p.kvScratch[:base]
 			return val.NoneVal(), p.errNow("Expecting ':' delimiter")
 		}
 		p.pos++ // consume ':'
 
 		valElem, err := p.parseValue()
 		if err != nil {
+			clear(p.kvScratch[base:])
+			p.kvScratch = p.kvScratch[:base]
 			return val.NoneVal(), err
 		}
 
-		dict.PutNew(keyVal, valElem)
+		p.kvScratch = append(p.kvScratch, val.DictEntry{Key: keyVal, Value: valElem})
 
 		p.skipWhitespace()
 		if p.pos >= len(p.src) {
+			clear(p.kvScratch[base:])
+			p.kvScratch = p.kvScratch[:base]
 			return val.NoneVal(), p.errNow("Expecting ',' delimiter")
 		}
 
 		if p.src[p.pos] == '}' {
 			p.pos++
-			if n := len(dict.Entries); n > p.dictCapHint && n <= 10 {
-				p.dictCapHint = n + 1
+			entries := p.kvScratch[base:]
+			n := len(entries)
+			if p.opts.hasHooks && !p.opts.objectPairsHook.IsUnbound() && !p.opts.objectPairsHook.IsNone() {
+				pairs := make([]val.Value, n)
+				for i, e := range entries {
+					pairs[i] = val.NewTupleVal(e.Key, e.Value)
+				}
+				clear(p.kvScratch[base:])
+				p.kvScratch = p.kvScratch[:base]
+				return p.invokeHook(p.opts.objectPairsHook, val.NewListFromOwnedSlice(pairs))
+			}
+
+			dictVal := p.acquireSmallDict(n)
+			d := dictVal.AsDict()
+			for i := range entries {
+				d.PutNew(entries[i].Key, entries[i].Value)
+			}
+			clear(p.kvScratch[base:])
+			p.kvScratch = p.kvScratch[:base]
+			if p.opts.hasHooks && !p.opts.objectHook.IsUnbound() && !p.opts.objectHook.IsNone() {
+				return p.invokeHook(p.opts.objectHook, dictVal)
 			}
 			return dictVal, nil
 		}
@@ -367,51 +421,72 @@ func (p *jsonParser) parseObject() (val.Value, error) {
 			p.pos++
 			p.skipWhitespace()
 			if p.pos < len(p.src) && p.src[p.pos] == '}' {
+				clear(p.kvScratch[base:])
+				p.kvScratch = p.kvScratch[:base]
 				return val.NoneVal(), p.errAt(commaPos, "Illegal trailing comma before end of object")
 			}
 			continue
 		}
+		clear(p.kvScratch[base:])
+		p.kvScratch = p.kvScratch[:base]
 		return val.NoneVal(), p.errNow("Expecting ',' delimiter")
 	}
 }
 
 func (p *jsonParser) parseArray() (val.Value, error) {
 	p.pos++ // consume '['
-	items := p.allocValSlice(4)
-
 	p.skipWhitespace()
 	if p.pos < len(p.src) && p.src[p.pos] == ']' {
 		p.pos++
-		return p.allocList(items), nil
+		return val.NewListVal(), nil
 	}
 
+	base := len(p.elemScratch)
 	for {
 		elem, err := p.parseValue()
 		if err != nil {
+			clear(p.elemScratch[base:])
+			p.elemScratch = p.elemScratch[:base]
 			return val.NoneVal(), err
 		}
-		items = append(items, elem)
+		p.elemScratch = append(p.elemScratch, elem)
 
 		p.skipWhitespace()
 		if p.pos >= len(p.src) {
+			clear(p.elemScratch[base:])
+			p.elemScratch = p.elemScratch[:base]
 			return val.NoneVal(), p.errNow("Expecting ',' delimiter")
 		}
 
 		if p.src[p.pos] == ']' {
 			p.pos++
-			return p.allocList(items), nil
+			res := val.NewListFromSlice(p.elemScratch[base:])
+			clear(p.elemScratch[base:])
+			p.elemScratch = p.elemScratch[:base]
+			return res, nil
 		}
 		if p.src[p.pos] == ',' {
 			commaPos := p.pos
 			p.pos++
 			p.skipWhitespace()
 			if p.pos < len(p.src) && p.src[p.pos] == ']' {
+				clear(p.elemScratch[base:])
+				p.elemScratch = p.elemScratch[:base]
 				return val.NoneVal(), p.errAt(commaPos, "Illegal trailing comma before end of array")
 			}
 			continue
 		}
+		clear(p.elemScratch[base:])
+		p.elemScratch = p.elemScratch[:base]
 		return val.NoneVal(), p.errNow("Expecting ',' delimiter")
 	}
+}
+
+func (p *jsonParser) materializeParsedString(b []byte, isKey bool) val.Value {
+	if isKey && len(b) <= 32 {
+		return val.InternBytes(b)
+	}
+	return val.NewStringFromBytes(b)
 }
 
 func (p *jsonParser) parseString(isKey bool) (val.Value, error) {
@@ -420,50 +495,60 @@ func (p *jsonParser) parseString(isKey bool) (val.Value, error) {
 	hasEscapes := false
 
 	for p.pos < len(p.src) {
+		span := val.FindJSONEscape(p.src[p.pos:])
+		p.pos += span
+		if p.pos >= len(p.src) {
+			break
+		}
 		b := p.src[p.pos]
 		if b == '"' {
 			raw := p.src[start:p.pos]
 			p.pos++ // consume closing '"'
-
 			if !hasEscapes {
-				if len(raw) <= 7 {
-					// Small String Optimization: 0 heap allocations, 0 string allocations!
-					return val.SmallStringFromBytes(raw), nil
-				}
-				if isKey {
-					return val.InternBytes(raw), nil
-				}
-				return p.allocString(raw), nil
+				return p.materializeParsedString(raw, isKey), nil
 			}
-
-			// Has escapes: decode via scratch buffer
 			decoded, err := p.decodeEscapes(raw, start)
 			if err != nil {
 				return val.NoneVal(), err
 			}
-			if isKey || len(decoded) <= 7 {
-				if len(decoded) <= 7 {
-					return val.SmallStringFromBytes(decoded), nil
-				}
-				if p.pool != nil {
-					return p.pool.InternBytes(decoded), nil
-				}
-				return val.InternString(string(decoded)), nil
-			}
-			return val.NewStringVal(string(decoded)), nil
+			return p.materializeParsedString(decoded, isKey), nil
 		}
 		if b == '\\' {
+			if p.pos+1 >= len(p.src) {
+				return val.NoneVal(), p.errAt(start-1, "Unterminated string starting at")
+			}
 			hasEscapes = true
 			p.pos += 2
 			continue
 		}
-		if b < 0x20 {
+		// Control character (< 0x20)
+		if p.opts.strict {
 			return val.NoneVal(), p.errNow("Invalid control character at")
 		}
 		p.pos++
 	}
 
 	return val.NoneVal(), p.errAt(start-1, "Unterminated string starting at")
+}
+
+func parseHex4(b []byte) (uint16, bool) {
+	var v uint16
+	for i := range 4 {
+		c := b[i]
+		var d uint16
+		switch {
+		case c >= '0' && c <= '9':
+			d = uint16(c - '0')
+		case c >= 'a' && c <= 'f':
+			d = uint16(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			d = uint16(c-'A') + 10
+		default:
+			return 0, false
+		}
+		v = (v << 4) | d
+	}
+	return v, true
 }
 
 // decodeEscapes decodes the escape sequences of a JSON string literal. base
@@ -494,24 +579,23 @@ func (p *jsonParser) decodeEscapes(raw []byte, base int) ([]byte, error) {
 				p.scratch = append(p.scratch, '\t')
 			case 'u':
 				if i+4 >= len(raw) {
-					return nil, p.errAt(base+i, "Invalid \\uXXXX escape")
+					return nil, p.errAt(base+i-1, "Invalid \\uXXXX escape")
 				}
-				r, err := strconv.ParseUint(string(raw[i+1:i+5]), 16, 16)
-				if err != nil {
-					return nil, p.errAt(base+i, "Invalid \\uXXXX escape")
+				r, ok := parseHex4(raw[i+1 : i+5])
+				if !ok {
+					return nil, p.errAt(base+i-1, "Invalid \\uXXXX escape")
 				}
 				i += 4
-				// Handle surrogate pairs
-				if utf16.IsSurrogate(rune(r)) {
+				// Combine UTF-16 surrogate pairs; lone surrogates pass through encodeRune.
+				if r >= 0xD800 && r <= 0xDBFF {
 					if i+6 < len(raw) && raw[i+1] == '\\' && raw[i+2] == 'u' {
-						r2, err2 := strconv.ParseUint(string(raw[i+3:i+7]), 16, 16)
-						if err2 == nil {
+						r2, ok2 := parseHex4(raw[i+3 : i+7])
+						if ok2 && r2 >= 0xDC00 && r2 <= 0xDFFF {
 							combined := utf16.DecodeRune(rune(r), rune(r2))
 							var utf8Buf [4]byte
 							n := encodeRune(combined, utf8Buf[:])
 							p.scratch = append(p.scratch, utf8Buf[:n]...)
-							i += 6
-							i++
+							i += 7
 							continue
 						}
 					}
@@ -520,7 +604,7 @@ func (p *jsonParser) decodeEscapes(raw []byte, base int) ([]byte, error) {
 				n := encodeRune(rune(r), utf8Buf[:])
 				p.scratch = append(p.scratch, utf8Buf[:n]...)
 			default:
-				p.scratch = append(p.scratch, '\\', raw[i])
+				return nil, p.errAt(base+i-1, "Invalid \\escape")
 			}
 			i++
 		} else {
@@ -557,6 +641,7 @@ func encodeRune(r rune, p []byte) int {
 func (p *jsonParser) parseNumber() (val.Value, error) {
 	start := p.pos
 	isFloat := false
+	hasExp := false
 	neg := false
 
 	if p.src[p.pos] == '-' {
@@ -564,71 +649,104 @@ func (p *jsonParser) parseNumber() (val.Value, error) {
 		p.pos++
 	}
 
+	if p.pos >= len(p.src) || p.src[p.pos] < '0' || p.src[p.pos] > '9' {
+		return val.NoneVal(), p.errAt(start, "Expecting value")
+	}
+
 	var uval uint64
+	overflow := false
 	digitStart := p.pos
-	for p.pos < len(p.src) && p.src[p.pos] >= '0' && p.src[p.pos] <= '9' {
-		uval = uval*10 + uint64(p.src[p.pos]-'0')
+	if p.src[p.pos] == '0' {
 		p.pos++
+	} else {
+		const maxDiv10 = uint64(math.MaxInt64) / 10
+		for p.pos < len(p.src) && p.src[p.pos] >= '0' && p.src[p.pos] <= '9' {
+			d := uint64(p.src[p.pos] - '0')
+			if !overflow {
+				if uval > maxDiv10 || (uval == maxDiv10 && ((neg && d > 8) || (!neg && d > 7))) {
+					overflow = true
+				} else {
+					uval = uval*10 + d
+				}
+			}
+			p.pos++
+		}
 	}
 	digits := p.pos - digitStart
 
+	var fracVal uint64
+	fracDigits := 0
 	if p.pos < len(p.src) && p.src[p.pos] == '.' {
-		isFloat = true
+		dotPos := p.pos
 		p.pos++
 		fracStart := p.pos
-		var fracVal uint64
 		for p.pos < len(p.src) && p.src[p.pos] >= '0' && p.src[p.pos] <= '9' {
 			fracVal = fracVal*10 + uint64(p.src[p.pos]-'0')
 			p.pos++
 		}
-		fracDigits := p.pos - fracStart
-		if (p.pos >= len(p.src) || (p.src[p.pos] != 'e' && p.src[p.pos] != 'E')) &&
-			digits > 0 && fracDigits > 0 && digits+fracDigits <= 15 && fracDigits <= 6 {
-			pow10 := [7]float64{1, 10, 100, 1000, 10000, 100000, 1000000}[fracDigits]
-			f := float64(uval) + float64(fracVal)/pow10
-			if neg {
-				f = -f
-			}
-			return val.Float64Val(f), nil
+		fracDigits = p.pos - fracStart
+		if fracDigits == 0 {
+			p.pos = dotPos
+		} else {
+			isFloat = true
 		}
 	}
 
 	if p.pos < len(p.src) && (p.src[p.pos] == 'e' || p.src[p.pos] == 'E') {
-		isFloat = true
+		expPos := p.pos
 		p.pos++
 		if p.pos < len(p.src) && (p.src[p.pos] == '+' || p.src[p.pos] == '-') {
 			p.pos++
 		}
+		expDigits := 0
 		for p.pos < len(p.src) && p.src[p.pos] >= '0' && p.src[p.pos] <= '9' {
+			expDigits++
 			p.pos++
 		}
-	}
-
-	if !isFloat && digits > 0 && digits <= 18 {
-		if neg {
-			return val.Int64Val(-int64(uval)), nil
+		if expDigits == 0 {
+			p.pos = expPos
+		} else {
+			isFloat = true
+			hasExp = true
 		}
-		return val.Int64Val(int64(uval)), nil
 	}
 
-	raw := p.src[start:p.pos]
-	numStr := unsafe.String(unsafe.SliceData(raw), len(raw))
-	if isFloat {
-		f, err := strconv.ParseFloat(numStr, 64)
-		if err != nil {
-			return val.NoneVal(), err
+	if !isFloat {
+		if p.opts.hasHooks && !p.opts.parseInt.IsUnbound() && !p.opts.parseInt.IsNone() {
+			return p.invokeHook(p.opts.parseInt, val.NewStringFromBytes(p.src[start:p.pos]))
+		}
+		if !overflow {
+			if neg {
+				return val.Int64Val(-int64(uval)), nil
+			}
+			return val.Int64Val(int64(uval)), nil
+		}
+		raw := p.src[start:p.pos]
+		numStr := unsafe.String(unsafe.SliceData(raw), len(raw))
+		bi, ok := new(big.Int).SetString(numStr, 10)
+		if !ok {
+			return val.NoneVal(), p.errAt(start, "Expecting value")
+		}
+		return val.NewBigIntVal(bi), nil
+	}
+
+	if p.opts.hasHooks && !p.opts.parseFloat.IsUnbound() && !p.opts.parseFloat.IsNone() {
+		return p.invokeHook(p.opts.parseFloat, val.NewStringFromBytes(p.src[start:p.pos]))
+	}
+	if !hasExp && !overflow && digits > 0 && fracDigits > 0 && digits+fracDigits <= 15 && fracDigits <= 6 {
+		pow10 := [7]float64{1, 10, 100, 1000, 10000, 100000, 1000000}[fracDigits]
+		f := float64(uval) + float64(fracVal)/pow10
+		if neg {
+			f = -f
 		}
 		return val.Float64Val(f), nil
 	}
 
-	i, err := strconv.ParseInt(numStr, 10, 64)
-	if err == nil {
-		return val.Int64Val(i), nil
-	}
-	// Big int promotion on overflow
-	f, ferr := strconv.ParseFloat(numStr, 64)
-	if ferr != nil {
-		return val.NoneVal(), ferr
+	raw := p.src[start:p.pos]
+	numStr := unsafe.String(unsafe.SliceData(raw), len(raw))
+	f, err := strconv.ParseFloat(numStr, 64)
+	if err != nil {
+		return val.NoneVal(), err
 	}
 	return val.Float64Val(f), nil
 }
@@ -1060,27 +1178,28 @@ func appendJSONStringBytes(dst []byte, b []byte, ensureASCII bool) []byte {
 	return append(dst, '"')
 }
 
-func applyJSONObjectHook(ctx *val.ExecContext, v val.Value, hook val.Value) val.Value {
-	if hook.IsNone() || hook.IsUnbound() {
-		return v
-	}
-	if v.IsList() {
-		lst := v.AsList()
-		for i, item := range lst.Items {
-			lst.Items[i] = applyJSONObjectHook(ctx, item, hook)
+func decodeJSONBytes(ctx *val.ExecContext, pool *val.InternPool, rawBytes []byte, opts jsonLoadOpts) val.Value {
+	p := acquireJSONParser(ctx, rawBytes, pool, opts)
+	res, err := p.parseValue()
+	if err == nil {
+		p.skipWhitespace()
+		if p.pos < len(p.src) {
+			err = p.errNow("Extra data")
 		}
-		return v
 	}
-	if v.IsDict() {
-		d := v.AsDict()
-		for i := range d.Entries {
-			if d.Entries[i].Active {
-				d.Entries[i].Value = applyJSONObjectHook(ctx, d.Entries[i].Value, hook)
-			}
+	releaseJSONParser(ctx, p)
+	if err != nil {
+		if errors.Is(err, errJSONHookRaised) {
+			return val.NoneVal()
 		}
-		return ctx.Invoke1(hook, v)
+		decErr := newJSONDecodeError(err, rawBytes)
+		if ctx != nil {
+			ctx.Raise(decErr)
+			return val.NoneVal()
+		}
+		panic(decErr)
 	}
-	return v
+	return res
 }
 
 // createJSONModule builds the native json PyModule Value.
@@ -1119,16 +1238,7 @@ func (e *Engine) createJSONModule() val.Value {
 			return val.NoneVal()
 		}
 
-		p := acquireJSONParser(ctx, rawBytes, e.internPool)
-		res, err := p.parseValue()
-		releaseJSONParser(ctx, p)
-		if err != nil {
-			panic(newJSONDecodeError(err, rawBytes))
-		}
-		if hook, ok := kwArg(args, kwnames, "object_hook"); ok && !hook.IsNone() {
-			res = applyJSONObjectHook(ctx, res, hook)
-		}
-		return res
+		return decodeJSONBytes(ctx, e.internPool, rawBytes, extractJSONLoadOpts(args, kwnames))
 	}))
 
 	mod.Dict.Set(val.InternString("dumps"), val.NewBuiltinFuncVal("dumps", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -1163,26 +1273,21 @@ func (e *Engine) createJSONModule() val.Value {
 		fp := pa[0]
 		readMethod := val.GetAttrCtx(ctx, fp, nameRead)
 		content := ctx.Invoke0(readMethod)
+		if ctx != nil && ctx.HasException() {
+			return val.NoneVal()
+		}
 		var rawBytes []byte
 		switch {
 		case content.IsAnyString():
-			rawBytes = []byte(content.AsString())
+			s := content.AsString()
+			rawBytes = unsafe.Slice(unsafe.StringData(s), len(s))
 		case content.IsBytes():
 			rawBytes = content.AsBytes().Data
 		default:
 			ctx.Raise(val.NewException(val.TypeErrorType, "fp.read() must return str or bytes"))
 			return val.NoneVal()
 		}
-		p := acquireJSONParser(ctx, rawBytes, e.internPool)
-		res, err := p.parseValue()
-		releaseJSONParser(ctx, p)
-		if err != nil {
-			panic(newJSONDecodeError(err, rawBytes))
-		}
-		if hook, ok := kwArg(args, kwnames, "object_hook"); ok && !hook.IsNone() {
-			res = applyJSONObjectHook(ctx, res, hook)
-		}
-		return res
+		return decodeJSONBytes(ctx, e.internPool, rawBytes, extractJSONLoadOpts(args, kwnames))
 	}))
 
 	mod.Dict.Set(val.InternString("dump"), val.NewBuiltinFuncVal("dump", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {

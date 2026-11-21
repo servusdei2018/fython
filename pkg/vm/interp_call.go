@@ -1777,6 +1777,10 @@ func (vm *VM) opCallBuiltinFast(st *loopState, inst uint32, ip, sp int) (int, in
 			return ip + 1, retSP + 1, ctlReload
 		}
 	}
+	if res, ok := val.TryFastPrimitiveDunderNew(target, stack[newBase:newBase+argc]); ok {
+		stack[retSP] = res
+		return ip + 1, retSP + 1, ctlNext
+	}
 	st.stack = stack
 	st.ip = ip
 	vm.execCtx.SP = newBase + argc
@@ -2457,6 +2461,10 @@ unwrapCall:
 			st.cache.ic[ip] = ICSlot{CachedVal: target, NativeFn: builtin.Fn}
 			st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL_BUILTIN_FAST))
 		}
+		if res, ok := val.TryFastPrimitiveDunderNew(target, stack[newBase:newBase+argc]); ok {
+			stack[retSP] = res
+			return ip + 1, retSP + 1, ctlNext
+		}
 		st.stack = stack
 		st.ip = ip
 		vm.execCtx.SP = newBase + argc
@@ -2799,6 +2807,12 @@ func (vm *VM) opCallMethodSlow(st *loopState, inst uint32, ip, sp int) (int, int
 	} else {
 		newBase = retSP + 2
 		totalArgs = argc
+		if !vm.hasTrackedViews && callable.IsBuiltinFunc() {
+			if res, ok := val.TryFastPrimitiveDunderNew(callable, stack[newBase:newBase+totalArgs]); ok {
+				stack[retSP] = res
+				return ip + 1, retSP + 1, ctlNext
+			}
+		}
 	}
 
 	if argc == 1 && !receiver.IsUnbound() && receiver.IsGenerator() && callable == val.GenSendBuiltin {
@@ -3517,6 +3531,12 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 					return rIP, rSP, rCtl
 				}
 			case val.KindBuiltinFunc:
+				if !vm.hasTrackedViews {
+					if res, ok := val.TryFastPrimitiveDunderNew(callable, stack[argBase:argBase+argCount]); ok {
+						stack[retSP] = res
+						return ip + 1, retSP + 1, ctlNext
+					}
+				}
 				if callable == val.StrJoinBuiltin && argCount == 2 && stack[argBase].IsAnyString() && stack[argBase+1].IsGenerator() {
 					return vm.pushStrJoinGenerator(st, stack[argBase], stack[argBase+1].AsGenerator(), ip, sp, retSP)
 				}
@@ -3872,6 +3892,12 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 					return rIP, rSP, rCtl
 				}
 			case val.KindBuiltinFunc:
+				if !vm.hasTrackedViews {
+					if res, ok := val.TryFastPrimitiveDunderNew(callable, stack[argBase:argBase+argCount]); ok {
+						stack[retSP] = res
+						return ip + 1, retSP + 1, ctlNext
+					}
+				}
 				if callable == val.StrJoinBuiltin && argCount == 2 && stack[argBase].IsAnyString() && stack[argBase+1].IsGenerator() {
 					return vm.pushStrJoinGenerator(st, stack[argBase], stack[argBase+1].AsGenerator(), ip, sp, retSP)
 				}

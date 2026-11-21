@@ -562,6 +562,20 @@ func NewListFromOwnedSlice(items []Value) Value {
 	return Value{num: 0, ptr: &obj.Header}
 }
 
+// NewListFromSlice constructs a KindList Value by copying items into a single exact-sized slice.
+func NewListFromSlice(items []Value) Value {
+	var cp []Value
+	if len(items) > 0 {
+		cp = make([]Value, len(items))
+		copy(cp, items)
+	}
+	obj := &PyList{
+		Header: ObjectHeader{Kind: KindList, Type: ListType},
+		Items:  cp,
+	}
+	return Value{num: 0, ptr: &obj.Header}
+}
+
 // NewListWithCap constructs an empty KindList Value with preallocated capacity.
 // Used for comprehension targets where the first append would otherwise grow
 // through 1 -> 2 -> 4 -> 8. The 8-slot floor skips that churn in one shot.
@@ -2357,6 +2371,9 @@ func (d *PyDict) initTable(minEntries int) {
 		d.mask = tableCap - 1
 		d.indexShift = shift
 		maxDense := int(tableCap) * 2 / 3
+		if tableCap == 32 && shift == 0 && minEntries <= Dict32EntryCap {
+			maxDense = Dict32EntryCap
+		}
 		if cap(d.Entries) < maxDense {
 			d.Entries = make([]DictEntry, 0, maxDense)
 		}
@@ -2581,6 +2598,44 @@ func (d *PyDict) ResetDict16ForPool() {
 	d.Header.Flags &^= FlagEphemeralDict | FlagEphemeralFrameDict
 }
 
+// Dict32EntryCap is the dense-entry capacity of a 32-slot table for
+// pooled 11-20 entry dicts.
+const Dict32EntryCap = 20
+
+// IsDict32Poolable reports whether d holds a 32-slot table with no external
+// owner for 32-slot (11-20 entry) freelist reuse.
+func (d *PyDict) IsDict32Poolable() bool {
+	return d.owner == nil && len(d.indices) == 32 && cap(d.Entries) == Dict32EntryCap
+}
+
+// InitDict32Table prepares a pooled 32-slot PyDict for reuse.
+// Pooled tables arrive cleared via ResetDict32ForPool.
+func (d *PyDict) InitDict32Table() {
+	d.mask = 31
+	d.indexShift = 0
+	d.used = 0
+	d.filled = 0
+	d.Entries = d.Entries[:0]
+}
+
+// ResetDict32ForPool zeroes all entries and indices while retaining the 32-slot table.
+// Clearing all Value slots keeps pooled slabs invisible to GODEBUG=gccheckmark=1.
+func (d *PyDict) ResetDict32ForPool() {
+	if cap(d.Entries) > 0 {
+		clear(d.Entries[:cap(d.Entries)])
+		d.Entries = d.Entries[:0]
+	}
+	if len(d.indices) > 0 {
+		clear(d.indices)
+	}
+	d.mask = 0
+	d.used = 0
+	d.filled = 0
+	d.indexShift = 0
+	d.VersionTag = 0
+	d.Header.Flags &^= FlagEphemeralDict | FlagEphemeralFrameDict
+}
+
 // AcquireDictTable16Hook, when set, returns a cleared 16-slot table slab:
 // entries with len 0 cap Dict16EntryCap and indices with len 16. The VM
 // registers a per-VM pool; val falls back to make when the hook is nil or
@@ -2753,7 +2808,8 @@ func (d *PyDict) setLocked(key, value Value) {
 	}
 }
 
-// PutNew inserts a key-value pair known to not exist in d (e.g. fresh parser output).
+// PutNew inserts a key-value pair into a pre-sized dict (e.g. fresh parser output),
+// updating in-place if the key already exists (matching Python duplicate-key semantics).
 func (d *PyDict) PutNew(key, value Value) {
 	if len(d.indices) == 0 {
 		d.initTable(4)
@@ -2766,17 +2822,57 @@ func (d *PyDict) PutNew(key, value Value) {
 		mask = d.mask
 		slot = h & mask
 	}
-	for d.readIndex(slot) != dictIndexEmpty {
-		slot = (slot + 1) & mask
+	if d.indexShift == 0 {
+		for {
+			raw := d.indices[slot]
+			if raw == dictIndexEmpty {
+				break
+			}
+			e := &d.Entries[int(raw)-dictIndexOffset]
+			if e.Key == key || (e.Hash == h && e.Active && dictKeyEqual(e.Key, key)) {
+				e.Value = value
+				atomic.AddUint64(&d.VersionTag, 1)
+				if d.owner != nil {
+					d.owner.bumpVersion()
+				}
+				return
+			}
+			slot = (slot + 1) & mask
+		}
+		entryIdx := len(d.Entries)
+		d.Entries = append(d.Entries, DictEntry{
+			Key:    key,
+			Value:  value,
+			Hash:   h,
+			Active: true,
+		})
+		d.indices[slot] = byte(entryIdx + dictIndexOffset)
+	} else {
+		for {
+			raw := d.readIndex(slot)
+			if raw == dictIndexEmpty {
+				break
+			}
+			e := &d.Entries[int(raw)-dictIndexOffset]
+			if e.Key == key || (e.Hash == h && e.Active && dictKeyEqual(e.Key, key)) {
+				e.Value = value
+				atomic.AddUint64(&d.VersionTag, 1)
+				if d.owner != nil {
+					d.owner.bumpVersion()
+				}
+				return
+			}
+			slot = (slot + 1) & mask
+		}
+		entryIdx := len(d.Entries)
+		d.Entries = append(d.Entries, DictEntry{
+			Key:    key,
+			Value:  value,
+			Hash:   h,
+			Active: true,
+		})
+		d.writeIndex(slot, uint32(entryIdx+dictIndexOffset))
 	}
-	entryIdx := len(d.Entries)
-	d.Entries = append(d.Entries, DictEntry{
-		Key:    key,
-		Value:  value,
-		Hash:   h,
-		Active: true,
-	})
-	d.writeIndex(slot, uint32(entryIdx+dictIndexOffset))
 	d.used++
 	d.filled++
 	atomic.AddUint64(&d.VersionTag, 1)

@@ -40,6 +40,13 @@ func maybeOptimizeCodeObject(vm *VM, co *CodeObject, cache *VMCodeCache) {
 	cache.hotness++
 	if cache.hotness >= tier2HotnessThreshold {
 		OptimizeCodeObject(co)
+		if rc := co.RegCode(); rc != nil && rc.jit.Load() == nil && rc.jitState.Load() == 0 && rc.jitState.CompareAndSwap(0, 1) {
+			if jc := jitCompileRegCode(vm.engine, rc, co.Consts); jc != nil {
+				rc.jit.Store(jc)
+			} else {
+				rc.jitState.Store(2)
+			}
+		}
 	}
 }
 

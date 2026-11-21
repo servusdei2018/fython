@@ -293,6 +293,23 @@ func (rf *regFrame) backwardTick(sip, targetPC int) (val.Value, bool) {
 
 // run executes the register stream to completion, a return, or an unwind.
 func (rf *regFrame) run() (val.Value, bool) {
+	if !val.MultiThreadedFlag.Load() && !rf.vm.hasTrackedViews && !rf.vm.limitsActive {
+		jc := rf.rc.jit.Load()
+		if jc == nil && rf.rc.jitState.Load() == 0 && rf.rc.jitState.CompareAndSwap(0, 1) {
+			jc = jitCompileRegCode(rf.vm.engine, rf.rc, rf.consts)
+			if jc != nil {
+				rf.rc.jit.Store(jc)
+			} else {
+				rf.rc.jitState.Store(2)
+			}
+		}
+		if jc != nil {
+			if res, finished, _ := rf.runJIT(jc); finished {
+				return res, true
+			}
+			// On bailout, rf.pc was updated by runJIT; continue in interpreter loop.
+		}
+	}
 	regs := rf.regs
 	consts := rf.consts
 	code := rf.code

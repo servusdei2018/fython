@@ -508,12 +508,13 @@ func (co *CodeObject) LineTableBytes() []byte {
 }
 
 // ConstKeyMapTemplate caches a pre-hashed dict literal shape for
-// OP_BUILD_CONST_KEY_MAP sites with 2..10 interned-string keys.
+// OP_BUILD_CONST_KEY_MAP sites with 2..16 interned-string keys.
 type ConstKeyMapTemplate struct {
-	Hashes    [10]uint64
+	Hashes    [16]uint64
 	Indices8  [8]byte
 	Indices16 [16]byte
-	Keys      [10]val.Value
+	Indices32 [32]byte
+	Keys      [16]val.Value
 	Count     int
 	Valid     bool
 }
@@ -875,6 +876,7 @@ type VM struct {
 	dictFreeList         []*val.PyDict
 	mediumDictFreeList   []*val.PyDict
 	dict16FreeList       []*val.PyDict
+	dict32FreeList       []*val.PyDict
 	strJoinPool          []*strJoinState
 	collectPool          []*collectState
 	loopStatePool        []*loopState
@@ -915,6 +917,10 @@ type VM struct {
 	hasTrackedViews bool
 	regArena        []val.Value
 	regArenaTop     int
+	jitPinned       [7]int64
+	jitRetVal       uint64
+	jitDirty        uint8
+	jitRetKind      uint8
 	rootCO          CodeObject
 	rootCache       VMCodeCache
 	limits          RuntimeLimits

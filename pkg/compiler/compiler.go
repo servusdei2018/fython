@@ -2678,7 +2678,7 @@ func (c *Compiler) compileExpr(exprID ExprID) error {
 			}
 		}
 		if !hasUnpack {
-			if count >= 2 && count <= 10 {
+			if count >= 2 && count <= 16 {
 				if keysTupleIdx, ok := c.tryConstKeyTuple(start, count); ok {
 					for i := range count {
 						pair := &c.arena.DictPairs[start+i]

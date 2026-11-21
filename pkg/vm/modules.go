@@ -456,13 +456,15 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 		return topVal, nil
 	}
 
-	// Native modules are created on first import.
-	if modVal, ok := vm.materializeBuiltinModule(canonicalName); ok {
-		if returnLeaf {
-			return modVal, nil
+	// Native top-level modules are created on first import.
+	if len(parts) == 1 {
+		if modVal, ok := vm.materializeBuiltinModule(canonicalName); ok {
+			if returnLeaf {
+				return modVal, nil
+			}
+			topVal, _ := vm.modules.Get(val.InternString(parts[0]))
+			return topVal, nil
 		}
-		topVal, _ := vm.modules.Get(val.InternString(parts[0]))
-		return topVal, nil
 	}
 
 	// Incrementally resolve and load parent packages
@@ -472,13 +474,22 @@ func (vm *VM) ImportModule(name string, level int, returnLeaf bool, callerGlobal
 		internedCurr := val.InternString(currName)
 
 		if existing, ok := vm.modules.Get(internedCurr); ok {
+			if i > 0 && parentVal.IsModule() {
+				leafName := val.InternString(parts[i])
+				if _, linked := parentVal.AsModule().Dict.Get(leafName); !linked {
+					parentVal.AsModule().Dict.Set(leafName, existing)
+				}
+			}
 			parentVal = existing
 			continue
 		}
 
-		// A native parent package (asyncio, test, ...) has to exist before
-		// its submodules can be resolved.
+		// A native parent package (asyncio, test, ...) or dotted native
+		// module is materialized and linked to its parent.
 		if modVal, ok := vm.materializeBuiltinModule(currName); ok {
+			if i > 0 && parentVal.IsModule() {
+				parentVal.AsModule().Dict.Set(val.InternString(parts[i]), modVal)
+			}
 			parentVal = modVal
 			continue
 		}

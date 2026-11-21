@@ -1,6 +1,9 @@
 package vm
 
-import "strconv"
+import (
+	"strconv"
+	"sync/atomic"
+)
 
 // RegOp identifies a Tier-2 register-bytecode operation executed by
 // VM.runRegLoop. The numbering is local to the register ISA and unrelated
@@ -338,4 +341,7 @@ type RegCode struct {
 	// RetLive records, per REG_RETURN position, the live scratch registers
 	// that may hold ephemeral iterators to release.
 	RetLive []regRetLive
+	jit     atomic.Pointer[jitCode]
+	// jitState tracks native codegen status: 0 = uncompiled, 1 = compiled, 2 = ineligible/closed.
+	jitState atomic.Uint32
 }

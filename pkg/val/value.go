@@ -560,6 +560,27 @@ func (v Value) AsBytes() *PyBytes {
 	return (*PyBytes)(unsafe.Pointer(v.ptr))
 }
 
+func unwrapBytesData(v Value) ([]byte, bool) {
+	if v.ptr == nil {
+		return nil, false
+	}
+	switch v.ptr.Kind {
+	case KindBytes:
+		return v.AsBytes().Data, true
+	case KindByteArray:
+		return v.AsByteArray().Data, true
+	case KindMemoryView:
+		return v.AsMemoryView().Buf, true
+	case KindInstance:
+		inst := v.AsInstance()
+		if inst.Header.Type != nil && BytesType != nil && IsSubclass(inst.Header.Type, BytesType) &&
+			len(inst.Slots) > 0 && inst.Slots[0].IsBytes() {
+			return inst.Slots[0].AsBytes().Data, true
+		}
+	}
+	return nil, false
+}
+
 // IsByteArray reports whether v is a heap-allocated PyByteArray.
 func (v Value) IsByteArray() bool {
 	return v.ptr != nil && v.ptr.Kind == KindByteArray
@@ -789,28 +810,11 @@ func equalsStructural(a, b Value) bool {
 		return a.AsString() == b.AsString()
 	}
 
-	// Binary data types comparison (bytes, bytearray, memoryview).
-	isBufA := a.ptr.Kind == KindBytes || a.ptr.Kind == KindByteArray || a.ptr.Kind == KindMemoryView
-	isBufB := b.ptr.Kind == KindBytes || b.ptr.Kind == KindByteArray || b.ptr.Kind == KindMemoryView
-	if isBufA && isBufB {
-		var bufA, bufB []byte
-		switch a.ptr.Kind {
-		case KindBytes:
-			bufA = a.AsBytes().Data
-		case KindByteArray:
-			bufA = a.AsByteArray().Data
-		case KindMemoryView:
-			bufA = a.AsMemoryView().Buf
+	// Binary data types comparison (bytes, bytearray, memoryview, bytes subclasses).
+	if bufA, okA := unwrapBytesData(a); okA {
+		if bufB, okB := unwrapBytesData(b); okB {
+			return bytes.Equal(bufA, bufB)
 		}
-		switch b.ptr.Kind {
-		case KindBytes:
-			bufB = b.AsBytes().Data
-		case KindByteArray:
-			bufB = b.AsByteArray().Data
-		case KindMemoryView:
-			bufB = b.AsMemoryView().Buf
-		}
-		return bytes.Equal(bufA, bufB)
 	}
 	if a.ptr.Kind == KindSlice && b.ptr.Kind == KindSlice {
 		sa := a.AsSlice()

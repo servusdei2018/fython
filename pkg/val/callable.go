@@ -1275,22 +1275,10 @@ func typeTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value)
 		return cls.Slots.TpCall(ctx, callable, args, kwnames)
 	}
 
-	if cls != nil && cls != StrType && StrType != nil && IsSubclass(cls, StrType) && posCount == 1 && len(kwnames) == 0 && len(args) == 1 {
-		if arg := args[0]; arg.IsAnyString() {
-			if !cls.HasInit() && cls.dunderNew.ptr != nil && StrType.dunderNew.ptr != nil && cls.dunderNew.ptr == StrType.dunderNew.ptr {
-				if cls.RootShape == nil || len(cls.RootShape.Attrs) == 0 {
-					instFast := NewInstanceOfType(cls)
-					instObj := instFast.AsInstance()
-					if len(instObj.Slots) == 0 {
-						if !instObj.ExtendBootstrapSlot(0, arg) {
-							instObj.Slots = []Value{arg}
-						}
-					} else {
-						instObj.Slots[0] = arg
-					}
-					return instFast
-				}
-			}
+	if cls != nil && posCount == 1 && len(kwnames) == 0 && len(args) == 1 && !cls.HasInit() &&
+		hasOnlyPrimRootSlot(cls) && cls.dunderNew.ptr != nil {
+		if instFast, ok := tryFastPrimitiveDunderNew2(cls.dunderNew.ptr, cls, args[0]); ok {
+			return instFast
 		}
 	}
 
@@ -1647,16 +1635,31 @@ func tupleMpSubscript(ctx *ExecContext, a, idxVal Value) Value {
 	return tupleSqItem(ctx, a, idxVal)
 }
 
+func unwrapBytesObj(v Value) *PyBytes {
+	if v.ptr != nil {
+		if v.ptr.Kind == KindBytes {
+			return v.AsBytes()
+		}
+		if v.ptr.Kind == KindInstance {
+			inst := v.AsInstance()
+			if len(inst.Slots) > 0 && inst.Slots[0].IsBytes() {
+				return inst.Slots[0].AsBytes()
+			}
+		}
+	}
+	return v.AsBytes()
+}
+
 func bytesSqLen(ctx *ExecContext, a Value) int64 {
-	return int64(len(a.AsBytes().Data))
+	return int64(len(unwrapBytesObj(a).Data))
 }
 
 func bytesTpAsBuffer(ctx *ExecContext, obj Value, view *PyBuffer, flags int) error {
-	return obj.AsBytes().GetBuffer(ctx, view, flags)
+	return unwrapBytesObj(obj).GetBuffer(ctx, view, flags)
 }
 
 func bytesMpSubscript(ctx *ExecContext, a, idxVal Value) Value {
-	data := a.AsBytes().Data
+	data := unwrapBytesObj(a).Data
 	if idxVal.IsSlice() {
 		sl := idxVal.AsSlice()
 		start, stop, step, sliceLen, err := NormalizeSliceIndices(sl.Start, sl.Stop, sl.Step, len(data))
@@ -3436,10 +3439,13 @@ func initTypes() {
 		}
 		inst := NewInstanceOfType(cls)
 		instInst := inst.AsInstance()
+		v := Int64Val(num)
 		if len(instInst.Slots) == 0 {
-			instInst.Slots = []Value{Int64Val(num)}
+			if !instInst.ExtendBootstrapSlot(0, v) {
+				instInst.Slots = []Value{v}
+			}
 		} else {
-			instInst.Slots[0] = Int64Val(num)
+			instInst.Slots[0] = v
 		}
 		return inst
 	})
@@ -7569,6 +7575,7 @@ func initTypes() {
 
 	// Binary Types and Slice Type
 	BytesType = MustNewType("bytes", []*PyType{ObjectType}, nil)
+	initPrimRootShape(BytesType)
 	BytesType.Slots.SqLen = bytesSqLen
 	BytesType.Slots.SqItem = bytesMpSubscript
 	BytesType.Slots.MpSubscript = bytesMpSubscript
@@ -7586,11 +7593,17 @@ func initTypes() {
 	}))
 
 	bytesNewBuiltin := NewBuiltinFuncVal("bytes.__new__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		var callArgs []Value
-		if len(args) > 1 {
-			callArgs = args[1:]
+		var res Value
+		if len(args) == 2 && len(kwnames) == 0 && args[1].ptr != nil && args[1].ptr.Kind == KindBytes &&
+			(args[1].ptr.Type == nil || args[1].ptr.Type == BytesType) {
+			res = args[1]
+		} else {
+			var callArgs []Value
+			if len(args) > 1 {
+				callArgs = args[1:]
+			}
+			res = bytesTpCall(ctx, callable, callArgs, kwnames)
 		}
-		res := bytesTpCall(ctx, callable, callArgs, kwnames)
 		if len(args) > 0 && args[0].IsType() && args[0].AsType() == BytesType {
 			return res
 		}
@@ -8678,6 +8691,94 @@ func initTypes() {
 	TypeType.syncDunderSlots()
 	TypeType.Slots.TpCall = typeTpCall
 	TypeType.UsesDefaultTpCall = true
+}
+
+func hasOnlyPrimRootSlot(cls *PyType) bool {
+	if cls == nil || (cls.Flags&(FlagHasCExtBase|FlagIsModuleSub)) != 0 {
+		return false
+	}
+	if cls.RootShape == nil || len(cls.RootShape.Attrs) == 0 {
+		return true
+	}
+	return len(cls.RootShape.Attrs) == 1 && cls.RootShape.Attrs[0].Name == strPrimAttr
+}
+
+func newPrimSubInstance(subcls *PyType, prim Value) Value {
+	instVal := NewInstanceOfType(subcls)
+	if instVal.ptr != nil && instVal.ptr.Kind == KindInstance {
+		instObj := instVal.AsInstance()
+		if len(instObj.Slots) == 0 {
+			if !instObj.ExtendBootstrapSlot(0, prim) {
+				instObj.Slots = []Value{prim}
+			}
+		} else {
+			instObj.Slots[0] = prim
+		}
+	}
+	return instVal
+}
+
+func tryFastPrimitiveDunderNew2(fnPtr *ObjectHeader, subcls *PyType, arg Value) (Value, bool) {
+	if !hasOnlyPrimRootSlot(subcls) {
+		return Value{}, false
+	}
+	switch fnPtr {
+	case StrType.dunderNew.ptr:
+		if subcls == StrType || !IsSubclass(subcls, StrType) {
+			return Value{}, false
+		}
+		var s Value
+		switch {
+		case arg.ptr == &tagInlineStr || (arg.ptr != nil && arg.ptr.Kind == KindString):
+			s = arg
+		case arg.ptr != nil && arg.ptr.Kind == KindInstance:
+			inst := arg.AsInstance()
+			if inst.Header.Type != nil && IsSubclass(inst.Header.Type, StrType) &&
+				len(inst.Slots) > 0 && inst.Slots[0].IsAnyString() {
+				s = inst.Slots[0]
+			} else {
+				return Value{}, false
+			}
+		default:
+			return Value{}, false
+		}
+		return newPrimSubInstance(subcls, s), true
+	case IntType.dunderNew.ptr:
+		if subcls == IntType || !IsSubclass(subcls, IntType) || arg.ptr != &tagInt64 {
+			return Value{}, false
+		}
+		return newPrimSubInstance(subcls, arg), true
+	case BytesType.dunderNew.ptr:
+		if subcls == BytesType || !IsSubclass(subcls, BytesType) ||
+			arg.ptr == nil || arg.ptr.Kind != KindBytes ||
+			(arg.ptr.Type != nil && arg.ptr.Type != BytesType) {
+			return Value{}, false
+		}
+		return newPrimSubInstance(subcls, arg), true
+	default:
+		return Value{}, false
+	}
+}
+
+// TryFastPrimitiveDunderNew accelerates object.__new__, str.__new__, int.__new__,
+// and bytes.__new__ for zero-slot subclasses without slice boxing or generic
+// ExecContext call plumbing.
+func TryFastPrimitiveDunderNew(fn Value, args []Value) (Value, bool) {
+	if fn.ptr == nil || len(args) == 0 || !args[0].IsType() {
+		return Value{}, false
+	}
+	subcls := args[0].AsType()
+	if fn.ptr == ObjectNewBuiltin.ptr {
+		if len(args) != 1 || (subcls.Flags&(FlagHasCExtBase|FlagIsModuleSub)) != 0 ||
+			(subcls.RootShape != nil && len(subcls.RootShape.Attrs) != 0) {
+			return Value{}, false
+		}
+		return NewInstanceOfType(subcls), true
+	}
+	if len(args) != 2 {
+		return Value{}, false
+	}
+	return tryFastPrimitiveDunderNew2(fn.ptr, subcls, args[1])
 }
 
 type PyDictKeys struct {

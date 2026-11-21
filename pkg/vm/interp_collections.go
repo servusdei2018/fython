@@ -919,7 +919,7 @@ func constKeyMapsFor(cache *VMCodeCache, n int) []ConstKeyMapTemplate {
 func (vm *VM) opBuildConstKeyMap(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
 	count := int(uint16(inst))
-	if count < 2 || count > 10 {
+	if count < 2 || count > 16 {
 		return vm.opBuildConstKeyMapGeneric(st, inst, ip, sp)
 	}
 	if sp < count+1 {
@@ -1055,7 +1055,8 @@ func (vm *VM) opBuildConstKeyMapGeneric(st *loopState, inst uint32, ip, sp int) 
 
 func (vm *VM) acquireConstKeyDict(count int) *val.PyDict {
 	if !val.MultiThreadedFlag.Load() {
-		if count <= 5 {
+		switch {
+		case count <= 5:
 			if n := len(vm.dictFreeList); n > 0 {
 				d := vm.dictFreeList[n-1]
 				vm.dictFreeList[n-1] = nil
@@ -1064,7 +1065,7 @@ func (vm *VM) acquireConstKeyDict(count int) *val.PyDict {
 				d.InitSmallInlineTable()
 				return d
 			}
-		} else if count <= 10 {
+		case count <= 10:
 			if n := len(vm.dict16FreeList); n > 0 {
 				d := vm.dict16FreeList[n-1]
 				vm.dict16FreeList[n-1] = nil
@@ -1073,20 +1074,34 @@ func (vm *VM) acquireConstKeyDict(count int) *val.PyDict {
 				d.InitDict16Table()
 				return d
 			}
+		case count <= 16:
+			if n := len(vm.dict32FreeList); n > 0 {
+				d := vm.dict32FreeList[n-1]
+				vm.dict32FreeList[n-1] = nil
+				vm.dict32FreeList = vm.dict32FreeList[:n-1]
+				d.Header = val.ObjectHeader{Kind: val.KindDict, Type: val.DictType}
+				d.InitDict32Table()
+				return d
+			}
 		}
 	}
 	return val.NewDictVal(count).AsDict()
 }
 
 func (vm *VM) buildConstKeyTemplate(tmpl *ConstKeyMapTemplate, keys []val.Value, count int) bool {
-	var hashes [10]uint64
+	if count < 2 || count > 16 {
+		return false
+	}
+	var hashes [16]uint64
 	for i := range count {
 		h := uint64(val.HashValue(keys[i]))
 		hashes[i] = h
 	}
 	var idx8 [8]byte
 	var idx16 [16]byte
-	if count <= 5 {
+	var idx32 [32]byte
+	switch {
+	case count <= 5:
 		for i := range count {
 			slot := hashes[i] & 7
 			for idx8[slot] != 0 {
@@ -1094,13 +1109,21 @@ func (vm *VM) buildConstKeyTemplate(tmpl *ConstKeyMapTemplate, keys []val.Value,
 			}
 			idx8[slot] = byte(i + 2)
 		}
-	} else {
+	case count <= 10:
 		for i := range count {
 			slot := hashes[i] & 15
 			for idx16[slot] != 0 {
 				slot = (slot + 1) & 15
 			}
 			idx16[slot] = byte(i + 2)
+		}
+	default:
+		for i := range count {
+			slot := hashes[i] & 31
+			for idx32[slot] != 0 {
+				slot = (slot + 1) & 31
+			}
+			idx32[slot] = byte(i + 2)
 		}
 	}
 	for i := range count {
@@ -1109,6 +1132,7 @@ func (vm *VM) buildConstKeyTemplate(tmpl *ConstKeyMapTemplate, keys []val.Value,
 	}
 	tmpl.Indices8 = idx8
 	tmpl.Indices16 = idx16
+	tmpl.Indices32 = idx32
 	tmpl.Count = count
 	tmpl.Valid = true
 	return true
@@ -1116,28 +1140,7 @@ func (vm *VM) buildConstKeyTemplate(tmpl *ConstKeyMapTemplate, keys []val.Value,
 
 func (vm *VM) fillConstKeyDict(d *val.PyDict, tmpl *ConstKeyMapTemplate, values []val.Value) bool {
 	count := tmpl.Count
-	if count < 2 || count > 10 || len(values) < count {
-		return false
-	}
-	if count <= 5 {
-		if len(d.Entries) != 0 {
-			return false
-		}
-		// Fresh inline tables hold up to 5 entries with an 8-byte index.
-		for i := range count {
-			d.Entries = append(d.Entries, val.DictEntry{
-				Hash:   uint32(tmpl.Hashes[i]),
-				Active: true,
-				Key:    tmpl.Keys[i],
-				Value:  values[i],
-			})
-		}
-		copy(d.Indices(), tmpl.Indices8[:])
-		d.SetUsedFilled(count, count)
-		d.BumpVersion()
-		return true
-	}
-	if len(d.Entries) != 0 {
+	if count < 2 || count > 16 || len(values) < count || len(d.Entries) != 0 {
 		return false
 	}
 	for i := range count {
@@ -1148,7 +1151,14 @@ func (vm *VM) fillConstKeyDict(d *val.PyDict, tmpl *ConstKeyMapTemplate, values 
 			Value:  values[i],
 		})
 	}
-	copy(d.Indices(), tmpl.Indices16[:])
+	switch {
+	case count <= 5:
+		copy(d.Indices(), tmpl.Indices8[:])
+	case count <= 10:
+		copy(d.Indices(), tmpl.Indices16[:])
+	default:
+		copy(d.Indices(), tmpl.Indices32[:])
+	}
 	d.SetUsedFilled(count, count)
 	d.BumpVersion()
 	return true
