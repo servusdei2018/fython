@@ -596,6 +596,7 @@ func (vm *VM) dispatchColdOpcode(st *loopState, op Opcode, inst uint32, ip, sp i
 						*(*val.Value)(unsafe.Add(stackPtr, uintptr(newBase)*16)) = b
 						*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)) = a
 					}
+					vm.tryInlineDunderFast(st, ip, entry, fn, callee, a, b, sp)
 					saved := &vm.frames[st.frameIdx]
 					saved.cmpLeft = a
 					saved.cmpRight = b
@@ -1104,6 +1105,10 @@ func (vm *VM) dispatchColdOpcode(st *loopState, op Opcode, inst uint32, ip, sp i
 		return vm.opListToTuple(st, ip, sp)
 	case OP_LIST_TO_SET:
 		return vm.opListToSet(st, ip, sp)
+	case OP_GUARD_INLINE_METHOD, OP_GUARD_INLINE_FUNC:
+		return vm.opGuardInline(st, op, inst, ip, sp)
+	case OP_INLINE_RETURN:
+		return vm.opInlineReturn(st, inst, ip, sp)
 	default:
 		panic("vm: unknown opcode")
 	}

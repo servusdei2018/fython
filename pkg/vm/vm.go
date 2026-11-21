@@ -4043,14 +4043,9 @@ func (vm *VM) pushFrameFast(
 	if !isTypeInit && st.frameIdx >= 0 && st.frameIdx < len(vm.frames) && !vm.frames[st.frameIdx].cmpActive {
 		maybeOptimizeCodeObject(vm, pushCallee, pushCache)
 	}
-	// Route quickened stack calls into register execution once compiled.
-	// Constructor type-init calls stay on the stack path so the
-	// initInstance return-self protocol in opReturnSlow is preserved.
-	if !isTypeInit && pushCallee.RegCode() != nil && !vm.hasTrackedViews {
-		if nip, nsp, handled := vm.tryRegEntry(st, pushFn, pushCallee, pushCache, pushNewBase, pushRetSP, ip+1, ip, pushTotalArgs); handled {
-			return nip, nsp
-		}
-	}
+	// Tier-1 path stays direct: nested register entry for quickened leaf
+	// calls is disabled so tiny methods never pay frame setup. Loop-bearing
+	// callees still reach the tier through the top-level runFrame entry.
 	saved := &vm.frames[st.frameIdx]
 	if isTypeInit {
 		instObj := val.NewInstanceOfType(st.stack[pushNewBase].AsType())

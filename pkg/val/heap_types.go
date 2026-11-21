@@ -2327,7 +2327,7 @@ func (d *PyDict) initTable(minEntries int) {
 	}
 	switch {
 	case tableCap == 8:
-		clear(d.inlineIndices[:])
+		// Fresh inline storage is zeroed; pooled reuse arrives cleared.
 		d.indices = d.inlineIndices[:]
 		d.mask = 7
 		d.indexShift = 0
@@ -2340,7 +2340,6 @@ func (d *PyDict) initTable(minEntries int) {
 			cap(entries) == Dict16EntryCap && len(indices) == 16 {
 			d.Entries = entries[:0]
 			d.indices = indices
-			clear(d.indices)
 			d.mask = 15
 			d.indexShift = 0
 		} else {
@@ -2487,8 +2486,9 @@ func (d *PyDict) IsSmallInline() bool {
 
 // InitSmallInlineTable configures d to use its inline indices and inlineEntries
 // storage without heap-allocating backing slices.
+// Fresh structs arrive zeroed from Go; pooled structs arrive cleared via
+// ResetForPool, so no clearing happens here.
 func (d *PyDict) InitSmallInlineTable() {
-	clear(d.inlineIndices[:])
 	d.indices = d.inlineIndices[:]
 	d.mask = 7
 	d.indexShift = 0
@@ -2517,8 +2517,8 @@ func (d *PyDict) IsMediumPoolable() bool {
 }
 
 // InitMediumTable prepares a pooled medium PyDict for reuse without reallocating.
+// Pooled tables arrive cleared via ResetMediumForPool.
 func (d *PyDict) InitMediumTable() {
-	clear(d.indices)
 	d.mask = 31
 	d.indexShift = 0
 	d.used = 0
@@ -2553,8 +2553,8 @@ func (d *PyDict) IsDict16Poolable() bool {
 }
 
 // InitDict16Table prepares a pooled 16-slot PyDict for reuse.
+// Pooled tables arrive cleared via ResetDict16ForPool.
 func (d *PyDict) InitDict16Table() {
-	clear(d.indices)
 	d.mask = 15
 	d.indexShift = 0
 	d.used = 0

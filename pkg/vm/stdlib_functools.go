@@ -31,6 +31,28 @@ type lruNode struct {
 	next int32
 }
 
+type lruKey2 struct {
+	a val.Value
+	b val.Value
+}
+
+type lruNode2 struct {
+	key  lruKey2
+	val  val.Value
+	prev int32
+	next int32
+}
+
+func isLruKey2Value(v val.Value) bool {
+	if v.IsInt64() || v.IsBool() || v.IsNone() || v.IsInlineStr() || v.IsInterned() {
+		return true
+	}
+	if v.IsType() || v.IsFunction() {
+		return true
+	}
+	return false
+}
+
 type pyLRUCache struct {
 	Header       val.ObjectHeader
 	UserFunction val.Value
@@ -45,6 +67,9 @@ type pyLRUCache struct {
 	clearGen     uint64
 	Attrs        *val.PyDict
 	Mu           sync.Mutex
+	cache2       map[lruKey2]int32
+	nodes2       []lruNode2
+	free2        []int32
 }
 
 func isFastHashableValue(v val.Value) bool {
@@ -136,6 +161,78 @@ func (c *pyLRUCache) linkMRU(idx int32) {
 	c.nodes[idx].next = first
 	c.nodes[first].prev = idx
 	c.nodes[0].next = idx
+}
+
+func (c *pyLRUCache) unlinkNode2(idx int32) {
+	p := c.nodes2[idx].prev
+	n := c.nodes2[idx].next
+	c.nodes2[p].next = n
+	c.nodes2[n].prev = p
+}
+
+func (c *pyLRUCache) linkMRU2(idx int32) {
+	first := c.nodes2[0].next
+	c.nodes2[idx].prev = 0
+	c.nodes2[idx].next = first
+	c.nodes2[first].prev = idx
+	c.nodes2[0].next = idx
+}
+
+func (c *pyLRUCache) probeLocked2(k lruKey2) (val.Value, bool) {
+	if c.Maxsize == 0 {
+		return val.Value{}, false
+	}
+	if c.cache2 == nil {
+		return val.Value{}, false
+	}
+	if idx, ok := c.cache2[k]; ok {
+		c.Hits++
+		if c.nodes2[0].next != idx {
+			c.unlinkNode2(idx)
+			c.linkMRU2(idx)
+		}
+		return c.nodes2[idx].val, true
+	}
+	return val.Value{}, false
+}
+
+func (c *pyLRUCache) insertAfterMiss2(k lruKey2, res val.Value, startGen uint64) {
+	if c.clearGen != startGen || c.Maxsize == 0 {
+		return
+	}
+	if c.cache2 == nil {
+		c.cache2 = make(map[lruKey2]int32)
+		c.nodes2 = append(c.nodes2[:0], lruNode2{prev: 0, next: 0})
+		c.free2 = c.free2[:0]
+	}
+	if _, exists := c.cache2[k]; exists {
+		return
+	}
+	var idx int32
+	if c.Maxsize > 0 && len(c.cache2) >= c.Maxsize {
+		lruIdx := c.nodes2[0].prev
+		if lruIdx != 0 {
+			delete(c.cache2, c.nodes2[lruIdx].key)
+			c.unlinkNode2(lruIdx)
+			idx = lruIdx
+			c.nodes2[idx].key = k
+			c.nodes2[idx].val = res
+			c.linkMRU2(idx)
+			c.cache2[k] = idx
+			return
+		}
+	}
+	if nf := len(c.free2); nf > 0 {
+		idx = c.free2[nf-1]
+		c.free2 = c.free2[:nf-1]
+	} else {
+		idx = int32(len(c.nodes2))
+		c.nodes2 = append(c.nodes2, lruNode2{})
+	}
+	c.nodes2[idx].key = k
+	c.nodes2[idx].val = res
+	c.linkMRU2(idx)
+	c.cache2[k] = idx
 }
 
 func (c *pyLRUCache) probeLocked(cacheKey val.Value) (val.Value, bool) {
@@ -312,6 +409,37 @@ func initFunctoolsTypes() {
 		CacheWrapper = val.MustNewType("_lru_cache_wrapper", []*val.PyType{val.ObjectType}, nil)
 		cacheCallTp := func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			cache := (*pyLRUCache)(unsafe.Pointer(callable.HeaderPtr()))
+			if len(kwnames) == 0 && !cache.Typed && len(args) == 2 && isLruKey2Value(args[0]) && isLruKey2Value(args[1]) {
+				k := lruKey2{a: args[0], b: args[1]}
+				locked := val.MultiThreadedFlag.Load()
+				if locked {
+					cache.Mu.Lock()
+				}
+				if res, hit := cache.probeLocked2(k); hit {
+					if locked {
+						cache.Mu.Unlock()
+					}
+					return res
+				}
+				cache.Misses++
+				startGen := cache.clearGen
+				if locked {
+					cache.Mu.Unlock()
+				}
+				res := ctx.Call(cache.UserFunction, args, kwnames)
+				if ctx != nil && ctx.HasException() {
+					return val.NoneVal()
+				}
+				locked = val.MultiThreadedFlag.Load()
+				if locked {
+					cache.Mu.Lock()
+				}
+				cache.insertAfterMiss2(k, res, startGen)
+				if locked {
+					cache.Mu.Unlock()
+				}
+				return res
+			}
 			cacheKey, ok := makeLRUCacheKey(ctx, args, kwnames, cache.Typed)
 			if !ok {
 				return val.NoneVal()
@@ -418,6 +546,7 @@ func initFunctoolsTypes() {
 			if cache.Cache != nil {
 				currsize = cache.Cache.Len()
 			}
+			currsize += len(cache.cache2)
 			if locked {
 				cache.Mu.Unlock()
 			}
@@ -449,6 +578,10 @@ func initFunctoolsTypes() {
 			cache.nodes = append(cache.nodes[:0], lruNode{prev: 0, next: 0})
 			cache.free = cache.free[:0]
 			cache.Cache = val.NewDictVal(16).AsDict()
+			clear(cache.nodes2)
+			cache.nodes2 = append(cache.nodes2[:0], lruNode2{prev: 0, next: 0})
+			cache.free2 = cache.free2[:0]
+			cache.cache2 = nil
 			if locked {
 				cache.Mu.Unlock()
 			}

@@ -14,91 +14,6 @@ import (
 // carries the resume state, so the panic value itself is empty.
 type regAbort struct{}
 
-// tryRegEntry attempts synchronous register execution for a quickened stack
-// call whose arguments are already bound at newBase. retSP is the caller
-// slot for the result, retIP the caller resume ip, callIP the call-site ip
-// for tracebacks. argc is the positional argument count (excluding the
-// callable slot when popCallable applies).
-//
-// All eligibility checks and capacity math run before any mutation: a
-// handled=false return leaves vm.stack, st and vm.regArenaTop untouched.
-// On handled=true the result is in stack[retSP]; the caller continues at
-// (retIP, retSP+1), or at the unwind handler on faults. Constructor
-// type-init calls (0x40000000) never enter here; the caller keeps them on
-// the existing pushFrameFast path so __init__ return-self semantics stay
-// intact.
-func (vm *VM) tryRegEntry(st *loopState, fn *val.PyFunction, callee *CodeObject, cc *VMCodeCache, newBase, retSP, retIP, callIP, argc int) (int, int, bool) {
-	if os.Getenv("FYTHON_DISABLE_TRYREG") != "" {
-		return 0, 0, false
-	}
-	rc := callee.RegCode()
-	if rc == nil {
-		return 0, 0, false
-	}
-	if !vm.regCallEligible(st, callee) {
-		return 0, 0, false
-	}
-	if vm.hasTrackedViews {
-		return 0, 0, false
-	}
-	if fn == nil {
-		return 0, 0, false
-	}
-	if vm.frames[st.frameIdx].initInstance.HeaderPtr() != nil {
-		return 0, 0, false
-	}
-	if !callee.SimplePositionalOnly || fn.KwDefaults != nil {
-		return 0, 0, false
-	}
-	needParams := callee.PositionalParamCount
-	if argc < needParams-len(fn.Defaults) || argc > needParams {
-		return 0, 0, false
-	}
-	if callee.NumLocals < needParams {
-		return 0, 0, false
-	}
-	// Free variables without a closure are unwirable; cell variables are
-	// bound fresh per call by the nested runner.
-	if callee.HasCells && !callee.HasCellVars && fn.Closure == nil {
-		return 0, 0, false
-	}
-	_ = cc
-	need := newBase + int(rc.NumRegs)
-	if need < newBase {
-		return 0, 0, false
-	}
-	// Success path below: mutations are now allowed.
-	if need > len(st.stack) {
-		st.stack = vm.growStack(st, st.stack, need)
-	}
-	if argc < needParams {
-		defStart := needParams - len(fn.Defaults)
-		copy(st.stack[newBase+argc:newBase+needParams], fn.Defaults[argc-defStart:])
-	}
-	if st.stackIsVM {
-		if hw := newBase + callee.FrameStackNeed; hw > vm.maxSP {
-			vm.maxSP = hw
-		}
-	}
-	savedArenaTop := vm.regArenaTop
-	nextSP := newBase + callee.EffectiveLocals
-	res, faulted := vm.nestedRegRun(st, callee, fn, newBase, nextSP)
-	vm.discardRegArena(savedArenaTop)
-	if faulted {
-		exc := vm.unhandledException
-		vm.unhandledException = val.NoneVal()
-		st.raiseExc = exc
-		nip, nsp, ctl := vm.unwind(st, callIP)
-		if ctl == ctlExit {
-			panic(regAbort{})
-		}
-		return nip, nsp, true
-	}
-	st.stack = vm.stack
-	st.stack[retSP] = res
-	return retIP, retSP + 1, true
-}
-
 // tryNestedRegCall attempts register execution for an in-loop call to
 // callee whose arguments are already bound in st.stack[newBase:nextSP]. On
 // success it returns the stack-loop continuation with the result at
@@ -142,11 +57,16 @@ func (vm *VM) tryNestedRegCall(st *loopState, callee *CodeObject, fn *val.PyFunc
 }
 
 // regCallEligible reports whether an in-loop call may enter register
-// execution. Dunder comparisons with caller fallback state keep the stack
-// path; everything else is governed by the callee's register compilation.
+// execution. Only loop-bearing substantial callees qualify: the tier must
+// cover its nested-runner cost with real loop bodies. Dunder comparisons
+// with caller fallback state keep the stack path; everything else is
+// governed by the callee's register compilation.
 func (vm *VM) regCallEligible(st *loopState, callee *CodeObject) bool {
 	rc := callee.RegCode()
-	if rc == nil || len(callee.Code) < 16 || callee.Name == "__init__" {
+	if rc == nil || len(callee.Code) < 24 || callee.Name == "__init__" {
+		return false
+	}
+	if !hasBackwardJump(callee.Code) {
 		return false
 	}
 	if st.activeGen != nil || st.activeCoro != nil || !st.stackIsVM {

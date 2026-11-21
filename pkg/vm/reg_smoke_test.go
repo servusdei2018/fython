@@ -26,6 +26,10 @@ func TestRegSmokeArithmetic(t *testing.T) {
 		NumLocals: 2,
 		NumParams: 2,
 	}
+	for range 19 {
+		co.Code = append(co.Code, Encode(OP_NOP, 0, 0))
+	}
+	co.Code = append(co.Code, Encode(OP_JUMP, 0, 0))
 	mustRegCompile(t, co)
 	v := NewVM()
 	v.stack[0] = val.Int64Val(40)

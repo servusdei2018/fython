@@ -1599,10 +1599,16 @@ func (vm *VM) lookupAttrQueryPIC(st *loopState, ip int, obj, rawName val.Value, 
 				res = v
 				found = true
 			} else {
+				// Confirmed absent: no entry on the type and no slot in the shape.
+				// No custom lookup hooks (checked at entry) and the receiver is a
+				// shaped instance (type/module/super excluded above), so this miss
+				// stays valid until TypeVer or ShapeID changes.
 				slotKind = attrQueryMiss
+				slotIdx = attrQueryMissingSlot
 			}
 		} else {
 			slotKind = attrQueryMiss
+			slotIdx = attrQueryMissingSlot
 		}
 	}
 
@@ -2429,6 +2435,7 @@ unwrapCall:
 				_, _ = vm.loadWindow(callee, cc)
 				st.cache.ic[ip] = ICSlot{CachedVal: target, CalleeCache: cc}
 				st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL_PY_EXACT_ARGS))
+				vm.tryInlineFunc(st, ip, argc, fn)
 			} else if defaultsArgs && callee.NumLocals >= callee.PositionalParamCount {
 				if len(callee.ExceptionTable) == 0 && atomic.LoadInt32(&callee.IsTier2Optimized) == 0 {
 					maybeOptimizeCodeObject(vm, callee, cc)
@@ -3570,6 +3577,7 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 
 		switch {
 		case targetFn != nil:
+			_ = targetFn // inline deferred
 			if rIP, rSP, rCtl, handled := vm.pushFuncPositional(st, targetFn, nil, stack, ip, sp, newBase, retSP, totalArgs, ip+1); handled {
 				return rIP, rSP, rCtl
 			}
@@ -3669,6 +3677,7 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 							pic[3] = newPic
 						}
 						if tFn != nil {
+							_ = tFn // inline deferred
 							if rIP, rSP, rCtl, handled := vm.pushFuncPositional(st, tFn, nil, stack, ip, sp, newBase, retSP, totalArgs, ip+1); handled {
 								return rIP, rSP, rCtl
 							}
@@ -3995,6 +4004,50 @@ func (vm *VM) callLRUCacheSlow(st *loopState, target val.Value, ip, sp, newBase,
 	vm.frames[st.frameIdx].ip = ip
 	vm.execCtx.SP = newBase + argc
 	cache := (*pyLRUCache)(unsafe.Pointer(target.HeaderPtr()))
+	if len(kwnames) == 0 && !cache.Typed && argc == 2 && isLruKey2Value(stack[newBase]) && isLruKey2Value(stack[newBase+1]) {
+		k := lruKey2{a: stack[newBase], b: stack[newBase+1]}
+		locked := val.MultiThreadedFlag.Load()
+		if locked {
+			cache.Mu.Lock()
+		}
+		if res, hit := cache.probeLocked2(k); hit {
+			if locked {
+				cache.Mu.Unlock()
+			}
+			stack[retSP] = res
+			if unsafe.SliceData(stack) == origData {
+				return ip + 1, retSP + 1, ctlNext
+			}
+			return ip + 1, retSP + 1, ctlReload
+		}
+		cache.Misses++
+		startGen := cache.clearGen
+		if locked {
+			cache.Mu.Unlock()
+		}
+		vm.execCtx.SP = newBase + argc
+		res := vm.callFromHookSafe(cache.UserFunction, newBase, argc, kwnames)
+		stack = st.syncStackFromExecCtx(vm, stack)
+		if vm.execCtx.HasException() {
+			exc := vm.execCtx.ActiveException
+			vm.execCtx.ClearException()
+			st.raiseExc = exc
+			return ip, sp, ctlRaise
+		}
+		locked = val.MultiThreadedFlag.Load()
+		if locked {
+			cache.Mu.Lock()
+		}
+		cache.insertAfterMiss2(k, res, startGen)
+		if locked {
+			cache.Mu.Unlock()
+		}
+		stack[retSP] = res
+		if unsafe.SliceData(stack) == origData {
+			return ip + 1, retSP + 1, ctlNext
+		}
+		return ip + 1, retSP + 1, ctlReload
+	}
 	cacheKey, ok := makeLRUCacheKey(&vm.execCtx, stack[newBase:newBase+argc], kwnames, cache.Typed)
 	stack = st.syncStackFromExecCtx(vm, stack)
 	if !ok {

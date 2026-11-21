@@ -59,6 +59,11 @@ const (
 	attrQueryClassFunc
 )
 
+// attrQueryMissingSlot marks a confirmed-absent attribute in AttrQueryPICEntry.
+// Missing on the type plus missing in the shape with no custom lookup hooks
+// guarantees absence, so later probes hit O(1) without another MRO walk.
+const attrQueryMissingSlot int32 = -2
+
 // AttrQueryPICEntry caches a 4-way polymorphic hasattr/getattr lookup keyed on
 // (Name, TypeVer, ShapeID) so repeated attribute probes resolve in O(1).
 type AttrQueryPICEntry struct {
@@ -495,7 +500,15 @@ func (co *CodeObject) LineTableBytes() []byte {
 	return buf
 }
 
-// VMCodeCache holds per-CodeObject inline caches isolated per VM instance (0 races, 0 cross-call thrashing).
+// InlineExpectEntry records the expected callee identity for a spliced
+// guard site so later polymorphic changes miss safely.
+type InlineExpectEntry struct {
+	Fn      val.Value
+	TypeVer uint64
+	AuxVer  uint64
+	ShapeID uint32
+	Shape2  uint32
+}
 type VMCodeCache struct {
 	// owner is the VM this cache belongs to. It lets a code object publish
 	// its cache without carrying a VM pointer of its own.
@@ -507,6 +520,8 @@ type VMCodeCache struct {
 	attrQueryPIC [][4]AttrQueryPICEntry
 	transitionIC []TransitionICEntry
 	kwPIC        [][2]KwPICEntry
+	inlineExpect []InlineExpectEntry
+	inlineConsts []val.Value
 	// hotness counts how often this VM executed the code object. It is
 	// VM-local, so it never shares a cache line with another VM.
 	hotness uint32
@@ -523,30 +538,47 @@ type VMCodeCache struct {
 
 func (c *VMCodeCache) ensureMethodPIC() [][4]val.MethodPICEntry {
 	if len(c.methodPIC) < len(c.ic) {
-		c.methodPIC = make([][4]val.MethodPICEntry, len(c.ic))
+		n := make([][4]val.MethodPICEntry, len(c.ic))
+		copy(n, c.methodPIC)
+		c.methodPIC = n
 	}
 	return c.methodPIC
 }
 
 func (c *VMCodeCache) ensureAttrPIC() [][4]AttrPICEntry {
 	if len(c.attrPIC) < len(c.ic) {
-		c.attrPIC = make([][4]AttrPICEntry, len(c.ic))
+		n := make([][4]AttrPICEntry, len(c.ic))
+		copy(n, c.attrPIC)
+		c.attrPIC = n
 	}
 	return c.attrPIC
 }
 
 func (c *VMCodeCache) ensureAttrQueryPIC() [][4]AttrQueryPICEntry {
 	if len(c.attrQueryPIC) < len(c.ic) {
-		c.attrQueryPIC = make([][4]AttrQueryPICEntry, len(c.ic))
+		n := make([][4]AttrQueryPICEntry, len(c.ic))
+		copy(n, c.attrQueryPIC)
+		c.attrQueryPIC = n
 	}
 	return c.attrQueryPIC
 }
 
 func (c *VMCodeCache) ensureTransitionIC() []TransitionICEntry {
 	if len(c.transitionIC) < len(c.ic) {
-		c.transitionIC = make([]TransitionICEntry, len(c.ic))
+		n := make([]TransitionICEntry, len(c.ic))
+		copy(n, c.transitionIC)
+		c.transitionIC = n
 	}
 	return c.transitionIC
+}
+
+func (c *VMCodeCache) ensureInlineExpect(n int) []InlineExpectEntry {
+	if len(c.inlineExpect) < n {
+		nw := make([]InlineExpectEntry, n)
+		copy(nw, c.inlineExpect)
+		c.inlineExpect = nw
+	}
+	return c.inlineExpect
 }
 
 // quickenAt writes a quickened instruction word into this VM's private copy of

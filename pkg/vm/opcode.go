@@ -229,6 +229,9 @@ const (
 	OP_UNPACK_3_FAST
 	OP_CALL_PY_DEFAULTS
 	OP_CALL_INSTANCE_DUNDER
+	OP_GUARD_INLINE_METHOD
+	OP_GUARD_INLINE_FUNC
+	OP_INLINE_RETURN
 )
 
 // Comparison operation codes for OP_COMPARE_OP (passed in ArgA field).
@@ -577,6 +580,12 @@ func (op Opcode) String() string {
 		return "OP_CALL_PY_DEFAULTS"
 	case OP_CALL_INSTANCE_DUNDER:
 		return "OP_CALL_INSTANCE_DUNDER"
+	case OP_GUARD_INLINE_METHOD:
+		return "OP_GUARD_INLINE_METHOD"
+	case OP_GUARD_INLINE_FUNC:
+		return "OP_GUARD_INLINE_FUNC"
+	case OP_INLINE_RETURN:
+		return "OP_INLINE_RETURN"
 	default:
 		return "OP_UNKNOWN"
 	}

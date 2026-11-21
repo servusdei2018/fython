@@ -19,6 +19,17 @@ func TryCompileRegCode(co *CodeObject) *RegCode {
 		recordRegReject(co, "empty-code")
 		return nil
 	}
+	// Tier-2 stays restricted to loop-bearing substantial functions so tiny
+	// leaf calls never pay nested runner setup. Small or straight-line code
+	// runs faster on the fused Tier-1 stack loop.
+	if len(co.Code) < 24 {
+		recordRegReject(co, "too-short-no-loop")
+		return nil
+	}
+	if !hasBackwardJump(co.Code) {
+		recordRegReject(co, "no-backward-jump")
+		return nil
+	}
 	if len(co.ExceptionTable) != 0 {
 		recordRegReject(co, "has-exception-table")
 		return nil
@@ -84,6 +95,31 @@ func TryCompileRegCode(co *CodeObject) *RegCode {
 		ScratchBase: uint16(scratchBase),
 		RetLive:     b.retLive,
 	}
+}
+
+// hasBackwardJump reports whether code contains a backward jump edge, the
+// marker of a real loop body where register-window savings can cover the
+// nested runner cost. Both base and fused jump forms use an absolute Bx
+// target, so any target at or before the jump site counts.
+func hasBackwardJump(code []uint32) bool {
+	for i, inst := range code {
+		switch DecodeOpcode(inst) {
+		case OP_JUMP, OP_JUMP_IF_FALSE, OP_JUMP_IF_TRUE,
+			OP_JUMP_IF_FALSE_OR_POP, OP_JUMP_IF_TRUE_OR_POP,
+			OP_FOR_ITER, OP_FOR_ITER_RANGE, OP_FOR_ITER_GEN,
+			OP_COMPARE_JUMP_IF_FALSE, OP_COMPARE_JUMP_IF_TRUE,
+			OP_FAST_LOOP_CMP_LT_CONST_JUMP,
+			OP_FAST_CMP_EQ_JUMP_IF_FALSE,
+			OP_FAST_JUMP_IF_DEREF_LIST_SUBSCR_TRUE,
+			OP_JUMP_IF_BITAND_ZERO,
+			OP_FAST_CMP_EQ_LOCAL_DEREF_JUMP_IF_FALSE:
+			t := int(DecodeArgBx(inst))
+			if t >= 0 && t <= i {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // regMaxRegs bounds the register file. Locals occupy [0, scratchBase) and

@@ -930,10 +930,13 @@ func (vm *VM) opCompareSlow(st *loopState, inst uint32, ip, sp int) (int, int, l
 			if dunder.HeaderPtr() != nil {
 				if dfn, dcallee, ok := isSimpleCompareDunder(dunder); ok {
 					vm.quickenCompareDunder(st, inst, ip, dunder, dfn, dcallee, ta.Version(), tb.Version(), mode)
+					left, right := a, b
 					if mode != 0 {
 						stack[sp-2] = b
 						stack[sp-1] = a
+						left, right = b, a
 					}
+					vm.tryInlineDunderForCompare(st, ip, dunder, dfn, dcallee, left, right)
 					newIP, newSP := vm.inlineDunderCompare(dunder, sp-2, sp-2, a, b, cmpOp, st, ip)
 					return newIP, newSP, ctlReload
 				}
