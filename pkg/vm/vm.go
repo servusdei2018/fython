@@ -39,6 +39,7 @@ func (vm *VM) Run(code []uint32, consts []val.Value, numLocals int) (res val.Val
 		vm.rootCO.IsTier2Optimized = 0
 		vm.rootCO.Hotness = 0
 		vm.rootCO.stream = nil
+		vm.rootCO.clearRegCode()
 		vm.rootCO.ParamShapeComputed = false
 		vm.rootCO.computeParamShape()
 		vm.rootCache.active = nil
@@ -2755,6 +2756,14 @@ func (vm *VM) runFrame(co *CodeObject, startBase int, startSP int, startFrameIdx
 		maybeOptimizeCodeObject(vm, co, st.cache)
 	}
 
+	// Enter the register loop when the code object compiled one. Entry
+	// checks inside runRegLoop fail closed to the stack loop.
+	if rc := co.RegCode(); rc != nil {
+		if res, ok := vm.runRegLoop(nil, co, rc, startBase); ok {
+			return res
+		}
+	}
+
 	if (activeGen != nil || activeCoro != nil) && vm.execCtx.HasException() {
 		exc := vm.execCtx.ActiveException
 		vm.execCtx.ClearException()
@@ -3996,6 +4005,13 @@ func (vm *VM) pushFrameFast(
 	}
 	pushNewBase := sp - pushTotalArgs
 	pushRetSP := pushNewBase - popCallable
+	// Count in-loop calls toward Tier-2 compilation so hot callees become
+	// eligible for register execution. Type-init calls keep the stack
+	// path so the in-loop instance protocol stays intact, as do dunder
+	// comparisons carrying caller fallback state.
+	if !isTypeInit && st.frameIdx >= 0 && st.frameIdx < len(vm.frames) && !vm.frames[st.frameIdx].cmpActive {
+		maybeOptimizeCodeObject(vm, pushCallee, pushCache)
+	}
 	saved := &vm.frames[st.frameIdx]
 	if isTypeInit {
 		instObj := val.NewInstanceOfType(st.stack[pushNewBase].AsType())

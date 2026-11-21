@@ -796,13 +796,17 @@ func OptimizeCodeObject(co *CodeObject) {
 		i++
 	}
 
-	if code == nil {
-		// Nothing could be fused: the original stream stays in place.
-		return
+	if code != nil {
+		// Publish the fused instruction stream atomically: every VM picks it up
+		// the next time it reloads the active slice.
+		co.publish(code)
 	}
-	// Publish the fused instruction stream atomically: every VM picks it up
-	// the next time it reloads the active slice.
-	co.publish(code)
+	// Attempt a register compilation on top of the original instruction
+	// stream. The stack stream stays authoritative; RegCode is consulted only
+	// when a frame is entered through runRegLoop.
+	if rc := TryCompileRegCode(co); rc != nil {
+		co.publishRegCode(rc)
+	}
 }
 
 func isPrimitiveCompareConst(v val.Value) bool {

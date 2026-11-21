@@ -61,6 +61,13 @@ func (vm *VM) pushCalleeFrame(
 	cc *VMCodeCache,
 	newBase, retSP, nextSP, retIP int,
 ) (int, int, loopCtl) {
+	// Enter register execution for hot callees through a nested frame,
+	// keeping the stack loop itself untouched. This must precede any
+	// caller-frame bookkeeping below so a nested run leaves the loop
+	// state exactly as the call site left it.
+	if nip, nsp, nctl, ok := vm.tryNestedRegCall(st, callee, fn, newBase, nextSP, retSP, retIP, -1); ok {
+		return nip, nsp, nctl
+	}
 	frameIdx := st.frameIdx
 	if frameIdx+2 > len(vm.frames) {
 		vm.ensureFrameCapacity(frameIdx + 2)

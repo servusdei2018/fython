@@ -5095,7 +5095,25 @@ func initTypes() {
 			list.Items = append(list.Items, args[1].AsTuple().Items...)
 			return NoneVal()
 		}
-		it := NewIterVal(args[1]).AsIter()
+		itVal := NewIterVal(args[1])
+		if itVal.IsGenerator() {
+			// __iter__ implemented as a generator (e.g. collection
+			// sequences): drive it through the resume protocol instead
+			// of misreading the generator frame as a PyIter.
+			gen := itVal.AsGenerator()
+			for {
+				item, status := gen.Send(ctx, NoneVal())
+				if status != IterYielded {
+					break
+				}
+				if ctx.HasException() {
+					return NoneVal()
+				}
+				list.Append(item)
+			}
+			return NoneVal()
+		}
+		it := itVal.AsIter()
 		for {
 			item, ok := it.Next()
 			if !ok {

@@ -69,6 +69,29 @@ func (vm *VM) releaseLoopState(st *loopState) {
 	}
 }
 
+// acquireRegFrame returns a scratch register-frame state. Frames are pooled
+// so hot entry stays allocation-free; nested register runs acquire their
+// own frame while the caller frame is active.
+func (vm *VM) acquireRegFrame() *regFrame {
+	if n := len(vm.regFramePool); n > 0 {
+		rf := vm.regFramePool[n-1]
+		vm.regFramePool[n-1] = nil
+		vm.regFramePool = vm.regFramePool[:n-1]
+		return rf
+	}
+	return &regFrame{}
+}
+
+func (vm *VM) releaseRegFrame(rf *regFrame) {
+	if rf == nil {
+		return
+	}
+	*rf = regFrame{}
+	if len(vm.regFramePool) < 64 {
+		vm.regFramePool = append(vm.regFramePool, rf)
+	}
+}
+
 // syncStackFromVM refreshes st.stack if a call grew vm.stack (or vm.execCtx.Stack
 // when executing on a generator/coroutine/nested stack).
 func (st *loopState) syncStackFromVM(vm *VM, curStack []val.Value) []val.Value {
