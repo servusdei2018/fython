@@ -20,8 +20,23 @@ func canInlineCallee(fn *val.PyFunction, callee *CodeObject, caller *CodeObject)
 	if len(fn.Defaults) != 0 || fn.KwDefaults != nil {
 		return false
 	}
-	if callee.HasCellVars || len(callee.FreeVars) != 0 {
+	if callee.HasCellVars {
 		return false
+	}
+	allowDeref := false
+	if len(callee.FreeVars) != 0 {
+		if len(callee.CellVars) != 0 {
+			return false
+		}
+		if fn.Closure == nil || len(fn.Closure) < len(callee.FreeVars) {
+			return false
+		}
+		for _, inst := range callee.Code {
+			if DecodeOpcode(inst) == OP_STORE_DEREF {
+				return false
+			}
+		}
+		allowDeref = true
 	}
 	if callee.IsGenerator || callee.IsCoroutine || callee.CanSuspend {
 		return false
@@ -71,7 +86,7 @@ func canInlineCallee(fn *val.PyFunction, callee *CodeObject, caller *CodeObject)
 			OP_FAST_JUMP_IF_DEREF_LIST_SUBSCR_TRUE,
 			OP_JUMP_IF_BITAND_ZERO,
 			OP_FAST_CMP_EQ_LOCAL_DEREF_JUMP_IF_FALSE,
-			OP_LOAD_DEREF, OP_STORE_DEREF,
+			OP_STORE_DEREF,
 			OP_CALL, OP_CALL_METHOD, OP_CALL_KW, OP_CALL_FUNCTION_EX,
 			OP_CALL_PY_EXACT_ARGS, OP_CALL_PY_DEFAULTS,
 			OP_CALL_BUILTIN_FAST, OP_CALL_LEN, OP_CALL_ISINSTANCE,
@@ -81,6 +96,14 @@ func canInlineCallee(fn *val.PyFunction, callee *CodeObject, caller *CodeObject)
 			OP_CALL_INSTANCE_DUNDER, OP_COMPARE_DUNDER,
 			OP_GUARD_INLINE_METHOD, OP_GUARD_INLINE_FUNC, OP_INLINE_RETURN:
 			return false
+		case OP_LOAD_DEREF:
+			if !allowDeref {
+				return false
+			}
+			idx := int(DecodeArgBx(callee.Code[i]))
+			if idx < 0 || idx >= len(callee.FreeVars) {
+				return false
+			}
 		}
 	}
 	return returns == 1
@@ -206,7 +229,7 @@ func (vm *VM) tryInlineFunc(st *loopState, ip, totalArgs int, fn *val.PyFunction
 	if postCall < 0 || postCall > 0xFFFF {
 		return false
 	}
-	if !spliceInlineBody(vm, st, ip, OP_GUARD_INLINE_FUNC, callee, totalArgs, 1, postCall) {
+	if !spliceInlineBody(vm, st, ip, OP_GUARD_INLINE_FUNC, callee, fn, totalArgs, 1, postCall) {
 		return false
 	}
 	cache := st.cache
@@ -279,7 +302,7 @@ func (vm *VM) tryInlineDunder(st *loopState, ip int, dunder val.Value, dfn *val.
 	if postCall < 0 || postCall > 0xFFFF {
 		return false
 	}
-	if !spliceInlineBody(vm, st, ip, OP_GUARD_INLINE_METHOD, dcallee, 2, 0, postCall) {
+	if !spliceInlineBody(vm, st, ip, OP_GUARD_INLINE_METHOD, dcallee, dfn, 2, 0, postCall) {
 		return false
 	}
 	cache := st.cache
@@ -292,7 +315,7 @@ func (vm *VM) tryInlineDunder(st *loopState, ip int, dunder val.Value, dfn *val.
 // the private active stream and swaps the call site to a guard. It operates
 // only on the per-VM private copy, so no shared CodeObject mutation occurs
 // except reading shared callee bytecode.
-func spliceInlineBody(vm *VM, st *loopState, guardIP int, guardOp Opcode, callee *CodeObject, totalArgs, popCallable int, postCall int) bool {
+func spliceInlineBody(vm *VM, st *loopState, guardIP int, guardOp Opcode, callee *CodeObject, fn *val.PyFunction, totalArgs, popCallable int, postCall int) bool {
 	cache := st.cache
 	if cache == nil || guardIP < 0 {
 		return false
@@ -326,6 +349,54 @@ func spliceInlineBody(vm *VM, st *loopState, guardIP int, guardOp Opcode, callee
 	newConsts, ok := inlineRemapConsts(body, callee.Consts, st.consts)
 	if !ok {
 		return false
+	}
+	if len(callee.FreeVars) != 0 {
+		if len(callee.CellVars) != 0 {
+			return false
+		}
+		if fn == nil || fn.Closure == nil || len(fn.Closure) < len(callee.FreeVars) {
+			return false
+		}
+		for i := range body {
+			if DecodeOpcode(body[i]) != OP_LOAD_DEREF {
+				continue
+			}
+			idx := int(DecodeArgBx(body[i]))
+			if idx < 0 || idx >= len(callee.FreeVars) || idx >= len(fn.Closure) {
+				return false
+			}
+			cellVal := fn.Closure[idx]
+			var inner val.Value
+			if cellVal.HeaderPtr() != nil && cellVal.HeaderPtr().Kind == val.KindCell {
+				inner = cellVal.AsCell().Get()
+			} else {
+				inner = cellVal
+			}
+			found := -1
+			for j, c := range newConsts {
+				if c == inner {
+					found = j
+					break
+				}
+			}
+			if found < 0 {
+				if len(newConsts) >= 0xFFFF {
+					return false
+				}
+				newConsts = append(newConsts, inner)
+				found = len(newConsts) - 1
+			}
+			if found > 0xFFFF {
+				return false
+			}
+			body[i] = Encode(OP_LOAD_CONST, 0, uint16(found))
+		}
+	} else {
+		for _, inst := range body {
+			if DecodeOpcode(inst) == OP_LOAD_DEREF {
+				return false
+			}
+		}
 	}
 	argA := uint8(totalArgs & 0x7F)
 	if popCallable != 0 {

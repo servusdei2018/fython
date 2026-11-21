@@ -2792,10 +2792,23 @@ func InitArenaDict(d *PyDict, capHint int, entries []DictEntry) {
 	for int(tableCap)*2 < capHint*3 {
 		tableCap <<= 1
 	}
-	if tableCap == 8 {
+	switch {
+	case tableCap == 8:
 		clear(d.inlineIndices[:])
 		d.indices = d.inlineIndices[:]
-	} else {
+	case tableCap == 16 && AcquireDictTable16Hook != nil && !MultiThreadedFlag.Load():
+		if pooledEntries, pooledIndices, ok := AcquireDictTable16Hook(); ok &&
+			cap(pooledEntries) == Dict16EntryCap && len(pooledIndices) == 16 {
+			d.indices = pooledIndices
+			clear(d.indices)
+			d.Entries = pooledEntries[:0]
+			d.mask = tableCap - 1
+			d.indexShift = 0
+			d.VersionTag = 1
+			return
+		}
+		d.indices = make([]byte, int(tableCap))
+	default:
 		d.indices = make([]byte, int(tableCap))
 	}
 	d.mask = tableCap - 1

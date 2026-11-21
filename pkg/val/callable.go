@@ -1270,6 +1270,25 @@ func typeTpCall(ctx *ExecContext, callable Value, args []Value, kwnames []Value)
 		return cls.Slots.TpCall(ctx, callable, args, kwnames)
 	}
 
+	if cls != nil && cls != StrType && StrType != nil && IsSubclass(cls, StrType) && posCount == 1 && len(kwnames) == 0 && len(args) == 1 {
+		if arg := args[0]; arg.IsAnyString() {
+			if !cls.HasInit() && cls.dunderNew.ptr != nil && StrType.dunderNew.ptr != nil && cls.dunderNew.ptr == StrType.dunderNew.ptr {
+				if cls.RootShape == nil || len(cls.RootShape.Attrs) == 0 {
+					instFast := NewInstanceOfType(cls)
+					instObj := instFast.AsInstance()
+					if len(instObj.Slots) == 0 {
+						if !instObj.ExtendBootstrapSlot(0, arg) {
+							instObj.Slots = []Value{arg}
+						}
+					} else {
+						instObj.Slots[0] = arg
+					}
+					return instFast
+				}
+			}
+		}
+	}
+
 	var inst Value
 	if cls.dunderNew.ptr != nil {
 		totalNewArgs := 1 + len(args)

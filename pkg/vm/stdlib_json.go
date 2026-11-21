@@ -111,6 +111,7 @@ type jsonParser struct {
 	valSlab     []val.Value
 	strSlab     []val.PyString
 	byteSlab    []byte
+	vm          *VM
 }
 
 func acquireJSONParser(ctx *val.ExecContext, src []byte, pool *val.InternPool) *jsonParser {
@@ -123,7 +124,18 @@ func acquireJSONParser(ctx *val.ExecContext, src []byte, pool *val.InternPool) *
 			p.pool = pool
 			p.scratch = p.scratch[:0]
 			p.dictCapHint = 5
+			p.vm = vm
 			return p
+		}
+		if vm, ok := ctx.VM.(*VM); ok {
+			return &jsonParser{
+				src:         src,
+				pos:         0,
+				pool:        pool,
+				scratch:     make([]byte, 0, 64),
+				dictCapHint: 5,
+				vm:          vm,
+			}
 		}
 	}
 	return &jsonParser{
@@ -187,6 +199,18 @@ func (p *jsonParser) allocDict(capHint int) *val.PyDict {
 	maxDense := tableCap * 2 / 3
 	val.InitArenaDict(d, capHint, p.allocEntries(maxDense))
 	return d
+}
+
+func (p *jsonParser) allocDictVal(capHint int) (*val.PyDict, val.Value) {
+	if p.vm != nil && !val.MultiThreadedFlag.Load() && capHint > 0 && capHint <= 10 {
+		hint := max(capHint, 1)
+		dv := p.vm.acquireSmallDict(hint, false)
+		if d := dv.AsDict(); d != nil {
+			return d, dv
+		}
+	}
+	d := p.allocDict(capHint)
+	return d, val.DictVal(d)
 }
 
 func (p *jsonParser) allocList(items []val.Value) val.Value {
@@ -294,8 +318,7 @@ func (p *jsonParser) parseValue() (val.Value, error) {
 
 func (p *jsonParser) parseObject() (val.Value, error) {
 	p.pos++ // consume '{'
-	dict := p.allocDict(p.dictCapHint)
-	dictVal := val.DictVal(dict)
+	dict, dictVal := p.allocDictVal(p.dictCapHint)
 
 	p.skipWhitespace()
 	if p.pos < len(p.src) && p.src[p.pos] == '}' {

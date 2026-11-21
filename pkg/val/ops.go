@@ -833,11 +833,21 @@ func compareSliceRich(ctx *ExecContext, ia, ib []Value, op uint8) Value {
 			if ea == eb && ea.ptr != &tagFloat64 {
 				continue
 			}
+			if ea.IsNone() && eb.IsNone() {
+				continue
+			}
 			if ea.ptr == &tagInt64 && eb.ptr == &tagInt64 {
 				return BoolVal(false)
 			}
 			if ea.ptr == &tagFloat64 && eb.ptr == &tagFloat64 {
 				if math.Float64frombits(ea.num) != math.Float64frombits(eb.num) {
+					return BoolVal(false)
+				}
+				continue
+			}
+			if ea.ptr != nil && eb.ptr != nil && ea.ptr.Kind == KindString && eb.ptr.Kind == KindString &&
+				(ea.ptr.Flags&FlagInterned) != 0 && (eb.ptr.Flags&FlagInterned) != 0 {
+				if ea.ptr != eb.ptr {
 					return BoolVal(false)
 				}
 				continue
@@ -882,6 +892,9 @@ func compareSliceRich(ctx *ExecContext, ia, ib []Value, op uint8) Value {
 		for i := range minLen {
 			ea, eb := ia[i], ib[i]
 			if ea == eb && ea.ptr != &tagFloat64 {
+				continue
+			}
+			if ea.IsNone() && eb.IsNone() {
 				continue
 			}
 			if ea.ptr == &tagInt64 && eb.ptr == &tagInt64 {

@@ -140,7 +140,6 @@ func isRegCallSite(st *loopState, ip int) bool {
 // synchronous helpers the stack loop uses on its slow paths; helpers that
 // can push interpreter frames are never called from here.
 func (vm *VM) runRegLoop(fn *val.PyFunction, co *CodeObject, rc *RegCode, base int) (val.Value, bool) {
-	_ = fn // The frame was already bound by the caller.
 	st := vm.activeState
 	if st == nil || st.curCO != co || st.cache == nil {
 		return val.Value{}, false
@@ -153,6 +152,16 @@ func (vm *VM) runRegLoop(fn *val.PyFunction, co *CodeObject, rc *RegCode, base i
 	}
 	if &st.stack[0] != &vm.stack[0] {
 		return val.Value{}, false
+	}
+	if len(co.CellVars) == 0 && len(co.FreeVars) > 0 {
+		if len(co.FreeVars) > 4 {
+			return val.Value{}, false
+		}
+		if len(st.cells) < len(co.FreeVars) {
+			if fn == nil || fn.Closure == nil || len(fn.Closure) < len(co.FreeVars) {
+				return val.Value{}, false
+			}
+		}
 	}
 	nregs := int(rc.NumRegs)
 	frameTop := base + nregs
@@ -339,6 +348,56 @@ func (rf *regFrame) run() (val.Value, bool) {
 			regs[dst] = val.BoolVal(!regs[src1].IsTruthy())
 			rf.pc++
 		case RegEq, RegNe, RegLt, RegLe, RegGt, RegGe, RegIn, RegIs:
+			avC, bvC := regs[src1], regs[src2]
+			if avC.IsInt64() && bvC.IsInt64() {
+				ai, bi := avC.AsInt64(), bvC.AsInt64()
+				var cb bool
+				switch op {
+				case RegEq:
+					cb = ai == bi
+				case RegNe:
+					cb = ai != bi
+				case RegLt:
+					cb = ai < bi
+				case RegLe:
+					cb = ai <= bi
+				case RegGt:
+					cb = ai > bi
+				default:
+					cb = ai >= bi
+				}
+				regs[dst] = val.BoolVal(cb)
+				rf.pc++
+				continue
+			}
+			if isRegStr(avC) && isRegStr(bvC) {
+				switch op {
+				case RegEq, RegNe:
+					eq := val.StringEquals(avC, bvC)
+					if op == RegNe {
+						eq = !eq
+					}
+					regs[dst] = val.BoolVal(eq)
+					rf.pc++
+					continue
+				case RegLt, RegLe, RegGt, RegGe:
+					c := val.StringCompare(avC, bvC)
+					var cb bool
+					switch op {
+					case RegLt:
+						cb = c < 0
+					case RegLe:
+						cb = c <= 0
+					case RegGt:
+						cb = c > 0
+					default:
+						cb = c >= 0
+					}
+					regs[dst] = val.BoolVal(cb)
+					rf.pc++
+					continue
+				}
+			}
 			if rf.cmpFast(op, dst, src1, src2, aux) {
 				rf.pc++
 				continue
@@ -377,6 +436,54 @@ func (rf *regFrame) run() (val.Value, bool) {
 			}
 			rf.pc++
 		case RegLtJmpIfFalse, RegLtJmpIfTrue, RegEqJmpIfFalse, RegEqJmpIfTrue:
+			avJ, bvJ := regs[src1], regs[src2]
+			if avJ.IsInt64() && bvJ.IsInt64() {
+				ai, bi := avJ.AsInt64(), bvJ.AsInt64()
+				var cj bool
+				if op == RegEqJmpIfFalse || op == RegEqJmpIfTrue {
+					cj = ai == bi
+				} else {
+					cj = ai < bi
+				}
+				wantTrueJ := op == RegLtJmpIfTrue || op == RegEqJmpIfTrue
+				if cj == wantTrueJ {
+					tj := int(aux)
+					if tj <= rf.pc {
+						if res, finished := rf.backwardTick(sip, tj); finished {
+							return res, true
+						}
+						regs = rf.regs
+						continue
+					}
+					rf.pc = tj
+					continue
+				}
+				rf.pc++
+				continue
+			}
+			if isRegStr(avJ) && isRegStr(bvJ) {
+				var cj bool
+				if op == RegEqJmpIfFalse || op == RegEqJmpIfTrue {
+					cj = val.StringEquals(avJ, bvJ)
+				} else {
+					cj = val.StringCompare(avJ, bvJ) < 0
+				}
+				wantTrueJ := op == RegLtJmpIfTrue || op == RegEqJmpIfTrue
+				if cj == wantTrueJ {
+					tj := int(aux)
+					if tj <= rf.pc {
+						if res, finished := rf.backwardTick(sip, tj); finished {
+							return res, true
+						}
+						regs = rf.regs
+						continue
+					}
+					rf.pc = tj
+					continue
+				}
+				rf.pc++
+				continue
+			}
 			if res, finished := rf.cmpJmp(op, src1, src2, int(aux), sip); finished {
 				return res, true
 			}
@@ -397,6 +504,114 @@ func (rf *regFrame) run() (val.Value, bool) {
 				continue
 			}
 			rf.pc++
+		case RegLoadAttr:
+			hitAttr := false
+			if !val.MultiThreadedFlag.Load() {
+				if instObjA := regs[dst].AsInstanceChecked(); instObjA != nil {
+					if ishA := instObjA.Shape; ishA != nil {
+						if itpA := instObjA.Header.Type; itpA != nil && (itpA.Flags&val.FlagCustomGetAttribute) == 0 {
+							tvA := itpA.Version()
+							if uint(sip) < uint(len(rf.cache.attrPIC)) {
+								if picA := &rf.cache.attrPIC[sip]; picA[0].Shape == ishA && picA[0].TypeVer == uint32(tvA) {
+									if idxA := picA[0].SlotIndex; uint(idxA) < uint(len(instObjA.Slots)) {
+										if vA := instObjA.Slots[idxA]; !vA.IsUnbound() {
+											regs[dst] = vA
+											rf.pc++
+											hitAttr = true
+										}
+									}
+								}
+							}
+							if !hitAttr && uint(sip) < uint(len(rf.cache.ic)) {
+								if eA := &rf.cache.ic[sip]; eA.ExpectedTypeVer == tvA && eA.Kind == ICKindSlotMember {
+									if idxA := eA.SlotIndex; uint(idxA) < uint(len(instObjA.Slots)) {
+										if vA := instObjA.Slots[idxA]; !vA.IsUnbound() {
+											regs[dst] = vA
+											rf.pc++
+											hitAttr = true
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+			if hitAttr {
+				continue
+			}
+			if res, finished := rf.loadAttr(dst, uint16(aux), sip); finished {
+				return res, true
+			}
+			regs = rf.regs
+		case RegCallMethod:
+			hitCall := false
+			argcM := int(aux & 0xFFFF)
+			if uint(sip) < uint(len(rf.cache.methodPIC)) {
+				if recvM := regs[dst]; !recvM.IsUnbound() {
+					if instM := recvM.AsInstanceChecked(); instM != nil {
+						if ishM := instM.Shape; ishM != nil {
+							if itpM := instM.Header.Type; itpM != nil {
+								if picM := &rf.cache.methodPIC[sip]; picM[0].Shape == ishM && picM[0].Shape != nil && itpM.Version() == picM[0].TypeVersion && picM[0].TargetFn != nil {
+									if rf.runDirectReg(dst, picM[0].TargetVal, recvM, true, src2, argcM, sip) {
+										regs = rf.regs
+										hitCall = true
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+			if hitCall {
+				continue
+			}
+			if uint(sip) < uint(len(rf.cache.ic)) {
+				if eM := &rf.cache.ic[sip]; eM.CalleeCache != nil {
+					if recvM := regs[dst]; !recvM.IsUnbound() {
+						if callM := regs[src1]; callM == eM.CachedVal && !callM.IsNone() && callM.HeaderPtr() != nil {
+							if rf.runDirectReg(dst, callM, recvM, true, src2, argcM, sip) {
+								regs = rf.regs
+								hitCall = true
+							}
+						}
+					} else {
+						if callM := regs[src1]; callM == eM.CachedVal && !callM.IsNone() && callM.HeaderPtr() != nil {
+							if rf.runDirectReg(dst, callM, val.Value{}, false, src2, argcM, sip) {
+								regs = rf.regs
+								hitCall = true
+							}
+						}
+					}
+				}
+			}
+			if hitCall {
+				continue
+			}
+			if res, finished := rf.regCallMethod(dst, src1, src2, argcM, sip); finished {
+				return res, true
+			}
+			regs = rf.regs
+		case RegCall:
+			hitCallC := false
+			argcC := int(aux & 0xFFFF)
+			if uint(sip) < uint(len(rf.cache.ic)) {
+				if eC := &rf.cache.ic[sip]; eC.CalleeCache != nil {
+					if tgtC := regs[src1]; tgtC == eC.CachedVal && !tgtC.IsNone() && tgtC.HeaderPtr() != nil {
+						if rf.runDirectReg(dst, tgtC, val.Value{}, false, src2, argcC, sip) {
+							regs = rf.regs
+							hitCallC = true
+						}
+					}
+				}
+			}
+			if hitCallC {
+				continue
+			}
+			if res, finished := rf.regCall(dst, src1, src2, argcC, sip); finished {
+				return res, true
+			}
+			regs = rf.regs
 		default:
 			if res, finished := rf.slow(op, dst, src1, src2, aux, sip); finished {
 				return res, true

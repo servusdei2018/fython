@@ -39,8 +39,25 @@ func TryCompileRegCode(co *CodeObject) *RegCode {
 		return nil
 	}
 	if len(co.CellVars) != 0 || len(co.FreeVars) != 0 {
-		recordRegReject(co, "has-cellvars-or-freevars")
-		return nil
+		if len(co.CellVars) != 0 || len(co.FreeVars) == 0 || len(co.FreeVars) > 4 {
+			recordRegReject(co, "has-cellvars-or-freevars")
+			return nil
+		}
+		for _, inst := range co.Code {
+			if DecodeOpcode(inst) == OP_STORE_DEREF {
+				recordRegReject(co, "has-cellvars-or-freevars")
+				return nil
+			}
+		}
+		for _, inst := range co.Code {
+			if DecodeOpcode(inst) == OP_LOAD_DEREF {
+				idx := int(DecodeArgBx(inst))
+				if idx < 0 || idx >= len(co.FreeVars) {
+					recordRegReject(co, "has-cellvars-or-freevars")
+					return nil
+				}
+			}
+		}
 	}
 	if !co.ParamShapeComputed {
 		co.computeParamShape()
