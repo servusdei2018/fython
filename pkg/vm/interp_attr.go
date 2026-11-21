@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"os"
 	"sync/atomic"
 	"unsafe"
 
@@ -1057,6 +1058,9 @@ func (vm *VM) opLoadGlobalSlow(st *loopState, inst uint32, ip, sp int) (int, int
 	globVer := atomic.LoadUint64(&st.globals.VersionTag)
 	entry := &st.cache.ic[ip]
 	if v, slot, ok := st.globals.GetWithSlotHint(nameVal, int(entry.SlotIndex)); ok {
+		if v.HeaderPtr() == nil && os.Getenv("FYTHON_DEBUG_GLOBALNONE") != "" {
+			println("global-none-cached", nameVal.AsString(), "co", st.curCO.Name)
+		}
 		if v.IsLazyImport() {
 			resolved, err := vm.resolveLazyImport(nil, nameVal, v)
 			if err != nil {

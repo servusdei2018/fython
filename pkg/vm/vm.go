@@ -2626,7 +2626,7 @@ func (vm *VM) storeFastValue(old, incoming val.Value, key uint32) {
 	}
 }
 
-func (vm *VM) runFrame(co *CodeObject, startBase int, startSP int, startFrameIdx int, startCells []val.Value, startGlobals *val.PyDict, startLocals val.Value, stack []val.Value, activeGen *val.PyGenerator, activeCoro *val.PyCoroutine) val.Value {
+func (vm *VM) runFrame(co *CodeObject, startBase int, startSP int, startFrameIdx int, startCells []val.Value, startGlobals *val.PyDict, startLocals val.Value, stack []val.Value, activeGen *val.PyGenerator, activeCoro *val.PyCoroutine) (res val.Value) {
 	savedActiveState := vm.activeState
 	if savedActiveState != nil {
 		vm.flushActiveFrame()
@@ -2757,11 +2757,42 @@ func (vm *VM) runFrame(co *CodeObject, startBase int, startSP int, startFrameIdx
 	}
 
 	// Enter the register loop when the code object compiled one. Entry
-	// checks inside runRegLoop fail closed to the stack loop.
+	// checks inside runRegLoop fail closed to the stack loop. A nested
+	// register abort (regAbort) unwinds here with the stack state already
+	// prepared: either a handler continuation in st or an unhandled
+	// exception to return.
+	defer func() {
+		if r := recover(); r != nil {
+			if _, isAbort := r.(regAbort); isAbort {
+				if !vm.unhandledException.IsNone() && vm.unhandledException.HeaderPtr() != nil {
+					res = st.result
+				} else {
+					res = vm.runLoopWithGlobals(st)
+				}
+				return
+			}
+			panic(r)
+		}
+	}()
 	if rc := co.RegCode(); rc != nil {
-		if res, ok := vm.runRegLoop(nil, co, rc, startBase); ok {
+		res, ok := func() (res val.Value, ok bool) {
+			defer func() {
+				if r := recover(); r != nil {
+					if _, isAbort := r.(regAbort); isAbort {
+						res, ok = val.Value{}, false
+						return
+					}
+					panic(r)
+				}
+			}()
+			return vm.runRegLoop(nil, co, rc, startBase)
+		}()
+		if ok {
 			return res
 		}
+	}
+	if !vm.unhandledException.IsNone() && vm.unhandledException.HeaderPtr() != nil {
+		return st.result
 	}
 
 	if (activeGen != nil || activeCoro != nil) && vm.execCtx.HasException() {
@@ -4011,6 +4042,14 @@ func (vm *VM) pushFrameFast(
 	// comparisons carrying caller fallback state.
 	if !isTypeInit && st.frameIdx >= 0 && st.frameIdx < len(vm.frames) && !vm.frames[st.frameIdx].cmpActive {
 		maybeOptimizeCodeObject(vm, pushCallee, pushCache)
+	}
+	// Route quickened stack calls into register execution once compiled.
+	// Constructor type-init calls stay on the stack path so the
+	// initInstance return-self protocol in opReturnSlow is preserved.
+	if !isTypeInit && pushCallee.RegCode() != nil && !vm.hasTrackedViews {
+		if nip, nsp, handled := vm.tryRegEntry(st, pushFn, pushCallee, pushCache, pushNewBase, pushRetSP, ip+1, ip, pushTotalArgs); handled {
+			return nip, nsp
+		}
 	}
 	saved := &vm.frames[st.frameIdx]
 	if isTypeInit {

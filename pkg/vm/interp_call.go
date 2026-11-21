@@ -161,10 +161,21 @@ func (vm *VM) fastCalleeCache(callee *CodeObject) *VMCodeCache {
 // isEphemeralSuperCallSite reports whether the PySuper returned at ip is consumed
 // directly by OP_LOAD_ATTR, OP_LOAD_METHOD, or OP_CALL_METHOD_PIC without escaping.
 func isEphemeralSuperCallSite(st *loopState, ip int) bool {
+	if st.codePtr == nil || st.codeLen <= 0 {
+		return false
+	}
+	return isEphemeralSuperCallSiteAt(unsafe.Slice((*uint32)(st.codePtr), st.codeLen), ip)
+}
+
+// isEphemeralSuperCallSiteAt is the instruction-stream half of
+// isEphemeralSuperCallSite. The register tier passes the unfused code
+// object stream with stack numbering; the stack loop passes its active
+// (possibly fused) stream.
+func isEphemeralSuperCallSiteAt(code []uint32, ip int) bool {
 	depth := 1
-	limit := min(st.codeLen, ip+16)
+	limit := min(len(code), ip+16)
 	for k := ip + 1; k < limit; k++ {
-		wk := *(*uint32)(unsafe.Add(st.codePtr, uintptr(k)*4))
+		wk := code[k]
 		opk := DecodeOpcode(wk)
 		if depth == 1 && (opk == OP_LOAD_METHOD || opk == OP_LOAD_ATTR) {
 			return true
@@ -593,6 +604,7 @@ func (vm *VM) pushTypeInitPositional(
 		}
 	}
 	cc := vm.fastCalleeCache(callee)
+	vm.frames[st.frameIdx].initInstance = instObj
 	rIP, rSP, rCtl := vm.pushCalleeFrame(st, callee, initFunc, cc, initBase, retSP, nextSP, ip+1)
 	vm.frames[st.frameIdx-1].initInstance = instObj
 	return rIP, rSP, rCtl, true
@@ -825,10 +837,10 @@ unwrapKw:
 						stack[newBase+int(df.Slot)] = df.Val
 					}
 				}
-				if st.frameIdx+2 <= len(vm.frames) {
-					newIP, newSP := vm.pushFrameFast(st, fn, e.CalleeCache, newBase+totalArgs, ^totalArgs, ip)
-					return newIP, newSP, ctlReload
-				}
+				// Slots are fully bound above, so enter through
+				// pushCalleeFrame directly: routing pre-bound kwargs
+				// through pushFrameFast would let tryRegEntry refill
+				// positional defaults over the kw-bound slots.
 				return vm.pushCalleeFrame(st, callee, fn, e.CalleeCache, newBase, retSP, newBase+e.NumLocals, retIP)
 			}
 			for k := range 2 {
@@ -970,6 +982,7 @@ unwrapKw:
 											stack[newBase+int(df.Slot)] = df.Val
 										}
 									}
+									vm.frames[st.frameIdx].initInstance = instObj
 									rIP, rSP, rCtl := vm.pushCalleeFrame(st, callee, initFunc, e.CalleeCache, newBase, retSP, newBase+e.NumLocals, ip+1)
 									vm.frames[st.frameIdx-1].initInstance = instObj
 									return rIP, rSP, rCtl
@@ -1004,6 +1017,7 @@ unwrapKw:
 								insertKwPICEntry(&kwSlab[ip], entry)
 							}
 						}
+						vm.frames[st.frameIdx].initInstance = instObj
 						rIP, rSP, rCtl := vm.pushCalleeFrame(st, callee, initFunc, cc, newBase, retSP, nextSP, ip+1)
 						vm.frames[st.frameIdx-1].initInstance = instObj
 						return rIP, rSP, rCtl
@@ -1842,6 +1856,9 @@ func (vm *VM) opCallTypeInit(st *loopState, inst uint32, ip, sp int) (int, int, 
 							defStart := callee.PositionalParamCount - len(fn.Defaults)
 							copy(stack[initBase+totalArgs:initBase+callee.PositionalParamCount], fn.Defaults[totalArgs-defStart:])
 						}
+						if !isNewOnly {
+							vm.frames[st.frameIdx].initInstance = instObj
+						}
 						rIP, rSP, rCtl := vm.pushCalleeFrame(st, callee, fn, cc, initBase, retSP, nextSP, ip+1)
 						if !isNewOnly {
 							vm.frames[st.frameIdx-1].initInstance = instObj
@@ -2520,6 +2537,7 @@ unwrapCall:
 						}
 						st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL_TYPE_INIT))
 					}
+					vm.frames[st.frameIdx].initInstance = instObj
 					rIP, rSP, rCtl := vm.pushCalleeFrame(st, callee, initFunc, cc, initBase, retSP, nextSP, ip+1)
 					vm.frames[st.frameIdx-1].initInstance = instObj
 					return rIP, rSP, rCtl

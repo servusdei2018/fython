@@ -2,6 +2,7 @@ package vm
 
 import (
 	"fmt"
+	"os"
 	"sync/atomic"
 	"unsafe"
 
@@ -61,6 +62,12 @@ func (rf *regFrame) slow(op RegOp, dst, src1, src2 int, aux uint32, sip int) (va
 		return rf.popTop(src1)
 	case RegDupTop:
 		return rf.dupTop(dst, src1)
+	case RegLoadDeref:
+		return rf.loadDeref(dst, aux, sip)
+	case RegStoreDeref:
+		return rf.storeDeref(src1, aux, sip)
+	case RegStoreFastView:
+		return rf.storeFastView(int(aux), src1)
 	case RegRaise:
 		return rf.raiseOp(int(aux), src1, sip)
 	default:
@@ -281,6 +288,57 @@ func (rf *regFrame) popTop(src int) (val.Value, bool) {
 	return val.Value{}, false
 }
 
+// loadDeref mirrors the in-loop OP_LOAD_DEREF fast path: cells are read
+// through the active cell pointers with the frame cell slice as fallback.
+func (rf *regFrame) loadDeref(dst int, aux uint32, sip int) (val.Value, bool) {
+	_ = sip
+	bx := int(aux)
+	regs := rf.regs
+	activePtrs := rf.vm.activeCellPtrs
+	if uint(bx) < uint(len(activePtrs)) && activePtrs[bx] != nil {
+		regs[dst] = activePtrs[bx].Value
+	} else {
+		cell := (*val.PyCell)(unsafe.Pointer(rf.st.cells[bx].HeaderPtr()))
+		regs[dst] = cell.Value
+	}
+	rf.pc++
+	return val.Value{}, false
+}
+
+// storeDeref mirrors OP_STORE_DEREF: arena backing is copied out before the
+// value escapes into the cell, then ephemeral flags are stripped.
+func (rf *regFrame) storeDeref(src int, aux uint32, sip int) (val.Value, bool) {
+	_ = sip
+	bx := int(aux)
+	v := rf.vm.copyOutOfArena(rf.regs[src])
+	val.ClearEphemeral(v)
+	if v.IsString() {
+		rf.vm.opDetachStoreDeref(v)
+	}
+	activePtrs := rf.vm.activeCellPtrs
+	if uint(bx) < uint(len(activePtrs)) && activePtrs[bx] != nil {
+		activePtrs[bx].Value = v
+	} else {
+		cell := (*val.PyCell)(unsafe.Pointer(rf.st.cells[bx].HeaderPtr()))
+		cell.Value = v
+	}
+	rf.pc++
+	return val.Value{}, false
+}
+
+// storeFastView mirrors OP_STORE_FAST_VIEW on the register file. Without
+// tracked views it is a plain local store.
+func (rf *regFrame) storeFastView(local int, src int) (val.Value, bool) {
+	v := rf.vm.copyOutOfArena(rf.regs[src])
+	if rf.vm.hasTrackedViews {
+		key := viewSlotKey(rf.st.frameIdx, local)
+		rf.vm.storeFastValue(rf.regs[local], v, key)
+	}
+	rf.regs[local] = v
+	rf.pc++
+	return val.Value{}, false
+}
+
 func (rf *regFrame) dupTop(dst, src int) (val.Value, bool) {
 	top := rf.regs[src]
 	if top.IsString() || top.Kind() == val.KindMemoryView {
@@ -422,6 +480,9 @@ func (rf *regFrame) loadAttr(dst int, nameIdx uint16, sip int) (val.Value, bool)
 	if vm.execCtx.HasException() {
 		return rf.failCtx(sip)
 	}
+	if obj.IsSuper() {
+		vm.releaseSuper(obj.AsSuper())
+	}
 	rf.refresh()
 	rf.regs[dst] = res
 	rf.pc++
@@ -469,14 +530,11 @@ func (rf *regFrame) loadAttrNonInstance(obj val.Value, dst int, sip int, name va
 		tp := obj.HeaderPtr().Type
 		if tp != nil && (tp.Flags&val.FlagCustomGetAttribute) == 0 && !val.MultiThreadedFlag.Load() {
 			if entry.ExpectedTypeVer == tp.Version() {
-				switch entry.Kind {
-				case ICKindTupleGetter:
+				if entry.Kind == ICKindTupleGetter {
 					t := obj.AsTuple()
 					if uint(entry.SlotIndex) < uint(len(t.Items)) {
 						return t.Items[entry.SlotIndex], true
 					}
-				case ICKindProperty:
-					return rf.loadAttrProperty(dst, entry, obj, sip)
 				}
 			}
 		}
@@ -603,11 +661,331 @@ func (rf *regFrame) loadMethod(dst, meth int, nameIdx uint16, sip int) (val.Valu
 	if vm.execCtx.HasException() {
 		return rf.failCtx(sip)
 	}
+	if obj.IsSuper() {
+		vm.releaseSuper(obj.AsSuper())
+	}
 	rf.refresh()
 	rf.regs[dst] = recv
 	rf.regs[meth] = methVal
 	rf.pc++
 	return val.Value{}, false
+}
+
+// checkDirectReg performs all zero-mutation eligibility checks for inline
+// register-to-register chaining of a positional call to target with argc
+// positional arguments. Stack-capacity math is left to the caller so a
+// false return means nothing was touched.
+func (rf *regFrame) checkDirectReg(target val.Value, argc int) (*val.PyFunction, *CodeObject, *RegCode, bool) {
+	vm := rf.vm
+	st := rf.st
+	if !target.IsFunction() {
+		return nil, nil, nil, false
+	}
+	fn := target.AsFunction()
+	co := AsCodeObject(fn.Code)
+	if co == nil {
+		return nil, nil, nil, false
+	}
+	rc := co.RegCode()
+	if rc == nil {
+		return nil, nil, nil, false
+	}
+	if vm.hasTrackedViews {
+		return nil, nil, nil, false
+	}
+	if st.activeGen != nil || st.activeCoro != nil || !st.stackIsVM {
+		return nil, nil, nil, false
+	}
+	if st.frameIdx < 0 || st.frameIdx >= len(vm.frames) {
+		return nil, nil, nil, false
+	}
+	if len(st.stack) == 0 || len(vm.stack) == 0 || &st.stack[0] != &vm.stack[0] {
+		return nil, nil, nil, false
+	}
+	if !co.SimplePositionalOnly || fn.KwDefaults != nil {
+		return nil, nil, nil, false
+	}
+	if co.IsGenerator || co.IsCoroutine || co.CanSuspend {
+		return nil, nil, nil, false
+	}
+	// Free variables without a closure are unwirable; cell variables are
+	// bound fresh per call by the inline core.
+	if co.HasCells && !co.HasCellVars && fn.Closure == nil {
+		return nil, nil, nil, false
+	}
+	need := co.PositionalParamCount
+	if argc < need-len(fn.Defaults) || argc > need {
+		return nil, nil, nil, false
+	}
+	if co.NumLocals < need {
+		return nil, nil, nil, false
+	}
+	return fn, co, rc, true
+}
+
+// runDirectReg stages a resolved positional call inline at
+// nestedBase=rf.frameTop+1 and recurses straight into register execution
+// without pushCalleeFrame or runFrame. recvValid reports a bound receiver
+// prepended to the argc values at argsReg. It returns handled: false means
+// no state was touched; true means the result is in regs[dst] and pc
+// advanced. Faults unwind through the shared st and abort with regAbort
+// (recovered in runRegLoop), with st prepared for stack resume or
+// top-level exit.
+func (rf *regFrame) runDirectReg(dst int, target, recv val.Value, recvValid bool, argsReg, argc, sip int) bool {
+	if os.Getenv("FYTHON_DISABLE_INLINE") != "" {
+		return false
+	}
+	vm := rf.vm
+	st := rf.st
+	totalArgs := argc
+	if recvValid {
+		totalArgs++
+	}
+	fn, co, rc, ok := rf.checkDirectReg(target, totalArgs)
+	if !ok {
+		return false
+	}
+	nestedCallee := rf.frameTop
+	nestedBase := rf.frameTop + 1
+	need := nestedBase + int(rc.NumRegs)
+	if need < nestedBase {
+		return false
+	}
+	// Success path below: mutations are now allowed.
+	if need > len(st.stack) {
+		st.stack = vm.growStack(st, st.stack, need)
+		rf.refresh()
+	}
+	argVals := rf.regs[argsReg : argsReg+argc]
+	st.stack[nestedCallee] = target
+	pos := nestedBase
+	if recvValid {
+		st.stack[pos] = recv
+		pos++
+	}
+	copy(st.stack[pos:pos+argc], argVals)
+	if totalArgs < co.PositionalParamCount {
+		defStart := co.PositionalParamCount - len(fn.Defaults)
+		copy(st.stack[nestedBase+totalArgs:nestedBase+co.PositionalParamCount], fn.Defaults[totalArgs-defStart:])
+	}
+	if vm.hasTrackedViews {
+		markViewsEscaped(st.stack[nestedBase : nestedBase+totalArgs])
+	}
+	if st.stackIsVM && need > vm.maxSP {
+		vm.maxSP = need
+	}
+	savedArenaTop := vm.regArenaTop
+	var inlineCells []val.Value
+	var inlinePtrs []*val.PyCell
+	if co.HasCells {
+		if !co.HasCellVars && fn.Closure != nil {
+			inlineCells, inlinePtrs = fn.Closure, fn.CellPtrs
+		} else {
+			inlineCells, inlinePtrs = vm.setupCalleeCellsForFn(co, fn, st.stack, nestedBase)
+		}
+	}
+	frameIdx := st.frameIdx
+	if frameIdx+2 > len(vm.frames) {
+		vm.ensureFrameCapacity(frameIdx + 2)
+	}
+	saved := &vm.frames[frameIdx]
+	saved.co = st.curCO
+	saved.codePtr = st.codePtr
+	saved.codeLen = st.codeLen
+	saved.consts = st.consts
+	// Resume address, mirroring pushFrameFast (unwind derives the call
+	// site as caller.ip - 1).
+	saved.ip = sip + 1
+	saved.baseOffset = st.base
+	saved.retSP = rf.base + dst
+	saved.cells = st.cells
+	saved.cellPtrs = st.cellPtrs
+	saved.globals = st.globals
+	saved.locals = st.curLocals
+	saved.cache = st.cache
+	saved.excStackLen = len(vm.excStack)
+	saved.stackIsVM = st.stackIsVM
+	saved.initInstance = val.Value{}
+	saved.cmpActive = false
+	saved.genMode = genModeNone
+	saved.genDefault = val.Value{}
+	saved.stack = nil
+	saved.activeGen = nil
+	saved.activeCoro = nil
+	cc := vm.fastCalleeCache(co)
+	cc.ensureMethodPIC()
+	nextFrame := frameIdx + 1
+	st.frameIdx = nextFrame
+	if nextFrame > vm.maxFrameIdx {
+		vm.maxFrameIdx = nextFrame
+	}
+	st.curCO = co
+	st.cache = cc
+	if atomic.LoadInt32(&co.StreamGen) == cc.streamGen && atomic.LoadInt32(&co.IsTier2Optimized) != 0 {
+		st.codePtr = cc.codePtr
+		st.codeLen = cc.codeLen
+	} else {
+		vm.syncCalleeCode(st, co, cc)
+	}
+	st.consts = co.Consts
+	st.base = nestedBase
+	st.ip = sip
+	if !co.HasCells {
+		st.cells = nil
+		st.cellPtrs = nil
+	} else {
+		st.cells = inlineCells
+		st.cellPtrs = inlinePtrs
+	}
+	if fn.Globals != nil {
+		st.globals = fn.Globals
+	}
+	vm.activeCO = co
+	vm.activeBaseOffset = nestedBase
+	vm.activeCells = st.cells
+	vm.activeCellPtrs = st.cellPtrs
+	vm.activeFrameIdx = nextFrame
+	nf := vm.acquireRegFrame()
+	nf.vm = vm
+	nf.st = st
+	nf.co = co
+	nf.rc = rc
+	nf.base = nestedBase
+	nf.frameTop = nestedBase + int(rc.NumRegs)
+	nf.scratchBase = int(rc.ScratchBase)
+	nf.code = rc.Code
+	nf.pcs = rc.StackPC
+	nf.consts = co.Consts
+	nf.cache = st.cache
+	nf.regs = st.stack[nestedBase:]
+	nf.pc = 0
+	nf.nested = true
+	res, finished := func() (res val.Value, finished bool) {
+		defer func() {
+			vm.releaseRegFrame(nf)
+		}()
+		return nf.run()
+	}()
+	vm.discardRegArena(savedArenaTop)
+	if !finished {
+		panic("vm: register call fell off the end without return")
+	}
+	if !vm.unhandledException.IsNone() && vm.unhandledException.HeaderPtr() != nil {
+		panic(regAbort{})
+	}
+	st.frameIdx--
+	savedSlot := &vm.frames[st.frameIdx]
+	st.curCO = savedSlot.co
+	st.codePtr = savedSlot.codePtr
+	st.codeLen = savedSlot.codeLen
+	st.consts = savedSlot.consts
+	st.base = savedSlot.baseOffset
+	st.cells = savedSlot.cells
+	st.cellPtrs = savedSlot.cellPtrs
+	st.globals = savedSlot.globals
+	st.curLocals = savedSlot.locals
+	st.cache = savedSlot.cache
+	vm.activeCO = st.curCO
+	vm.activeBaseOffset = st.base
+	vm.activeCells = st.cells
+	vm.activeCellPtrs = st.cellPtrs
+	vm.activeFrameIdx = st.frameIdx
+	rf.refresh()
+	res = vm.copyOutOfArena(res)
+	rf.regs[dst] = res
+	rf.pc++
+	return true
+}
+
+// regSuperCall runs builtin super(...) by resolving (thisClass, self) and
+// acquiring a pooled ephemeral super exactly like the stack path, but
+// without the fused attribute/method follow-up: the following register
+// operations perform the lookup normally, so consuming the next stack
+// instruction here would double-dispatch. No interpreter frames are pushed.
+func (rf *regFrame) regSuperCall(dst, argsReg, argc, sip int) (val.Value, bool) {
+	vm := rf.vm
+	st := rf.st
+	if vm.hasTrackedViews && argc > 0 {
+		markViewsEscaped(rf.regs[argsReg : argsReg+argc])
+	}
+	st.ip = sip
+	var newBase int
+	if argc == 2 {
+		top := rf.frameTop
+		need := top + 2
+		if need > len(st.stack) {
+			st.stack = vm.growStack(st, st.stack, need)
+			rf.refresh()
+		}
+		copy(st.stack[top:top+2], rf.regs[argsReg:argsReg+2])
+		newBase = top
+	} else {
+		newBase = rf.frameTop
+	}
+	thisClass, self, ok := resolveSuperDirect(st, st.stack, newBase, argc)
+	if !ok {
+		// Fall back to the generic builtin call so argument errors
+		// surface identically to the stack loop.
+		top := rf.frameTop
+		need := top + argc + 1
+		if need > len(st.stack) {
+			st.stack = vm.growStack(st, st.stack, need)
+			rf.refresh()
+		}
+		st.stack[top] = vm.builtinSuper
+		if argc > 0 {
+			copy(st.stack[top+1:need], rf.regs[argsReg:argsReg+argc])
+		}
+		vm.execCtx.SP = need
+		res := vm.callFromHookSafe(vm.builtinSuper, top+1, argc, nil)
+		rf.refresh()
+		if vm.execCtx.HasException() {
+			exc := vm.execCtx.ActiveException
+			vm.execCtx.ClearException()
+			st.raiseExc = exc
+			return rf.fault(sip)
+		}
+		rf.regs[dst] = res
+		rf.pc++
+		return val.Value{}, false
+	}
+	ephemeral := isEphemeralSuperCallSiteAt(rf.co.Code, sip)
+	rf.regs[dst] = vm.acquireSuper(thisClass, self, ephemeral)
+	rf.pc++
+	return val.Value{}, false
+}
+
+// regBuiltinLen mirrors the stack loop's OP_CALL_LEN arm: it handles the
+// common builtin container kinds without retaining the argument.
+func regBuiltinLen(arg val.Value) (int, bool) {
+	switch arg.Kind() {
+	case val.KindString, val.KindInlineStr:
+		return arg.StringLen(), true
+	case val.KindList:
+		return len(arg.AsList().Items), true
+	case val.KindTuple:
+		return len(arg.AsTuple().Items), true
+	case val.KindDict:
+		return arg.AsDict().Len(), true
+	case val.KindSet:
+		return arg.AsSet().Len(), true
+	case val.KindBytes:
+		return len(arg.AsBytes().Data), true
+	case val.KindByteArray:
+		return len(arg.AsByteArray().Data), true
+	case val.KindMemoryView:
+		mv := arg.AsMemoryView()
+		switch {
+		case mv.NDim > 0:
+			return mv.Dim(0), true
+		case mv.ItemSize > 1:
+			return len(mv.Buf) / mv.ItemSize, true
+		default:
+			return len(mv.Buf), true
+		}
+	default:
+		return 0, false
+	}
 }
 
 // stageCall copies a [callee, args...] window of total slots starting at
@@ -638,6 +1016,21 @@ func (rf *regFrame) regCall(dst, callee, args int, argc int, sip int) (val.Value
 	st := rf.st
 	target := rf.regs[callee]
 	rf.callTick()
+	if os.Getenv("FYTHON_DISABLE_SUPER") == "" && target == vm.builtinSuper && (argc == 0 || argc == 2) {
+		return rf.regSuperCall(dst, args, argc, sip)
+	}
+	// Builtin len() neither retains nor escapes its argument, so it skips
+	// view-escape marking exactly like the stack loop's OP_CALL_LEN arm.
+	if os.Getenv("FYTHON_DISABLE_LEN") == "" && target == vm.builtinLen && argc == 1 {
+		if n, ok := regBuiltinLen(rf.regs[args]); ok {
+			rf.regs[dst] = val.Int64Val(int64(n))
+			rf.pc++
+			return val.Value{}, false
+		}
+	}
+	if rf.runDirectReg(dst, target, val.Value{}, false, args, argc, sip) {
+		return val.Value{}, false
+	}
 	if vm.hasTrackedViews && argc > 0 {
 		markViewsEscaped(rf.regs[args : args+argc])
 	}
@@ -665,6 +1058,13 @@ func (rf *regFrame) regCallMethod(dst, meth, args int, argc int, sip int) (val.V
 	recv := regs[dst]
 	callable := regs[meth]
 	rf.callTick()
+	if recv.IsUnbound() {
+		if rf.runDirectReg(dst, callable, val.Value{}, false, args, argc, sip) {
+			return val.Value{}, false
+		}
+	} else if rf.runDirectReg(dst, callable, recv, true, args, argc, sip) {
+		return val.Value{}, false
+	}
 	if vm.hasTrackedViews && argc > 0 {
 		markViewsEscaped(regs[args : args+argc])
 	}
@@ -969,7 +1369,7 @@ func (rf *regFrame) getItem(dst, objR, keyR int, sip int) (val.Value, bool) {
 	case val.IsInlineStrASCII(obj) && key.IsInt64():
 		raw := obj.RawNum()
 		if k := key.AsInt64(); uint64(k) < (raw & 0xFF) {
-			regs[dst] = val.InlineByteCharVal(byte(raw >> (uint(k) + 1) * 8))
+			regs[dst] = val.InlineByteCharVal(byte(raw >> ((uint(k) + 1) * 8)))
 			rf.pc++
 			return val.Value{}, false
 		}

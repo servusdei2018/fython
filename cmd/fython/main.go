@@ -23,6 +23,7 @@ func run() int {
 	if os.Getenv("FYTHON_OPSTATS") != "" {
 		defer vm.DumpOpStats(os.Stderr)
 		defer vm.DumpRegStats(os.Stderr)
+		defer vm.DumpRegRejects(os.Stderr)
 	}
 	if os.Getenv("GOGC") == "" {
 		debug.SetGCPercent(500)

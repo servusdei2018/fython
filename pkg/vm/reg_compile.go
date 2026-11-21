@@ -1,5 +1,7 @@
 package vm
 
+import "os"
+
 // TryCompileRegCode compiles the stack bytecode of co into 3-address
 // register form. It returns nil when co is ineligible for register
 // execution; the caller then keeps executing the stack stream.
@@ -9,16 +11,24 @@ package vm
 // at every merge, and the total register demand must fit the fixed file.
 // Anything else fails closed to the stack loop.
 func TryCompileRegCode(co *CodeObject) *RegCode {
+	if os.Getenv("FYTHON_DISABLE_REG") != "" {
+		recordRegReject(co, "bisect-disabled")
+		return nil
+	}
 	if co == nil || len(co.Code) == 0 {
+		recordRegReject(co, "empty-code")
 		return nil
 	}
 	if len(co.ExceptionTable) != 0 {
+		recordRegReject(co, "has-exception-table")
 		return nil
 	}
 	if co.IsGenerator || co.IsCoroutine || co.CanSuspend {
+		recordRegReject(co, "is-generator-or-coro")
 		return nil
 	}
 	if len(co.CellVars) != 0 || len(co.FreeVars) != 0 {
+		recordRegReject(co, "has-cellvars-or-freevars")
 		return nil
 	}
 	if !co.ParamShapeComputed {
@@ -27,13 +37,16 @@ func TryCompileRegCode(co *CodeObject) *RegCode {
 	scratchBase := co.EffectiveLocals
 	scratchBase = max(scratchBase, co.NumLocals)
 	if scratchBase >= regMaxRegs {
+		recordRegReject(co, "scratch-base-overflow")
 		return nil
 	}
 	if co.MaxStackSize > 0 && scratchBase+co.MaxStackSize > regMaxRegs {
+		recordRegReject(co, "register-overflow")
 		return nil
 	}
 	entry := co.EntryIP
 	if entry < 0 || entry >= len(co.Code) {
+		recordRegReject(co, "bad-entry-ip")
 		return nil
 	}
 	b := &regBuilder{
@@ -54,9 +67,14 @@ func TryCompileRegCode(co *CodeObject) *RegCode {
 	// safe intermediate.
 	b.moveTemp = b.allocScratch()
 	if b.moveTemp < 0 {
+		recordRegReject(co, "scratch-temp-exhausted")
 		return nil
 	}
 	if !b.build() {
+		if b.rejectReason == "" {
+			b.rejectReason = "build-failed"
+		}
+		recordRegReject(co, b.rejectReason)
 		return nil
 	}
 	return &RegCode{
@@ -126,6 +144,8 @@ type regBuilder struct {
 	// conditional jump, so the driver skips an extra instruction and
 	// closes the block.
 	fusedJump bool
+	// rejectReason records the first failure cause for opstats telemetry.
+	rejectReason string
 }
 
 type regFixup struct {
@@ -156,6 +176,13 @@ type regRetLive struct {
 func (b *regBuilder) fail() bool {
 	b.failed = true
 	return false
+}
+
+// rejectf records the first rejection reason for telemetry.
+func (b *regBuilder) rejectf(reason string) {
+	if b.rejectReason == "" {
+		b.rejectReason = reason
+	}
 }
 
 func (b *regBuilder) allocScratch() int {
@@ -342,6 +369,7 @@ func (b *regBuilder) recordEntry(posIP, target int, vstack []uint8) ([]uint8, bo
 		if int(r) < b.scratchBase {
 			s := b.allocScratch()
 			if s < 0 {
+				b.rejectf("register-overflow")
 				return nil, false
 			}
 			b.emit(RegMov, s, int(r), 0, 0, posIP)
@@ -425,6 +453,7 @@ func (b *regBuilder) edgeTo(ip, target int, conditional bool) bool {
 	}
 	mv, ok := b.reconcile(b.entries[target], b.vstack)
 	if !ok {
+		b.rejectf("merge-depth-mismatch")
 		return b.fail()
 	}
 	if conditional {
@@ -454,6 +483,7 @@ func (b *regBuilder) build() bool {
 			OP_FOR_ITER, OP_FOR_ITER_RANGE:
 			t := int(DecodeArgBx(inst))
 			if t < b.entry || t >= n {
+				b.rejectf("bad-jump-target")
 				return false
 			}
 			b.leaders[t] = true
@@ -481,6 +511,7 @@ func (b *regBuilder) build() bool {
 				// the recorded entry with no reconciliation MOVs.
 				want, ok := b.entries[ip]
 				if !ok {
+					b.rejectf("missing-entry-unreachable")
 					return false
 				}
 				b.vstack = append(b.vstack[:0], want...)
@@ -490,6 +521,7 @@ func (b *regBuilder) build() bool {
 				b.reachable = true
 			case !b.hasEntry[ip]:
 				if _, ok := b.recordEntry(ip, ip, b.vstack); !ok {
+					b.rejectf("record-entry-failed")
 					return false
 				}
 			default:
@@ -497,6 +529,7 @@ func (b *regBuilder) build() bool {
 				want := b.entries[ip]
 				mv, ok := b.reconcile(want, b.vstack)
 				if !ok {
+					b.rejectf("merge-depth-mismatch")
 					return false
 				}
 				for _, m := range mv {
@@ -518,6 +551,9 @@ func (b *regBuilder) build() bool {
 			continue
 		}
 		if !b.lower(op, inst, ip) || b.failed {
+			if b.rejectReason == "" {
+				b.rejectReason = "no-lowering:" + op.String()
+			}
 			return false
 		}
 		switch op {
@@ -566,6 +602,7 @@ func (b *regBuilder) build() bool {
 	for _, j := range b.jumps {
 		pc, ok := b.pcOf[j.target]
 		if !ok {
+			b.rejectf("missing-jump-target")
 			return false
 		}
 		inst := b.code[j.pos]
@@ -580,9 +617,16 @@ func (b *regBuilder) build() bool {
 		}
 	}
 	if b.failed {
+		if b.rejectReason == "" {
+			b.rejectReason = "build-failed"
+		}
 		return false
 	}
-	return b.verify()
+	if !b.verify() {
+		b.rejectf("verify-failed")
+		return false
+	}
+	return true
 }
 
 // singleDef reports whether op defines exactly one destination register
@@ -591,7 +635,7 @@ func (b *regBuilder) build() bool {
 // excluded: their inputs are positionally tied to the result slot.
 func (b *regBuilder) singleDef(op RegOp) bool {
 	switch op {
-	case RegLoadConst, RegLoadGlobal,
+	case RegLoadConst, RegLoadGlobal, RegLoadDeref,
 		RegAdd, RegSub, RegMul, RegTrueDiv, RegFloorDiv, RegMod,
 		RegPow, RegMatMul, RegBitAnd, RegBitOr, RegBitXor,
 		RegLShift, RegRShift, RegNeg, RegPos, RegInvert, RegNot,
@@ -610,6 +654,7 @@ func (b *regBuilder) verify() bool {
 	for _, inst := range b.code {
 		for _, r := range []uint8{DecodeRegDst(inst), DecodeRegSrc1(inst), DecodeRegSrc2(inst)} {
 			if int(r) >= nregs {
+				b.rejectf("verify-reg-range")
 				return false
 			}
 		}
@@ -620,6 +665,7 @@ func (b *regBuilder) verify() bool {
 			RegIsNoneJmpIfFalse, RegIsNoneJmpIfTrue,
 			RegForIter, RegForIterRange:
 			if int(DecodeRegAux(inst)) >= len(b.code) {
+				b.rejectf("verify-jump-range")
 				return false
 			}
 		}

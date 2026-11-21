@@ -853,6 +853,8 @@ type VM struct {
 	reASCIICache    [4]reASCIIEntry
 	reASCIICachePos int
 	hasTrackedViews bool
+	regArena        []val.Value
+	regArenaTop     int
 	rootCO          CodeObject
 	rootCache       VMCodeCache
 	limits          RuntimeLimits
@@ -1245,6 +1247,7 @@ func (vm *VM) Reset() {
 	vm.lastReRunes = nil
 	vm.reASCIICache = [4]reASCIIEntry{}
 	vm.reASCIICachePos = 0
+	vm.discardRegArena(0)
 	if vm.context == nil || vm.context.Len() > 0 {
 		vm.context = val.NewPyContext()
 	}

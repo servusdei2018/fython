@@ -120,6 +120,13 @@ const (
 	RegPopTop // releases R[src1]
 	RegDupTop // R[dst] = R[src1]
 
+	// Cell variables. aux is the cell index.
+	RegLoadDeref  // R[dst] = cell[aux]
+	RegStoreDeref // cell[aux] = R[src1]
+
+	// Memoryview-aware local store. aux is the local index, src1 the value.
+	RegStoreFastView // R[aux] = R[src1] with view-slot bookkeeping
+
 	// Exceptions. aux is the argc operand of OP_RAISE.
 	RegRaise // src1 is exc (or exc/cause pair in src1, src2)
 )
@@ -261,6 +268,12 @@ func (op RegOp) String() string {
 		return "REG_POP_TOP"
 	case RegDupTop:
 		return "REG_DUP_TOP"
+	case RegLoadDeref:
+		return "REG_LOAD_DEREF"
+	case RegStoreDeref:
+		return "REG_STORE_DEREF"
+	case RegStoreFastView:
+		return "REG_STORE_FAST_VIEW"
 	case RegRaise:
 		return "REG_RAISE"
 	default:

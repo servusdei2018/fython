@@ -170,20 +170,8 @@ func TestRegRejects(t *testing.T) {
 		"excTable": mk(func(co *CodeObject) {
 			co.ExceptionTable = []ExceptionEntry{{StartIP: 0, EndIP: 1, TargetIP: 1}}
 		}),
-		"cells": mk(func(co *CodeObject) {
-			co.CellVars = []val.Value{val.InternString("c")}
-		}),
-		"freevars": mk(func(co *CodeObject) {
-			co.FreeVars = []val.Value{val.InternString("f")}
-		}),
 		"import": mk(func(co *CodeObject) {
 			co.Code = []uint32{Encode(OP_IMPORT_NAME, 0, 0), Encode(OP_POP_TOP, 0, 0), Encode(OP_LOAD_CONST, 0, 0), Encode(OP_RETURN, 0, 0)}
-		}),
-		"storeView": mk(func(co *CodeObject) {
-			co.Code = []uint32{Encode(OP_LOAD_CONST, 0, 0), Encode(OP_STORE_FAST_VIEW, 0, 0), Encode(OP_LOAD_CONST, 0, 0), Encode(OP_RETURN, 0, 0)}
-		}),
-		"deref": mk(func(co *CodeObject) {
-			co.Code = []uint32{Encode(OP_LOAD_DEREF, 0, 0), Encode(OP_RETURN, 0, 0), Encode(OP_NOP, 0, 0), Encode(OP_NOP, 0, 0)}
 		}),
 		"badJump": mk(func(co *CodeObject) {
 			co.Code = []uint32{Encode(OP_JUMP, 0, 99), Encode(OP_LOAD_CONST, 0, 0), Encode(OP_RETURN, 0, 0), Encode(OP_NOP, 0, 0)}
@@ -193,6 +181,12 @@ func TestRegRejects(t *testing.T) {
 			co.MaxStackSize = 16
 			co.Code = []uint32{Encode(OP_LOAD_CONST, 0, 0), Encode(OP_RETURN, 0, 0), Encode(OP_NOP, 0, 0), Encode(OP_NOP, 0, 0)}
 		}),
+		"cells": mk(func(co *CodeObject) {
+			co.CellVars = []val.Value{val.InternString("c")}
+		}),
+		"freevars": mk(func(co *CodeObject) {
+			co.FreeVars = []val.Value{val.InternString("f")}
+		}),
 	}
 	for name, co := range cases {
 		if rc := TryCompileRegCode(co); rc != nil {
@@ -200,6 +194,22 @@ func TestRegRejects(t *testing.T) {
 		}
 		if co.RegCode() != nil {
 			t.Fatalf("%s: RegCode published despite rejection", name)
+		}
+	}
+	// View stores and deref reads lower to register operations, so they
+	// compile. Cell and free variables stay fail-closed: functions that
+	// define or capture cells keep the stack loop.
+	accept := map[string]*CodeObject{
+		"storeView": mk(func(co *CodeObject) {
+			co.Code = []uint32{Encode(OP_LOAD_CONST, 0, 0), Encode(OP_STORE_FAST_VIEW, 0, 0), Encode(OP_LOAD_CONST, 0, 0), Encode(OP_RETURN, 0, 0)}
+		}),
+		"deref": mk(func(co *CodeObject) {
+			co.Code = []uint32{Encode(OP_LOAD_DEREF, 0, 0), Encode(OP_RETURN, 0, 0), Encode(OP_NOP, 0, 0), Encode(OP_NOP, 0, 0)}
+		}),
+	}
+	for name, co := range accept {
+		if rc := TryCompileRegCode(co); rc == nil {
+			t.Fatalf("%s: expected RegCode, got rejection", name)
 		}
 	}
 }

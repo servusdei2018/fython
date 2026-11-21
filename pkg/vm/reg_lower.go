@@ -1,5 +1,7 @@
 package vm
 
+import "os"
+
 // lower compiles a single stack instruction at ip. It returns false when the
 // opcode has no register lowering, failing the whole compilation closed to
 // the stack loop. Transfers terminate the current block; the caller advances
@@ -64,6 +66,50 @@ func (b *regBuilder) lower(op Opcode, inst uint32, ip int) bool {
 		b.producer[d] = int32(len(b.code) - 1)
 		b.prodBlock[d] = b.blockID
 		return b.push(d)
+	case OP_LOAD_DEREF:
+		if os.Getenv("FYTHON_DISABLE_DEREF") != "" {
+			return false
+		}
+		bx := int(DecodeArgBx(inst))
+		if bx < 0 {
+			return false
+		}
+		d := b.allocScratch()
+		if d < 0 {
+			return false
+		}
+		b.emit(RegLoadDeref, d, 0, 0, uint32(bx), ip)
+		b.producer[d] = int32(len(b.code) - 1)
+		b.prodBlock[d] = b.blockID
+		return b.push(d)
+	case OP_STORE_DEREF:
+		if os.Getenv("FYTHON_DISABLE_DEREF") != "" {
+			return false
+		}
+		bx := int(DecodeArgBx(inst))
+		if bx < 0 || len(b.vstack) == 0 {
+			return false
+		}
+		v := b.pop()
+		if b.failed {
+			return false
+		}
+		b.emit(RegStoreDeref, 0, v, 0, uint32(bx), ip)
+		return true
+	case OP_STORE_FAST_VIEW:
+		if os.Getenv("FYTHON_DISABLE_STOREVIEW") != "" {
+			return false
+		}
+		x := int(DecodeArgBx(inst))
+		if x < 0 || x >= b.scratchBase || len(b.vstack) == 0 {
+			return false
+		}
+		r := b.pop()
+		if b.failed {
+			return false
+		}
+		b.emit(RegStoreFastView, 0, r, 0, uint32(x), ip)
+		return true
 	case OP_STORE_GLOBAL:
 		c := int(DecodeArgBx(inst))
 		if c < 0 || c >= len(b.co.Consts) {
@@ -87,6 +133,11 @@ func (b *regBuilder) lower(op Opcode, inst uint32, ip int) bool {
 		return b.lowerLoadMethod(inst, ip)
 	case OP_CALL_METHOD:
 		return b.lowerCallMethod(inst, ip)
+	case OP_CALL_METHOD_PIC:
+		if os.Getenv("FYTHON_DISABLE_PIC_DESUGAR") != "" {
+			return false
+		}
+		return b.lowerCallMethodPIC(inst, ip)
 	case OP_CALL:
 		return b.lowerCall(inst, ip)
 	case OP_CALL_KW:
@@ -774,6 +825,61 @@ func (b *regBuilder) lowerCallMethod(inst uint32, ip int) bool {
 	}
 	b.freeWindow(w+1, argc+1)
 	return true
+}
+
+// lowerCallMethodPIC desugars a quickened method call into the existing
+// LOAD_METHOD + CALL_METHOD lowerings. The stack holds [recv, args...] with
+// the method name in the instruction; shuffling routes through the two
+// established paths so no new runtime operation is needed.
+func (b *regBuilder) lowerCallMethodPIC(inst uint32, ip int) bool {
+	argc := int(DecodeArgA(inst))
+	methIdx := int(DecodeArgBx(inst))
+	if argc < 0 || argc > 250 {
+		return false
+	}
+	if methIdx < 0 || methIdx >= len(b.co.Consts) {
+		return false
+	}
+	if len(b.vstack) < argc+1 {
+		return false
+	}
+	args := make([]int, argc)
+	for i := argc - 1; i >= 0; i-- {
+		args[i] = b.pop()
+		if b.failed {
+			return false
+		}
+	}
+	recv := b.pop()
+	if b.failed {
+		return false
+	}
+	// Hold every live source across the sub-lowerings so window allocation
+	// can never recycle one mid-shuffle.
+	for _, a := range args {
+		b.hold(a)
+	}
+	b.hold(recv)
+	if !b.push(recv) {
+		return false
+	}
+	ok := b.lowerLoadMethod(Encode(OP_LOAD_METHOD, 0, uint16(methIdx)), ip)
+	if ok {
+		for _, a := range args {
+			if !b.push(a) {
+				ok = false
+				break
+			}
+		}
+	}
+	if ok {
+		ok = b.lowerCallMethod(Encode(OP_CALL_METHOD, uint8(argc), 0), ip)
+	}
+	for _, a := range args {
+		b.unhold(a)
+	}
+	b.unhold(recv)
+	return ok && !b.failed
 }
 
 func (b *regBuilder) lowerCall(inst uint32, ip int) bool {

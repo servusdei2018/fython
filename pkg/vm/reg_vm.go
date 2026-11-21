@@ -1,11 +1,103 @@
 package vm
 
 import (
+	"os"
 	"sync/atomic"
 	"unsafe"
 
 	"github.com/servusdei2018/fython/pkg/val"
 )
+
+// regAbort aborts Go control flow to the enclosing runFrame when a nested
+// register call faults and the stack state has already been unwound to a
+// handler (or to the top with vm.unhandledException set). The loopState
+// carries the resume state, so the panic value itself is empty.
+type regAbort struct{}
+
+// tryRegEntry attempts synchronous register execution for a quickened stack
+// call whose arguments are already bound at newBase. retSP is the caller
+// slot for the result, retIP the caller resume ip, callIP the call-site ip
+// for tracebacks. argc is the positional argument count (excluding the
+// callable slot when popCallable applies).
+//
+// All eligibility checks and capacity math run before any mutation: a
+// handled=false return leaves vm.stack, st and vm.regArenaTop untouched.
+// On handled=true the result is in stack[retSP]; the caller continues at
+// (retIP, retSP+1), or at the unwind handler on faults. Constructor
+// type-init calls (0x40000000) never enter here; the caller keeps them on
+// the existing pushFrameFast path so __init__ return-self semantics stay
+// intact.
+func (vm *VM) tryRegEntry(st *loopState, fn *val.PyFunction, callee *CodeObject, cc *VMCodeCache, newBase, retSP, retIP, callIP, argc int) (int, int, bool) {
+	if os.Getenv("FYTHON_DISABLE_TRYREG") != "" {
+		return 0, 0, false
+	}
+	rc := callee.RegCode()
+	if rc == nil {
+		return 0, 0, false
+	}
+	if !vm.regCallEligible(st, callee) {
+		return 0, 0, false
+	}
+	if vm.hasTrackedViews {
+		return 0, 0, false
+	}
+	if fn == nil {
+		return 0, 0, false
+	}
+	if vm.frames[st.frameIdx].initInstance.HeaderPtr() != nil {
+		return 0, 0, false
+	}
+	if !callee.SimplePositionalOnly || fn.KwDefaults != nil {
+		return 0, 0, false
+	}
+	needParams := callee.PositionalParamCount
+	if argc < needParams-len(fn.Defaults) || argc > needParams {
+		return 0, 0, false
+	}
+	if callee.NumLocals < needParams {
+		return 0, 0, false
+	}
+	// Free variables without a closure are unwirable; cell variables are
+	// bound fresh per call by the nested runner.
+	if callee.HasCells && !callee.HasCellVars && fn.Closure == nil {
+		return 0, 0, false
+	}
+	_ = cc
+	need := newBase + int(rc.NumRegs)
+	if need < newBase {
+		return 0, 0, false
+	}
+	// Success path below: mutations are now allowed.
+	if need > len(st.stack) {
+		st.stack = vm.growStack(st, st.stack, need)
+	}
+	if argc < needParams {
+		defStart := needParams - len(fn.Defaults)
+		copy(st.stack[newBase+argc:newBase+needParams], fn.Defaults[argc-defStart:])
+	}
+	if st.stackIsVM {
+		if hw := newBase + callee.FrameStackNeed; hw > vm.maxSP {
+			vm.maxSP = hw
+		}
+	}
+	savedArenaTop := vm.regArenaTop
+	nextSP := newBase + callee.EffectiveLocals
+	res, faulted := vm.nestedRegRun(st, callee, fn, newBase, nextSP)
+	vm.discardRegArena(savedArenaTop)
+	if faulted {
+		exc := vm.unhandledException
+		vm.unhandledException = val.NoneVal()
+		st.raiseExc = exc
+		nip, nsp, ctl := vm.unwind(st, callIP)
+		if ctl == ctlExit {
+			panic(regAbort{})
+		}
+		return nip, nsp, true
+	}
+	st.stack = vm.stack
+	st.stack[retSP] = res
+	return retIP, retSP + 1, true
+}
 
 // tryNestedRegCall attempts register execution for an in-loop call to
 // callee whose arguments are already bound in st.stack[newBase:nextSP]. On
@@ -15,7 +107,17 @@ import (
 // negative callIP to derive and verify it from retIP (bailing when the
 // resume slot does not decode to a call).
 func (vm *VM) tryNestedRegCall(st *loopState, callee *CodeObject, fn *val.PyFunction, newBase, nextSP, retSP, retIP, callIP int) (int, int, loopCtl, bool) {
+	if os.Getenv("FYTHON_DISABLE_NESTED") != "" {
+		return 0, 0, ctlNext, false
+	}
 	if !vm.regCallEligible(st, callee) {
+		return 0, 0, ctlNext, false
+	}
+	// Constructor __init__ calls carry the freshly allocated receiver in the
+	// caller slot's initInstance for opReturnSlow's return-self protocol.
+	// They stay on the stack path; direct __init__ calls (no marker) may
+	// still enter register execution.
+	if vm.frames[st.frameIdx].initInstance.HeaderPtr() != nil {
 		return 0, 0, ctlNext, false
 	}
 	if callIP < 0 {
@@ -40,8 +142,8 @@ func (vm *VM) tryNestedRegCall(st *loopState, callee *CodeObject, fn *val.PyFunc
 }
 
 // regCallEligible reports whether an in-loop call may enter register
-// execution. Type-construction __init__ calls and dunder comparisons with
-// caller fallback state keep the stack path.
+// execution. Dunder comparisons with caller fallback state keep the stack
+// path; everything else is governed by the callee's register compilation.
 func (vm *VM) regCallEligible(st *loopState, callee *CodeObject) bool {
 	rc := callee.RegCode()
 	if rc == nil || len(callee.Code) < 16 || callee.Name == "__init__" {
@@ -61,7 +163,8 @@ func (vm *VM) regCallEligible(st *loopState, callee *CodeObject) bool {
 
 // nestedRegRun executes callee in a nested frame, returning (result, false)
 // on success. On fault it returns (zero, true) with the exception pending
-// in vm.unhandledException and st.stack refreshed.
+// in vm.unhandledException and st.stack refreshed. Cell environments are
+// wired exactly like the stack call path so closures execute.
 func (vm *VM) nestedRegRun(st *loopState, callee *CodeObject, fn *val.PyFunction, newBase, nextSP int) (val.Value, bool) {
 	fnGlobals := st.globals
 	if fn != nil && fn.Globals != nil {
@@ -69,7 +172,15 @@ func (vm *VM) nestedRegRun(st *loopState, callee *CodeObject, fn *val.PyFunction
 	}
 	nextFrame := st.frameIdx + 1
 	vm.ensureFrameCapacity(nextFrame + 4)
-	res := vm.runFrame(callee, newBase, nextSP, nextFrame, nil, fnGlobals, val.NoneVal(), st.stack, nil, nil)
+	var cells []val.Value
+	if callee.HasCells {
+		if !callee.HasCellVars && fn != nil && fn.Closure != nil {
+			cells = fn.Closure
+		} else {
+			cells, _ = vm.setupCalleeCellsForFn(callee, fn, st.stack, newBase)
+		}
+	}
+	res := vm.runFrame(callee, newBase, nextSP, nextFrame, cells, fnGlobals, val.NoneVal(), st.stack, nil, nil)
 	st.stack = vm.stack
 	if !vm.unhandledException.IsNone() && vm.unhandledException.HeaderPtr() != nil {
 		return val.Value{}, true
@@ -128,6 +239,15 @@ func (vm *VM) runRegLoop(fn *val.PyFunction, co *CodeObject, rc *RegCode, base i
 	if frameTop > len(st.stack) {
 		return val.Value{}, false
 	}
+	// Slow helpers shared with the stack loop (notably loadMethodSlow) write
+	// the method PIC unconditionally; make sure the slab is sized. The
+	// per-(VM, code) slabs allocate once and the checks are lenient after
+	// warmup.
+	st.cache.ensureMethodPIC()
+	if os.Getenv("FYTHON_DEBUG_REGENTRY") != "" {
+		println("regentry", co.Name)
+	}
+	savedArenaTop := vm.regArenaTop
 	rf := vm.acquireRegFrame()
 	rf.vm = vm
 	rf.st = st
@@ -142,8 +262,20 @@ func (vm *VM) runRegLoop(fn *val.PyFunction, co *CodeObject, rc *RegCode, base i
 	rf.cache = st.cache
 	rf.regs = st.stack[base:]
 	rf.pc = 0
-	res, ok := rf.run()
-	vm.releaseRegFrame(rf)
+	res, ok := func() (res val.Value, ok bool) {
+		defer func() {
+			vm.releaseRegFrame(rf)
+			if r := recover(); r != nil {
+				if _, isAbort := r.(regAbort); isAbort {
+					res, ok = val.Value{}, false
+					return
+				}
+				panic(r)
+			}
+		}()
+		return rf.run()
+	}()
+	vm.discardRegArena(savedArenaTop)
 	return res, ok
 }
 
@@ -162,17 +294,29 @@ type regFrame struct {
 	cache       *VMCodeCache
 	regs        []val.Value
 	pc          int
+	// nested marks an inline register-to-register frame pushed without a
+	// fresh loopState. Faults unwind through the shared st and abort with
+	// regAbort instead of resuming.
+	nested bool
 }
 
 // fault unwinds the register frame at mapped stack ip. Register functions
 // carry no exception tables, so unwind always runs to the nested-call
 // protocol: vm.unhandledException carries the exception to the caller.
+// Inline nested frames (nested=true) instead stash the handler continuation
+// in st and abort with regAbort: the outer runRegLoop recovers it and the
+// enclosing runFrame resumes the stack loop (or returns on top-level exit).
 func (rf *regFrame) fault(sip int) (val.Value, bool) {
 	rf.st.ip = sip
 	rf.st.sp = rf.frameTop
-	_, _, ctl := rf.vm.unwind(rf.st, sip)
+	nip, nsp, ctl := rf.vm.unwind(rf.st, sip)
 	if ctl == ctlExit {
 		return rf.st.result, true
+	}
+	if rf.nested {
+		rf.st.ip = nip
+		rf.st.sp = nsp
+		panic(regAbort{})
 	}
 	panic("vm: register loop resumed after unwind")
 }
