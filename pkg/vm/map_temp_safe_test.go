@@ -44,7 +44,7 @@ func TestComputeLocalDictSafeRejects(t *testing.T) {
 	}{
 		"too many entries": {
 			code: []uint32{
-				Encode(OP_BUILD_MAP, 0, 9),
+				Encode(OP_BUILD_MAP, 0, 17),
 				Encode(OP_STORE_FAST, 0, 0),
 				Encode(OP_LOAD_FAST, 0, 0),
 				Encode(OP_CALL_FUNCTION_EX, 1, 0),

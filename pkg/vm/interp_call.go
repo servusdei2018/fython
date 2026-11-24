@@ -1482,28 +1482,43 @@ func (vm *VM) lookupAttrQueryPIC(st *loopState, ip int, obj, rawName val.Value, 
 	}
 	typeVer := tp.Version()
 	pic := &st.cache.ensureAttrQueryPIC()[ip]
-	for k := range 4 {
-		e := &pic[k]
-		if e.Kind != attrQueryNone && e.TypeVer == typeVer && e.ShapeID == shapeID && e.Name == rawName {
-			switch e.Kind {
-			case attrQueryMiss:
-				return val.Value{}, false, true, e.Name
-			case attrQueryClassAttr:
-				return e.CachedVal, true, true, e.Name
-			case attrQueryClassFunc:
-				if wantVal {
-					return val.NewBoundMethodVal(obj, e.CachedVal), true, true, e.Name
-				}
-				return val.Value{}, true, true, e.Name
-			case attrQuerySlot:
-				if instObj != nil && uint(e.SlotIndex) < uint(len(instObj.Slots)) {
-					v := instObj.Slots[e.SlotIndex]
-					if !v.IsUnbound() {
-						return v, true, true, e.Name
+	var picExt *[4]AttrQueryPICEntry
+	if uint(ip) < uint(len(st.cache.attrQueryPICExt)) {
+		picExt = &st.cache.attrQueryPICExt[ip]
+	}
+	probeAttrQuery := func(entries *[4]AttrQueryPICEntry, name val.Value) (val.Value, bool, bool, val.Value) {
+		for k := range 4 {
+			e := &entries[k]
+			if e.Kind != attrQueryNone && e.TypeVer == typeVer && e.ShapeID == shapeID && e.Name == name {
+				switch e.Kind {
+				case attrQueryMiss:
+					return val.Value{}, false, true, e.Name
+				case attrQueryClassAttr:
+					return e.CachedVal, true, true, e.Name
+				case attrQueryClassFunc:
+					if wantVal {
+						return val.NewBoundMethodVal(obj, e.CachedVal), true, true, e.Name
 					}
+					return val.Value{}, true, true, e.Name
+				case attrQuerySlot:
+					if instObj != nil && uint(e.SlotIndex) < uint(len(instObj.Slots)) {
+						v := instObj.Slots[e.SlotIndex]
+						if !v.IsUnbound() {
+							return v, true, true, e.Name
+						}
+					}
+					return val.Value{}, false, false, e.Name
 				}
-				return val.Value{}, false, false, e.Name
 			}
+		}
+		return val.Value{}, false, false, val.Value{}
+	}
+	if v, ok, hit, nm := probeAttrQuery(pic, rawName); hit {
+		return v, ok, true, nm
+	}
+	if picExt != nil {
+		if v, ok, hit, nm := probeAttrQuery(picExt, rawName); hit {
+			return v, ok, true, nm
 		}
 	}
 
@@ -1511,35 +1526,33 @@ func (vm *VM) lookupAttrQueryPIC(st *loopState, ip int, obj, rawName val.Value, 
 	if interned == nameDunderDict || interned == nameAnnotations || interned == nameDunderDoc || interned == nameClass {
 		return val.Value{}, false, false, interned
 	}
-	for k := range 4 {
-		e := &pic[k]
-		if e.Kind != attrQueryNone && e.TypeVer == typeVer && e.ShapeID == shapeID && e.Name == interned {
-			switch e.Kind {
-			case attrQueryMiss:
-				return val.Value{}, false, true, interned
-			case attrQueryClassAttr:
-				return e.CachedVal, true, true, interned
-			case attrQueryClassFunc:
-				if wantVal {
-					return val.NewBoundMethodVal(obj, e.CachedVal), true, true, interned
-				}
-				return val.Value{}, true, true, interned
-			case attrQuerySlot:
-				if instObj != nil && uint(e.SlotIndex) < uint(len(instObj.Slots)) {
-					v := instObj.Slots[e.SlotIndex]
-					if !v.IsUnbound() {
-						return v, true, true, interned
-					}
-				}
-				return val.Value{}, false, false, interned
-			}
+	if v, ok, hit, nm := probeAttrQuery(pic, interned); hit {
+		return v, ok, true, nm
+	}
+	if picExt != nil {
+		if v, ok, hit, nm := probeAttrQuery(picExt, interned); hit {
+			return v, ok, true, nm
 		}
 	}
 
 	var slotKind uint8
 	var cachedVal val.Value
 	var slotIdx int32
-	descr, _, foundInClass := tp.LookupMRO(interned)
+	var descr val.Value
+	var foundInClass bool
+	if instObj == nil && isNativeAttrCacheableType(tp) && len(tp.MRO) <= 2 {
+		if v, ok := tp.Dict.Get(interned); ok {
+			descr = v
+			foundInClass = true
+		} else if val.ObjectType != nil && tp != val.ObjectType {
+			if v, ok := val.ObjectType.Dict.Get(interned); ok {
+				descr = v
+				foundInClass = true
+			}
+		}
+	} else {
+		descr, _, foundInClass = tp.LookupMRO(interned)
+	}
 	if foundInClass {
 		if descr.IsDataDescriptor() || descr.Type().Slots.TpDescrSet != nil {
 			return val.Value{}, false, false, interned
@@ -1612,20 +1625,7 @@ func (vm *VM) lookupAttrQueryPIC(st *loopState, ip int, obj, rawName val.Value, 
 		}
 	}
 
-	insertIdx := -1
-	for k := range 4 {
-		if pic[k].Kind == attrQueryNone {
-			insertIdx = k
-			break
-		}
-	}
-	if insertIdx < 0 {
-		pic[3] = pic[2]
-		pic[2] = pic[1]
-		pic[1] = pic[0]
-		insertIdx = 0
-	}
-	pic[insertIdx] = AttrQueryPICEntry{
+	newEntry := AttrQueryPICEntry{
 		Name:      interned,
 		CachedVal: cachedVal,
 		TypeVer:   typeVer,
@@ -1633,6 +1633,32 @@ func (vm *VM) lookupAttrQueryPIC(st *loopState, ip int, obj, rawName val.Value, 
 		SlotIndex: slotIdx,
 		Kind:      slotKind,
 	}
+	insertIdx := -1
+	for k := range 4 {
+		if pic[k].Kind == attrQueryNone {
+			insertIdx = k
+			break
+		}
+	}
+	if insertIdx >= 0 {
+		pic[insertIdx] = newEntry
+		return res, found, true, interned
+	}
+	ext := &st.cache.ensureAttrQueryPICExt()[ip]
+	for k := range 4 {
+		if ext[k].Kind == attrQueryNone {
+			ext[k] = newEntry
+			return res, found, true, interned
+		}
+	}
+	ext[3] = ext[2]
+	ext[2] = ext[1]
+	ext[1] = ext[0]
+	ext[0] = pic[3]
+	pic[3] = pic[2]
+	pic[2] = pic[1]
+	pic[1] = pic[0]
+	pic[0] = newEntry
 	return res, found, true, interned
 }
 
@@ -2083,12 +2109,11 @@ func (vm *VM) opCallSlow(st *loopState, inst uint32, ip, sp int) (int, int, loop
 	stack := st.stack
 	argc := int(uint8(inst >> 16))
 	bx := int(uint16(inst))
-	isDirectAwait := isDirectAwaitCallSite(st, ip)
+	canQuicken := uint16(inst) == CallFromStack
 
 	var target val.Value
 	var newBase int
 	var retSP int
-	canQuicken := uint16(inst) == CallFromStack
 
 	if bx < len(st.consts) && isCallableConst(st.consts[bx]) {
 		target = st.consts[bx]
@@ -2099,6 +2124,41 @@ func (vm *VM) opCallSlow(st *loopState, inst uint32, ip, sp int) (int, int, loop
 		newBase = sp - argc
 		retSP = sp - argc - 1
 	}
+
+	// Closure-code fast path: freshly allocated closures sharing the same
+	// *CodeObject (including non-suspending direct-await coroutine closures)
+	// validate fn.Code == cc.co and bind live fn.Closure / fn.Globals without
+	// re-quickening or re-scanning isDirectAwaitCallSite.
+	if canQuicken && !vm.hasTrackedViews && target.Kind() == val.KindFunction && st.cache != nil && uint(ip) < uint(len(st.cache.ic)) {
+		entry := &st.cache.ic[ip]
+		if cc := entry.CalleeCache; cc != nil && cc.owner == vm && cc.co != nil {
+			fn := target.AsFunction()
+			callee := cc.co
+			if fn.Code.HeaderPtr() == &callee.Header &&
+				len(fn.Defaults) == 0 && fn.KwDefaults == nil &&
+				callee.SimplePositionalOnly && argc == callee.PositionalParamCount &&
+				!callee.HasCellVars && (!callee.HasCells || fn.Closure != nil) {
+				isDirectCoro := callee.IsCoroutine && !callee.CanSuspend && entry.SlotIndex == 1
+				if (!callee.IsGenerator && !callee.IsCoroutine) || isDirectCoro {
+					st.periodicTick++
+					if (st.periodicTick & 0xFF) == 0 {
+						vm.checkPeriodicSafepoint(st.frameIdx)
+					}
+					minCap := max(newBase+256, newBase+callee.NumLocals+64)
+					if minCap > len(stack) {
+						_ = vm.growStack(st, stack, minCap)
+					}
+					retIP := ip + 1
+					if isDirectCoro {
+						retIP = ip + 3
+					}
+					return vm.pushCalleeFrame(st, callee, fn, cc, newBase, retSP, newBase+callee.EffectiveLocals, retIP)
+				}
+			}
+		}
+	}
+
+	isDirectAwait := isDirectAwaitCallSite(st, ip)
 
 	if vm.hasTrackedViews && argc > 0 {
 		markViewsEscaped(stack[newBase : newBase+argc])
@@ -2430,23 +2490,31 @@ unwrapCall:
 			}
 		}
 		cc := vm.cacheFor(callee)
-		if canQuicken && !vm.hasTrackedViews && !callee.IsGenerator && !callee.IsCoroutine &&
+		if canQuicken && !vm.hasTrackedViews && !callee.IsGenerator &&
 			!callee.HasCellVars && (!callee.HasCells || fn.Closure != nil) {
-			if exactArgs {
+			if !callee.IsCoroutine {
+				if exactArgs {
+					if len(callee.ExceptionTable) == 0 && atomic.LoadInt32(&callee.IsTier2Optimized) == 0 {
+						maybeOptimizeCodeObject(vm, callee, cc)
+					}
+					_, _ = vm.loadWindow(callee, cc)
+					st.cache.ic[ip] = ICSlot{CachedVal: target, CalleeCache: cc}
+					st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL_PY_EXACT_ARGS))
+					vm.tryInlineFunc(st, ip, argc, fn)
+				} else if defaultsArgs && callee.NumLocals >= callee.PositionalParamCount {
+					if len(callee.ExceptionTable) == 0 && atomic.LoadInt32(&callee.IsTier2Optimized) == 0 {
+						maybeOptimizeCodeObject(vm, callee, cc)
+					}
+					_, _ = vm.loadWindow(callee, cc)
+					st.cache.ic[ip] = ICSlot{CachedVal: target, CalleeCache: cc}
+					st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL_PY_DEFAULTS))
+				}
+			} else if isDirectAwait && !callee.CanSuspend && exactArgs {
 				if len(callee.ExceptionTable) == 0 && atomic.LoadInt32(&callee.IsTier2Optimized) == 0 {
 					maybeOptimizeCodeObject(vm, callee, cc)
 				}
 				_, _ = vm.loadWindow(callee, cc)
-				st.cache.ic[ip] = ICSlot{CachedVal: target, CalleeCache: cc}
-				st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL_PY_EXACT_ARGS))
-				vm.tryInlineFunc(st, ip, argc, fn)
-			} else if defaultsArgs && callee.NumLocals >= callee.PositionalParamCount {
-				if len(callee.ExceptionTable) == 0 && atomic.LoadInt32(&callee.IsTier2Optimized) == 0 {
-					maybeOptimizeCodeObject(vm, callee, cc)
-				}
-				_, _ = vm.loadWindow(callee, cc)
-				st.cache.ic[ip] = ICSlot{CachedVal: target, CalleeCache: cc}
-				st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL_PY_DEFAULTS))
+				st.cache.ic[ip] = ICSlot{CalleeCache: cc, SlotIndex: 1}
 			}
 		}
 		retIP := ip + 1

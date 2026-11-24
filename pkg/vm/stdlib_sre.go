@@ -36,8 +36,8 @@ type pyMatch struct {
 	Header     val.ObjectHeader
 	Pat        *pyPattern
 	StringVal  val.Value
-	extCaps    *[]int32
-	inlineCaps [4]int32
+	extCaps    []int32
+	inlineCaps [12]int32
 	Pos        int32
 	EndPos     int32
 	LastIndex  int32
@@ -46,8 +46,8 @@ type pyMatch struct {
 
 var (
 	_ [0 - unsafe.Offsetof(pyMatch{}.Header)]byte
-	_ [80 - unsafe.Sizeof(pyMatch{})]byte
-	_ [unsafe.Sizeof(pyMatch{}) - 80]byte
+	_ [128 - unsafe.Sizeof(pyMatch{})]byte
+	_ [unsafe.Sizeof(pyMatch{}) - 128]byte
 )
 
 type pyScanner struct {
@@ -518,10 +518,11 @@ func newMatch(ctx *val.ExecContext, p *pyPattern, strVal val.Value, caps []int32
 	m.numCaps = int32(len(caps))
 	if len(caps) <= len(m.inlineCaps) {
 		copy(m.inlineCaps[:], caps)
+		m.extCaps = nil
 	} else {
 		c := make([]int32, len(caps))
 		copy(c, caps)
-		m.extCaps = &c
+		m.extCaps = c
 	}
 	return val.ObjectVal(&m.Header)
 }
@@ -530,15 +531,14 @@ func (m *pyMatch) capBounds(idx int) (int, int) {
 	if m.extCaps == nil {
 		return int(m.inlineCaps[2*idx]), int(m.inlineCaps[2*idx+1])
 	}
-	c := *m.extCaps
-	return int(c[2*idx]), int(c[2*idx+1])
+	return int(m.extCaps[2*idx]), int(m.extCaps[2*idx+1])
 }
 
 func (m *pyMatch) allCaps() []int32 {
 	if m.extCaps == nil {
 		return m.inlineCaps[:m.numCaps]
 	}
-	return *m.extCaps
+	return m.extCaps
 }
 
 func (m *pyMatch) group(ctx *val.ExecContext, g val.Value) int {
@@ -601,22 +601,70 @@ func (p *pyPattern) posArgs(ctx *val.ExecContext, in []rune, posV, endV val.Valu
 	return pos, end
 }
 
+//go:noinline
+func (p *pyPattern) doMatchInlineASCII(ctx *val.ExecContext, mode sre.Mode, strVal, posV, endV val.Value) val.Value {
+	var inlineBuf [7]byte
+	raw := strVal.RawNum()
+	n := int(raw & 0xFF)
+	for i := range n {
+		inlineBuf[i] = byte((raw >> ((uint(i) + 1) * 8)) & 0xFF)
+	}
+	inBytes := inlineBuf[:n]
+	pos := clampInt(intArg(ctx, posV, 0), 0, n)
+	end := clampInt(intArg(ctx, endV, int64(n)), 0, n)
+	var capsBuf [32]int32
+	caps, last, matched := p.Re.ExecASCIIInto(inBytes, pos, end, mode, false, capsBuf[:0])
+	if !matched {
+		return val.NoneVal()
+	}
+	return newMatch(ctx, p, strVal, caps, last, pos, end, 0)
+}
+
 func (p *pyPattern) doMatch(ctx *val.ExecContext, mode sre.Mode, strVal, posV, endV val.Value) val.Value {
 	if !p.IsBytes {
-		var inlineBuf [7]byte
-		if inBytes, ok := asciiSubjectBytesCtx(ctx, strVal, &inlineBuf); ok {
-			pos := clampInt(intArg(ctx, posV, 0), 0, len(inBytes))
-			end := clampInt(intArg(ctx, endV, int64(len(inBytes))), 0, len(inBytes))
-			var capsBuf [32]int32
-			caps, last, matched := p.Re.ExecASCIIInto(inBytes, pos, end, mode, false, capsBuf[:0])
-			if !matched {
-				return val.NoneVal()
+		switch {
+		case strVal.IsString():
+			ps := strVal.AsStringObj()
+			if ps.Buf == nil {
+				var isASCII bool
+				if ctx != nil && !val.MultiThreadedFlag.Load() {
+					if vm, ok := ctx.VM.(*VM); ok && vm != nil {
+						isASCII = vm.isPyStringASCII(ps)
+					} else {
+						isASCII = val.IsASCII(ps.Data)
+					}
+				} else {
+					isASCII = val.IsASCII(ps.Data)
+				}
+				if isASCII {
+					inBytes := unsafe.Slice(unsafe.StringData(ps.Data), len(ps.Data))
+					pos := clampInt(intArg(ctx, posV, 0), 0, len(inBytes))
+					end := clampInt(intArg(ctx, endV, int64(len(inBytes))), 0, len(inBytes))
+					var capsBuf [32]int32
+					caps, last, matched := p.Re.ExecASCIIInto(inBytes, pos, end, mode, false, capsBuf[:0])
+					if !matched {
+						return val.NoneVal()
+					}
+					return newMatch(ctx, p, strVal, caps, last, pos, end, flagMatchASCII)
+				}
 			}
-			var flags uint8
-			if strVal.IsString() {
-				flags = flagMatchASCII
+		case val.IsInlineStrASCII(strVal):
+			return p.doMatchInlineASCII(ctx, mode, strVal, posV, endV)
+		case strVal.IsInstance() && val.IsSubclass(strVal.Type(), val.StrType):
+			inst := strVal.AsInstance()
+			if len(inst.Slots) > 0 && inst.Slots[0].IsAnyString() {
+				var inlineBuf [7]byte
+				if inBytes, ok := asciiSubjectBytesCtx(ctx, inst.Slots[0], &inlineBuf); ok {
+					pos := clampInt(intArg(ctx, posV, 0), 0, len(inBytes))
+					end := clampInt(intArg(ctx, endV, int64(len(inBytes))), 0, len(inBytes))
+					var capsBuf [32]int32
+					caps, last, matched := p.Re.ExecASCIIInto(inBytes, pos, end, mode, false, capsBuf[:0])
+					if !matched {
+						return val.NoneVal()
+					}
+					return newMatch(ctx, p, strVal, caps, last, pos, end, 0)
+				}
 			}
-			return newMatch(ctx, p, strVal, caps, last, pos, end, flags)
 		}
 	}
 	var in []rune

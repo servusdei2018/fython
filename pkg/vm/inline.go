@@ -637,6 +637,11 @@ func spliceInlineBody(vm *VM, st *loopState, guardIP int, guardOp Opcode, callee
 		copy(n, cache.attrQueryPIC)
 		cache.attrQueryPIC = n
 	}
+	if len(cache.attrQueryPICExt) != 0 && len(cache.attrQueryPICExt) < needIC {
+		n := make([][4]AttrQueryPICEntry, needIC)
+		copy(n, cache.attrQueryPICExt)
+		cache.attrQueryPICExt = n
+	}
 	if len(cache.transitionIC) != 0 && len(cache.transitionIC) < needIC {
 		n := make([]TransitionICEntry, needIC)
 		copy(n, cache.transitionIC)

@@ -510,13 +510,15 @@ func (co *CodeObject) LineTableBytes() []byte {
 // ConstKeyMapTemplate caches a pre-hashed dict literal shape for
 // OP_BUILD_CONST_KEY_MAP sites with 2..16 interned-string keys.
 type ConstKeyMapTemplate struct {
-	Hashes    [16]uint64
-	Indices8  [8]byte
-	Indices16 [16]byte
-	Indices32 [32]byte
-	Keys      [16]val.Value
-	Count     int
-	Valid     bool
+	Hashes      [16]uint64
+	Indices8    [8]byte
+	Indices16   [16]byte
+	Indices32   [32]byte
+	Keys        [16]val.Value
+	KeysTuple   val.Value
+	Count       int
+	Valid       bool
+	IsEphemeral bool
 }
 
 // InlineExpectEntry records the expected callee identity for a spliced
@@ -549,11 +551,12 @@ type VMCodeCache struct {
 	// and streamGen the generation it belongs to. The pair lets the VM pick
 	// up a stream published by the Tier-2 optimizer without loading it on
 	// every frame switch.
-	active        []uint32
-	codePtr       unsafe.Pointer
-	codeLen       int
-	streamGen     int32
-	privateActive bool
+	active          []uint32
+	codePtr         unsafe.Pointer
+	codeLen         int
+	streamGen       int32
+	privateActive   bool
+	attrQueryPICExt [][4]AttrQueryPICEntry
 }
 
 func (c *VMCodeCache) ensureMethodPIC() [][4]val.MethodPICEntry {
@@ -581,6 +584,15 @@ func (c *VMCodeCache) ensureAttrQueryPIC() [][4]AttrQueryPICEntry {
 		c.attrQueryPIC = n
 	}
 	return c.attrQueryPIC
+}
+
+func (c *VMCodeCache) ensureAttrQueryPICExt() [][4]AttrQueryPICEntry {
+	if len(c.attrQueryPICExt) < len(c.ic) {
+		n := make([][4]AttrQueryPICEntry, len(c.ic))
+		copy(n, c.attrQueryPICExt)
+		c.attrQueryPICExt = n
+	}
+	return c.attrQueryPICExt
 }
 
 func (c *VMCodeCache) ensureTransitionIC() []TransitionICEntry {
@@ -1115,7 +1127,7 @@ func (vm *VM) releaseMatch(m *pyMatch) {
 	m.Pat = nil
 	m.StringVal = val.Value{}
 	m.extCaps = nil
-	m.inlineCaps = [4]int32{}
+	m.inlineCaps = [12]int32{}
 	m.Pos = 0
 	m.EndPos = 0
 	m.LastIndex = 0
@@ -2049,10 +2061,11 @@ func computeLocalDictSafe(co *CodeObject) []bool {
 	}
 	var safe []bool
 	for ip, inst := range co.Code {
-		if DecodeOpcode(inst) != OP_BUILD_MAP {
+		op := DecodeOpcode(inst)
+		if op != OP_BUILD_MAP && op != OP_BUILD_CONST_KEY_MAP {
 			continue
 		}
-		if int(uint16(inst)) > 8 {
+		if int(uint16(inst)) > 16 {
 			continue
 		}
 		if ip+1 >= n || DecodeOpcode(co.Code[ip+1]) != OP_STORE_FAST {

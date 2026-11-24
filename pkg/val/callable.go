@@ -3263,6 +3263,55 @@ func floatFromInstance(ctx *ExecContext, a Value) (float64, bool) {
 	return 0, false
 }
 
+// replaceOneByte replaces single ASCII byte oldByte in src with newBytes,
+// honouring n (negative = all). It performs one counting pass to pre-size a
+// single output buffer, then one fill pass — no rune decoding and no
+// intermediate splits. Callers must have verified a match exists when they
+// want to avoid a redundant scan; the function itself also handles zero
+// matches by returning a copy.
+func replaceOneByte(src []byte, oldByte byte, newBytes []byte, n int) []byte {
+	if n == 0 || len(src) == 0 {
+		out := make([]byte, len(src))
+		copy(out, src)
+		return out
+	}
+	limit := n
+	if limit < 0 {
+		limit = len(src) + 1
+	}
+	count := 0
+	for i := range src {
+		if count >= limit {
+			break
+		}
+		if src[i] == oldByte {
+			count++
+		}
+	}
+	if count == 0 {
+		out := make([]byte, len(src))
+		copy(out, src)
+		return out
+	}
+	outLen := len(src) + count*(len(newBytes)-1)
+	out := make([]byte, 0, outLen)
+	pos := 0
+	done := 0
+	for i := range src {
+		if src[i] == oldByte && done < limit {
+			out = append(out, src[pos:i]...)
+			out = append(out, newBytes...)
+			pos = i + 1
+			done++
+			if done >= limit {
+				break
+			}
+		}
+	}
+	out = append(out, src[pos:]...)
+	return out
+}
+
 func initTypes() {
 	// 1. Pre-intern canonical dunder method names.
 	DunderAdd = InternString("__add__")
@@ -4694,7 +4743,29 @@ func initTypes() {
 				sOld := args[1].AsString()
 				ob = unsafe.Slice(unsafe.StringData(sOld), len(sOld))
 			}
-			if n == 0 || (len(ob) > 0 && !bytes.Contains(sb, ob)) {
+			if n == 0 {
+				return args[0]
+			}
+			// 1-byte ASCII fast path: zero-alloc miss check, single-buffer hit.
+			if len(ob) == 1 && ob[0] < 128 {
+				if bytes.IndexByte(sb, ob[0]) == -1 {
+					return args[0]
+				}
+				var newBuf [7]byte
+				var nb []byte
+				if args[2].ptr == &tagInlineStr {
+					nb = inlineStrSlice(args[2], &newBuf)
+				} else {
+					sNew := args[2].AsString()
+					nb = unsafe.Slice(unsafe.StringData(sNew), len(sNew))
+				}
+				out := replaceOneByte(sb, ob[0], nb, n)
+				if len(out) <= 7 {
+					return SmallStringFromBytes(out)
+				}
+				return NewStringVal(unsafe.String(unsafe.SliceData(out), len(out)))
+			}
+			if len(ob) > 0 && !bytes.Contains(sb, ob) {
 				return args[0]
 			}
 			var newBuf [7]byte
@@ -4719,6 +4790,28 @@ func initTypes() {
 			oldStr = unsafe.String(&oldBuf[0], len(ob))
 		} else {
 			oldStr = args[1].AsString()
+		}
+		if n != 0 && len(oldStr) == 1 && oldStr[0] < 128 {
+			srcBytes := unsafe.Slice(unsafe.StringData(s), len(s))
+			if bytes.IndexByte(srcBytes, oldStr[0]) == -1 {
+				if args[0].Type() == StrType {
+					return args[0]
+				}
+				return NewStringVal(s)
+			}
+			var newStrFast string
+			if args[2].ptr == &tagInlineStr {
+				nb := inlineStrSlice(args[2], &newBuf)
+				newStrFast = unsafe.String(&newBuf[0], len(nb))
+			} else {
+				newStrFast = args[2].AsString()
+			}
+			newBytes := unsafe.Slice(unsafe.StringData(newStrFast), len(newStrFast))
+			out := replaceOneByte(srcBytes, oldStr[0], newBytes, n)
+			if len(out) <= 7 {
+				return SmallStringFromBytes(out)
+			}
+			return NewStringVal(unsafe.String(unsafe.SliceData(out), len(out)))
 		}
 		if n == 0 || (len(oldStr) > 0 && !strings.Contains(s, oldStr)) {
 			if args[0].Type() == StrType {

@@ -1285,12 +1285,23 @@ func (c *Compiler) compileForStmt(stmt *ASTStmt) error {
 
 		forIterJump := c.emitOp(vm.OP_FOR_ITER_RANGE, rangeSlot, 0)
 
+		// The fused range iterator occupies one stack slot for the whole
+		// loop body (same footprint as OP_GET_ITER/OP_FOR_ITER). Track it so
+		// nested try/except records TargetStackDepth=outer+1 and unwind
+		// preserves the iterator instead of truncating it.
+		c.stackDepth++
+		if c.stackDepth > c.maxStackDepth {
+			c.maxStackDepth = c.stackDepth
+		}
+
 		for _, sID := range c.arena.GetStmtSlice(stmt.Body) {
 			if err := c.compileStmt(sID); err != nil {
+				c.stackDepth--
 				return err
 			}
 		}
 
+		c.stackDepth--
 		c.emitOp(vm.OP_JUMP, 0, uint16(loopStart))
 
 		endTarget := len(c.code)

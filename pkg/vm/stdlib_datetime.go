@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -1182,17 +1183,157 @@ func initDateTimeType() {
 	datetimeType.InvalidateVersion()
 }
 
+var errInvalidIsoFormat = errors.New("invalid isoformat")
+
+func parseASCII2(s string, i int) (int, bool) {
+	a, b := s[i]-'0', s[i+1]-'0'
+	if a > 9 || b > 9 {
+		return 0, false
+	}
+	return int(a)*10 + int(b), true
+}
+
+func parseASCII4(s string, i int) (int, bool) {
+	a, b, c, d := s[i]-'0', s[i+1]-'0', s[i+2]-'0', s[i+3]-'0'
+	if a > 9 || b > 9 || c > 9 || d > 9 {
+		return 0, false
+	}
+	return int(a)*1000 + int(b)*100 + int(c)*10 + int(d), true
+}
+
+func isLeapYear(y int) bool {
+	return (y%4 == 0 && y%100 != 0) || y%400 == 0
+}
+
+func isoDaysInMonth(y, m int) int {
+	switch m {
+	case 1, 3, 5, 7, 8, 10, 12:
+		return 31
+	case 4, 6, 9, 11:
+		return 30
+	case 2:
+		if isLeapYear(y) {
+			return 29
+		}
+		return 28
+	default:
+		return 0
+	}
+}
+
 func parseIsoFormat(s string) (val.Value, error) {
-	s = strings.TrimSpace(s)
-	// Try standard RFC3339 formats first
+	n := len(s)
+	if n > 0 && (s[0] <= ' ' || s[n-1] <= ' ') {
+		s = strings.TrimSpace(s)
+		n = len(s)
+	}
+	if n < 8 || s[0] < '0' || s[0] > '9' {
+		return val.NoneVal(), errInvalidIsoFormat
+	}
+	// Fast zero-alloc ASCII path for standard YYYY-MM-DD[T| |t]HH:MM[:SS[.f+]][Z|±HH:MM[:SS]].
+	if n >= 10 && s[4] == '-' && s[7] == '-' {
+		y, okY := parseASCII4(s, 0)
+		mo, okM := parseASCII2(s, 5)
+		d, okD := parseASCII2(s, 8)
+		if !okY || !okM || !okD || y < 1 || mo < 1 || mo > 12 || d < 1 || d > isoDaysInMonth(y, mo) {
+			return val.NoneVal(), errInvalidIsoFormat
+		}
+		if n == 10 {
+			return newDateTimeVal(y, mo, d, 0, 0, 0, 0, val.NoneVal(), 0), nil
+		}
+		sep := s[10]
+		if sep != 'T' && sep != ' ' && sep != 't' {
+			return val.NoneVal(), errInvalidIsoFormat
+		}
+		if n < 16 || s[13] != ':' {
+			return val.NoneVal(), errInvalidIsoFormat
+		}
+		h, okH := parseASCII2(s, 11)
+		mi, okMi := parseASCII2(s, 14)
+		if !okH || !okMi || h > 23 || mi > 59 {
+			return val.NoneVal(), errInvalidIsoFormat
+		}
+		pos := 16
+		sec := 0
+		us := 0
+		if pos < n && s[pos] == ':' {
+			if pos+3 > n {
+				return val.NoneVal(), errInvalidIsoFormat
+			}
+			var okS bool
+			sec, okS = parseASCII2(s, pos+1)
+			if !okS || sec > 59 {
+				return val.NoneVal(), errInvalidIsoFormat
+			}
+			pos += 3
+			if pos < n && (s[pos] == '.' || s[pos] == ',') {
+				pos++
+				fracStart := pos
+				scale := 100000
+				for pos < n && s[pos] >= '0' && s[pos] <= '9' {
+					if scale > 0 {
+						us += int(s[pos]-'0') * scale
+						scale /= 10
+					}
+					pos++
+				}
+				if pos == fracStart {
+					return val.NoneVal(), errInvalidIsoFormat
+				}
+			}
+		}
+		tz := val.NoneVal()
+		if pos < n {
+			c := s[pos]
+			switch c {
+			case 'Z', 'z':
+				if pos+1 != n {
+					return val.NoneVal(), errInvalidIsoFormat
+				}
+				tz = newTimezoneVal(0, "")
+			case '+', '-':
+				sign := int64(1)
+				if c == '-' {
+					sign = -1
+				}
+				rem := n - (pos + 1)
+				var tzH, tzM, tzS int
+				var okTH, okTM, okTS bool
+				switch {
+				case rem == 5 && s[pos+3] == ':':
+					tzH, okTH = parseASCII2(s, pos+1)
+					tzM, okTM = parseASCII2(s, pos+4)
+					okTS = true
+				case rem == 4:
+					tzH, okTH = parseASCII2(s, pos+1)
+					tzM, okTM = parseASCII2(s, pos+3)
+					okTS = true
+				case rem == 8 && s[pos+3] == ':' && s[pos+6] == ':':
+					tzH, okTH = parseASCII2(s, pos+1)
+					tzM, okTM = parseASCII2(s, pos+4)
+					tzS, okTS = parseASCII2(s, pos+7)
+				case rem == 2:
+					tzH, okTH = parseASCII2(s, pos+1)
+					okTM, okTS = true, true
+				default:
+					return val.NoneVal(), errInvalidIsoFormat
+				}
+				if !okTH || !okTM || !okTS || tzH > 23 || tzM > 59 || tzS > 59 {
+					return val.NoneVal(), errInvalidIsoFormat
+				}
+				tz = newTimezoneVal(sign*int64(tzH*3600+tzM*60+tzS), "")
+			default:
+				return val.NoneVal(), errInvalidIsoFormat
+			}
+		}
+		return newDateTimeVal(y, mo, d, h, mi, sec, us, tz, 0), nil
+	}
+	// Fallback for compact or exotic ISO-8601 forms (e.g. YYYYMMDD).
 	layouts := []string{
 		time.RFC3339Nano,
 		time.RFC3339,
-		"2006-01-02T15:04:05.999999",
-		"2006-01-02T15:04:05",
-		"2006-01-02 15:04:05.999999",
-		"2006-01-02 15:04:05",
-		"2006-01-02",
+		"20060102T150405",
+		"20060102",
 	}
 	for _, l := range layouts {
 		if t, err := time.Parse(l, s); err == nil {
@@ -1205,7 +1346,7 @@ func parseIsoFormat(s string) (val.Value, error) {
 			return newDateTimeVal(t.Year(), int(t.Month()), t.Day(), t.Hour(), t.Minute(), t.Second(), us, tz, 0), nil
 		}
 	}
-	return val.NoneVal(), fmt.Errorf("invalid isoformat: %s", s)
+	return val.NoneVal(), errInvalidIsoFormat
 }
 
 func pythonStrftime(t time.Time, us int, format string) string {

@@ -658,7 +658,7 @@ func (vm *VM) opDeleteSubscr(st *loopState, ip, sp int) (int, int, loopCtl) {
 }
 
 func isEphemeralMapSite(st *loopState, ip int) bool {
-	limit := min(st.codeLen, ip+16)
+	limit := min(st.codeLen, ip+32)
 	depth := 1
 	for k := ip + 1; k < limit; k++ {
 		wk := *(*uint32)(unsafe.Add(st.codePtr, uintptr(k)*4))
@@ -676,6 +676,15 @@ func isEphemeralMapSite(st *loopState, ip int) bool {
 			depth++
 		case OP_BUILD_MAP:
 			depth = depth - int(DecodeArgBx(wk))*2 + 1
+			if depth <= 1 {
+				return false
+			}
+		case OP_BUILD_CONST_KEY_MAP:
+			// Const-key literal consumes count values + keys tuple and
+			// produces one dict. Mirror BUILD_MAP accounting so nested
+			// 11-16 key literals for the same CALL_FUNCTION_EX stay
+			// eligible while dicts merged into an outer literal fail closed.
+			depth -= int(DecodeArgBx(wk))
 			if depth <= 1 {
 				return false
 			}
@@ -878,7 +887,7 @@ func (vm *VM) opBuildMap(st *loopState, inst uint32, ip, sp int) (int, int, loop
 	switch {
 	case count <= 16 && isEphemeralMapSite(st, ip):
 		dictVal = vm.acquireSmallDict(count, true)
-	case count <= 8 && st.curCO != nil && ip < len(st.curCO.MapTempSafe) && st.curCO.MapTempSafe[ip]:
+	case count <= 16 && st.curCO != nil && ip < len(st.curCO.MapTempSafe) && st.curCO.MapTempSafe[ip]:
 		dictVal = vm.acquireSmallDict(count, true)
 	default:
 		dictVal = val.NewDictVal(count)
@@ -927,25 +936,6 @@ func (vm *VM) opBuildConstKeyMap(st *loopState, inst uint32, ip, sp int) (int, i
 		return ip, sp, ctlRaise
 	}
 	keysVal := stack[sp-1]
-	if !keysVal.IsTuple() {
-		return vm.opBuildConstKeyMapGeneric(st, inst, ip, sp)
-	}
-	keys := keysVal.AsTuple().Items
-	if len(keys) != count {
-		return vm.opBuildConstKeyMapGeneric(st, inst, ip, sp)
-	}
-	for _, k := range keys {
-		if !constKeyIsTemplateable(k) {
-			return vm.opBuildConstKeyMapGeneric(st, inst, ip, sp)
-		}
-	}
-	for i := range count {
-		for j := i + 1; j < count; j++ {
-			if keys[i] == keys[j] {
-				return vm.opBuildConstKeyMapGeneric(st, inst, ip, sp)
-			}
-		}
-	}
 	base := sp - 1 - count
 	cache := st.cache
 	var tmpl *ConstKeyMapTemplate
@@ -955,51 +945,45 @@ func (vm *VM) opBuildConstKeyMap(st *loopState, inst uint32, ip, sp int) (int, i
 			tmpl = &maps[ip]
 		}
 	}
-	if tmpl != nil && tmpl.Valid && tmpl.Count == count {
-		match := true
-		for i := range count {
-			if tmpl.Keys[i] != keys[i] {
-				match = false
-				break
-			}
-		}
-		if match {
-			d := vm.acquireConstKeyDict(count)
-			if d != nil {
-				if vm.fillConstKeyDict(d, tmpl, stack[base:base+count]) {
-					for i := base; i < base+count; i++ {
-						val.ClearEphemeral(stack[i])
-						val.DetachStringBuf(stack[i])
-					}
-					sp = base
-					stack[sp] = val.DictVal(d)
-					sp++
-					ip++
-					return ip, sp, ctlReload
+	// O(1) hot path: constant tuple identity guarantees keys are unchanged,
+	// templateable, and duplicate-free without re-scanning.
+	if tmpl != nil && tmpl.Valid && tmpl.KeysTuple == keysVal && tmpl.Count == count {
+		d := vm.acquireConstKeyDictEphemeral(count, tmpl.IsEphemeral)
+		if d != nil {
+			if vm.fillConstKeyDict(d, tmpl, stack[base:base+count]) {
+				for i := base; i < base+count; i++ {
+					val.ClearEphemeral(stack[i])
+					val.DetachStringBuf(stack[i])
 				}
-				vm.releaseSmallDictFlag(d, 0)
+				stack[base] = val.DictVal(d)
+				return ip + 1, base + 1, ctlNext
 			}
+			vm.releaseSmallDictFlag(d, val.FlagEphemeralDict)
 		}
 	}
+	if !keysVal.IsTuple() {
+		return vm.opBuildConstKeyMapGeneric(st, inst, ip, sp)
+	}
+	keys := keysVal.AsTuple().Items
+	if len(keys) != count {
+		return vm.opBuildConstKeyMapGeneric(st, inst, ip, sp)
+	}
 	if tmpl != nil {
-		if vm.buildConstKeyTemplate(tmpl, keys, count) {
+		if vm.buildConstKeyTemplate(tmpl, keysVal, keys, count, st, ip) {
 			if ip >= 0 && ip < len(st.cache.ic) {
 				st.cache.ic[ip].Kind = ICKindConstKeyMap
 			}
-			d := vm.acquireConstKeyDict(count)
+			d := vm.acquireConstKeyDictEphemeral(count, tmpl.IsEphemeral)
 			if d != nil && vm.fillConstKeyDict(d, tmpl, stack[base:base+count]) {
 				for i := base; i < base+count; i++ {
 					val.ClearEphemeral(stack[i])
 					val.DetachStringBuf(stack[i])
 				}
-				sp = base
-				stack[sp] = val.DictVal(d)
-				sp++
-				ip++
-				return ip, sp, ctlReload
+				stack[base] = val.DictVal(d)
+				return ip + 1, base + 1, ctlNext
 			}
 			if d != nil {
-				vm.releaseSmallDictFlag(d, 0)
+				vm.releaseSmallDictFlag(d, val.FlagEphemeralDict)
 			}
 		} else {
 			tmpl.Valid = false
@@ -1022,7 +1006,7 @@ func (vm *VM) opBuildConstKeyMapGeneric(st *loopState, inst uint32, ip, sp int) 
 	switch {
 	case count <= 16 && isEphemeralMapSite(st, ip):
 		dictVal = vm.acquireSmallDict(count, true)
-	case count <= 8 && st.curCO != nil && ip < len(st.curCO.MapTempSafe) && st.curCO.MapTempSafe[ip]:
+	case count <= 16 && st.curCO != nil && ip < len(st.curCO.MapTempSafe) && st.curCO.MapTempSafe[ip]:
 		dictVal = vm.acquireSmallDict(count, true)
 	default:
 		dictVal = val.NewDictVal(count)
@@ -1053,7 +1037,11 @@ func (vm *VM) opBuildConstKeyMapGeneric(st *loopState, inst uint32, ip, sp int) 
 	return ip, sp, ctlNext
 }
 
-func (vm *VM) acquireConstKeyDict(count int) *val.PyDict {
+func (vm *VM) acquireConstKeyDictEphemeral(count int, ephemeral bool) *val.PyDict {
+	var flags uint8
+	if ephemeral {
+		flags = val.FlagEphemeralDict
+	}
 	if !val.MultiThreadedFlag.Load() {
 		switch {
 		case count <= 5:
@@ -1061,7 +1049,7 @@ func (vm *VM) acquireConstKeyDict(count int) *val.PyDict {
 				d := vm.dictFreeList[n-1]
 				vm.dictFreeList[n-1] = nil
 				vm.dictFreeList = vm.dictFreeList[:n-1]
-				d.Header = val.ObjectHeader{Kind: val.KindDict, Type: val.DictType}
+				d.Header = val.ObjectHeader{Kind: val.KindDict, Flags: flags, Type: val.DictType}
 				d.InitSmallInlineTable()
 				return d
 			}
@@ -1070,7 +1058,7 @@ func (vm *VM) acquireConstKeyDict(count int) *val.PyDict {
 				d := vm.dict16FreeList[n-1]
 				vm.dict16FreeList[n-1] = nil
 				vm.dict16FreeList = vm.dict16FreeList[:n-1]
-				d.Header = val.ObjectHeader{Kind: val.KindDict, Type: val.DictType}
+				d.Header = val.ObjectHeader{Kind: val.KindDict, Flags: flags, Type: val.DictType}
 				d.InitDict16Table()
 				return d
 			}
@@ -1079,18 +1067,34 @@ func (vm *VM) acquireConstKeyDict(count int) *val.PyDict {
 				d := vm.dict32FreeList[n-1]
 				vm.dict32FreeList[n-1] = nil
 				vm.dict32FreeList = vm.dict32FreeList[:n-1]
-				d.Header = val.ObjectHeader{Kind: val.KindDict, Type: val.DictType}
+				d.Header = val.ObjectHeader{Kind: val.KindDict, Flags: flags, Type: val.DictType}
 				d.InitDict32Table()
 				return d
 			}
 		}
 	}
-	return val.NewDictVal(count).AsDict()
+	d := val.NewDictVal(count).AsDict()
+	if flags != 0 {
+		d.Header.Flags |= flags
+	}
+	return d
 }
 
-func (vm *VM) buildConstKeyTemplate(tmpl *ConstKeyMapTemplate, keys []val.Value, count int) bool {
+func (vm *VM) buildConstKeyTemplate(tmpl *ConstKeyMapTemplate, keysVal val.Value, keys []val.Value, count int, st *loopState, ip int) bool {
 	if count < 2 || count > 16 {
 		return false
+	}
+	for _, k := range keys {
+		if !constKeyIsTemplateable(k) {
+			return false
+		}
+	}
+	for i := range count {
+		for j := i + 1; j < count; j++ {
+			if keys[i] == keys[j] {
+				return false
+			}
+		}
 	}
 	var hashes [16]uint64
 	for i := range count {
@@ -1130,9 +1134,15 @@ func (vm *VM) buildConstKeyTemplate(tmpl *ConstKeyMapTemplate, keys []val.Value,
 		tmpl.Keys[i] = keys[i]
 		tmpl.Hashes[i] = hashes[i]
 	}
+	tmpl.KeysTuple = keysVal
 	tmpl.Indices8 = idx8
 	tmpl.Indices16 = idx16
 	tmpl.Indices32 = idx32
+	ephemeral := isEphemeralMapSite(st, ip)
+	if !ephemeral && st.curCO != nil && ip < len(st.curCO.MapTempSafe) && st.curCO.MapTempSafe[ip] {
+		ephemeral = true
+	}
+	tmpl.IsEphemeral = ephemeral
 	tmpl.Count = count
 	tmpl.Valid = true
 	return true

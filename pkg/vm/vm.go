@@ -2928,6 +2928,13 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 			}
 			ip, sp, ctl = vm.opStoreFastWide(st, inst, ip, sp)
 		case OP_STORE_FAST_VIEW:
+			bx := uint16(inst)
+			if !vm.hasTrackedViews && bx < 256 {
+				sp--
+				*(*val.Value)(unsafe.Add(locals, uintptr(uint8(bx))*16)) = *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16))
+				ip++
+				continue
+			}
 			ip, sp, ctl = vm.opStoreFastView(st, inst, ip, sp)
 		case OP_BINARY_ADD:
 			b := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
@@ -3953,20 +3960,6 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				}
 			}
 			ip, sp, ctl = vm.dispatchColdOpcode(st, op, inst, ip, sp)
-		case OP_FAST_ADD_INT_LOCAL_TO_LOCAL:
-			va := *(*val.Value)(unsafe.Add(locals, uintptr(uint8(inst>>8))*16))
-			vb := *(*val.Value)(unsafe.Add(locals, uintptr(uint8(inst))*16))
-			if va.IsInt64() && vb.IsInt64() {
-				ai, bi := va.AsInt64(), vb.AsInt64()
-				sum := ai + bi
-				if ((ai ^ sum) & (bi ^ sum)) >= 0 {
-					*(*val.Value)(unsafe.Add(locals, uintptr(uint8(inst>>16))*16)) = val.Int64Val(sum)
-					ip += 4
-					continue
-				}
-			}
-			vm.deoptInst(st, ip, inst)
-			ctl = ctlReload
 		default:
 			ip, sp, ctl = vm.dispatchColdOpcode(st, op, inst, ip, sp)
 		}
