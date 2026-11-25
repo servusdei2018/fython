@@ -293,20 +293,43 @@ func (vm *VM) dispatchSuperCall(st *loopState, inst uint32, ip, sp, newBase, ret
 		op1 := DecodeOpcode(w1)
 		methIdx := uint16(w1)
 		if (op1 == OP_LOAD_METHOD || op1 == OP_LOAD_ATTR) && int(methIdx) < len(st.consts) {
-			var selfType *val.PyType
-			var isClassSuper bool
-			if self.IsType() && val.IsSubclass(self.AsType(), thisClass) {
-				selfType = self.AsType()
-				isClassSuper = true
-			} else {
-				selfType = self.Type()
-			}
-			typeVer := selfType.Version()
 			thisVer := thisClass.Version()
 			entry := &st.cache.ic[ip+1]
-			hit := entry.Kind == ICKindSuperMethod && entry.ExpectedTypeVer == typeVer && entry.ExpectedAuxVer == thisVer
+			var selfType *val.PyType
+			var isClassSuper bool
+			var typeVer uint64
+			hit := false
+			if self.IsType() {
+				cand := self.AsType()
+				candVer := cand.Version()
+				switch {
+				case entry.Kind == ICKindSuperMethod && entry.ExpectedTypeVer == candVer && entry.ExpectedAuxVer == thisVer && (entry.SlotIndex&4) != 0:
+					selfType = cand
+					typeVer = candVer
+					isClassSuper = true
+					hit = true
+				case cand == thisClass || val.IsSubclass(cand, thisClass):
+					selfType = cand
+					typeVer = candVer
+					isClassSuper = true
+				default:
+					selfType = self.Type()
+					typeVer = selfType.Version()
+				}
+			} else {
+				selfType = self.Type()
+				typeVer = selfType.Version()
+			}
+			if !hit {
+				hit = entry.Kind == ICKindSuperMethod && entry.ExpectedTypeVer == typeVer && entry.ExpectedAuxVer == thisVer &&
+					((entry.SlotIndex&4) != 0) == isClassSuper
+			}
 			if !hit {
 				attrName := val.InternValue(st.consts[methIdx])
+				classFlag := int32(0)
+				if isClassSuper {
+					classFlag = 4
+				}
 				if descr, _, foundMRO := selfType.LookupMROAfter(thisClass, attrName); foundMRO {
 					switch {
 					case descr.IsFunction() || (descr.IsBuiltinFunc() && !descr.AsBuiltinFunc().NoBind):
@@ -318,7 +341,7 @@ func (vm *VM) dispatchSuperCall(st *loopState, inst uint32, ip, sp, newBase, ret
 							Kind:            ICKindSuperMethod,
 							ExpectedTypeVer: typeVer,
 							ExpectedAuxVer:  thisVer,
-							SlotIndex:       bind,
+							SlotIndex:       bind | classFlag,
 							CachedVal:       descr,
 						}
 						hit = true
@@ -327,7 +350,7 @@ func (vm *VM) dispatchSuperCall(st *loopState, inst uint32, ip, sp, newBase, ret
 							Kind:            ICKindSuperMethod,
 							ExpectedTypeVer: typeVer,
 							ExpectedAuxVer:  thisVer,
-							SlotIndex:       0,
+							SlotIndex:       classFlag,
 							CachedVal:       descr.AsStaticMethod().Callable,
 						}
 						hit = true
@@ -336,7 +359,7 @@ func (vm *VM) dispatchSuperCall(st *loopState, inst uint32, ip, sp, newBase, ret
 							Kind:            ICKindSuperMethod,
 							ExpectedTypeVer: typeVer,
 							ExpectedAuxVer:  thisVer,
-							SlotIndex:       0,
+							SlotIndex:       classFlag,
 							CachedVal:       descr,
 						}
 						hit = true
@@ -344,11 +367,12 @@ func (vm *VM) dispatchSuperCall(st *loopState, inst uint32, ip, sp, newBase, ret
 				}
 			}
 			if hit {
+				bindFlag := entry.SlotIndex & 3
 				if op1 == OP_LOAD_METHOD {
 					if retSP+2 > len(stack) {
 						stack = vm.growStack(st, stack, retSP+64)
 					}
-					if entry.SlotIndex == 1 {
+					if bindFlag == 1 {
 						stack[retSP] = self
 					} else {
 						stack[retSP] = val.UnboundVal()
@@ -356,7 +380,7 @@ func (vm *VM) dispatchSuperCall(st *loopState, inst uint32, ip, sp, newBase, ret
 					stack[retSP+1] = entry.CachedVal
 					return ip + 2, retSP + 2, ctlReload
 				}
-				if entry.SlotIndex == 1 {
+				if bindFlag == 1 {
 					stack[retSP] = val.NewBoundMethodVal(self, entry.CachedVal)
 				} else {
 					stack[retSP] = entry.CachedVal
@@ -2258,6 +2282,37 @@ func (vm *VM) opCallTypeInit(st *loopState, inst uint32, ip, sp int) (int, int, 
 	return vm.opCallSlow(st, ReplaceOpcode(inst, OP_CALL), ip, sp)
 }
 
+// classifyMatchCallSite reports whether a regex match/search/fullmatch call at
+// ip can return a boolean-only sentinel or recycle a loop-carried ephemeral
+// pyMatch stored in a proven-safe local slot.
+func classifyMatchCallSite(st *loopState, ip int) (boolOnly bool, recycleSlot int) {
+	if ip+1 >= st.codeLen {
+		return false, -1
+	}
+	nextInst := *(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4))
+	switch DecodeOpcode(nextInst) {
+	case OP_JUMP_IF_FALSE, OP_JUMP_IF_TRUE, OP_UNARY_NOT, OP_POP_TOP:
+		return true, -1
+	case OP_CMP_CONST_JUMP_IF_FALSE, OP_CMP_CONST_JUMP_IF_TRUE:
+		cmpOp := DecodeArgA(nextInst)
+		cIdx := int(uint8(nextInst >> 8))
+		if (cmpOp == CMP_IS || cmpOp == CMP_IS_NOT) && cIdx < len(st.consts) && st.consts[cIdx].IsNone() {
+			return true, -1
+		}
+	case OP_STORE_FAST:
+		r := int(DecodeArgBx(nextInst))
+		if st.curCO != nil && st.curCO.isMatchLocalSafe(r) {
+			return false, r
+		}
+	case OP_STORE_LOAD_FAST:
+		r := int(uint8(nextInst >> 8))
+		if st.curCO != nil && st.curCO.isMatchLocalSafe(r) {
+			return false, r
+		}
+	}
+	return false, -1
+}
+
 //go:noinline
 func (vm *VM) opCallMethodDescr(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
@@ -2323,19 +2378,14 @@ func (vm *VM) opCallMethodDescr(st *loopState, inst uint32, ip, sp int) (int, in
 			}
 			origData := unsafe.SliceData(stack)
 			matchRecycleSlot := -1
-			if !val.MultiThreadedFlag.Load() && ip+1 < st.codeLen &&
+			if !val.MultiThreadedFlag.Load() &&
 				(targetVal == patternMatchBuiltin || targetVal == patternSearchBuiltin || targetVal == patternFullMatchBuiltin) {
-				nextInst := *(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4))
-				nextOp := DecodeOpcode(nextInst)
-				switch nextOp {
-				case OP_JUMP_IF_FALSE, OP_JUMP_IF_TRUE, OP_UNARY_NOT, OP_POP_TOP:
+				boolOnly, r := classifyMatchCallSite(st, ip)
+				if boolOnly {
 					vm.matchBoolOnly = true
-				case OP_STORE_FAST:
-					r := int(DecodeArgBx(nextInst))
-					if st.curCO != nil && st.curCO.isMatchLocalSafe(r) {
-						vm.matchEphemeral = true
-						matchRecycleSlot = r
-					}
+				} else if r >= 0 {
+					vm.matchEphemeral = true
+					matchRecycleSlot = r
 				}
 			}
 			st.ip = ip
@@ -2502,18 +2552,13 @@ func (vm *VM) opCallBoundNative(st *loopState, inst uint32, ip, sp int) (int, in
 			origTarget := target
 			origData := unsafe.SliceData(stack)
 			matchRecycleSlot := -1
-			if (slotFlags&boundNativeFlagPattern) != 0 && !val.MultiThreadedFlag.Load() && ip+1 < st.codeLen {
-				nextInst := *(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4))
-				nextOp := DecodeOpcode(nextInst)
-				switch nextOp {
-				case OP_JUMP_IF_FALSE, OP_JUMP_IF_TRUE, OP_UNARY_NOT, OP_POP_TOP:
+			if (slotFlags&boundNativeFlagPattern) != 0 && !val.MultiThreadedFlag.Load() {
+				boolOnly, r := classifyMatchCallSite(st, ip)
+				if boolOnly {
 					vm.matchBoolOnly = true
-				case OP_STORE_FAST:
-					r := int(DecodeArgBx(nextInst))
-					if st.curCO != nil && st.curCO.isMatchLocalSafe(r) {
-						vm.matchEphemeral = true
-						matchRecycleSlot = r
-					}
+				} else if r >= 0 {
+					vm.matchEphemeral = true
+					matchRecycleSlot = r
 				}
 			}
 			stack[retSP] = bm.Self
@@ -2586,19 +2631,14 @@ func (vm *VM) opCallMethodDescrFast(st *loopState, inst uint32, ip, sp int) (int
 			}
 			origData := unsafe.SliceData(stack)
 			matchRecycleSlot := -1
-			if !val.MultiThreadedFlag.Load() && ip+1 < st.codeLen &&
+			if !val.MultiThreadedFlag.Load() &&
 				(entry.CachedVal == patternMatchBuiltin || entry.CachedVal == patternSearchBuiltin || entry.CachedVal == patternFullMatchBuiltin) {
-				nextInst := *(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4))
-				nextOp := DecodeOpcode(nextInst)
-				switch nextOp {
-				case OP_JUMP_IF_FALSE, OP_JUMP_IF_TRUE, OP_UNARY_NOT, OP_POP_TOP:
+				boolOnly, r := classifyMatchCallSite(st, ip)
+				if boolOnly {
 					vm.matchBoolOnly = true
-				case OP_STORE_FAST:
-					r := int(DecodeArgBx(nextInst))
-					if st.curCO != nil && st.curCO.isMatchLocalSafe(r) {
-						vm.matchEphemeral = true
-						matchRecycleSlot = r
-					}
+				} else if r >= 0 {
+					vm.matchEphemeral = true
+					matchRecycleSlot = r
 				}
 			}
 			st.ip = ip
@@ -3984,17 +4024,10 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 			}
 			if methIdx >= uint16(len(st.consts)) || (attrName != nameExists && attrName != nameRemove && attrName != nameUnlink) {
 				isMatchOptSite := false
-				if !val.MultiThreadedFlag.Load() && ip+1 < st.codeLen &&
+				if !val.MultiThreadedFlag.Load() &&
 					(targetVal == patternMatchBuiltin || targetVal == patternSearchBuiltin || targetVal == patternFullMatchBuiltin) {
-					nextInst := *(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4))
-					switch DecodeOpcode(nextInst) {
-					case OP_JUMP_IF_FALSE, OP_JUMP_IF_TRUE, OP_UNARY_NOT, OP_POP_TOP:
-						isMatchOptSite = true
-					case OP_STORE_FAST:
-						if st.curCO != nil && st.curCO.isMatchLocalSafe(int(DecodeArgBx(nextInst))) {
-							isMatchOptSite = true
-						}
-					}
+					boolOnly, r := classifyMatchCallSite(st, ip)
+					isMatchOptSite = boolOnly || r >= 0
 				}
 				if !isMatchOptSite && pic[0].ReceiverType == tp && pic[1].ReceiverType == nil && pic[1].Shape == nil {
 					st.cache.ic[ip] = ICSlot{
@@ -4572,81 +4605,149 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 		}
 	} else if receiver.IsSuper() {
 		sup := receiver.AsSuper()
-		var selfType *val.PyType
-		var isClassSuper bool
-		if sup.Self.IsType() && val.IsSubclass(sup.Self.AsType(), sup.ThisClass) {
-			selfType = sup.Self.AsType()
-			isClassSuper = true
-		} else {
-			selfType = sup.Self.Type()
-		}
-		typeVer := selfType.Version()
 		thisVer := sup.ThisClass.Version()
 		entry := &st.cache.ic[ip]
+		var selfType *val.PyType
+		var isClassSuper bool
+		var typeVer uint64
 		var callable val.Value
 		var cc *VMCodeCache
 		var nativeFn val.VectorcallFunc
 		var bind int32
 		found := false
-		if entry.Kind == ICKindSuperMethod && entry.ExpectedTypeVer == typeVer && entry.ExpectedAuxVer == thisVer {
+		if sup.Self.IsType() {
+			cand := sup.Self.AsType()
+			candVer := cand.Version()
+			switch {
+			case entry.Kind == ICKindSuperMethod && entry.ExpectedTypeVer == candVer && entry.ExpectedAuxVer == thisVer && (entry.SlotIndex&4) != 0:
+				selfType = cand
+				typeVer = candVer
+				isClassSuper = true
+				callable = entry.CachedVal
+				cc = entry.CalleeCache
+				nativeFn = entry.NativeFn
+				bind = entry.SlotIndex & 3
+				found = true
+			case cand == sup.ThisClass || val.IsSubclass(cand, sup.ThisClass):
+				selfType = cand
+				typeVer = candVer
+				isClassSuper = true
+			default:
+				selfType = sup.Self.Type()
+				typeVer = selfType.Version()
+			}
+		} else {
+			selfType = sup.Self.Type()
+			typeVer = selfType.Version()
+		}
+		if !found && entry.Kind == ICKindSuperMethod && entry.ExpectedTypeVer == typeVer && entry.ExpectedAuxVer == thisVer &&
+			((entry.SlotIndex&4) != 0) == isClassSuper {
 			callable = entry.CachedVal
 			cc = entry.CalleeCache
 			nativeFn = entry.NativeFn
-			bind = entry.SlotIndex
+			bind = entry.SlotIndex & 3
 			found = true
-		} else if methIdx < uint16(len(st.consts)) {
-			attrName := val.InternValue(st.consts[methIdx])
-			if descr, _, ok := selfType.LookupMROAfter(sup.ThisClass, attrName); ok {
-				switch {
-				case descr.IsFunction():
-					if !isClassSuper {
-						bind = 1
+		}
+		if !found && methIdx < uint16(len(st.consts)) {
+			// Check 4-way polymorphic typeMethodPIC before walking MRO so
+			// polymorphic super(Cls, cls).__new__(cls, ...) call sites do not thrash.
+			pairKey := uint64(uintptr(unsafe.Pointer(selfType))) ^ (uint64(uintptr(unsafe.Pointer(sup.ThisClass))) << 1)
+			if isClassSuper {
+				pairKey |= 1
+			}
+			pairVer := typeVer ^ (thisVer*0x9e3779b97f4a7c15 + 1)
+			if uint(ip) < uint(len(st.cache.typeMethodPIC)) {
+				tpic := &st.cache.typeMethodPIC[ip]
+				for k := range 4 {
+					e := &tpic[k]
+					if e.ObjPtr == pairKey && e.ExpectedVer == pairVer {
+						callable = e.CachedVal
+						cc = e.CalleeCache
+						nativeFn = e.NativeFn
+						if e.Bind {
+							if isClassSuper {
+								bind = 2
+							} else {
+								bind = 1
+							}
+						}
+						found = true
+						break
 					}
-					callable = descr
-					cc = vm.fastCalleeCache(AsCodeObject(descr.AsFunction().Code))
-					found = true
-				case descr.IsBuiltinFunc() && !descr.AsBuiltinFunc().NoBind:
-					if !isClassSuper {
-						bind = 1
-					}
-					callable = descr
-					nativeFn = descr.AsBuiltinFunc().Fn
-					found = true
-				case descr.Kind() == val.KindStaticMethod:
-					bind = 0
-					callable = descr.AsStaticMethod().Callable
-					if callable.IsFunction() {
-						cc = vm.fastCalleeCache(AsCodeObject(callable.AsFunction().Code))
-					} else if callable.IsBuiltinFunc() {
-						nativeFn = callable.AsBuiltinFunc().Fn
-					}
-					found = true
-				case descr.Kind() == val.KindClassMethod:
-					bind = 2
-					callable = descr.AsClassMethod().Callable
-					if callable.IsFunction() {
-						cc = vm.fastCalleeCache(AsCodeObject(callable.AsFunction().Code))
-					} else if callable.IsBuiltinFunc() {
-						nativeFn = callable.AsBuiltinFunc().Fn
-					}
-					found = true
-				case descr.Type().Slots.TpDescrGet == nil || (descr.IsBuiltinFunc() && descr.AsBuiltinFunc().NoBind):
-					bind = 0
-					callable = descr
-					if callable.IsBuiltinFunc() {
-						nativeFn = callable.AsBuiltinFunc().Fn
-					}
-					found = true
 				}
-				if found {
-					*entry = ICSlot{
-						Kind:            ICKindSuperMethod,
-						ExpectedTypeVer: typeVer,
-						ExpectedAuxVer:  thisVer,
-						SlotIndex:       bind,
-						CachedVal:       callable,
-						CalleeCache:     cc,
-						NativeFn:        nativeFn,
+			}
+			if !found {
+				attrName := val.InternValue(st.consts[methIdx])
+				if descr, _, ok := selfType.LookupMROAfter(sup.ThisClass, attrName); ok {
+					switch {
+					case descr.IsFunction():
+						if !isClassSuper {
+							bind = 1
+						}
+						callable = descr
+						cc = vm.fastCalleeCache(AsCodeObject(descr.AsFunction().Code))
+						found = true
+					case descr.IsBuiltinFunc() && !descr.AsBuiltinFunc().NoBind:
+						if !isClassSuper {
+							bind = 1
+						}
+						callable = descr
+						nativeFn = descr.AsBuiltinFunc().Fn
+						found = true
+					case descr.Kind() == val.KindStaticMethod:
+						bind = 0
+						callable = descr.AsStaticMethod().Callable
+						if callable.IsFunction() {
+							cc = vm.fastCalleeCache(AsCodeObject(callable.AsFunction().Code))
+						} else if callable.IsBuiltinFunc() {
+							nativeFn = callable.AsBuiltinFunc().Fn
+						}
+						found = true
+					case descr.Kind() == val.KindClassMethod:
+						bind = 2
+						callable = descr.AsClassMethod().Callable
+						if callable.IsFunction() {
+							cc = vm.fastCalleeCache(AsCodeObject(callable.AsFunction().Code))
+						} else if callable.IsBuiltinFunc() {
+							nativeFn = callable.AsBuiltinFunc().Fn
+						}
+						found = true
+					case descr.Type().Slots.TpDescrGet == nil || (descr.IsBuiltinFunc() && descr.AsBuiltinFunc().NoBind):
+						bind = 0
+						callable = descr
+						if callable.IsBuiltinFunc() {
+							nativeFn = callable.AsBuiltinFunc().Fn
+						}
+						found = true
+					}
+					if found {
+						classFlag := int32(0)
+						if isClassSuper {
+							classFlag = 4
+						}
+						// Promote to polymorphic PIC when monomorphic slot already holds a different pair.
+						if entry.Kind == ICKindSuperMethod && (entry.ExpectedTypeVer != typeVer || entry.ExpectedAuxVer != thisVer) {
+							tpic := &st.cache.ensureTypeMethodPIC()[ip]
+							if bind == 0 || (isClassSuper && bind == 2) || (!isClassSuper && bind == 1) {
+								recordTypeMethodPICMRU(tpic, typeMethodPICEntry{
+									CachedVal:   callable,
+									CalleeCache: cc,
+									NativeFn:    nativeFn,
+									ExpectedVer: pairVer,
+									ObjPtr:      pairKey,
+									Bind:        bind != 0,
+								})
+							}
+						}
+						*entry = ICSlot{
+							Kind:            ICKindSuperMethod,
+							ExpectedTypeVer: typeVer,
+							ExpectedAuxVer:  thisVer,
+							SlotIndex:       bind | classFlag,
+							CachedVal:       callable,
+							CalleeCache:     cc,
+							NativeFn:        nativeFn,
+						}
 					}
 				}
 			}

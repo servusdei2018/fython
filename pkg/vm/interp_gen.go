@@ -1033,6 +1033,139 @@ func (vm *VM) suspendActiveChain(st *loopState, yieldVal val.Value, resumeIP, re
 	return resumeIP, resumeSP, ctlExit
 }
 
+func (vm *VM) isDrainingActiveGen(st *loopState) bool {
+	if vm.activeDrainGen == nil || st.activeGen == nil {
+		return false
+	}
+	if st.frameIdx == st.startFrameIdx {
+		return st.activeGen == vm.activeDrainGen
+	}
+	if st.frameIdx != st.genFrameIdx {
+		return false
+	}
+	for k := st.frameIdx - 1; k >= st.startFrameIdx; k-- {
+		if k >= len(vm.frameAux) || vm.frameAux[k].genMode != genModeYieldFrom {
+			return false
+		}
+		if k == st.startFrameIdx {
+			return vm.frameAux[k].activeGen == vm.activeDrainGen
+		}
+	}
+	return false
+}
+
+func (vm *VM) emitDrainItem(v val.Value) {
+	if vm.hasTrackedViews {
+		markViewEscaped(v)
+	}
+	val.ClearEphemeral(v)
+	val.DetachStringBuf(v)
+	if vm.drainItems != nil {
+		*vm.drainItems = append(*vm.drainItems, v)
+		return
+	}
+	if vm.drainAppend != nil {
+		vm.drainAppend(v)
+	}
+}
+
+// drainGeneratorRun drains all yielded items from gen in a single runFrame
+// invocation, routing yields either directly into itemsSink or appendFn.
+func (vm *VM) drainGeneratorRun(ctx *val.ExecContext, gen *val.PyGenerator, itemsSink *[]val.Value, appendFn func(val.Value)) bool {
+	if gen.State == val.GenClosed {
+		return true
+	}
+	if gen.State == val.GenRunning {
+		if ctx != nil {
+			ctx.Raise(val.NewValueError("generator already executing"))
+		}
+		return false
+	}
+	var thrownExc val.Value
+	if ctx != nil && ctx.HasException() {
+		thrownExc = ctx.ActiveException
+		ctx.ClearException()
+		if gen.State == val.GenCreated {
+			gen.State = val.GenClosed
+			vm.releaseGeneratorStack(gen)
+			ctx.Raise(thrownExc)
+			return false
+		}
+	}
+	co := AsCodeObject(gen.Code)
+	switch {
+	case !thrownExc.IsNone() && thrownExc.HeaderPtr() != nil:
+		vm.execCtx.Raise(thrownExc)
+	case gen.State == val.GenSuspended:
+		if gen.IP < len(co.Code) && Opcode(co.Code[gen.IP]>>24) != OP_YIELD_FROM {
+			if gen.SP >= len(gen.Stack) {
+				newStack := make([]val.Value, len(gen.Stack)*2+16)
+				copy(newStack, gen.Stack)
+				gen.Stack = newStack
+			}
+			gen.Stack[gen.SP] = val.NoneVal()
+			gen.SP++
+		}
+	case gen.State != val.GenCreated:
+		return false
+	}
+
+	savedGen, savedItems, savedAppend := vm.activeDrainGen, vm.drainItems, vm.drainAppend
+	vm.activeDrainGen = gen
+	vm.drainItems = itemsSink
+	vm.drainAppend = appendFn
+	restoreDrain := func() {
+		vm.activeDrainGen, vm.drainItems, vm.drainAppend = savedGen, savedItems, savedAppend
+	}
+
+	nextFrame := 0
+	if vm.activeCO != nil {
+		nextFrame = vm.activeFrameIdx + 1
+	}
+	vm.ensureFrameCapacity(nextFrame + 4)
+	vm.unhandledException = val.NoneVal()
+	gen.State = val.GenRunning
+	_ = vm.runFrame(co, gen.Base, gen.SP, nextFrame, gen.Cells, gen.Globals, val.NoneVal(), gen.Stack, gen, nil)
+
+	if gen.State == val.GenClosed && (vm.unhandledException.IsNone() || vm.unhandledException.HeaderPtr() == nil) {
+		vm.releaseGeneratorStack(gen)
+		restoreDrain()
+		return true
+	}
+	if !vm.unhandledException.IsNone() && vm.unhandledException.HeaderPtr() != nil {
+		vm.releaseGeneratorStack(gen)
+		exc := vm.unhandledException
+		vm.unhandledException = val.NoneVal()
+		restoreDrain()
+		if ctx != nil {
+			ctx.Raise(exc)
+		} else {
+			panic(exc)
+		}
+		return false
+	}
+	restoreDrain()
+	return true
+}
+
+func (vm *VM) drainGeneratorSlice(ctx *val.ExecContext, gen *val.PyGenerator) ([]val.Value, bool) {
+	if gen.State == val.GenClosed {
+		return nil, true
+	}
+	var items []val.Value
+	if !vm.drainGeneratorRun(ctx, gen, &items, nil) {
+		return nil, false
+	}
+	return items, true
+}
+
+func (vm *VM) drainGeneratorInto(ctx *val.ExecContext, gen *val.PyGenerator, appendFn func(val.Value)) bool {
+	if gen.State == val.GenClosed {
+		return true
+	}
+	return vm.drainGeneratorRun(ctx, gen, nil, appendFn)
+}
+
 //go:noinline
 func (vm *VM) opYieldValue(st *loopState, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
@@ -1075,6 +1208,11 @@ func (vm *VM) opYieldValue(st *loopState, ip, sp int) (int, int, loopCtl) {
 			sp++
 			ip++
 			return ip, sp, ctlNext
+		}
+		if vm.isDrainingActiveGen(st) {
+			vm.emitDrainItem(yieldVal)
+			stack[sp] = val.NoneVal()
+			return ip + 1, sp + 1, ctlNext
 		}
 		return vm.suspendActiveChain(st, yieldVal, ip+1, sp)
 	}
@@ -1146,6 +1284,33 @@ func (vm *VM) opYieldFrom(st *loopState, ip, sp int) (int, int, loopCtl) {
 	}
 	if subiter.IsCoroutine() {
 		return vm.pushInlineCoroutine(st, subiter.AsCoroutine(), ip, sp, sp, genModeYieldFrom, sentVal)
+	}
+	if vm.isDrainingActiveGen(st) {
+		for {
+			var nextVal val.Value
+			var status val.IterStatus
+			if tpIterNext := subiter.Type().Slots.TpIterNext; tpIterNext != nil {
+				nextVal, status = tpIterNext(&vm.execCtx, subiter)
+			} else {
+				break
+			}
+			if status == val.IterYielded {
+				vm.emitDrainItem(nextVal)
+				continue
+			}
+			if status == val.IterExhausted {
+				stack[sp-1] = val.NoneVal()
+				break
+			}
+			if vm.execCtx.HasException() {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				st.raiseExc = exc
+				return ip, sp, ctlRaise
+			}
+			break
+		}
+		return ip + 1, sp, ctlReload
 	}
 	if callerIdx, mode := vm.findGenDrainCaller(st); mode != genModeNone {
 		js := vm.frameAux[callerIdx].joinState

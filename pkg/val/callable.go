@@ -3088,6 +3088,14 @@ func ExtractIterableItems(ctx *ExecContext, arg Value) []Value {
 			defer release()
 		}
 		gen := arg.AsGenerator()
+		if DrainGeneratorHook != nil {
+			if items, ok := DrainGeneratorHook(ctx, gen); ok {
+				return items
+			}
+			if ctx != nil && ctx.HasException() {
+				return nil
+			}
+		}
 		var res []Value
 		for {
 			v, status := gen.Send(ctx, NoneVal())
@@ -3547,8 +3555,16 @@ func initTypes() {
 			return Int64Val(num)
 		}
 		cls := IntType
-		if len(args) > 0 && args[0].IsType() {
+		if len(args) > 0 {
+			if !args[0].IsType() {
+				ctx.Raise(NewException(TypeErrorType, "int.__new__(X): X is not a type object"))
+				return NoneVal()
+			}
 			cls = args[0].AsType()
+			if cls != IntType && (cls.Flags&FlagIsIntSub) == 0 && !IsSubclass(cls, IntType) {
+				ctx.Raise(NewException(TypeErrorType, "int.__new__("+cls.Name+"): "+cls.Name+" is not a subtype of int"))
+				return NoneVal()
+			}
 		}
 		inst := NewInstanceOfType(cls)
 		instInst := inst.AsInstance()
@@ -4400,8 +4416,16 @@ func initTypes() {
 			return s
 		}
 		cls := StrType
-		if len(args) > 0 && args[0].IsType() {
+		if len(args) > 0 {
+			if !args[0].IsType() {
+				ctx.Raise(NewException(TypeErrorType, "str.__new__(X): X is not a type object"))
+				return NoneVal()
+			}
 			cls = args[0].AsType()
+			if cls != StrType && (cls.Flags&FlagIsStrSub) == 0 && !IsSubclass(cls, StrType) {
+				ctx.Raise(NewException(TypeErrorType, "str.__new__("+cls.Name+"): "+cls.Name+" is not a subtype of str"))
+				return NoneVal()
+			}
 		}
 		inst := NewInstanceOfType(cls)
 		instInst := inst.AsInstance()
@@ -5897,6 +5921,14 @@ func initTypes() {
 		}
 		if arg.IsGenerator() {
 			gen := arg.AsGenerator()
+			if DrainGeneratorHook != nil {
+				if items, ok := DrainGeneratorHook(ctx, gen); ok {
+					return newTupleOfTypeFromSlice(cls, items)
+				}
+				if ctx != nil && ctx.HasException() {
+					return NoneVal()
+				}
+			}
 			var buf [8]Value
 			items := buf[:0]
 			for {
@@ -5948,8 +5980,16 @@ func initTypes() {
 	}
 	tupleNewBuiltin := NewBuiltinFuncVal("tuple.__new__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		cls := TupleType
-		if len(args) > 0 && args[0].IsType() {
+		if len(args) > 0 {
+			if !args[0].IsType() {
+				ctx.Raise(NewException(TypeErrorType, "tuple.__new__(X): X is not a type object"))
+				return NoneVal()
+			}
 			cls = args[0].AsType()
+			if cls != TupleType && (cls.Flags&FlagIsTupleSub) == 0 && !IsSubclass(cls, TupleType) {
+				ctx.Raise(NewException(TypeErrorType, "tuple.__new__("+cls.Name+"): "+cls.Name+" is not a subtype of tuple"))
+				return NoneVal()
+			}
 		}
 		if len(args) <= 1 {
 			if cls == TupleType {
@@ -7821,8 +7861,16 @@ func initTypes() {
 			return res
 		}
 		cls := BytesType
-		if len(args) > 0 && args[0].IsType() {
+		if len(args) > 0 {
+			if !args[0].IsType() {
+				ctx.Raise(NewException(TypeErrorType, "bytes.__new__(X): X is not a type object"))
+				return NoneVal()
+			}
 			cls = args[0].AsType()
+			if cls != BytesType && (cls.Flags&FlagIsBytesSub) == 0 && !IsSubclass(cls, BytesType) {
+				ctx.Raise(NewException(TypeErrorType, "bytes.__new__("+cls.Name+"): "+cls.Name+" is not a subtype of bytes"))
+				return NoneVal()
+			}
 		}
 		inst := NewInstanceOfType(cls)
 		instObj := inst.AsInstance()
@@ -9005,27 +9053,51 @@ func hasOnlyPrimRootSlot(cls *PyType) bool {
 }
 
 func newPrimSubInstance(subcls *PyType, prim Value) Value {
-	instVal := NewInstanceOfType(subcls)
-	if instVal.ptr != nil && instVal.ptr.Kind == KindInstance {
-		instObj := instVal.AsInstance()
-		if len(instObj.Slots) == 0 {
-			if !instObj.ExtendBootstrapSlot(0, prim) {
-				instObj.Slots = []Value{prim}
-			}
-		} else {
-			instObj.Slots[0] = prim
-		}
+	shape := subcls.RootShape
+	if shape == nil {
+		shape = defaultRootShape
 	}
-	return instVal
+	obj := &PyInstance{
+		Header: ObjectHeader{Kind: KindInstance, Type: subcls},
+		Shape:  shape,
+	}
+	if pred := int(subcls.likelySlotCap.Load()); pred > len(obj.bootstrap) {
+		slots := make([]Value, 1, pred)
+		slots[0] = prim
+		obj.Slots = slots
+	} else {
+		obj.bootstrap[0] = prim
+		obj.Slots = obj.bootstrap[:1]
+	}
+	return Value{num: 0, ptr: &obj.Header}
 }
 
 func tryFastPrimitiveDunderNew2(fnPtr *ObjectHeader, subcls *PyType, arg Value) (Value, bool) {
+	if fnPtr == TupleType.dunderNew.ptr {
+		if subcls == nil || (subcls.Flags&(FlagHasCExtBase|FlagIsModuleSub)) != 0 ||
+			(subcls.Flags&FlagIsTupleSub) == 0 ||
+			arg.ptr == nil || arg.ptr.Kind != KindTuple {
+			return Value{}, false
+		}
+		items := arg.AsTuple().Items
+		obj := &PyTuple{
+			Header: ObjectHeader{Kind: KindTuple, Type: subcls},
+		}
+		if n := len(items); n <= len(obj.inline) {
+			copy(obj.inline[:n], items)
+			obj.Items = obj.inline[:n]
+		} else {
+			ClearEphemeral(arg)
+			obj.Items = items
+		}
+		return Value{num: 0, ptr: &obj.Header}, true
+	}
 	if !hasOnlyPrimRootSlot(subcls) {
 		return Value{}, false
 	}
 	switch fnPtr {
 	case StrType.dunderNew.ptr:
-		if subcls == StrType || !IsSubclass(subcls, StrType) {
+		if (subcls.Flags & FlagIsStrSub) == 0 {
 			return Value{}, false
 		}
 		var s Value
@@ -9034,7 +9106,7 @@ func tryFastPrimitiveDunderNew2(fnPtr *ObjectHeader, subcls *PyType, arg Value) 
 			s = arg
 		case arg.ptr != nil && arg.ptr.Kind == KindInstance:
 			inst := arg.AsInstance()
-			if inst.Header.Type != nil && IsSubclass(inst.Header.Type, StrType) &&
+			if inst.Header.Type != nil && (inst.Header.Type.Flags&FlagIsStrSub) != 0 &&
 				len(inst.Slots) > 0 && inst.Slots[0].IsAnyString() {
 				s = inst.Slots[0]
 			} else {
@@ -9045,11 +9117,14 @@ func tryFastPrimitiveDunderNew2(fnPtr *ObjectHeader, subcls *PyType, arg Value) 
 		}
 		return newPrimSubInstance(subcls, s), true
 	case IntType.dunderNew.ptr:
-		if subcls == IntType || !IsSubclass(subcls, IntType) {
+		if (subcls.Flags & FlagIsIntSub) == 0 {
 			return Value{}, false
 		}
 		if arg.ptr == &tagInt64 {
 			return newPrimSubInstance(subcls, arg), true
+		}
+		if arg.ptr == &tagBool {
+			return newPrimSubInstance(subcls, Int64Val(int64(arg.num))), true
 		}
 		if arg.IsAnyString() {
 			if parsed, ok := parseASCIIBase10Int64(arg.AsString()); ok {
@@ -9058,7 +9133,7 @@ func tryFastPrimitiveDunderNew2(fnPtr *ObjectHeader, subcls *PyType, arg Value) 
 		}
 		return Value{}, false
 	case BytesType.dunderNew.ptr:
-		if subcls == BytesType || !IsSubclass(subcls, BytesType) ||
+		if (subcls.Flags&FlagIsBytesSub) == 0 ||
 			arg.ptr == nil || arg.ptr.Kind != KindBytes ||
 			(arg.ptr.Type != nil && arg.ptr.Type != BytesType) {
 			return Value{}, false

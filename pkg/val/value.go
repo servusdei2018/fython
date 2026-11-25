@@ -130,6 +130,14 @@ const (
 	FlagHasCExtBase uint32 = 1 << 7
 	// FlagIsModuleSub marks ModuleType and any subclass of ModuleType.
 	FlagIsModuleSub uint32 = 1 << 8
+	// FlagIsStrSub marks any strict subclass of StrType.
+	FlagIsStrSub uint32 = 1 << 9
+	// FlagIsIntSub marks any strict subclass of IntType.
+	FlagIsIntSub uint32 = 1 << 10
+	// FlagIsBytesSub marks any strict subclass of BytesType.
+	FlagIsBytesSub uint32 = 1 << 11
+	// FlagIsTupleSub marks any strict subclass of TupleType.
+	FlagIsTupleSub uint32 = 1 << 12
 )
 
 // String returns the human-readable name of the Kind.
@@ -1037,6 +1045,49 @@ func TryHashValue(ctx *ExecContext, v Value) (uint32, Value, bool) {
 }
 
 //go:noinline
+func hashTupleFast(ctx *ExecContext, t *PyTuple) (uint32, Value, bool) {
+	if h := atomic.LoadUint32(&t.Header.Hash); h != 0 {
+		return h, Value{}, true
+	}
+	items := t.Items
+	var acc uint64 = 0x345678
+	for _, it := range items {
+		var ih uint32
+		switch {
+		case it.ptr == &tagInt64 || it.ptr == &tagBool:
+			f := float64(int64(it.num))
+			if f == 0.0 {
+				ih = mix64To32(0)
+			} else {
+				ih = mix64To32(math.Float64bits(f))
+			}
+		case it.ptr == &tagInlineStr:
+			ih = InlineStrHash(it)
+		case it.ptr != nil && it.ptr.Kind == KindString:
+			ih = atomic.LoadUint32(&it.ptr.Hash)
+			if ih == 0 {
+				ih = HashString((*PyString)(unsafe.Pointer(it.ptr)).Data)
+				atomic.StoreUint32(&it.ptr.Hash, ih)
+			}
+		case it.ptr == &tagNone:
+			ih = 0x4e6f6e65
+		default:
+			var exc Value
+			var ok bool
+			ih, exc, ok = TryHashValue(ctx, it)
+			if !ok {
+				return 0, exc, false
+			}
+		}
+		acc = (acc ^ uint64(ih)) * 1000003
+	}
+	acc ^= uint64(len(items))
+	h := mix64To32(acc)
+	atomic.StoreUint32(&t.Header.Hash, h)
+	return h, Value{}, true
+}
+
+//go:noinline
 func hashValueSlowCtx(ctx *ExecContext, v Value) (uint32, Value, bool) {
 	if v.IsAnyString() {
 		return HashString(v.AsString()), Value{}, true
@@ -1057,22 +1108,7 @@ func hashValueSlowCtx(ctx *ExecContext, v Value) (uint32, Value, bool) {
 		return hashComplex(v.AsComplex()), Value{}, true
 	}
 	if v.ptr.Kind == KindTuple && (v.ptr.Type == nil || v.ptr.Type == TupleType || v.ptr.Type.dunderHash.ptr == nil) {
-		if h := atomic.LoadUint32(&v.ptr.Hash); h != 0 {
-			return h, Value{}, true
-		}
-		items := v.AsTuple().Items
-		var acc uint64 = 0x345678
-		for _, it := range items {
-			ih, exc, ok := TryHashValue(ctx, it)
-			if !ok {
-				return 0, exc, false
-			}
-			acc = (acc ^ uint64(ih)) * 1000003
-		}
-		acc ^= uint64(len(items))
-		h := mix64To32(acc)
-		atomic.StoreUint32(&v.ptr.Hash, h)
-		return h, Value{}, true
+		return hashTupleFast(ctx, v.AsTuple())
 	}
 	if v.ptr.Kind == KindBytes {
 		if h := atomic.LoadUint32(&v.ptr.Hash); h != 0 {

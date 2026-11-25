@@ -1015,6 +1015,13 @@ type VM struct {
 	joinFirst     bool
 	joinCount     int
 	joinErrMsg    string
+	// Continuous generic drain state. While activeDrainGen is set, a generator
+	// drained by drainGeneratorInto/drainGeneratorSlice runs inside a single
+	// runLoopWithGlobals invocation: yields append straight into drainItems or
+	// drainAppend without suspending and re-entering runFrame per item.
+	activeDrainGen *val.PyGenerator
+	drainItems     *[]val.Value
+	drainAppend    func(val.Value)
 	// mvFree holds the memory views that are no longer referenced and can
 	// be handed out again by the next slice.
 	mvFree          []*val.PyMemoryView
@@ -1815,6 +1822,16 @@ func init() {
 		}
 		return vm.joinGenerator(ctx, sep, gen)
 	}
+	val.DrainGeneratorHook = func(ctx *val.ExecContext, gen *val.PyGenerator) ([]val.Value, bool) {
+		if ctx == nil || ctx.VM == nil {
+			return nil, false
+		}
+		vm, ok := ctx.VM.(*VM)
+		if !ok {
+			return nil, false
+		}
+		return vm.drainGeneratorSlice(ctx, gen)
+	}
 	val.AcquireExecContextHook = func() (*val.ExecContext, func()) {
 		v := standaloneVMPool.Get().(*VM)
 		return &v.execCtx, func() {
@@ -2119,6 +2136,23 @@ func computeLocalMatchSafe(co *CodeObject) [4]uint64 {
 			switch op1 {
 			case OP_JUMP_IF_FALSE, OP_JUMP_IF_TRUE, OP_UNARY_NOT, OP_POP_TOP:
 				continue
+			case OP_CMP_CONST_JUMP_IF_FALSE, OP_CMP_CONST_JUMP_IF_TRUE:
+				cmpOp := DecodeArgA(w1)
+				if cmpOp == CMP_IS || cmpOp == CMP_IS_NOT {
+					continue
+				}
+				clearBit(r)
+			case OP_LOAD_CONST:
+				cIdx := int(DecodeArgBx(w1))
+				if cIdx < len(co.Consts) && co.Consts[cIdx].IsNone() && i+2 < n {
+					w2 := co.Code[i+2]
+					op2 := DecodeOpcode(w2)
+					if (op2 == OP_COMPARE_OP || op2 == OP_COMPARE_JUMP_IF_FALSE || op2 == OP_COMPARE_JUMP_IF_TRUE) &&
+						(DecodeArgA(w2) == CMP_IS || DecodeArgA(w2) == CMP_IS_NOT) {
+						continue
+					}
+				}
+				clearBit(r)
 			case OP_LOAD_ATTR:
 				cIdx := int(DecodeArgBx(w1))
 				if cIdx < len(co.Consts) {

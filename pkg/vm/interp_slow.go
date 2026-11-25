@@ -1578,10 +1578,40 @@ func (vm *VM) opCompareJumpSlow(st *loopState, op Opcode, inst uint32, ip, sp in
 	}
 	cond := st.stack[newSP-1]
 	newSP--
+	if cond.IsInstance() {
+		truthy, raised := vm.evalInstanceTruthy(st, cond, ip, newSP)
+		if raised {
+			return ip, newSP, ctlRaise
+		}
+		if truthy == wantTrue {
+			return int(target), newSP, ctlReload
+		}
+		return ip + 2, newSP, ctlReload
+	}
 	if cond.IsTruthy() == wantTrue {
 		return int(target), newSP, ctl
 	}
 	return ip + 2, newSP, ctl
+}
+
+// evalInstanceTruthy evaluates Python truthiness for a KindInstance Value using
+// the active VM's ExecContext so custom __bool__/__len__ methods avoid
+// standalone-VM acquisition and propagate exceptions cleanly.
+//
+//go:noinline
+func (vm *VM) evalInstanceTruthy(st *loopState, v val.Value, ip, sp int) (bool, bool) {
+	st.ip = ip
+	vm.frames[st.frameIdx].ip = ip
+	vm.execCtx.SP = sp
+	truthy := v.IsTruthyCtx(&vm.execCtx)
+	st.stack = st.syncStackFromExecCtx(vm, st.stack)
+	if vm.execCtx.HasException() {
+		exc := vm.execCtx.ActiveException
+		vm.execCtx.ClearException()
+		st.raiseExc = exc
+		return false, true
+	}
+	return truthy, false
 }
 
 //go:noinline
@@ -1647,6 +1677,16 @@ func (vm *VM) opCmpConstJumpSlow(st *loopState, op Opcode, inst uint32, ip, sp i
 	}
 	cond := st.stack[newSP-1]
 	newSP--
+	if cond.IsInstance() {
+		truthy, raised := vm.evalInstanceTruthy(st, cond, ip, newSP)
+		if raised {
+			return ip, newSP, ctlRaise
+		}
+		if truthy == wantTrue {
+			return target, newSP, ctlReload
+		}
+		return ip + 3, newSP, ctlReload
+	}
 	if cond.IsTruthy() == wantTrue {
 		return target, newSP, ctl
 	}

@@ -476,7 +476,12 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			return val.Int64Val(int64(val.HashValue(obj)))
 		}
 		if obj.IsTuple() && obj.Type() == val.TupleType {
-			return val.Int64Val(int64(val.HashValue(obj)))
+			h, exc, ok := val.TryHashValue(ctx, obj)
+			if !ok {
+				ctx.Raise(exc)
+				return val.NoneVal()
+			}
+			return val.Int64Val(int64(h))
 		}
 		tp := obj.Type()
 		if hashFn, owner, ok := tp.LookupMRO(nameHash); ok {
@@ -488,7 +493,12 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			}
 		}
 		if obj.IsTuple() {
-			return val.Int64Val(int64(val.HashValue(obj)))
+			h, exc, ok := val.TryHashValue(ctx, obj)
+			if !ok {
+				ctx.Raise(exc)
+				return val.NoneVal()
+			}
+			return val.Int64Val(int64(h))
 		}
 		if obj.IsList() || obj.IsDict() || obj.IsSet() || obj.IsByteArray() {
 			return val.RaiseTypeError(ctx, "unhashable type: '"+tp.Name+"'")

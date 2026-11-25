@@ -203,17 +203,52 @@ func (vm *VM) dispatchColdOpcode(st *loopState, op Opcode, inst uint32, ip, sp i
 	case OP_JUMP_IF_TRUE:
 		sp--
 		cond := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16))
-		if cond.IsTruthy() {
+		var truthy bool
+		if cond.IsInstance() {
+			var raised bool
+			truthy, raised = vm.evalInstanceTruthy(st, cond, ip, sp)
+			if raised {
+				return ip, sp, ctlRaise
+			}
+			if truthy {
+				return int(uint16(inst)), sp, ctlReload
+			}
+			return ip + 1, sp, ctlReload
+		}
+		truthy = cond.IsTruthy()
+		if truthy {
 			return int(uint16(inst)), sp, ctlNext
 		}
 		return ip + 1, sp, ctlNext
 	case OP_JUMP_IF_FALSE_OR_POP:
-		if !(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)).IsTruthy() {
+		cond := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
+		if cond.IsInstance() {
+			truthy, raised := vm.evalInstanceTruthy(st, cond, ip, sp)
+			if raised {
+				return ip, sp, ctlRaise
+			}
+			if !truthy {
+				return int(uint16(inst)), sp, ctlReload
+			}
+			return ip + 1, sp - 1, ctlReload
+		}
+		if !cond.IsTruthy() {
 			return int(uint16(inst)), sp, ctlNext
 		}
 		return ip + 1, sp - 1, ctlNext
 	case OP_JUMP_IF_TRUE_OR_POP:
-		if (*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)).IsTruthy() {
+		cond := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
+		if cond.IsInstance() {
+			truthy, raised := vm.evalInstanceTruthy(st, cond, ip, sp)
+			if raised {
+				return ip, sp, ctlRaise
+			}
+			if truthy {
+				return int(uint16(inst)), sp, ctlReload
+			}
+			return ip + 1, sp - 1, ctlReload
+		}
+		if cond.IsTruthy() {
 			return int(uint16(inst)), sp, ctlNext
 		}
 		return ip + 1, sp - 1, ctlNext
@@ -553,7 +588,16 @@ func (vm *VM) dispatchColdOpcode(st *loopState, op Opcode, inst uint32, ip, sp i
 		}
 		return vm.opUnarySlow(st, OP_UNARY_POSITIVE, ip, sp)
 	case OP_UNARY_NOT:
-		*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)) = val.BoolVal(!(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)).IsTruthy())
+		v := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
+		if v.IsInstance() {
+			truthy, raised := vm.evalInstanceTruthy(st, v, ip, sp)
+			if raised {
+				return ip, sp, ctlRaise
+			}
+			st.stack[sp-1] = val.BoolVal(!truthy)
+			return ip + 1, sp, ctlReload
+		}
+		*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)) = val.BoolVal(!v.IsTruthy())
 		ip++
 		return ip, sp, ctlNext
 

@@ -39,6 +39,12 @@ var ResolveLazyImportHook func(vm any, mod *PyModule, name Value, lazyVal Value)
 // to fall back to the default send loop.
 var JoinGeneratorHook func(ctx *ExecContext, sep string, gen *PyGenerator) (Value, bool)
 
+// DrainGeneratorHook drains all yielded values from a generator in a single
+// VM entry without per-yield Send/runFrame re-entry overhead. Returns
+// (items, true) on completion or (nil, false) when an exception is raised on
+// ctx or fallback is required.
+var DrainGeneratorHook func(ctx *ExecContext, gen *PyGenerator) ([]Value, bool)
+
 func (ctx *ExecContext) Raise(exc Value) {
 	if ctx == nil {
 		panic(exc)
@@ -975,14 +981,19 @@ func NewTypeWithMeta(name string, bases []*PyType, dict *PyDict, meta *PyType) (
 	return t, nil
 }
 
-// RefreshInstanceFlags precomputes FlagHasCExtBase and FlagIsModuleSub from t.MRO
-// so NewInstanceOfType can check both conditions in a single flag test.
+// RefreshInstanceFlags precomputes FlagHasCExtBase, FlagIsModuleSub, and
+// primitive-subclass flags from t.MRO so NewInstanceOfType and
+// TryFastPrimitiveDunderNew can test them in O(1) without walking MRO.
 func (t *PyType) RefreshInstanceFlags() {
 	if t == nil {
 		return
 	}
 	hasCExt := t.Basicsize > 16
 	isMod := false
+	isStrSub := false
+	isIntSub := false
+	isBytesSub := false
+	isTupleSub := false
 	for _, b := range t.MRO {
 		if b == nil {
 			continue
@@ -993,12 +1004,37 @@ func (t *PyType) RefreshInstanceFlags() {
 		if ModuleType != nil && b == ModuleType {
 			isMod = true
 		}
+		if StrType != nil && b == StrType && t != StrType {
+			isStrSub = true
+		}
+		if IntType != nil && b == IntType && t != IntType {
+			isIntSub = true
+		}
+		if BytesType != nil && b == BytesType && t != BytesType {
+			isBytesSub = true
+		}
+		if TupleType != nil && b == TupleType && t != TupleType {
+			isTupleSub = true
+		}
 	}
+	t.Flags &^= FlagHasCExtBase | FlagIsModuleSub | FlagIsStrSub | FlagIsIntSub | FlagIsBytesSub | FlagIsTupleSub
 	if hasCExt {
 		t.Flags |= FlagHasCExtBase
 	}
 	if isMod {
 		t.Flags |= FlagIsModuleSub
+	}
+	if isStrSub {
+		t.Flags |= FlagIsStrSub
+	}
+	if isIntSub {
+		t.Flags |= FlagIsIntSub
+	}
+	if isBytesSub {
+		t.Flags |= FlagIsBytesSub
+	}
+	if isTupleSub {
+		t.Flags |= FlagIsTupleSub
 	}
 }
 

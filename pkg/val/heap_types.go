@@ -3347,12 +3347,39 @@ func SetVal(s *PySet) Value {
 	return Value{ptr: &s.Header}
 }
 
-// Copy returns a shallow copy of d, using a pre-sized PutNewHashed fast path
-// for concrete single-threaded non-live dicts (zero repeated resizes or re-hashing).
+// Copy returns a shallow copy of d, using a zero-probe memcpy fast path for
+// tombstone-free concrete dicts and a pre-sized PutNewHashed compaction path
+// when tombstones are present.
 func (d *PyDict) Copy() *PyDict {
 	if d.Live == nil && !d.Shared && !MultiThreadedFlag.Load() {
 		if d.used == 0 {
 			return &PyDict{Header: ObjectHeader{Kind: KindDict, Type: DictType}}
+		}
+		if d.used == d.filled && len(d.Entries) == d.used && len(d.indices) > 0 {
+			if d.IsSmallInline() {
+				newD := NewSmallDictDirect(0)
+				copy(newD.Entries[:d.used], d.Entries[:d.used])
+				newD.Entries = newD.Entries[:d.used]
+				copy(newD.indices, d.indices)
+				newD.used = d.used
+				newD.filled = d.filled
+				newD.mask = d.mask
+				newD.indexShift = d.indexShift
+				return newD
+			}
+			entries := make([]DictEntry, len(d.Entries), cap(d.Entries))
+			copy(entries, d.Entries)
+			indices := make([]byte, len(d.indices))
+			copy(indices, d.indices)
+			return &PyDict{
+				Header:     ObjectHeader{Kind: KindDict, Type: DictType},
+				Entries:    entries,
+				indices:    indices,
+				used:       d.used,
+				filled:     d.filled,
+				mask:       d.mask,
+				indexShift: d.indexShift,
+			}
 		}
 		var newD *PyDict
 		if d.used <= 5 {
@@ -3428,10 +3455,28 @@ func NewSetFromDict(d *PyDict) Value {
 	return NewSetVal(d.Keys()...)
 }
 
-// Copy returns a shallow copy of s, reusing pre-computed hashes without re-hashing.
+// Copy returns a shallow copy of s, using a zero-probe memcpy fast path when
+// tombstone-free and a pre-sized PutNewHashed compaction path otherwise.
 func (s *PySet) Copy() *PySet {
 	d := &s.dict
 	if d.Live == nil && !d.Shared && !MultiThreadedFlag.Load() {
+		if d.used > 0 && d.used == d.filled && len(d.Entries) == d.used && len(d.indices) > 0 {
+			entries := make([]DictEntry, len(d.Entries), cap(d.Entries))
+			copy(entries, d.Entries)
+			indices := make([]byte, len(d.indices))
+			copy(indices, d.indices)
+			return &PySet{
+				Header: ObjectHeader{Kind: KindSet, Type: SetType},
+				dict: PyDict{
+					Entries:    entries,
+					indices:    indices,
+					used:       d.used,
+					filled:     d.filled,
+					mask:       d.mask,
+					indexShift: d.indexShift,
+				},
+			}
+		}
 		out := &PySet{
 			Header: ObjectHeader{Kind: KindSet, Type: SetType},
 		}

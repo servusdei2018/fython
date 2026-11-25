@@ -557,8 +557,18 @@ func isFastAttrDescrEligibleAt(co *CodeObject, methodIdx int, src []uint32, next
 		switch DecodeOpcode(nextInst) {
 		case OP_JUMP_IF_FALSE, OP_JUMP_IF_TRUE, OP_UNARY_NOT, OP_POP_TOP:
 			return false
+		case OP_CMP_CONST_JUMP_IF_FALSE, OP_CMP_CONST_JUMP_IF_TRUE:
+			cmpOp := DecodeArgA(nextInst)
+			cIdx := int(uint8(nextInst >> 8))
+			if (cmpOp == CMP_IS || cmpOp == CMP_IS_NOT) && cIdx < len(co.Consts) && co.Consts[cIdx].IsNone() {
+				return false
+			}
 		case OP_STORE_FAST:
 			if co.isMatchLocalSafe(int(DecodeArgBx(nextInst))) {
+				return false
+			}
+		case OP_STORE_LOAD_FAST:
+			if co.isMatchLocalSafe(int(uint8(nextInst >> 8))) {
 				return false
 			}
 		}

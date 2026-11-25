@@ -271,9 +271,12 @@ func (vm *VM) opBinarySlice(st *loopState, ip, sp int) (int, int, loopCtl) {
 			start, stop, _, sliceLen, err = val.NormalizeSliceIndices(startVal, stopVal, val.NoneVal(), len(data))
 		}
 		if err == nil {
-			if sliceLen == 0 {
+			switch {
+			case start == 0 && stop == len(data) && container.Type() == val.BytesType:
+				stack[sp-3] = container
+			case sliceLen == 0:
 				stack[sp-3] = val.NewBytesVal(nil)
-			} else {
+			default:
 				stack[sp-3] = val.NewBytesVal(data[start:stop])
 			}
 			sp -= 2
@@ -337,8 +340,8 @@ func (vm *VM) opBinarySlice(st *loopState, ip, sp int) (int, int, loopCtl) {
 				stack[sp-3] = val.EmptyTupleVal()
 			case start == 0 && stop == len(items) && container.Type() == val.TupleType:
 				stack[sp-3] = container
-			case sliceLen <= 3 && ip+1 < st.codeLen && !val.MultiThreadedFlag.Load() &&
-				isEphemeralTupleNextInst(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4))):
+			case sliceLen <= 8 && container.Type() == val.TupleType && ip+1 < st.codeLen && !val.MultiThreadedFlag.Load() &&
+				isCachedEphemeralTupleSite(st, ip):
 				stack[sp-3] = vm.acquireEphemeralTuple(items[start:stop])
 			case sliceLen >= 4:
 				// Tuples are immutable so sharing the backing slice is
@@ -365,9 +368,12 @@ func (vm *VM) opBinarySlice(st *loopState, ip, sp int) (int, int, loopCtl) {
 			start, stop, _, sliceLen, err = val.NormalizeSliceIndices(startVal, stopVal, val.NoneVal(), n)
 		}
 		if err == nil {
-			if sliceLen == 0 {
+			switch {
+			case start == 0 && stop == n:
+				stack[sp-3] = container
+			case sliceLen == 0:
 				stack[sp-3] = val.SmallStringVal("")
-			} else {
+			default:
 				stack[sp-3] = val.SliceInlineStrASCII(container, start, stop)
 			}
 			sp -= 2
@@ -392,6 +398,8 @@ func (vm *VM) opBinarySlice(st *loopState, ip, sp int) (int, int, loopCtl) {
 			}
 			if err == nil {
 				switch {
+				case start == 0 && stop == len(s) && (container.Kind() == val.KindInlineStr || container.Type() == val.StrType):
+					stack[sp-3] = container
 				case sliceLen == 0:
 					stack[sp-3] = val.SmallStringVal("")
 				case sliceLen <= 7:
@@ -411,9 +419,12 @@ func (vm *VM) opBinarySlice(st *loopState, ip, sp int) (int, int, loopCtl) {
 				start, stop, _, sliceLen, err = val.NormalizeSliceIndices(startVal, stopVal, val.NoneVal(), len(runes))
 			}
 			if err == nil {
-				if sliceLen == 0 {
+				switch {
+				case start == 0 && stop == len(runes) && (container.Kind() == val.KindInlineStr || container.Type() == val.StrType):
+					stack[sp-3] = container
+				case sliceLen == 0:
 					stack[sp-3] = val.SmallStringVal("")
-				} else {
+				default:
 					stack[sp-3] = val.NewStringVal(string(runes[start:stop]))
 				}
 				sp -= 2
@@ -1345,6 +1356,33 @@ func isEphemeralTupleLHSCmp(st *loopState, ip int) bool {
 	return false
 }
 
+// isCachedEphemeralTupleSite caches whether a tuple produced at ip (by
+// OP_BUILD_TUPLE or OP_BINARY_SLICE) is consumed immediately by a non-escaping
+// operation, keyed by VMCodeCache.streamGen.
+func isCachedEphemeralTupleSite(st *loopState, ip int) bool {
+	cache := st.cache
+	var state uint8
+	if cache != nil && cache.buildTupleGen == cache.streamGen && uint(ip) < uint(len(cache.buildTupleEphemeral)) {
+		state = cache.buildTupleEphemeral[ip]
+	}
+	if state == 0 {
+		nextWord := *(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4))
+		if isEphemeralTupleNextInst(nextWord) || isEphemeralTupleLHSCmp(st, ip) {
+			state = 2
+		} else {
+			state = 1
+		}
+		if cache != nil && uint(ip) < uint(len(cache.ic)) {
+			if cache.buildTupleGen != cache.streamGen || len(cache.buildTupleEphemeral) < len(cache.ic) {
+				cache.buildTupleEphemeral = make([]uint8, len(cache.ic))
+				cache.buildTupleGen = cache.streamGen
+			}
+			cache.buildTupleEphemeral[ip] = state
+		}
+	}
+	return state == 2
+}
+
 //go:noinline
 func (vm *VM) opBuildTuple(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
@@ -1359,31 +1397,9 @@ func (vm *VM) opBuildTuple(st *loopState, inst uint32, ip, sp int) (int, int, lo
 		val.DetachStringBuf(stack[i])
 		markViewEscaped(stack[i])
 	}
-	if count <= 8 && ip+1 < st.codeLen && !val.MultiThreadedFlag.Load() {
-		cache := st.cache
-		var state uint8
-		if cache != nil && cache.buildTupleGen == cache.streamGen && uint(ip) < uint(len(cache.buildTupleEphemeral)) {
-			state = cache.buildTupleEphemeral[ip]
-		}
-		if state == 0 {
-			nextWord := *(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4))
-			if isEphemeralTupleNextInst(nextWord) || isEphemeralTupleLHSCmp(st, ip) {
-				state = 2
-			} else {
-				state = 1
-			}
-			if cache != nil && uint(ip) < uint(len(cache.ic)) {
-				if cache.buildTupleGen != cache.streamGen || len(cache.buildTupleEphemeral) < len(cache.ic) {
-					cache.buildTupleEphemeral = make([]uint8, len(cache.ic))
-					cache.buildTupleGen = cache.streamGen
-				}
-				cache.buildTupleEphemeral[ip] = state
-			}
-		}
-		if state == 2 {
-			stack[base] = vm.acquireEphemeralTuple(stack[base:sp])
-			return ip + 1, base + 1, ctlNext
-		}
+	if count <= 8 && ip+1 < st.codeLen && !val.MultiThreadedFlag.Load() && isCachedEphemeralTupleSite(st, ip) {
+		stack[base] = vm.acquireEphemeralTuple(stack[base:sp])
+		return ip + 1, base + 1, ctlNext
 	}
 	stack[base] = val.NewTupleFromSlice(stack[base:sp])
 	return ip + 1, base + 1, ctlNext

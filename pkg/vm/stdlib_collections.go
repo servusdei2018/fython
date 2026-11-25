@@ -23,9 +23,7 @@ type pyDeque struct {
 	Mu     sync.RWMutex
 }
 
-func (d *pyDeque) appendRight(v val.Value) {
-	d.Mu.Lock()
-	defer d.Mu.Unlock()
+func (d *pyDeque) appendRightNoLock(v val.Value) {
 	if d.MaxLen >= 0 && len(d.Items) >= d.MaxLen {
 		if d.MaxLen == 0 {
 			return
@@ -35,6 +33,88 @@ func (d *pyDeque) appendRight(v val.Value) {
 		return
 	}
 	d.Items = append(d.Items, v)
+}
+
+func (d *pyDeque) appendRightFast(v val.Value) {
+	if val.MultiThreadedFlag.Load() {
+		d.appendRight(v)
+		return
+	}
+	d.appendRightNoLock(v)
+}
+
+func (d *pyDeque) extendRightSlice(items []val.Value) {
+	if len(items) == 0 {
+		return
+	}
+	if val.MultiThreadedFlag.Load() {
+		d.Mu.Lock()
+		defer d.Mu.Unlock()
+	}
+	if d.MaxLen < 0 {
+		d.Items = append(d.Items, items...)
+		return
+	}
+	if d.MaxLen == 0 {
+		d.Items = d.Items[:0]
+		return
+	}
+	if len(items) >= d.MaxLen {
+		tail := items[len(items)-d.MaxLen:]
+		if cap(d.Items) >= d.MaxLen {
+			d.Items = d.Items[:d.MaxLen]
+		} else {
+			d.Items = make([]val.Value, d.MaxLen)
+		}
+		copy(d.Items, tail)
+		return
+	}
+	total := len(d.Items) + len(items)
+	if total <= d.MaxLen {
+		d.Items = append(d.Items, items...)
+		return
+	}
+	drop := total - d.MaxLen
+	keep := len(d.Items) - drop
+	copy(d.Items, d.Items[drop:])
+	d.Items = append(d.Items[:keep], items...)
+}
+
+func (d *pyDeque) extendFromIterable(ctx *val.ExecContext, iterable val.Value) {
+	if iterable.HeaderPtr() == &d.Header {
+		// Self-extension: snapshot current items so extending doesn't loop.
+		if val.MultiThreadedFlag.Load() {
+			d.Mu.RLock()
+			snap := make([]val.Value, len(d.Items))
+			copy(snap, d.Items)
+			d.Mu.RUnlock()
+			d.extendRightSlice(snap)
+			return
+		}
+		snap := make([]val.Value, len(d.Items))
+		copy(snap, d.Items)
+		d.extendRightSlice(snap)
+		return
+	}
+	if iterable.IsGenerator() {
+		if ctx != nil && ctx.VM != nil {
+			if vm, ok := ctx.VM.(*VM); ok && vm != nil {
+				vm.drainGeneratorInto(ctx, iterable.AsGenerator(), d.appendRightFast)
+				return
+			}
+		}
+	}
+	items := val.ExtractIterableItems(ctx, iterable)
+	if ctx != nil && ctx.HasException() {
+		return
+	}
+	d.extendRightSlice(items)
+}
+
+func (d *pyDeque) appendRight(v val.Value) {
+	d.Mu.Lock()
+	defer d.Mu.Unlock()
+	d.appendRightNoLock(v)
 }
 
 func (d *pyDeque) appendLeft(v val.Value) {
@@ -136,9 +216,9 @@ func initCollectionsTypes() {
 				MaxLen: maxLen,
 			}
 			if posCount > 0 && !args[0].IsNone() {
-				items := val.ExtractIterableItems(ctx, args[0])
-				for _, v := range items {
-					deq.appendRight(v)
+				deq.extendFromIterable(ctx, args[0])
+				if ctx != nil && ctx.HasException() {
+					return val.NoneVal()
 				}
 			}
 			return val.ObjectVal(&deq.Header)
@@ -258,9 +338,7 @@ func initCollectionsTypes() {
 				ctx.Raise(val.NewException(val.TypeErrorType, "extend() takes exactly one argument"))
 				return val.NoneVal()
 			}
-			for _, v := range val.ExtractIterableItems(ctx, args[0]) {
-				deq.appendRight(v)
-			}
+			deq.extendFromIterable(ctx, args[0])
 			return val.NoneVal()
 		})
 
