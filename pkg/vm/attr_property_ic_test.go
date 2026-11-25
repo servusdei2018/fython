@@ -593,7 +593,133 @@ assert unpack_with_view(bytearray(b"abcd")) == 6 * (ord("a") + 5)
 			has3 = true
 		}
 	}
-	if !has2 || !has3 {
-		t.Fatalf("expected OP_UNPACK_2_FAST and OP_UNPACK_3_FAST in fused stream, got has2=%v has3=%v", has2, has3)
+	if !has2 || has3 {
+		t.Fatalf("expected OP_UNPACK_2_FAST in fused stream and cold OP_UNPACK_3_FAST unfused, got has2=%v has3=%v", has2, has3)
 	}
+}
+
+func TestStage5CoroutineClosureQuickeningAndDefaultsGuard(t *testing.T) {
+	eng, v := runPySource(t, `
+import asyncio
+
+async def yield_once():
+    return 1
+
+def make_coro(delta):
+    async def inner(x):
+        y = await yield_once()
+        return x + delta + y
+    return inner
+
+def make_coro_with_default(delta):
+    async def inner(x=10):
+        return x + delta
+    return inner
+
+async def call_site(fn, arg):
+    return await fn(arg)
+
+async def main():
+    total = 0
+    for i in range(12):
+        total += await call_site(make_coro(i), 2)
+    # Polymorphic call site: switch to a function with defaults and mutate __defaults__.
+    f = make_coro_with_default(5)
+    assert (await f()) == 15
+    f.__defaults__ = (20,)
+    assert (await f()) == 25
+    # Verify non-direct-await coroutine closure site too.
+    c = make_coro(3)(4)
+    assert (await c) == 8
+    return total
+
+res = asyncio.run(main())
+assert res == sum(2 + i + 1 for i in range(12)), res
+`)
+	defer eng.ReleaseVM(v)
+}
+
+func TestStage5MethodPICStaticClassMethodAndShadowing(t *testing.T) {
+	eng, v := runPySource(t, `
+class Base:
+    @staticmethod
+    def sm(x):
+        return x + 1
+
+    @classmethod
+    def cm(cls, x):
+        return (cls.__name__, x)
+
+class Sub(Base):
+    pass
+
+def call_sm(obj, x):
+    return obj.sm(x)
+
+def call_cm(obj, x):
+    return obj.cm(x)
+
+b = Base()
+s = Sub()
+for _ in range(10):
+    assert call_sm(b, 5) == 6
+    assert call_cm(b, 5) == ("Base", 5)
+    assert call_cm(s, 5) == ("Sub", 5)
+
+# Instance shadowing must invalidate cached staticmethod/classmethod.
+b.sm = lambda x: x + 100
+b.cm = lambda x: ("shadow", x)
+assert call_sm(b, 5) == 105
+assert call_cm(b, 5) == ("shadow", 5)
+# Unshadowed instance still sees class methods.
+b2 = Base()
+assert call_sm(b2, 5) == 6
+assert call_cm(b2, 5) == ("Base", 5)
+
+# Polymorphic instance-slot callables across distinct shapes.
+class V1:
+    def __init__(self, f):
+        self.a = 1
+        self.run = f
+class V2:
+    def __init__(self, f):
+        self.b = 2
+        self.c = 3
+        self.run = f
+
+def invoke(obj, x):
+    return obj.run(x)
+
+v1 = V1(lambda x: x * 2)
+v2 = V2(lambda x: x * 3)
+for _ in range(10):
+    assert invoke(v1, 4) == 8
+    assert invoke(v2, 4) == 12
+`)
+	defer eng.ReleaseVM(v)
+}
+
+func TestStage5StoreAttrTransitionInvalidation(t *testing.T) {
+	eng, v := runPySource(t, `
+class Box:
+    def __init__(self, a, b):
+        self.a = a
+        self.b = b
+
+for i in range(20):
+    obj = Box(i, i + 1)
+    assert obj.a == i and obj.b == i + 1
+
+# Adding a data descriptor on the class must invalidate the in-loop transition IC.
+hits = []
+def set_a(self, val):
+    hits.append(val)
+    self._a = val
+Box.a = property(lambda self: self._a, set_a)
+
+obj2 = Box(99, 100)
+assert hits == [99]
+assert obj2.a == 99 and obj2.b == 100
+`)
+	defer eng.ReleaseVM(v)
 }

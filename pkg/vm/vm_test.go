@@ -1088,28 +1088,17 @@ func TestTier2SuperinstructionFusion(t *testing.T) {
 		}
 	}
 
-	if DecodeOpcode(fused[0]) != OP_FAST_ADD_INT_LOCAL_TO_LOCAL {
-		t.Fatalf("expected OP_FAST_ADD_INT_LOCAL_TO_LOCAL at index 0, got %v", DecodeOpcode(fused[0]))
+	// Cold-only superinstructions (OP_FAST_ADD_INT_LOCAL_TO_LOCAL, OP_FAST_INC_INT_LOCAL_CONST,
+	// OP_FAST_LOOP_CMP_LT_CONST_JUMP) are intentionally not emitted; instead, hot constituent
+	// pairs (OP_LOAD_FAST_2, OP_STORE_LOAD_FAST, OP_CMP_CONST_JUMP_IF_FALSE) fuse in-loop.
+	if DecodeOpcode(fused[0]) != OP_LOAD_FAST_2 {
+		t.Fatalf("expected OP_LOAD_FAST_2 at index 0, got %v", DecodeOpcode(fused[0]))
 	}
-	if DecodeArgA(fused[0]) != 2 || DecodeArgB(fused[0]) != 0 || DecodeArgC(fused[0]) != 1 {
-		t.Fatalf("unexpected args for FAST_ADD: dst=%d, srcA=%d, srcB=%d",
-			DecodeArgA(fused[0]), DecodeArgB(fused[0]), DecodeArgC(fused[0]))
+	if DecodeOpcode(fused[3]) != OP_STORE_LOAD_FAST {
+		t.Fatalf("expected OP_STORE_LOAD_FAST at index 3, got %v", DecodeOpcode(fused[3]))
 	}
-
-	if DecodeOpcode(fused[4]) != OP_FAST_INC_INT_LOCAL_CONST {
-		t.Fatalf("expected OP_FAST_INC_INT_LOCAL_CONST at index 4, got %v", DecodeOpcode(fused[4]))
-	}
-	if DecodeArgA(fused[4]) != 0 || DecodeArgBx(fused[4]) != 1 {
-		t.Fatalf("unexpected args for FAST_INC: reg=%d, constIdx=%d",
-			DecodeArgA(fused[4]), DecodeArgBx(fused[4]))
-	}
-
-	if DecodeOpcode(fused[8]) != OP_FAST_LOOP_CMP_LT_CONST_JUMP {
-		t.Fatalf("expected OP_FAST_LOOP_CMP_LT_CONST_JUMP at index 8, got %v", DecodeOpcode(fused[8]))
-	}
-	if DecodeArgA(fused[8]) != 0 || DecodeArgBx(fused[8]) != 12 {
-		t.Fatalf("unexpected args for FAST_LOOP: reg=%d, exitTarget=%d",
-			DecodeArgA(fused[8]), DecodeArgBx(fused[8]))
+	if DecodeOpcode(fused[10]) != OP_COMPARE_JUMP_IF_FALSE {
+		t.Fatalf("expected OP_COMPARE_JUMP_IF_FALSE at index 10, got %v", DecodeOpcode(fused[10]))
 	}
 }
 
@@ -1357,8 +1346,8 @@ func TestCompactSuperinstructionFusionAndDeopt(t *testing.T) {
 	if DecodeOpcode(fused[13]) != OP_STORE_LOAD_FAST {
 		t.Fatalf("expected OP_STORE_LOAD_FAST at 13, got %v", DecodeOpcode(fused[13]))
 	}
-	if DecodeOpcode(fused[16]) != OP_COMPARE_JUMP_IF_TRUE {
-		t.Fatalf("expected OP_COMPARE_JUMP_IF_TRUE at 16, got %v", DecodeOpcode(fused[16]))
+	if DecodeOpcode(fused[16]) != OP_COMPARE_OP {
+		t.Fatalf("expected unfused OP_COMPARE_OP at 16 (OP_COMPARE_JUMP_IF_TRUE is cold), got %v", DecodeOpcode(fused[16]))
 	}
 	if DecodeOpcode(fused[18]) != OP_LOAD_FAST_2 {
 		t.Fatalf("expected OP_LOAD_FAST_2 at 18, got %v", DecodeOpcode(fused[18]))
@@ -1381,7 +1370,7 @@ func TestCompactSuperinstructionFusionAndDeopt(t *testing.T) {
 
 	// Verify deoptInst restores exact original instructions for every fused slot.
 	st := &loopState{curCO: co, codePtr: unsafe.Pointer(unsafe.SliceData(fused)), codeLen: len(fused)}
-	for _, idx := range []int{3, 5, 8, 13, 16, 18, 20, 22, 24} {
+	for _, idx := range []int{3, 5, 8, 13, 18, 20, 22, 24} {
 		ptr := v.deoptInst(st, idx, fused[idx])
 		cur := unsafe.Slice((*uint32)(ptr), len(code))
 		want := code[idx]
@@ -1429,12 +1418,12 @@ func TestSuperinstructionMultilineTracebackAndSubscr(t *testing.T) {
 	}
 	coSubscr.Init()
 	OptimizeCodeObject(coSubscr)
-	if DecodeOpcode(coSubscr.Active()[3]) != OP_SUBSCR_FAST_CONST {
-		t.Fatalf("expected OP_SUBSCR_FAST_CONST, got %v", DecodeOpcode(coSubscr.Active()[3]))
+	if DecodeOpcode(coSubscr.Active()[3]) != OP_LOAD_FAST_CONST {
+		t.Fatalf("expected OP_LOAD_FAST_CONST at 3 (OP_SUBSCR_FAST_CONST is cold), got %v", DecodeOpcode(coSubscr.Active()[3]))
 	}
 	_ = v.RunCode(coSubscr)
 	if v.unhandledException.IsNone() {
-		t.Fatal("expected KeyError from OP_SUBSCR_FAST_CONST")
+		t.Fatal("expected KeyError from OP_BINARY_SUBSCR")
 	}
 	tb, _ := v.unhandledException.AsInstance().GetAttr(nameTraceback)
 	if tb.IsNone() || tb.AsTraceback().LineNo != 11 {
@@ -1595,7 +1584,7 @@ func TestUnpack2And3FastFusion(t *testing.T) {
 	if DecodeOpcode(fused[1]) != OP_UNPACK_2_FAST {
 		t.Fatalf("expected OP_UNPACK_2_FAST at 1, got %v", DecodeOpcode(fused[1]))
 	}
-	if DecodeOpcode(fused[5]) != OP_UNPACK_3_FAST {
-		t.Fatalf("expected OP_UNPACK_3_FAST at 5, got %v", DecodeOpcode(fused[5]))
+	if DecodeOpcode(fused[5]) != OP_UNPACK_SEQUENCE {
+		t.Fatalf("expected unfused OP_UNPACK_SEQUENCE at 5 (OP_UNPACK_3_FAST is cold), got %v", DecodeOpcode(fused[5]))
 	}
 }

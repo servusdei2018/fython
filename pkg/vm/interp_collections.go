@@ -1150,17 +1150,25 @@ func (vm *VM) buildConstKeyTemplate(tmpl *ConstKeyMapTemplate, keysVal val.Value
 
 func (vm *VM) fillConstKeyDict(d *val.PyDict, tmpl *ConstKeyMapTemplate, values []val.Value) bool {
 	count := tmpl.Count
-	if count < 2 || count > 16 || len(values) < count || len(d.Entries) != 0 {
+	if count < 2 || count > 16 || len(values) < count || len(d.Entries) != 0 || cap(d.Entries) < count {
 		return false
 	}
+	entries := d.Entries[:count]
+	_ = entries[count-1]
+	_ = values[count-1]
+	hashes := tmpl.Hashes[:count]
+	keys := tmpl.Keys[:count]
+	_ = hashes[count-1]
+	_ = keys[count-1]
 	for i := range count {
-		d.Entries = append(d.Entries, val.DictEntry{
-			Hash:   uint32(tmpl.Hashes[i]),
+		entries[i] = val.DictEntry{
+			Hash:   uint32(hashes[i]),
 			Active: true,
-			Key:    tmpl.Keys[i],
+			Key:    keys[i],
 			Value:  values[i],
-		})
+		}
 	}
+	d.Entries = entries
 	switch {
 	case count <= 5:
 		copy(d.Indices(), tmpl.Indices8[:])

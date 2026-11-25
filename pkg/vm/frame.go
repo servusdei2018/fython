@@ -50,6 +50,7 @@ const (
 	ICKindIterDunder                // Custom __iter__ on PyInstance (CachedVal=fn Value, CalleeCache=CC, ExpectedTypeVer=type ver, ExpectedShapeID=shape ID, SlotIndex=gen flag)
 	ICKindIsinstanceTuple           // isinstance(x, (T1, ...)) (CachedVal=tuple Value, ExpectedTypeVer=lhs ver, ExpectedShapeID=shape ID or 0, SlotIndex=bool result)
 	ICKindConstKeyMap               // Pre-hashed const-key dict template (template lives in constKeyMaps[ip])
+	ICKindCoroClosure               // Quickened coroutine closure site (CalleeCache=CC, SlotIndex: 1=direct non-suspending, 2=direct suspending, 3=non-direct)
 )
 
 const (
@@ -1205,7 +1206,7 @@ func (vm *VM) releaseEphemeralTupleVal(v val.Value) {
 	t.Header.Hash = 0
 	t.Attrs = nil
 	t.ClearInline()
-	if len(vm.tupleFreeList) < 64 {
+	if len(vm.tupleFreeList) < 256 {
 		vm.tupleFreeList = append(vm.tupleFreeList, t)
 		return
 	}

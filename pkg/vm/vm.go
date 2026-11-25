@@ -3644,15 +3644,32 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				if instObj := obj.AsInstanceChecked(); instObj != nil {
 					instShape := instObj.Shape
 					instType := instObj.Header.Type
-					if instShape != nil && instType != nil && (instType.Flags&val.FlagCustomSetAttr) == 0 && uint(ip) < uint(len(st.cache.attrPIC)) {
-						pic := &st.cache.attrPIC[ip]
-						if pic[0].Shape == instShape && pic[0].TypeVer == uint32(instType.Version()) {
-							slotIdx := pic[0].SlotIndex
-							if uint(slotIdx) < uint(len(instObj.Slots)) {
-								instObj.Slots[slotIdx] = v
-								sp -= 2
-								ip++
-								continue
+					if instShape != nil && instType != nil && (instType.Flags&val.FlagCustomSetAttr) == 0 {
+						typeVer := instType.Version()
+						if uint(ip) < uint(len(st.cache.attrPIC)) {
+							pic := &st.cache.attrPIC[ip]
+							if pic[0].Shape == instShape && pic[0].TypeVer == uint32(typeVer) {
+								slotIdx := pic[0].SlotIndex
+								if uint(slotIdx) < uint(len(instObj.Slots)) {
+									instObj.Slots[slotIdx] = v
+									sp -= 2
+									ip++
+									continue
+								}
+							}
+						}
+						if uint(ip) < uint(len(st.cache.transitionIC)) {
+							tc := &st.cache.transitionIC[ip]
+							if tc.OldShape == instShape && tc.TypeVer == typeVer && tc.NewShape != nil {
+								slotIdx := int(tc.SlotIdx)
+								if slotIdx == len(instObj.Slots) && slotIdx < cap(instObj.Slots) {
+									instObj.Slots = instObj.Slots[:slotIdx+1]
+									instObj.Slots[slotIdx] = v
+									instObj.Shape = tc.NewShape
+									sp -= 2
+									ip++
+									continue
+								}
 							}
 						}
 					}

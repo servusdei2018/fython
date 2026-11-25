@@ -42,7 +42,24 @@ type PyTuple struct {
 // SetInline copies up to 4 elements into t's inline storage and binds t.Items.
 func (t *PyTuple) SetInline(src []Value) {
 	n := len(src)
-	copy(t.inline[:n], src)
+	switch n {
+	case 1:
+		t.inline[0] = src[0]
+	case 2:
+		t.inline[0] = src[0]
+		t.inline[1] = src[1]
+	case 3:
+		t.inline[0] = src[0]
+		t.inline[1] = src[1]
+		t.inline[2] = src[2]
+	case 4:
+		t.inline[0] = src[0]
+		t.inline[1] = src[1]
+		t.inline[2] = src[2]
+		t.inline[3] = src[3]
+	default:
+		copy(t.inline[:n], src)
+	}
 	t.Items = t.inline[:n]
 }
 
@@ -148,7 +165,22 @@ func NewTupleFromSlice(src []Value) Value {
 				Type: TupleType,
 			},
 		}
-		copy(obj.inline[:n], src)
+		switch n {
+		case 1:
+			obj.inline[0] = src[0]
+		case 2:
+			obj.inline[0] = src[0]
+			obj.inline[1] = src[1]
+		case 3:
+			obj.inline[0] = src[0]
+			obj.inline[1] = src[1]
+			obj.inline[2] = src[2]
+		case 4:
+			obj.inline[0] = src[0]
+			obj.inline[1] = src[1]
+			obj.inline[2] = src[2]
+			obj.inline[3] = src[3]
+		}
 		obj.Items = obj.inline[:n]
 		return Value{num: 0, ptr: &obj.Header}
 	}

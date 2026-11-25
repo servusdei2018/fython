@@ -2193,9 +2193,9 @@ func (vm *VM) opCallSlow(st *loopState, inst uint32, ip, sp int) (int, int, loop
 	}
 
 	// Closure-code fast path: freshly allocated closures sharing the same
-	// *CodeObject (including non-suspending direct-await coroutine closures)
-	// validate fn.Code == cc.co and bind live fn.Closure / fn.Globals without
-	// re-quickening or re-scanning isDirectAwaitCallSite.
+	// *CodeObject (including coroutine closures) validate fn.Code == cc.co,
+	// live fn.Defaults/KwDefaults/Closure, and explicit ICSlot.Kind without
+	// re-quickening or scanning builtin checks.
 	if canQuicken && !vm.hasTrackedViews && target.Kind() == val.KindFunction && st.cache != nil && uint(ip) < uint(len(st.cache.ic)) {
 		entry := &st.cache.ic[ip]
 		if cc := entry.CalleeCache; cc != nil && cc.owner == vm && cc.co != nil {
@@ -2205,24 +2205,44 @@ func (vm *VM) opCallSlow(st *loopState, inst uint32, ip, sp int) (int, int, loop
 				len(fn.Defaults) == 0 && fn.KwDefaults == nil &&
 				callee.SimplePositionalOnly && argc == callee.PositionalParamCount &&
 				!callee.HasCellVars && (!callee.HasCells || fn.Closure != nil) {
-				isDirectCoro := callee.IsCoroutine && !callee.CanSuspend && entry.SlotIndex == 1
-				if (!callee.IsGenerator && !callee.IsCoroutine) || isDirectCoro {
+				if entry.Kind == ICKindCoroClosure && callee.IsCoroutine {
+					switch entry.SlotIndex {
+					case 1:
+						if !callee.CanSuspend {
+							st.periodicTick++
+							if (st.periodicTick & 0xFF) == 0 {
+								vm.checkPeriodicSafepoint(st.frameIdx)
+							}
+							minCap := max(newBase+256, newBase+callee.NumLocals+64)
+							if minCap > len(stack) {
+								_ = vm.growStack(st, stack, minCap)
+							}
+							return vm.pushCalleeFrame(st, callee, fn, cc, newBase, retSP, newBase+callee.EffectiveLocals, ip+3)
+						}
+					case 2, 3:
+						st.periodicTick++
+						if (st.periodicTick & 0xFF) == 0 {
+							vm.checkPeriodicSafepoint(st.frameIdx)
+						}
+						fnGlobals := fn.Globals
+						if fnGlobals == nil {
+							fnGlobals = st.globals
+						}
+						return vm.dispatchCoroutineCall(st, callee, target, nil, nil, stack, ip, sp, newBase, retSP, argc, nil, fnGlobals, entry.SlotIndex == 2)
+					}
+				} else if !callee.IsGenerator && !callee.IsCoroutine {
 					st.periodicTick++
 					if (st.periodicTick & 0xFF) == 0 {
 						vm.checkPeriodicSafepoint(st.frameIdx)
 					}
-					if !isDirectCoro && target == entry.CachedVal && DecodeOpcode(inst) == OP_CALL_PY_EXACT_ARGS {
+					if target == entry.CachedVal && DecodeOpcode(inst) == OP_CALL_PY_EXACT_ARGS {
 						vm.tryInlineFunc(st, ip, argc, fn)
 					}
 					minCap := max(newBase+256, newBase+callee.NumLocals+64)
 					if minCap > len(stack) {
 						_ = vm.growStack(st, stack, minCap)
 					}
-					retIP := ip + 1
-					if isDirectCoro {
-						retIP = ip + 3
-					}
-					return vm.pushCalleeFrame(st, callee, fn, cc, newBase, retSP, newBase+callee.EffectiveLocals, retIP)
+					return vm.pushCalleeFrame(st, callee, fn, cc, newBase, retSP, newBase+callee.EffectiveLocals, ip+1)
 				}
 			}
 		}
@@ -2529,6 +2549,18 @@ unwrapCall:
 			return ip + 1, retSP + 1, ctlReload
 		}
 		if callee.IsCoroutine && (!isDirectAwait || callee.CanSuspend) {
+			if canQuicken && !vm.hasTrackedViews &&
+				callee.SimplePositionalOnly && argc == callee.PositionalParamCount &&
+				len(fn.Defaults) == 0 && fn.KwDefaults == nil &&
+				!callee.HasCellVars && (!callee.HasCells || fn.Closure != nil) &&
+				st.cache != nil && uint(ip) < uint(len(st.cache.ic)) {
+				cc := vm.fastCalleeCache(callee)
+				slotFlag := int32(3)
+				if isDirectAwait {
+					slotFlag = 2
+				}
+				st.cache.ic[ip] = ICSlot{Kind: ICKindCoroClosure, CalleeCache: cc, SlotIndex: slotFlag}
+			}
 			return vm.dispatchCoroutineCall(st, callee, target, fn.Defaults, fn.KwDefaults, stack, ip, sp, newBase, retSP, argc, nil, fnGlobals, isDirectAwait)
 		}
 		minCap := max(newBase+256, newBase+callee.NumLocals+64)
@@ -2584,7 +2616,7 @@ unwrapCall:
 					maybeOptimizeCodeObject(vm, callee, cc)
 				}
 				_, _ = vm.loadWindow(callee, cc)
-				st.cache.ic[ip] = ICSlot{CalleeCache: cc, SlotIndex: 1}
+				st.cache.ic[ip] = ICSlot{Kind: ICKindCoroClosure, CalleeCache: cc, SlotIndex: 1}
 			}
 		}
 		retIP := ip + 1
@@ -3779,6 +3811,7 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 			entry := &st.cache.ic[ip]
 			var callable val.Value
 			hasCallable := false
+			bindClassSelf := false
 			switch {
 			case entry.Kind == ICKindInstanceSlot && instShape.ID == entry.ExpectedShapeID && instVer == entry.ExpectedTypeVer:
 				if c, okSlot := instObj.GetSlot(int(entry.SlotIndex)); okSlot && !c.IsUnbound() {
@@ -3788,7 +3821,27 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 			case entry.Kind == ICKindClassAttr && instShape.ID == entry.ExpectedShapeID && instVer == entry.ExpectedTypeVer:
 				callable = entry.CachedVal
 				hasCallable = true
+			case entry.Kind == ICKindClassMethod && instShape.ID == entry.ExpectedShapeID && instVer == entry.ExpectedTypeVer:
+				callable = entry.CachedVal
+				hasCallable = true
+				bindClassSelf = true
 			default:
+				if !val.MultiThreadedFlag.Load() && uint(ip) < uint(len(st.cache.attrPIC)) {
+					apic := &st.cache.attrPIC[ip]
+					typeVer32 := uint32(instVer)
+					for k := range 4 {
+						if apic[k].Shape == instShape && apic[k].TypeVer == typeVer32 {
+							if c, okSlot := instObj.GetSlot(int(apic[k].SlotIndex)); okSlot && !c.IsUnbound() {
+								callable = c
+								hasCallable = true
+							}
+							break
+						}
+					}
+				}
+				if hasCallable {
+					break
+				}
 				attrName := val.InternValue(st.consts[methIdx])
 				if sIdx, ok := instShape.Lookup(attrName); ok {
 					descr, _, foundInClass := instType.LookupMRO(attrName)
@@ -3798,6 +3851,24 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 							ExpectedShapeID: instShape.ID,
 							ExpectedTypeVer: instVer,
 							SlotIndex:       int32(sIdx),
+						}
+						if !val.MultiThreadedFlag.Load() {
+							apic := &st.cache.ensureAttrPIC()[ip]
+							typeVer32 := uint32(instVer)
+							inserted := false
+							for k := range 4 {
+								if apic[k].Shape == nil || apic[k].Shape == instShape {
+									apic[k] = AttrPICEntry{Shape: instShape, SlotIndex: int32(sIdx), TypeVer: typeVer32}
+									inserted = true
+									break
+								}
+							}
+							if !inserted {
+								apic[0] = apic[1]
+								apic[1] = apic[2]
+								apic[2] = apic[3]
+								apic[3] = AttrPICEntry{Shape: instShape, SlotIndex: int32(sIdx), TypeVer: typeVer32}
+							}
 						}
 						if c, okSlot := instObj.GetSlot(sIdx); okSlot && !c.IsUnbound() {
 							callable = c
@@ -3861,11 +3932,26 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 							return ip + 1, retSP + 1, ctlReload
 						}
 					case descr.Kind() == val.KindStaticMethod:
-						callable = descr.AsStaticMethod().Callable
+						smVal := descr.AsStaticMethod().Callable
+						*entry = ICSlot{
+							Kind:            ICKindClassAttr,
+							ExpectedShapeID: instShape.ID,
+							ExpectedTypeVer: instVer,
+							CachedVal:       smVal,
+						}
+						callable = smVal
 						hasCallable = true
 					case descr.Kind() == val.KindClassMethod:
-						callable = val.NewBoundMethodVal(val.TypeVal(instType), descr.AsClassMethod().Callable)
+						cmVal := descr.AsClassMethod().Callable
+						*entry = ICSlot{
+							Kind:            ICKindClassMethod,
+							ExpectedShapeID: instShape.ID,
+							ExpectedTypeVer: instVer,
+							CachedVal:       cmVal,
+						}
+						callable = cmVal
 						hasCallable = true
+						bindClassSelf = true
 					case descr.Kind() == val.KindNative && CacheWrapper != nil && descr.Type() == CacheWrapper:
 						return vm.callLRUCacheSlow(st, descr, ip, sp, newBase, retSP, totalArgs, nil)
 					case descr.Type().Slots.TpDescrGet == nil || (descr.IsBuiltinFunc() && descr.AsBuiltinFunc().NoBind):
@@ -3883,7 +3969,11 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 			if hasCallable {
 				argBase := newBase + 1
 				argCount := argc
-				if callable.IsBoundMethod() {
+				if bindClassSelf {
+					stack[newBase] = val.TypeVal(instType)
+					argBase = newBase
+					argCount = argc + 1
+				} else if callable.IsBoundMethod() {
 					bm := callable.AsBoundMethod()
 					stack[newBase] = bm.Self
 					argBase = newBase
