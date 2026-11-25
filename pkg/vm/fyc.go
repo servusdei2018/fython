@@ -17,7 +17,7 @@ const (
 	// FycMagic is the 4-byte magic signature for Fython bytecode files ("FYTH" in ASCII).
 	FycMagic uint32 = 0x48545946
 	// FycVersion is the current bytecode format version.
-	FycVersion uint32 = 8
+	FycVersion uint32 = 9
 	// FycHeaderSize is the fixed size of the .fyc file header in bytes.
 	FycHeaderSize = 64
 )
@@ -34,6 +34,7 @@ const (
 	TagCode
 	TagBytes
 	TagComplex
+	TagSet
 )
 
 // FycHeader represents the 64-byte deterministic header of a .fyc file.
@@ -110,6 +111,12 @@ func (sc *stringCollector) collectFromValue(v val.Value) {
 	case val.KindTuple:
 		for _, item := range v.AsTuple().Items {
 			sc.collectFromValue(item)
+		}
+	case val.KindSet:
+		for _, e := range v.AsSet().DictEntries() {
+			if e.Active {
+				sc.collectFromValue(e.Key)
+			}
 		}
 	case val.KindCode:
 		sc.collectFromCodeObject(AsCodeObject(v))
@@ -348,6 +355,17 @@ func encodeValue(buf []byte, v val.Value, sc *stringCollector) []byte {
 		binary.LittleEndian.PutUint32(tmp4[:], uint32(len(data)))
 		buf = append(buf, tmp4[:]...)
 		buf = append(buf, data...)
+
+	case val.KindSet:
+		buf = append(buf, TagSet)
+		s := v.AsSet()
+		binary.LittleEndian.PutUint32(tmp4[:], uint32(s.Len()))
+		buf = append(buf, tmp4[:]...)
+		for _, e := range s.DictEntries() {
+			if e.Active {
+				buf = encodeValue(buf, e.Key, sc)
+			}
+		}
 
 	default:
 		// Fallback for sentinels
@@ -815,6 +833,21 @@ func decodeValue(r *binaryReader, stringTable []val.Value) (val.Value, error) {
 		res := make([]byte, count)
 		copy(res, data)
 		return val.NewBytesVal(res), nil
+
+	case TagSet:
+		count, err := r.readUint32()
+		if err != nil {
+			return val.NoneVal(), err
+		}
+		items := make([]val.Value, count)
+		for i := range count {
+			item, err := decodeValue(r, stringTable)
+			if err != nil {
+				return val.NoneVal(), err
+			}
+			items[i] = item
+		}
+		return val.NewSetVal(items...), nil
 
 	default:
 		return val.NoneVal(), fmt.Errorf("fyc: unknown constant tag %d", tag)

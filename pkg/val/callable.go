@@ -3512,8 +3512,12 @@ func initTypes() {
 				num = 1
 			}
 		case valToConvert.IsAnyString():
-			n, _ := strconv.ParseInt(strings.TrimSpace(valToConvert.AsString()), 10, 64)
-			num = n
+			if parsed, ok := parseASCIIBase10Int64(valToConvert.AsString()); ok {
+				num = parsed
+			} else {
+				n, _ := strconv.ParseInt(strings.TrimSpace(valToConvert.AsString()), 10, 64)
+				num = n
+			}
 		case valToConvert.IsInstance():
 			inst := valToConvert.AsInstance()
 			if len(inst.Slots) > 0 && inst.Slots[0].IsInt64() {
@@ -3806,6 +3810,16 @@ func initTypes() {
 	}))
 
 	IntType.Slots.TpCall = func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if callable.ptr == &IntType.Header && len(kwnames) == 0 && len(args) == 1 {
+			a := args[0]
+			if a.IsAnyString() {
+				if parsed, ok := parseASCIIBase10Int64(a.AsString()); ok {
+					return Int64Val(parsed)
+				}
+			} else if a.IsInt64() {
+				return a
+			}
+		}
 		pa, kw := splitStrKw(args, kwnames)
 		if len(pa) == 0 {
 			return Int64Val(0)
@@ -8874,6 +8888,87 @@ func initTypes() {
 	TypeType.UsesDefaultTpCall = true
 }
 
+// parseASCIIBase10Int64 parses an ASCII base-10 integer string with optional
+// leading/trailing ASCII whitespace, optional '+'/'-' sign, and valid PEP 515
+// single underscores between digits without heap allocations. Returns (0, false)
+// on non-ASCII, invalid syntax, empty/sign-only input, or int64 overflow so
+// callers can fall back to the generic big.Int / ValueError path.
+func parseASCIIBase10Int64(s string) (int64, bool) {
+	n := len(s)
+	i := 0
+	for i < n {
+		c := s[i]
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f' {
+			i++
+			continue
+		}
+		break
+	}
+	end := n
+	for end > i {
+		c := s[end-1]
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f' {
+			end--
+			continue
+		}
+		break
+	}
+	if i >= end {
+		return 0, false
+	}
+	neg := false
+	switch s[i] {
+	case '+':
+		i++
+	case '-':
+		neg = true
+		i++
+	}
+	if i >= end {
+		return 0, false
+	}
+	// First character after optional sign must be an ASCII digit (rejects leading/sign-adjacent '_').
+	c0 := s[i]
+	if c0 < '0' || c0 > '9' {
+		return 0, false
+	}
+	var acc uint64
+	var limit uint64 = math.MaxInt64
+	if neg {
+		limit = math.MaxInt64 + 1
+	}
+	prevUnderscore := false
+	for ; i < end; i++ {
+		c := s[i]
+		switch {
+		case c >= '0' && c <= '9':
+			prevUnderscore = false
+			d := uint64(c - '0')
+			if acc > (limit-d)/10 {
+				return 0, false
+			}
+			acc = acc*10 + d
+		case c == '_':
+			if prevUnderscore {
+				return 0, false
+			}
+			prevUnderscore = true
+		default:
+			return 0, false
+		}
+	}
+	if prevUnderscore {
+		return 0, false
+	}
+	if neg {
+		if acc == math.MaxInt64+1 {
+			return math.MinInt64, true
+		}
+		return -int64(acc), true
+	}
+	return int64(acc), true
+}
+
 func hasOnlyPrimRootSlot(cls *PyType) bool {
 	if cls == nil || (cls.Flags&(FlagHasCExtBase|FlagIsModuleSub)) != 0 {
 		return false
@@ -8925,10 +9020,18 @@ func tryFastPrimitiveDunderNew2(fnPtr *ObjectHeader, subcls *PyType, arg Value) 
 		}
 		return newPrimSubInstance(subcls, s), true
 	case IntType.dunderNew.ptr:
-		if subcls == IntType || !IsSubclass(subcls, IntType) || arg.ptr != &tagInt64 {
+		if subcls == IntType || !IsSubclass(subcls, IntType) {
 			return Value{}, false
 		}
-		return newPrimSubInstance(subcls, arg), true
+		if arg.ptr == &tagInt64 {
+			return newPrimSubInstance(subcls, arg), true
+		}
+		if arg.IsAnyString() {
+			if parsed, ok := parseASCIIBase10Int64(arg.AsString()); ok {
+				return newPrimSubInstance(subcls, Int64Val(parsed)), true
+			}
+		}
+		return Value{}, false
 	case BytesType.dunderNew.ptr:
 		if subcls == BytesType || !IsSubclass(subcls, BytesType) ||
 			arg.ptr == nil || arg.ptr.Kind != KindBytes ||

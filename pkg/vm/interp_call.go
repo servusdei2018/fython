@@ -1231,6 +1231,104 @@ func (vm *VM) opCallFunctionEx(st *loopState, inst uint32, ip, sp int) (int, int
 				}
 				dst := newBase
 				var initInst val.Value
+
+				// Fast paths for exact-tuple positional-only and *args/**kwargs forwarding
+				// into simple non-generator, non-coroutine Python functions without cells/defaults.
+				if !hasSelf && !callee.IsGenerator && !callee.IsCoroutine &&
+					!callee.HasCells && len(fn.Defaults) == 0 && fn.KwDefaults == nil &&
+					callee.KWOnlyArgCount == 0 && argsVal.Kind() == val.KindTuple {
+					varFlags := callee.Flags & (CO_VARARGS | CO_VARKEYWORDS)
+					switch {
+					case kwDict == nil && varFlags == 0 && len(posArgs) == callee.PositionalParamCount:
+						// Fixed-param pos_only fast path: copy args directly into frame slots.
+						if len(posArgs) > 0 {
+							copy(stack[newBase:newBase+len(posArgs)], posArgs)
+						}
+						vm.releaseEphemeralTupleVal(argsVal)
+						for l := len(posArgs); l < callee.NumLocals; l++ {
+							stack[newBase+l] = val.UnboundVal()
+						}
+						cc := vm.fastCalleeCache(callee)
+						return vm.pushCalleeFrame(st, callee, fn, cc, newBase, sp, newBase+callee.NumLocals, ip+1)
+
+					case kwDict == nil && varFlags == CO_VARARGS && len(posArgs) >= callee.PosParamCount:
+						// Pure *args forwarding fast path.
+						if callee.PosParamCount == 0 && argsVal.HeaderPtr().Type == val.TupleType {
+							val.ClearEphemeral(argsVal)
+							for l := range callee.NumLocals {
+								stack[newBase+l] = val.UnboundVal()
+							}
+							stack[newBase+callee.VarArgsIdx] = argsVal
+							cc := vm.fastCalleeCache(callee)
+							return vm.pushCalleeFrame(st, callee, fn, cc, newBase, sp, newBase+callee.NumLocals, ip+1)
+						}
+						if callee.PosParamCount > 0 {
+							copy(stack[newBase:newBase+callee.PosParamCount], posArgs[:callee.PosParamCount])
+							tail := posArgs[callee.PosParamCount:]
+							var restVal val.Value
+							if len(tail) == 0 {
+								restVal = val.EmptyTupleVal()
+							} else {
+								restItems := make([]val.Value, len(tail))
+								copy(restItems, tail)
+								restVal = val.NewTupleVal(restItems...)
+							}
+							vm.releaseEphemeralTupleVal(argsVal)
+							for l := callee.PosParamCount; l < callee.NumLocals; l++ {
+								stack[newBase+l] = val.UnboundVal()
+							}
+							stack[newBase+callee.VarArgsIdx] = restVal
+							cc := vm.fastCalleeCache(callee)
+							return vm.pushCalleeFrame(st, callee, fn, cc, newBase, sp, newBase+callee.NumLocals, ip+1)
+						}
+
+					case varFlags == (CO_VARARGS|CO_VARKEYWORDS) && callee.PosParamCount == 0 &&
+						argsVal.HeaderPtr().Type == val.TupleType:
+						// f(*a, **kw) -> def g(*args, **kwargs) forwarding fast path.
+						kwValid := true
+						if kwDict != nil {
+							for i := range kwDict.Entries {
+								e := &kwDict.Entries[i]
+								if e.Active && !e.Key.IsAnyString() {
+									kwValid = false
+									break
+								}
+							}
+						}
+						if kwValid {
+							var kwArg val.Value
+							switch {
+							case kwDict == nil:
+								kwArg = val.NewDictVal(0)
+							case kwDict.Header.Type == val.DictType &&
+								(kwDict.Header.Flags&val.FlagEphemeralDict) != 0 &&
+								kwDict.Live == nil && !kwDict.Shared:
+								kwDict.Header.Flags &^= val.FlagEphemeralDict | val.FlagEphemeralFrameDict
+								kwArg = val.DictVal(kwDict)
+							default:
+								copied := val.NewDictVal(kwLen)
+								cd := copied.AsDict()
+								for i := range kwDict.Entries {
+									e := &kwDict.Entries[i]
+									if e.Active {
+										cd.Set(val.InternValue(e.Key), e.Value)
+									}
+								}
+								vm.releaseSmallDict(kwDict)
+								kwArg = copied
+							}
+							val.ClearEphemeral(argsVal)
+							for l := range callee.NumLocals {
+								stack[newBase+l] = val.UnboundVal()
+							}
+							stack[newBase+callee.VarArgsIdx] = argsVal
+							stack[newBase+callee.VarKWIdx] = kwArg
+							cc := vm.fastCalleeCache(callee)
+							return vm.pushCalleeFrame(st, callee, fn, cc, newBase, sp, newBase+callee.NumLocals, ip+1)
+						}
+					}
+				}
+
 				if hasSelf {
 					if initType != nil {
 						initInst = val.NewInstanceOfType(initType)
@@ -2096,10 +2194,28 @@ func (vm *VM) opCallMethodDescr(st *loopState, inst uint32, ip, sp int) (int, in
 				markViewsEscaped(stack[newBase : newBase+totalArgs])
 			}
 			origData := unsafe.SliceData(stack)
+			matchRecycleSlot := -1
+			if !val.MultiThreadedFlag.Load() && ip+1 < st.codeLen &&
+				(targetVal == patternMatchBuiltin || targetVal == patternSearchBuiltin || targetVal == patternFullMatchBuiltin) {
+				nextInst := *(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4))
+				nextOp := DecodeOpcode(nextInst)
+				switch nextOp {
+				case OP_JUMP_IF_FALSE, OP_JUMP_IF_TRUE, OP_UNARY_NOT, OP_POP_TOP:
+					vm.matchBoolOnly = true
+				case OP_STORE_FAST:
+					r := int(DecodeArgBx(nextInst))
+					if st.curCO != nil && st.curCO.isMatchLocalSafe(r) {
+						vm.matchEphemeral = true
+						matchRecycleSlot = r
+					}
+				}
+			}
 			st.ip = ip
 			vm.frames[st.frameIdx].ip = ip
 			vm.execCtx.SP = newBase + totalArgs
 			res := nativeFn(&vm.execCtx, targetVal, stack[newBase:newBase+totalArgs], nil)
+			vm.matchBoolOnly = false
+			vm.matchEphemeral = false
 			if unsafe.SliceData(vm.execCtx.Stack) != origData || (st.stackIsVM && unsafe.SliceData(vm.stack) != origData) {
 				stack = st.syncStackFromExecCtx(vm, stack)
 			}
@@ -2108,6 +2224,13 @@ func (vm *VM) opCallMethodDescr(st *loopState, inst uint32, ip, sp int) (int, in
 				vm.execCtx.ClearException()
 				st.raiseExc = exc
 				return ip, sp, ctlRaise
+			}
+			if matchRecycleSlot >= 0 {
+				old := stack[st.base+matchRecycleSlot]
+				if hdr := old.HeaderPtr(); hdr != nil && hdr.Type == MatchType && (hdr.Flags&val.FlagEphemeralMatch) != 0 && hdr != res.HeaderPtr() {
+					stack[st.base+matchRecycleSlot] = val.Value{}
+					vm.releaseMatch((*pyMatch)(unsafe.Pointer(hdr)))
+				}
 			}
 			stack[retSP] = res
 			if unsafe.SliceData(stack) == origData {
@@ -3727,7 +3850,20 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 				return vm.pushInlineCoroutine(st, receiver.AsCoroutine(), ip, sp, retSP, genModeCoroSend, stack[newBase+1])
 			}
 			if methIdx >= uint16(len(st.consts)) || (attrName != nameExists && attrName != nameRemove && attrName != nameUnlink) {
-				if pic[0].ReceiverType == tp && pic[1].ReceiverType == nil && pic[1].Shape == nil {
+				isMatchOptSite := false
+				if !val.MultiThreadedFlag.Load() && ip+1 < st.codeLen &&
+					(targetVal == patternMatchBuiltin || targetVal == patternSearchBuiltin || targetVal == patternFullMatchBuiltin) {
+					nextInst := *(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4))
+					switch DecodeOpcode(nextInst) {
+					case OP_JUMP_IF_FALSE, OP_JUMP_IF_TRUE, OP_UNARY_NOT, OP_POP_TOP:
+						isMatchOptSite = true
+					case OP_STORE_FAST:
+						if st.curCO != nil && st.curCO.isMatchLocalSafe(int(DecodeArgBx(nextInst))) {
+							isMatchOptSite = true
+						}
+					}
+				}
+				if !isMatchOptSite && pic[0].ReceiverType == tp && pic[1].ReceiverType == nil && pic[1].Shape == nil {
 					st.cache.ic[ip] = ICSlot{
 						Kind:            ICKindMethodDescr,
 						ExpectedTypeVer: tp.Version(),

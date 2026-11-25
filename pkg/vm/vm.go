@@ -476,6 +476,149 @@ func (vm *VM) Call(callable val.Value, args ...val.Value) val.Value {
 	return vm.Vectorcall(callable, args, nil)
 }
 
+// callSimpleFuncFromHook is a lean re-entry path for exact-arity, non-generator,
+// non-coroutine, cell-free Python functions invoked from hooks (e.g., list.sort
+// key/comparison dunders). It reuses the cached VMCodeCache directly and avoids
+// redundant stack/cache/generator/cell checks while preserving full unwind and
+// panic-restore invariants.
+func (vm *VM) callSimpleFuncFromHook(ctx *val.ExecContext, co *CodeObject, fnGlobals *val.PyDict, argBase, nargs int) val.Value {
+	numLocals := max(co.NumLocals, co.NumParams)
+	minStack := argBase + max(256, numLocals+max(co.MaxStackSize, len(co.Code))+64)
+	stack := ctx.Stack
+	wasVMStack := len(stack) > 0 && len(vm.stack) > 0 && &stack[0] == &vm.stack[0]
+	if minStack > len(stack) {
+		if wasVMStack {
+			vm.stack = ensureStack(vm.stack, minStack)
+			stack = vm.stack
+			ctx.Stack = stack
+		} else {
+			stack = ensureStack(stack, minStack)
+			ctx.Stack = stack
+		}
+	}
+	for i := nargs; i < numLocals; i++ {
+		stack[argBase+i] = val.NoneVal()
+	}
+	spAfterBind := argBase + numLocals
+
+	savedActiveState := vm.activeState
+	if savedActiveState != nil {
+		vm.flushActiveFrame()
+	}
+	savedCtxStack := stack
+	savedCtxSP := ctx.SP
+	savedActiveCO := vm.activeCO
+	savedActiveBaseOffset := vm.activeBaseOffset
+	savedActiveCells := vm.activeCells
+	savedActiveCellPtrs := vm.activeCellPtrs
+	savedActiveFrameIdx := vm.activeFrameIdx
+
+	nextFrame := 0
+	if savedActiveCO != nil {
+		nextFrame = savedActiveFrameIdx + 1
+	}
+	if nextFrame+4 > len(vm.frames) {
+		vm.ensureFrameCapacity(nextFrame + 4)
+	}
+
+	st := vm.acquireLoopState()
+	defer func() {
+		if st.frameIdx > vm.maxFrameIdx {
+			vm.maxFrameIdx = st.frameIdx
+		}
+		if st.stackIsVM {
+			hw := st.base + 256
+			if st.curCO != nil && st.curCO.NumLocals+st.curCO.MaxStackSize > 256 {
+				hw = st.base + st.curCO.NumLocals + st.curCO.MaxStackSize
+			}
+			if hw > vm.maxSP {
+				vm.maxSP = hw
+			}
+		}
+		if wasVMStack {
+			vm.execCtx.Stack = vm.stack
+		} else {
+			vm.execCtx.Stack = savedCtxStack
+		}
+		vm.execCtx.SP = savedCtxSP
+		vm.activeCO = savedActiveCO
+		vm.activeBaseOffset = savedActiveBaseOffset
+		vm.activeCells = savedActiveCells
+		vm.activeCellPtrs = savedActiveCellPtrs
+		vm.activeFrameIdx = savedActiveFrameIdx
+		vm.activeState = savedActiveState
+		vm.releaseLoopState(st)
+	}()
+
+	vm.execCtx.Stack = stack
+	vm.execCtx.SP = spAfterBind
+
+	st.curCO = co
+	st.frameIdx = nextFrame
+	st.startFrameIdx = nextFrame
+	st.genFrameIdx = -1
+	if nextFrame > vm.maxFrameIdx {
+		vm.maxFrameIdx = nextFrame
+	}
+	st.base = argBase
+	st.globals = fnGlobals
+	st.curLocals = val.NoneVal()
+	st.ip = co.EntryIP
+	st.sp = spAfterBind
+	st.periodicTick = 0
+	st.stack = stack
+	st.stackIsVM = wasVMStack
+	if wasVMStack && minStack > vm.maxSP {
+		vm.maxSP = minStack
+	}
+
+	cc := vm.fastCalleeCache(co)
+	if cc != nil && cc.owner == vm && atomic.LoadInt32(&co.StreamGen) == cc.streamGen {
+		st.cache = cc
+		st.codePtr = cc.codePtr
+		st.codeLen = cc.codeLen
+		st.consts = cc.frameConsts(co)
+		if cc.tier2Done == 0 {
+			if atomic.LoadInt32(&co.IsTier2Optimized) != 0 {
+				cc.tier2Done = 1
+			} else {
+				maybeOptimizeCodeObject(vm, co, cc)
+				if atomic.LoadInt32(&co.StreamGen) != cc.streamGen {
+					st.codePtr, st.codeLen = vm.loadWindow(co, cc)
+				}
+			}
+		}
+	} else {
+		cc = vm.cacheFor(co)
+		st.cache = cc
+		st.codePtr, st.codeLen = vm.loadWindow(co, cc)
+		st.consts = cc.frameConsts(co)
+		if atomic.LoadInt32(&co.IsTier2Optimized) == 0 {
+			maybeOptimizeCodeObject(vm, co, cc)
+			if atomic.LoadInt32(&co.StreamGen) != cc.streamGen {
+				st.codePtr, st.codeLen = vm.loadWindow(co, cc)
+			}
+		}
+	}
+
+	vm.activeCO = co
+	vm.activeBaseOffset = argBase
+	vm.activeCells = nil
+	vm.activeCellPtrs = nil
+	vm.activeFrameIdx = nextFrame
+	vm.activeState = st
+	vm.unhandledException = val.NoneVal()
+
+	res := vm.runLoopWithGlobals(st)
+	if !vm.unhandledException.IsNone() && vm.unhandledException.HeaderPtr() != nil {
+		exc := vm.unhandledException
+		vm.unhandledException = val.NoneVal()
+		ctx.Raise(exc)
+		return val.NoneVal()
+	}
+	return res
+}
+
 // callFromHook executes a callable whose arguments are already placed on vm.stack[argBase : argBase+nargs].
 func (vm *VM) callFromHook(ctx *val.ExecContext, callable val.Value, argBase int, nargs int, kwnames []val.Value) val.Value {
 	switch callable.Kind() {
@@ -498,6 +641,11 @@ func (vm *VM) callFromHook(ctx *val.ExecContext, callable val.Value, argBase int
 		}
 		if co.IsCoroutine {
 			return vm.instantiateCoroutine(co, callable, fn.Defaults, fn.KwDefaults, ctx.Stack, argBase, nargs, kwnames, fnGlobals, false)
+		}
+		if len(kwnames) == 0 && co.SimplePositionalOnly && co.KWOnlyArgCount == 0 &&
+			!co.IsGenerator && !co.IsCoroutine && !co.HasCells &&
+			nargs == co.PositionalParamCount && len(fn.Defaults) == 0 && fn.KwDefaults == nil {
+			return vm.callSimpleFuncFromHook(ctx, co, fnGlobals, argBase, nargs)
 		}
 		numLocals := max(co.NumLocals, co.NumParams)
 		need := argBase + numLocals + co.MaxStackSize + 256

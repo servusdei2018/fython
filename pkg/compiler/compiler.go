@@ -1121,6 +1121,66 @@ func (c *Compiler) compileCond(exprID ExprID, falseJumps *[]int) error {
 }
 
 func (c *Compiler) compileIfStmt(stmt *ASTStmt) error {
+	// Constant branch folding: only prune a dead branch when it contains no
+	// scope declarations, bindings, or yield/await expressions.
+	if condVal, ok := c.evalConstExpr(stmt.Expr1); ok {
+		elifsStart := stmt.Extra >> 16
+		elifsCount := stmt.Extra & 0xFFFF
+		if condVal.IsTruthy() {
+			canFold := true
+			for i := range elifsCount {
+				elif := &c.arena.Elifs[elifsStart+i]
+				if c.exprHasScopeOrSuspend(elif.Cond) ||
+					c.stmtsHaveScopeDecls(c.arena.StmtIDs[elif.Body.Start:elif.Body.Start+elif.Body.Count]) {
+					canFold = false
+					break
+				}
+			}
+			if canFold && stmt.Else != 0 && c.stmtsHaveScopeDecls(c.arena.GetStmtSlice(stmt.Else)) {
+				canFold = false
+			}
+			if canFold {
+				for _, sID := range c.arena.GetStmtSlice(stmt.Body) {
+					if err := c.compileStmt(sID); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+		} else if !c.stmtsHaveScopeDecls(c.arena.GetStmtSlice(stmt.Body)) {
+			// Skip dead `then` branch; compile remaining elifs and else.
+			var exitJumps []int
+			for i := range elifsCount {
+				elif := &c.arena.Elifs[elifsStart+i]
+				var elifFalseJumps []int
+				if err := c.compileCond(elif.Cond, &elifFalseJumps); err != nil {
+					return err
+				}
+				for _, sID := range c.arena.StmtIDs[elif.Body.Start : elif.Body.Start+elif.Body.Count] {
+					if err := c.compileStmt(sID); err != nil {
+						return err
+					}
+				}
+				exitJumps = append(exitJumps, c.emitOp(vm.OP_JUMP, 0, 0))
+				for _, j := range elifFalseJumps {
+					c.patchJump(j, len(c.code))
+				}
+			}
+			if stmt.Else != 0 {
+				for _, sID := range c.arena.GetStmtSlice(stmt.Else) {
+					if err := c.compileStmt(sID); err != nil {
+						return err
+					}
+				}
+			}
+			endTarget := len(c.code)
+			for _, j := range exitJumps {
+				c.patchJump(j, endTarget)
+			}
+			return nil
+		}
+	}
+
 	var falseJumps []int
 	if err := c.compileCond(stmt.Expr1, &falseJumps); err != nil {
 		return err
@@ -1329,7 +1389,15 @@ func (c *Compiler) compileForStmt(stmt *ASTStmt) error {
 		return nil
 	}
 
-	if err := c.compileExpr(stmt.Expr2); err != nil {
+	if iterExpr != nil && (iterExpr.Kind == ExprKindList || iterExpr.Kind == ExprKindTuple) {
+		slice := c.arena.ExprSlices[iterExpr.Extra]
+		if tupVal, ok := c.tryBuildConstTuple(c.arena.GetExprSlice(slice)); ok {
+			idx := c.constPool.Add(tupVal)
+			c.emitOp(vm.OP_LOAD_CONST, 0, idx)
+		} else if err := c.compileExpr(stmt.Expr2); err != nil {
+			return err
+		}
+	} else if err := c.compileExpr(stmt.Expr2); err != nil {
 		return err
 	}
 	c.emitOp(vm.OP_GET_ITER, 0, 0)
@@ -2522,6 +2590,11 @@ func (c *Compiler) compileExpr(exprID ExprID) error {
 		return c.compileNameLoad(name)
 
 	case ExprKindUnary:
+		if folded, ok := c.evalConstExpr(exprID); ok {
+			idx := c.constPool.Add(folded)
+			c.emitOp(vm.OP_LOAD_CONST, 0, idx)
+			return nil
+		}
 		if err := c.compileExpr(expr.Left); err != nil {
 			return err
 		}
@@ -2558,6 +2631,11 @@ func (c *Compiler) compileExpr(exprID ExprID) error {
 				return err
 			}
 			c.patchJump(jumpEnd, len(c.code))
+			return nil
+		}
+		if folded, ok := c.evalConstExpr(exprID); ok {
+			idx := c.constPool.Add(folded)
+			c.emitOp(vm.OP_LOAD_CONST, 0, idx)
 			return nil
 		}
 
@@ -2600,8 +2678,22 @@ func (c *Compiler) compileExpr(exprID ExprID) error {
 		if err := c.compileExpr(expr.Left); err != nil {
 			return err
 		}
-		if err := c.compileExpr(expr.Right); err != nil {
-			return err
+		hoistedRHS := false
+		if expr.Op == vm.CMP_IN || expr.Op == vm.CMP_NOT_IN {
+			if rhs := c.arena.GetExpr(expr.Right); rhs != nil &&
+				(rhs.Kind == ExprKindTuple || rhs.Kind == ExprKindList || rhs.Kind == ExprKindSet) {
+				slice := c.arena.ExprSlices[rhs.Extra]
+				if setVal, ok := c.tryBuildConstSet(c.arena.GetExprSlice(slice)); ok {
+					idx := c.constPool.Add(setVal)
+					c.emitOp(vm.OP_LOAD_CONST, 0, idx)
+					hoistedRHS = true
+				}
+			}
+		}
+		if !hoistedRHS {
+			if err := c.compileExpr(expr.Right); err != nil {
+				return err
+			}
 		}
 		if expr.Op == vm.CMP_LT {
 			c.emitOp(vm.OP_COMPARE_LT, 0, 0)
@@ -2611,6 +2703,14 @@ func (c *Compiler) compileExpr(exprID ExprID) error {
 
 	case ExprKindIfExp:
 		cond := ExprID(expr.Extra)
+		if condVal, ok := c.evalConstExpr(cond); ok {
+			if condVal.IsTruthy() && !c.exprHasScopeOrSuspend(expr.Right) {
+				return c.compileExpr(expr.Left)
+			}
+			if !condVal.IsTruthy() && !c.exprHasScopeOrSuspend(expr.Left) {
+				return c.compileExpr(expr.Right)
+			}
+		}
 		if err := c.compileExpr(cond); err != nil {
 			return err
 		}
@@ -2676,7 +2776,13 @@ func (c *Compiler) compileExpr(exprID ExprID) error {
 
 	case ExprKindTuple:
 		slice := c.arena.ExprSlices[expr.Extra]
-		return c.compileSequenceDisplay(c.arena.GetExprSlice(slice), vm.OP_BUILD_TUPLE)
+		elemIDs := c.arena.GetExprSlice(slice)
+		if tupVal, ok := c.tryBuildConstTuple(elemIDs); ok {
+			idx := c.constPool.Add(tupVal)
+			c.emitOp(vm.OP_LOAD_CONST, 0, idx)
+			return nil
+		}
+		return c.compileSequenceDisplay(elemIDs, vm.OP_BUILD_TUPLE)
 
 	case ExprKindDict:
 		start := expr.Extra
@@ -3391,22 +3497,288 @@ func (c *Compiler) compileDictComp(expr *ASTExpr) error {
 	return compileClause(expr.Extra, 1)
 }
 
-// peephole optimizes bytecode by eliminating redundant jumps.
+func isJumpOp(op vm.Opcode) bool {
+	switch op {
+	case vm.OP_JUMP, vm.OP_JUMP_IF_FALSE, vm.OP_JUMP_IF_TRUE,
+		vm.OP_JUMP_IF_FALSE_OR_POP, vm.OP_JUMP_IF_TRUE_OR_POP,
+		vm.OP_FOR_ITER, vm.OP_FOR_ITER_RANGE, vm.OP_FOR_ITER_GEN:
+		return true
+	default:
+		return false
+	}
+}
+
+func isPrimitiveCompareConstVal(v val.Value) bool {
+	return v.IsNone() || v.IsBool() || v.IsInt64() || v.IsFloat64() ||
+		v.IsInlineStr() || (v.IsString() && v.AsStringObj().Header.Type == val.StrType)
+}
+
+// peephole optimizes bytecode via multi-hop jump threading, dead-code elimination,
+// dead OP_NOP compaction (with accurate jump/exception/line-span remapping), and
+// safe compile-time fusion of in-loop superinstructions.
 func (c *Compiler) peephole() {
 	code := c.code
+	if len(code) == 0 {
+		return
+	}
+
+	// 1. Multi-hop jump threading for unconditional and conditional jumps.
 	for i := range code {
 		op := vm.DecodeOpcode(code[i])
-		if op == vm.OP_JUMP {
-			target := int(vm.DecodeArgBx(code[i]))
-			if target == i+1 {
-				// JUMP to next instruction is a no-op
-				code[i] = vm.Encode(vm.OP_NOP, 0, 0)
-			} else if target < len(code) && vm.DecodeOpcode(code[target]) == vm.OP_JUMP {
-				// Jump to jump chaining
-				nextTarget := vm.DecodeArgBx(code[target])
-				code[i] = vm.Encode(op, 0, nextTarget)
+		if !isJumpOp(op) {
+			continue
+		}
+		target := int(vm.DecodeArgBx(code[i]))
+		for hops := 0; hops < 16 && target >= 0 && target < len(code); hops++ {
+			if vm.DecodeOpcode(code[target]) != vm.OP_JUMP {
+				break
+			}
+			next := int(vm.DecodeArgBx(code[target]))
+			if next == target {
+				break
+			}
+			target = next
+		}
+		if op == vm.OP_JUMP && target == i+1 {
+			code[i] = vm.Encode(vm.OP_NOP, 0, 0)
+		} else {
+			code[i] = vm.Encode(op, vm.DecodeArgA(code[i]), uint16(target))
+		}
+	}
+
+	// 2. Mark jump targets and exception-table boundaries, then eliminate
+	// unreachable instructions after unconditional terminators.
+	n := len(code)
+	isBoundary := make([]bool, n+1)
+	markBoundaries := func() {
+		clear(isBoundary)
+		for i := range code {
+			op := vm.DecodeOpcode(code[i])
+			if isJumpOp(op) {
+				target := int(vm.DecodeArgBx(code[i]))
+				if target >= 0 && target <= n {
+					isBoundary[target] = true
+				}
 			}
 		}
+		for _, e := range c.exceptionTable {
+			if e.StartIP >= 0 && e.StartIP <= n {
+				isBoundary[e.StartIP] = true
+			}
+			if e.EndIP >= 0 && e.EndIP <= n {
+				isBoundary[e.EndIP] = true
+			}
+			if e.TargetIP >= 0 && e.TargetIP <= n {
+				isBoundary[e.TargetIP] = true
+			}
+		}
+	}
+	markBoundaries()
+
+	hasNOP := false
+	dead := false
+	for i := range code {
+		if isBoundary[i] {
+			dead = false
+		}
+		op := vm.DecodeOpcode(code[i])
+		if dead {
+			code[i] = vm.Encode(vm.OP_NOP, 0, 0)
+			hasNOP = true
+			continue
+		}
+		switch op {
+		case vm.OP_NOP:
+			hasNOP = true
+		case vm.OP_RETURN, vm.OP_RAISE, vm.OP_JUMP:
+			dead = true
+		}
+	}
+
+	// 3. Compact dead standalone OP_NOPs and remap jump targets, ExceptionTable,
+	// and LineSpans using oldToNew of length len(oldCode)+1 so exclusive EndIP
+	// bounds remap accurately.
+	if hasNOP {
+		oldToNew := make([]int, n+1)
+		newCode := make([]uint32, 0, n)
+		for i := range code {
+			oldToNew[i] = len(newCode)
+			if vm.DecodeOpcode(code[i]) != vm.OP_NOP {
+				newCode = append(newCode, code[i])
+			}
+		}
+		oldToNew[n] = len(newCode)
+
+		for i := range newCode {
+			op := vm.DecodeOpcode(newCode[i])
+			if isJumpOp(op) {
+				oldTarget := int(vm.DecodeArgBx(newCode[i]))
+				if oldTarget >= 0 && oldTarget <= n {
+					newTarget := oldToNew[oldTarget]
+					newCode[i] = vm.Encode(op, vm.DecodeArgA(newCode[i]), uint16(newTarget))
+				}
+			}
+		}
+		for i := range c.exceptionTable {
+			e := &c.exceptionTable[i]
+			if e.StartIP >= 0 && e.StartIP <= n {
+				e.StartIP = oldToNew[e.StartIP]
+			}
+			if e.EndIP >= 0 && e.EndIP <= n {
+				e.EndIP = oldToNew[e.EndIP]
+			}
+			if e.TargetIP >= 0 && e.TargetIP <= n {
+				e.TargetIP = oldToNew[e.TargetIP]
+			}
+		}
+		if len(c.lineSpans) > 0 {
+			newSpans := c.lineSpans[:0]
+			for _, sp := range c.lineSpans {
+				sIP := int(sp.StartIP)
+				eIP := int(sp.EndIP)
+				if sIP > n {
+					sIP = n
+				}
+				if eIP > n {
+					eIP = n
+				}
+				ns := uint32(oldToNew[sIP])
+				ne := uint32(oldToNew[eIP])
+				if ne <= ns {
+					continue
+				}
+				if m := len(newSpans); m > 0 && newSpans[m-1].Line == sp.Line && newSpans[m-1].Col == sp.Col && newSpans[m-1].EndIP == ns {
+					newSpans[m-1].EndIP = ne
+				} else {
+					newSpans = append(newSpans, vm.LineSpanEntry{
+						StartIP: ns,
+						EndIP:   ne,
+						Line:    sp.Line,
+						Col:     sp.Col,
+					})
+				}
+			}
+			c.lineSpans = newSpans
+		}
+		c.code = newCode
+		code = newCode
+		n = len(code)
+		isBoundary = make([]bool, n+1)
+		markBoundaries()
+	}
+
+	// 4. Safe compile-time fusion of already-in-loop 2-word opcodes (preserving
+	// the trailing OP_NOP slot so vm.go, inline.go, and tier2.go invariants hold).
+	consts := c.constPool.Slice()
+	for i := 0; i+1 < n; {
+		if isBoundary[i+1] {
+			i++
+			continue
+		}
+		w0, w1 := code[i], code[i+1]
+		op0, op1 := vm.DecodeOpcode(w0), vm.DecodeOpcode(w1)
+
+		// OP_LOAD_CONST + OP_RETURN -> OP_RETURN_CONST, OP_NOP
+		if op0 == vm.OP_LOAD_CONST && op1 == vm.OP_RETURN {
+			code[i] = vm.Encode(vm.OP_RETURN_CONST, 0, vm.DecodeArgBx(w0))
+			code[i+1] = vm.Encode(vm.OP_NOP, 0, 0)
+			i += 2
+			continue
+		}
+
+		// OP_LOAD_FAST (<256) + OP_RETURN -> OP_RETURN_FAST, OP_NOP
+		if op0 == vm.OP_LOAD_FAST && op1 == vm.OP_RETURN {
+			reg := vm.DecodeArgBx(w0)
+			if reg < 256 {
+				code[i] = vm.Encode(vm.OP_RETURN_FAST, 0, reg)
+				code[i+1] = vm.Encode(vm.OP_NOP, 0, 0)
+				i += 2
+				continue
+			}
+		}
+
+		// OP_LOAD_FAST (<256) + OP_LOAD_ATTR -> OP_LOAD_FAST_ATTR, OP_NOP
+		// Preserves trailing OP_NOP IC/property-splice slot.
+		if op0 == vm.OP_LOAD_FAST && op1 == vm.OP_LOAD_ATTR {
+			reg := vm.DecodeArgBx(w0)
+			attrIdx := vm.DecodeArgBx(w1)
+			if reg < 256 {
+				code[i] = vm.Encode(vm.OP_LOAD_FAST_ATTR, uint8(reg), attrIdx)
+				code[i+1] = vm.Encode(vm.OP_NOP, 0, 0)
+				i += 2
+				continue
+			}
+		}
+
+		// (OP_COMPARE_OP [excluding IN/NOT_IN] | OP_COMPARE_LT) + OP_JUMP_IF_FALSE -> OP_COMPARE_JUMP_IF_FALSE, OP_NOP
+		// Skip if preceded by OP_LOAD_CONST of a primitive constant so Tier-2's
+		// 3-op OP_CMP_CONST_JUMP_IF_FALSE pattern remains eligible.
+		if (op0 == vm.OP_COMPARE_OP || op0 == vm.OP_COMPARE_LT) && op1 == vm.OP_JUMP_IF_FALSE {
+			cmpOp := vm.CMP_LT
+			if op0 == vm.OP_COMPARE_OP {
+				cmpOp = vm.DecodeArgA(w0)
+			}
+			if cmpOp != vm.CMP_IN && cmpOp != vm.CMP_NOT_IN {
+				precededByPrimConst := false
+				if i > 0 && !isBoundary[i] && vm.DecodeOpcode(code[i-1]) == vm.OP_LOAD_CONST {
+					cIdx := int(vm.DecodeArgBx(code[i-1]))
+					if cIdx < 256 && cIdx < len(consts) && isPrimitiveCompareConstVal(consts[cIdx]) {
+						precededByPrimConst = true
+					}
+				}
+				if !precededByPrimConst {
+					code[i] = vm.Encode(vm.OP_COMPARE_JUMP_IF_FALSE, cmpOp, vm.DecodeArgBx(w1))
+					code[i+1] = vm.Encode(vm.OP_NOP, 0, 0)
+					i += 2
+					continue
+				}
+			}
+		}
+
+		// OP_LOAD_FAST (<256) + OP_LOAD_FAST (<256) -> OP_LOAD_FAST_2, OP_NOP
+		// Skip when followed by OP_CALL_METHOD_PIC or OP_BINARY_SUB (Tier-2 3/4/6-op patterns).
+		if op0 == vm.OP_LOAD_FAST && op1 == vm.OP_LOAD_FAST {
+			r1, r2 := vm.DecodeArgBx(w0), vm.DecodeArgBx(w1)
+			if r1 < 256 && r2 < 256 {
+				blockTier2 := false
+				if i+2 < n && !isBoundary[i+2] {
+					op2 := vm.DecodeOpcode(code[i+2])
+					if op2 == vm.OP_CALL_METHOD_PIC || op2 == vm.OP_BINARY_SUB {
+						blockTier2 = true
+					} else if i+3 < n && !isBoundary[i+3] &&
+						(op2 == vm.OP_LOAD_FAST || op2 == vm.OP_LOAD_CONST) &&
+						vm.DecodeOpcode(code[i+3]) == vm.OP_CALL_METHOD_PIC {
+						blockTier2 = true
+					}
+				}
+				if !blockTier2 {
+					code[i] = vm.EncodeABC(vm.OP_LOAD_FAST_2, 0, uint8(r1), uint8(r2))
+					code[i+1] = vm.Encode(vm.OP_NOP, 0, 0)
+					i += 2
+					continue
+				}
+			}
+		}
+
+		// OP_STORE_FAST (<256) + OP_LOAD_FAST (<256) -> OP_STORE_LOAD_FAST, OP_NOP
+		// Skip when c.hasSliceOps is set (so finalizedCode can rewrite OP_STORE_FAST
+		// to OP_STORE_FAST_VIEW for memoryview recycling) or when preceded by
+		// OP_UNPACK_SEQUENCE (so Tier-2's OP_UNPACK_2_FAST stays eligible).
+		if !c.hasSliceOps && op0 == vm.OP_STORE_FAST && op1 == vm.OP_LOAD_FAST {
+			dst, srcReg := vm.DecodeArgBx(w0), vm.DecodeArgBx(w1)
+			if dst < 256 && srcReg < 256 {
+				precededByUnpack := (i > 0 && !isBoundary[i] && vm.DecodeOpcode(code[i-1]) == vm.OP_UNPACK_SEQUENCE) ||
+					(i > 1 && !isBoundary[i] && !isBoundary[i-1] && vm.DecodeOpcode(code[i-2]) == vm.OP_UNPACK_SEQUENCE)
+				if !precededByUnpack {
+					code[i] = vm.EncodeABC(vm.OP_STORE_LOAD_FAST, 0, uint8(dst), uint8(srcReg))
+					code[i+1] = vm.Encode(vm.OP_NOP, 0, 0)
+					i += 2
+					continue
+				}
+			}
+		}
+
+		i++
 	}
 }
 

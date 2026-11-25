@@ -1,6 +1,7 @@
 package compiler
 
 import (
+	"bytes"
 	"math"
 
 	"github.com/servusdei2018/fython/pkg/val"
@@ -25,6 +26,10 @@ func NewConstPool() *ConstPool {
 	}
 }
 
+func isIndexedConstKind(k val.Kind) bool {
+	return k != val.KindTuple && k != val.KindBytes && k != val.KindSet && k != val.KindComplex
+}
+
 // Add deduplicates v with strict type+value sensitivity and returns its 16-bit constant pool index.
 // Guaranteed: 1 (int), 1.0 (float), and True (bool) will NEVER share a constant slot.
 func (cp *ConstPool) Add(v val.Value) uint16 {
@@ -33,6 +38,9 @@ func (cp *ConstPool) Add(v val.Value) uint16 {
 		cp.index = make(map[constKey]uint16, 32)
 		for i, existing := range cp.consts {
 			ek := existing.Kind()
+			if !isIndexedConstKind(ek) {
+				continue
+			}
 			key := constKey{kind: ek, num: existing.RawNum()}
 			if ek == val.KindString {
 				key.str = existing.AsString()
@@ -41,7 +49,7 @@ func (cp *ConstPool) Add(v val.Value) uint16 {
 		}
 	}
 
-	if cp.index != nil {
+	if cp.index != nil && isIndexedConstKind(k) {
 		key := constKey{kind: k, num: v.RawNum()}
 		if k == val.KindString {
 			key.str = v.AsString()
@@ -61,7 +69,7 @@ func (cp *ConstPool) Add(v val.Value) uint16 {
 
 	idx := uint16(len(cp.consts))
 	cp.consts = append(cp.consts, v)
-	if cp.index != nil {
+	if cp.index != nil && isIndexedConstKind(k) {
 		key := constKey{kind: k, num: v.RawNum()}
 		if k == val.KindString {
 			key.str = v.AsString()
@@ -120,6 +128,35 @@ func exactTypeAndValueEqual(a, b val.Value) bool {
 		}
 		for i := range ta {
 			if !exactTypeAndValueEqual(ta[i], tb[i]) {
+				return false
+			}
+		}
+		return true
+
+	case val.KindBytes:
+		return bytes.Equal(a.AsBytes().Data, b.AsBytes().Data)
+
+	case val.KindSet:
+		sa := a.AsSet()
+		sb := b.AsSet()
+		if sa.Len() != sb.Len() {
+			return false
+		}
+		// Match elements by strict type+value equality so {1} != {True} != {1.0}.
+		entriesA := sa.DictEntries()
+		entriesB := sb.DictEntries()
+		for i := range entriesA {
+			if !entriesA[i].Active {
+				continue
+			}
+			found := false
+			for j := range entriesB {
+				if entriesB[j].Active && exactTypeAndValueEqual(entriesA[i].Key, entriesB[j].Key) {
+					found = true
+					break
+				}
+			}
+			if !found {
 				return false
 			}
 		}

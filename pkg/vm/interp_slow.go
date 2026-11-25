@@ -1533,20 +1533,25 @@ func (vm *VM) opCompareJumpSlow(st *loopState, op Opcode, inst uint32, ip, sp in
 		return ip + 2, newSP, ctl
 	}
 	callerCache := st.cache
+	savedFrameIdx := st.frameIdx
 	newIP, newSP, ctl := vm.opCompareSlow(st, cmpInst, ip, sp)
 	if ctl == ctlRaise || ctl == ctlExit {
 		return newIP, newSP, ctl
 	}
-	if callerCache != nil && callerCache.privateActive && ip+1 < len(callerCache.active) &&
-		DecodeOpcode(callerCache.active[ip]) == OP_COMPARE_DUNDER {
-		ptr := callerCache.quickenAt(ip+1, Encode(jumpOp, 0, target))
-		if st.cache == callerCache {
-			st.codePtr = ptr
+	pushedFrame := st.frameIdx != savedFrameIdx
+	if callerCache != nil && ip+1 < len(callerCache.active) {
+		if callerCache.privateActive && DecodeOpcode(callerCache.active[ip]) == OP_COMPARE_DUNDER {
+			ptr := callerCache.quickenAt(ip+1, Encode(jumpOp, 0, target))
+			if st.cache == callerCache {
+				st.codePtr = ptr
+			}
+		} else if pushedFrame && DecodeOpcode(callerCache.active[ip+1]) == OP_NOP {
+			// Ensure the dunder return lands on the conditional jump instead of OP_NOP.
+			callerCache.quickenAt(ip, cmpInst)
+			callerCache.quickenAt(ip+1, Encode(jumpOp, 0, target))
 		}
-		if newIP == 0 {
-			return newIP, newSP, ctl
-		}
-	} else if newIP == 0 {
+	}
+	if pushedFrame {
 		return newIP, newSP, ctl
 	}
 	cond := st.stack[newSP-1]
@@ -1595,22 +1600,27 @@ func (vm *VM) opCmpConstJumpSlow(st *loopState, op Opcode, inst uint32, ip, sp i
 	}
 	st.stack[sp] = b
 	callerCache := st.cache
+	savedFrameIdx := st.frameIdx
 	cmpInst := Encode(OP_COMPARE_OP, cmpOp, 0)
 	newIP, newSP, ctl := vm.opCompareSlow(st, cmpInst, ip+1, sp+1)
 	if ctl == ctlRaise || ctl == ctlExit {
 		return newIP, newSP, ctl
 	}
-	if callerCache != nil && callerCache.privateActive && ip+2 < len(callerCache.active) &&
-		DecodeOpcode(callerCache.active[ip+1]) == OP_COMPARE_DUNDER {
-		callerCache.quickenAt(ip, Encode(OP_LOAD_CONST, 0, constIdx))
-		ptr := callerCache.quickenAt(ip+2, Encode(jumpOp, 0, uint16(target)))
-		if st.cache == callerCache {
-			st.codePtr = ptr
+	pushedFrame := st.frameIdx != savedFrameIdx
+	if callerCache != nil && ip+2 < len(callerCache.active) {
+		if callerCache.privateActive && DecodeOpcode(callerCache.active[ip+1]) == OP_COMPARE_DUNDER {
+			callerCache.quickenAt(ip, Encode(OP_LOAD_CONST, 0, constIdx))
+			ptr := callerCache.quickenAt(ip+2, Encode(jumpOp, 0, uint16(target)))
+			if st.cache == callerCache {
+				st.codePtr = ptr
+			}
+		} else if pushedFrame && DecodeOpcode(callerCache.active[ip+2]) == OP_NOP {
+			callerCache.quickenAt(ip, Encode(OP_LOAD_CONST, 0, constIdx))
+			callerCache.quickenAt(ip+1, cmpInst)
+			callerCache.quickenAt(ip+2, Encode(jumpOp, 0, uint16(target)))
 		}
-		if newIP == 0 {
-			return newIP, newSP, ctl
-		}
-	} else if newIP == 0 {
+	}
+	if pushedFrame {
 		return newIP, newSP, ctl
 	}
 	cond := st.stack[newSP-1]

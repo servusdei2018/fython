@@ -82,7 +82,8 @@ func OptimizeCodeObject(co *CodeObject) {
 		inst := co.Code[i]
 		op := DecodeOpcode(inst)
 		switch op {
-		case OP_JUMP, OP_JUMP_IF_FALSE, OP_JUMP_IF_TRUE, OP_JUMP_IF_FALSE_OR_POP, OP_JUMP_IF_TRUE_OR_POP, OP_FOR_ITER, OP_FOR_ITER_GEN:
+		case OP_JUMP, OP_JUMP_IF_FALSE, OP_JUMP_IF_TRUE, OP_JUMP_IF_FALSE_OR_POP, OP_JUMP_IF_TRUE_OR_POP,
+			OP_FOR_ITER, OP_FOR_ITER_GEN, OP_FOR_ITER_RANGE, OP_COMPARE_JUMP_IF_FALSE:
 			target := int(DecodeArgBx(inst))
 			if target >= 0 && target < len(isJumpTarget) {
 				isJumpTarget[target] = true
@@ -170,6 +171,16 @@ func OptimizeCodeObject(co *CodeObject) {
 		src = code
 	}
 	for i := co.EntryIP; i < len(src); {
+		// Skip past both words of already-fused 2-word compile-time instructions
+		// so we never mis-fuse across their trailing OP_NOP slot.
+		switch DecodeOpcode(src[i]) {
+		case OP_LOAD_FAST_ATTR, OP_RETURN_CONST, OP_RETURN_FAST, OP_LOAD_FAST_2,
+			OP_STORE_LOAD_FAST, OP_COMPARE_JUMP_IF_FALSE:
+			if i+1 < len(src) && DecodeOpcode(src[i+1]) == OP_NOP {
+				i += 2
+				continue
+			}
+		}
 		if i+5 < len(src) && !isJumpTarget[i+1] && !isJumpTarget[i+2] && !isJumpTarget[i+3] && !isJumpTarget[i+4] && !isJumpTarget[i+5] {
 			w0, w1, w2, w3, w4, w5 := src[i], src[i+1], src[i+2], src[i+3], src[i+4], src[i+5]
 			op0, op1, op2, op3, op4, op5 := DecodeOpcode(w0), DecodeOpcode(w1), DecodeOpcode(w2), DecodeOpcode(w3), DecodeOpcode(w4), DecodeOpcode(w5)
@@ -299,7 +310,7 @@ func OptimizeCodeObject(co *CodeObject) {
 				DecodeArgA(w3) == 2 {
 				reg := DecodeArgBx(w0)
 				methodIdx := DecodeArgBx(w3)
-				if reg < 256 && methodIdx < 256 && isFastAttrDescrEligible(co, int(methodIdx)) {
+				if reg < 256 && methodIdx < 256 && isFastAttrDescrEligibleAt(co, int(methodIdx), src, i+4) {
 					code = fusionCopy(co, code)
 					code[i] = w1
 					code[i+1] = w2
@@ -359,7 +370,7 @@ func OptimizeCodeObject(co *CodeObject) {
 				op2 == OP_CALL_METHOD_PIC && DecodeArgA(w2) == 1 {
 				reg := DecodeArgBx(w0)
 				methodIdx := DecodeArgBx(w2)
-				if reg < 256 && methodIdx < 256 && isFastAttrDescrEligible(co, int(methodIdx)) {
+				if reg < 256 && methodIdx < 256 && isFastAttrDescrEligibleAt(co, int(methodIdx), src, i+3) {
 					code = fusionCopy(co, code)
 					code[i] = w1
 					code[i+1] = EncodeABC(OP_CALL_FAST_ATTR_DESCR, uint8(reg), uint8(methodIdx), 1)
@@ -502,7 +513,7 @@ func OptimizeCodeObject(co *CodeObject) {
 			if op0 == OP_LOAD_FAST && op1 == OP_CALL_METHOD_PIC && DecodeArgA(w1) == 0 {
 				reg := DecodeArgBx(w0)
 				methodIdx := DecodeArgBx(w1)
-				if reg < 256 && methodIdx < 256 && isFastAttrDescrEligible(co, int(methodIdx)) {
+				if reg < 256 && methodIdx < 256 && isFastAttrDescrEligibleAt(co, int(methodIdx), src, i+2) {
 					code = fusionCopy(co, code)
 					code[i] = EncodeABC(OP_CALL_FAST_ATTR_DESCR, uint8(reg), uint8(methodIdx), 0)
 					code[i+1] = Encode(OP_NOP, 0, 0)
@@ -530,6 +541,29 @@ func isPrimitiveCompareConst(v val.Value) bool {
 
 func isSimpleLoadOp(op Opcode) bool {
 	return op == OP_LOAD_FAST || op == OP_LOAD_CONST || op == OP_LOAD_DEREF || op == OP_LOAD_GLOBAL
+}
+
+// isFastAttrDescrEligibleAt checks isFastAttrDescrEligible and also keeps
+// regex match/search/fullmatch calls unfused when the next instruction qualifies
+// for matchBoolOnly or matchEphemeral (so OP_CALL_METHOD_DESCR can elide or
+// recycle pyMatch allocations), while escaping matches stay on the fast path.
+func isFastAttrDescrEligibleAt(co *CodeObject, methodIdx int, src []uint32, nextIP int) bool {
+	if !isFastAttrDescrEligible(co, methodIdx) {
+		return false
+	}
+	name := co.Consts[methodIdx].AsString()
+	if (name == "match" || name == "search" || name == "fullmatch") && nextIP < len(src) {
+		nextInst := src[nextIP]
+		switch DecodeOpcode(nextInst) {
+		case OP_JUMP_IF_FALSE, OP_JUMP_IF_TRUE, OP_UNARY_NOT, OP_POP_TOP:
+			return false
+		case OP_STORE_FAST:
+			if co.isMatchLocalSafe(int(DecodeArgBx(nextInst))) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // isFastAttrDescrEligible reports whether a method name constant is a hot

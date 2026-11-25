@@ -2170,8 +2170,12 @@ func computeVarKWSafe(co *CodeObject) bool {
 		op := DecodeOpcode(inst)
 		bx := DecodeArgBx(inst)
 		switch op {
-		case OP_STORE_FAST, OP_DELETE_FAST:
+		case OP_STORE_FAST, OP_DELETE_FAST, OP_RETURN_FAST:
 			if bx == kwIdx {
+				return false
+			}
+		case OP_LOAD_FAST_2, OP_STORE_LOAD_FAST:
+			if uint16(uint8(inst>>8)) == kwIdx || uint16(uint8(inst)) == kwIdx {
 				return false
 			}
 		case OP_LOAD_FAST_ATTR, OP_STORE_FAST_ATTR, OP_LOAD_FAST_ATTR_MUL_SELF:
