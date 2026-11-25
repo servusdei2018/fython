@@ -467,8 +467,8 @@ func (vm *VM) nextZipEnumeratePooled(pyIter *val.PyIter) (val.Value, bool) {
 		pyIter.Stop = 1
 		return val.NoneVal(), false
 	}
-	if n <= 4 {
-		var buf [4]val.Value
+	if n <= 3 {
+		var buf [3]val.Value
 		for i := range n {
 			v, ok := pyIter.Seq[i].AsIter().NextCtx(ctx)
 			if !ok {

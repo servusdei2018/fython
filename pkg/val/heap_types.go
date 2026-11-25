@@ -24,15 +24,15 @@ type PyBigInt struct {
 type PyString struct {
 	Header ObjectHeader
 	Data   string
-	Buf    []byte
+	// RuneCache holds a lazily computed []rune view of Data. It is immutable
+	// once published, so concurrent readers may use it without locking.
+	RuneCache atomic.Pointer[[]rune]
+	Buf       []byte
 	// BufClaimed records that the spare capacity of Buf has been handed over
 	// to a derived string. It is manipulated with sync/atomic only, so that
 	// two VMs concatenating the very same string can never both mutate the
 	// shared backing bytes.
 	BufClaimed uint32
-	// RuneCache holds a lazily computed []rune view of Data. It is immutable
-	// once published, so concurrent readers may use it without locking.
-	RuneCache atomic.Pointer[[]rune]
 }
 
 // PyList represents a dynamic array of Value on the heap.
@@ -40,8 +40,8 @@ type PyString struct {
 type PyList struct {
 	Header ObjectHeader
 	Items  []Value
-	mu     sync.RWMutex
 	Attrs  *PyDict
+	mu     sync.RWMutex
 }
 
 // DictEntry represents a key-value pair stored in the dense, insertion-ordered PyDict array.
@@ -63,21 +63,10 @@ const (
 // from the dense insertion-ordered Entries slice.
 // Header MUST be at offset 0.
 type PyDict struct {
-	Header     ObjectHeader
-	Entries    []DictEntry
-	indices    []byte
-	mask       uint32
-	used       int
-	filled     int
-	indexShift uint8 // 0: uint8 slots, 1: uint16 slots, 2: uint32 slots
-	VersionTag uint64
-	mu         sync.RWMutex
-	// Shared marks a dictionary that several VMs can reach at the same
-	// time, such as the builtins of an engine. Such a dictionary always
-	// takes its lock, even when the runtime believes it is
-	// single-threaded.
-	Shared bool
-	Attrs  *PyDict
+	Header  ObjectHeader
+	Entries []DictEntry
+	indices []byte
+	Attrs   *PyDict
 	// Live, when non-nil, turns this dict into a zero-copy view over a
 	// Shape-backed instance: every read and write is resolved through
 	// Live.Shape and Live.Slots (see NewInstanceDictProxy).
@@ -88,8 +77,19 @@ type PyDict struct {
 	owner *PyType
 	// Small-table inline storage for dicts and sets with <= 5 entries, avoiding
 	// separate heap allocations for indices and Entries in initTable.
-	inlineIndices [8]byte
 	inlineEntries [5]DictEntry
+	VersionTag    uint64
+	used          int
+	filled        int
+	mu            sync.RWMutex
+	mask          uint32
+	indexShift    uint8 // 0: uint8 slots, 1: uint16 slots, 2: uint32 slots
+	// Shared marks a dictionary that several VMs can reach at the same
+	// time, such as the builtins of an engine. Such a dictionary always
+	// takes its lock, even when the runtime believes it is
+	// single-threaded.
+	Shared        bool
+	inlineIndices [8]byte
 }
 
 // PyCell wraps a shared mutable Value on the heap for closures and nonlocal variables.
@@ -346,16 +346,16 @@ const (
 // Header MUST be at offset 0.
 type PyIter struct {
 	Header  ObjectHeader
-	Kind    IterKind
 	Obj     Value
 	Sub     Value
+	NextFn  func() (Value, bool)
 	Seq     []Value
 	Idx     int
 	Cur     int64
 	NextIdx int64
 	Stop    int64
 	Step    int64
-	NextFn  func() (Value, bool)
+	Kind    IterKind
 }
 
 // GenState classifies the lifecycle state of a PyGenerator.
@@ -374,22 +374,22 @@ type PyGenerator struct {
 	Header      ObjectHeader
 	Name        string
 	Code        Value
-	State       GenState
-	Stack       []Value
-	SP          int
-	Base        int
-	IP          int
-	MaxSP       int
-	PoolClass   uint8
-	OwnCells    bool
-	Cells       []Value
-	CellPtrs    []*PyCell
 	Globals     *PyDict
 	YieldVal    Value
 	RetVal      Value
 	LastSent    Value
 	ResumeHook  func(ctx *ExecContext, gen *PyGenerator, val Value) (Value, IterStatus)
 	ReleaseHook func(gen *PyGenerator)
+	Stack       []Value
+	Cells       []Value
+	CellPtrs    []*PyCell
+	SP          int
+	Base        int
+	IP          int
+	MaxSP       int
+	State       GenState
+	PoolClass   uint8
+	OwnCells    bool
 }
 
 // CoroutineState classifies the lifecycle state of a PyCoroutine.
@@ -408,22 +408,22 @@ type PyCoroutine struct {
 	Header      ObjectHeader
 	Name        string
 	Code        Value
-	State       CoroutineState
-	Stack       []Value
-	SP          int
-	Base        int
-	IP          int
-	MaxSP       int
-	PoolClass   uint8
-	OwnCells    bool
-	Cells       []Value
-	CellPtrs    []*PyCell
 	Globals     *PyDict
 	YieldVal    Value
 	RetVal      Value
 	LastSent    Value
 	ResumeHook  func(ctx *ExecContext, coro *PyCoroutine, val Value) (Value, IterStatus)
 	ReleaseHook func(coro *PyCoroutine)
+	Stack       []Value
+	Cells       []Value
+	CellPtrs    []*PyCell
+	SP          int
+	Base        int
+	IP          int
+	MaxSP       int
+	State       CoroutineState
+	PoolClass   uint8
+	OwnCells    bool
 }
 
 // FutureState classifies the lifecycle state of a PyFuture.
@@ -2735,6 +2735,14 @@ func dictKeyEqual(a, b Value) bool {
 	return Equals(a, b)
 }
 
+func (d *PyDict) bumpVersionTag() {
+	if d.Shared || MultiThreadedFlag.Load() {
+		atomic.AddUint64(&d.VersionTag, 1)
+		return
+	}
+	d.VersionTag++
+}
+
 func (d *PyDict) setLocked(key, value Value) {
 	if len(d.indices) == 0 {
 		d.initTable(4)
@@ -2744,7 +2752,7 @@ func (d *PyDict) setLocked(key, value Value) {
 			e := &d.Entries[i]
 			if e.Active && (e.Key == key || dictKeyEqual(e.Key, key)) {
 				e.Value = value
-				atomic.AddUint64(&d.VersionTag, 1)
+				d.bumpVersionTag()
 				if d.owner != nil {
 					d.owner.bumpVersion()
 				}
@@ -2775,7 +2783,7 @@ func (d *PyDict) setLocked(key, value Value) {
 				e := &d.Entries[int(raw)-dictIndexOffset]
 				if e.Key == key || (e.Hash == h && e.Active && dictKeyEqual(e.Key, key)) {
 					e.Value = value
-					atomic.AddUint64(&d.VersionTag, 1)
+					d.bumpVersionTag()
 					if d.owner != nil {
 						d.owner.bumpVersion()
 					}
@@ -2801,7 +2809,7 @@ func (d *PyDict) setLocked(key, value Value) {
 				e := &d.Entries[int(raw)-dictIndexOffset]
 				if e.Key == key || (e.Hash == h && e.Active && dictKeyEqual(e.Key, key)) {
 					e.Value = value
-					atomic.AddUint64(&d.VersionTag, 1)
+					d.bumpVersionTag()
 					if d.owner != nil {
 						d.owner.bumpVersion()
 					}
@@ -2835,7 +2843,7 @@ func (d *PyDict) setLocked(key, value Value) {
 	}
 	d.writeIndex(uint32(insertSlot), uint32(entryIdx+dictIndexOffset))
 	d.used++
-	atomic.AddUint64(&d.VersionTag, 1)
+	d.bumpVersionTag()
 	if d.owner != nil {
 		d.owner.bumpVersion()
 	}
@@ -2864,7 +2872,7 @@ func (d *PyDict) PutNew(key, value Value) {
 			e := &d.Entries[int(raw)-dictIndexOffset]
 			if e.Key == key || (e.Hash == h && e.Active && dictKeyEqual(e.Key, key)) {
 				e.Value = value
-				atomic.AddUint64(&d.VersionTag, 1)
+				d.bumpVersionTag()
 				if d.owner != nil {
 					d.owner.bumpVersion()
 				}
@@ -2889,7 +2897,7 @@ func (d *PyDict) PutNew(key, value Value) {
 			e := &d.Entries[int(raw)-dictIndexOffset]
 			if e.Key == key || (e.Hash == h && e.Active && dictKeyEqual(e.Key, key)) {
 				e.Value = value
-				atomic.AddUint64(&d.VersionTag, 1)
+				d.bumpVersionTag()
 				if d.owner != nil {
 					d.owner.bumpVersion()
 				}
@@ -2908,7 +2916,7 @@ func (d *PyDict) PutNew(key, value Value) {
 	}
 	d.used++
 	d.filled++
-	atomic.AddUint64(&d.VersionTag, 1)
+	d.bumpVersionTag()
 	if d.owner != nil {
 		d.owner.bumpVersion()
 	}
@@ -3118,7 +3126,7 @@ func (d *PyDict) deleteLocked(key Value) bool {
 				e.Value = NoneVal()
 				d.writeIndex(slot, dictIndexDummy)
 				d.used--
-				atomic.AddUint64(&d.VersionTag, 1)
+				d.bumpVersionTag()
 				if d.owner != nil {
 					d.owner.bumpVersion()
 				}
@@ -4090,7 +4098,7 @@ func (d *PyDict) SetUsedFilled(used, filled int) {
 
 // BumpVersion bumps the dict version tag for template fills.
 func (d *PyDict) BumpVersion() {
-	atomic.AddUint64(&d.VersionTag, 1)
+	d.bumpVersionTag()
 	if d.owner != nil {
 		d.owner.bumpVersion()
 	}
@@ -4112,7 +4120,7 @@ func (d *PyDict) Clear() {
 	clear(d.indices)
 	d.used = 0
 	d.filled = 0
-	atomic.AddUint64(&d.VersionTag, 1)
+	d.bumpVersionTag()
 	if d.owner != nil {
 		d.owner.bumpVersion()
 	}

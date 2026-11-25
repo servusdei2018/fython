@@ -337,10 +337,10 @@ func (vm *VM) opBinarySlice(st *loopState, ip, sp int) (int, int, loopCtl) {
 				stack[sp-3] = val.EmptyTupleVal()
 			case start == 0 && stop == len(items) && container.Type() == val.TupleType:
 				stack[sp-3] = container
-			case sliceLen <= 4 && ip+1 < st.codeLen && !val.MultiThreadedFlag.Load() &&
+			case sliceLen <= 3 && ip+1 < st.codeLen && !val.MultiThreadedFlag.Load() &&
 				isEphemeralTupleNextOp(DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4)))):
 				stack[sp-3] = vm.acquireEphemeralTuple(items[start:stop])
-			case sliceLen >= 5:
+			case sliceLen >= 4:
 				// Tuples are immutable so sharing the backing slice is
 				// safe and avoids the Packaging copy path.
 				val.ClearEphemeral(container)
@@ -1280,7 +1280,7 @@ func (vm *VM) opBuildTuple(st *loopState, inst uint32, ip, sp int) (int, int, lo
 		val.DetachStringBuf(stack[i])
 		markViewEscaped(stack[i])
 	}
-	if count <= 4 && ip+1 < st.codeLen && !val.MultiThreadedFlag.Load() {
+	if count <= 3 && ip+1 < st.codeLen && !val.MultiThreadedFlag.Load() {
 		opNext := DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4)))
 		if isEphemeralTupleNextOp(opNext) {
 			stack[base] = vm.acquireEphemeralTuple(stack[base:sp])

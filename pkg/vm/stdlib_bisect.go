@@ -84,7 +84,7 @@ func bisectRightCore(ctx *val.ExecContext, a, x val.Value, lo, hi int, keyFn val
 		for lo < hi {
 			mid := (lo + hi) / 2
 			elem := getSeqItem(ctx, a, mid)
-			if val.LessThan(x, elem).IsTruthy() {
+			if val.RichCompare(ctx, x, elem, val.CmpLT).IsTruthy() {
 				hi = mid
 			} else {
 				lo = mid + 1
@@ -107,7 +107,7 @@ func bisectRightCore(ctx *val.ExecContext, a, x val.Value, lo, hi int, keyFn val
 			} else {
 				kelem = elem
 			}
-			if val.LessThan(kx, kelem).IsTruthy() {
+			if val.RichCompare(ctx, kx, kelem, val.CmpLT).IsTruthy() {
 				hi = mid
 			} else {
 				lo = mid + 1
@@ -122,7 +122,7 @@ func bisectLeftCore(ctx *val.ExecContext, a, x val.Value, lo, hi int, keyFn val.
 		for lo < hi {
 			mid := (lo + hi) / 2
 			elem := getSeqItem(ctx, a, mid)
-			if val.LessThan(elem, x).IsTruthy() {
+			if val.RichCompare(ctx, elem, x, val.CmpLT).IsTruthy() {
 				lo = mid + 1
 			} else {
 				hi = mid
@@ -145,7 +145,7 @@ func bisectLeftCore(ctx *val.ExecContext, a, x val.Value, lo, hi int, keyFn val.
 			} else {
 				kelem = elem
 			}
-			if val.LessThan(kelem, kx).IsTruthy() {
+			if val.RichCompare(ctx, kelem, kx, val.CmpLT).IsTruthy() {
 				lo = mid + 1
 			} else {
 				hi = mid

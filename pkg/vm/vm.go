@@ -499,7 +499,8 @@ func (vm *VM) callFromHook(ctx *val.ExecContext, callable val.Value, argBase int
 		if co.IsCoroutine {
 			return vm.instantiateCoroutine(co, callable, fn.Defaults, fn.KwDefaults, ctx.Stack, argBase, nargs, kwnames, fnGlobals, false)
 		}
-		need := argBase + co.NumLocals + co.MaxStackSize + 256
+		numLocals := max(co.NumLocals, co.NumParams)
+		need := argBase + numLocals + co.MaxStackSize + 256
 		if need > len(ctx.Stack) {
 			if len(ctx.Stack) > 0 && len(vm.stack) > 0 && &ctx.Stack[0] == &vm.stack[0] {
 				vm.stack = ensureStack(vm.stack, need)
@@ -508,9 +509,19 @@ func (vm *VM) callFromHook(ctx *val.ExecContext, callable val.Value, argBase int
 				ctx.Stack = ensureStack(ctx.Stack, need)
 			}
 		}
-		spAfterBind := vm.bindFunctionArgs(co, fn.Defaults, fn.KwDefaults, ctx.Stack, argBase, nargs, kwnames)
-		if ctx.HasException() {
-			return val.NoneVal()
+		var spAfterBind int
+		if len(kwnames) == 0 && co.SimplePositionalOnly && co.KWOnlyArgCount == 0 &&
+			!co.IsGenerator && !co.IsCoroutine &&
+			nargs == co.PositionalParamCount && len(fn.Defaults) == 0 && fn.KwDefaults == nil {
+			for i := nargs; i < numLocals; i++ {
+				ctx.Stack[argBase+i] = val.NoneVal()
+			}
+			spAfterBind = argBase + numLocals
+		} else {
+			spAfterBind = vm.bindFunctionArgs(co, fn.Defaults, fn.KwDefaults, ctx.Stack, argBase, nargs, kwnames)
+			if ctx.HasException() {
+				return val.NoneVal()
+			}
 		}
 		savedSP := ctx.SP
 		savedFrameIdx := vm.activeFrameIdx
@@ -519,7 +530,10 @@ func (vm *VM) callFromHook(ctx *val.ExecContext, callable val.Value, argBase int
 			nextFrame = vm.activeFrameIdx + 1
 		}
 		vm.ensureFrameCapacity(nextFrame + 4)
-		cells := vm.setupCalleeCells(co, callable, ctx.Stack, argBase, nargs)
+		var cells []val.Value
+		if len(co.CellVars) != 0 || len(co.FreeVars) != 0 {
+			cells = vm.setupCalleeCells(co, callable, ctx.Stack, argBase, nargs)
+		}
 		vm.unhandledException = val.NoneVal()
 		res := vm.runFrame(co, argBase, spAfterBind, nextFrame, cells, fnGlobals, val.NoneVal(), ctx.Stack, nil, nil)
 		ctx.SP = savedSP

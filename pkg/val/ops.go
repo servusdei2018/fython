@@ -610,6 +610,30 @@ func RichCompare(ctx *ExecContext, a, b Value, op uint8) Value {
 		}
 	}
 
+	// Fast path for unboxed int64/bool pairs (avoids big.NewInt allocation)
+	if (a.ptr == &tagInt64 || a.ptr == &tagBool) && (b.ptr == &tagInt64 || b.ptr == &tagBool) {
+		ai := int64(a.num)
+		bi := int64(b.num)
+		switch op {
+		case CmpLT:
+			return BoolVal(ai < bi)
+		case CmpLTE:
+			return BoolVal(ai <= bi)
+		case CmpEQ:
+			return BoolVal(ai == bi)
+		case CmpNEQ:
+			return BoolVal(ai != bi)
+		case CmpGT:
+			return BoolVal(ai > bi)
+		case CmpGTE:
+			return BoolVal(ai >= bi)
+		case CmpIS:
+			return BoolVal(a.ptr == b.ptr && a.num == b.num)
+		case CmpISNOT:
+			return BoolVal(a.ptr != b.ptr || a.num != b.num)
+		}
+	}
+
 	if isAnyInt(a) && isAnyInt(b) {
 		cmp := toBigInt(a).Cmp(toBigInt(b))
 		switch op {
@@ -678,32 +702,51 @@ func RichCompare(ctx *ExecContext, a, b Value, op uint8) Value {
 		reflectedOp = CmpLTE
 	}
 
-	isStrictSub := aType != bType && IsSubclass(bType, aType)
-
-	// 1. If b is a strict subclass of a and defines the reflected comparison, try b first!
-	if isStrictSub {
-		if rFn := getCompareDunder(bType, reflectedOp); rFn.ptr != nil {
-			res := invokeCompareDunder(ctx, rFn, b, a, bType)
+	if aType == bType {
+		// Exact concrete same-type fast path: skip IsSubclass and avoid
+		// duplicate reflected dunder lookup for symmetric == / !=.
+		if fn := getCompareDunder(aType, op); fn.ptr != nil {
+			res := invokeCompareDunder(ctx, fn, a, b, aType)
 			if !res.IsNotImplemented() {
 				return res
 			}
 		}
-	}
-
-	// 2. Try a's comparison operator
-	if fn := getCompareDunder(aType, op); fn.ptr != nil {
-		res := invokeCompareDunder(ctx, fn, a, b, aType)
-		if !res.IsNotImplemented() {
-			return res
+		if reflectedOp != op {
+			if rFn := getCompareDunder(bType, reflectedOp); rFn.ptr != nil {
+				res := invokeCompareDunder(ctx, rFn, b, a, bType)
+				if !res.IsNotImplemented() {
+					return res
+				}
+			}
 		}
-	}
+	} else {
+		isStrictSub := IsSubclass(bType, aType)
 
-	// 3. Try b's reflected comparison operator (if not tried already)
-	if !isStrictSub {
-		if rFn := getCompareDunder(bType, reflectedOp); rFn.ptr != nil {
-			res := invokeCompareDunder(ctx, rFn, b, a, bType)
+		// 1. If b is a strict subclass of a and defines the reflected comparison, try b first!
+		if isStrictSub {
+			if rFn := getCompareDunder(bType, reflectedOp); rFn.ptr != nil {
+				res := invokeCompareDunder(ctx, rFn, b, a, bType)
+				if !res.IsNotImplemented() {
+					return res
+				}
+			}
+		}
+
+		// 2. Try a's comparison operator
+		if fn := getCompareDunder(aType, op); fn.ptr != nil {
+			res := invokeCompareDunder(ctx, fn, a, b, aType)
 			if !res.IsNotImplemented() {
 				return res
+			}
+		}
+
+		// 3. Try b's reflected comparison operator (if not tried already)
+		if !isStrictSub {
+			if rFn := getCompareDunder(bType, reflectedOp); rFn.ptr != nil {
+				res := invokeCompareDunder(ctx, rFn, b, a, bType)
+				if !res.IsNotImplemented() {
+					return res
+				}
 			}
 		}
 	}
@@ -917,8 +960,11 @@ func compareSliceRich(ctx *ExecContext, ia, ib []Value, op uint8) Value {
 			if ea.IsNone() && eb.IsNone() {
 				continue
 			}
-			if ea.ptr == &tagInt64 && eb.ptr == &tagInt64 {
-				return BoolVal(false)
+			if (ea.ptr == &tagInt64 || ea.ptr == &tagBool) && (eb.ptr == &tagInt64 || eb.ptr == &tagBool) {
+				if int64(ea.num) != int64(eb.num) {
+					return BoolVal(false)
+				}
+				continue
 			}
 			if ea.ptr == &tagFloat64 && eb.ptr == &tagFloat64 {
 				if math.Float64frombits(ea.num) != math.Float64frombits(eb.num) {
@@ -988,8 +1034,11 @@ func compareSliceRich(ctx *ExecContext, ia, ib []Value, op uint8) Value {
 			if ea.IsNone() && eb.IsNone() {
 				continue
 			}
-			if ea.ptr == &tagInt64 && eb.ptr == &tagInt64 {
+			if (ea.ptr == &tagInt64 || ea.ptr == &tagBool) && (eb.ptr == &tagInt64 || eb.ptr == &tagBool) {
 				ai, bi := int64(ea.num), int64(eb.num)
+				if ai == bi {
+					continue
+				}
 				switch op {
 				case CmpLT:
 					return BoolVal(ai < bi)

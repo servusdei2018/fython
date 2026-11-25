@@ -163,7 +163,6 @@ func NewStringVal(s string) Value {
 	obj := &PyString{
 		Header: ObjectHeader{
 			Kind: KindString,
-			Hash: HashString(s),
 			Type: StrType,
 		},
 		Data: s,
@@ -185,7 +184,6 @@ func NewStringFromBytes(b []byte) Value {
 	obj := &PyString{
 		Header: ObjectHeader{
 			Kind: KindString,
-			Hash: HashString(s),
 			Type: StrType,
 		},
 		Data: s,
@@ -211,7 +209,9 @@ func StringEquals(a, b Value) bool {
 		}
 		sa := (*PyString)(unsafe.Pointer(a.ptr))
 		sb := (*PyString)(unsafe.Pointer(b.ptr))
-		if sa.Header.Hash != 0 && sb.Header.Hash != 0 && sa.Header.Hash != sb.Header.Hash {
+		ha := atomic.LoadUint32(&sa.Header.Hash)
+		hb := atomic.LoadUint32(&sb.Header.Hash)
+		if ha != 0 && hb != 0 && ha != hb {
 			return false
 		}
 		return sa.Data == sb.Data
@@ -763,7 +763,6 @@ func IntToStringVal(n int64) Value {
 	ps := &PyString{
 		Header: ObjectHeader{
 			Kind: KindString,
-			Hash: HashString(s),
 			Type: StrType,
 		},
 		Data: s,
@@ -773,8 +772,8 @@ func IntToStringVal(n int64) Value {
 
 // ConcatStrings concatenates two string-like Values.
 // If the combined length <= 7, it returns a KindInlineStr with 0 allocations.
-// For larger strings, it copies directly into an allocated buffer with extra headroom
-// for chained in-place additions, avoiding redundant Go string copies.
+// For larger strings, it allocates an exact-sized buffer for one-off concatenations;
+// repeated appends promote to geometric growth inside TryConcatInPlace.
 func ConcatStrings(a, b Value) Value {
 	lenA := a.StringByteLen()
 	lenB := b.StringByteLen()
@@ -785,8 +784,7 @@ func ConcatStrings(a, b Value) Value {
 		dst, _ = AppendValueBytes(dst, b)
 		return SmallStringFromBytes(dst)
 	}
-	capSize := max(128, totalLen)
-	buf := make([]byte, totalLen, capSize)
+	buf := make([]byte, totalLen)
 	var pos int
 	switch {
 	case a.ptr == &tagInlineStr:
@@ -832,7 +830,6 @@ func ConcatStrings(a, b Value) Value {
 	ps := &PyString{
 		Header: ObjectHeader{
 			Kind: KindString,
-			Hash: HashString(s),
 			Type: StrType,
 		},
 		Data: s,
@@ -842,7 +839,8 @@ func ConcatStrings(a, b Value) Value {
 }
 
 // TryConcatInPlace concatenates the heap string a with b, reusing the spare
-// capacity that a's backing buffer was allocated with.
+// capacity of a's backing buffer when it fits, or promoting to geometric growth
+// (max(64, 2*newLen)) when a is an unclaimed concatenation result.
 //
 // Python strings are immutable, so the bytes a already exposes must never
 // change. The returned Value is therefore always a freshly allocated
@@ -854,8 +852,8 @@ func ConcatStrings(a, b Value) Value {
 // goroutine can ever read or write it: concurrent concatenations of the same
 // string fall back to ConcatStrings instead of racing on the shared bytes.
 //
-// ok reports whether the buffer could be reused; when it is false the caller
-// must fall back to ConcatStrings.
+// ok reports whether the buffer could be reused or promoted; when it is false
+// the caller must fall back to ConcatStrings.
 func TryConcatInPlace(a, b Value) (Value, bool) {
 	if a.ptr == nil || a.ptr.Kind != KindString {
 		return NoneVal(), false
@@ -869,18 +867,31 @@ func TryConcatInPlace(a, b Value) (Value, bool) {
 		return NoneVal(), false
 	}
 	buf := psA.Buf
-	if buf == nil || len(buf) < oldLen || cap(buf) < oldLen+bLen {
+	if buf == nil || len(buf) < oldLen {
 		return NoneVal(), false
 	}
-	grown, ok := AppendValueBytes(buf[:oldLen], b)
-	if !ok || len(grown) != oldLen+bLen {
-		return NoneVal(), false
+	newLen := oldLen + bLen
+	var grown []byte
+	if cap(buf) >= newLen {
+		var ok bool
+		grown, ok = AppendValueBytes(buf[:oldLen], b)
+		if !ok || len(grown) != newLen {
+			return NoneVal(), false
+		}
+	} else {
+		newCap := max(64, newLen*2)
+		grown = make([]byte, oldLen, newCap)
+		copy(grown, psA.Data)
+		var ok bool
+		grown, ok = AppendValueBytes(grown, b)
+		if !ok || len(grown) != newLen {
+			return NoneVal(), false
+		}
 	}
 	s := unsafe.String(unsafe.SliceData(grown), len(grown))
 	ps := &PyString{
 		Header: ObjectHeader{
 			Kind: KindString,
-			Hash: HashString(s),
 			Type: StrType,
 		},
 		Data: s,

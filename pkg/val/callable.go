@@ -42,16 +42,16 @@ var MaterializeTracebackHook func(ctx *ExecContext, exc Value)
 var ClearDeferredTracebackHook func(ctx *ExecContext, exc Value)
 
 // PyTuple represents an immutable sequence of Values on the heap (used for kwnames and tuple constants).
-// Tuples with up to 4 elements store their backing array inline inside the same allocation (112 B size class).
+// Tuples with up to 3 elements store their backing array inline inside the same allocation (96 B size class).
 // Header MUST be at byte offset 0.
 type PyTuple struct {
 	Header ObjectHeader
 	Items  []Value
 	Attrs  *PyDict
-	inline [4]Value
+	inline [3]Value
 }
 
-// SetInline copies up to 4 elements into t's inline storage and binds t.Items.
+// SetInline copies up to 3 elements into t's inline storage and binds t.Items.
 func (t *PyTuple) SetInline(src []Value) {
 	n := len(src)
 	switch n {
@@ -64,25 +64,20 @@ func (t *PyTuple) SetInline(src []Value) {
 		t.inline[0] = src[0]
 		t.inline[1] = src[1]
 		t.inline[2] = src[2]
-	case 4:
-		t.inline[0] = src[0]
-		t.inline[1] = src[1]
-		t.inline[2] = src[2]
-		t.inline[3] = src[3]
 	default:
 		copy(t.inline[:n], src)
 	}
 	t.Items = t.inline[:n]
 }
 
-// ClearInline zeroes all 4 slots of t's inline storage and clears t.Items for freelist reuse.
+// ClearInline zeroes all 3 slots of t's inline storage and clears t.Items for freelist reuse.
 func (t *PyTuple) ClearInline() {
-	t.inline = [4]Value{}
+	t.inline = [3]Value{}
 	t.Items = nil
 }
 
 // AcquireEphemeralTupleHook, when set, returns a cleared *PyTuple with inline
-// [4]Value storage for short-lived small concatenations. Providers guard with
+// [3]Value storage for short-lived small concatenations. Providers guard with
 // !MultiThreadedFlag.Load().
 var AcquireEphemeralTupleHook func() (*PyTuple, bool)
 
@@ -165,7 +160,7 @@ func NewTupleVal(items ...Value) Value {
 }
 
 // NewTupleFromSlice constructs a tuple copying elements from src.
-// For 1..4 elements, it performs a single allocation with no separate slice backing array.
+// For 1..3 elements, it performs a single allocation with no separate slice backing array.
 func NewTupleFromSlice(src []Value) Value {
 	n := len(src)
 	if n == 0 && TupleType != nil {
@@ -188,11 +183,6 @@ func NewTupleFromSlice(src []Value) Value {
 			obj.inline[0] = src[0]
 			obj.inline[1] = src[1]
 			obj.inline[2] = src[2]
-		case 4:
-			obj.inline[0] = src[0]
-			obj.inline[1] = src[1]
-			obj.inline[2] = src[2]
-			obj.inline[3] = src[3]
 		}
 		obj.Items = obj.inline[:n]
 		return Value{num: 0, ptr: &obj.Header}
@@ -242,7 +232,7 @@ func NewTuple2(a, b Value) Value {
 			Kind: KindTuple,
 			Type: TupleType,
 		},
-		inline: [4]Value{a, b},
+		inline: [3]Value{a, b},
 	}
 	obj.Items = obj.inline[:2]
 	return Value{num: 0, ptr: &obj.Header}
@@ -2950,7 +2940,7 @@ func tupleNbAdd(ctx *ExecContext, a, b Value) Value {
 	if a.IsTuple() && b.IsTuple() {
 		ta := a.AsTuple().Items
 		tb := b.AsTuple().Items
-		if total := len(ta) + len(tb); total <= 4 && !MultiThreadedFlag.Load() {
+		if total := len(ta) + len(tb); total <= len(PyTuple{}.inline) && !MultiThreadedFlag.Load() {
 			if AcquireEphemeralTupleHook != nil {
 				if t, ok := AcquireEphemeralTupleHook(); ok && t != nil {
 					t.Header = ObjectHeader{Kind: KindTuple, Flags: FlagEphemeralTuple, Type: TupleType}
@@ -5176,22 +5166,35 @@ func initTypes() {
 				return NoneVal()
 			}
 			sort.SliceStable(pairs, func(i, j int) bool {
-				if reverse {
-					return LessThan(pairs[j].key, pairs[i].key).IsTruthy()
+				if ctx != nil && ctx.HasException() {
+					return false
 				}
-				return LessThan(pairs[i].key, pairs[j].key).IsTruthy()
+				if reverse {
+					return RichCompare(ctx, pairs[j].key, pairs[i].key, CmpLT).IsTruthy()
+				}
+				return RichCompare(ctx, pairs[i].key, pairs[j].key, CmpLT).IsTruthy()
 			})
+			if ctx != nil && ctx.HasException() {
+				clear(pairs)
+				return NoneVal()
+			}
 			for i, p := range pairs {
 				items[i] = p.val
 			}
 			clear(pairs)
 		} else {
 			sort.SliceStable(items, func(i, j int) bool {
-				if reverse {
-					return LessThan(items[j], items[i]).IsTruthy()
+				if ctx != nil && ctx.HasException() {
+					return false
 				}
-				return LessThan(items[i], items[j]).IsTruthy()
+				if reverse {
+					return RichCompare(ctx, items[j], items[i], CmpLT).IsTruthy()
+				}
+				return RichCompare(ctx, items[i], items[j], CmpLT).IsTruthy()
 			})
+			if ctx != nil && ctx.HasException() {
+				return NoneVal()
+			}
 		}
 		l.mu.Lock()
 		l.Items = items

@@ -15,12 +15,12 @@ func getHeapList(args []val.Value, name string) *val.PyList {
 	return v.AsList()
 }
 
-func heapqSiftdown(heap []val.Value, startpos, pos int) {
+func heapqSiftdown(ctx *val.ExecContext, heap []val.Value, startpos, pos int) {
 	newitem := heap[pos]
 	for pos > startpos {
 		parentpos := (pos - 1) >> 1
 		parent := heap[parentpos]
-		if val.LessThan(newitem, parent).IsTruthy() {
+		if val.RichCompare(ctx, newitem, parent, val.CmpLT).IsTruthy() {
 			heap[pos] = parent
 			pos = parentpos
 			continue
@@ -30,14 +30,14 @@ func heapqSiftdown(heap []val.Value, startpos, pos int) {
 	heap[pos] = newitem
 }
 
-func heapqSiftup(heap []val.Value, pos int) {
+func heapqSiftup(ctx *val.ExecContext, heap []val.Value, pos int) {
 	endpos := len(heap)
 	startpos := pos
 	newitem := heap[pos]
 	childpos := 2*pos + 1
 	for childpos < endpos {
 		rightpos := childpos + 1
-		if rightpos < endpos && !val.LessThan(heap[childpos], heap[rightpos]).IsTruthy() {
+		if rightpos < endpos && !val.RichCompare(ctx, heap[childpos], heap[rightpos], val.CmpLT).IsTruthy() {
 			childpos = rightpos
 		}
 		heap[pos] = heap[childpos]
@@ -45,15 +45,15 @@ func heapqSiftup(heap []val.Value, pos int) {
 		childpos = 2*pos + 1
 	}
 	heap[pos] = newitem
-	heapqSiftdown(heap, startpos, pos)
+	heapqSiftdown(ctx, heap, startpos, pos)
 }
 
-func heapqSiftdownMax(heap []val.Value, startpos, pos int) {
+func heapqSiftdownMax(ctx *val.ExecContext, heap []val.Value, startpos, pos int) {
 	newitem := heap[pos]
 	for pos > startpos {
 		parentpos := (pos - 1) >> 1
 		parent := heap[parentpos]
-		if val.GreaterThan(newitem, parent).IsTruthy() {
+		if val.RichCompare(ctx, newitem, parent, val.CmpGT).IsTruthy() {
 			heap[pos] = parent
 			pos = parentpos
 			continue
@@ -63,14 +63,14 @@ func heapqSiftdownMax(heap []val.Value, startpos, pos int) {
 	heap[pos] = newitem
 }
 
-func heapqSiftupMax(heap []val.Value, pos int) {
+func heapqSiftupMax(ctx *val.ExecContext, heap []val.Value, pos int) {
 	endpos := len(heap)
 	startpos := pos
 	newitem := heap[pos]
 	childpos := 2*pos + 1
 	for childpos < endpos {
 		rightpos := childpos + 1
-		if rightpos < endpos && !val.GreaterThan(heap[childpos], heap[rightpos]).IsTruthy() {
+		if rightpos < endpos && !val.RichCompare(ctx, heap[childpos], heap[rightpos], val.CmpGT).IsTruthy() {
 			childpos = rightpos
 		}
 		heap[pos] = heap[childpos]
@@ -78,7 +78,7 @@ func heapqSiftupMax(heap []val.Value, pos int) {
 		childpos = 2*pos + 1
 	}
 	heap[pos] = newitem
-	heapqSiftdownMax(heap, startpos, pos)
+	heapqSiftdownMax(ctx, heap, startpos, pos)
 }
 
 func (e *Engine) createHeapQModule() val.Value {
@@ -93,7 +93,7 @@ func (e *Engine) createHeapQModule() val.Value {
 		lst := getHeapList(args, "heappush")
 		item := args[1]
 		lst.Items = append(lst.Items, item)
-		heapqSiftdown(lst.Items, 0, len(lst.Items)-1)
+		heapqSiftdown(ctx, lst.Items, 0, len(lst.Items)-1)
 		return val.NoneVal()
 	}))
 
@@ -108,7 +108,7 @@ func (e *Engine) createHeapQModule() val.Value {
 		if len(lst.Items) > 0 {
 			returnitem := lst.Items[0]
 			lst.Items[0] = lastelt
-			heapqSiftup(lst.Items, 0)
+			heapqSiftup(ctx, lst.Items, 0)
 			return returnitem
 		}
 		return lastelt
@@ -127,7 +127,7 @@ func (e *Engine) createHeapQModule() val.Value {
 		item := args[1]
 		returnitem := lst.Items[0]
 		lst.Items[0] = item
-		heapqSiftup(lst.Items, 0)
+		heapqSiftup(ctx, lst.Items, 0)
 		return returnitem
 	}))
 
@@ -138,9 +138,9 @@ func (e *Engine) createHeapQModule() val.Value {
 		}
 		lst := getHeapList(args, "heappushpop")
 		item := args[1]
-		if len(lst.Items) > 0 && val.LessThan(lst.Items[0], item).IsTruthy() {
+		if len(lst.Items) > 0 && val.RichCompare(ctx, lst.Items[0], item, val.CmpLT).IsTruthy() {
 			item, lst.Items[0] = lst.Items[0], item
-			heapqSiftup(lst.Items, 0)
+			heapqSiftup(ctx, lst.Items, 0)
 		}
 		return item
 	}))
@@ -149,7 +149,7 @@ func (e *Engine) createHeapQModule() val.Value {
 		lst := getHeapList(args, "heapify")
 		n := len(lst.Items)
 		for i := (n >> 1) - 1; i >= 0; i-- {
-			heapqSiftup(lst.Items, i)
+			heapqSiftup(ctx, lst.Items, i)
 		}
 		return val.NoneVal()
 	}))
@@ -158,7 +158,7 @@ func (e *Engine) createHeapQModule() val.Value {
 		lst := getHeapList(args, "_heapify_max")
 		n := len(lst.Items)
 		for i := (n >> 1) - 1; i >= 0; i-- {
-			heapqSiftupMax(lst.Items, i)
+			heapqSiftupMax(ctx, lst.Items, i)
 		}
 		return val.NoneVal()
 	}))
@@ -174,7 +174,7 @@ func (e *Engine) createHeapQModule() val.Value {
 		if len(lst.Items) > 0 {
 			returnitem := lst.Items[0]
 			lst.Items[0] = lastelt
-			heapqSiftupMax(lst.Items, 0)
+			heapqSiftupMax(ctx, lst.Items, 0)
 			return returnitem
 		}
 		return lastelt
@@ -193,7 +193,7 @@ func (e *Engine) createHeapQModule() val.Value {
 		item := args[1]
 		returnitem := lst.Items[0]
 		lst.Items[0] = item
-		heapqSiftupMax(lst.Items, 0)
+		heapqSiftupMax(ctx, lst.Items, 0)
 		return returnitem
 	}))
 

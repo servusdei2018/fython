@@ -927,15 +927,24 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			}
 			pairs := make([]sortedItem, len(items))
 			for i, itm := range items {
-				pairs[i] = sortedItem{val: itm, key: ctx.Invoke1(keyFunc, itm)}
+				k := ctx.Invoke1(keyFunc, itm)
+				if ctx != nil && ctx.HasException() {
+					return val.NoneVal()
+				}
+				pairs[i] = sortedItem{val: itm, key: k}
 			}
 			sort.SliceStable(pairs, func(i, j int) bool {
-				lt := val.RichCompare(ctx, pairs[i].key, pairs[j].key, val.CmpLT).IsTruthy()
-				if reverse {
-					return !lt && !val.RichCompare(ctx, pairs[i].key, pairs[j].key, val.CmpEQ).IsTruthy()
+				if ctx != nil && ctx.HasException() {
+					return false
 				}
-				return lt
+				if reverse {
+					return val.RichCompare(ctx, pairs[j].key, pairs[i].key, val.CmpLT).IsTruthy()
+				}
+				return val.RichCompare(ctx, pairs[i].key, pairs[j].key, val.CmpLT).IsTruthy()
 			})
+			if ctx != nil && ctx.HasException() {
+				return val.NoneVal()
+			}
 			res := make([]val.Value, len(items))
 			for i, p := range pairs {
 				res[i] = p.val
@@ -944,12 +953,17 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		}
 
 		sort.SliceStable(items, func(i, j int) bool {
-			lt := val.RichCompare(ctx, items[i], items[j], val.CmpLT).IsTruthy()
-			if reverse {
-				return !lt && !val.RichCompare(ctx, items[i], items[j], val.CmpEQ).IsTruthy()
+			if ctx != nil && ctx.HasException() {
+				return false
 			}
-			return lt
+			if reverse {
+				return val.RichCompare(ctx, items[j], items[i], val.CmpLT).IsTruthy()
+			}
+			return val.RichCompare(ctx, items[i], items[j], val.CmpLT).IsTruthy()
 		})
+		if ctx != nil && ctx.HasException() {
+			return val.NoneVal()
+		}
 		return val.NewListVal(items...)
 	}))
 

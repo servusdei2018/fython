@@ -1756,7 +1756,7 @@ func init() {
 	val.AcquireEphemeralTupleHook = acquireEphemeralTuplePooled
 }
 
-// tuple4Pool caches cleared *val.PyTuple objects with inline [4]Value storage
+// tuple4Pool caches cleared *val.PyTuple objects with inline [3]Value storage
 // for small tuple concatenations. Single-threaded use only.
 var tuple4Pool struct {
 	mu   sync.Mutex

@@ -6,6 +6,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"unsafe"
 )
 
@@ -946,12 +947,17 @@ func HashValue(v Value) uint32 {
 		return InlineStrHash(v)
 	}
 	if v.ptr.Kind == KindString {
-		if v.ptr.Hash != 0 {
-			return v.ptr.Hash
+		if h := atomic.LoadUint32(&v.ptr.Hash); h != 0 {
+			return h
 		}
 		h := HashString((*PyString)(unsafe.Pointer(v.ptr)).Data)
-		v.ptr.Hash = h
+		atomic.StoreUint32(&v.ptr.Hash, h)
 		return h
+	}
+	if v.ptr.Kind == KindTuple && v.ptr.Type == TupleType {
+		if h := atomic.LoadUint32(&v.ptr.Hash); h != 0 {
+			return h
+		}
 	}
 	if v.ptr == &tagFloat64 {
 		f := math.Float64frombits(v.num)
@@ -984,12 +990,17 @@ func TryHashValue(ctx *ExecContext, v Value) (uint32, Value, bool) {
 		return InlineStrHash(v), Value{}, true
 	}
 	if v.ptr.Kind == KindString {
-		if v.ptr.Hash != 0 {
-			return v.ptr.Hash, Value{}, true
+		if h := atomic.LoadUint32(&v.ptr.Hash); h != 0 {
+			return h, Value{}, true
 		}
 		h := HashString((*PyString)(unsafe.Pointer(v.ptr)).Data)
-		v.ptr.Hash = h
+		atomic.StoreUint32(&v.ptr.Hash, h)
 		return h, Value{}, true
+	}
+	if v.ptr.Kind == KindTuple && v.ptr.Type == TupleType {
+		if h := atomic.LoadUint32(&v.ptr.Hash); h != 0 {
+			return h, Value{}, true
+		}
 	}
 	if v.ptr == &tagFloat64 {
 		f := math.Float64frombits(v.num)
@@ -1025,8 +1036,8 @@ func hashValueSlowCtx(ctx *ExecContext, v Value) (uint32, Value, bool) {
 		return hashComplex(v.AsComplex()), Value{}, true
 	}
 	if v.ptr.Kind == KindTuple && (v.ptr.Type == nil || v.ptr.Type == TupleType || v.ptr.Type.dunderHash.ptr == nil) {
-		if v.ptr.Hash != 0 {
-			return v.ptr.Hash, Value{}, true
+		if h := atomic.LoadUint32(&v.ptr.Hash); h != 0 {
+			return h, Value{}, true
 		}
 		items := v.AsTuple().Items
 		var acc uint64 = 0x345678
@@ -1039,15 +1050,15 @@ func hashValueSlowCtx(ctx *ExecContext, v Value) (uint32, Value, bool) {
 		}
 		acc ^= uint64(len(items))
 		h := mix64To32(acc)
-		v.ptr.Hash = h
+		atomic.StoreUint32(&v.ptr.Hash, h)
 		return h, Value{}, true
 	}
 	if v.ptr.Kind == KindBytes {
-		if v.ptr.Hash != 0 {
-			return v.ptr.Hash, Value{}, true
+		if h := atomic.LoadUint32(&v.ptr.Hash); h != 0 {
+			return h, Value{}, true
 		}
 		h := HashBytes(v.AsBytes().Data)
-		v.ptr.Hash = h
+		atomic.StoreUint32(&v.ptr.Hash, h)
 		return h, Value{}, true
 	}
 	tp := v.Type()

@@ -469,7 +469,6 @@ func initIOTypes() {
 			ps := &val.PyString{
 				Header: val.ObjectHeader{
 					Kind: val.KindString,
-					Hash: val.HashString(copied),
 					Type: val.StrType,
 				},
 				Data: copied,
@@ -783,7 +782,6 @@ func initIOTypes() {
 								ps := &val.PyString{
 									Header: val.ObjectHeader{
 										Kind: val.KindString,
-										Hash: val.HashString(s),
 										Type: val.StrType,
 									},
 									Data: s,
@@ -816,7 +814,6 @@ func initIOTypes() {
 				ps := &val.PyString{
 					Header: val.ObjectHeader{
 						Kind: val.KindString,
-						Hash: val.HashString(s),
 						Type: val.StrType,
 					},
 					Data: s,
@@ -841,7 +838,6 @@ func initIOTypes() {
 			ps := &val.PyString{
 				Header: val.ObjectHeader{
 					Kind: val.KindString,
-					Hash: val.HashString(s),
 					Type: val.StrType,
 				},
 				Data: s,
