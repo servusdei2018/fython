@@ -84,6 +84,12 @@ func (vm *VM) dispatchColdOpcode(st *loopState, op Opcode, inst uint32, ip, sp i
 			st.ip = ip
 			vm.execCtx.SP = sp
 			res := val.CompareTuplesFast(&vm.execCtx, a, b, CMP_LT)
+			if (a.HeaderPtr().Flags & val.FlagEphemeralTuple) != 0 {
+				vm.releaseEphemeralTupleVal(a)
+			}
+			if (b.HeaderPtr().Flags & val.FlagEphemeralTuple) != 0 {
+				vm.releaseEphemeralTupleVal(b)
+			}
 			if !vm.execCtx.HasException() && unsafe.Pointer(unsafe.SliceData(vm.execCtx.Stack)) == stackPtr &&
 				(!st.stackIsVM || unsafe.Pointer(unsafe.SliceData(vm.stack)) == stackPtr) {
 				*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = res

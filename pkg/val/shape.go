@@ -258,6 +258,23 @@ func AllocCInstanceStub(v Value) unsafe.Pointer {
 	return GetDefaultArena().ToStub(v)
 }
 
+// NewInstanceWithShape constructs a new heap-allocated PyInstance belonging to cls
+// with a pre-seeded Shape whose slot count matches len(shape.Attrs). Callers must
+// populate every slot in [0, len(shape.Attrs)) before exposing the instance.
+func NewInstanceWithShape(cls *PyType, shape *Shape) *PyInstance {
+	n := len(shape.Attrs)
+	obj := &PyInstance{
+		Header: ObjectHeader{Kind: KindInstance, Type: cls},
+		Shape:  shape,
+	}
+	if n <= len(obj.bootstrap) {
+		obj.Slots = obj.bootstrap[:n]
+	} else {
+		obj.Slots = make([]Value, n)
+	}
+	return obj
+}
+
 // NewInstanceOfType constructs a new heap-allocated KindInstance Value belonging to cls.
 func NewInstanceOfType(cls *PyType) Value {
 	if cls == nil {

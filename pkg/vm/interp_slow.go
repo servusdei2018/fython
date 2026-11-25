@@ -951,6 +951,8 @@ func (vm *VM) opCompareSlow(st *loopState, inst uint32, ip, sp int) (int, int, l
 			}
 			if dunder.HeaderPtr() != nil {
 				if dfn, dcallee, ok := isSimpleCompareDunder(dunder); ok {
+					val.ClearEphemeral(a)
+					val.ClearEphemeral(b)
 					vm.quickenCompareDunder(st, inst, ip, dunder, dfn, dcallee, ta.Version(), tb.Version(), mode)
 					left, right := a, b
 					if mode != 0 {
@@ -969,6 +971,8 @@ func (vm *VM) opCompareSlow(st *loopState, inst uint32, ip, sp int) (int, int, l
 		if bt := b.Type(); bt != nil {
 			if dunder := bt.DunderContainsVal(); dunder.HeaderPtr() != nil {
 				if dfn, dcallee, ok := isSimpleCompareDunder(dunder); ok {
+					val.ClearEphemeral(a)
+					val.ClearEphemeral(b)
 					vm.quickenCompareDunder(st, inst, ip, dunder, dfn, dcallee, 0, bt.Version(), 2)
 					stack[sp-2] = b
 					stack[sp-1] = a
@@ -981,6 +985,7 @@ func (vm *VM) opCompareSlow(st *loopState, inst uint32, ip, sp int) (int, int, l
 	// Fast path for exact built-in containment checks (IN / NOT_IN) without
 	// entering compareOpSafe -> RichCompare -> InCtx or returning ctlReload.
 	if cmpOp == CMP_IN || cmpOp == CMP_NOT_IN {
+		val.ClearEphemeral(a)
 		bType := b.Type()
 		var found bool
 		var handled bool
@@ -998,6 +1003,9 @@ func (vm *VM) opCompareSlow(st *loopState, inst uint32, ip, sp int) (int, int, l
 					found = true
 					break
 				}
+			}
+			if (b.HeaderPtr().Flags & val.FlagEphemeralTuple) != 0 {
+				vm.releaseEphemeralTupleVal(b)
 			}
 			handled = true
 		case b.IsList() && bType == val.ListType:
@@ -1051,6 +1059,12 @@ func (vm *VM) opCompareSlow(st *loopState, inst uint32, ip, sp int) (int, int, l
 			st.ip = ip
 			vm.execCtx.SP = sp
 			res := val.CompareTuplesFast(&vm.execCtx, a, b, cmpOp)
+			if (a.HeaderPtr().Flags & val.FlagEphemeralTuple) != 0 {
+				vm.releaseEphemeralTupleVal(a)
+			}
+			if (b.HeaderPtr().Flags & val.FlagEphemeralTuple) != 0 {
+				vm.releaseEphemeralTupleVal(b)
+			}
 			if unsafe.SliceData(vm.execCtx.Stack) != origData || (st.stackIsVM && unsafe.SliceData(vm.stack) != origData) {
 				stack = st.syncStackFromExecCtx(vm, stack)
 			}
@@ -1067,6 +1081,8 @@ func (vm *VM) opCompareSlow(st *loopState, inst uint32, ip, sp int) (int, int, l
 			return ip + 1, sp - 1, ctlReload
 		}
 	}
+	val.ClearEphemeral(a)
+	val.ClearEphemeral(b)
 	origData := unsafe.SliceData(stack)
 	st.ip = ip
 	vm.execCtx.SP = sp
@@ -1512,6 +1528,12 @@ func (vm *VM) opCompareJumpSlow(st *loopState, op Opcode, inst uint32, ip, sp in
 		st.ip = ip
 		vm.execCtx.SP = sp
 		res := val.CompareTuplesFast(&vm.execCtx, a, b, cmpOp)
+		if (a.HeaderPtr().Flags & val.FlagEphemeralTuple) != 0 {
+			vm.releaseEphemeralTupleVal(a)
+		}
+		if (b.HeaderPtr().Flags & val.FlagEphemeralTuple) != 0 {
+			vm.releaseEphemeralTupleVal(b)
+		}
 		if !vm.execCtx.HasException() &&
 			len(vm.execCtx.Stack) > 0 && len(st.stack) > 0 &&
 			&vm.execCtx.Stack[0] == &st.stack[0] {

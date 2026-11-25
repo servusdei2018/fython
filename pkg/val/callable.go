@@ -80,6 +80,25 @@ func (t *PyTuple) ClearInline() {
 // !MultiThreadedFlag.Load().
 var AcquireEphemeralTupleHook func() (*PyTuple, bool)
 
+// BuiltinFastID tags hot PyBuiltinFunc callables for O(1) switch dispatch in opCallBuiltinFast.
+const (
+	BuiltinFastNone uint8 = iota
+	BuiltinFastNext
+	BuiltinFastSuper
+	BuiltinFastStrJoin
+	BuiltinFastListExtend
+	BuiltinFastAny
+	BuiltinFastAll
+	BuiltinFastSum
+	BuiltinFastMin
+	BuiltinFastMax
+	BuiltinFastAbs
+	BuiltinFastOrd
+	BuiltinFastChr
+	BuiltinFastID
+	BuiltinFastLen
+)
+
 // PyBuiltinFunc represents a zero-allocation native Go built-in callable using the Vectorcall convention.
 // Header MUST be at byte offset 0.
 type PyBuiltinFunc struct {
@@ -87,6 +106,7 @@ type PyBuiltinFunc struct {
 	Name   string
 	Fn     VectorcallFunc
 	NoBind bool
+	FastID uint8
 }
 
 // PyFunction represents a Python function object wrapping a KindCode bytecode object,
@@ -5086,6 +5106,7 @@ func initTypes() {
 		}
 		return NewStringVal(b.String())
 	})
+	StrJoinBuiltin.AsBuiltinFunc().FastID = BuiltinFastStrJoin
 	StrType.Dict.Set(InternString("join"), StrJoinBuiltin)
 
 	StrType.Dict.Set(InternString("encode"), NewBuiltinFuncVal("encode", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
@@ -5368,6 +5389,7 @@ func initTypes() {
 		}
 		return NoneVal()
 	})
+	ListExtendBuiltin.AsBuiltinFunc().FastID = BuiltinFastListExtend
 	ListType.Dict.Set(InternString("extend"), ListExtendBuiltin)
 
 	ListType.Dict.Set(InternString("pop"), NewBuiltinFuncVal("pop", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {

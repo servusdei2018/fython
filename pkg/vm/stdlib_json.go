@@ -146,6 +146,15 @@ func extractJSONLoadOpts(args []val.Value, kwnames []val.Value) jsonLoadOpts {
 	return opts
 }
 
+// jsonKeyCacheEntry caches an interned JSON object key and its pre-computed hash
+// in a per-VM direct-mapped table. keyStr always aliases the interned string's
+// backing storage, never the raw JSON input slice.
+type jsonKeyCacheEntry struct {
+	keyVal val.Value
+	keyStr string
+	hash   uint32
+}
+
 // jsonParser provides single-pass, allocation-optimized JSON parsing into fython Values.
 type jsonParser struct {
 	src         []byte
@@ -359,7 +368,7 @@ func (p *jsonParser) parseObject() (val.Value, error) {
 			return val.NoneVal(), p.errNow("Expecting property name enclosed in double quotes")
 		}
 
-		keyVal, err := p.parseString(true)
+		keyVal, keyHash, err := p.parseKeyString()
 		if err != nil {
 			clear(p.kvScratch[base:])
 			p.kvScratch = p.kvScratch[:base]
@@ -381,7 +390,7 @@ func (p *jsonParser) parseObject() (val.Value, error) {
 			return val.NoneVal(), err
 		}
 
-		p.kvScratch = append(p.kvScratch, val.DictEntry{Key: keyVal, Value: valElem})
+		p.kvScratch = append(p.kvScratch, val.DictEntry{Key: keyVal, Value: valElem, Hash: keyHash})
 
 		p.skipWhitespace()
 		if p.pos >= len(p.src) {
@@ -407,7 +416,7 @@ func (p *jsonParser) parseObject() (val.Value, error) {
 			dictVal := p.acquireSmallDict(n)
 			d := dictVal.AsDict()
 			for i := range entries {
-				d.PutNew(entries[i].Key, entries[i].Value)
+				d.PutNewHashed(entries[i].Key, entries[i].Value, entries[i].Hash)
 			}
 			clear(p.kvScratch[base:])
 			p.kvScratch = p.kvScratch[:base]
@@ -487,6 +496,53 @@ func (p *jsonParser) materializeParsedString(b []byte, isKey bool) val.Value {
 		return val.InternBytes(b)
 	}
 	return val.NewStringFromBytes(b)
+}
+
+func (p *jsonParser) parseKeyString() (val.Value, uint32, error) {
+	if p.vm != nil && !val.MultiThreadedFlag.Load() {
+		start := p.pos + 1
+		src := p.src
+		limit := min(len(src), start+33)
+		var h uint32 = 2166136261
+		for i := start; i < limit; i++ {
+			b := src[i]
+			if b == '"' {
+				raw := src[start:i]
+				if len(raw) > 0 && len(raw) <= 32 {
+					p.pos = i + 1
+					kc := p.vm.jsonKeyCache
+					if kc == nil {
+						kc = new([64]jsonKeyCacheEntry)
+						p.vm.jsonKeyCache = kc
+					}
+					slot := h & 63
+					e := &kc[slot]
+					if e.keyStr != "" && string(raw) == e.keyStr {
+						return e.keyVal, e.hash, nil
+					}
+					kv := val.InternBytes(raw)
+					kh := val.HashValue(kv)
+					*e = jsonKeyCacheEntry{
+						keyVal: kv,
+						keyStr: kv.AsString(),
+						hash:   kh,
+					}
+					return kv, kh, nil
+				}
+				break
+			}
+			if b < 0x20 || b >= 0x80 || b == '\\' {
+				break
+			}
+			h ^= uint32(b)
+			h *= 16777619
+		}
+	}
+	kv, err := p.parseString(true)
+	if err != nil {
+		return val.NoneVal(), 0, err
+	}
+	return kv, val.HashValue(kv), nil
 }
 
 func (p *jsonParser) parseString(isKey bool) (val.Value, error) {

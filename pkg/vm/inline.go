@@ -569,6 +569,12 @@ func (vm *VM) tryInlineMethod(st *loopState, ip, totalArgs int, fn *val.PyFuncti
 	if DecodeOpcode(st.cache.active[ip]) != OP_CALL_METHOD_PIC {
 		return false
 	}
+	if uint(ip) < uint(len(st.cache.methodPIC)) {
+		pic := &st.cache.methodPIC[ip]
+		if pic[1].Shape != nil || pic[1].ReceiverType != nil {
+			return false
+		}
+	}
 	instObj := recv.AsInstanceChecked()
 	if instObj == nil || instObj.Shape == nil || instObj.Header.Type == nil {
 		return false

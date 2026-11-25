@@ -1136,21 +1136,51 @@ func (vm *VM) initBuiltins() {
 	}
 	if nextVal, ok := vm.builtins.Get(nameBuiltinNext); ok {
 		vm.builtinNext = nextVal
+		if nextVal.IsBuiltinFunc() {
+			nextVal.AsBuiltinFunc().FastID = val.BuiltinFastNext
+		}
 	}
 	if anyVal, ok := vm.builtins.Get(val.InternString("any")); ok {
 		vm.builtinAny = anyVal
+		if anyVal.IsBuiltinFunc() {
+			anyVal.AsBuiltinFunc().FastID = val.BuiltinFastAny
+		}
 	}
 	if allVal, ok := vm.builtins.Get(val.InternString("all")); ok {
 		vm.builtinAll = allVal
+		if allVal.IsBuiltinFunc() {
+			allVal.AsBuiltinFunc().FastID = val.BuiltinFastAll
+		}
 	}
 	if sumVal, ok := vm.builtins.Get(val.InternString("sum")); ok {
 		vm.builtinSum = sumVal
+		if sumVal.IsBuiltinFunc() {
+			sumVal.AsBuiltinFunc().FastID = val.BuiltinFastSum
+		}
 	}
 	if minVal, ok := vm.builtins.Get(val.InternString("min")); ok {
 		vm.builtinMin = minVal
+		if minVal.IsBuiltinFunc() {
+			minVal.AsBuiltinFunc().FastID = val.BuiltinFastMin
+		}
 	}
 	if maxVal, ok := vm.builtins.Get(val.InternString("max")); ok {
 		vm.builtinMax = maxVal
+		if maxVal.IsBuiltinFunc() {
+			maxVal.AsBuiltinFunc().FastID = val.BuiltinFastMax
+		}
+	}
+	if absVal, ok := vm.builtins.Get(val.InternString("abs")); ok && absVal.IsBuiltinFunc() {
+		absVal.AsBuiltinFunc().FastID = val.BuiltinFastAbs
+	}
+	if ordVal, ok := vm.builtins.Get(val.InternString("ord")); ok && ordVal.IsBuiltinFunc() {
+		ordVal.AsBuiltinFunc().FastID = val.BuiltinFastOrd
+	}
+	if chrVal, ok := vm.builtins.Get(val.InternString("chr")); ok && chrVal.IsBuiltinFunc() {
+		chrVal.AsBuiltinFunc().FastID = val.BuiltinFastChr
+	}
+	if idVal, ok := vm.builtins.Get(val.InternString("id")); ok && idVal.IsBuiltinFunc() {
+		idVal.AsBuiltinFunc().FastID = val.BuiltinFastID
 	}
 	if hasattrVal, ok := vm.builtins.Get(nameHasattr); ok {
 		vm.builtinHasattr = hasattrVal
@@ -1203,6 +1233,7 @@ func (vm *VM) initBuiltins() {
 		ctx.Raise(val.NewException(val.TypeErrorType, "object of type '"+a.Type().Name+"' has no len()"))
 		return val.NoneVal()
 	})
+	lenVal.AsBuiltinFunc().FastID = val.BuiltinFastLen
 	vm.builtinLen = lenVal
 	vm.builtins.Set(val.InternString("len"), lenVal)
 	if vm.strBuildBuf == nil {
@@ -1315,6 +1346,7 @@ func (vm *VM) initBuiltins() {
 		ctx.Raise(val.NewException(val.TypeErrorType, fmt.Sprintf("super() takes at most 2 arguments (%d given)", len(args))))
 		return val.NoneVal()
 	})
+	superVal.AsBuiltinFunc().FastID = val.BuiltinFastSuper
 	vm.builtinSuper = superVal
 	vm.builtins.Set(val.InternString("super"), superVal)
 

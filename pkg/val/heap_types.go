@@ -2873,10 +2873,15 @@ func (d *PyDict) setLocked(key, value Value) {
 // PutNew inserts a key-value pair into a pre-sized dict (e.g. fresh parser output),
 // updating in-place if the key already exists (matching Python duplicate-key semantics).
 func (d *PyDict) PutNew(key, value Value) {
+	d.PutNewHashed(key, value, HashValue(key))
+}
+
+// PutNewHashed inserts a key-value pair with a pre-computed hash into a pre-sized dict,
+// updating in-place if the key already exists (matching Python duplicate-key semantics).
+func (d *PyDict) PutNewHashed(key, value Value, h uint32) {
 	if len(d.indices) == 0 {
 		d.initTable(4)
 	}
-	h := HashValue(key)
 	mask := d.mask
 	slot := h & mask
 	if (d.filled+1)*3 > int(mask+1)*2 || len(d.Entries)+dictIndexOffset >= d.maxIndexValue() {

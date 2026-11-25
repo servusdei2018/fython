@@ -600,15 +600,43 @@ type VMCodeCache struct {
 	// and streamGen the generation it belongs to. The pair lets the VM pick
 	// up a stream published by the Tier-2 optimizer without loading it on
 	// every frame switch.
-	active          []uint32
-	codePtr         unsafe.Pointer
-	codeLen         int
-	streamGen       int32
-	privateActive   bool
-	tier2Done       uint8
-	attrQueryPICExt [][4]AttrQueryPICEntry
-	setAttrIC       []setAttrICEntry
+	active              []uint32
+	codePtr             unsafe.Pointer
+	codeLen             int
+	streamGen           int32
+	privateActive       bool
+	tier2Done           uint8
+	attrQueryPICExt     [][4]AttrQueryPICEntry
+	setAttrIC           []setAttrICEntry
+	typeMethodPIC       [][4]typeMethodPICEntry
+	buildTupleEphemeral []uint8 // 0=unknown, 1=no, 2=yes (keyed by buildTupleGen == streamGen)
+	buildTupleGen       int32
 }
+
+// typeMethodPICEntry caches polymorphic module/type method resolutions lazily
+// when an OP_CALL_METHOD_PIC site sees more than one module or type receiver.
+type typeMethodPICEntry struct {
+	CachedVal   val.Value
+	CalleeCache *VMCodeCache
+	NativeFn    val.VectorcallFunc
+	ExpectedVer uint64
+	ObjPtr      uint64
+	Bind        bool
+}
+
+func (c *VMCodeCache) ensureTypeMethodPIC() [][4]typeMethodPICEntry {
+	if len(c.typeMethodPIC) < len(c.ic) {
+		n := make([][4]typeMethodPICEntry, len(c.ic))
+		copy(n, c.typeMethodPIC)
+		c.typeMethodPIC = n
+	}
+	return c.typeMethodPIC
+}
+
+const (
+	boundNativeFlagSetAttr int32 = 1 << 0
+	boundNativeFlagPattern int32 = 1 << 1
+)
 
 // setAttrICEntry caches monomorphic object.__setattr__(self, const_name, value)
 // resolutions at OP_CALL_BOUND_NATIVE sites (such as attrs/dataclass __init__).
@@ -954,6 +982,7 @@ type VM struct {
 	genFreeList          []*val.PyGenerator
 	iterFreeList         []*val.PyIter
 	tupleFreeList        []*val.PyTuple
+	tupleLargeFreeList   []*val.PyTuple
 	superFreeList        []*val.PySuper
 	dictFreeList         []*val.PyDict
 	mediumDictFreeList   []*val.PyDict
@@ -971,6 +1000,7 @@ type VM struct {
 	coroReleaseHook      func(coro *val.PyCoroutine)
 	jsonParser           *jsonParser
 	jsonDumpBuf          []byte
+	jsonKeyCache         *[64]jsonKeyCacheEntry
 	maxSP                int
 	maxFrameIdx          int
 	// Continuous join drain state. While activeJoinGen is set, a generator
@@ -1214,17 +1244,39 @@ func (vm *VM) releaseDeadEphemeralIters(dead []val.Value) {
 }
 
 func (vm *VM) acquireEphemeralTuple(src []val.Value) val.Value {
+	n := len(src)
+	if n <= 3 {
+		var t *val.PyTuple
+		if fl := len(vm.tupleFreeList); fl > 0 {
+			t = vm.tupleFreeList[fl-1]
+			vm.tupleFreeList[fl-1] = nil
+			vm.tupleFreeList = vm.tupleFreeList[:fl-1]
+		} else {
+			t = &val.PyTuple{}
+		}
+		t.Header = val.ObjectHeader{Kind: val.KindTuple, Flags: val.FlagEphemeralTuple, Type: val.TupleType}
+		t.Attrs = nil
+		t.SetInline(src)
+		return val.ObjectVal(&t.Header)
+	}
 	var t *val.PyTuple
-	if n := len(vm.tupleFreeList); n > 0 {
-		t = vm.tupleFreeList[n-1]
-		vm.tupleFreeList[n-1] = nil
-		vm.tupleFreeList = vm.tupleFreeList[:n-1]
+	if fl := len(vm.tupleLargeFreeList); fl > 0 {
+		t = vm.tupleLargeFreeList[fl-1]
+		vm.tupleLargeFreeList[fl-1] = nil
+		vm.tupleLargeFreeList = vm.tupleLargeFreeList[:fl-1]
 	} else {
-		t = &val.PyTuple{}
+		t = &val.PyTuple{
+			Items: make([]val.Value, 0, 8),
+		}
 	}
 	t.Header = val.ObjectHeader{Kind: val.KindTuple, Flags: val.FlagEphemeralTuple, Type: val.TupleType}
 	t.Attrs = nil
-	t.SetInline(src)
+	if cap(t.Items) < n {
+		t.Items = make([]val.Value, n, 8)
+	} else {
+		t.Items = t.Items[:n]
+	}
+	copy(t.Items, src)
 	return val.ObjectVal(&t.Header)
 }
 
@@ -1237,12 +1289,23 @@ func (vm *VM) releaseEphemeralTupleVal(v val.Value) {
 	t.Header.Flags = 0
 	t.Header.Hash = 0
 	t.Attrs = nil
-	t.ClearInline()
-	if len(vm.tupleFreeList) < 256 {
-		vm.tupleFreeList = append(vm.tupleFreeList, t)
+	c := cap(t.Items)
+	if c <= 3 {
+		t.ClearInline()
+		if len(vm.tupleFreeList) < 256 {
+			vm.tupleFreeList = append(vm.tupleFreeList, t)
+			return
+		}
+		releaseEphemeralTuplePooled(t)
 		return
 	}
-	releaseEphemeralTuplePooled(t)
+	if c <= 8 && len(vm.tupleLargeFreeList) < 64 {
+		clear(t.Items[:len(t.Items)])
+		t.Items = t.Items[:0]
+		vm.tupleLargeFreeList = append(vm.tupleLargeFreeList, t)
+		return
+	}
+	t.Items = nil
 }
 
 func (vm *VM) releaseGeneratorStack(gen *val.PyGenerator) {
@@ -1390,6 +1453,9 @@ func (vm *VM) Reset() {
 	vm.lastException = val.NoneVal()
 	vm.unhandledException = val.NoneVal()
 	vm.jsonParser = nil
+	if vm.jsonKeyCache != nil {
+		clear(vm.jsonKeyCache[:])
+	}
 	if cap(vm.jsonDumpBuf) > 65536 {
 		vm.jsonDumpBuf = nil
 	}

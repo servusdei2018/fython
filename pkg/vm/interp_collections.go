@@ -338,7 +338,7 @@ func (vm *VM) opBinarySlice(st *loopState, ip, sp int) (int, int, loopCtl) {
 			case start == 0 && stop == len(items) && container.Type() == val.TupleType:
 				stack[sp-3] = container
 			case sliceLen <= 3 && ip+1 < st.codeLen && !val.MultiThreadedFlag.Load() &&
-				isEphemeralTupleNextOp(DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4)))):
+				isEphemeralTupleNextInst(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4))):
 				stack[sp-3] = vm.acquireEphemeralTuple(items[start:stop])
 			case sliceLen >= 4:
 				// Tuples are immutable so sharing the backing slice is
@@ -1261,9 +1261,56 @@ func (vm *VM) fillConstKeyDict(d *val.PyDict, tmpl *ConstKeyMapTemplate, values 
 	return true
 }
 
-func isEphemeralTupleNextOp(op Opcode) bool {
-	return op == OP_CALL_FUNCTION_EX || op == OP_UNPACK_SEQUENCE ||
-		op == OP_UNPACK_2_FAST || op == OP_UNPACK_3_FAST
+func isEphemeralTupleNextInst(nextWord uint32) bool {
+	switch DecodeOpcode(nextWord) {
+	case OP_CALL_FUNCTION_EX, OP_UNPACK_SEQUENCE, OP_UNPACK_2_FAST, OP_UNPACK_3_FAST, OP_COMPARE_LT:
+		return true
+	case OP_COMPARE_OP, OP_COMPARE_JUMP_IF_FALSE, OP_COMPARE_JUMP_IF_TRUE,
+		OP_CMP_CONST_JUMP_IF_FALSE, OP_CMP_CONST_JUMP_IF_TRUE:
+		return DecodeArgA(nextWord) <= CMP_NOT_IN
+	}
+	return false
+}
+
+// isEphemeralTupleLHSCmp reports whether a tuple built at ip is the LHS operand
+// of a non-identity comparison whose RHS is built purely from non-escaping
+// loads and tuple builds (e.g. (a, b) < (c, d) in @dataclass(order=True)).
+func isEphemeralTupleLHSCmp(st *loopState, ip int) bool {
+	if st.codePtr == nil || ip+2 >= st.codeLen {
+		return false
+	}
+	code := unsafe.Slice((*uint32)(st.codePtr), st.codeLen)
+	depth := 1
+	limit := min(st.codeLen, ip+20)
+	for k := ip + 1; k < limit; k++ {
+		wk := code[k]
+		opk := DecodeOpcode(wk)
+		if depth == 2 {
+			if opk == OP_COMPARE_LT {
+				return true
+			}
+			if opk == OP_COMPARE_OP || opk == OP_COMPARE_JUMP_IF_FALSE || opk == OP_COMPARE_JUMP_IF_TRUE {
+				return DecodeArgA(wk) <= CMP_NOT_IN
+			}
+		}
+		switch opk {
+		case OP_NOP:
+			// Trailing NOP emitted after fused OP_LOAD_FAST_ATTR / OP_LOAD_FAST_2.
+		case OP_LOAD_FAST, OP_LOAD_CONST, OP_LOAD_FAST_ATTR:
+			depth++
+		case OP_LOAD_FAST_2, OP_LOAD_FAST_CONST:
+			depth += 2
+		case OP_BUILD_TUPLE:
+			cnt := int(DecodeArgBx(wk))
+			if depth-cnt < 1 {
+				return false
+			}
+			depth = depth - cnt + 1
+		default:
+			return false
+		}
+	}
+	return false
 }
 
 //go:noinline
@@ -1280,9 +1327,28 @@ func (vm *VM) opBuildTuple(st *loopState, inst uint32, ip, sp int) (int, int, lo
 		val.DetachStringBuf(stack[i])
 		markViewEscaped(stack[i])
 	}
-	if count <= 3 && ip+1 < st.codeLen && !val.MultiThreadedFlag.Load() {
-		opNext := DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4)))
-		if isEphemeralTupleNextOp(opNext) {
+	if count <= 8 && ip+1 < st.codeLen && !val.MultiThreadedFlag.Load() {
+		cache := st.cache
+		var state uint8
+		if cache != nil && cache.buildTupleGen == cache.streamGen && uint(ip) < uint(len(cache.buildTupleEphemeral)) {
+			state = cache.buildTupleEphemeral[ip]
+		}
+		if state == 0 {
+			nextWord := *(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4))
+			if isEphemeralTupleNextInst(nextWord) || isEphemeralTupleLHSCmp(st, ip) {
+				state = 2
+			} else {
+				state = 1
+			}
+			if cache != nil && uint(ip) < uint(len(cache.ic)) {
+				if cache.buildTupleGen != cache.streamGen || len(cache.buildTupleEphemeral) < len(cache.ic) {
+					cache.buildTupleEphemeral = make([]uint8, len(cache.ic))
+					cache.buildTupleGen = cache.streamGen
+				}
+				cache.buildTupleEphemeral[ip] = state
+			}
+		}
+		if state == 2 {
 			stack[base] = vm.acquireEphemeralTuple(stack[base:sp])
 			return ip + 1, base + 1, ctlNext
 		}

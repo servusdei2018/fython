@@ -20,7 +20,8 @@ const (
 )
 
 type astState struct {
-	classes []*val.PyType // indexed by pyast.Spec.ID
+	classes []*val.PyType  // indexed by pyast.Spec.ID
+	shapes  [][]*val.Shape // indexed by [spec.ID][HasPos], immutable after astInit
 	byName  map[string]*val.PyType
 	astType *val.PyType
 	bySpec  map[*val.PyType]*pyast.Spec
@@ -52,6 +53,7 @@ func astInit() *astState {
 		pyast.EnsureSpecs()
 		st := &astState{
 			classes: make([]*val.PyType, len(pyast.Specs)),
+			shapes:  make([][]*val.Shape, len(pyast.Specs)),
 			byName:  map[string]*val.PyType{},
 			bySpec:  map[*val.PyType]*pyast.Spec{},
 		}
@@ -99,6 +101,24 @@ func astInit() *astState {
 			st.classes[sp.ID] = t
 			st.byName[sp.Name] = t
 			st.bySpec[t] = sp
+			if t.RootShape != nil && len(sp.Attrs) <= 4 {
+				baseShape := t.RootShape
+				for _, f := range sp.Fields {
+					baseShape = baseShape.Transition(internS(f.Name))
+				}
+				maskCount := 1 << len(sp.Attrs)
+				table := make([]*val.Shape, maskCount)
+				for mask := range maskCount {
+					sh := baseShape
+					for i, a := range sp.Attrs {
+						if (mask & (1 << uint(i))) != 0 {
+							sh = sh.Transition(internS(a))
+						}
+					}
+					table[mask] = sh
+				}
+				st.shapes[sp.ID] = table
+			}
 		}
 		// _field_types (computed after every class exists)
 		for _, sp := range pyast.Specs {
@@ -410,6 +430,25 @@ func (st *astState) newNode(n *pyast.Node) val.Value {
 		return val.NoneVal()
 	}
 	cls := st.classes[n.Spec.ID]
+	if table := st.shapes[n.Spec.ID]; int(n.HasPos) < len(table) {
+		shape := table[n.HasPos]
+		inst := val.NewInstanceWithShape(cls, shape)
+		slots := inst.Slots
+		slot := 0
+		for i := range n.Spec.Fields {
+			slots[slot] = st.fieldValue(n, i)
+			slot++
+		}
+		if n.HasPos != 0 {
+			for i := range n.Spec.Attrs {
+				if n.Has(i) {
+					slots[slot] = val.Int64Val(int64(n.Pos[i]))
+					slot++
+				}
+			}
+		}
+		return val.ObjectVal(&inst.Header)
+	}
 	v := val.NewInstanceOfType(cls)
 	inst := v.AsInstance()
 	for i, f := range n.Spec.Fields {
