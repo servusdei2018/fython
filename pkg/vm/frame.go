@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"unsafe"
 
+	"github.com/servusdei2018/fython/pkg/sre"
 	"github.com/servusdei2018/fython/pkg/val"
 )
 
@@ -996,6 +997,7 @@ type VM struct {
 	reInlineBuf     [7]rune
 	reASCIICache    [4]reASCIIEntry
 	reASCIICachePos int
+	reExecState     *sre.ExecState
 	hasTrackedViews bool
 	rootCO          CodeObject
 	rootCache       VMCodeCache

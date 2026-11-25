@@ -25,6 +25,12 @@ func (cs *charSet) hasByte(b byte) bool {
 // ExecASCIIInto runs the regexp directly against an ASCII or single-byte subject
 // slice without allocating or decoding a []rune buffer, copying capture bounds into dst.
 func (re *Regexp) ExecASCIIInto(input []byte, pos, endpos int, mode Mode, mustAdvance bool, dst []int32) ([]int32, int, bool) {
+	return re.ExecASCIIIntoWithState(nil, input, pos, endpos, mode, mustAdvance, dst)
+}
+
+// ExecASCIIIntoWithState is ExecASCIIInto using an optional caller-owned ExecState
+// to avoid per-call sync.Pool.Get/Put and defer overhead on single-threaded VM hot paths.
+func (re *Regexp) ExecASCIIIntoWithState(st *ExecState, input []byte, pos, endpos int, mode Mode, mustAdvance bool, dst []int32) ([]int32, int, bool) {
 	if pos < 0 {
 		pos = 0
 	}
@@ -74,14 +80,28 @@ func (re *Regexp) ExecASCIIInto(input []byte, pos, endpos int, mode Mode, mustAd
 		}
 	}
 
-	mm, _ := re.asciiMatcherPool.Get().(*asciiMatcher)
-	m := mm
-	if m == nil {
-		m = &asciiMatcher{
-			re:   re,
-			prog: re.prog,
-			caps: make([]int, 2*(re.NumGroups+1)),
-			regs: make([]int, re.nregs),
+	var m *asciiMatcher
+	fromPool := false
+	if st != nil {
+		m = st.ascii
+		if m == nil {
+			m = &asciiMatcher{
+				caps: make([]int, 2*(re.NumGroups+1)),
+				regs: make([]int, re.nregs),
+			}
+			st.ascii = m
+		}
+	} else {
+		fromPool = true
+		mm, _ := re.asciiMatcherPool.Get().(*asciiMatcher)
+		m = mm
+		if m == nil {
+			m = &asciiMatcher{
+				re:   re,
+				prog: re.prog,
+				caps: make([]int, 2*(re.NumGroups+1)),
+				regs: make([]int, re.nregs),
+			}
 		}
 	}
 	m.re = re
@@ -91,14 +111,19 @@ func (re *Regexp) ExecASCIIInto(input []byte, pos, endpos int, mode Mode, mustAd
 	m.last = -1
 	m.full = -1
 	m.mustAdv = -1
-	if len(m.caps) != 2*(re.NumGroups+1) {
-		m.caps = make([]int, 2*(re.NumGroups+1))
+	needCaps := 2 * (re.NumGroups + 1)
+	if cap(m.caps) < needCaps {
+		m.caps = make([]int, needCaps)
+	} else {
+		m.caps = m.caps[:needCaps]
 	}
 	for i := range m.caps {
 		m.caps[i] = -1
 	}
-	if len(m.regs) != re.nregs {
+	if cap(m.regs) < re.nregs {
 		m.regs = make([]int, re.nregs)
+	} else {
+		m.regs = m.regs[:re.nregs]
 	}
 	for i := range m.regs {
 		m.regs[i] = 0
@@ -110,10 +135,15 @@ func (re *Regexp) ExecASCIIInto(input []byte, pos, endpos int, mode Mode, mustAd
 	if mustAdvance {
 		m.mustAdv = pos
 	}
-	defer func() {
+
+	release := func() {
 		m.in = nil
-		re.asciiMatcherPool.Put(m)
-	}()
+		m.re = nil
+		m.prog = nil
+		if fromPool {
+			re.asciiMatcherPool.Put(m)
+		}
+	}
 
 	try := func(start int) bool {
 		m.stack = m.stack[:0]
@@ -130,11 +160,13 @@ func (re *Regexp) ExecASCIIInto(input []byte, pos, endpos int, mode Mode, mustAd
 	switch mode {
 	case ModeMatch, ModeFullMatch:
 		if !try(pos) {
+			release()
 			return nil, -1, false
 		}
 	default:
 		if re.bosOnly {
 			if pos != 0 || !try(0) {
+				release()
 				return nil, -1, false
 			}
 			break
@@ -222,6 +254,7 @@ func (re *Regexp) ExecASCIIInto(input []byte, pos, endpos int, mode Mode, mustAd
 			}
 		}
 		if !found {
+			release()
 			return nil, -1, false
 		}
 	}
@@ -236,7 +269,9 @@ func (re *Regexp) ExecASCIIInto(input []byte, pos, endpos int, mode Mode, mustAd
 	for i, c := range m.caps {
 		out[i] = int32(c)
 	}
-	return out, m.last, true
+	last := m.last
+	release()
+	return out, last, true
 }
 
 func (m *asciiMatcher) setReg(i, v int) {

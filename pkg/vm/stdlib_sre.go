@@ -582,7 +582,11 @@ func (m *pyMatch) groupVal(idx int, def val.Value) val.Value {
 			if e-s >= 0 && e-s <= 7 {
 				return val.SmallStringVal(ps.Data[s:e])
 			}
-			return val.NewStringVal(ps.Data[s:e])
+			obj := &val.PyString{
+				Header: val.ObjectHeader{Kind: val.KindString, Type: val.StrType},
+				Data:   ps.Data[s:e],
+			}
+			return val.ObjectVal(&obj.Header)
 		}
 	}
 	return m.Pat.sliceSubject(m.StringVal, m.Pat.subject(m.StringVal), s, e)
@@ -604,6 +608,24 @@ func (p *pyPattern) posArgs(ctx *val.ExecContext, in []rune, posV, endV val.Valu
 	return pos, end
 }
 
+func acquireReExecState(vm *VM) (*sre.ExecState, bool) {
+	if vm == nil || val.MultiThreadedFlag.Load() {
+		return nil, false
+	}
+	if vm.reExecState != nil {
+		st := vm.reExecState
+		vm.reExecState = nil
+		return st, true
+	}
+	return sre.NewExecState(), true
+}
+
+func releaseReExecState(vm *VM, st *sre.ExecState, owned bool) {
+	if owned && vm != nil && vm.reExecState == nil {
+		vm.reExecState = st
+	}
+}
+
 //go:noinline
 func (p *pyPattern) doMatchInlineASCII(ctx *val.ExecContext, mode sre.Mode, strVal, posV, endV val.Value, boolOnly bool, extraFlags uint8) val.Value {
 	var inlineBuf [7]byte
@@ -615,8 +637,14 @@ func (p *pyPattern) doMatchInlineASCII(ctx *val.ExecContext, mode sre.Mode, strV
 	inBytes := inlineBuf[:n]
 	pos := clampInt(intArg(ctx, posV, 0), 0, n)
 	end := clampInt(intArg(ctx, endV, int64(n)), 0, n)
+	var vm *VM
+	if ctx != nil {
+		vm, _ = ctx.VM.(*VM)
+	}
+	reSt, owned := acquireReExecState(vm)
 	var capsBuf [32]int32
-	caps, last, matched := p.Re.ExecASCIIInto(inBytes, pos, end, mode, false, capsBuf[:0])
+	caps, last, matched := p.Re.ExecASCIIIntoWithState(reSt, inBytes, pos, end, mode, false, capsBuf[:0])
+	releaseReExecState(vm, reSt, owned)
 	if !matched {
 		return val.NoneVal()
 	}
@@ -629,8 +657,10 @@ func (p *pyPattern) doMatchInlineASCII(ctx *val.ExecContext, mode sre.Mode, strV
 func (p *pyPattern) doMatch(ctx *val.ExecContext, mode sre.Mode, strVal, posV, endV val.Value) val.Value {
 	var boolOnly bool
 	var extraFlags uint8
+	var vm *VM
 	if ctx != nil && !val.MultiThreadedFlag.Load() {
-		if vm, ok := ctx.VM.(*VM); ok && vm != nil {
+		if v, ok := ctx.VM.(*VM); ok && v != nil {
+			vm = v
 			if vm.matchBoolOnly {
 				boolOnly = true
 				vm.matchBoolOnly = false
@@ -646,12 +676,8 @@ func (p *pyPattern) doMatch(ctx *val.ExecContext, mode sre.Mode, strVal, posV, e
 			ps := strVal.AsStringObj()
 			if ps.Buf == nil {
 				var isASCII bool
-				if ctx != nil && !val.MultiThreadedFlag.Load() {
-					if vm, ok := ctx.VM.(*VM); ok && vm != nil {
-						isASCII = vm.isPyStringASCII(ps)
-					} else {
-						isASCII = val.IsASCII(ps.Data)
-					}
+				if vm != nil {
+					isASCII = vm.isPyStringASCII(ps)
 				} else {
 					isASCII = val.IsASCII(ps.Data)
 				}
@@ -659,8 +685,10 @@ func (p *pyPattern) doMatch(ctx *val.ExecContext, mode sre.Mode, strVal, posV, e
 					inBytes := unsafe.Slice(unsafe.StringData(ps.Data), len(ps.Data))
 					pos := clampInt(intArg(ctx, posV, 0), 0, len(inBytes))
 					end := clampInt(intArg(ctx, endV, int64(len(inBytes))), 0, len(inBytes))
+					reSt, owned := acquireReExecState(vm)
 					var capsBuf [32]int32
-					caps, last, matched := p.Re.ExecASCIIInto(inBytes, pos, end, mode, false, capsBuf[:0])
+					caps, last, matched := p.Re.ExecASCIIIntoWithState(reSt, inBytes, pos, end, mode, false, capsBuf[:0])
+					releaseReExecState(vm, reSt, owned)
 					if !matched {
 						return val.NoneVal()
 					}
@@ -679,8 +707,10 @@ func (p *pyPattern) doMatch(ctx *val.ExecContext, mode sre.Mode, strVal, posV, e
 				if inBytes, ok := asciiSubjectBytesCtx(ctx, inst.Slots[0], &inlineBuf); ok {
 					pos := clampInt(intArg(ctx, posV, 0), 0, len(inBytes))
 					end := clampInt(intArg(ctx, endV, int64(len(inBytes))), 0, len(inBytes))
+					reSt, owned := acquireReExecState(vm)
 					var capsBuf [32]int32
-					caps, last, matched := p.Re.ExecASCIIInto(inBytes, pos, end, mode, false, capsBuf[:0])
+					caps, last, matched := p.Re.ExecASCIIIntoWithState(reSt, inBytes, pos, end, mode, false, capsBuf[:0])
+					releaseReExecState(vm, reSt, owned)
 					if !matched {
 						return val.NoneVal()
 					}
@@ -693,18 +723,18 @@ func (p *pyPattern) doMatch(ctx *val.ExecContext, mode sre.Mode, strVal, posV, e
 		}
 	}
 	var in []rune
-	if !p.IsBytes && ctx != nil && !val.MultiThreadedFlag.Load() &&
+	if !p.IsBytes && vm != nil &&
 		(posV.IsNone() || posV.IsInt64()) && (endV.IsNone() || endV.IsInt64()) {
-		if vm, ok := ctx.VM.(*VM); ok && vm != nil {
-			in = vm.subjectMatchFast(strVal)
-		}
+		in = vm.subjectMatchFast(strVal)
 	}
 	if in == nil {
 		in = p.subject(strVal)
 	}
 	pos, end := p.posArgs(ctx, in, posV, endV)
+	reSt, owned := acquireReExecState(vm)
 	var capsBuf [32]int32
-	caps, last, ok := p.Re.ExecInto(in, pos, end, mode, false, capsBuf[:0])
+	caps, last, ok := p.Re.ExecIntoWithState(reSt, in, pos, end, mode, false, capsBuf[:0])
+	releaseReExecState(vm, reSt, owned)
 	if !ok {
 		return val.NoneVal()
 	}
@@ -995,11 +1025,17 @@ func (sc *pyScanner) step(ctx *val.ExecContext, mode sre.Mode) val.Value {
 	var caps []int32
 	var last int
 	var ok bool
-	if sc.InASCII != nil {
-		caps, last, ok = sc.Pat.Re.ExecASCIIInto(sc.InASCII, sc.next, sc.EndPos, mode, sc.mustAdv, capsBuf[:0])
-	} else {
-		caps, last, ok = sc.Pat.Re.ExecInto(sc.In, sc.next, sc.EndPos, mode, sc.mustAdv, capsBuf[:0])
+	var vm *VM
+	if ctx != nil {
+		vm, _ = ctx.VM.(*VM)
 	}
+	reSt, owned := acquireReExecState(vm)
+	if sc.InASCII != nil {
+		caps, last, ok = sc.Pat.Re.ExecASCIIIntoWithState(reSt, sc.InASCII, sc.next, sc.EndPos, mode, sc.mustAdv, capsBuf[:0])
+	} else {
+		caps, last, ok = sc.Pat.Re.ExecIntoWithState(reSt, sc.In, sc.next, sc.EndPos, mode, sc.mustAdv, capsBuf[:0])
+	}
+	releaseReExecState(vm, reSt, owned)
 	if !ok {
 		sc.done = true
 		return val.NoneVal()
@@ -1133,7 +1169,16 @@ func initSRETypes() {
 			case 1:
 				return m.groupVal(0, val.NoneVal())
 			case 2:
-				return m.groupVal(m.group(ctx, args[1]), val.NoneVal())
+				g := args[1]
+				if g.IsInt64() {
+					idx := int(g.AsInt64())
+					if idx < 0 || idx > m.Pat.Re.NumGroups {
+						ctx.Raise(val.NewException(val.IndexErrorType, "no such group"))
+						return val.NoneVal()
+					}
+					return m.groupVal(idx, val.NoneVal())
+				}
+				return m.groupVal(m.group(ctx, g), val.NoneVal())
 			}
 			items := make([]val.Value, 0, len(args)-1)
 			for _, a := range args[1:] {

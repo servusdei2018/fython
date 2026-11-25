@@ -69,9 +69,26 @@ func (re *Regexp) ExecFrom(input []rune, pos, endpos int, mode Mode, mustAdvance
 	return &Result{Caps: caps, LastIndex: last}
 }
 
+// ExecState holds reusable scratch buffers for single-threaded callers (such as a VM)
+// to execute regexes without sync.Pool.Get/Put or defer overhead.
+type ExecState struct {
+	ascii *asciiMatcher
+	runeM *matcher
+}
+
+// NewExecState allocates a new reusable ExecState.
+func NewExecState() *ExecState {
+	return &ExecState{}
+}
+
 // ExecInto runs the regexp against input[:endpos] starting at pos, copying capture
 // positions into dst (reusing dst[:n] when cap(dst) >= n) to avoid allocating *Result.
 func (re *Regexp) ExecInto(input []rune, pos, endpos int, mode Mode, mustAdvance bool, dst []int32) ([]int32, int, bool) {
+	return re.ExecIntoWithState(nil, input, pos, endpos, mode, mustAdvance, dst)
+}
+
+// ExecIntoWithState is ExecInto using an optional caller-owned ExecState.
+func (re *Regexp) ExecIntoWithState(st *ExecState, input []rune, pos, endpos int, mode Mode, mustAdvance bool, dst []int32) ([]int32, int, bool) {
 	if pos < 0 {
 		pos = 0
 	}
@@ -117,14 +134,28 @@ func (re *Regexp) ExecInto(input []rune, pos, endpos int, mode Mode, mustAdvance
 		}
 	}
 
-	mm, _ := re.matcherPool.Get().(*matcher)
-	m := mm
-	if m == nil {
-		m = &matcher{
-			re:   re,
-			prog: re.prog,
-			caps: make([]int, 2*(re.NumGroups+1)),
-			regs: make([]int, re.nregs),
+	var m *matcher
+	fromPool := false
+	if st != nil {
+		m = st.runeM
+		if m == nil {
+			m = &matcher{
+				caps: make([]int, 2*(re.NumGroups+1)),
+				regs: make([]int, re.nregs),
+			}
+			st.runeM = m
+		}
+	} else {
+		fromPool = true
+		mm, _ := re.matcherPool.Get().(*matcher)
+		m = mm
+		if m == nil {
+			m = &matcher{
+				re:   re,
+				prog: re.prog,
+				caps: make([]int, 2*(re.NumGroups+1)),
+				regs: make([]int, re.nregs),
+			}
 		}
 	}
 	m.re = re
@@ -134,14 +165,19 @@ func (re *Regexp) ExecInto(input []rune, pos, endpos int, mode Mode, mustAdvance
 	m.last = -1
 	m.full = -1
 	m.mustAdv = -1
-	if len(m.caps) != 2*(re.NumGroups+1) {
-		m.caps = make([]int, 2*(re.NumGroups+1))
+	needCaps := 2 * (re.NumGroups + 1)
+	if cap(m.caps) < needCaps {
+		m.caps = make([]int, needCaps)
+	} else {
+		m.caps = m.caps[:needCaps]
 	}
 	for i := range m.caps {
 		m.caps[i] = -1
 	}
-	if len(m.regs) != re.nregs {
+	if cap(m.regs) < re.nregs {
 		m.regs = make([]int, re.nregs)
+	} else {
+		m.regs = m.regs[:re.nregs]
 	}
 	for i := range m.regs {
 		m.regs[i] = 0
@@ -153,10 +189,14 @@ func (re *Regexp) ExecInto(input []rune, pos, endpos int, mode Mode, mustAdvance
 	if mustAdvance {
 		m.mustAdv = pos
 	}
-	defer func() {
+	release := func() {
 		m.in = nil
-		re.matcherPool.Put(m)
-	}()
+		m.re = nil
+		m.prog = nil
+		if fromPool {
+			re.matcherPool.Put(m)
+		}
+	}
 	try := func(start int) bool {
 		m.stack = m.stack[:0]
 		m.last = -1
@@ -171,11 +211,13 @@ func (re *Regexp) ExecInto(input []rune, pos, endpos int, mode Mode, mustAdvance
 	switch mode {
 	case ModeMatch, ModeFullMatch:
 		if !try(pos) {
+			release()
 			return nil, -1, false
 		}
 	default:
 		if re.bosOnly {
 			if pos != 0 || !try(0) {
+				release()
 				return nil, -1, false
 			}
 			break
@@ -240,6 +282,7 @@ func (re *Regexp) ExecInto(input []rune, pos, endpos int, mode Mode, mustAdvance
 			}
 		}
 		if !found {
+			release()
 			return nil, -1, false
 		}
 	}
@@ -253,7 +296,9 @@ func (re *Regexp) ExecInto(input []rune, pos, endpos int, mode Mode, mustAdvance
 	for i, c := range m.caps {
 		out[i] = int32(c)
 	}
-	return out, m.last, true
+	last := m.last
+	release()
+	return out, last, true
 }
 
 func (m *matcher) setReg(i, v int) {

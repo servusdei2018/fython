@@ -1228,43 +1228,77 @@ func (vm *VM) opCallFunctionEx(st *loopState, inst uint32, ip, sp int) (int, int
 				minCap := max(newBase+totalArgs+256, newBase+callee.NumLocals+64)
 				if minCap > len(stack) {
 					stack = vm.growStack(st, stack, minCap)
+					st.stack = stack
 				}
 				dst := newBase
 				var initInst val.Value
 
 				// Fast paths for exact-tuple positional-only and *args/**kwargs forwarding
-				// into simple non-generator, non-coroutine Python functions without cells/defaults.
-				if !hasSelf && !callee.IsGenerator && !callee.IsCoroutine &&
+				// into simple non-generator, non-coroutine Python functions (and bound methods / __init__)
+				// without cells/defaults.
+				if !callee.IsGenerator && !callee.IsCoroutine &&
 					!callee.HasCells && len(fn.Defaults) == 0 && fn.KwDefaults == nil &&
 					callee.KWOnlyArgCount == 0 && argsVal.Kind() == val.KindTuple {
 					varFlags := callee.Flags & (CO_VARARGS | CO_VARKEYWORDS)
 					switch {
-					case kwDict == nil && varFlags == 0 && len(posArgs) == callee.PositionalParamCount:
-						// Fixed-param pos_only fast path: copy args directly into frame slots.
+					case kwDict == nil && varFlags == 0 && selfCount+len(posArgs) == callee.PositionalParamCount:
+						// Fixed-param fast path: copy self (if any) + args directly into frame slots.
+						if hasSelf {
+							if initType != nil {
+								initInst = val.NewInstanceOfType(initType)
+								selfVal = initInst
+							}
+							stack[newBase] = selfVal
+						}
 						if len(posArgs) > 0 {
-							copy(stack[newBase:newBase+len(posArgs)], posArgs)
+							copy(stack[newBase+selfCount:newBase+selfCount+len(posArgs)], posArgs)
 						}
 						vm.releaseEphemeralTupleVal(argsVal)
-						for l := len(posArgs); l < callee.NumLocals; l++ {
+						for l := selfCount + len(posArgs); l < callee.NumLocals; l++ {
 							stack[newBase+l] = val.UnboundVal()
 						}
 						cc := vm.fastCalleeCache(callee)
-						return vm.pushCalleeFrame(st, callee, fn, cc, newBase, sp, newBase+callee.NumLocals, ip+1)
+						nextIP, nextSP := vm.pushFrameFast(st, fn, cc, newBase+callee.NumLocals, callee.NumLocals, ip)
+						if initType != nil {
+							vm.frames[st.frameIdx-1].initInstance = initInst
+							vm.frames[st.frameIdx-1].flags |= frameFlagInit
+						}
+						return nextIP, nextSP, ctlReload
 
-					case kwDict == nil && varFlags == CO_VARARGS && len(posArgs) >= callee.PosParamCount:
-						// Pure *args forwarding fast path.
-						if callee.PosParamCount == 0 && argsVal.HeaderPtr().Type == val.TupleType {
+					case kwDict == nil && varFlags == CO_VARARGS && selfCount+len(posArgs) >= callee.PosParamCount:
+						// Pure *args forwarding fast path (including def m(self, *args):).
+						if callee.PosParamCount == selfCount && argsVal.HeaderPtr().Type == val.TupleType {
+							if hasSelf {
+								if initType != nil {
+									initInst = val.NewInstanceOfType(initType)
+									selfVal = initInst
+								}
+								stack[newBase] = selfVal
+							}
 							val.ClearEphemeral(argsVal)
-							for l := range callee.NumLocals {
+							for l := selfCount; l < callee.NumLocals; l++ {
 								stack[newBase+l] = val.UnboundVal()
 							}
 							stack[newBase+callee.VarArgsIdx] = argsVal
 							cc := vm.fastCalleeCache(callee)
-							return vm.pushCalleeFrame(st, callee, fn, cc, newBase, sp, newBase+callee.NumLocals, ip+1)
+							nextIP, nextSP := vm.pushFrameFast(st, fn, cc, newBase+callee.NumLocals, callee.NumLocals, ip)
+							if initType != nil {
+								vm.frames[st.frameIdx-1].initInstance = initInst
+								vm.frames[st.frameIdx-1].flags |= frameFlagInit
+							}
+							return nextIP, nextSP, ctlReload
 						}
-						if callee.PosParamCount > 0 {
-							copy(stack[newBase:newBase+callee.PosParamCount], posArgs[:callee.PosParamCount])
-							tail := posArgs[callee.PosParamCount:]
+						if callee.PosParamCount > selfCount {
+							if hasSelf {
+								if initType != nil {
+									initInst = val.NewInstanceOfType(initType)
+									selfVal = initInst
+								}
+								stack[newBase] = selfVal
+							}
+							needPos := callee.PosParamCount - selfCount
+							copy(stack[newBase+selfCount:newBase+callee.PosParamCount], posArgs[:needPos])
+							tail := posArgs[needPos:]
 							var restVal val.Value
 							if len(tail) == 0 {
 								restVal = val.EmptyTupleVal()
@@ -1279,12 +1313,17 @@ func (vm *VM) opCallFunctionEx(st *loopState, inst uint32, ip, sp int) (int, int
 							}
 							stack[newBase+callee.VarArgsIdx] = restVal
 							cc := vm.fastCalleeCache(callee)
-							return vm.pushCalleeFrame(st, callee, fn, cc, newBase, sp, newBase+callee.NumLocals, ip+1)
+							nextIP, nextSP := vm.pushFrameFast(st, fn, cc, newBase+callee.NumLocals, callee.NumLocals, ip)
+							if initType != nil {
+								vm.frames[st.frameIdx-1].initInstance = initInst
+								vm.frames[st.frameIdx-1].flags |= frameFlagInit
+							}
+							return nextIP, nextSP, ctlReload
 						}
 
-					case varFlags == (CO_VARARGS|CO_VARKEYWORDS) && callee.PosParamCount == 0 &&
+					case varFlags == (CO_VARARGS|CO_VARKEYWORDS) && callee.PosParamCount == selfCount &&
 						argsVal.HeaderPtr().Type == val.TupleType:
-						// f(*a, **kw) -> def g(*args, **kwargs) forwarding fast path.
+						// f(*a, **kw) -> def g(*args, **kwargs) (or def m(self, *args, **kwargs)) forwarding fast path.
 						kwValid := true
 						if kwDict != nil {
 							for i := range kwDict.Entries {
@@ -1296,6 +1335,13 @@ func (vm *VM) opCallFunctionEx(st *loopState, inst uint32, ip, sp int) (int, int
 							}
 						}
 						if kwValid {
+							if hasSelf {
+								if initType != nil {
+									initInst = val.NewInstanceOfType(initType)
+									selfVal = initInst
+								}
+								stack[newBase] = selfVal
+							}
 							var kwArg val.Value
 							switch {
 							case kwDict == nil:
@@ -1318,13 +1364,18 @@ func (vm *VM) opCallFunctionEx(st *loopState, inst uint32, ip, sp int) (int, int
 								kwArg = copied
 							}
 							val.ClearEphemeral(argsVal)
-							for l := range callee.NumLocals {
+							for l := selfCount; l < callee.NumLocals; l++ {
 								stack[newBase+l] = val.UnboundVal()
 							}
 							stack[newBase+callee.VarArgsIdx] = argsVal
 							stack[newBase+callee.VarKWIdx] = kwArg
 							cc := vm.fastCalleeCache(callee)
-							return vm.pushCalleeFrame(st, callee, fn, cc, newBase, sp, newBase+callee.NumLocals, ip+1)
+							nextIP, nextSP := vm.pushFrameFast(st, fn, cc, newBase+callee.NumLocals, callee.NumLocals, ip)
+							if initType != nil {
+								vm.frames[st.frameIdx-1].initInstance = initInst
+								vm.frames[st.frameIdx-1].flags |= frameFlagInit
+							}
+							return nextIP, nextSP, ctlReload
 						}
 					}
 				}
@@ -1395,14 +1446,13 @@ func (vm *VM) opCallFunctionEx(st *loopState, inst uint32, ip, sp int) (int, int
 								for l := argCount; l < callee.NumLocals; l++ {
 									stack[newBase+l] = val.UnboundVal()
 								}
-								nextSP := newBase + callee.NumLocals
 								cc := vm.fastCalleeCache(callee)
-								rIP, rSP, rCtl := vm.pushCalleeFrame(st, callee, fn, cc, newBase, sp, nextSP, ip+1)
+								rIP, rSP := vm.pushFrameFast(st, fn, cc, newBase+callee.NumLocals, callee.NumLocals, ip)
 								if initType != nil {
 									vm.frames[st.frameIdx-1].initInstance = initInst
 									vm.frames[st.frameIdx-1].flags |= frameFlagInit
 								}
-								return rIP, rSP, rCtl
+								return rIP, rSP, ctlReload
 							}
 						}
 					}

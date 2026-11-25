@@ -74,22 +74,18 @@ type PyDict struct {
 	// owner is set when this dict is the namespace of a type. Every mutation
 	// then invalidates the owner version tag (and its subclasses), so lookup
 	// caches never need to trust call sites to invalidate explicitly.
-	owner *PyType
-	// Small-table inline storage for dicts and sets with <= 5 entries, avoiding
-	// separate heap allocations for indices and Entries in initTable.
-	inlineEntries [5]DictEntry
-	VersionTag    uint64
-	used          int
-	filled        int
-	mu            sync.RWMutex
-	mask          uint32
-	indexShift    uint8 // 0: uint8 slots, 1: uint16 slots, 2: uint32 slots
+	owner      *PyType
+	VersionTag uint64
+	used       int
+	filled     int
+	mu         sync.RWMutex
+	mask       uint32
+	indexShift uint8 // 0: uint8 slots, 1: uint16 slots, 2: uint32 slots
 	// Shared marks a dictionary that several VMs can reach at the same
 	// time, such as the builtins of an engine. Such a dictionary always
 	// takes its lock, even when the runtime believes it is
 	// single-threaded.
-	Shared        bool
-	inlineIndices [8]byte
+	Shared bool
 }
 
 // PyCell wraps a shared mutable Value on the heap for closures and nonlocal variables.
@@ -641,27 +637,53 @@ type dict32Backing struct {
 	indices [32]byte
 }
 
-// NewSmallDictDirect allocates a fresh <=5-entry PyDict with inline storage
-// already bound, skipping generic initTable sizing.
+// smallDictBundle fuses a PyDict with its 5-entry / 8-index small table into
+// a single heap allocation for known-nonempty small dicts and pooled dicts.
+// dict MUST remain at offset 0 so &b.dict.Header is offset 0.
+type smallDictBundle struct {
+	dict    PyDict
+	entries [5]DictEntry
+	indices [8]byte
+}
+
+// smallDictBacking fuses the 5-entry / 8-index small table into a single heap
+// allocation when a slim empty PyDict or PySet receives its first entry.
+type smallDictBacking struct {
+	entries [5]DictEntry
+	indices [8]byte
+}
+
+// NewSmallDictDirect allocates a fresh <=5-entry PyDict with fused small-table
+// storage already bound in a single heap allocation.
 func NewSmallDictDirect(flags uint8) *PyDict {
-	d := &PyDict{
-		Header:     ObjectHeader{Kind: KindDict, Flags: flags, Type: DictType},
-		mask:       7,
-		VersionTag: 1,
+	b := &smallDictBundle{
+		dict: PyDict{
+			Header:     ObjectHeader{Kind: KindDict, Flags: flags, Type: DictType},
+			mask:       7,
+			VersionTag: 1,
+		},
 	}
-	d.indices = d.inlineIndices[:]
-	d.Entries = d.inlineEntries[:0]
-	return d
+	b.dict.indices = b.indices[:]
+	b.dict.Entries = b.entries[:0]
+	return &b.dict
 }
 
 // NewDictVal constructs an empty heap-allocated KindDict Value with initial capacity.
 func NewDictVal(capacity int) Value {
+	if capacity <= 0 {
+		obj := &PyDict{
+			Header: ObjectHeader{Kind: KindDict, Type: DictType},
+		}
+		return Value{num: 0, ptr: &obj.Header}
+	}
+	if capacity <= 5 {
+		d := NewSmallDictDirect(0)
+		return Value{num: 0, ptr: &d.Header}
+	}
 	obj := &PyDict{
 		Header: ObjectHeader{Kind: KindDict, Type: DictType},
 	}
-	if capacity > 0 {
-		obj.initTable(capacity)
-	}
+	obj.initTable(capacity)
 	return Value{num: 0, ptr: &obj.Header}
 }
 
@@ -2368,12 +2390,12 @@ func (d *PyDict) initTable(minEntries int) {
 	}
 	switch {
 	case tableCap == 8:
-		// Fresh inline storage is zeroed; pooled reuse arrives cleared.
-		d.indices = d.inlineIndices[:]
+		b := &smallDictBacking{}
+		d.indices = b.indices[:]
 		d.mask = 7
 		d.indexShift = 0
-		if cap(d.Entries) < len(d.inlineEntries) {
-			d.Entries = d.inlineEntries[:0]
+		if cap(d.Entries) < len(b.entries) {
+			d.Entries = b.entries[:0]
 		}
 	case tableCap == 16 && shift == 0 && AcquireDictTable16Hook != nil:
 		d.Header.Flags &^= FlagEphemeralDict | FlagEphemeralFrameDict
@@ -2475,7 +2497,7 @@ func (d *PyDict) resize(minEntries int) {
 
 	oldEntries := d.Entries
 	oldIndices := d.indices
-	oldIsInline := len(oldEntries) > 0 && &oldEntries[0] == &d.inlineEntries[0]
+	oldIsSmall := cap(oldEntries) == 5 && len(oldIndices) == 8
 	maxDense := int(tableCap) * 2 / 3
 	var newEntries []DictEntry
 	if tableCap == 16 && shift == 0 && AcquireDictTable16Hook != nil {
@@ -2513,9 +2535,9 @@ func (d *PyDict) resize(minEntries int) {
 		d.used++
 		d.filled++
 	}
-	if len(oldEntries) > 0 && &oldEntries[0] == &d.inlineEntries[0] {
-		clear(d.inlineEntries[:])
-	} else if !oldIsInline && ReleaseDictTable16Hook != nil &&
+	if oldIsSmall {
+		clear(oldEntries[:cap(oldEntries)])
+	} else if ReleaseDictTable16Hook != nil &&
 		len(oldIndices) == 16 && cap(oldEntries) == Dict16EntryCap &&
 		tableCap != 16 {
 		clear(oldEntries[:cap(oldEntries)])
@@ -2525,34 +2547,33 @@ func (d *PyDict) resize(minEntries int) {
 	d.Entries = newEntries
 }
 
-// IsSmallInline reports whether d has no external owner and still fits within
-// its inline entries and indices buffers for safe freelist recycling.
+// IsSmallInline reports whether d has no external owner and holds a pre-allocated
+// 5-entry / 8-index small table for safe freelist recycling.
 func (d *PyDict) IsSmallInline() bool {
 	return d.owner == nil &&
-		len(d.Entries) <= len(d.inlineEntries) &&
-		cap(d.Entries) <= len(d.inlineEntries) &&
-		len(d.indices) <= len(d.inlineIndices)
+		cap(d.Entries) == 5 &&
+		len(d.indices) == 8
 }
 
-// InitSmallInlineTable configures d to use its inline indices and inlineEntries
-// storage without heap-allocating backing slices.
-// Fresh structs arrive zeroed from Go; pooled structs arrive cleared via
-// ResetForPool, so no clearing happens here.
+// InitSmallInlineTable configures a pooled small PyDict for reuse without
+// heap-allocating backing slices. Pooled structs arrive cleared via ResetForPool.
 func (d *PyDict) InitSmallInlineTable() {
-	d.indices = d.inlineIndices[:]
 	d.mask = 7
 	d.indexShift = 0
-	d.Entries = d.inlineEntries[:0]
+	d.used = 0
+	d.filled = 0
+	d.Entries = d.Entries[:0]
 }
 
-// ResetForPool clears all entries and metadata on a pooled small PyDict before
-// returning it to a VM freelist.
+// ResetForPool clears all entries and metadata on a pooled small PyDict while
+// retaining its 5-entry / 8-index backing slices for VM freelist reuse.
 func (d *PyDict) ResetForPool() {
-	clear(d.inlineEntries[:])
-	clear(d.inlineIndices[:])
-	d.Entries = nil
-	d.indices = nil
-	d.mask = 0
+	if cap(d.Entries) > 0 {
+		clear(d.Entries[:cap(d.Entries)])
+		d.Entries = d.Entries[:0]
+	}
+	clear(d.indices)
+	d.mask = 7
 	d.used = 0
 	d.filled = 0
 	d.indexShift = 0
@@ -2931,8 +2952,7 @@ func InitArenaDict(d *PyDict, capHint int, entries []DictEntry) {
 	}
 	switch {
 	case tableCap == 8:
-		clear(d.inlineIndices[:])
-		d.indices = d.inlineIndices[:]
+		d.indices = make([]byte, 8)
 	case tableCap == 16 && AcquireDictTable16Hook != nil && !MultiThreadedFlag.Load():
 		if pooledEntries, pooledIndices, ok := AcquireDictTable16Hook(); ok &&
 			cap(pooledEntries) == Dict16EntryCap && len(pooledIndices) == 16 {

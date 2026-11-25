@@ -23,12 +23,12 @@ func TestCoreStructLayouts(t *testing.T) {
 	if got := unsafe.Sizeof(PyTuple{}); got != 96 {
 		t.Fatalf("unsafe.Sizeof(PyTuple{}) = %d, want 96", got)
 	}
-	if got := unsafe.Sizeof(PyDict{}); got > 352 {
-		t.Fatalf("unsafe.Sizeof(PyDict{}) = %d, want <= 352", got)
+	if got := unsafe.Sizeof(PyDict{}); got > 144 {
+		t.Fatalf("unsafe.Sizeof(PyDict{}) = %d, want <= 144", got)
 	}
 	// Pointer-bearing fields must precede scalar tails on reordered structs.
-	if unsafe.Offsetof(PyDict{}.inlineEntries) >= unsafe.Offsetof(PyDict{}.VersionTag) {
-		t.Fatalf("PyDict.inlineEntries must precede scalar tail VersionTag")
+	if unsafe.Offsetof(PyDict{}.owner) >= unsafe.Offsetof(PyDict{}.VersionTag) {
+		t.Fatalf("PyDict.owner must precede scalar tail VersionTag")
 	}
 	if unsafe.Offsetof(PyList{}.Attrs) >= unsafe.Offsetof(PyList{}.mu) {
 		t.Fatalf("PyList.Attrs must precede scalar mu")

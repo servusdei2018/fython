@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"math"
 	"math/big"
-	"sort"
 	"strconv"
 	"strings"
 	"unicode"
@@ -920,48 +919,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			}
 		}
 
-		if keyFunc.HeaderPtr() != nil && !keyFunc.IsNone() {
-			type sortedItem struct {
-				val val.Value
-				key val.Value
-			}
-			pairs := make([]sortedItem, len(items))
-			for i, itm := range items {
-				k := ctx.Invoke1(keyFunc, itm)
-				if ctx != nil && ctx.HasException() {
-					return val.NoneVal()
-				}
-				pairs[i] = sortedItem{val: itm, key: k}
-			}
-			sort.SliceStable(pairs, func(i, j int) bool {
-				if ctx != nil && ctx.HasException() {
-					return false
-				}
-				if reverse {
-					return val.RichCompare(ctx, pairs[j].key, pairs[i].key, val.CmpLT).IsTruthy()
-				}
-				return val.RichCompare(ctx, pairs[i].key, pairs[j].key, val.CmpLT).IsTruthy()
-			})
-			if ctx != nil && ctx.HasException() {
-				return val.NoneVal()
-			}
-			res := make([]val.Value, len(items))
-			for i, p := range pairs {
-				res[i] = p.val
-			}
-			return val.NewListVal(res...)
-		}
-
-		sort.SliceStable(items, func(i, j int) bool {
-			if ctx != nil && ctx.HasException() {
-				return false
-			}
-			if reverse {
-				return val.RichCompare(ctx, items[j], items[i], val.CmpLT).IsTruthy()
-			}
-			return val.RichCompare(ctx, items[i], items[j], val.CmpLT).IsTruthy()
-		})
-		if ctx != nil && ctx.HasException() {
+		if !val.SortValues(ctx, items, keyFunc, reverse) {
 			return val.NoneVal()
 		}
 		return val.NewListVal(items...)

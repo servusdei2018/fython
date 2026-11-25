@@ -6,7 +6,6 @@ import (
 	"math"
 	"math/big"
 	"math/bits"
-	"sort"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -4912,10 +4911,104 @@ func initTypes() {
 		}
 		sepLen := args[0].StringByteLen()
 		iterable := args[1]
+		// Fast path for exact str separator and concrete list/tuple of exact strs:
+		// 0 heap allocs for empty, single-element, or <=7B SSO results;
+		// 1 exact allocation for >7B results (eliminating strings.Builder double alloc).
+		sepExact := sepInline || (args[0].ptr != nil && args[0].ptr.Kind == KindString && args[0].ptr.Type == StrType)
+		joinExactItems := func(items []Value) (Value, bool) {
+			n := len(items)
+			if n == 0 {
+				return SmallStringVal(""), true
+			}
+			if n == 1 {
+				if isExactStr(items[0]) {
+					return items[0], true
+				}
+				return Value{}, false
+			}
+			if sepLen > 0 && (n-1) > math.MaxInt/sepLen {
+				return Value{}, false
+			}
+			total := sepLen * (n - 1)
+			for _, it := range items {
+				var l int
+				switch {
+				case it.ptr == &tagInlineStr:
+					l = int(it.num & 0xFF)
+				case it.ptr != nil && it.ptr.Kind == KindString && it.ptr.Type == StrType:
+					l = len((*PyString)(unsafe.Pointer(it.ptr)).Data)
+				default:
+					return Value{}, false
+				}
+				if l > math.MaxInt-total {
+					return Value{}, false
+				}
+				total += l
+			}
+			if total == 0 {
+				return SmallStringVal(""), true
+			}
+			if total <= 7 {
+				var out [7]byte
+				pos := 0
+				for i, it := range items {
+					if i > 0 && sepLen > 0 {
+						if sepInline {
+							pos += copy(out[pos:], sepBytes)
+						} else {
+							pos += copy(out[pos:], sepStr)
+						}
+					}
+					if it.ptr == &tagInlineStr {
+						raw := it.num
+						ilen := int(raw & 0xFF)
+						for j := range ilen {
+							out[pos] = byte(raw >> ((uint(j) + 1) * 8))
+							pos++
+						}
+					} else {
+						pos += copy(out[pos:], (*PyString)(unsafe.Pointer(it.ptr)).Data)
+					}
+				}
+				return SmallStringFromBytes(out[:total]), true
+			}
+			buf := make([]byte, total)
+			pos := 0
+			for i, it := range items {
+				if i > 0 && sepLen > 0 {
+					if sepInline {
+						pos += copy(buf[pos:], sepBytes)
+					} else {
+						pos += copy(buf[pos:], sepStr)
+					}
+				}
+				if it.ptr == &tagInlineStr {
+					raw := it.num
+					ilen := int(raw & 0xFF)
+					for j := range ilen {
+						buf[pos] = byte(raw >> ((uint(j) + 1) * 8))
+						pos++
+					}
+				} else {
+					pos += copy(buf[pos:], (*PyString)(unsafe.Pointer(it.ptr)).Data)
+				}
+			}
+			obj := &PyString{
+				Header: ObjectHeader{Kind: KindString, Type: StrType},
+				Data:   unsafe.String(&buf[0], total),
+			}
+			return Value{ptr: &obj.Header}, true
+		}
+
 		// Streaming container paths avoid building an intermediate []Value
 		// slice of every item.
 		var b strings.Builder
 		joinItems := func(items []Value) Value {
+			if sepExact {
+				if res, ok := joinExactItems(items); ok {
+					return res
+				}
+			}
 			if len(items) == 0 {
 				return NewStringVal("")
 			}
@@ -5151,68 +5244,7 @@ func initTypes() {
 			}
 		}
 		l := args[0].AsList()
-		l.mu.Lock()
-		items := append([]Value(nil), l.Items...)
-		l.mu.Unlock()
-		origLen := len(items)
-		if keyFn.ptr != nil && !keyFn.IsNone() {
-			type sortPair struct {
-				val Value
-				key Value
-			}
-			pairs := make([]sortPair, origLen)
-			for i, itm := range items {
-				k := ctx.Invoke1(keyFn, itm)
-				if ctx != nil && ctx.HasException() {
-					clear(pairs)
-					return NoneVal()
-				}
-				pairs[i] = sortPair{val: itm, key: k}
-			}
-			l.mu.Lock()
-			modified := len(l.Items) != origLen
-			l.mu.Unlock()
-			if modified {
-				clear(pairs)
-				if ctx != nil {
-					ctx.Raise(NewException(ValueErrorType, "list modified during sort"))
-				}
-				return NoneVal()
-			}
-			sort.SliceStable(pairs, func(i, j int) bool {
-				if ctx != nil && ctx.HasException() {
-					return false
-				}
-				if reverse {
-					return RichCompare(ctx, pairs[j].key, pairs[i].key, CmpLT).IsTruthy()
-				}
-				return RichCompare(ctx, pairs[i].key, pairs[j].key, CmpLT).IsTruthy()
-			})
-			if ctx != nil && ctx.HasException() {
-				clear(pairs)
-				return NoneVal()
-			}
-			for i, p := range pairs {
-				items[i] = p.val
-			}
-			clear(pairs)
-		} else {
-			sort.SliceStable(items, func(i, j int) bool {
-				if ctx != nil && ctx.HasException() {
-					return false
-				}
-				if reverse {
-					return RichCompare(ctx, items[j], items[i], CmpLT).IsTruthy()
-				}
-				return RichCompare(ctx, items[i], items[j], CmpLT).IsTruthy()
-			})
-			if ctx != nil && ctx.HasException() {
-				return NoneVal()
-			}
-		}
-		l.mu.Lock()
-		l.Items = items
-		l.mu.Unlock()
+		SortList(ctx, l, keyFn, reverse)
 		return NoneVal()
 	}))
 	ListType.Dict.Set(InternString("insert"), NewBuiltinFuncVal("insert", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
