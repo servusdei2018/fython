@@ -22,6 +22,10 @@ func isNativeAttrCacheableType(tp *val.PyType) bool {
 func (vm *VM) dispatchPropertyGet(st *loopState, fget val.Value, cc *VMCodeCache, stack []val.Value, ip, sp int) (int, int, loopCtl) {
 	if fget.IsFunction() && sp > 0 {
 		if fn := fget.AsFunction(); fn != nil {
+			if v, collapsed := vm.tryCollapsePropertyToAttrPIC(st, ip, fn, stack[sp-1]); collapsed {
+				stack[sp-1] = v
+				return ip + 1, sp, ctlNext
+			}
 			vm.tryInlineProperty(st, ip, fn, stack[sp-1])
 		}
 	}

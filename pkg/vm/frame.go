@@ -365,6 +365,9 @@ type CodeObject struct {
 	// this code object. The interpreter loop reads it to reach the cache
 	// without calling getCodeCache.
 	primary unsafe.Pointer
+	// inlineMeta caches static per-CodeObject inlining eligibility and scan
+	// metadata keyed by StreamGen in a single race-free atomic word.
+	inlineMeta atomic.Uint64
 }
 
 // Active returns the instruction slice that must be executed for this code

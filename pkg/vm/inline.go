@@ -7,51 +7,105 @@ import (
 	"github.com/servusdei2018/fython/pkg/val"
 )
 
-// canInlineCallee reports whether callee is a small leaf safe to splice into
-// a caller. Supports straight-line and forward-only branching Python code
-// (2 <= len <= 48, zero loops, zero exception handlers, no suspensions).
-func canInlineCallee(fn *val.PyFunction, callee *CodeObject, caller *CodeObject) bool {
-	if fn == nil || callee == nil || caller == nil {
-		return false
+const (
+	inlineEligUnknown  uint64 = 0
+	inlineEligEligible uint64 = 1
+	inlineEligRejected uint64 = 2
+	inlineEligMask     uint64 = 0x3
+
+	inlineMetaHasGlobals     uint64 = 1 << 2
+	inlineMetaHasLoadDeref   uint64 = 1 << 3
+	inlineMetaDefAssigned    uint64 = 1 << 4
+	inlineMetaTrivialProp1   uint64 = 1 << 5
+	inlineMetaAttrIdxShift   uint   = 8
+	inlineMetaAttrIdxMask    uint64 = 0xFFFF << inlineMetaAttrIdxShift
+	inlineMetaStreamGenShift uint   = 32
+)
+
+// detectTrivial1SlotProperty checks whether callee is a pure 1-slot @property
+// getter of the form `def x(self): return self._x`, compiled as either
+// `LOAD_FAST 0; LOAD_ATTR nameIdx; RETURN` or fused `LOAD_FAST_ATTR 0, nameIdx; [NOP*]; RETURN`
+// (ignoring unreachable trailing bytecode after the unconditional RETURN).
+func detectTrivial1SlotProperty(callee *CodeObject, fused []uint32, start, end int) (uint16, bool) {
+	if !callee.SimplePositionalOnly || callee.NumParams != 1 {
+		return 0, false
 	}
-	if !callee.SimplePositionalOnly {
-		return false
+	if callee.IsGenerator || callee.IsCoroutine || callee.CanSuspend || len(callee.ExceptionTable) != 0 {
+		return 0, false
 	}
-	if len(fn.Defaults) != 0 || fn.KwDefaults != nil {
-		return false
+	if start < 0 || start >= end || end > len(fused) {
+		return 0, false
 	}
-	if callee.HasCellVars {
-		return false
-	}
-	allowDeref := false
-	if len(callee.FreeVars) != 0 {
-		if len(callee.CellVars) != 0 {
-			return false
+	var attrIdx uint16
+	matched := false
+	op0 := DecodeOpcode(fused[start])
+	switch op0 {
+	case OP_LOAD_FAST:
+		if DecodeArgBx(fused[start]) == 0 && start+2 < end &&
+			DecodeOpcode(fused[start+1]) == OP_LOAD_ATTR &&
+			DecodeOpcode(fused[start+2]) == OP_RETURN {
+			attrIdx = DecodeArgBx(fused[start+1])
+			matched = true
 		}
-		if fn.Closure == nil || len(fn.Closure) < len(callee.FreeVars) {
-			return false
+	case OP_LOAD_FAST_ATTR:
+		if DecodeArgA(fused[start]) == 0 && start+1 < end {
+			pos := start + 1
+			for pos < end && DecodeOpcode(fused[pos]) == OP_NOP {
+				pos++
+			}
+			if pos < end && DecodeOpcode(fused[pos]) == OP_RETURN {
+				attrIdx = DecodeArgBx(fused[start])
+				matched = true
+			}
+		}
+	}
+	if !matched || int(attrIdx) >= len(callee.Consts) || !callee.Consts[attrIdx].IsAnyString() {
+		return 0, false
+	}
+	return attrIdx, true
+}
+
+// analyzeInlineCallee computes and caches static per-CodeObject inlining
+// eligibility and scan metadata keyed by StreamGen in a single atomic word.
+func analyzeInlineCallee(callee *CodeObject) uint64 {
+	if callee == nil {
+		return inlineEligRejected
+	}
+	curGen := uint32(atomic.LoadInt32(&callee.StreamGen))
+	meta := callee.inlineMeta.Load()
+	if (meta&inlineEligMask) != inlineEligUnknown && uint32(meta>>inlineMetaStreamGenShift) == curGen {
+		return meta
+	}
+	genBits := uint64(curGen) << inlineMetaStreamGenShift
+	reject := func() uint64 {
+		res := inlineEligRejected | genBits
+		callee.inlineMeta.Store(res)
+		return res
+	}
+	if !callee.SimplePositionalOnly || callee.HasCellVars {
+		return reject()
+	}
+	if len(callee.FreeVars) != 0 {
+		if len(callee.CellVars) != 0 || callee.ClassCellIdx >= 0 {
+			return reject()
 		}
 		for _, inst := range callee.Code {
 			if DecodeOpcode(inst) == OP_STORE_DEREF {
-				return false
+				return reject()
 			}
 		}
-		allowDeref = true
 	}
 	if callee.IsGenerator || callee.IsCoroutine || callee.CanSuspend {
-		return false
+		return reject()
 	}
 	if len(callee.ExceptionTable) != 0 {
-		return false
+		return reject()
 	}
 	if len(callee.Code) < 2 || len(callee.Code) > 48 {
-		return false
+		return reject()
 	}
 	if callee.NumLocals < callee.NumParams || callee.NumLocals > 127 || callee.NumParams > 127 {
-		return false
-	}
-	if caller.NumLocals+callee.NumLocals > 220 {
-		return false
+		return reject()
 	}
 	fused := callee.Active()
 	if len(fused) == 0 {
@@ -66,8 +120,13 @@ func canInlineCallee(fn *val.PyFunction, callee *CodeObject, caller *CodeObject)
 		end--
 	}
 	if end-start < 2 || end-start > 48 {
-		return false
+		return reject()
 	}
+	var flags uint64
+	if attrIdx, ok := detectTrivial1SlotProperty(callee, fused, start, end); ok {
+		flags |= inlineMetaTrivialProp1 | (uint64(attrIdx) << inlineMetaAttrIdxShift)
+	}
+	allowDeref := len(callee.FreeVars) != 0
 	returns := 0
 	for i := start; i < end; i++ {
 		inst := fused[i]
@@ -80,14 +139,22 @@ func canInlineCallee(fn *val.PyFunction, callee *CodeObject, caller *CodeObject)
 			OP_COMPARE_JUMP_IF_FALSE, OP_COMPARE_JUMP_IF_TRUE:
 			target := int(DecodeArgBx(inst))
 			if target <= i || target > end {
-				return false
+				res := inlineEligRejected | flags | genBits
+				callee.inlineMeta.Store(res)
+				return res
 			}
 		case OP_CMP_CONST_JUMP_IF_FALSE, OP_CMP_CONST_JUMP_IF_TRUE:
 			rel := int(DecodeArgC(inst))
 			target := i + rel
 			if rel <= 0 || target <= i || target >= end {
-				return false
+				res := inlineEligRejected | flags | genBits
+				callee.inlineMeta.Store(res)
+				return res
 			}
+		case OP_LOAD_GLOBAL, OP_LOAD_GLOBAL_FAST, OP_LOAD_FROM_DICT_OR_GLOBALS,
+			OP_STORE_GLOBAL, OP_DELETE_GLOBAL,
+			OP_LOAD_NAME, OP_STORE_NAME, OP_DELETE_NAME:
+			flags |= inlineMetaHasGlobals
 		case OP_YIELD_VALUE, OP_YIELD_FROM, OP_GET_AWAITABLE, OP_AWAIT,
 			OP_SETUP_RANGE, OP_FOR_ITER, OP_FOR_ITER_RANGE, OP_FOR_ITER_GEN,
 			OP_LOAD_CLOSURE, OP_MAKE_FUNCTION,
@@ -106,22 +173,142 @@ func canInlineCallee(fn *val.PyFunction, callee *CodeObject, caller *CodeObject)
 			OP_CALL_BOUND_NATIVE, OP_CALL_HASATTR, OP_CALL_GETATTR,
 			OP_CALL_INSTANCE_DUNDER, OP_COMPARE_DUNDER,
 			OP_GUARD_INLINE_METHOD, OP_GUARD_INLINE_FUNC, OP_INLINE_RETURN:
-			return false
+			res := inlineEligRejected | flags | genBits
+			callee.inlineMeta.Store(res)
+			return res
 		case OP_LOAD_DEREF:
 			if !allowDeref {
-				return false
+				res := inlineEligRejected | flags | genBits
+				callee.inlineMeta.Store(res)
+				return res
 			}
 			idx := int(DecodeArgBx(inst))
 			if idx < 0 || idx >= len(callee.FreeVars) {
-				return false
+				res := inlineEligRejected | flags | genBits
+				callee.inlineMeta.Store(res)
+				return res
 			}
+			flags |= inlineMetaHasLoadDeref
 		}
 	}
 	if returns < 1 {
-		return false
+		res := inlineEligRejected | flags | genBits
+		callee.inlineMeta.Store(res)
+		return res
 	}
 	lastOp := DecodeOpcode(fused[end-1])
-	return lastOp == OP_RETURN || lastOp == OP_RETURN_FAST || lastOp == OP_RETURN_CONST || lastOp == OP_JUMP
+	if lastOp != OP_RETURN && lastOp != OP_RETURN_FAST && lastOp != OP_RETURN_CONST && lastOp != OP_JUMP {
+		res := inlineEligRejected | flags | genBits
+		callee.inlineMeta.Store(res)
+		return res
+	}
+	if callee.NumLocals <= callee.NumParams || inlineLocalsDefinitelyAssigned(fused[start:end], start, callee.NumParams, callee.NumLocals) {
+		flags |= inlineMetaDefAssigned
+	}
+	res := inlineEligEligible | flags | genBits
+	callee.inlineMeta.Store(res)
+	return res
+}
+
+// canInlineCallee reports whether callee is a small function safe to splice into
+// a caller. Static per-CodeObject checks are cached in callee.inlineMeta; only
+// O(1) per-PyFunction and per-caller checks run here.
+func canInlineCallee(fn *val.PyFunction, callee *CodeObject, caller *CodeObject) bool {
+	if fn == nil || callee == nil || caller == nil {
+		return false
+	}
+	meta := analyzeInlineCallee(callee)
+	if (meta & inlineEligMask) != inlineEligEligible {
+		return false
+	}
+	if len(fn.Defaults) != 0 || fn.KwDefaults != nil {
+		return false
+	}
+	if len(callee.FreeVars) != 0 && (fn.Closure == nil || len(fn.Closure) < len(callee.FreeVars)) {
+		return false
+	}
+	if caller.NumLocals+callee.NumLocals > 220 {
+		return false
+	}
+	return true
+}
+
+// collapsePropertySlot attempts to collapse a pure 1-slot @property getter
+// (`def x(self): return self._x`) directly into the existing 4-way attrPIC[ip]
+// so subsequent reads execute in 1 dispatch with 0 B added to runLoopWithGlobals.
+func collapsePropertySlot(cache *VMCodeCache, curIC []ICSlot, curAttrPIC [][4]AttrPICEntry, ip int, fn *val.PyFunction, instObj *val.PyInstance) (val.Value, bool) {
+	if cache == nil || fn == nil || fn.KwDefaults != nil || instObj == nil {
+		return val.Value{}, false
+	}
+	instShape := instObj.Shape
+	instType := instObj.Header.Type
+	if instShape == nil || instType == nil || (instType.Flags&val.FlagCustomGetAttribute) != 0 {
+		return val.Value{}, false
+	}
+	if ip < 0 || ip >= len(cache.active) || ip >= len(curIC) || ip >= len(curAttrPIC) {
+		return val.Value{}, false
+	}
+	curOp := DecodeOpcode(cache.active[ip])
+	isFastAttrProp := curOp == OP_NOP && ip > 0 && DecodeOpcode(cache.active[ip-1]) == OP_LOAD_FAST_ATTR
+	if curOp != OP_LOAD_ATTR && !isFastAttrProp {
+		return val.Value{}, false
+	}
+	callee := AsCodeObject(fn.Code)
+	if callee == nil {
+		return val.Value{}, false
+	}
+	meta := analyzeInlineCallee(callee)
+	if (meta & inlineMetaTrivialProp1) == 0 {
+		return val.Value{}, false
+	}
+	attrIdx := int((meta & inlineMetaAttrIdxMask) >> inlineMetaAttrIdxShift)
+	if attrIdx < 0 || attrIdx >= len(callee.Consts) {
+		return val.Value{}, false
+	}
+	targetName := val.InternValue(callee.Consts[attrIdx])
+	descr, _, found := instType.LookupMRO(targetName)
+	if found && descr.Kind() != val.KindMemberDescr {
+		return val.Value{}, false
+	}
+	slotIdx, ok := instShape.Lookup(targetName)
+	if !ok || slotIdx < 0 {
+		return val.Value{}, false
+	}
+	if found && descr.Kind() == val.KindMemberDescr && descr.AsMemberDescr().SlotIndex != slotIdx {
+		return val.Value{}, false
+	}
+	var v val.Value
+	if !val.MultiThreadedFlag.Load() {
+		if uint(slotIdx) >= uint(len(instObj.Slots)) {
+			return val.Value{}, false
+		}
+		v = instObj.Slots[slotIdx]
+		if v.IsUnbound() {
+			return val.Value{}, false
+		}
+	} else {
+		var okSlot bool
+		v, okSlot = instObj.GetSlot(slotIdx)
+		if !okSlot || v.IsUnbound() {
+			return val.Value{}, false
+		}
+	}
+	recordAttrPICMRU(&curAttrPIC[ip], instShape, slotIdx, uint32(instType.Version()))
+	curIC[ip].Kind = ICKindNone
+	return v, true
+}
+
+// tryCollapsePropertyToAttrPIC collapses a pure 1-slot @property getter from
+// dispatchPropertyGet before falling back to bytecode splicing.
+func (vm *VM) tryCollapsePropertyToAttrPIC(st *loopState, ip int, fn *val.PyFunction, recv val.Value) (val.Value, bool) {
+	if st == nil || st.cache == nil || fn == nil {
+		return val.Value{}, false
+	}
+	instObj := recv.AsInstanceChecked()
+	if instObj == nil {
+		return val.Value{}, false
+	}
+	return collapsePropertySlot(st.cache, st.cache.ic, st.cache.ensureAttrPIC(), ip, fn, instObj)
 }
 
 // inlineLocalsDefinitelyAssigned reports whether every non-parameter local
@@ -376,7 +563,7 @@ func (vm *VM) tryInlineMethod(st *loopState, ip, totalArgs int, fn *val.PyFuncti
 	if atomic.LoadInt32(&st.curCO.IsTier2Optimized) == 0 {
 		return false
 	}
-	if ip < 0 || ip >= len(st.cache.active) {
+	if ip < 0 || ip >= len(st.cache.active) || ip >= len(st.curCO.Code) {
 		return false
 	}
 	if DecodeOpcode(st.cache.active[ip]) != OP_CALL_METHOD_PIC {
@@ -426,7 +613,7 @@ func (vm *VM) tryInlineProperty(st *loopState, ip int, fn *val.PyFunction, recv 
 	if atomic.LoadInt32(&st.curCO.IsTier2Optimized) == 0 {
 		return false
 	}
-	if ip < 0 || ip >= len(st.cache.active) {
+	if ip < 0 || ip >= len(st.cache.active) || ip >= len(st.curCO.Code) {
 		return false
 	}
 	curOp := DecodeOpcode(st.cache.active[ip])
@@ -480,13 +667,13 @@ func (vm *VM) tryInlineProperty(st *loopState, ip int, fn *val.PyFunction, recv 
 
 // tryInlineFunc attempts per-VM inlining of a monomorphic direct call.
 func (vm *VM) tryInlineFunc(st *loopState, ip, totalArgs int, fn *val.PyFunction) bool {
-	if st == nil || st.cache == nil || st.curCO == nil {
+	if st == nil || st.cache == nil || st.curCO == nil || fn == nil {
 		return false
 	}
 	if atomic.LoadInt32(&st.curCO.IsTier2Optimized) == 0 {
 		return false
 	}
-	if ip < 0 || ip >= len(st.cache.active) {
+	if ip < 0 || ip >= len(st.cache.active) || ip >= len(st.curCO.Code) {
 		return false
 	}
 	curOp := DecodeOpcode(st.cache.active[ip])
@@ -538,6 +725,12 @@ func (vm *VM) tryInlineDunderFast(st *loopState, ip int, entry *ICSlot, fn *val.
 	if DecodeOpcode(st.cache.active[ip]) == OP_GUARD_INLINE_METHOD || DecodeOpcode(st.cache.active[ip]) == OP_GUARD_INLINE_FUNC {
 		return
 	}
+	if entry.SlotIndex != 0 {
+		// Reflected comparisons (SlotIndex 1) and __contains__ (SlotIndex 2)
+		// require swapping stack operands (and negating for not-in), which
+		// opGuardInline does not perform.
+		return
+	}
 	lObj, rObj := a.AsInstanceChecked(), b.AsInstanceChecked()
 	if lObj == nil || rObj == nil || lObj.Shape == nil || rObj.Shape == nil {
 		return
@@ -545,17 +738,8 @@ func (vm *VM) tryInlineDunderFast(st *loopState, ip int, entry *ICSlot, fn *val.
 	if lObj.Header.Type == nil || rObj.Header.Type == nil {
 		return
 	}
-	// Account for reflected order (SlotIndex 1 swaps operands before the call).
 	taVer, tbVer := lObj.Header.Type.Version(), rObj.Header.Type.Version()
 	lsID, rsID := lObj.Shape.ID, rObj.Shape.ID
-	if entry.SlotIndex == 1 || entry.SlotIndex == 2 {
-		// Slot 2 is contains (b in a) with swapped layout; keep versions aligned
-		// to the post-swap order used by the fast path.
-		if entry.SlotIndex == 1 {
-			taVer, tbVer = tbVer, taVer
-			lsID, rsID = rsID, lsID
-		}
-	}
 	vm.tryInlineDunder(st, ip, entry.CachedVal, fn, callee, taVer, tbVer, lsID, rsID)
 }
 
@@ -568,7 +752,7 @@ func (vm *VM) tryInlineDunder(st *loopState, ip int, dunder val.Value, dfn *val.
 	if atomic.LoadInt32(&st.curCO.IsTier2Optimized) == 0 {
 		return false
 	}
-	if ip < 0 || ip >= len(st.cache.active) {
+	if ip < 0 || ip >= len(st.cache.active) || ip >= len(st.curCO.Code) {
 		return false
 	}
 	curOp := DecodeOpcode(st.cache.active[ip])
@@ -652,15 +836,9 @@ func spliceInlineBody(vm *VM, st *loopState, guardIP int, guardOp Opcode, origCa
 	if lastOp != OP_RETURN && lastOp != OP_RETURN_FAST && lastOp != OP_RETURN_CONST && lastOp != OP_JUMP {
 		return 0, false
 	}
-	if fn != nil && fn.Globals != st.globals {
-		for _, inst := range body {
-			switch DecodeOpcode(inst) {
-			case OP_LOAD_GLOBAL, OP_LOAD_GLOBAL_FAST, OP_LOAD_FROM_DICT_OR_GLOBALS,
-				OP_STORE_GLOBAL, OP_DELETE_GLOBAL,
-				OP_LOAD_NAME, OP_STORE_NAME, OP_DELETE_NAME:
-				return 0, false
-			}
-		}
+	meta := analyzeInlineCallee(callee)
+	if fn != nil && fn.Globals != st.globals && (meta&inlineMetaHasGlobals) != 0 {
+		return 0, false
 	}
 	baseConsts := st.consts
 	if len(cache.inlineConsts) > len(baseConsts) {
@@ -723,7 +901,7 @@ func spliceInlineBody(vm *VM, st *loopState, guardIP int, guardOp Opcode, origCa
 		return 0, false
 	}
 	zeroFrom := uint8(totalArgs)
-	if savedSlotOffset <= totalArgs || inlineLocalsDefinitelyAssigned(body, start, totalArgs, callee.NumLocals) {
+	if savedSlotOffset <= totalArgs || (meta&inlineMetaDefAssigned) != 0 {
 		zeroFrom = uint8(savedSlotOffset)
 	}
 	argA := uint8(savedSlotOffset & 0x7F)

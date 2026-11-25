@@ -170,3 +170,104 @@ assert loop_direct(100) == 200
 `
 	runPython(t, src)
 }
+
+// TestPropertyCollapseAttrPIC verifies that pure 1-slot @property getters
+// collapse into attrPIC while preserving all soundness invariants:
+// (a) read-only @property still raises AttributeError on write,
+// (b) reassigning Cls.x = new_prop invalidates via TypeVer,
+// (c) adding a descriptor for _x on Cls invalidates via TypeVer,
+// (d) del obj._x raises AttributeError instead of returning UnboundVal,
+// (e) subclass overriding @property invalidates cleanly,
+// (f) __slots__-backed 1-slot @property collapses and handles del cleanly.
+func TestPropertyCollapseAttrPIC(t *testing.T) {
+	src := `
+class Box:
+    def __init__(self, v):
+        self._x = v
+
+    @property
+    def x(self):
+        return self._x
+
+class SubBox(Box):
+    @property
+    def x(self):
+        return self._x * 10
+
+class SlottedBox:
+    __slots__ = ("_x",)
+    def __init__(self, v):
+        self._x = v
+
+    @property
+    def x(self):
+        return self._x
+
+def read_fast(obj, n):
+    total = 0
+    for _ in range(n):
+        total += obj.x
+    return total
+
+def read_unfused(objs):
+    total = 0
+    for i in range(len(objs)):
+        total += objs[i].x
+    return total
+
+b = Box(7)
+assert read_fast(b, 200) == 1400
+assert read_unfused([b] * 50) == 350
+
+# (a) Read-only @property must still reject assignment.
+try:
+    b.x = 99
+    assert False, "expected AttributeError on read-only property write"
+except AttributeError:
+    pass
+
+# (e) Subclass overriding @property must not read base slot directly.
+sb = SubBox(7)
+assert read_fast(sb, 50) == 3500
+assert read_unfused([b, sb, b, sb]) == 154
+
+# (d) del obj._x must raise AttributeError instead of returning UnboundVal.
+b_del = Box(11)
+assert read_fast(b_del, 20) == 220
+del b_del._x
+try:
+    _ = read_fast(b_del, 1)
+    assert False, "expected AttributeError after del obj._x"
+except AttributeError:
+    pass
+
+# (f) __slots__-backed 1-slot @property collapses and raises after del.
+sl = SlottedBox(9)
+assert read_fast(sl, 100) == 900
+del sl._x
+try:
+    _ = read_fast(sl, 1)
+    assert False, "expected AttributeError after del slotted._x"
+except AttributeError:
+    pass
+
+# (c) Adding a descriptor for _x on Box bumps TypeVer and invalidates attrPIC.
+class ConstDescr:
+    def __get__(self, obj, objtype=None):
+        return 123
+    def __set__(self, obj, value):
+        pass
+
+b2 = Box(5)
+assert read_fast(b2, 50) == 250
+Box._x = ConstDescr()
+assert read_fast(b2, 10) == 1230
+del Box._x
+assert read_fast(b2, 10) == 50
+
+# (b) Reassigning Box.x = new_prop bumps TypeVer and invalidates attrPIC.
+Box.x = property(lambda self: self._x + 100)
+assert read_fast(b2, 10) == 1050
+`
+	runPython(t, src)
+}

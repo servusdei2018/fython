@@ -956,9 +956,9 @@ func (vm *VM) opCompareSlow(st *loopState, inst uint32, ip, sp int) (int, int, l
 					if mode != 0 {
 						stack[sp-2] = b
 						stack[sp-1] = a
-						left, right = b, a
+					} else {
+						vm.tryInlineDunderForCompare(st, ip, dunder, dfn, dcallee, left, right)
 					}
-					vm.tryInlineDunderForCompare(st, ip, dunder, dfn, dcallee, left, right)
 					newIP, newSP := vm.inlineDunderCompare(dunder, sp-2, sp-2, a, b, cmpOp, st, ip)
 					return newIP, newSP, ctlReload
 				}

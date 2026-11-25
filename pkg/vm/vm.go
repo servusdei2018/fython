@@ -4688,6 +4688,17 @@ func (vm *VM) loadAttrInstanceSlow(instObj *val.PyInstance, obj, attrName val.Va
 		}
 		if descr.IsProperty() {
 			prop := descr.AsProperty()
+			if prop.FGet.IsFunction() {
+				var curCache *VMCodeCache
+				if vm.activeState != nil && vm.activeState.frameIdx == frameIdx {
+					curCache = vm.activeState.cache
+				} else if frameIdx >= 0 && frameIdx < len(vm.frames) {
+					curCache = vm.frames[frameIdx].cache
+				}
+				if v, collapsed := collapsePropertySlot(curCache, curIC, curAttrPIC, ip, prop.FGet.AsFunction(), instObj); collapsed {
+					return v
+				}
+			}
 			if prop.FGet.IsFunction() || prop.FGet.IsBuiltinFunc() {
 				curIC[ip] = ICSlot{
 					Kind:            ICKindProperty,
