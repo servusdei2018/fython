@@ -1165,6 +1165,59 @@ func (vm *VM) dispatchColdOpcode(st *loopState, op Opcode, inst uint32, ip, sp i
 		return vm.opCompareFastFast(st, inst, ip, sp)
 	case OP_CALL_FAST_ATTR_DESCR:
 		return vm.opCallFastAttrDescr(st, inst, ip, sp)
+	case OP_CALL_PY_DEFAULTS:
+		argc := int(uint8(inst >> 16))
+		newBase := sp - argc
+		retSP := newBase - 1
+		target := *(*val.Value)(unsafe.Add(stackPtr, uintptr(retSP)*16))
+		entry := &st.cache.ic[ip]
+		if target == entry.CachedVal && !vm.hasTrackedViews {
+			fn := target.AsFunction()
+			cc := entry.CalleeCache
+			if cc != nil && cc.owner == vm && cc.co != nil &&
+				fn.Code.HeaderPtr() == &cc.co.Header &&
+				len(fn.Defaults) > 0 && fn.KwDefaults == nil &&
+				atomic.LoadInt32(&cc.co.StreamGen) == cc.streamGen {
+				callee := cc.co
+				if argc >= callee.PositionalParamCount-len(fn.Defaults) &&
+					argc <= callee.PositionalParamCount {
+					st.periodicTick++
+					if (st.periodicTick&0xFF) != 0 &&
+						st.frameIdx+2 <= len(vm.frames) &&
+						newBase+max(256, callee.NumLocals+64) <= len(st.stack) {
+						if argc < callee.PositionalParamCount {
+							defStart := callee.PositionalParamCount - len(fn.Defaults)
+							copy(st.stack[newBase+argc:newBase+callee.PositionalParamCount], fn.Defaults[argc-defStart:])
+						}
+						nextIP, nextSP := vm.pushFrameFast(st, fn, cc, sp, ^argc, ip)
+						return nextIP, nextSP, ctlReload
+					}
+				}
+			}
+		}
+		return vm.opCallPyDefaults(st, inst, ip, sp)
+	case OP_CALL_INSTANCE_DUNDER:
+		argc := int(uint8(inst >> 16))
+		entry := &st.cache.ic[ip]
+		if entry.Kind == ICKindInstanceCall && entry.SlotIndex == int32(argc+1) && !vm.hasTrackedViews {
+			if oh := *(**val.ObjectHeader)(unsafe.Add(stackPtr, uintptr(sp-argc-1)*16+8)); oh != nil && oh.Kind == val.KindInstance {
+				if (*val.PyInstance)(unsafe.Pointer(oh)).Shape != nil && (*val.PyInstance)(unsafe.Pointer(oh)).Shape.ID == entry.ExpectedShapeID {
+					if oh.Type != nil && oh.Type.Version() == entry.ExpectedTypeVer {
+						if cc := entry.CalleeCache; cc != nil && cc.co != nil && atomic.LoadInt32(&cc.co.StreamGen) == cc.streamGen {
+							if st.frameIdx+2 <= len(vm.frames) && sp-argc-1+max(256, cc.co.NumLocals+64) <= len(st.stack) {
+								vm.frames[st.frameIdx].ip = ip
+								pushFn := (*val.PyFunction)(unsafe.Pointer(entry.CachedVal.HeaderPtr()))
+								nextIP, nextSP := vm.pushFrameFast(st, pushFn, cc, sp, argc+1, ip)
+								return nextIP, nextSP, ctlReload
+							}
+						}
+					}
+				}
+			}
+		}
+		return vm.opCallInstanceDunderSlow(st, inst, ip, sp)
+	case OP_UNPACK_3_FAST:
+		return vm.opUnpackStoreFastSlow(st, op, inst, ip, sp)
 	default:
 		panic("vm: unknown opcode")
 	}

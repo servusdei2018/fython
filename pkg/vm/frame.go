@@ -524,11 +524,28 @@ type ConstKeyMapTemplate struct {
 // InlineExpectEntry records the expected callee identity for a spliced
 // guard site so later polymorphic changes miss safely.
 type InlineExpectEntry struct {
-	Fn      val.Value
-	TypeVer uint64
-	AuxVer  uint64
-	ShapeID uint32
-	Shape2  uint32
+	Fn             val.Value
+	TypeVer        uint64
+	AuxVer         uint64
+	ShapeID        uint32
+	Shape2         uint32
+	TotalArgs      uint8
+	SavedSlot      uint8
+	ZeroFrom       uint8
+	Dunder         bool
+	IsFastAttrProp bool
+}
+
+// inlineSite records metadata for a spliced inline body so exception unwinding
+// and frame materialization map spliced IPs back to the callee and caller.
+type inlineSite struct {
+	GuardIP   int
+	BodyStart int
+	StubStart int
+	SavedSlot int
+	Callee    *CodeObject
+	Fn        *val.PyFunction
+	IPMap     []uint16
 }
 type VMCodeCache struct {
 	// owner is the VM this cache belongs to. It lets a code object publish
@@ -543,6 +560,7 @@ type VMCodeCache struct {
 	kwPIC        [][2]KwPICEntry
 	inlineExpect []InlineExpectEntry
 	inlineConsts []val.Value
+	inlineSites  []inlineSite
 	constKeyMaps []ConstKeyMapTemplate
 	// hotness counts how often this VM executed the code object. It is
 	// VM-local, so it never shares a cache line with another VM.
@@ -611,6 +629,26 @@ func (c *VMCodeCache) ensureInlineExpect(n int) []InlineExpectEntry {
 		c.inlineExpect = nw
 	}
 	return c.inlineExpect
+}
+
+func (c *VMCodeCache) frameConsts(co *CodeObject) []val.Value {
+	if c != nil && c.inlineConsts != nil {
+		return c.inlineConsts
+	}
+	return co.Consts
+}
+
+func (c *VMCodeCache) findInlineSite(ip int) *inlineSite {
+	if c == nil {
+		return nil
+	}
+	for i := range c.inlineSites {
+		s := &c.inlineSites[i]
+		if ip >= s.BodyStart && ip < s.StubStart+2 {
+			return s
+		}
+	}
+	return nil
 }
 
 func (c *VMCodeCache) ensureConstKeyMaps(n int) []ConstKeyMapTemplate {
@@ -1369,8 +1407,12 @@ func (vm *VM) materializeFrame(targetIdx int) val.Value {
 		vm.syncActiveFrame(vm.activeState, vm.activeState.ip)
 	}
 	fSlot := &vm.frames[targetIdx]
+	fIP := fSlot.ip
+	if site := fSlot.cache.findInlineSite(fIP); site != nil {
+		fIP = site.GuardIP
+	}
 	if fSlot.shadowFrame != nil {
-		fSlot.shadowFrame.IP = fSlot.ip
+		fSlot.shadowFrame.IP = fIP
 		return val.NewFrameVal(fSlot.shadowFrame)
 	}
 	co := fSlot.co
@@ -1400,7 +1442,7 @@ func (vm *VM) materializeFrame(targetIdx int) val.Value {
 		globals,
 		cells,
 	)
-	pyFrame.IP = fSlot.ip
+	pyFrame.IP = fIP
 	if fSlot.locals.IsDict() {
 		pyFrame.ExtraLocals = fSlot.locals.AsDict()
 	}

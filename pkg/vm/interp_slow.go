@@ -1301,6 +1301,9 @@ func (vm *VM) opFastAttrSlow(st *loopState, inst uint32, ip, sp int) (int, int, 
 				}
 			}
 		}
+		if st.cache != nil && ip+1 < len(st.cache.active) && DecodeOpcode(st.cache.active[ip+1]) == OP_GUARD_INLINE_METHOD {
+			st.cache.active[ip+1] = Encode(OP_NOP, 0, 0)
+		}
 		stack[sp] = obj
 		newIP, newSP, ctl := vm.opLoadAttrSlow(st, ReplaceOpcode(inst, OP_LOAD_ATTR), ip+1, sp+1)
 		// Restore OP_LOAD_FAST + OP_LOAD_ATTR per-VM for tuples/modules/types

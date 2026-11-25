@@ -122,7 +122,7 @@ func (vm *VM) pushCalleeFrame(
 	} else {
 		vm.syncCalleeCode(st, callee, cc)
 	}
-	st.consts = callee.Consts
+	st.consts = cc.frameConsts(callee)
 	st.base = newBase
 	if !callee.HasCells {
 		if st.cells != nil || st.cellPtrs != nil {
@@ -2143,6 +2143,9 @@ func (vm *VM) opCallSlow(st *loopState, inst uint32, ip, sp int) (int, int, loop
 					st.periodicTick++
 					if (st.periodicTick & 0xFF) == 0 {
 						vm.checkPeriodicSafepoint(st.frameIdx)
+					}
+					if !isDirectCoro && target == entry.CachedVal && DecodeOpcode(inst) == OP_CALL_PY_EXACT_ARGS {
+						vm.tryInlineFunc(st, ip, argc, fn)
 					}
 					minCap := max(newBase+256, newBase+callee.NumLocals+64)
 					if minCap > len(stack) {

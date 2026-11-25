@@ -110,7 +110,7 @@ func (vm *VM) saveAndPushInlineFrame(
 		maybeOptimizeCodeObject(vm, callee, st.cache)
 		st.codePtr, st.codeLen = vm.loadWindow(callee, st.cache)
 	}
-	st.consts = callee.Consts
+	st.consts = st.cache.frameConsts(callee)
 	st.base = childBase
 	st.cells = childCells
 	st.cellPtrs = childCellPtrs

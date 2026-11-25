@@ -2263,7 +2263,7 @@ func (vm *VM) inlineDunderCompare(dunder val.Value, newBase, retSP int, cmpLeft,
 	st.curCO = dcallee
 	st.cache = vm.cacheFor(dcallee)
 	st.codePtr, st.codeLen = vm.loadWindow(dcallee, st.cache)
-	st.consts = dcallee.Consts
+	st.consts = st.cache.frameConsts(dcallee)
 	st.base = newBase
 	switch {
 	case len(dcallee.CellVars) == 0 && dfn.Closure != nil:
@@ -2362,6 +2362,38 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 	faultCO := st.curCO
 	faultFrameIdx := st.frameIdx
 
+	var inlineCalleeFrame *val.PyFrame
+	if site := st.cache.findInlineSite(ip); site != nil {
+		if ip < site.StubStart && site.Callee != nil {
+			calleeIP := int(site.IPMap[ip-site.BodyStart])
+			calleeGlobals := st.globals
+			var calleeCells []val.Value
+			if site.Fn != nil {
+				if site.Fn.Globals != nil {
+					calleeGlobals = site.Fn.Globals
+				}
+				calleeCells = site.Fn.Closure
+			}
+			inlineCalleeFrame = val.NewPyFrame(vm, -1, st.base, NewCodeVal(site.Callee), calleeGlobals, calleeCells)
+			inlineCalleeFrame.IP = calleeIP
+			inlineCalleeFrame.Detach()
+			calleeLine := site.Callee.LineAt(calleeIP)
+			curTB = val.NewTracebackVal(val.NewFrameVal(inlineCalleeFrame), calleeLine, calleeIP, curTB)
+			if exc.IsInstance() {
+				exc.AsInstance().SetAttr(nameTraceback, curTB)
+			}
+			savedSlot := st.base + site.SavedSlot
+			if savedSlot >= 0 && savedSlot < len(st.stack) {
+				callerBase := int(st.stack[savedSlot].AsInt64())
+				st.base = callerBase
+				vm.activeBaseOffset = callerBase
+			}
+		}
+		ip = site.GuardIP
+		faultIP = site.GuardIP
+		st.ip = faultIP
+	}
+
 	if faultFrameIdx >= 0 && faultFrameIdx < len(vm.frames) {
 		fSlot := &vm.frames[faultFrameIdx]
 		fSlot.co = faultCO
@@ -2416,10 +2448,14 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 			}
 		}
 
-		if curTB.IsNone() && faultCO != nil {
+		if (curTB.IsNone() || inlineCalleeFrame != nil) && faultCO != nil {
 			line := faultCO.LineAt(faultIP)
 			frameVal := vm.materializeFrame(faultFrameIdx)
-			curTB = val.NewTracebackVal(frameVal, line, faultIP, val.NoneVal())
+			if inlineCalleeFrame != nil {
+				inlineCalleeFrame.Back = frameVal
+				inlineCalleeFrame = nil
+			}
+			curTB = val.NewTracebackVal(frameVal, line, faultIP, curTB)
 			if exc.IsInstance() {
 				exc.AsInstance().SetAttr(nameTraceback, curTB)
 			}
@@ -2511,12 +2547,43 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 			st.globals = caller.globals
 			st.curLocals = caller.locals
 			st.cache = caller.cache
+			var poppedInlineCallee *val.PyFrame
+			if site := st.cache.findInlineSite(callerIP); site != nil {
+				if callerIP < site.StubStart && site.Callee != nil {
+					calleeIP := int(site.IPMap[callerIP-site.BodyStart])
+					calleeGlobals := st.globals
+					var calleeCells []val.Value
+					if site.Fn != nil {
+						if site.Fn.Globals != nil {
+							calleeGlobals = site.Fn.Globals
+						}
+						calleeCells = site.Fn.Closure
+					}
+					poppedInlineCallee = val.NewPyFrame(vm, -1, st.base, NewCodeVal(site.Callee), calleeGlobals, calleeCells)
+					poppedInlineCallee.IP = calleeIP
+					poppedInlineCallee.Detach()
+					calleeLine := site.Callee.LineAt(calleeIP)
+					curTB = val.NewTracebackVal(val.NewFrameVal(poppedInlineCallee), calleeLine, calleeIP, curTB)
+					savedSlot := st.base + site.SavedSlot
+					if savedSlot >= 0 && savedSlot < len(st.stack) {
+						callerBase := int(st.stack[savedSlot].AsInt64())
+						st.base = callerBase
+						caller.baseOffset = callerBase
+						vm.activeBaseOffset = callerBase
+					}
+				}
+				callerIP = site.GuardIP
+				caller.ip = callerIP
+			}
 			ip = callerIP
 			st.ip = callerIP
 
 			if caller.co != nil {
 				line := caller.co.LineAt(callerIP)
 				frameVal := vm.materializeFrame(st.frameIdx)
+				if poppedInlineCallee != nil {
+					poppedInlineCallee.Back = frameVal
+				}
 				curTB = val.NewTracebackVal(frameVal, line, callerIP, curTB)
 				if exc.IsInstance() {
 					exc.AsInstance().SetAttr(nameTraceback, curTB)
@@ -2773,6 +2840,7 @@ func (vm *VM) runFrame(co *CodeObject, startBase int, startSP int, startFrameIdx
 
 	st.cache = vm.cacheFor(co)
 	st.codePtr, st.codeLen = vm.loadWindow(co, st.cache)
+	st.consts = st.cache.frameConsts(co)
 	vm.activeState = st
 
 	if atomic.LoadInt32(&co.IsTier2Optimized) == 0 {
@@ -2895,6 +2963,13 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 			}
 			ip += 2
 			continue
+		case OP_POP_LOAD_FAST:
+			if !vm.hasTrackedViews && uint16(inst) < 256 {
+				*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)) = *(*val.Value)(unsafe.Add(locals, uintptr(uint8(inst))*16))
+				ip += 2
+				continue
+			}
+			ip, sp, ctl = vm.opPopLoadFastSlow(st, inst, ip, sp)
 		case OP_LOAD_GLOBAL, OP_LOAD_GLOBAL_FAST:
 			if st.globals.Header.Type == val.DictType || st.globals.Header.Type == nil {
 				globVer := atomic.LoadUint64(&st.globals.VersionTag)
@@ -3036,6 +3111,24 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				ip++
 			}
 			continue
+		case OP_JUMP_IF_TRUE:
+			sp--
+			cond := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16))
+			if cond.IsTruthy() {
+				ip = int(uint16(inst))
+			} else {
+				ip++
+			}
+			continue
+		case OP_JUMP_IF_TRUE_OR_POP, OP_JUMP_IF_FALSE_OR_POP:
+			cond := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
+			if cond.IsTruthy() == (op == OP_JUMP_IF_TRUE_OR_POP) {
+				ip = int(uint16(inst))
+			} else {
+				sp--
+				ip++
+			}
+			continue
 
 		case OP_JUMP:
 			target := int(uint16(inst))
@@ -3080,39 +3173,33 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				}
 			}
 			ip, sp, ctl = vm.opCallSlow(st, inst, ip, sp)
-		case OP_CALL_PY_DEFAULTS:
-			argc := int(uint8(inst >> 16))
-			newBase := sp - argc
-			retSP := newBase - 1
-			target := *(*val.Value)(unsafe.Add(stackPtr, uintptr(retSP)*16))
-			entry := &st.cache.ic[ip]
-			if target == entry.CachedVal && !vm.hasTrackedViews {
-				fn := target.AsFunction()
-				cc := entry.CalleeCache
-				if cc != nil && cc.owner == vm && cc.co != nil &&
-					fn.Code.HeaderPtr() == &cc.co.Header &&
-					len(fn.Defaults) > 0 && fn.KwDefaults == nil &&
-					atomic.LoadInt32(&cc.co.StreamGen) == cc.streamGen {
-					callee := cc.co
-					if argc >= callee.PositionalParamCount-len(fn.Defaults) &&
-						argc <= callee.PositionalParamCount {
-						st.periodicTick++
-						if (st.periodicTick&0xFF) != 0 &&
-							st.frameIdx+2 <= len(vm.frames) &&
-							newBase+max(256, callee.NumLocals+64) <= len(st.stack) {
-							if argc < callee.PositionalParamCount {
-								defStart := callee.PositionalParamCount - len(fn.Defaults)
-								copy(st.stack[newBase+argc:newBase+callee.PositionalParamCount], fn.Defaults[argc-defStart:])
-							}
-							pushFn = fn
-							pushCache = cc
-							pushTotalArgs = ^argc
-							goto pushFrame
-						}
-					}
+		case OP_CALL_LEN:
+			if *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) == vm.builtinLen {
+				arg := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
+				var n int
+				lenHit := true
+				switch {
+				case arg.IsList() && arg.AsList().Header.Type == val.ListType:
+					n = len(arg.AsList().Items)
+				case arg.IsTuple() && arg.AsTuple().Header.Type == val.TupleType:
+					n = len(arg.AsTuple().Items)
+				case arg.IsDict() && arg.AsDict().Header.Type == val.DictType:
+					n = arg.AsDict().Len()
+				case val.IsInlineStrASCII(arg):
+					n = int(arg.RawNum() & 0xFF)
+				case arg.IsInlineStr() || (arg.IsString() && arg.AsStringObj().Header.Type == val.StrType):
+					n = arg.StringLen()
+				default:
+					lenHit = false
+				}
+				if lenHit {
+					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.Int64Val(int64(n))
+					sp--
+					ip++
+					continue
 				}
 			}
-			ip, sp, ctl = vm.opCallPyDefaults(st, inst, ip, sp)
+			ip, sp, ctl = vm.opCallLenSlow(st, inst, ip, sp)
 		case OP_CALL_ISINSTANCE:
 			target := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-3)*16))
 			if target == vm.builtinIsInstance {
@@ -3275,27 +3362,6 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 			}
 		case OP_CALL_BOUND_NATIVE:
 			ip, sp, ctl = vm.opCallBoundNative(st, inst, ip, sp)
-		case OP_CALL_INSTANCE_DUNDER:
-			argc := int(uint8(inst >> 16))
-			entry := &st.cache.ic[ip]
-			if entry.Kind == ICKindInstanceCall && entry.SlotIndex == int32(argc+1) && !vm.hasTrackedViews {
-				if oh := *(**val.ObjectHeader)(unsafe.Add(stackPtr, uintptr(sp-argc-1)*16+8)); oh != nil && oh.Kind == val.KindInstance {
-					if (*val.PyInstance)(unsafe.Pointer(oh)).Shape != nil && (*val.PyInstance)(unsafe.Pointer(oh)).Shape.ID == entry.ExpectedShapeID {
-						if oh.Type != nil && oh.Type.Version() == entry.ExpectedTypeVer {
-							if cc := entry.CalleeCache; cc != nil && cc.co != nil && atomic.LoadInt32(&cc.co.StreamGen) == cc.streamGen {
-								if st.frameIdx+2 <= len(vm.frames) && sp-argc-1+max(256, cc.co.NumLocals+64) <= len(st.stack) {
-									vm.frames[st.frameIdx].ip = ip
-									pushFn = (*val.PyFunction)(unsafe.Pointer(entry.CachedVal.HeaderPtr()))
-									pushCache = cc
-									pushTotalArgs = argc + 1
-									goto pushFrame
-								}
-							}
-						}
-					}
-				}
-			}
-			ip, sp, ctl = vm.opCallInstanceDunderSlow(st, inst, ip, sp)
 		case OP_CALL_TYPE_INIT:
 			argc := int(uint8(inst >> 16))
 			initBase := sp - argc - 1
@@ -3475,6 +3541,9 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 							*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16)) = val.ObjectVal(&instObj.Header)
 							sp++
 							ip++
+							if Opcode(*(*uint32)(unsafe.Add(codePtr, uintptr(ip)*4))>>24) != OP_NOP {
+								continue
+							}
 							goto loadAttrProp
 						}
 					}
@@ -3585,6 +3654,29 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 			*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16)) = attrRes
 			ip++
 			continue
+		case OP_STORE_ATTR:
+			v := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16))
+			obj := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
+			vhdr := v.HeaderPtr()
+			if (vhdr == nil || ((vhdr.Flags&val.FlagEphemeralAll) == 0 && vhdr.Kind != val.KindMemoryView && (vhdr.Kind != val.KindString || (*val.PyString)(unsafe.Pointer(vhdr)).Buf == nil))) && !val.MultiThreadedFlag.Load() {
+				if instObj := obj.AsInstanceChecked(); instObj != nil {
+					instShape := instObj.Shape
+					instType := instObj.Header.Type
+					if instShape != nil && instType != nil && (instType.Flags&val.FlagCustomSetAttr) == 0 && uint(ip) < uint(len(st.cache.attrPIC)) {
+						pic := &st.cache.attrPIC[ip]
+						if pic[0].Shape == instShape && pic[0].TypeVer == uint32(instType.Version()) {
+							slotIdx := pic[0].SlotIndex
+							if uint(slotIdx) < uint(len(instObj.Slots)) {
+								instObj.Slots[slotIdx] = v
+								sp -= 2
+								ip++
+								continue
+							}
+						}
+					}
+				}
+			}
+			ip, sp, ctl = vm.dispatchColdOpcode(st, op, inst, ip, sp)
 		case OP_POP_TOP:
 			sp--
 			if vm.hasTrackedViews {
@@ -3728,7 +3820,7 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 				}
 			}
 			ip, sp, ctl = vm.opUnpackSequence(st, inst, ip, sp)
-		case OP_UNPACK_2_FAST, OP_UNPACK_3_FAST:
+		case OP_UNPACK_2_FAST:
 			if !vm.hasTrackedViews {
 				seq := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
 				var itemsPtr unsafe.Pointer
@@ -3744,15 +3836,10 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 					itemsPtr = unsafe.Pointer(unsafe.SliceData(l.Items))
 					itemsLen = len(l.Items)
 				}
-				if (op == OP_UNPACK_2_FAST && itemsLen == 2) || (op == OP_UNPACK_3_FAST && itemsLen == 3) {
+				if itemsLen == 2 {
 					*(*val.Value)(unsafe.Add(locals, uintptr(uint8(inst>>16))*16)) = *(*val.Value)(itemsPtr)
 					*(*val.Value)(unsafe.Add(locals, uintptr(uint8(inst>>8))*16)) = *(*val.Value)(unsafe.Add(itemsPtr, 16))
-					if op == OP_UNPACK_3_FAST {
-						*(*val.Value)(unsafe.Add(locals, uintptr(uint8(inst))*16)) = *(*val.Value)(unsafe.Add(itemsPtr, 32))
-						ip += 4
-					} else {
-						ip += 3
-					}
+					ip += 3
 					sp--
 					continue
 				}
@@ -3808,57 +3895,6 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 			*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-2)*16)) = val.BoolVal(cmpRes)
 			sp--
 			ip++
-			continue
-		case OP_COMPARE_FAST_FAST:
-			cmpOp := uint8(inst >> 16)
-			ffa := *(*val.Value)(unsafe.Add(locals, uintptr(uint8(inst>>8))*16))
-			ffb := *(*val.Value)(unsafe.Add(locals, uintptr(uint8(inst))*16))
-			var ffRes bool
-			ffHit := true
-			switch {
-			case cmpOp == CMP_IS:
-				ffRes = ffa == ffb
-			case cmpOp == CMP_IS_NOT:
-				ffRes = ffa != ffb
-			case ffa.IsInt64() && ffb.IsInt64() && cmpOp <= CMP_GTE:
-				ai, bi := ffa.AsInt64(), ffb.AsInt64()
-				switch cmpOp {
-				case CMP_EQ:
-					ffRes = ai == bi
-				case CMP_NEQ:
-					ffRes = ai != bi
-				case CMP_LT:
-					ffRes = ai < bi
-				case CMP_LTE:
-					ffRes = ai <= bi
-				case CMP_GT:
-					ffRes = ai > bi
-				case CMP_GTE:
-					ffRes = ai >= bi
-				}
-			case (cmpOp == CMP_EQ || cmpOp == CMP_NEQ) && ffa.IsNone() && ffb.IsNone():
-				ffRes = cmpOp == CMP_EQ
-			case (cmpOp == CMP_EQ || cmpOp == CMP_NEQ) && (ffa.IsNone() || ffb.IsNone()):
-				ffRes = cmpOp == CMP_NEQ
-			case (cmpOp == CMP_EQ || cmpOp == CMP_NEQ) && ffa.IsInlineStr() && ffb.IsInlineStr():
-				ffRes = (ffa == ffb) == (cmpOp == CMP_EQ)
-			case (cmpOp == CMP_EQ || cmpOp == CMP_NEQ) && ffa.IsString() && ffb.IsString():
-				fah, fbh := ffa.HeaderPtr(), ffb.HeaderPtr()
-				if fah != nil && fbh != nil && (fah.Flags&val.FlagInterned) != 0 && (fbh.Flags&val.FlagInterned) != 0 {
-					ffRes = (fah == fbh) == (cmpOp == CMP_EQ)
-				} else {
-					ffHit = false
-				}
-			default:
-				ffHit = false
-			}
-			if !ffHit {
-				ip, sp, ctl = vm.dispatchColdOpcode(st, op, inst, ip, sp)
-				break
-			}
-			*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16)) = val.BoolVal(ffRes)
-			sp++
-			ip += 3
 			continue
 		case OP_COMPARE_JUMP_IF_FALSE:
 			cmpOp := uint8(inst >> 16)
@@ -3946,20 +3982,46 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 			ip++
 			continue
 
-		case OP_FAST_ADD_INT_LOCALS:
-			va := *(*val.Value)(unsafe.Add(locals, uintptr(uint8(inst>>16))*16))
-			vb := *(*val.Value)(unsafe.Add(locals, uintptr(uint8(inst))*16))
-			if va.IsInt64() && vb.IsInt64() {
-				ai, bi := va.AsInt64(), vb.AsInt64()
-				sum := ai + bi
-				if ((ai ^ sum) & (bi ^ sum)) >= 0 {
-					*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16)) = val.Int64Val(sum)
-					sp++
-					ip += 3
+		case OP_GUARD_INLINE_METHOD, OP_GUARD_INLINE_FUNC:
+			if uint(ip) < uint(len(st.cache.inlineExpect)) {
+				exp := &st.cache.inlineExpect[ip]
+				nb := sp - int(exp.TotalArgs)
+				hit := false
+				if op == OP_GUARD_INLINE_FUNC {
+					hit = *(*val.Value)(unsafe.Add(stackPtr, uintptr(nb-1)*16)) == exp.Fn
+				} else if oh := *(**val.ObjectHeader)(unsafe.Add(stackPtr, uintptr(nb)*16+8)); !exp.Dunder && oh != nil && oh.Kind == val.KindInstance {
+					in := (*val.PyInstance)(unsafe.Pointer(oh))
+					hit = in.Shape != nil && in.Shape.ID == exp.ShapeID && oh.Type != nil && oh.Type.Version() == exp.TypeVer
+				}
+				nsp := nb + int(exp.SavedSlot) + 1
+				if hit && nsp+256 <= len(st.stack) && (!st.stackIsVM || nsp+256 <= vm.maxSP) &&
+					unsafe.SliceData(st.consts) == unsafe.SliceData(st.cache.inlineConsts) {
+					for i := nb + int(exp.ZeroFrom); i < nsp-1; i++ {
+						*(*val.Value)(unsafe.Add(stackPtr, uintptr(i)*16)) = val.NoneVal()
+					}
+					*(*val.Value)(unsafe.Add(stackPtr, uintptr(nsp-1)*16)) = val.Int64Val(int64(st.base))
+					st.base = nb
+					vm.activeBaseOffset = nb
+					locals = unsafe.Add(stackPtr, uintptr(nb)*16)
+					sp = nsp
+					ip = int(uint16(inst))
 					continue
 				}
 			}
-			ip, sp, ctl = vm.dispatchColdOpcode(st, op, inst, ip, sp)
+			ip, sp, ctl = vm.opGuardInline(st, op, inst, ip, sp)
+		case OP_INLINE_RETURN:
+			a := uint8(inst >> 16)
+			rv := *(*val.Value)(unsafe.Add(stackPtr, uintptr(sp-1)*16))
+			ob := int((*val.Value)(unsafe.Add(locals, uintptr(a&0x7F)*16)).AsInt64())
+			rsp := st.base - int(a>>7)
+			*(*val.Value)(unsafe.Add(stackPtr, uintptr(rsp)*16)) = rv
+			st.base = ob
+			vm.activeBaseOffset = ob
+			locals = unsafe.Add(stackPtr, uintptr(ob)*16)
+			sp = rsp + 1
+			ip = int(uint16(inst))
+			continue
+
 		default:
 			ip, sp, ctl = vm.dispatchColdOpcode(st, op, inst, ip, sp)
 		}
@@ -4091,7 +4153,7 @@ func (vm *VM) pushFrameFast(
 	st.cache = pushCache
 	st.codePtr = pushCache.codePtr
 	st.codeLen = pushCache.codeLen
-	st.consts = pushCallee.Consts
+	st.consts = pushCache.frameConsts(pushCallee)
 	st.base = pushNewBase
 	if !pushCallee.HasCells {
 		if st.cells != nil || st.cellPtrs != nil {
