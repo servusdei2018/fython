@@ -332,16 +332,17 @@ type TypeSlots struct {
 // C3 MRO linearization, and monotonic VersionTag invalidation.
 // Header MUST be at byte offset 0.
 type PyType struct {
-	Header     ObjectHeader
-	Name       string
-	Bases      []*PyType
-	MRO        []*PyType
-	Subclasses []*PyType
-	Dict       *PyDict
-	RootShape  *Shape
-	VersionTag uint64
-	Flags      uint32
-	Slots      TypeSlots
+	Header        ObjectHeader
+	Name          string
+	Bases         []*PyType
+	MRO           []*PyType
+	Subclasses    []*PyType
+	Dict          *PyDict
+	RootShape     *Shape
+	VersionTag    uint64
+	Flags         uint32
+	likelySlotCap atomic.Uint32
+	Slots         TypeSlots
 	// UsesDefaultNew reports whether instantiation may skip a custom
 	// __new__: the resolved __new__ is absent or object.__new__. The
 	// metaclass gate is checked live at call sites, so this flag only
@@ -358,6 +359,7 @@ type PyType struct {
 	dunderMul     Value
 	dunderAbs     Value
 	dunderLen     Value
+	dunderBool    Value
 	dunderGetItem Value
 	dunderSetItem Value
 	dunderCall    Value
@@ -1626,6 +1628,11 @@ func (t *PyType) syncDunderSlots() {
 		t.dunderHash = fn
 	} else {
 		t.dunderHash = Value{}
+	}
+	if fn, _, ok := t.lookupMROUncached(strBool); ok {
+		t.dunderBool = fn
+	} else {
+		t.dunderBool = Value{}
 	}
 	if fn, _, ok := t.lookupMROUncached(DunderDir); ok {
 		t.dunderDir = fn

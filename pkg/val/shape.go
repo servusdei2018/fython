@@ -302,9 +302,17 @@ func NewInstanceOfType(cls *PyType) Value {
 		Shape:  shape,
 	}
 	if n <= len(obj.bootstrap) {
-		obj.Slots = obj.bootstrap[:n]
+		if pred := int(cls.likelySlotCap.Load()); pred > len(obj.bootstrap) {
+			obj.Slots = make([]Value, n, pred)
+		} else {
+			obj.Slots = obj.bootstrap[:n]
+		}
 	} else {
-		obj.Slots = make([]Value, n, max(8, n))
+		capHint := max(8, n)
+		if pred := int(cls.likelySlotCap.Load()); pred > capHint {
+			capHint = pred
+		}
+		obj.Slots = make([]Value, n, capHint)
 	}
 	return Value{num: 0, ptr: &obj.Header}
 }
@@ -363,12 +371,35 @@ func (inst *PyInstance) SetSlot(idx int, val Value) bool {
 	return true
 }
 
-// ExtendBootstrapSlot appends v into the inline bootstrap array at slotIdx when
-// slotIdx is the next contiguous slot and still fits inline.
+// noteSlotCap monotonically bumps cls.likelySlotCap up to min(c, 64) so future
+// instances of multi-attribute classes pre-allocate Slots once without growing
+// past bootstrap mid-__init__.
+func (t *PyType) noteSlotCap(c int) {
+	if t == nil || c <= 6 {
+		return
+	}
+	if c > 64 {
+		c = 64
+	}
+	want := uint32(c)
+	for {
+		cur := t.likelySlotCap.Load()
+		if cur >= want {
+			return
+		}
+		if t.likelySlotCap.CompareAndSwap(cur, want) {
+			return
+		}
+	}
+}
+
+// ExtendBootstrapSlot appends v into inst.Slots at slotIdx when slotIdx is the
+// next contiguous slot and fits within existing capacity (either inline bootstrap
+// or a pre-allocated Slots slice).
 func (inst *PyInstance) ExtendBootstrapSlot(slotIdx int, v Value) bool {
-	if slotIdx == len(inst.Slots) && slotIdx < len(inst.bootstrap) && (slotIdx == 0 || &inst.Slots[0] == &inst.bootstrap[0]) {
-		inst.bootstrap[slotIdx] = v
-		inst.Slots = inst.bootstrap[:slotIdx+1]
+	if slotIdx == len(inst.Slots) && slotIdx < cap(inst.Slots) {
+		inst.Slots = inst.Slots[:slotIdx+1]
+		inst.Slots[slotIdx] = v
 		return true
 	}
 	return false
@@ -381,9 +412,9 @@ func (inst *PyInstance) ApplyShapeTransition(newShape *Shape, slotIdx int, v Val
 		switch {
 		case slotIdx < len(inst.Slots):
 			inst.Slots[slotIdx] = v
-		case slotIdx == len(inst.Slots) && slotIdx < len(inst.bootstrap) && (slotIdx == 0 || &inst.Slots[0] == &inst.bootstrap[0]):
-			inst.bootstrap[slotIdx] = v
-			inst.Slots = inst.bootstrap[:slotIdx+1]
+		case slotIdx == len(inst.Slots) && slotIdx < cap(inst.Slots):
+			inst.Slots = inst.Slots[:slotIdx+1]
+			inst.Slots[slotIdx] = v
 		default:
 			inst.Slots = inst.appendSlot(v)
 		}
@@ -395,9 +426,9 @@ func (inst *PyInstance) ApplyShapeTransition(newShape *Shape, slotIdx int, v Val
 	switch {
 	case slotIdx < len(inst.Slots):
 		inst.Slots[slotIdx] = v
-	case slotIdx == len(inst.Slots) && slotIdx < len(inst.bootstrap) && (slotIdx == 0 || &inst.Slots[0] == &inst.bootstrap[0]):
-		inst.bootstrap[slotIdx] = v
-		inst.Slots = inst.bootstrap[:slotIdx+1]
+	case slotIdx == len(inst.Slots) && slotIdx < cap(inst.Slots):
+		inst.Slots = inst.Slots[:slotIdx+1]
+		inst.Slots[slotIdx] = v
 	default:
 		inst.Slots = inst.appendSlot(v)
 	}
@@ -498,15 +529,23 @@ allowDynamic:
 
 func (inst *PyInstance) appendSlot(value Value) []Value {
 	n := len(inst.Slots)
-	if n < len(inst.bootstrap) && (n == 0 || &inst.Slots[0] == &inst.bootstrap[0]) {
-		inst.bootstrap[n] = value
-		return inst.bootstrap[:n+1]
+	if n < cap(inst.Slots) {
+		s := inst.Slots[:n+1]
+		s[n] = value
+		return s
 	}
 	if n == len(inst.bootstrap) && n > 0 && &inst.Slots[0] == &inst.bootstrap[0] {
 		newSlots := make([]Value, n+1, n+4)
 		copy(newSlots, inst.bootstrap[:])
 		newSlots[n] = value
+		if inst.Header.Type != nil {
+			inst.Header.Type.noteSlotCap(cap(newSlots))
+		}
 		return newSlots
 	}
-	return append(inst.Slots, value)
+	inst.Slots = append(inst.Slots, value)
+	if inst.Header.Type != nil && cap(inst.Slots) > len(inst.bootstrap) {
+		inst.Header.Type.noteSlotCap(cap(inst.Slots))
+	}
+	return inst.Slots
 }

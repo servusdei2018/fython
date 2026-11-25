@@ -1496,7 +1496,7 @@ func strSqItem(ctx *ExecContext, a, idxVal Value) Value {
 		}
 		return SmallStringVal(s[idx : idx+1])
 	}
-	runes := []rune(s)
+	runes := StringValRunes(a)
 	if idx < 0 {
 		idx += len(runes)
 	}
@@ -1535,7 +1535,7 @@ func strMpSubscript(ctx *ExecContext, a, idxVal Value) Value {
 			}
 			return NewStringVal(buf.String())
 		}
-		runes := []rune(s)
+		runes := StringValRunes(a)
 		start, stop, step, sliceLen, err := NormalizeSliceIndices(sl.Start, sl.Stop, sl.Step, len(runes))
 		if err != nil {
 			panic(err.Error())
@@ -5699,12 +5699,7 @@ func initTypes() {
 			ctx.Raise(NewException(TypeErrorType, "descriptor 'copy' of 'dict' object needs an argument"))
 			return NoneVal()
 		}
-		d := args[0].AsDict()
-		newD := NewDictVal(d.Len()).AsDict()
-		d.ForEachActive(func(k, v Value) bool {
-			newD.Set(k, v)
-			return true
-		})
+		newD := args[0].AsDict().Copy()
 		return Value{ptr: &newD.Header}
 	}))
 
@@ -5776,19 +5771,11 @@ func initTypes() {
 		if posCount > 1 {
 			other := args[1]
 			if other.IsDict() {
-				if od := other.AsDict(); od != d {
-					od.ForEachActive(func(k, v Value) bool {
-						d.Set(k, v)
-						return true
-					})
-				}
+				d.UpdateFromDict(other.AsDict())
 			} else if other.IsMappingProxy() {
 				mp := other.AsMappingProxy()
 				if mp.Mapping.IsDict() {
-					mp.Mapping.AsDict().ForEachActive(func(k, v Value) bool {
-						d.Set(k, v)
-						return true
-					})
+					d.UpdateFromDict(mp.Mapping.AsDict())
 				}
 			} else if keysFn, _, ok := other.Type().LookupMRO(strKeys); ok {
 				keysVal := ctx.Invoke1(keysFn, other)
@@ -7478,25 +7465,9 @@ func initTypes() {
 		case arg.IsTuple():
 			return NewSetVal(arg.AsTuple().Items...)
 		case arg.IsSet():
-			s := NewSetVal().AsSet()
-			for _, e := range arg.AsSet().DictEntries() {
-				if e.Active {
-					s.Add(e.Key)
-				}
-			}
-			return SetVal(s)
+			return SetVal(arg.AsSet().Copy())
 		case arg.IsDict():
-			s := NewSetVal().AsSet()
-			d := arg.AsDict()
-			if d.Live != nil {
-				return NewSetVal(d.Keys()...)
-			}
-			for _, e := range d.Entries {
-				if e.Active {
-					s.Add(e.Key)
-				}
-			}
-			return SetVal(s)
+			return NewSetFromDict(arg.AsDict())
 		}
 		items := ExtractIterableItems(ctx, arg)
 		if ctx != nil && ctx.HasException() {
@@ -7574,7 +7545,7 @@ func initTypes() {
 			return NoneVal()
 		}
 		if args[0].IsSet() {
-			return NewSetVal(args[0].AsSet().Items()...)
+			return SetVal(args[0].AsSet().Copy())
 		}
 		return NewSetVal()
 	}))

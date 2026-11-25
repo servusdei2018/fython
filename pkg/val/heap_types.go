@@ -33,6 +33,9 @@ type PyString struct {
 	// two VMs concatenating the very same string can never both mutate the
 	// shared backing bytes.
 	BufClaimed uint32
+	// asciiState caches pure-ASCII classification (0=unknown, 1=ASCII, 2=non-ASCII)
+	// in the 4-byte tail padding after BufClaimed (0 extra struct bytes).
+	asciiState atomic.Uint32
 }
 
 // PyList represents a dynamic array of Value on the heap.
@@ -2736,7 +2739,7 @@ func (d *PyDict) Set(key, value Value) {
 }
 
 // dictKeyEqual compares a dict entry key against a lookup key using O(1)
-// pointer/inline-string fast paths before falling back to generic Equals.
+// pointer/inline-string fast paths before falling back to dictKeyEqualSlow.
 func dictKeyEqual(a, b Value) bool {
 	if a == b {
 		return true
@@ -2753,7 +2756,65 @@ func dictKeyEqual(a, b Value) bool {
 			return StringEquals(a, b)
 		}
 	}
+	return dictKeyEqualSlow(a, b)
+}
+
+//go:noinline
+func dictKeyEqualSlow(a, b Value) bool {
+	if a.ptr != nil && b.ptr != nil &&
+		a.ptr.Kind == KindTuple && b.ptr.Kind == KindTuple &&
+		a.ptr.Type == TupleType && b.ptr.Type == TupleType {
+		return tupleDictKeyEqual(a, b)
+	}
 	return Equals(a, b)
+}
+
+//go:noinline
+func tupleDictKeyEqual(a, b Value) bool {
+	if a.ptr == b.ptr {
+		return true
+	}
+	ia := (*PyTuple)(unsafe.Pointer(a.ptr)).Items
+	ib := (*PyTuple)(unsafe.Pointer(b.ptr)).Items
+	if len(ia) != len(ib) {
+		return false
+	}
+	for i := range ia {
+		ea, eb := ia[i], ib[i]
+		if ea == eb {
+			// Matches CPython PyObject_RichCompareBool: identical element
+			// identity is equal inside tuple dict/set keys (even for NaN).
+			continue
+		}
+		if ea.ptr == &tagInt64 && eb.ptr == &tagInt64 {
+			return false
+		}
+		if ea.ptr == &tagInlineStr && eb.ptr == &tagInlineStr {
+			return false
+		}
+		if (ea.ptr == &tagInt64 && eb.ptr == &tagBool) || (ea.ptr == &tagBool && eb.ptr == &tagInt64) {
+			if ea.num != eb.num {
+				return false
+			}
+			continue
+		}
+		if ea.ptr != nil && eb.ptr != nil {
+			if (ea.ptr.Flags & eb.ptr.Flags & FlagInterned) != 0 {
+				return false
+			}
+			if (ea.ptr == &tagInlineStr || ea.ptr.Kind == KindString) &&
+				(eb.ptr == &tagInlineStr || eb.ptr.Kind == KindString) {
+				if !StringEquals(ea, eb) {
+					return false
+				}
+				continue
+			}
+		}
+		if !Equals(ea, eb) {
+			return false
+		}
+	}
+	return true
 }
 
 func (d *PyDict) bumpVersionTag() {
@@ -3286,6 +3347,108 @@ func SetVal(s *PySet) Value {
 	return Value{ptr: &s.Header}
 }
 
+// Copy returns a shallow copy of d, using a pre-sized PutNewHashed fast path
+// for concrete single-threaded non-live dicts (zero repeated resizes or re-hashing).
+func (d *PyDict) Copy() *PyDict {
+	if d.Live == nil && !d.Shared && !MultiThreadedFlag.Load() {
+		if d.used == 0 {
+			return &PyDict{Header: ObjectHeader{Kind: KindDict, Type: DictType}}
+		}
+		var newD *PyDict
+		if d.used <= 5 {
+			newD = NewSmallDictDirect(0)
+		} else {
+			newD = NewDictVal(d.used).AsDict()
+		}
+		for i := range d.Entries {
+			e := &d.Entries[i]
+			if e.Active {
+				newD.PutNewHashed(e.Key, e.Value, e.Hash)
+			}
+		}
+		return newD
+	}
+	newD := NewDictVal(d.Len()).AsDict()
+	d.ForEachActive(func(k, v Value) bool {
+		newD.Set(k, v)
+		return true
+	})
+	return newD
+}
+
+// UpdateFromDict copies all active entries from other into d, using a pre-sized
+// PutNewHashed fast path for concrete single-threaded non-live dicts.
+func (d *PyDict) UpdateFromDict(other *PyDict) {
+	if other == d {
+		return
+	}
+	if d.Live == nil && other.Live == nil && !d.Shared && !other.Shared && !MultiThreadedFlag.Load() {
+		if other.used == 0 {
+			return
+		}
+		need := d.used + other.used
+		if len(d.indices) == 0 {
+			d.initTable(max(4, need))
+		} else if d.used != d.filled || (d.filled+other.used)*3 > int(d.mask+1)*2 || len(d.Entries)+other.used+dictIndexOffset >= d.maxIndexValue() {
+			// Resizing compacts away any tombstones so PutNewHashed is safe.
+			d.resize(need)
+		}
+		for i := range other.Entries {
+			e := &other.Entries[i]
+			if e.Active {
+				d.PutNewHashed(e.Key, e.Value, e.Hash)
+			}
+		}
+		return
+	}
+	other.ForEachActive(func(k, v Value) bool {
+		d.Set(k, v)
+		return true
+	})
+}
+
+// NewSetFromDict creates a new PySet containing the keys of d, using a pre-sized
+// PutNewHashed fast path for concrete single-threaded non-live dicts.
+func NewSetFromDict(d *PyDict) Value {
+	if d.Live == nil && !d.Shared && !MultiThreadedFlag.Load() {
+		s := &PySet{
+			Header: ObjectHeader{Kind: KindSet, Type: SetType},
+		}
+		if d.used > 0 {
+			s.dict.initTable(max(4, d.used))
+			for i := range d.Entries {
+				e := &d.Entries[i]
+				if e.Active {
+					s.dict.PutNewHashed(e.Key, NoneVal(), e.Hash)
+				}
+			}
+		}
+		return Value{ptr: &s.Header}
+	}
+	return NewSetVal(d.Keys()...)
+}
+
+// Copy returns a shallow copy of s, reusing pre-computed hashes without re-hashing.
+func (s *PySet) Copy() *PySet {
+	d := &s.dict
+	if d.Live == nil && !d.Shared && !MultiThreadedFlag.Load() {
+		out := &PySet{
+			Header: ObjectHeader{Kind: KindSet, Type: SetType},
+		}
+		if d.used > 0 {
+			out.dict.initTable(max(4, d.used))
+			for i := range d.Entries {
+				e := &d.Entries[i]
+				if e.Active {
+					out.dict.PutNewHashed(e.Key, NoneVal(), e.Hash)
+				}
+			}
+		}
+		return out
+	}
+	return NewSetVal(s.Items()...).AsSet()
+}
+
 // Add adds an element to the set.
 func (s *PySet) Add(v Value) {
 	s.dict.Set(v, NoneVal())
@@ -3624,11 +3787,7 @@ func FormatValueCtx(ctx *ExecContext, v Value, spec string, conversion uint8) Va
 			return v
 		}
 		if v.IsInt64() {
-			n := v.AsInt64()
-			if n >= 0 && n < 10 {
-				return NewStringVal(string(byte('0' + n)))
-			}
-			return NewStringVal(strconv.FormatInt(n, 10))
+			return IntToStringVal(v.AsInt64())
 		}
 		if v.IsFloat64() {
 			return NewStringVal(FloatRepr(v.AsFloat64()))
@@ -4209,6 +4368,15 @@ func (v Value) IsLazyImport() bool {
 	return v.Kind() == KindLazyImport
 }
 
+// StringValRunes returns a []rune view of a string Value, reusing
+// PyString.RuneCache when v is a heap PyString.
+func StringValRunes(v Value) []rune {
+	if v.ptr != nil && v.ptr.Kind == KindString {
+		return (*PyString)(unsafe.Pointer(v.ptr)).Runes()
+	}
+	return []rune(v.AsString())
+}
+
 // Runes returns a cached []rune view of ps.Data, computing it at most once.
 func (ps *PyString) Runes() []rune {
 	if p := ps.RuneCache.Load(); p != nil {
@@ -4232,7 +4400,18 @@ func (pb *PyBytes) Runes() []rune {
 	return rs
 }
 
-// IsASCII reports whether ps.Data contains only ASCII runes.
+// IsASCII reports whether ps.Data contains only ASCII runes, caching the
+// result atomically in the tail padding after BufClaimed (O(1) after first check).
 func (ps *PyString) IsASCII() bool {
-	return len(ps.Data) == utf8.RuneCountInString(ps.Data)
+	if s := ps.asciiState.Load(); s != 0 {
+		return s == 1
+	}
+	for i := range len(ps.Data) {
+		if ps.Data[i] >= 0x80 {
+			ps.asciiState.Store(2)
+			return false
+		}
+	}
+	ps.asciiState.Store(1)
+	return true
 }

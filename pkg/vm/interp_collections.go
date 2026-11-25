@@ -377,17 +377,49 @@ func (vm *VM) opBinarySlice(st *loopState, ip, sp int) (int, int, loopCtl) {
 	}
 
 	if container.Kind() == val.KindString || container.Kind() == val.KindInlineStr {
-		s := container.AsString()
-		start, stop, _, sliceLen, err := val.NormalizeSliceIndices(startVal, stopVal, val.NoneVal(), len(s))
-		if err == nil {
-			if sliceLen == 0 {
-				stack[sp-3] = val.NewStringVal("")
-			} else {
-				stack[sp-3] = val.NewStringVal(s[start:stop])
+		var ascii bool
+		if container.Kind() == val.KindString {
+			ascii = container.AsStringObj().IsASCII()
+		} else {
+			ascii = val.IsInlineStrASCII(container)
+		}
+		if ascii {
+			s := container.AsString()
+			start, stop, sliceLen, ok := normalizeSimpleSlice(startVal, stopVal, len(s))
+			var err error
+			if !ok {
+				start, stop, _, sliceLen, err = val.NormalizeSliceIndices(startVal, stopVal, val.NoneVal(), len(s))
 			}
-			sp -= 2
-			ip++
-			return ip, sp, ctlReload
+			if err == nil {
+				switch {
+				case sliceLen == 0:
+					stack[sp-3] = val.SmallStringVal("")
+				case sliceLen <= 7:
+					stack[sp-3] = val.SmallStringVal(s[start:stop])
+				default:
+					stack[sp-3] = val.NewStringVal(s[start:stop])
+				}
+				sp -= 2
+				ip++
+				return ip, sp, ctlReload
+			}
+		} else {
+			runes := val.StringValRunes(container)
+			start, stop, sliceLen, ok := normalizeSimpleSlice(startVal, stopVal, len(runes))
+			var err error
+			if !ok {
+				start, stop, _, sliceLen, err = val.NormalizeSliceIndices(startVal, stopVal, val.NoneVal(), len(runes))
+			}
+			if err == nil {
+				if sliceLen == 0 {
+					stack[sp-3] = val.SmallStringVal("")
+				} else {
+					stack[sp-3] = val.NewStringVal(string(runes[start:stop]))
+				}
+				sp -= 2
+				ip++
+				return ip, sp, ctlReload
+			}
 		}
 	}
 
@@ -422,7 +454,7 @@ func (vm *VM) opUnpackSequence(st *loopState, inst uint32, ip, sp int) (int, int
 	case seq.IsList():
 		items = seq.AsList().Items
 	case seq.IsAnyString():
-		r := []rune(seq.AsString())
+		r := val.StringValRunes(seq)
 		items = make([]val.Value, len(r))
 		for i := range r {
 			items[i] = val.NewStringVal(string(r[i]))

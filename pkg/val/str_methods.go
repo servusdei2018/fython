@@ -720,6 +720,114 @@ func strSplitWhitespace(s string, maxsplit int, fromRight bool) []string {
 	return parts
 }
 
+func strSplitASCIIWhitespaceDirect(s string, maxsplit int) (Value, bool) {
+	n := len(s)
+	// Fast-scan to verify ASCII and count tokens or bail to Unicode fallback.
+	for i := range n {
+		if s[i] >= 0x80 {
+			return Value{}, false
+		}
+	}
+	items := make([]Value, 0, 8)
+	i := 0
+	for i < n {
+		for i < n && (s[i] == ' ' || (s[i] >= '\t' && s[i] <= '\r')) {
+			i++
+		}
+		if i >= n {
+			break
+		}
+		if maxsplit >= 0 && len(items) == maxsplit {
+			sub := s[i:]
+			if len(sub) <= 7 {
+				items = append(items, SmallStringVal(sub))
+			} else {
+				obj := &PyString{Header: ObjectHeader{Kind: KindString, Type: StrType}, Data: sub}
+				items = append(items, Value{ptr: &obj.Header})
+			}
+			break
+		}
+		start := i
+		for i < n && s[i] != ' ' && (s[i] < '\t' || s[i] > '\r') {
+			i++
+		}
+		sub := s[start:i]
+		if len(sub) <= 7 {
+			items = append(items, SmallStringVal(sub))
+		} else {
+			obj := &PyString{Header: ObjectHeader{Kind: KindString, Type: StrType}, Data: sub}
+			items = append(items, Value{ptr: &obj.Header})
+		}
+	}
+	lst := &PyList{Header: ObjectHeader{Kind: KindList, Type: ListType}, Items: items}
+	return Value{ptr: &lst.Header}, true
+}
+
+func strSplitSepDirect(s, sep string, maxsplit int) Value {
+	if maxsplit == 0 {
+		items := make([]Value, 1)
+		items[0] = NewStringVal(s)
+		lst := &PyList{Header: ObjectHeader{Kind: KindList, Type: ListType}, Items: items}
+		return Value{ptr: &lst.Header}
+	}
+	var count int
+	if maxsplit < 0 {
+		count = strings.Count(s, sep) + 1
+	} else {
+		count = min(maxsplit+1, strings.Count(s, sep)+1)
+	}
+	items := make([]Value, 0, count)
+	if len(sep) == 1 {
+		b := sep[0]
+		rest := s
+		for maxsplit < 0 || len(items) < maxsplit {
+			idx := strings.IndexByte(rest, b)
+			if idx < 0 {
+				break
+			}
+			sub := rest[:idx]
+			if len(sub) <= 7 && isASCII(sub) {
+				items = append(items, SmallStringVal(sub))
+			} else {
+				obj := &PyString{Header: ObjectHeader{Kind: KindString, Type: StrType}, Data: sub}
+				items = append(items, Value{ptr: &obj.Header})
+			}
+			rest = rest[idx+1:]
+		}
+		if len(rest) <= 7 && isASCII(rest) {
+			items = append(items, SmallStringVal(rest))
+		} else {
+			obj := &PyString{Header: ObjectHeader{Kind: KindString, Type: StrType}, Data: rest}
+			items = append(items, Value{ptr: &obj.Header})
+		}
+	} else {
+		sepLen := len(sep)
+		rest := s
+		for maxsplit < 0 || len(items) < maxsplit {
+			idx := strings.Index(rest, sep)
+			if idx < 0 {
+				break
+			}
+			sub := rest[:idx]
+			if len(sub) <= 7 && isASCII(sub) {
+				items = append(items, SmallStringVal(sub))
+			} else {
+				obj := &PyString{Header: ObjectHeader{Kind: KindString, Type: StrType}, Data: sub}
+				items = append(items, Value{ptr: &obj.Header})
+			}
+			rest = rest[idx+sepLen:]
+		}
+		if len(rest) <= 7 && isASCII(rest) {
+			items = append(items, SmallStringVal(rest))
+		} else {
+			obj := &PyString{Header: ObjectHeader{Kind: KindString, Type: StrType}, Data: rest}
+			items = append(items, Value{ptr: &obj.Header})
+		}
+	}
+	lst := &PyList{Header: ObjectHeader{Kind: KindList, Type: ListType}, Items: items}
+	return Value{ptr: &lst.Header}
+}
+
 func stringsToList(parts []string) Value {
 	items := make([]Value, len(parts))
 	for i, p := range parts {
@@ -1022,6 +1130,11 @@ func initStrExtraMethods() {
 			}
 			maxsplit := strIntArg(maxV, -1)
 			if sepV.IsNone() {
+				if !fromRight {
+					if res, ok := strSplitASCIIWhitespaceDirect(s, maxsplit); ok {
+						return res
+					}
+				}
 				return stringsToList(strSplitWhitespace(s, maxsplit, fromRight))
 			}
 			sep, _ := strMethodArg(sepV)
@@ -1029,11 +1142,11 @@ func initStrExtraMethods() {
 				ctx.Raise(NewException(ValueErrorType, "empty separator"))
 				return NoneVal()
 			}
+			if !fromRight {
+				return strSplitSepDirect(s, sep, maxsplit)
+			}
 			if maxsplit < 0 {
 				return stringsToList(strings.Split(s, sep))
-			}
-			if !fromRight {
-				return stringsToList(strings.SplitN(s, sep, maxsplit+1))
 			}
 			var parts []string
 			rest := s

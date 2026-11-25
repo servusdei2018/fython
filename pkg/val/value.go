@@ -701,12 +701,22 @@ func (v Value) IsTruthy() bool {
 	if v.ptr == &tagBool || v.ptr == &tagInt64 {
 		return v.num != 0
 	}
-	return v.isTruthySlow()
+	return v.isTruthySlowCtx(nil)
+}
+
+// IsTruthyCtx evaluates Python truthiness of v using ctx for any __bool__ or
+// __len__ dunder invocation, avoiding standalone VM acquisition when called
+// from an active VM.
+func (v Value) IsTruthyCtx(ctx *ExecContext) bool {
+	if v.ptr == &tagBool || v.ptr == &tagInt64 {
+		return v.num != 0
+	}
+	return v.isTruthySlowCtx(ctx)
 }
 
 //go:noinline
-func (v Value) isTruthySlow() bool {
-	if v.ptr == &tagNone {
+func (v Value) isTruthySlowCtx(ctx *ExecContext) bool {
+	if v.ptr == nil || v.ptr == &tagNone {
 		return false
 	}
 	if v.ptr == &tagInlineStr {
@@ -740,25 +750,36 @@ func (v Value) isTruthySlow() bool {
 		c := v.AsComplex()
 		return c.Real != 0 || c.Imag != 0
 	case KindInstance, KindNative:
-		return objectTruthy(v)
+		return objectTruthyCtx(ctx, v)
 	default:
 		return true
 	}
 }
 
-// objectTruthy applies __bool__, then __len__ (via SqLen), to instances and
-// native objects. Objects defining neither are truthy.
-func objectTruthy(v Value) bool {
+// objectTruthyCtx applies cached __bool__, then __len__ (via SqLen), to
+// instances and native objects using ctx when available.
+func objectTruthyCtx(ctx *ExecContext, v Value) bool {
 	t := v.Type()
 	if t == nil {
 		return true
 	}
-	if fn, _, ok := t.LookupMRO(strBool); ok {
-		var ctx *ExecContext
-		return (*ExecContext).Invoke1(ctx, fn, v).IsTruthy()
+	if fn := t.dunderBool; fn.ptr != nil {
+		var res Value
+		if fn.IsFunction() || fn.IsBuiltinFunc() {
+			res = ctx.Invoke1(fn, v)
+		} else if descrGet := fn.Type().Slots.TpDescrGet; descrGet != nil {
+			bound := descrGet(ctx, fn, v, t)
+			res = ctx.Invoke0(bound)
+		} else {
+			res = ctx.Invoke1(fn, v)
+		}
+		if ctx != nil && ctx.HasException() {
+			return false
+		}
+		return res.IsTruthy()
 	}
 	if sqLen := t.Slots.SqLen; sqLen != nil {
-		return sqLen(nil, v) != 0
+		return sqLen(ctx, v) != 0
 	}
 	return true
 }
