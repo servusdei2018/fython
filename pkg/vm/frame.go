@@ -363,10 +363,6 @@ type CodeObject struct {
 	// this code object. The interpreter loop reads it to reach the cache
 	// without calling getCodeCache.
 	primary unsafe.Pointer
-	// regCode publishes the Tier-2 register compilation of this code
-	// object, if any. It is written once by the optimizer and only ever
-	// replaced by an equivalent compilation, so readers need no lock.
-	regCode atomic.Pointer[RegCode]
 }
 
 // Active returns the instruction slice that must be executed for this code
@@ -875,32 +871,6 @@ func AsCodeObject(v val.Value) *CodeObject {
 	return (*CodeObject)(unsafe.Pointer(v.HeaderPtr()))
 }
 
-// RegCode returns the published register compilation of co, or nil when co
-// has no register form.
-func (co *CodeObject) RegCode() *RegCode {
-	if co == nil {
-		return nil
-	}
-	return co.regCode.Load()
-}
-
-// publishRegCode installs rc as the register compilation of co.
-func (co *CodeObject) publishRegCode(rc *RegCode) {
-	if co == nil || rc == nil {
-		return
-	}
-	co.regCode.Store(rc)
-}
-
-// clearRegCode drops the register compilation of co. It is used when the
-// underlying instruction stream is replaced with an unrelated one.
-func (co *CodeObject) clearRegCode() {
-	if co == nil {
-		return
-	}
-	co.regCode.Store(nil)
-}
-
 type reASCIIEntry struct {
 	ps      *val.PyString
 	strLen  int
@@ -962,7 +932,6 @@ type VM struct {
 	strJoinPool          []*strJoinState
 	collectPool          []*collectState
 	loopStatePool        []*loopState
-	regFramePool         []*regFrame
 	genStackPools        [5][][]val.Value
 	genCellValPools      [8][][]val.Value
 	genCellPtrPools      [8][][]*val.PyCell
@@ -997,12 +966,6 @@ type VM struct {
 	reASCIICache    [4]reASCIIEntry
 	reASCIICachePos int
 	hasTrackedViews bool
-	regArena        []val.Value
-	regArenaTop     int
-	jitPinned       [7]int64
-	jitRetVal       uint64
-	jitDirty        uint8
-	jitRetKind      uint8
 	rootCO          CodeObject
 	rootCache       VMCodeCache
 	limits          RuntimeLimits
@@ -1402,7 +1365,6 @@ func (vm *VM) Reset() {
 	vm.lastReRunes = nil
 	vm.reASCIICache = [4]reASCIIEntry{}
 	vm.reASCIICachePos = 0
-	vm.discardRegArena(0)
 	if vm.context == nil || vm.context.Len() > 0 {
 		vm.context = val.NewPyContext()
 	}

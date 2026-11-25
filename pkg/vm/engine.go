@@ -81,34 +81,10 @@ type Engine struct {
 	// that two VMs sharing a module namespace cannot create two copies of
 	// the same module.
 	builtinModuleMu sync.Mutex
-	jitMu           sync.Mutex
-	jitEntries      []jitEntry
 }
 
-type jitEntry struct {
-	rc *RegCode
-	jc *jitCode
-}
-
-// Close releases native executable code buffers owned by this Engine.
-func (e *Engine) Close() {
-	if e == nil {
-		return
-	}
-	e.jitMu.Lock()
-	entries := e.jitEntries
-	e.jitEntries = nil
-	e.jitMu.Unlock()
-	for _, entry := range entries {
-		if entry.rc != nil {
-			entry.rc.jitState.Store(2)
-			entry.rc.jit.CompareAndSwap(entry.jc, nil)
-		}
-		if entry.jc != nil {
-			entry.jc.release()
-		}
-	}
-}
+// Close releases resources owned by this Engine.
+func (e *Engine) Close() {}
 
 var (
 	defaultCompileHook                func(src []byte) (*CodeObject, error)

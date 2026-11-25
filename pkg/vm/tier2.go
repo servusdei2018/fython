@@ -43,13 +43,6 @@ func maybeOptimizeCodeObject(vm *VM, co *CodeObject, cache *VMCodeCache) {
 	cache.hotness++
 	if cache.hotness >= tier2HotnessThreshold {
 		OptimizeCodeObject(co)
-		if rc := co.RegCode(); rc != nil && rc.jit.Load() == nil && rc.jitState.Load() == 0 && rc.jitState.CompareAndSwap(0, 1) {
-			if jc := jitCompileRegCode(vm.engine, rc, co.Consts); jc != nil {
-				rc.jit.Store(jc)
-			} else {
-				rc.jitState.Store(2)
-			}
-		}
 	}
 }
 
@@ -871,12 +864,6 @@ func OptimizeCodeObject(co *CodeObject) {
 		// Publish the fused instruction stream atomically: every VM picks it up
 		// the next time it reloads the active slice.
 		co.publish(code)
-	}
-	// Attempt a register compilation on top of the original instruction
-	// stream. The stack stream stays authoritative; RegCode is consulted only
-	// when a frame is entered through runRegLoop.
-	if rc := TryCompileRegCode(co); rc != nil {
-		co.publishRegCode(rc)
 	}
 }
 

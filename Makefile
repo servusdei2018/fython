@@ -1,9 +1,10 @@
-.PHONY: all build test lint format clean shim test-extensions loop-metrics
+.PHONY: all build pgo-profile build-pgo test lint format clean shim test-extensions loop-metrics loop-metrics-bin loop-metrics-pgo
 
 export GOTOOLCHAIN ?= go1.27.0
 
 BIN_DIR := bin
 BINARY := $(BIN_DIR)/fython
+PGO_PROFILE ?= $(BIN_DIR)/default.pgo
 SRC := ./cmd/fython
 SHIM_SRC := shim/fython_abi3_shim.c
 SHIM_OUT := shim/libfython_abi3.so
@@ -19,7 +20,14 @@ all: lint test build
 
 build:
 	@mkdir -p $(BIN_DIR)
-	go build -o $(BINARY) $(SRC)
+	CGO_ENABLED=0 go build -o $(BINARY) $(SRC)
+
+pgo-profile: build
+	python3 benchmarks/gen_pgo.py --binary $(BINARY) --output $(PGO_PROFILE)
+
+build-pgo: pgo-profile
+	@mkdir -p $(BIN_DIR)
+	CGO_ENABLED=0 go build -pgo=$(PGO_PROFILE) -o $(BINARY) $(SRC)
 
 test:
 	go test ./...
@@ -67,9 +75,13 @@ clean:
 	rm -rf $(BIN_DIR) $(SHIM_OUT) $(SHIM_DYLIB) $(SHIM_DLL) $(EXT_DIR)
 	rm -f libfython_abi3.so
 
-loop-metrics: build
+loop-metrics-bin:
 	@go tool objdump -s 'VM..runLoopWithGlobals$$' $(BINARY) > /tmp/fython_loop.asm
 	@grep -m1 'SUBQ' /tmp/fython_loop.asm || true
 	@printf "gcWriteBarrier sites: "; grep -c 'runtime.gcWriteBarrier' /tmp/fython_loop.asm || true
 	@python3 -c 'import re; addrs=[int(m,16) for m in re.findall(r"\t0x([0-9a-f]+)\t", open("/tmp/fython_loop.asm").read())]; print(f"code bytes: {addrs[-1]-addrs[0]}" if addrs else "code bytes: 0")'
 	@rm -f /tmp/fython_loop.asm
+
+loop-metrics: build loop-metrics-bin
+
+loop-metrics-pgo: build-pgo loop-metrics-bin

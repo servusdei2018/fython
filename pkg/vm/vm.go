@@ -39,7 +39,6 @@ func (vm *VM) Run(code []uint32, consts []val.Value, numLocals int) (res val.Val
 		vm.rootCO.IsTier2Optimized = 0
 		vm.rootCO.Hotness = 0
 		vm.rootCO.stream = nil
-		vm.rootCO.clearRegCode()
 		vm.rootCO.ParamShapeComputed = false
 		vm.rootCO.computeParamShape()
 		vm.rootCache.active = nil
@@ -2862,45 +2861,6 @@ func (vm *VM) runFrame(co *CodeObject, startBase int, startSP int, startFrameIdx
 
 	if atomic.LoadInt32(&co.IsTier2Optimized) == 0 {
 		maybeOptimizeCodeObject(vm, co, st.cache)
-	}
-
-	// Enter the register loop when the code object compiled one. Entry
-	// checks inside runRegLoop fail closed to the stack loop. A nested
-	// register abort (regAbort) unwinds here with the stack state already
-	// prepared: either a handler continuation in st or an unhandled
-	// exception to return.
-	defer func() {
-		if r := recover(); r != nil {
-			if _, isAbort := r.(regAbort); isAbort {
-				if !vm.unhandledException.IsNone() && vm.unhandledException.HeaderPtr() != nil {
-					res = st.result
-				} else {
-					res = vm.runLoopWithGlobals(st)
-				}
-				return
-			}
-			panic(r)
-		}
-	}()
-	if rc := co.RegCode(); rc != nil {
-		res, ok := func() (res val.Value, ok bool) {
-			defer func() {
-				if r := recover(); r != nil {
-					if _, isAbort := r.(regAbort); isAbort {
-						res, ok = val.Value{}, false
-						return
-					}
-					panic(r)
-				}
-			}()
-			return vm.runRegLoop(nil, co, rc, startBase)
-		}()
-		if ok {
-			return res
-		}
-	}
-	if !vm.unhandledException.IsNone() && vm.unhandledException.HeaderPtr() != nil {
-		return st.result
 	}
 
 	if (activeGen != nil || activeCoro != nil) && vm.execCtx.HasException() {

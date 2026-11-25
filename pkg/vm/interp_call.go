@@ -61,13 +61,6 @@ func (vm *VM) pushCalleeFrame(
 	cc *VMCodeCache,
 	newBase, retSP, nextSP, retIP int,
 ) (int, int, loopCtl) {
-	// Enter register execution for hot callees through a nested frame,
-	// keeping the stack loop itself untouched. This must precede any
-	// caller-frame bookkeeping below so a nested run leaves the loop
-	// state exactly as the call site left it.
-	if nip, nsp, nctl, ok := vm.tryNestedRegCall(st, callee, fn, newBase, nextSP, retSP, retIP, -1); ok {
-		return nip, nsp, nctl
-	}
 	frameIdx := st.frameIdx
 	if frameIdx+2 > len(vm.frames) {
 		vm.ensureFrameCapacity(frameIdx + 2)
@@ -165,9 +158,7 @@ func isEphemeralSuperCallSite(st *loopState, ip int) bool {
 }
 
 // isEphemeralSuperCallSiteAt is the instruction-stream half of
-// isEphemeralSuperCallSite. The register tier passes the unfused code
-// object stream with stack numbering; the stack loop passes its active
-// (possibly fused) stream.
+// isEphemeralSuperCallSite on the active (possibly fused) bytecode stream.
 func isEphemeralSuperCallSiteAt(code []uint32, ip int) bool {
 	depth := 1
 	limit := min(len(code), ip+16)
