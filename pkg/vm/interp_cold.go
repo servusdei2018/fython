@@ -632,10 +632,11 @@ func (vm *VM) dispatchColdOpcode(st *loopState, op Opcode, inst uint32, ip, sp i
 					}
 					vm.tryInlineDunderFast(st, ip, entry, fn, callee, a, b, sp)
 					saved := &vm.frames[st.frameIdx]
-					saved.cmpLeft = a
-					saved.cmpRight = b
-					saved.cmpOp = cmpOp
-					saved.cmpActive = true
+					aux := vm.frameAuxAt(st.frameIdx)
+					aux.cmpLeft = a
+					aux.cmpRight = b
+					aux.cmpOp = cmpOp
+					saved.flags |= frameFlagCmp
 					nextIP, nextSP := vm.pushFrameFast(st, fn, cc, sp, 2, ip)
 					return nextIP, nextSP, ctlReload
 				}
@@ -1084,24 +1085,23 @@ func (vm *VM) dispatchColdOpcode(st *loopState, op Opcode, inst uint32, ip, sp i
 					ai, ci := argVal.AsInt64(), cVal.AsInt64()
 					sum := ai + ci
 					if ((ai ^ sum) & (ci ^ sum)) >= 0 {
-						saved := &vm.frames[st.frameIdx]
-						saved.co = st.curCO
-						saved.codePtr = codePtr
-						saved.codeLen = st.codeLen
-						saved.consts = st.consts
+						frameIdx := st.frameIdx
+						saved := &vm.frames[frameIdx]
+						saved.cache = st.cache
 						saved.ip = ip + 6
 						saved.baseOffset = st.base
 						saved.retSP = sp
-						saved.cells = st.cells
-						saved.cellPtrs = st.cellPtrs
-						saved.globals = st.globals
-						saved.locals = st.curLocals
-						saved.cache = st.cache
-						saved.excStackLen = len(vm.excStack)
-						saved.stackIsVM = st.stackIsVM
+						saved.excStackLen = int32(len(vm.excStack))
 						saved.initInstance = val.Value{}
-						saved.cmpActive = false
-						st.curLocals = val.NoneVal()
+						flags := (saved.flags & frameFlagHasShadow) | frameFlagSameGlobals
+						if st.stackIsVM {
+							flags |= frameFlagStackIsVM
+						}
+						if st.cells != nil || st.cellPtrs != nil || !st.curLocals.IsNone() {
+							vm.saveFrameAux(st, frameIdx)
+							flags |= frameFlagHasAux
+						}
+						saved.flags = flags
 						st.frameIdx++
 						st.base = sp
 						*(*val.Value)(unsafe.Add(stackPtr, uintptr(sp)*16)) = val.Int64Val(sum)

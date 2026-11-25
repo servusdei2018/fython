@@ -26,6 +26,9 @@ func maybeOptimizeCodeObject(vm *VM, co *CodeObject, cache *VMCodeCache) {
 		return
 	}
 	if atomic.LoadInt32(&co.IsTier2Optimized) != 0 {
+		if cache != nil {
+			cache.tier2Done = 1
+		}
 		return
 	}
 	if val.IsMultiThreaded() {

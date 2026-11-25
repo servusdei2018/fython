@@ -789,29 +789,24 @@ func (rf *regFrame) runDirectReg(dst int, target, recv val.Value, recvValid bool
 		vm.ensureFrameCapacity(frameIdx + 2)
 	}
 	saved := &vm.frames[frameIdx]
-	saved.co = st.curCO
-	saved.codePtr = st.codePtr
-	saved.codeLen = st.codeLen
-	saved.consts = st.consts
+	saved.cache = st.cache
 	// Resume address, mirroring pushFrameFast (unwind derives the call
 	// site as caller.ip - 1).
 	saved.ip = sip + 1
 	saved.baseOffset = st.base
 	saved.retSP = rf.base + dst
-	saved.cells = st.cells
-	saved.cellPtrs = st.cellPtrs
 	saved.globals = st.globals
-	saved.locals = st.curLocals
-	saved.cache = st.cache
-	saved.excStackLen = len(vm.excStack)
-	saved.stackIsVM = st.stackIsVM
+	saved.excStackLen = int32(len(vm.excStack))
 	saved.initInstance = val.Value{}
-	saved.cmpActive = false
-	saved.genMode = genModeNone
-	saved.genDefault = val.Value{}
-	saved.stack = nil
-	saved.activeGen = nil
-	saved.activeCoro = nil
+	flags := saved.flags & frameFlagHasShadow
+	if st.stackIsVM {
+		flags |= frameFlagStackIsVM
+	}
+	if st.cells != nil || st.cellPtrs != nil || !st.curLocals.IsNone() {
+		vm.saveFrameAux(st, frameIdx)
+		flags |= frameFlagHasAux
+	}
+	saved.flags = flags
 	cc := vm.fastCalleeCache(co)
 	cc.ensureMethodPIC()
 	nextFrame := frameIdx + 1
@@ -875,21 +870,7 @@ func (rf *regFrame) runDirectReg(dst int, target, recv val.Value, recvValid bool
 	}
 	st.frameIdx--
 	savedSlot := &vm.frames[st.frameIdx]
-	st.curCO = savedSlot.co
-	st.codePtr = savedSlot.codePtr
-	st.codeLen = savedSlot.codeLen
-	st.consts = savedSlot.consts
-	st.base = savedSlot.baseOffset
-	st.cells = savedSlot.cells
-	st.cellPtrs = savedSlot.cellPtrs
-	st.globals = savedSlot.globals
-	st.curLocals = savedSlot.locals
-	st.cache = savedSlot.cache
-	vm.activeCO = st.curCO
-	vm.activeBaseOffset = st.base
-	vm.activeCells = st.cells
-	vm.activeCellPtrs = st.cellPtrs
-	vm.activeFrameIdx = st.frameIdx
+	vm.restoreNormalCallerFrame(st, st.frameIdx, savedSlot)
 	rf.refresh()
 	res = vm.copyOutOfArena(res)
 	rf.regs[dst] = res

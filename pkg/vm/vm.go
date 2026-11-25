@@ -46,6 +46,7 @@ func (vm *VM) Run(code []uint32, consts []val.Value, numLocals int) (res val.Val
 		vm.rootCache.codePtr = nil
 		vm.rootCache.codeLen = 0
 		vm.rootCache.privateActive = false
+		vm.rootCache.tier2Done = 0
 		if len(vm.rootCache.ic) > 0 {
 			clear(vm.rootCache.ic)
 			clear(vm.rootCache.methodPIC)
@@ -107,10 +108,10 @@ func (vm *VM) vmStackTop() int {
 	limit := min(vm.activeFrameIdx, len(vm.frames))
 	for i := range limit {
 		f := &vm.frames[i]
-		if f.co != nil && f.stackIsVM {
+		if co := f.codeObject(); co != nil && f.stackIsVM() {
 			end := f.baseOffset + 256
-			if f.co.NumLocals+f.co.MaxStackSize > 256 {
-				end = f.baseOffset + f.co.NumLocals + f.co.MaxStackSize
+			if co.NumLocals+co.MaxStackSize > 256 {
+				end = f.baseOffset + co.NumLocals + co.MaxStackSize
 			}
 			if end > top {
 				top = end
@@ -189,25 +190,20 @@ func (vm *VM) runNestedCode(co *CodeObject, globals *val.PyDict, locals val.Valu
 }
 
 func (vm *VM) currentGlobals() *val.PyDict {
-	if vm.activeState != nil && vm.activeFrameIdx == vm.activeState.frameIdx && vm.activeState.globals != nil {
-		return vm.activeState.globals
-	}
-	if vm.activeCO != nil && vm.activeFrameIdx >= 0 && vm.activeFrameIdx < len(vm.frames) {
-		if g := vm.frames[vm.activeFrameIdx].globals; g != nil {
-			return g
-		}
-	}
-	return vm.globals
+	return vm.frameGlobals(vm.activeFrameIdx)
 }
 
 func (vm *VM) currentLocalsVal() val.Value {
 	vm.flushActiveFrame()
 	if vm.activeCO != nil && vm.activeFrameIdx >= 0 && vm.activeFrameIdx < len(vm.frames) {
 		f := &vm.frames[vm.activeFrameIdx]
-		if !f.locals.IsNone() && f.locals.HeaderPtr() != nil {
-			return f.locals
+		if (f.flags&frameFlagHasAux) != 0 && vm.activeFrameIdx < len(vm.frameAux) {
+			loc := vm.frameAux[vm.activeFrameIdx].locals
+			if !loc.IsNone() && loc.HeaderPtr() != nil {
+				return loc
+			}
 		}
-		if f.co != nil && f.co != &vm.rootCO && len(f.co.VarNames) > 0 {
+		if co := f.codeObject(); co != nil && co != &vm.rootCO && len(co.VarNames) > 0 {
 			frameVal := vm.materializeFrame(vm.activeFrameIdx)
 			if frameVal.IsFrame() {
 				fr := frameVal.AsFrame()
@@ -1197,16 +1193,7 @@ func (vm *VM) initBuiltins() {
 		pkgName := ""
 		if ctx != nil && ctx.VM != nil {
 			vmInstance := ctx.VM.(*VM)
-			var activeGlobals *val.PyDict
-			if vmInstance.activeState != nil && vmInstance.activeFrameIdx == vmInstance.activeState.frameIdx {
-				activeGlobals = vmInstance.activeState.globals
-			}
-			if activeGlobals == nil && vmInstance.activeFrameIdx >= 0 && vmInstance.activeFrameIdx < len(vmInstance.frames) {
-				activeGlobals = vmInstance.frames[vmInstance.activeFrameIdx].globals
-			}
-			if activeGlobals == nil {
-				activeGlobals = vmInstance.globals
-			}
+			activeGlobals := vmInstance.currentGlobals()
 			if activeGlobals != nil {
 				if v, ok := activeGlobals.Get(namePackage); ok && v.IsAnyString() {
 					pkgName = v.AsString()
@@ -1340,14 +1327,7 @@ func (vm *VM) initBuiltins() {
 
 	vm.builtins.Set(val.InternString("globals"), val.NewBuiltinFuncVal("globals", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		vmInstance := ctx.VM.(*VM)
-		if vmInstance.activeState != nil && vmInstance.activeFrameIdx == vmInstance.activeState.frameIdx && vmInstance.activeState.globals != nil {
-			return val.DictVal(vmInstance.activeState.globals)
-		}
-		frameIdx := vmInstance.activeFrameIdx
-		if frameIdx >= 0 && frameIdx < len(vmInstance.frames) && vmInstance.frames[frameIdx].globals != nil {
-			return val.DictVal(vmInstance.frames[frameIdx].globals)
-		}
-		return val.DictVal(vmInstance.globals)
+		return val.DictVal(vmInstance.currentGlobals())
 	}))
 
 	vm.builtins.Set(val.InternString("open"), val.NewBuiltinFuncVal("open", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -2233,31 +2213,30 @@ func (vm *VM) inlineDunderCompare(dunder val.Value, newBase, retSP int, cmpLeft,
 	if st.frameIdx+2 > len(vm.frames) {
 		vm.ensureFrameCapacity(st.frameIdx + 2)
 	}
-	saved := &vm.frames[st.frameIdx]
-	saved.co = st.curCO
-	saved.codePtr = st.codePtr
-	saved.codeLen = st.codeLen
-	saved.consts = st.consts
+	frameIdx := st.frameIdx
+	saved := &vm.frames[frameIdx]
+	saved.cache = st.cache
 	saved.ip = ip + 1
 	saved.baseOffset = st.base
 	saved.retSP = retSP
-	saved.cells = st.cells
-	saved.cellPtrs = st.cellPtrs
 	saved.globals = st.globals
-	saved.locals = st.curLocals
-	saved.cache = st.cache
-	saved.excStackLen = len(vm.excStack)
-	saved.stackIsVM = st.stackIsVM
-	saved.stack = st.stack
-	saved.activeGen = st.activeGen
-	saved.genFrameIdx = st.genFrameIdx
-	saved.genMode = genModeNone
-	saved.genDefault = val.Value{}
+	saved.excStackLen = int32(len(vm.excStack))
 	saved.initInstance = val.Value{}
-	saved.cmpLeft = cmpLeft
-	saved.cmpRight = cmpRight
-	saved.cmpOp = cmpOp
-	saved.cmpActive = true
+	flags := (saved.flags & frameFlagHasShadow) | frameFlagCmp
+	if st.stackIsVM {
+		flags |= frameFlagStackIsVM
+	}
+	aux := vm.frameAuxAt(frameIdx)
+	if st.cells != nil || st.cellPtrs != nil || !st.curLocals.IsNone() {
+		aux.cells = st.cells
+		aux.cellPtrs = st.cellPtrs
+		aux.locals = st.curLocals
+		flags |= frameFlagHasAux
+	}
+	aux.cmpLeft = cmpLeft
+	aux.cmpRight = cmpRight
+	aux.cmpOp = cmpOp
+	saved.flags = flags
 	st.curLocals = val.NoneVal()
 	st.frameIdx++
 	st.curCO = dcallee
@@ -2396,17 +2375,18 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 
 	if faultFrameIdx >= 0 && faultFrameIdx < len(vm.frames) {
 		fSlot := &vm.frames[faultFrameIdx]
-		fSlot.co = faultCO
-		fSlot.codePtr = st.codePtr
-		fSlot.codeLen = st.codeLen
-		fSlot.consts = st.consts
+		fSlot.cache = st.cache
 		fSlot.ip = faultIP
 		fSlot.baseOffset = st.base
-		fSlot.cells = st.cells
-		fSlot.cellPtrs = st.cellPtrs
 		fSlot.globals = st.globals
-		fSlot.locals = st.curLocals
-		fSlot.cache = st.cache
+		fSlot.flags &^= frameFlagSameGlobals
+		if st.cells != nil || st.cellPtrs != nil || !st.curLocals.IsNone() {
+			aux := vm.frameAuxAt(faultFrameIdx)
+			aux.cells = st.cells
+			aux.cellPtrs = st.cellPtrs
+			aux.locals = st.curLocals
+			fSlot.flags |= frameFlagHasAux
+		}
 		vm.activeFrameIdx = faultFrameIdx
 	}
 
@@ -2443,7 +2423,7 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 				vm.activeCellPtrs = st.cellPtrs
 				vm.activeFrameIdx = st.frameIdx
 				vm.frames[st.frameIdx].initInstance = val.Value{}
-				vm.frames[st.frameIdx].cmpActive = false
+				vm.frames[st.frameIdx].flags &^= frameFlagInit | frameFlagCmp
 				return matched.TargetIP, sp, ctlReload
 			}
 		}
@@ -2461,7 +2441,7 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 			}
 		}
 
-		if st.curCO != nil && st.curCO.VarKWSafe && st.frameIdx != st.genFrameIdx && vm.frames[st.frameIdx].shadowFrame == nil {
+		if st.curCO != nil && st.curCO.VarKWSafe && st.frameIdx != st.genFrameIdx && (vm.frames[st.frameIdx].flags&frameFlagHasShadow) == 0 {
 			idx := st.base + st.curCO.VarKWIdx
 			if idx >= 0 && idx < len(st.stack) {
 				vm.releaseFrameSmallDictVal(st.stack[idx])
@@ -2481,72 +2461,104 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 		}
 
 		if st.frameIdx > st.startFrameIdx {
-			if curShadow := vm.frames[st.frameIdx].shadowFrame; curShadow != nil {
-				vm.frames[st.frameIdx].shadowFrame = nil
-				if !curShadow.LocalsProxy.IsNone() || curShadow.ExtraLocals != nil || !curShadow.Back.IsNone() {
-					curShadow.Detach()
-				} else {
-					pendingDetach = append(pendingDetach, curShadow)
+			if (vm.frames[st.frameIdx].flags & frameFlagHasShadow) != 0 {
+				vm.frames[st.frameIdx].flags &^= frameFlagHasShadow
+				if st.frameIdx < len(vm.frameAux) {
+					if curShadow := vm.frameAux[st.frameIdx].shadowFrame; curShadow != nil {
+						vm.frameAux[st.frameIdx].shadowFrame = nil
+						if !curShadow.LocalsProxy.IsNone() || curShadow.ExtraLocals != nil || !curShadow.Back.IsNone() {
+							curShadow.Detach()
+						} else {
+							pendingDetach = append(pendingDetach, curShadow)
+						}
+					}
 				}
 			}
 
 			st.frameIdx--
-			caller := &vm.frames[st.frameIdx]
-			caller.initInstance = val.Value{}
-			if caller.cmpActive {
-				caller.cmpActive = false
-				caller.cmpLeft = val.Value{}
-				caller.cmpRight = val.Value{}
+			callerIdx := st.frameIdx
+			caller := &vm.frames[callerIdx]
+			if (caller.flags & frameFlagInit) != 0 {
+				caller.flags &^= frameFlagInit
+				caller.initInstance = val.Value{}
 			}
-			if len(vm.excStack) > caller.excStackLen {
+			if (caller.flags & frameFlagCmp) != 0 {
+				caller.flags &^= frameFlagCmp
+				if callerIdx < len(vm.frameAux) {
+					vm.frameAux[callerIdx].cmpLeft = val.Value{}
+					vm.frameAux[callerIdx].cmpRight = val.Value{}
+				}
+			}
+			if len(vm.excStack) > int(caller.excStackLen) {
 				vm.excStack = vm.excStack[:caller.excStackLen]
 			}
 			callerIP := caller.ip - 1
-			if caller.genMode == genModeYieldFrom || caller.genMode == genModeAwait {
-				callerIP = caller.ip
+			if (caller.flags&frameFlagGenOrCoro) != 0 && callerIdx < len(vm.frameAux) {
+				aux := &vm.frameAux[callerIdx]
+				mode := aux.genMode
+				if mode == genModeYieldFrom || mode == genModeAwait {
+					callerIP = caller.ip
+				}
+				if mode != genModeNone {
+					st.stack = aux.stack
+					st.stackIsVM = caller.stackIsVM()
+					vm.execCtx.Stack = aux.stack
+					st.activeGen = aux.activeGen
+					st.activeCoro = aux.activeCoro
+					st.genFrameIdx = aux.genFrameIdx
+					aux.genMode = genModeNone
+					aux.genDefault = val.Value{}
+					aux.stack = nil
+					aux.activeGen = nil
+					aux.activeCoro = nil
+					if aux.joinState != nil {
+						vm.releaseStrJoinState(aux.joinState)
+						aux.joinState = nil
+					}
+					if aux.collectState != nil {
+						vm.releaseCollectState(aux.collectState)
+						aux.collectState = nil
+					}
+					if finishedGen != nil && (mode == genModeForIter || mode == genModeYieldFrom || mode == genModeAwait || mode == genModeStrJoin ||
+						mode == genModeCollectList || mode == genModeCollectTuple || mode == genModeCollectSet || mode == genModeListExtend ||
+						mode == genModeCollectDict || mode == genModeAny || mode == genModeAll || mode == genModeSum || mode == genModeMin || mode == genModeMax) {
+						vm.releaseGenerator(finishedGen)
+					}
+					if finishedCoro != nil && (mode == genModeAwait || mode == genModeYieldFrom) {
+						vm.releaseEphemeralCoroutine(finishedCoro)
+					}
+				}
+				caller.flags &^= frameFlagGenOrCoro
 			}
-			mode := caller.genMode
-			if mode != genModeNone {
-				st.stack = caller.stack
-				st.stackIsVM = caller.stackIsVM
-				vm.execCtx.Stack = caller.stack
-				st.activeGen = caller.activeGen
-				st.activeCoro = caller.activeCoro
-				st.genFrameIdx = caller.genFrameIdx
-				caller.genMode = genModeNone
-				caller.genDefault = val.Value{}
-				caller.stack = nil
-				caller.activeGen = nil
-				caller.activeCoro = nil
-				if caller.joinState != nil {
-					vm.releaseStrJoinState(caller.joinState)
-					caller.joinState = nil
-				}
-				if caller.collectState != nil {
-					vm.releaseCollectState(caller.collectState)
-					caller.collectState = nil
-				}
-				if finishedGen != nil && (mode == genModeForIter || mode == genModeYieldFrom || mode == genModeAwait || mode == genModeStrJoin ||
-					mode == genModeCollectList || mode == genModeCollectTuple || mode == genModeCollectSet || mode == genModeListExtend ||
-					mode == genModeCollectDict || mode == genModeAny || mode == genModeAll || mode == genModeSum || mode == genModeMin || mode == genModeMax) {
-					vm.releaseGenerator(finishedGen)
-				}
-				if finishedCoro != nil && (mode == genModeAwait || mode == genModeYieldFrom) {
-					vm.releaseEphemeralCoroutine(finishedCoro)
-				}
+			cc := caller.cache
+			callerCO := caller.codeObject()
+			st.curCO = callerCO
+			st.cache = cc
+			if cc != nil {
+				st.codePtr = cc.codePtr
+				st.codeLen = cc.codeLen
+				st.consts = cc.frameConsts(callerCO)
 			}
-			st.curCO = caller.co
-			st.codePtr = caller.codePtr
-			st.codeLen = caller.codeLen
-			st.consts = caller.consts
 			st.base = caller.baseOffset
-			st.cells = caller.cells
-			st.cellPtrs = caller.cellPtrs
-			vm.activeCells = caller.cells
-			vm.activeCellPtrs = caller.cellPtrs
-			st.globals = caller.globals
-			st.curLocals = caller.locals
-			st.cache = caller.cache
+			if (caller.flags&frameFlagHasAux) != 0 && callerIdx < len(vm.frameAux) {
+				aux := &vm.frameAux[callerIdx]
+				st.cells = aux.cells
+				st.cellPtrs = aux.cellPtrs
+				st.curLocals = aux.locals
+				aux.cells = nil
+				aux.cellPtrs = nil
+				aux.locals = val.Value{}
+				caller.flags &^= frameFlagHasAux
+			} else {
+				st.cells = nil
+				st.cellPtrs = nil
+				st.curLocals = val.NoneVal()
+			}
+			vm.activeCells = st.cells
+			vm.activeCellPtrs = st.cellPtrs
+			if (caller.flags & frameFlagSameGlobals) == 0 {
+				st.globals = caller.globals
+			}
 			var poppedInlineCallee *val.PyFrame
 			if site := st.cache.findInlineSite(callerIP); site != nil {
 				if callerIP < site.StubStart && site.Callee != nil {
@@ -2578,8 +2590,8 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 			ip = callerIP
 			st.ip = callerIP
 
-			if caller.co != nil {
-				line := caller.co.LineAt(callerIP)
+			if callerCO != nil {
+				line := callerCO.LineAt(callerIP)
 				frameVal := vm.materializeFrame(st.frameIdx)
 				if poppedInlineCallee != nil {
 					poppedInlineCallee.Back = frameVal
@@ -2592,9 +2604,14 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 			continue
 		}
 
-		if curShadow := vm.frames[st.frameIdx].shadowFrame; curShadow != nil {
-			curShadow.Detach()
-			vm.frames[st.frameIdx].shadowFrame = nil
+		if (vm.frames[st.frameIdx].flags & frameFlagHasShadow) != 0 {
+			vm.frames[st.frameIdx].flags &^= frameFlagHasShadow
+			if st.frameIdx < len(vm.frameAux) {
+				if curShadow := vm.frameAux[st.frameIdx].shadowFrame; curShadow != nil {
+					curShadow.Detach()
+					vm.frameAux[st.frameIdx].shadowFrame = nil
+				}
+			}
 		}
 		for _, f := range pendingDetach {
 			f.Detach()
@@ -3466,18 +3483,24 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 			if retVal.IsString() || retVal.Kind() == val.KindMemoryView {
 				vm.prepareReturnValue(retVal)
 			}
-			if st.frameIdx > st.startFrameIdx && st.frameIdx != st.genFrameIdx && vm.frames[st.frameIdx].shadowFrame == nil {
+			if st.frameIdx > st.startFrameIdx && st.frameIdx != st.genFrameIdx && (vm.frames[st.frameIdx].flags&frameFlagHasShadow) == 0 {
 				caller := &vm.frames[st.frameIdx-1]
-				if caller.initInstance.HeaderPtr() == nil && !st.curCO.VarKWSafe &&
-					(!caller.cmpActive || (caller.cmpOp <= CMP_GTE && !retVal.IsNotImplemented())) &&
-					len(vm.excStack) <= caller.excStackLen && caller.cache != nil {
-					if caller.cmpActive {
-						caller.cmpActive = false
-						caller.cmpLeft = val.Value{}
-						caller.cmpRight = val.Value{}
+				if (caller.flags&frameFlagSlowReturn) == 0 && !st.curCO.VarKWSafe &&
+					st.cells == nil && st.curLocals.IsNone() &&
+					len(vm.excStack) <= int(caller.excStackLen) && caller.cache != nil {
+					if (caller.flags & frameFlagInit) != 0 {
+						if !retVal.IsNone() {
+							goto returnSlow
+						}
+						retVal = caller.initInstance
+						caller.flags &^= frameFlagInit
+						caller.initInstance = val.Value{}
 					}
 					st.frameIdx--
-					if caller.co == st.curCO {
+					if (caller.flags & frameFlagSameGlobals) == 0 {
+						st.globals = caller.globals
+					}
+					if caller.cache == st.cache {
 						ip = caller.ip
 						st.base = caller.baseOffset
 						locals = unsafe.Add(stackPtr, uintptr(st.base)*16)
@@ -3487,32 +3510,31 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 						sp = caller.retSP + 1
 						continue
 					}
-					st.curCO = caller.co
-					codePtr = caller.codePtr
+					cc := caller.cache
+					co := cc.co
+					consts := co.Consts
+					if cc.inlineConsts != nil {
+						consts = cc.inlineConsts
+					}
+					st.curCO = co
+					codePtr = cc.codePtr
 					st.codePtr = codePtr
-					st.codeLen = caller.codeLen
-					st.consts = caller.consts
-					constsPtr = unsafe.Pointer(unsafe.SliceData(caller.consts))
+					st.codeLen = cc.codeLen
+					st.consts = consts
+					constsPtr = unsafe.Pointer(unsafe.SliceData(consts))
 					ip = caller.ip
 					st.base = caller.baseOffset
 					locals = unsafe.Add(stackPtr, uintptr(st.base)*16)
-					st.cells = caller.cells
-					st.cellPtrs = caller.cellPtrs
-					st.globals = caller.globals
-					st.curLocals = caller.locals
-					vm.activeCO = st.curCO
+					vm.activeCO = co
 					vm.activeBaseOffset = st.base
-					if vm.activeCellPtrs != nil || st.cellPtrs != nil {
-						vm.activeCells = st.cells
-						vm.activeCellPtrs = st.cellPtrs
-					}
 					vm.activeFrameIdx = st.frameIdx
 					*(*val.Value)(unsafe.Add(stackPtr, uintptr(caller.retSP)*16)) = retVal
 					sp = caller.retSP + 1
-					st.cache = caller.cache
+					st.cache = cc
 					continue
 				}
 			}
+		returnSlow:
 			ip, sp, ctl = vm.opReturnSlow(st, ip, sp, retVal)
 		case OP_LOAD_FAST_ATTR:
 			if instObj := (*val.Value)(unsafe.Add(locals, uintptr(uint8(inst>>16))*16)).AsInstanceChecked(); instObj != nil {
@@ -4082,6 +4104,40 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 }
 
 //go:noinline
+func (vm *VM) maybeOptimizeFast(callee *CodeObject, cc *VMCodeCache) {
+	maybeOptimizeCodeObject(vm, callee, cc)
+	if atomic.LoadInt32(&callee.IsTier2Optimized) != 0 {
+		cc.tier2Done = 1
+	}
+}
+
+//go:noinline
+func (vm *VM) saveFrameAux(st *loopState, frameIdx int) {
+	aux := vm.frameAuxAt(frameIdx)
+	aux.cells = st.cells
+	aux.cellPtrs = st.cellPtrs
+	aux.locals = st.curLocals
+	if !st.curLocals.IsNone() {
+		st.curLocals = val.NoneVal()
+	}
+}
+
+//go:noinline
+func (vm *VM) switchCalleeCells(st *loopState, callee *CodeObject, fn *val.PyFunction) {
+	if !callee.HasCells {
+		st.cells = nil
+		st.cellPtrs = nil
+		vm.activeCells = nil
+		vm.activeCellPtrs = nil
+		return
+	}
+	st.cells = fn.Closure
+	st.cellPtrs = fn.CellPtrs
+	vm.activeCells = st.cells
+	vm.activeCellPtrs = st.cellPtrs
+}
+
+//go:noinline
 func (vm *VM) pushFrameFast(
 	st *loopState,
 	pushFn *val.PyFunction,
@@ -4101,79 +4157,66 @@ func (vm *VM) pushFrameFast(
 	}
 	pushNewBase := sp - pushTotalArgs
 	pushRetSP := pushNewBase - popCallable
-	// Count in-loop calls toward Tier-2 compilation so hot callees become
-	// eligible for register execution. Type-init calls keep the stack
-	// path so the in-loop instance protocol stays intact, as do dunder
-	// comparisons carrying caller fallback state.
-	if !isTypeInit && st.frameIdx >= 0 && st.frameIdx < len(vm.frames) && !vm.frames[st.frameIdx].cmpActive {
-		maybeOptimizeCodeObject(vm, pushCallee, pushCache)
+	frameIdx := st.frameIdx
+	saved := &vm.frames[frameIdx]
+	if pushCache.tier2Done == 0 && !isTypeInit && (saved.flags&frameFlagCmp) == 0 {
+		vm.maybeOptimizeFast(pushCallee, pushCache)
 	}
-	// Tier-1 path stays direct: nested register entry for quickened leaf
-	// calls is disabled so tiny methods never pay frame setup. Loop-bearing
-	// callees still reach the tier through the top-level runFrame entry.
-	saved := &vm.frames[st.frameIdx]
+	flags := saved.flags & (frameFlagCmp | frameFlagHasShadow)
+	if st.stackIsVM {
+		flags |= frameFlagStackIsVM
+	}
 	if isTypeInit {
 		instObj := val.NewInstanceOfType(st.stack[pushNewBase].AsType())
 		st.stack[pushNewBase] = instObj
 		saved.initInstance = instObj
+		flags |= frameFlagInit
 	}
-	saved.co = st.curCO
-	saved.codePtr = st.codePtr
-	saved.codeLen = st.codeLen
-	saved.consts = st.consts
+	if saved.cache != st.cache {
+		saved.cache = st.cache
+	}
 	saved.ip = ip + 1
 	saved.baseOffset = st.base
 	saved.retSP = pushRetSP
-	if saved.cells != nil || st.cells != nil {
-		saved.cells = st.cells
+	saved.excStackLen = int32(len(vm.excStack))
+	if st.cells != nil || st.cellPtrs != nil || !st.curLocals.IsNone() {
+		vm.saveFrameAux(st, frameIdx)
+		flags |= frameFlagHasAux
 	}
-	if saved.cellPtrs != nil || st.cellPtrs != nil {
-		saved.cellPtrs = st.cellPtrs
+	if pushFn.Globals == nil || pushFn.Globals == st.globals {
+		flags |= frameFlagSameGlobals
+	} else {
+		saved.globals = st.globals
+		st.globals = pushFn.Globals
 	}
-	saved.globals = st.globals
-	if saved.locals != st.curLocals {
-		saved.locals = st.curLocals
-	}
-	saved.cache = st.cache
-	saved.excStackLen = len(vm.excStack)
-	saved.stackIsVM = st.stackIsVM
-	if !st.curLocals.IsNone() {
-		st.curLocals = val.NoneVal()
-	}
-	st.frameIdx++
-	if st.frameIdx > vm.maxFrameIdx {
-		vm.maxFrameIdx = st.frameIdx
+	saved.flags = flags
+
+	nextFrame := frameIdx + 1
+	st.frameIdx = nextFrame
+	if nextFrame > vm.maxFrameIdx {
+		vm.maxFrameIdx = nextFrame
 	}
 	if st.stackIsVM {
 		if hw := pushNewBase + pushCallee.FrameStackNeed; hw > vm.maxSP {
 			vm.maxSP = hw
 		}
 	}
+	consts := pushCallee.Consts
+	if pushCache.inlineConsts != nil {
+		consts = pushCache.inlineConsts
+	}
 	st.curCO = pushCallee
 	st.cache = pushCache
 	st.codePtr = pushCache.codePtr
 	st.codeLen = pushCache.codeLen
-	st.consts = pushCache.frameConsts(pushCallee)
+	st.consts = consts
 	st.base = pushNewBase
-	if !pushCallee.HasCells {
-		if st.cells != nil || st.cellPtrs != nil {
-			st.cells = nil
-			st.cellPtrs = nil
-		}
-	} else {
-		st.cells = pushFn.Closure
-		st.cellPtrs = pushFn.CellPtrs
-	}
-	if pushFn.Globals != nil {
-		st.globals = pushFn.Globals
-	}
 	vm.activeCO = pushCallee
 	vm.activeBaseOffset = pushNewBase
-	if vm.activeCellPtrs != nil || st.cellPtrs != nil {
-		vm.activeCells = st.cells
-		vm.activeCellPtrs = st.cellPtrs
+	vm.activeFrameIdx = nextFrame
+	if pushCallee.HasCells || st.cells != nil || st.cellPtrs != nil {
+		vm.switchCalleeCells(st, pushCallee, pushFn)
 	}
-	vm.activeFrameIdx = st.frameIdx
 	return pushCallee.EntryIP, pushNewBase + max(pushCallee.NumLocals, pushTotalArgs)
 }
 

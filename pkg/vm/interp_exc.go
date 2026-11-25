@@ -138,15 +138,20 @@ func (vm *VM) opReturnSlow(st *loopState, ip, sp int, retVal val.Value) (int, in
 	if st.curCO != nil && st.frameIdx != st.genFrameIdx && sp > st.base+st.curCO.EffectiveLocals {
 		vm.releaseDeadEphemeralIters(stack[st.base+st.curCO.EffectiveLocals : sp])
 	}
-	if st.curCO != nil && st.curCO.VarKWSafe && st.frameIdx != st.genFrameIdx && vm.frames[st.frameIdx].shadowFrame == nil {
+	if st.curCO != nil && st.curCO.VarKWSafe && st.frameIdx != st.genFrameIdx && (vm.frames[st.frameIdx].flags&frameFlagHasShadow) == 0 {
 		idx := st.base + st.curCO.VarKWIdx
 		if idx >= 0 && idx < len(stack) {
 			vm.releaseFrameSmallDictVal(stack[idx])
 		}
 	}
-	if curShadow := vm.frames[st.frameIdx].shadowFrame; curShadow != nil {
-		curShadow.Detach()
-		vm.frames[st.frameIdx].shadowFrame = nil
+	if (vm.frames[st.frameIdx].flags & frameFlagHasShadow) != 0 {
+		vm.frames[st.frameIdx].flags &^= frameFlagHasShadow
+		if st.frameIdx < len(vm.frameAux) {
+			if curShadow := vm.frameAux[st.frameIdx].shadowFrame; curShadow != nil {
+				curShadow.Detach()
+				vm.frameAux[st.frameIdx].shadowFrame = nil
+			}
+		}
 	}
 	if st.activeGen != nil && st.frameIdx == st.genFrameIdx {
 		gen := st.activeGen
@@ -159,19 +164,21 @@ func (vm *VM) opReturnSlow(st *loopState, ip, sp int, retVal val.Value) (int, in
 			return ip, sp, ctlExit
 		}
 		st.frameIdx--
-		caller := &vm.frames[st.frameIdx]
-		if len(vm.excStack) > caller.excStackLen {
+		callerIdx := st.frameIdx
+		caller := &vm.frames[callerIdx]
+		if len(vm.excStack) > int(caller.excStackLen) {
 			vm.excStack = vm.excStack[:caller.excStackLen]
 		}
-		mode := caller.genMode
-		defVal := caller.genDefault
-		exitIP := caller.genExitIP
+		aux := vm.frameAuxAt(callerIdx)
+		mode := aux.genMode
+		defVal := aux.genDefault
+		exitIP := aux.genExitIP
 		callerIP := caller.ip
 		retSP := caller.retSP
-		js := caller.joinState
-		caller.joinState = nil
-		cs := caller.collectState
-		caller.collectState = nil
+		js := aux.joinState
+		aux.joinState = nil
+		cs := aux.collectState
+		aux.collectState = nil
 		vm.restoreCallerFrame(st, caller)
 		if mode == genModeForIter || mode == genModeYieldFrom || mode == genModeAwait || mode == genModeStrJoin ||
 			mode == genModeCollectList || mode == genModeCollectTuple || mode == genModeCollectSet || mode == genModeListExtend ||
@@ -257,11 +264,13 @@ func (vm *VM) opReturnSlow(st *loopState, ip, sp int, retVal val.Value) (int, in
 			return ip, sp, ctlExit
 		}
 		st.frameIdx--
-		caller := &vm.frames[st.frameIdx]
-		if len(vm.excStack) > caller.excStackLen {
+		callerIdx := st.frameIdx
+		caller := &vm.frames[callerIdx]
+		if len(vm.excStack) > int(caller.excStackLen) {
 			vm.excStack = vm.excStack[:caller.excStackLen]
 		}
-		mode := caller.genMode
+		aux := vm.frameAuxAt(callerIdx)
+		mode := aux.genMode
 		callerIP := caller.ip
 		retSP := caller.retSP
 		vm.restoreCallerFrame(st, caller)
@@ -282,9 +291,11 @@ func (vm *VM) opReturnSlow(st *loopState, ip, sp int, retVal val.Value) (int, in
 		return ip, sp, ctlExit
 	}
 	st.frameIdx--
-	caller := &vm.frames[st.frameIdx]
-	if caller.initInstance.HeaderPtr() != nil {
+	callerIdx := st.frameIdx
+	caller := &vm.frames[callerIdx]
+	if (caller.flags & frameFlagInit) != 0 {
 		inst := caller.initInstance
+		caller.flags &^= frameFlagInit
 		caller.initInstance = val.Value{}
 		if !retVal.IsNone() {
 			st.raiseExc = val.NewTypeError("__init__() should return None, not '" + retVal.Type().Name + "'")
@@ -292,37 +303,18 @@ func (vm *VM) opReturnSlow(st *loopState, ip, sp int, retVal val.Value) (int, in
 		}
 		retVal = inst
 	}
-	if caller.cmpActive {
-		cmpLeft, cmpRight, cmpOp := caller.cmpLeft, caller.cmpRight, caller.cmpOp
-		caller.cmpActive = false
-		caller.cmpLeft = val.Value{}
-		caller.cmpRight = val.Value{}
+	if (caller.flags & frameFlagCmp) != 0 {
+		aux := &vm.frameAux[callerIdx]
+		cmpLeft, cmpRight, cmpOp := aux.cmpLeft, aux.cmpRight, aux.cmpOp
+		caller.flags &^= frameFlagCmp
+		aux.cmpLeft = val.Value{}
+		aux.cmpRight = val.Value{}
 		if retVal.IsNotImplemented() {
-			if len(vm.excStack) > caller.excStackLen {
+			if len(vm.excStack) > int(caller.excStackLen) {
 				vm.excStack = vm.excStack[:caller.excStackLen]
 			}
-			st.curCO = caller.co
-			st.codePtr = caller.codePtr
-			st.codeLen = caller.codeLen
-			st.consts = caller.consts
+			vm.restoreNormalCallerFrame(st, callerIdx, caller)
 			ip = caller.ip
-			st.base = caller.baseOffset
-			st.cells = caller.cells
-			st.cellPtrs = caller.cellPtrs
-			st.globals = caller.globals
-			st.curLocals = caller.locals
-			vm.activeCO = st.curCO
-			vm.activeBaseOffset = st.base
-			if vm.activeCellPtrs != nil || st.cellPtrs != nil {
-				vm.activeCells = st.cells
-				vm.activeCellPtrs = st.cellPtrs
-			}
-			vm.activeFrameIdx = st.frameIdx
-			if caller.cache != nil {
-				st.cache = caller.cache
-			} else {
-				st.cache = vm.cacheFor(st.curCO)
-			}
 			st.ip = ip
 			vm.execCtx.SP = sp
 			res := vm.compareOpSafe(cmpLeft, cmpRight, cmpOp)
@@ -344,10 +336,13 @@ func (vm *VM) opReturnSlow(st *loopState, ip, sp int, retVal val.Value) (int, in
 			}
 		}
 	}
-	if len(vm.excStack) > caller.excStackLen {
+	if len(vm.excStack) > int(caller.excStackLen) {
 		vm.excStack = vm.excStack[:caller.excStackLen]
 	}
-	if caller.co == st.curCO {
+	if caller.cache == st.cache && (caller.flags&frameFlagHasAux) == 0 && st.cells == nil && st.curLocals.IsNone() {
+		if (caller.flags & frameFlagSameGlobals) == 0 {
+			st.globals = caller.globals
+		}
 		ip = caller.ip
 		st.base = caller.baseOffset
 		vm.activeBaseOffset = st.base
@@ -355,28 +350,43 @@ func (vm *VM) opReturnSlow(st *loopState, ip, sp int, retVal val.Value) (int, in
 		stack[caller.retSP] = retVal
 		return ip, caller.retSP + 1, ctlReload
 	}
-	st.curCO = caller.co
-	st.codePtr = caller.codePtr
-	st.codeLen = caller.codeLen
-	st.consts = caller.consts
+	vm.restoreNormalCallerFrame(st, callerIdx, caller)
 	ip = caller.ip
+	stack[caller.retSP] = retVal
+	return ip, caller.retSP + 1, ctlReload
+}
+
+func (vm *VM) restoreNormalCallerFrame(st *loopState, callerIdx int, caller *CallFrame) {
+	cc := caller.cache
+	co := cc.co
+	st.curCO = co
+	st.cache = cc
+	st.codePtr = cc.codePtr
+	st.codeLen = cc.codeLen
+	st.consts = cc.frameConsts(co)
 	st.base = caller.baseOffset
-	st.cells = caller.cells
-	st.cellPtrs = caller.cellPtrs
-	st.globals = caller.globals
-	st.curLocals = caller.locals
-	vm.activeCO = st.curCO
+	if (caller.flags & frameFlagHasAux) != 0 {
+		aux := &vm.frameAux[callerIdx]
+		st.cells = aux.cells
+		st.cellPtrs = aux.cellPtrs
+		st.curLocals = aux.locals
+		aux.cells = nil
+		aux.cellPtrs = nil
+		aux.locals = val.Value{}
+		caller.flags &^= frameFlagHasAux
+	} else {
+		st.cells = nil
+		st.cellPtrs = nil
+		st.curLocals = val.NoneVal()
+	}
+	if (caller.flags & frameFlagSameGlobals) == 0 {
+		st.globals = caller.globals
+	}
+	vm.activeCO = co
 	vm.activeBaseOffset = st.base
 	if vm.activeCellPtrs != nil || st.cellPtrs != nil {
 		vm.activeCells = st.cells
 		vm.activeCellPtrs = st.cellPtrs
 	}
 	vm.activeFrameIdx = st.frameIdx
-	stack[caller.retSP] = retVal
-	if caller.cache != nil {
-		st.cache = caller.cache
-	} else {
-		st.cache = vm.cacheFor(st.curCO)
-	}
-	return ip, caller.retSP + 1, ctlReload
 }

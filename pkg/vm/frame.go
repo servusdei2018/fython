@@ -134,6 +134,13 @@ type KwDefaultFill struct {
 	Val    val.Value
 }
 
+const (
+	kwCopyScratch   uint8 = iota
+	kwCopyIdentity        // every KwSlots[i] == posCount + i (0 copies)
+	kwCopyDirectFwd       // forward copy i=0..kwCount-1 is conflict-free
+	kwCopyDirectRev       // reverse copy i=kwCount-1..0 is conflict-free
+)
+
 // KwPICEntry caches a monomorphic/polymorphic OP_CALL_KW parameter binding plan so
 // keyword calls write directly into callee frame slots with 0 heap allocations.
 type KwPICEntry struct {
@@ -143,6 +150,7 @@ type KwPICEntry struct {
 	TypeVersion   uint64
 	DefaultsLen   int
 	HasKwDefaults bool
+	KwCopyMode    uint8
 	KwDefaultsVer uint64
 	NumLocals     int
 	PosCount      int
@@ -207,27 +215,26 @@ type collectState struct {
 	isliceIter *val.PyIter
 }
 
-// CallFrame is an unboxed value struct stored in the contiguous VM.frames slab.
-// It is never heap-allocated per function call.
-type CallFrame struct {
-	co          *CodeObject
-	codePtr     unsafe.Pointer
-	codeLen     int
-	consts      []val.Value
-	ip          int
-	baseOffset  int
-	retSP       int // Caller's stack pointer where the return value will be written
-	cells       []val.Value
-	cellPtrs    []*val.PyCell
-	globals     *val.PyDict
-	locals      val.Value
-	cache       *VMCodeCache
-	shadowFrame *val.PyFrame
-	excStackLen int
-	stackIsVM   bool
-	// Inline generator/coroutine linkage. When genMode != genModeNone, the child
-	// frame is executing on its own stack slice, and stack holds the caller's
-	// stack slice to restore on yield/suspend/return/unwind.
+// CallFrame flags bitmask.
+const (
+	frameFlagStackIsVM   uint8 = 1 << 0
+	frameFlagSameGlobals uint8 = 1 << 1 // callee shares caller globals; caller.globals not written/restored
+	frameFlagInit        uint8 = 1 << 2 // caller awaiting __init__ return (initInstance valid)
+	frameFlagCmp         uint8 = 1 << 3 // caller awaiting dunder compare return (frameAux.cmp* valid)
+	frameFlagHasAux      uint8 = 1 << 4 // caller saved cells/cellPtrs/locals in vm.frameAux[idx]
+	frameFlagHasShadow   uint8 = 1 << 5 // frame has materialized shadowFrame in vm.frameAux[idx]
+	frameFlagGenOrCoro   uint8 = 1 << 6 // inline generator/coroutine suspension frame (frameAux.gen* valid)
+)
+
+const frameFlagSlowReturn = frameFlagHasAux | frameFlagCmp | frameFlagGenOrCoro
+
+// frameAux holds cold CallFrame state in VM.frameAux (lazily allocated side slice
+// indexed by frameIdx) so the hot CallFrame slab stays 64 bytes per entry.
+type frameAux struct {
+	cells        []val.Value
+	cellPtrs     []*val.PyCell
+	locals       val.Value
+	shadowFrame  *val.PyFrame
 	stack        []val.Value
 	activeGen    *val.PyGenerator
 	activeCoro   *val.PyCoroutine
@@ -237,17 +244,39 @@ type CallFrame struct {
 	genExitIP    int
 	joinState    *strJoinState
 	collectState *collectState
-	// initInstance holds the freshly allocated receiver for an in-loop
-	// __init__ call. When set, OP_RETURN substitutes it for a None
-	// return and raises TypeError otherwise.
-	initInstance val.Value
-	// cmpLeft/cmpRight/cmpOp record an in-loop dunder comparison so
-	// OP_RETURN can fall back to the generic comparison when the dunder
-	// answers NotImplemented. cmpActive marks the record live.
-	cmpLeft   val.Value
-	cmpRight  val.Value
-	cmpOp     uint8
-	cmpActive bool
+	cmpLeft      val.Value
+	cmpRight     val.Value
+	cmpOp        uint8
+}
+
+// CallFrame is an unboxed 64-byte (single cache line) hot value struct stored in
+// the contiguous VM.frames slab. All 3 pointer words sit in the first 32 bytes so
+// Go's GC pointer bitmap ends halfway through the struct.
+type CallFrame struct {
+	cache        *VMCodeCache //  8 B (derives co, codePtr, codeLen, consts)
+	globals      *val.PyDict  //  8 B (only written when !frameFlagSameGlobals)
+	initInstance val.Value    // 16 B (kept inline so C(...) never touches frameAux)
+	ip           int          //  8 B
+	baseOffset   int          //  8 B
+	retSP        int          //  8 B
+	excStackLen  int32        //  4 B
+	flags        uint8        //  1 B (+ 3 B pad)
+}
+
+var (
+	_ [64 - unsafe.Sizeof(CallFrame{})]byte
+	_ [unsafe.Sizeof(CallFrame{}) - 64]byte
+)
+
+func (f *CallFrame) codeObject() *CodeObject {
+	if f.cache != nil {
+		return f.cache.co
+	}
+	return nil
+}
+
+func (f *CallFrame) stackIsVM() bool {
+	return (f.flags & frameFlagStackIsVM) != 0
 }
 
 // LineSpanEntry maps an instruction pointer range [StartIP, EndIP) to source line and column.
@@ -574,6 +603,7 @@ type VMCodeCache struct {
 	codeLen         int
 	streamGen       int32
 	privateActive   bool
+	tier2Done       uint8
 	attrQueryPICExt [][4]AttrQueryPICEntry
 }
 
@@ -883,6 +913,8 @@ type VM struct {
 	engine               *Engine
 	stack                []val.Value
 	frames               []CallFrame
+	frameAux             []frameAux
+	maxFrameAuxLen       int
 	codeCaches           []*VMCodeCache
 	builtinRange         val.Value
 	builtinLen           val.Value
@@ -1331,19 +1363,24 @@ func (vm *VM) Reset() {
 
 	fLimit := min(vm.maxFrameIdx+1, len(vm.frames))
 	if fLimit > 0 {
-		for i := range fLimit {
-			if js := vm.frames[i].joinState; js != nil {
-				vm.frames[i].joinState = nil
-				vm.releaseStrJoinState(js)
-			}
-			if cs := vm.frames[i].collectState; cs != nil {
-				vm.frames[i].collectState = nil
-				vm.releaseCollectState(cs)
-			}
-		}
 		clear(vm.frames[:fLimit])
 	}
 	vm.maxFrameIdx = 0
+	if vm.maxFrameAuxLen > 0 {
+		aLimit := min(vm.maxFrameAuxLen, len(vm.frameAux))
+		for i := range aLimit {
+			if js := vm.frameAux[i].joinState; js != nil {
+				vm.frameAux[i].joinState = nil
+				vm.releaseStrJoinState(js)
+			}
+			if cs := vm.frameAux[i].collectState; cs != nil {
+				vm.frameAux[i].collectState = nil
+				vm.releaseCollectState(cs)
+			}
+		}
+		clear(vm.frameAux[:aLimit])
+		vm.maxFrameAuxLen = 0
+	}
 
 	vm.execCtx.SP = 0
 	vm.execCtx.Stack = vm.stack
@@ -1399,6 +1436,56 @@ func (vm *VM) MaterializeFrame(frameIdx int) val.Value {
 	return vm.materializeFrame(frameIdx)
 }
 
+func (vm *VM) frameAuxAt(idx int) *frameAux {
+	if idx >= len(vm.frameAux) {
+		vm.growFrameAux(idx + 1)
+	}
+	if idx+1 > vm.maxFrameAuxLen {
+		vm.maxFrameAuxLen = idx + 1
+	}
+	return &vm.frameAux[idx]
+}
+
+//go:noinline
+func (vm *VM) growFrameAux(minLen int) {
+	newCap := max(len(vm.frames), minLen, DefaultFrameSlabSize)
+	next := make([]frameAux, newCap)
+	copy(next, vm.frameAux)
+	vm.frameAux = next
+}
+
+func (vm *VM) frameGlobals(idx int) *val.PyDict {
+	if idx < 0 || idx >= len(vm.frames) {
+		if vm.activeState != nil && vm.activeState.globals != nil {
+			return vm.activeState.globals
+		}
+		return vm.globals
+	}
+	top := vm.activeFrameIdx
+	if vm.activeState != nil {
+		top = vm.activeState.frameIdx
+	}
+	if idx == top && vm.activeState != nil && vm.activeState.globals != nil {
+		return vm.activeState.globals
+	}
+	for j := idx; j < top && j < len(vm.frames); j++ {
+		f := &vm.frames[j]
+		if (f.flags & frameFlagSameGlobals) == 0 {
+			if f.globals != nil {
+				return f.globals
+			}
+			break
+		}
+	}
+	if vm.activeState != nil && vm.activeState.globals != nil {
+		return vm.activeState.globals
+	}
+	if top >= 0 && top < len(vm.frames) && (vm.frames[top].flags&frameFlagSameGlobals) == 0 && vm.frames[top].globals != nil {
+		return vm.frames[top].globals
+	}
+	return vm.globals
+}
+
 func (vm *VM) materializeFrame(targetIdx int) val.Value {
 	if targetIdx < 0 || targetIdx >= len(vm.frames) {
 		return val.NoneVal()
@@ -1411,13 +1498,18 @@ func (vm *VM) materializeFrame(targetIdx int) val.Value {
 	if site := fSlot.cache.findInlineSite(fIP); site != nil {
 		fIP = site.GuardIP
 	}
-	if fSlot.shadowFrame != nil {
-		fSlot.shadowFrame.IP = fIP
-		return val.NewFrameVal(fSlot.shadowFrame)
+	if (fSlot.flags&frameFlagHasShadow) != 0 && targetIdx < len(vm.frameAux) && vm.frameAux[targetIdx].shadowFrame != nil {
+		vm.frameAux[targetIdx].shadowFrame.IP = fIP
+		return val.NewFrameVal(vm.frameAux[targetIdx].shadowFrame)
 	}
-	co := fSlot.co
+	co := fSlot.codeObject()
 	baseOffset := fSlot.baseOffset
-	cells := fSlot.cells
+	var cells []val.Value
+	var extraLocals val.Value
+	if (fSlot.flags&frameFlagHasAux) != 0 && targetIdx < len(vm.frameAux) {
+		cells = vm.frameAux[targetIdx].cells
+		extraLocals = vm.frameAux[targetIdx].locals
+	}
 	if co == nil && targetIdx == vm.activeFrameIdx {
 		co = vm.activeCO
 		baseOffset = vm.activeBaseOffset
@@ -1430,7 +1522,7 @@ func (vm *VM) materializeFrame(targetIdx int) val.Value {
 		return val.NoneVal()
 	}
 	codeVal := NewCodeVal(co)
-	globals := fSlot.globals
+	globals := vm.frameGlobals(targetIdx)
 	if globals == nil {
 		globals = vm.globals
 	}
@@ -1443,10 +1535,12 @@ func (vm *VM) materializeFrame(targetIdx int) val.Value {
 		cells,
 	)
 	pyFrame.IP = fIP
-	if fSlot.locals.IsDict() {
-		pyFrame.ExtraLocals = fSlot.locals.AsDict()
+	if extraLocals.IsDict() {
+		pyFrame.ExtraLocals = extraLocals.AsDict()
 	}
-	fSlot.shadowFrame = pyFrame
+	aux := vm.frameAuxAt(targetIdx)
+	aux.shadowFrame = pyFrame
+	fSlot.flags |= frameFlagHasShadow
 	return val.NewFrameVal(pyFrame)
 }
 

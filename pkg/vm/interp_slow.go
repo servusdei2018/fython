@@ -1122,29 +1122,23 @@ func (vm *VM) opFastSelfRecurseSlow(st *loopState, inst uint32, ip, sp int) (int
 				if st.frameIdx+2 > len(vm.frames) {
 					vm.ensureFrameCapacity(st.frameIdx + 2)
 				}
-				saved := &vm.frames[st.frameIdx]
-				saved.co = st.curCO
-				saved.codePtr = st.codePtr
-				saved.codeLen = st.codeLen
-				saved.consts = st.consts
+				frameIdx := st.frameIdx
+				saved := &vm.frames[frameIdx]
+				saved.cache = st.cache
 				saved.ip = ip + 6
 				saved.baseOffset = st.base
 				saved.retSP = sp
-				saved.cells = st.cells
-				saved.cellPtrs = st.cellPtrs
-				saved.globals = st.globals
-				saved.locals = st.curLocals
-				saved.cache = st.cache
-				saved.excStackLen = len(vm.excStack)
-				saved.stackIsVM = st.stackIsVM
-				saved.stack = st.stack
-				saved.activeGen = st.activeGen
-				saved.genFrameIdx = st.genFrameIdx
-				saved.genMode = genModeNone
-				saved.genDefault = val.Value{}
+				saved.excStackLen = int32(len(vm.excStack))
 				saved.initInstance = val.Value{}
-				saved.cmpActive = false
-				st.curLocals = val.NoneVal()
+				flags := (saved.flags & frameFlagHasShadow) | frameFlagSameGlobals
+				if st.stackIsVM {
+					flags |= frameFlagStackIsVM
+				}
+				if st.cells != nil || st.cellPtrs != nil || !st.curLocals.IsNone() {
+					vm.saveFrameAux(st, frameIdx)
+					flags |= frameFlagHasAux
+				}
+				saved.flags = flags
 				st.frameIdx++
 				st.base = newBase
 				minCap := st.base + 256

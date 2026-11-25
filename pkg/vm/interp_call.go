@@ -73,33 +73,28 @@ func (vm *VM) pushCalleeFrame(
 		vm.ensureFrameCapacity(frameIdx + 2)
 	}
 	saved := &vm.frames[frameIdx]
-	if saved.co != st.curCO || saved.codePtr != st.codePtr {
-		saved.co = st.curCO
-		saved.codePtr = st.codePtr
-		saved.codeLen = st.codeLen
-		saved.consts = st.consts
+	if saved.cache != st.cache {
 		saved.cache = st.cache
 	}
 	saved.ip = retIP
 	saved.baseOffset = st.base
 	saved.retSP = retSP
-	saved.excStackLen = len(vm.excStack)
-	saved.stackIsVM = st.stackIsVM
-	if saved.globals != st.globals {
+	saved.excStackLen = int32(len(vm.excStack))
+	flags := saved.flags & (frameFlagInit | frameFlagCmp | frameFlagHasShadow)
+	if st.stackIsVM {
+		flags |= frameFlagStackIsVM
+	}
+	if st.cells != nil || st.cellPtrs != nil || !st.curLocals.IsNone() {
+		vm.saveFrameAux(st, frameIdx)
+		flags |= frameFlagHasAux
+	}
+	if fn == nil || fn.Globals == nil || fn.Globals == st.globals {
+		flags |= frameFlagSameGlobals
+	} else {
 		saved.globals = st.globals
+		st.globals = fn.Globals
 	}
-	if saved.cells != nil || st.cells != nil {
-		saved.cells = st.cells
-	}
-	if saved.cellPtrs != nil || st.cellPtrs != nil {
-		saved.cellPtrs = st.cellPtrs
-	}
-	if saved.locals != st.curLocals {
-		saved.locals = st.curLocals
-	}
-	if !st.curLocals.IsNone() {
-		st.curLocals = val.NoneVal()
-	}
+	saved.flags = flags
 
 	nextFrame := frameIdx + 1
 	st.frameIdx = nextFrame
@@ -116,10 +111,15 @@ func (vm *VM) pushCalleeFrame(
 		cc = vm.cacheFor(callee)
 	}
 	st.cache = cc
-	if atomic.LoadInt32(&callee.StreamGen) == cc.streamGen && atomic.LoadInt32(&callee.IsTier2Optimized) != 0 {
+	switch {
+	case cc.tier2Done != 0 && atomic.LoadInt32(&callee.StreamGen) == cc.streamGen:
 		st.codePtr = cc.codePtr
 		st.codeLen = cc.codeLen
-	} else {
+	case atomic.LoadInt32(&callee.StreamGen) == cc.streamGen && atomic.LoadInt32(&callee.IsTier2Optimized) != 0:
+		cc.tier2Done = 1
+		st.codePtr = cc.codePtr
+		st.codeLen = cc.codeLen
+	default:
 		vm.syncCalleeCode(st, callee, cc)
 	}
 	st.consts = cc.frameConsts(callee)
@@ -133,9 +133,6 @@ func (vm *VM) pushCalleeFrame(
 		}
 	} else {
 		vm.setCalleeCells(st, callee, fn, newBase)
-	}
-	if fn != nil && fn.Globals != nil && st.globals != fn.Globals {
-		st.globals = fn.Globals
 	}
 	vm.activeCO = callee
 	vm.activeBaseOffset = newBase
@@ -605,8 +602,10 @@ func (vm *VM) pushTypeInitPositional(
 	}
 	cc := vm.fastCalleeCache(callee)
 	vm.frames[st.frameIdx].initInstance = instObj
+	vm.frames[st.frameIdx].flags |= frameFlagInit
 	rIP, rSP, rCtl := vm.pushCalleeFrame(st, callee, initFunc, cc, initBase, retSP, nextSP, ip+1)
 	vm.frames[st.frameIdx-1].initInstance = instObj
+	vm.frames[st.frameIdx-1].flags |= frameFlagInit
 	return rIP, rSP, rCtl, true
 }
 
@@ -694,6 +693,30 @@ func buildKwPICEntry(
 	if tp != nil {
 		typeVer = tp.Version()
 	}
+	copyMode := kwCopyScratch
+	identity := true
+	fwdOK := true
+	revOK := true
+	for i := range kwCount {
+		dst := int(kwSlots[i])
+		if dst != posCount+i {
+			identity = false
+		}
+		if dst > posCount+i && dst < posCount+kwCount {
+			fwdOK = false
+		}
+		if dst >= posCount && dst < posCount+i {
+			revOK = false
+		}
+	}
+	switch {
+	case identity:
+		copyMode = kwCopyIdentity
+	case fwdOK:
+		copyMode = kwCopyDirectFwd
+	case revOK:
+		copyMode = kwCopyDirectRev
+	}
 	numLocals := max(callee.NumLocals, callee.NumParams)
 	return KwPICEntry{
 		TargetCo:      callee,
@@ -702,6 +725,7 @@ func buildKwPICEntry(
 		TypeVersion:   typeVer,
 		DefaultsLen:   len(defaults),
 		HasKwDefaults: hasKwDef,
+		KwCopyMode:    copyMode,
 		KwDefaultsVer: kwDefVer,
 		NumLocals:     numLocals,
 		PosCount:      posCount,
@@ -731,7 +755,6 @@ func (vm *VM) opCallKw(st *loopState, inst uint32, ip, sp int) (int, int, loopCt
 	totalArgs := int(uint8(inst >> 16))
 	bx := int(uint16(inst))
 	kwnames := st.consts[bx].AsTuple().Items
-	isDirectAwait := isDirectAwaitCallSite(st, ip)
 
 	target := stack[sp-totalArgs-1]
 	newBase := sp - totalArgs
@@ -792,7 +815,11 @@ unwrapKw:
 		if fnGlobals == nil {
 			fnGlobals = st.globals
 		}
-		if isDirectAwait && callee.IsCoroutine {
+		if callee.IsCoroutine {
+			isDirectAwait := isDirectAwaitCallSite(st, ip)
+			if !isDirectAwait || callee.CanSuspend {
+				return vm.dispatchCoroutineCall(st, callee, target, fn.Defaults, fn.KwDefaults, stack, ip, sp, newBase, retSP, totalArgs, kwnames, fnGlobals, isDirectAwait)
+			}
 			retIP = ip + 3
 		}
 		if callee.IsGenerator {
@@ -806,12 +833,9 @@ unwrapKw:
 			stack[retSP] = genVal
 			return ip + 1, retSP + 1, ctlReload
 		}
-		if callee.IsCoroutine && (!isDirectAwait || callee.CanSuspend) {
-			return vm.dispatchCoroutineCall(st, callee, target, fn.Defaults, fn.KwDefaults, stack, ip, sp, newBase, retSP, totalArgs, kwnames, fnGlobals, isDirectAwait)
-		}
 
 		// Fast path: OP_CALL_KW PIC hit writes kwargs directly into callee slots with 0 allocations.
-		// Monomorphic entry uses pushFrameFast setup without pushCalleeFrame dispatch.
+		// Monomorphic entry routes directly into pushFrameFast without pushCalleeFrame overhead.
 		if ip < len(st.cache.kwPIC) {
 			pic := &st.cache.kwPIC[ip]
 			if e := &pic[0]; e.TargetCo == callee && e.TargetFn == fn && e.TargetType == nil &&
@@ -826,9 +850,22 @@ unwrapKw:
 				if minCap > len(stack) {
 					stack = vm.growStack(st, stack, minCap)
 				}
-				copy(vm.kwScratch[:kwCount], stack[newBase+posCount:newBase+totalArgs])
-				for i := range kwCount {
-					stack[newBase+int(e.KwSlots[i])] = vm.kwScratch[i]
+				switch e.KwCopyMode {
+				case kwCopyIdentity:
+					// Values are already in target slots.
+				case kwCopyDirectFwd:
+					for i := range kwCount {
+						stack[newBase+int(e.KwSlots[i])] = stack[newBase+posCount+i]
+					}
+				case kwCopyDirectRev:
+					for i := kwCount - 1; i >= 0; i-- {
+						stack[newBase+int(e.KwSlots[i])] = stack[newBase+posCount+i]
+					}
+				default:
+					copy(vm.kwScratch[:kwCount], stack[newBase+posCount:newBase+totalArgs])
+					for i := range kwCount {
+						stack[newBase+int(e.KwSlots[i])] = vm.kwScratch[i]
+					}
 				}
 				for _, df := range e.DefaultsFill {
 					if df.DefIdx >= 0 {
@@ -837,11 +874,11 @@ unwrapKw:
 						stack[newBase+int(df.Slot)] = df.Val
 					}
 				}
-				// Slots are fully bound above, so enter through
-				// pushCalleeFrame directly: routing pre-bound kwargs
-				// through pushFrameFast would let tryRegEntry refill
-				// positional defaults over the kw-bound slots.
-				return vm.pushCalleeFrame(st, callee, fn, e.CalleeCache, newBase, retSP, newBase+e.NumLocals, retIP)
+				if st.frameIdx+2 > len(vm.frames) {
+					vm.ensureFrameCapacity(st.frameIdx + 2)
+				}
+				nextIP, nextSP := vm.pushFrameFast(st, fn, e.CalleeCache, newBase+totalArgs, ^totalArgs, ip)
+				return nextIP, nextSP, ctlReload
 			}
 			for k := range 2 {
 				e := &pic[k]
@@ -853,9 +890,21 @@ unwrapKw:
 					if minCap > len(stack) {
 						stack = vm.growStack(st, stack, minCap)
 					}
-					copy(vm.kwScratch[:kwCount], stack[newBase+posCount:newBase+totalArgs])
-					for i := range kwCount {
-						stack[newBase+int(e.KwSlots[i])] = vm.kwScratch[i]
+					switch e.KwCopyMode {
+					case kwCopyIdentity:
+					case kwCopyDirectFwd:
+						for i := range kwCount {
+							stack[newBase+int(e.KwSlots[i])] = stack[newBase+posCount+i]
+						}
+					case kwCopyDirectRev:
+						for i := kwCount - 1; i >= 0; i-- {
+							stack[newBase+int(e.KwSlots[i])] = stack[newBase+posCount+i]
+						}
+					default:
+						copy(vm.kwScratch[:kwCount], stack[newBase+posCount:newBase+totalArgs])
+						for i := range kwCount {
+							stack[newBase+int(e.KwSlots[i])] = vm.kwScratch[i]
+						}
 					}
 					for _, df := range e.DefaultsFill {
 						if df.DefIdx >= 0 {
@@ -891,7 +940,11 @@ unwrapKw:
 
 	case val.KindCode:
 		callee := AsCodeObject(target)
-		if isDirectAwait && callee.IsCoroutine {
+		if callee.IsCoroutine {
+			isDirectAwait := isDirectAwaitCallSite(st, ip)
+			if !isDirectAwait || callee.CanSuspend {
+				return vm.dispatchCoroutineCall(st, callee, target, nil, nil, stack, ip, sp, newBase, retSP, totalArgs, kwnames, st.globals, isDirectAwait)
+			}
 			retIP = ip + 3
 		}
 		if callee.IsGenerator {
@@ -904,9 +957,6 @@ unwrapKw:
 			}
 			stack[retSP] = genVal
 			return ip + 1, retSP + 1, ctlReload
-		}
-		if callee.IsCoroutine && (!isDirectAwait || callee.CanSuspend) {
-			return vm.dispatchCoroutineCall(st, callee, target, nil, nil, stack, ip, sp, newBase, retSP, totalArgs, kwnames, st.globals, isDirectAwait)
 		}
 		minCap := max(newBase+256, newBase+callee.NumLocals+64)
 		if minCap > len(stack) {
@@ -923,11 +973,13 @@ unwrapKw:
 
 	case val.KindBuiltinFunc:
 		builtin := target.AsBuiltinFunc()
-		st.stack = stack
+		origData := unsafe.SliceData(stack)
 		st.ip = ip
 		vm.execCtx.SP = newBase + totalArgs
 		res := vm.invokeBuiltinSafe(builtin.Fn, target, stack[newBase:newBase+totalArgs], kwnames)
-		stack = st.syncStackFromVM(vm, stack)
+		if unsafe.SliceData(vm.execCtx.Stack) != origData || (st.stackIsVM && unsafe.SliceData(vm.stack) != origData) {
+			stack = st.syncStackFromVM(vm, stack)
+		}
 		if vm.execCtx.HasException() {
 			exc := vm.execCtx.ActiveException
 			vm.execCtx.ClearException()
@@ -935,6 +987,9 @@ unwrapKw:
 			return ip, sp, ctlRaise
 		}
 		stack[retSP] = res
+		if unsafe.SliceData(stack) == origData {
+			return ip + 1, retSP + 1, ctlNext
+		}
 		return ip + 1, retSP + 1, ctlReload
 
 	case val.KindType:
@@ -942,7 +997,7 @@ unwrapKw:
 		if canFastInstantiate(tp) {
 			if !tp.HasInit() && len(kwnames) == 0 {
 				stack[retSP] = val.NewInstanceOfType(tp)
-				return ip + 1, retSP + 1, ctlReload
+				return ip + 1, retSP + 1, ctlNext
 			}
 			if tp.HasInit() {
 				initFn := tp.DunderInitVal()
@@ -983,8 +1038,10 @@ unwrapKw:
 										}
 									}
 									vm.frames[st.frameIdx].initInstance = instObj
+									vm.frames[st.frameIdx].flags |= frameFlagInit
 									rIP, rSP, rCtl := vm.pushCalleeFrame(st, callee, initFunc, e.CalleeCache, newBase, retSP, newBase+e.NumLocals, ip+1)
 									vm.frames[st.frameIdx-1].initInstance = instObj
+									vm.frames[st.frameIdx-1].flags |= frameFlagInit
 									return rIP, rSP, rCtl
 								}
 							}
@@ -1018,8 +1075,10 @@ unwrapKw:
 							}
 						}
 						vm.frames[st.frameIdx].initInstance = instObj
+						vm.frames[st.frameIdx].flags |= frameFlagInit
 						rIP, rSP, rCtl := vm.pushCalleeFrame(st, callee, initFunc, cc, newBase, retSP, nextSP, ip+1)
 						vm.frames[st.frameIdx-1].initInstance = instObj
+						vm.frames[st.frameIdx-1].flags |= frameFlagInit
 						return rIP, rSP, rCtl
 					}
 				}
@@ -1233,6 +1292,7 @@ func (vm *VM) opCallFunctionEx(st *loopState, inst uint32, ip, sp int) (int, int
 				rIP, rSP, rCtl := vm.pushCalleeFrame(st, callee, fn, cc, newBase, sp, nextSP, ip+1)
 				if initType != nil {
 					vm.frames[st.frameIdx-1].initInstance = initInst
+					vm.frames[st.frameIdx-1].flags |= frameFlagInit
 				}
 				return rIP, rSP, rCtl
 			}
@@ -1796,18 +1856,18 @@ func (vm *VM) opCallBuiltinFast(st *loopState, inst uint32, ip, sp int) (int, in
 		arg := stack[newBase]
 		if arg.IsInt64() {
 			stack[retSP] = val.IntToStringVal(arg.AsInt64())
-			return ip + 1, retSP + 1, ctlReload
+			return ip + 1, retSP + 1, ctlNext
 		}
 		if arg.IsAnyString() {
 			stack[retSP] = arg
-			return ip + 1, retSP + 1, ctlReload
+			return ip + 1, retSP + 1, ctlNext
 		}
 	}
 	if res, ok := val.TryFastPrimitiveDunderNew(target, stack[newBase:newBase+argc]); ok {
 		stack[retSP] = res
 		return ip + 1, retSP + 1, ctlNext
 	}
-	st.stack = stack
+	origData := unsafe.SliceData(stack)
 	st.ip = ip
 	vm.execCtx.SP = newBase + argc
 	var res val.Value
@@ -1816,7 +1876,9 @@ func (vm *VM) opCallBuiltinFast(st *loopState, inst uint32, ip, sp int) (int, in
 	} else {
 		res = vm.callFromHookSafe(target, newBase, argc, nil)
 	}
-	stack = st.syncStackFromVM(vm, stack)
+	if unsafe.SliceData(vm.execCtx.Stack) != origData || (st.stackIsVM && unsafe.SliceData(vm.stack) != origData) {
+		stack = st.syncStackFromVM(vm, stack)
+	}
 	if vm.execCtx.HasException() {
 		exc := vm.execCtx.ActiveException
 		vm.execCtx.ClearException()
@@ -1824,6 +1886,9 @@ func (vm *VM) opCallBuiltinFast(st *loopState, inst uint32, ip, sp int) (int, in
 		return ip, sp, ctlRaise
 	}
 	stack[retSP] = res
+	if unsafe.SliceData(stack) == origData {
+		return ip + 1, retSP + 1, ctlNext
+	}
 	return ip + 1, retSP + 1, ctlReload
 }
 
@@ -1845,7 +1910,7 @@ func (vm *VM) opCallTypeInit(st *loopState, inst uint32, ip, sp int) (int, int, 
 		if tp.Version() == entry.ExpectedTypeVer && metaOK {
 			if entry.SlotIndex == 0 && entry.CalleeCache == nil && argc == 0 && !tp.HasInit() {
 				stack[retSP] = val.NewInstanceOfType(tp)
-				return ip + 1, retSP + 1, ctlReload
+				return ip + 1, retSP + 1, ctlNext
 			}
 			var targetFn val.Value
 			isNewOnly := entry.SlotIndex == 1
@@ -1894,10 +1959,12 @@ func (vm *VM) opCallTypeInit(st *loopState, inst uint32, ip, sp int) (int, int, 
 						}
 						if !isNewOnly {
 							vm.frames[st.frameIdx].initInstance = instObj
+							vm.frames[st.frameIdx].flags |= frameFlagInit
 						}
 						rIP, rSP, rCtl := vm.pushCalleeFrame(st, callee, fn, cc, initBase, retSP, nextSP, ip+1)
 						if !isNewOnly {
 							vm.frames[st.frameIdx-1].initInstance = instObj
+							vm.frames[st.frameIdx-1].flags |= frameFlagInit
 						}
 						return rIP, rSP, rCtl
 					}
@@ -1973,12 +2040,13 @@ func (vm *VM) opCallMethodDescr(st *loopState, inst uint32, ip, sp int) (int, in
 				markViewsEscaped(stack[newBase : newBase+totalArgs])
 			}
 			origData := unsafe.SliceData(stack)
-			st.stack = stack
 			st.ip = ip
 			vm.frames[st.frameIdx].ip = ip
 			vm.execCtx.SP = newBase + totalArgs
 			res := nativeFn(&vm.execCtx, targetVal, stack[newBase:newBase+totalArgs], nil)
-			stack = st.syncStackFromExecCtx(vm, stack)
+			if unsafe.SliceData(vm.execCtx.Stack) != origData || (st.stackIsVM && unsafe.SliceData(vm.stack) != origData) {
+				stack = st.syncStackFromExecCtx(vm, stack)
+			}
 			if vm.execCtx.HasException() {
 				exc := vm.execCtx.ActiveException
 				vm.execCtx.ClearException()
@@ -2018,19 +2086,26 @@ func (vm *VM) opCallBoundNative(st *loopState, inst uint32, ip, sp int) (int, in
 	entry := &st.cache.ic[ip]
 	if target.Kind() == val.KindBoundMethod && entry.NativeFn != nil {
 		bm := target.AsBoundMethod()
-		if bm.Func == entry.CachedVal && bm.Self.Type().Version() == entry.ExpectedTypeVer {
+		var selfVer uint64
+		if oh := bm.Self.HeaderPtr(); oh != nil && oh.Type != nil {
+			selfVer = oh.Type.Version()
+		} else {
+			selfVer = bm.Self.Type().Version()
+		}
+		if bm.Func == entry.CachedVal && selfVer == entry.ExpectedTypeVer {
 			if vm.hasTrackedViews && argc > 0 {
 				markViewsEscaped(stack[retSP+1 : retSP+1+argc])
 			}
 			origTarget := target
 			origData := unsafe.SliceData(stack)
 			stack[retSP] = bm.Self
-			st.stack = stack
 			st.ip = ip
 			vm.frames[st.frameIdx].ip = ip
 			vm.execCtx.SP = sp
 			res := entry.NativeFn(&vm.execCtx, bm.Func, stack[retSP:sp], nil)
-			stack = st.syncStackFromExecCtx(vm, stack)
+			if unsafe.SliceData(vm.execCtx.Stack) != origData || (st.stackIsVM && unsafe.SliceData(vm.stack) != origData) {
+				stack = st.syncStackFromExecCtx(vm, stack)
+			}
 			if vm.execCtx.HasException() {
 				stack[retSP] = origTarget
 				exc := vm.execCtx.ActiveException
@@ -2081,12 +2156,13 @@ func (vm *VM) opCallMethodDescrFast(st *loopState, inst uint32, ip, sp int) (int
 				markViewsEscaped(stack[newBase : newBase+totalArgs])
 			}
 			origData := unsafe.SliceData(stack)
-			st.stack = stack
 			st.ip = ip
 			vm.frames[st.frameIdx].ip = ip
 			vm.execCtx.SP = sp
 			res := entry.NativeFn(&vm.execCtx, entry.CachedVal, stack[newBase:newBase+totalArgs], nil)
-			stack = st.syncStackFromExecCtx(vm, stack)
+			if unsafe.SliceData(vm.execCtx.Stack) != origData || (st.stackIsVM && unsafe.SliceData(vm.stack) != origData) {
+				stack = st.syncStackFromExecCtx(vm, stack)
+			}
 			if vm.execCtx.HasException() {
 				exc := vm.execCtx.ActiveException
 				vm.execCtx.ClearException()
@@ -2624,8 +2700,10 @@ unwrapCall:
 						st.codePtr = st.cache.quickenAt(ip, ReplaceOpcode(inst, OP_CALL_TYPE_INIT))
 					}
 					vm.frames[st.frameIdx].initInstance = instObj
+					vm.frames[st.frameIdx].flags |= frameFlagInit
 					rIP, rSP, rCtl := vm.pushCalleeFrame(st, callee, initFunc, cc, initBase, retSP, nextSP, ip+1)
 					vm.frames[st.frameIdx-1].initInstance = instObj
+					vm.frames[st.frameIdx-1].flags |= frameFlagInit
 					return rIP, rSP, rCtl
 				}
 			}
@@ -2962,11 +3040,11 @@ func (vm *VM) opCallMethodSlow(st *loopState, inst uint32, ip, sp int) (int, int
 			if st.frameIdx+2 > len(vm.frames) {
 				vm.ensureFrameCapacity(st.frameIdx + 2)
 			}
-			saved := &vm.frames[st.frameIdx]
-			saved.co = st.curCO
-			saved.codePtr = st.codePtr
-			saved.codeLen = st.codeLen
-			saved.consts = st.consts
+			frameIdx := st.frameIdx
+			saved := &vm.frames[frameIdx]
+			if saved.cache != st.cache {
+				saved.cache = st.cache
+			}
 			if isDirectAwait && callee.IsCoroutine {
 				saved.ip = ip + 3
 			} else {
@@ -2974,22 +3052,21 @@ func (vm *VM) opCallMethodSlow(st *loopState, inst uint32, ip, sp int) (int, int
 			}
 			saved.baseOffset = st.base
 			saved.retSP = retSP
-			if saved.cells != nil || st.cells != nil {
-				saved.cells = st.cells
+			saved.excStackLen = int32(len(vm.excStack))
+			flags := (saved.flags & frameFlagHasShadow) | frameFlagSameGlobals
+			if st.stackIsVM {
+				flags |= frameFlagStackIsVM
 			}
-			if saved.cellPtrs != nil || st.cellPtrs != nil {
-				saved.cellPtrs = st.cellPtrs
+			if st.cells != nil || st.cellPtrs != nil || !st.curLocals.IsNone() {
+				vm.saveFrameAux(st, frameIdx)
+				flags |= frameFlagHasAux
 			}
-			saved.globals = st.globals
-			if saved.locals != st.curLocals {
-				saved.locals = st.curLocals
+			if fnGlobals != st.globals {
+				flags &^= frameFlagSameGlobals
+				saved.globals = st.globals
+				st.globals = fnGlobals
 			}
-			saved.cache = st.cache
-			saved.excStackLen = len(vm.excStack)
-			saved.stackIsVM = st.stackIsVM
-			if !st.curLocals.IsNone() {
-				st.curLocals = val.NoneVal()
-			}
+			saved.flags = flags
 			st.frameIdx++
 			if st.frameIdx > vm.maxFrameIdx {
 				vm.maxFrameIdx = st.frameIdx

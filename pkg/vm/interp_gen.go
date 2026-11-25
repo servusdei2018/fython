@@ -9,36 +9,40 @@ import (
 )
 
 func (vm *VM) restoreCallerFrame(st *loopState, caller *CallFrame) {
-	st.curCO = caller.co
-	if caller.cache != nil {
-		st.cache = caller.cache
-	} else {
-		st.cache = vm.cacheFor(st.curCO)
+	callerIdx := st.frameIdx
+	cc := caller.cache
+	co := cc.co
+	st.curCO = co
+	st.cache = cc
+	if cc != nil && len(cc.active) > 0 {
+		st.codePtr = unsafe.Pointer(unsafe.SliceData(cc.active))
+		st.codeLen = len(cc.active)
+	} else if cc != nil {
+		st.codePtr = cc.codePtr
+		st.codeLen = cc.codeLen
 	}
-	if st.cache != nil && len(st.cache.active) > 0 {
-		st.codePtr = unsafe.Pointer(unsafe.SliceData(st.cache.active))
-		st.codeLen = len(st.cache.active)
-	} else {
-		st.codePtr = caller.codePtr
-		st.codeLen = caller.codeLen
-	}
-	st.consts = caller.consts
+	st.consts = cc.frameConsts(co)
 	st.base = caller.baseOffset
-	st.cells = caller.cells
-	st.cellPtrs = caller.cellPtrs
+	aux := vm.frameAuxAt(callerIdx)
+	st.cells = aux.cells
+	st.cellPtrs = aux.cellPtrs
 	st.globals = caller.globals
-	st.curLocals = caller.locals
-	st.stack = caller.stack
-	st.stackIsVM = caller.stackIsVM
-	vm.execCtx.Stack = caller.stack
-	st.activeGen = caller.activeGen
-	st.activeCoro = caller.activeCoro
-	st.genFrameIdx = caller.genFrameIdx
-	caller.genMode = genModeNone
-	caller.genDefault = val.Value{}
-	caller.stack = nil
-	caller.activeGen = nil
-	caller.activeCoro = nil
+	st.curLocals = aux.locals
+	st.stack = aux.stack
+	st.stackIsVM = caller.stackIsVM()
+	vm.execCtx.Stack = aux.stack
+	st.activeGen = aux.activeGen
+	st.activeCoro = aux.activeCoro
+	st.genFrameIdx = aux.genFrameIdx
+	aux.cells = nil
+	aux.cellPtrs = nil
+	aux.locals = val.Value{}
+	aux.genMode = genModeNone
+	aux.genDefault = val.Value{}
+	aux.stack = nil
+	aux.activeGen = nil
+	aux.activeCoro = nil
+	caller.flags &^= frameFlagGenOrCoro | frameFlagHasAux
 	vm.activeCO = st.curCO
 	vm.activeBaseOffset = st.base
 	vm.activeCells = st.cells
@@ -63,11 +67,9 @@ func (vm *VM) saveAndPushInlineFrame(
 	if st.frameIdx+2 > len(vm.frames) {
 		vm.ensureFrameCapacity(st.frameIdx + 2)
 	}
-	saved := &vm.frames[st.frameIdx]
-	saved.co = st.curCO
-	saved.codePtr = st.codePtr
-	saved.codeLen = st.codeLen
-	saved.consts = st.consts
+	frameIdx := st.frameIdx
+	saved := &vm.frames[frameIdx]
+	saved.cache = st.cache
 	if mode == genModeYieldFrom || mode == genModeAwait {
 		saved.ip = callerIP
 	} else {
@@ -75,22 +77,25 @@ func (vm *VM) saveAndPushInlineFrame(
 	}
 	saved.baseOffset = st.base
 	saved.retSP = retSP
-	saved.cells = st.cells
-	saved.cellPtrs = st.cellPtrs
 	saved.globals = st.globals
-	saved.locals = st.curLocals
-	saved.cache = st.cache
-	saved.excStackLen = len(vm.excStack)
-	saved.stackIsVM = st.stackIsVM
-	saved.stack = st.stack
-	saved.activeGen = st.activeGen
-	saved.activeCoro = st.activeCoro
-	saved.genFrameIdx = st.genFrameIdx
-	saved.genMode = mode
-	saved.genDefault = defaultVal
-	saved.genExitIP = jumpTarget
+	saved.excStackLen = int32(len(vm.excStack))
 	saved.initInstance = val.Value{}
-	saved.cmpActive = false
+	flags := (saved.flags & frameFlagHasShadow) | frameFlagHasAux | frameFlagGenOrCoro
+	if st.stackIsVM {
+		flags |= frameFlagStackIsVM
+	}
+	saved.flags = flags
+	aux := vm.frameAuxAt(frameIdx)
+	aux.cells = st.cells
+	aux.cellPtrs = st.cellPtrs
+	aux.locals = st.curLocals
+	aux.stack = st.stack
+	aux.activeGen = st.activeGen
+	aux.activeCoro = st.activeCoro
+	aux.genFrameIdx = st.genFrameIdx
+	aux.genMode = mode
+	aux.genDefault = defaultVal
+	aux.genExitIP = jumpTarget
 
 	st.curLocals = val.NoneVal()
 	st.frameIdx++
@@ -485,7 +490,7 @@ func (vm *VM) pushListExtendGenerator(st *loopState, targetList *val.PyList, gen
 		return ip, sp, ctl
 	}
 	if st.frameIdx > st.startFrameIdx {
-		vm.frames[st.frameIdx-1].collectState = cs
+		vm.frameAuxAt(st.frameIdx - 1).collectState = cs
 	} else {
 		vm.releaseCollectState(cs)
 	}
@@ -577,7 +582,7 @@ func (vm *VM) pushCollectGenerator(st *loopState, mode uint8, gen *val.PyGenerat
 		return ip, sp, ctl
 	}
 	if st.frameIdx > st.startFrameIdx {
-		vm.frames[st.frameIdx-1].collectState = cs
+		vm.frameAuxAt(st.frameIdx - 1).collectState = cs
 	} else {
 		vm.releaseCollectState(cs)
 	}
@@ -605,7 +610,7 @@ func (vm *VM) pushStrJoinGenerator(st *loopState, sepVal val.Value, gen *val.PyG
 		return ip, sp, ctl
 	}
 	if st.frameIdx > st.startFrameIdx {
-		vm.frames[st.frameIdx-1].joinState = js
+		vm.frameAuxAt(st.frameIdx - 1).joinState = js
 	} else {
 		vm.releaseStrJoinState(js)
 	}
@@ -618,7 +623,10 @@ func (vm *VM) findGenDrainCaller(st *loopState) (int, uint8) {
 	}
 	k := st.frameIdx - 1
 	for {
-		mode := vm.frames[k].genMode
+		if k >= len(vm.frameAux) {
+			return -1, genModeNone
+		}
+		mode := vm.frameAux[k].genMode
 		switch mode {
 		case genModeStrJoin, genModeCollectList, genModeCollectTuple, genModeCollectSet, genModeListExtend,
 			genModeCollectDict, genModeAny, genModeAll, genModeSum, genModeMin, genModeMax:
@@ -635,8 +643,8 @@ func (vm *VM) findGenDrainCaller(st *loopState) (int, uint8) {
 
 func (vm *VM) earlyStopGenDrainCaller(st *loopState, callerIdx int, resultVal val.Value, ip, sp, ipDelta int) (int, int, loopCtl) {
 	outermostGen := st.activeGen
-	if st.frameIdx-1 > callerIdx && vm.frames[callerIdx+1].activeGen != nil {
-		outermostGen = vm.frames[callerIdx+1].activeGen
+	if st.frameIdx-1 > callerIdx && callerIdx+1 < len(vm.frameAux) && vm.frameAux[callerIdx+1].activeGen != nil {
+		outermostGen = vm.frameAux[callerIdx+1].activeGen
 	}
 	releaseChain := outermostGen != nil && (outermostGen.Header.Flags&val.FlagEphemeralGen) != 0
 	if st.activeGen != nil {
@@ -654,25 +662,29 @@ func (vm *VM) earlyStopGenDrainCaller(st *loopState, callerIdx int, resultVal va
 		}
 	}
 	for st.frameIdx > callerIdx {
-		if curShadow := vm.frames[st.frameIdx].shadowFrame; curShadow != nil {
-			curShadow.Detach()
-			vm.frames[st.frameIdx].shadowFrame = nil
+		if (vm.frames[st.frameIdx].flags & frameFlagHasShadow) != 0 {
+			vm.frames[st.frameIdx].flags &^= frameFlagHasShadow
+			if st.frameIdx < len(vm.frameAux) && vm.frameAux[st.frameIdx].shadowFrame != nil {
+				vm.frameAux[st.frameIdx].shadowFrame.Detach()
+				vm.frameAux[st.frameIdx].shadowFrame = nil
+			}
 		}
 		st.frameIdx--
 		caller := &vm.frames[st.frameIdx]
-		if len(vm.excStack) > caller.excStackLen {
+		if len(vm.excStack) > int(caller.excStackLen) {
 			vm.excStack = vm.excStack[:caller.excStackLen]
 		}
 		if st.frameIdx == callerIdx {
 			callerIP := caller.ip
 			retSP := caller.retSP
-			if caller.joinState != nil {
-				vm.releaseStrJoinState(caller.joinState)
-				caller.joinState = nil
+			aux := vm.frameAuxAt(callerIdx)
+			if aux.joinState != nil {
+				vm.releaseStrJoinState(aux.joinState)
+				aux.joinState = nil
 			}
-			if caller.collectState != nil {
-				vm.releaseCollectState(caller.collectState)
-				caller.collectState = nil
+			if aux.collectState != nil {
+				vm.releaseCollectState(aux.collectState)
+				aux.collectState = nil
 			}
 			vm.restoreCallerFrame(st, caller)
 			st.stack[retSP] = resultVal
@@ -714,24 +726,28 @@ func (vm *VM) failGenDrainCaller(st *loopState, callerIdx int, badVal, errExc va
 		}
 	}
 	for st.frameIdx > callerIdx {
-		if curShadow := vm.frames[st.frameIdx].shadowFrame; curShadow != nil {
-			curShadow.Detach()
-			vm.frames[st.frameIdx].shadowFrame = nil
+		if (vm.frames[st.frameIdx].flags & frameFlagHasShadow) != 0 {
+			vm.frames[st.frameIdx].flags &^= frameFlagHasShadow
+			if st.frameIdx < len(vm.frameAux) && vm.frameAux[st.frameIdx].shadowFrame != nil {
+				vm.frameAux[st.frameIdx].shadowFrame.Detach()
+				vm.frameAux[st.frameIdx].shadowFrame = nil
+			}
 		}
 		st.frameIdx--
 		caller := &vm.frames[st.frameIdx]
-		if len(vm.excStack) > caller.excStackLen {
+		if len(vm.excStack) > int(caller.excStackLen) {
 			vm.excStack = vm.excStack[:caller.excStackLen]
 		}
 		if st.frameIdx == callerIdx {
 			callerIP := caller.ip
-			if caller.joinState != nil {
-				vm.releaseStrJoinState(caller.joinState)
-				caller.joinState = nil
+			aux := vm.frameAuxAt(callerIdx)
+			if aux.joinState != nil {
+				vm.releaseStrJoinState(aux.joinState)
+				aux.joinState = nil
 			}
-			if caller.collectState != nil {
-				vm.releaseCollectState(caller.collectState)
-				caller.collectState = nil
+			if aux.collectState != nil {
+				vm.releaseCollectState(aux.collectState)
+				aux.collectState = nil
 			}
 			vm.restoreCallerFrame(st, caller)
 			st.raiseExc = errExc
@@ -971,16 +987,19 @@ func (vm *VM) suspendActiveChain(st *loopState, yieldVal val.Value, resumeIP, re
 		st.activeCoro.IP = resumeIP
 	}
 	for st.frameIdx == st.genFrameIdx && st.frameIdx > st.startFrameIdx {
-		if curShadow := vm.frames[st.frameIdx].shadowFrame; curShadow != nil {
-			curShadow.Detach()
-			vm.frames[st.frameIdx].shadowFrame = nil
+		if (vm.frames[st.frameIdx].flags & frameFlagHasShadow) != 0 {
+			vm.frames[st.frameIdx].flags &^= frameFlagHasShadow
+			if st.frameIdx < len(vm.frameAux) && vm.frameAux[st.frameIdx].shadowFrame != nil {
+				vm.frameAux[st.frameIdx].shadowFrame.Detach()
+				vm.frameAux[st.frameIdx].shadowFrame = nil
+			}
 		}
 		st.frameIdx--
 		caller := &vm.frames[st.frameIdx]
-		if len(vm.excStack) > caller.excStackLen {
+		if len(vm.excStack) > int(caller.excStackLen) {
 			vm.excStack = vm.excStack[:caller.excStackLen]
 		}
-		switch caller.genMode {
+		switch vm.frameAuxAt(st.frameIdx).genMode {
 		case genModeForIter, genModeNext, genModeNextDefault, genModeSend, genModeCoroSend:
 			retSP := caller.retSP
 			callerIP := caller.ip
@@ -1022,7 +1041,7 @@ func (vm *VM) opYieldValue(st *loopState, ip, sp int) (int, int, loopCtl) {
 	if st.activeGen != nil {
 		if callerIdx, mode := vm.findGenDrainCaller(st); mode != genModeNone {
 			if mode == genModeStrJoin {
-				js := vm.frames[callerIdx].joinState
+				js := vm.frameAux[callerIdx].joinState
 				if !js.appendValue(yieldVal) {
 					return vm.failStrJoinNonString(st, js, callerIdx, yieldVal, ip, sp)
 				}
@@ -1032,7 +1051,7 @@ func (vm *VM) opYieldValue(st *loopState, ip, sp int) (int, int, loopCtl) {
 				st.ip = ip
 				vm.frames[st.frameIdx].ip = ip
 				vm.execCtx.SP = sp
-				cs := vm.frames[callerIdx].collectState
+				cs := vm.frameAux[callerIdx].collectState
 				errExc, earlyRes, doneEarly, ok := cs.appendValue(&vm.execCtx, yieldVal, mode, vm.hasTrackedViews)
 				stack = st.syncStackFromExecCtx(vm, stack)
 				if !ok {
@@ -1129,8 +1148,8 @@ func (vm *VM) opYieldFrom(st *loopState, ip, sp int) (int, int, loopCtl) {
 		return vm.pushInlineCoroutine(st, subiter.AsCoroutine(), ip, sp, sp, genModeYieldFrom, sentVal)
 	}
 	if callerIdx, mode := vm.findGenDrainCaller(st); mode != genModeNone {
-		js := vm.frames[callerIdx].joinState
-		cs := vm.frames[callerIdx].collectState
+		js := vm.frameAux[callerIdx].joinState
+		cs := vm.frameAux[callerIdx].collectState
 		for {
 			var nextVal val.Value
 			var status val.IterStatus

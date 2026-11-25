@@ -242,13 +242,7 @@ func callerModuleName(ctx *val.ExecContext) string {
 	if !ok {
 		return "typing"
 	}
-	var g *val.PyDict
-	if vm.activeState != nil && vm.activeFrameIdx == vm.activeState.frameIdx {
-		g = vm.activeState.globals
-	}
-	if g == nil && vm.activeFrameIdx >= 0 && vm.activeFrameIdx < len(vm.frames) {
-		g = vm.frames[vm.activeFrameIdx].globals
-	}
+	g := vm.currentGlobals()
 	if g == nil {
 		return "typing"
 	}

@@ -32,7 +32,7 @@ func (vm *VM) tryNestedRegCall(st *loopState, callee *CodeObject, fn *val.PyFunc
 	// caller slot's initInstance for opReturnSlow's return-self protocol.
 	// They stay on the stack path; direct __init__ calls (no marker) may
 	// still enter register execution.
-	if vm.frames[st.frameIdx].initInstance.HeaderPtr() != nil {
+	if (vm.frames[st.frameIdx].flags & frameFlagInit) != 0 {
 		return 0, 0, ctlNext, false
 	}
 	if callIP < 0 {
@@ -75,7 +75,7 @@ func (vm *VM) regCallEligible(st *loopState, callee *CodeObject) bool {
 	if st.activeGen != nil || st.activeCoro != nil || !st.stackIsVM {
 		return false
 	}
-	if st.frameIdx < 0 || st.frameIdx >= len(vm.frames) || vm.frames[st.frameIdx].cmpActive {
+	if st.frameIdx < 0 || st.frameIdx >= len(vm.frames) || (vm.frames[st.frameIdx].flags&frameFlagCmp) != 0 {
 		return false
 	}
 	if len(st.stack) == 0 || len(vm.stack) == 0 || &st.stack[0] != &vm.stack[0] {

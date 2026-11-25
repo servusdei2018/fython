@@ -163,11 +163,11 @@ func (vm *VM) growStack(st *loopState, curStack []val.Value, minCap int) []val.V
 		}
 		s, newCls := vm.acquireGeneratorStack(minCap)
 		copy(s, curStack)
-		if len(curStack) > 0 {
+		if len(curStack) > 0 && len(vm.frameAux) > 0 {
 			oldBase := &curStack[0]
-			for i := st.genFrameIdx; i < st.frameIdx && i < len(vm.frames); i++ {
-				if len(vm.frames[i].stack) > 0 && &vm.frames[i].stack[0] == oldBase {
-					vm.frames[i].stack = s
+			for i := st.genFrameIdx; i < st.frameIdx && i < len(vm.frameAux); i++ {
+				if len(vm.frameAux[i].stack) > 0 && &vm.frameAux[i].stack[0] == oldBase {
+					vm.frameAux[i].stack = s
 				}
 			}
 		}
@@ -220,25 +220,28 @@ func (vm *VM) syncActiveFrame(st *loopState, ip int) {
 	}
 	if frameIdx >= 0 && frameIdx < len(vm.frames) {
 		saved := &vm.frames[frameIdx]
-		saved.co = st.curCO
-		saved.codePtr = st.codePtr
-		saved.codeLen = st.codeLen
-		saved.consts = st.consts
+		saved.cache = st.cache
 		saved.ip = ip
 		saved.baseOffset = st.base
-		saved.cells = st.cells
-		saved.cellPtrs = st.cellPtrs
 		saved.globals = st.globals
-		saved.locals = st.curLocals
-		saved.cache = st.cache
-		saved.excStackLen = len(vm.excStack)
-		saved.stackIsVM = st.stackIsVM
-		saved.stack = st.stack
-		saved.activeGen = st.activeGen
-		saved.activeCoro = st.activeCoro
-		saved.genFrameIdx = st.genFrameIdx
+		saved.excStackLen = int32(len(vm.excStack))
 		saved.initInstance = val.Value{}
-		saved.cmpActive = false
+		flags := saved.flags & frameFlagHasShadow
+		if st.stackIsVM {
+			flags |= frameFlagStackIsVM
+		}
+		if st.cells != nil || st.cellPtrs != nil || !st.curLocals.IsNone() || st.activeGen != nil || st.activeCoro != nil {
+			aux := vm.frameAuxAt(frameIdx)
+			aux.cells = st.cells
+			aux.cellPtrs = st.cellPtrs
+			aux.locals = st.curLocals
+			aux.stack = st.stack
+			aux.activeGen = st.activeGen
+			aux.activeCoro = st.activeCoro
+			aux.genFrameIdx = st.genFrameIdx
+			flags |= frameFlagHasAux
+		}
+		saved.flags = flags
 		vm.activeFrameIdx = frameIdx
 		vm.activeCO = st.curCO
 		vm.activeBaseOffset = st.base
