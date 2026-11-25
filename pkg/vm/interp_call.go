@@ -1172,7 +1172,7 @@ func (vm *VM) opCallFunctionEx(st *loopState, inst uint32, ip, sp int) (int, int
 				if (argsVal.IsTuple() && len(argsVal.AsTuple().Items) == 0) ||
 					(argsVal.IsList() && len(argsVal.AsList().Items) == 0) {
 					stack[sp] = val.NewInstanceOfType(tp)
-					return ip + 1, sp + 1, ctlReload
+					return ip + 1, sp + 1, ctlNext
 				}
 			} else if tp.HasInit() {
 				if initFn := tp.DunderInitVal(); initFn.IsFunction() {
@@ -1244,6 +1244,71 @@ func (vm *VM) opCallFunctionEx(st *loopState, inst uint32, ip, sp int) (int, int
 					dst += len(posArgs)
 				}
 				vm.releaseEphemeralTupleVal(argsVal)
+				// Direct kwargs-only binding fast path for functions/constructors without *args/**kwargs/cells:
+				// maps kwDict.Entries straight into callee local slots without copying into kwNamesScratch
+				// or running generic bindFunctionArgsSafe.
+				if len(posArgs) == 0 && kwLen > 0 && (callee.Flags&(CO_VARARGS|CO_VARKEYWORDS)) == 0 &&
+					callee.KWOnlyArgCount == 0 && callee.PosOnlyArgCount == 0 && !callee.HasCells &&
+					callee.NumParams <= 16 {
+					posCount := selfCount
+					argCount := callee.NumParams
+					if posCount+kwLen <= argCount {
+						var matchedMask uint32
+						directOK := true
+						for i := range kwDict.Entries {
+							e := &kwDict.Entries[i]
+							if !e.Active {
+								continue
+							}
+							if !e.Key.IsAnyString() {
+								directOK = false
+								break
+							}
+							slotIdx := -1
+							for p := posCount; p < argCount; p++ {
+								vn := callee.VarNames[p]
+								if e.Key == vn || val.StringEquals(e.Key, vn) {
+									slotIdx = p
+									break
+								}
+							}
+							if slotIdx < 0 || (matchedMask&(uint32(1)<<uint(slotIdx))) != 0 {
+								directOK = false
+								break
+							}
+							matchedMask |= uint32(1) << uint(slotIdx)
+							stack[newBase+slotIdx] = e.Value
+						}
+						if directOK {
+							numDefaults := len(fn.Defaults)
+							firstDef := argCount - numDefaults
+							for p := posCount; p < argCount; p++ {
+								if (matchedMask & (uint32(1) << uint(p))) == 0 {
+									if p >= firstDef {
+										stack[newBase+p] = fn.Defaults[p-firstDef]
+									} else {
+										directOK = false
+										break
+									}
+								}
+							}
+							if directOK {
+								vm.releaseSmallDict(kwDict)
+								for l := argCount; l < callee.NumLocals; l++ {
+									stack[newBase+l] = val.UnboundVal()
+								}
+								nextSP := newBase + callee.NumLocals
+								cc := vm.fastCalleeCache(callee)
+								rIP, rSP, rCtl := vm.pushCalleeFrame(st, callee, fn, cc, newBase, sp, nextSP, ip+1)
+								if initType != nil {
+									vm.frames[st.frameIdx-1].initInstance = initInst
+									vm.frames[st.frameIdx-1].flags |= frameFlagInit
+								}
+								return rIP, rSP, rCtl
+							}
+						}
+					}
+				}
 				var kwnames []val.Value
 				if kwLen > 0 {
 					kwCount := 0
@@ -2084,16 +2149,134 @@ func (vm *VM) opCallBoundNative(st *loopState, inst uint32, ip, sp int) (int, in
 			selfVer = bm.Self.Type().Version()
 		}
 		if bm.Func == entry.CachedVal && selfVer == entry.ExpectedTypeVer {
+			// Fast path for bound object.__setattr__(name, value) (e.g. attrs/dataclass __init__).
+			if argc == 2 && entry.CachedVal == val.ObjectSetAttrBuiltin && !val.MultiThreadedFlag.Load() &&
+				bm.Self.Kind() == val.KindInstance {
+				instObj := bm.Self.AsInstance()
+				nameVal := stack[retSP+1]
+				valArg := stack[retSP+2]
+				sicSlice := st.cache.ensureSetAttrIC()
+				sic := &sicSlice[ip]
+				if sic.typeVer == selfVer && sic.name == nameVal {
+					if sic.isMemberDescr {
+						slotIdx := int(sic.slotIdx)
+						if slotIdx >= 0 && slotIdx < len(instObj.Slots) {
+							if vm.hasTrackedViews {
+								markViewEscaped(valArg)
+							}
+							val.ClearEphemeral(valArg)
+							val.DetachStringBuf(valArg)
+							instObj.Slots[slotIdx] = valArg
+							stack[retSP] = val.NoneVal()
+							return ip + 1, retSP + 1, ctlNext
+						}
+					} else if instObj.Shape != nil && instObj.Shape.ID == sic.shapeID {
+						slotIdx := int(sic.slotIdx)
+						if vm.hasTrackedViews {
+							markViewEscaped(valArg)
+						}
+						val.ClearEphemeral(valArg)
+						val.DetachStringBuf(valArg)
+						if sic.nextShape == nil {
+							instObj.Slots[slotIdx] = valArg
+							stack[retSP] = val.NoneVal()
+							return ip + 1, retSP + 1, ctlNext
+						}
+						instObj.ApplyShapeTransition(sic.nextShape, slotIdx, valArg)
+						stack[retSP] = val.NoneVal()
+						return ip + 1, retSP + 1, ctlNext
+					}
+				}
+				if nameVal.IsAnyString() {
+					tp := instObj.Header.Type
+					var interned val.Value
+					if hdr := nameVal.HeaderPtr(); hdr != nil && (hdr.Flags&val.FlagInterned) != 0 {
+						interned = nameVal
+					} else {
+						interned = val.InternValue(nameVal)
+					}
+					descr, _, foundInClass := tp.LookupMRO(interned)
+					if foundInClass {
+						if descr.Kind() == val.KindMemberDescr {
+							md := descr.AsMemberDescr()
+							if md.SlotIndex >= 0 && md.SlotIndex < len(instObj.Slots) {
+								if vm.hasTrackedViews {
+									markViewEscaped(valArg)
+								}
+								val.ClearEphemeral(valArg)
+								val.DetachStringBuf(valArg)
+								instObj.Slots[md.SlotIndex] = valArg
+								*sic = setAttrICEntry{
+									name:          nameVal,
+									typeVer:       selfVer,
+									slotIdx:       int32(md.SlotIndex),
+									isMemberDescr: true,
+								}
+								stack[retSP] = val.NoneVal()
+								return ip + 1, retSP + 1, ctlNext
+							}
+						}
+					} else if (tp.Flags&val.FlagForbidDynamicAttrs) == 0 && instObj.Shape != nil {
+						oldShape := instObj.Shape
+						if vm.hasTrackedViews {
+							markViewEscaped(valArg)
+						}
+						val.ClearEphemeral(valArg)
+						val.DetachStringBuf(valArg)
+						if slotIdx, ok := oldShape.Lookup(interned); ok && slotIdx < len(instObj.Slots) {
+							instObj.Slots[slotIdx] = valArg
+							*sic = setAttrICEntry{
+								name:    nameVal,
+								typeVer: selfVer,
+								shapeID: oldShape.ID,
+								slotIdx: int32(slotIdx),
+							}
+							stack[retSP] = val.NoneVal()
+							return ip + 1, retSP + 1, ctlNext
+						}
+						instObj.SetAttr(interned, valArg)
+						if newShape := instObj.Shape; newShape != nil && newShape != oldShape && newShape.SlotIndex >= 0 {
+							*sic = setAttrICEntry{
+								name:      nameVal,
+								typeVer:   selfVer,
+								shapeID:   oldShape.ID,
+								slotIdx:   int32(newShape.SlotIndex),
+								nextShape: newShape,
+							}
+						}
+						stack[retSP] = val.NoneVal()
+						return ip + 1, retSP + 1, ctlNext
+					}
+				}
+			}
 			if vm.hasTrackedViews && argc > 0 {
 				markViewsEscaped(stack[retSP+1 : retSP+1+argc])
 			}
 			origTarget := target
 			origData := unsafe.SliceData(stack)
+			matchRecycleSlot := -1
+			if !val.MultiThreadedFlag.Load() && ip+1 < st.codeLen &&
+				(entry.CachedVal == patternMatchBuiltin || entry.CachedVal == patternSearchBuiltin || entry.CachedVal == patternFullMatchBuiltin) {
+				nextInst := *(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4))
+				nextOp := DecodeOpcode(nextInst)
+				switch nextOp {
+				case OP_JUMP_IF_FALSE, OP_JUMP_IF_TRUE, OP_UNARY_NOT, OP_POP_TOP:
+					vm.matchBoolOnly = true
+				case OP_STORE_FAST:
+					r := int(DecodeArgBx(nextInst))
+					if st.curCO != nil && st.curCO.isMatchLocalSafe(r) {
+						vm.matchEphemeral = true
+						matchRecycleSlot = r
+					}
+				}
+			}
 			stack[retSP] = bm.Self
 			st.ip = ip
 			vm.frames[st.frameIdx].ip = ip
 			vm.execCtx.SP = sp
 			res := entry.NativeFn(&vm.execCtx, bm.Func, stack[retSP:sp], nil)
+			vm.matchBoolOnly = false
+			vm.matchEphemeral = false
 			if unsafe.SliceData(vm.execCtx.Stack) != origData || (st.stackIsVM && unsafe.SliceData(vm.stack) != origData) {
 				stack = st.syncStackFromExecCtx(vm, stack)
 			}
@@ -2103,6 +2286,13 @@ func (vm *VM) opCallBoundNative(st *loopState, inst uint32, ip, sp int) (int, in
 				vm.execCtx.ClearException()
 				st.raiseExc = exc
 				return ip, sp, ctlRaise
+			}
+			if matchRecycleSlot >= 0 {
+				old := stack[st.base+matchRecycleSlot]
+				if hdr := old.HeaderPtr(); hdr != nil && hdr.Type == MatchType && (hdr.Flags&val.FlagEphemeralMatch) != 0 && hdr != res.HeaderPtr() {
+					stack[st.base+matchRecycleSlot] = val.Value{}
+					vm.releaseMatch((*pyMatch)(unsafe.Pointer(hdr)))
+				}
 			}
 			stack[retSP] = res
 			if unsafe.SliceData(stack) == origData {
@@ -2147,10 +2337,28 @@ func (vm *VM) opCallMethodDescrFast(st *loopState, inst uint32, ip, sp int) (int
 				markViewsEscaped(stack[newBase : newBase+totalArgs])
 			}
 			origData := unsafe.SliceData(stack)
+			matchRecycleSlot := -1
+			if !val.MultiThreadedFlag.Load() && ip+1 < st.codeLen &&
+				(entry.CachedVal == patternMatchBuiltin || entry.CachedVal == patternSearchBuiltin || entry.CachedVal == patternFullMatchBuiltin) {
+				nextInst := *(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4))
+				nextOp := DecodeOpcode(nextInst)
+				switch nextOp {
+				case OP_JUMP_IF_FALSE, OP_JUMP_IF_TRUE, OP_UNARY_NOT, OP_POP_TOP:
+					vm.matchBoolOnly = true
+				case OP_STORE_FAST:
+					r := int(DecodeArgBx(nextInst))
+					if st.curCO != nil && st.curCO.isMatchLocalSafe(r) {
+						vm.matchEphemeral = true
+						matchRecycleSlot = r
+					}
+				}
+			}
 			st.ip = ip
 			vm.frames[st.frameIdx].ip = ip
 			vm.execCtx.SP = sp
 			res := entry.NativeFn(&vm.execCtx, entry.CachedVal, stack[newBase:newBase+totalArgs], nil)
+			vm.matchBoolOnly = false
+			vm.matchEphemeral = false
 			if unsafe.SliceData(vm.execCtx.Stack) != origData || (st.stackIsVM && unsafe.SliceData(vm.stack) != origData) {
 				stack = st.syncStackFromExecCtx(vm, stack)
 			}
@@ -2159,6 +2367,13 @@ func (vm *VM) opCallMethodDescrFast(st *loopState, inst uint32, ip, sp int) (int
 				vm.execCtx.ClearException()
 				st.raiseExc = exc
 				return ip, sp, ctlRaise
+			}
+			if matchRecycleSlot >= 0 {
+				old := stack[st.base+matchRecycleSlot]
+				if hdr := old.HeaderPtr(); hdr != nil && hdr.Type == MatchType && (hdr.Flags&val.FlagEphemeralMatch) != 0 && hdr != res.HeaderPtr() {
+					stack[st.base+matchRecycleSlot] = val.Value{}
+					vm.releaseMatch((*pyMatch)(unsafe.Pointer(hdr)))
+				}
 			}
 			stack[newBase] = res
 			if unsafe.SliceData(stack) == origData {

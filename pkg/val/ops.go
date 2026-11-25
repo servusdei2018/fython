@@ -7,6 +7,7 @@ import (
 	"math"
 	"math/big"
 	"math/bits"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -1536,12 +1537,24 @@ func InCtx(ctx *ExecContext, item, container Value) Value {
 		return BoolVal(container.AsSet().Contains(item))
 	}
 	if container.IsList() && cType == ListType {
-		return BoolVal(container.AsList().Contains(item))
+		items := container.AsList().Items
+		if (item.IsInlineStr() || item.IsInt64()) && slices.Contains(items, item) {
+			return BoolVal(true)
+		}
+		for i := range items {
+			if items[i] == item || Equals(items[i], item) {
+				return BoolVal(true)
+			}
+		}
+		return BoolVal(false)
 	}
 	if container.IsTuple() && cType == TupleType {
 		items := container.AsTuple().Items
+		if (item.IsInlineStr() || item.IsInt64()) && slices.Contains(items, item) {
+			return BoolVal(true)
+		}
 		for i := range items {
-			if Equals(items[i], item) {
+			if items[i] == item || Equals(items[i], item) {
 				return BoolVal(true)
 			}
 		}

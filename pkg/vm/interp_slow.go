@@ -978,10 +978,102 @@ func (vm *VM) opCompareSlow(st *loopState, inst uint32, ip, sp int) (int, int, l
 			}
 		}
 	}
+	// Fast path for exact built-in containment checks (IN / NOT_IN) without
+	// entering compareOpSafe -> RichCompare -> InCtx or returning ctlReload.
+	if cmpOp == CMP_IN || cmpOp == CMP_NOT_IN {
+		bType := b.Type()
+		var found bool
+		var handled bool
+		switch {
+		case b.IsSet() && bType == val.SetType:
+			found = b.AsSet().Contains(a)
+			handled = true
+		case b.IsDict() && bType == val.DictType:
+			_, found = b.AsDict().Get(a)
+			handled = true
+		case b.IsTuple() && bType == val.TupleType:
+			items := b.AsTuple().Items
+			for i := range items {
+				if items[i] == a || val.Equals(items[i], a) {
+					found = true
+					break
+				}
+			}
+			handled = true
+		case b.IsList() && bType == val.ListType:
+			items := b.AsList().Items
+			for i := range items {
+				if items[i] == a || val.Equals(items[i], a) {
+					found = true
+					break
+				}
+			}
+			handled = true
+		case b.IsAnyString() && bType == val.StrType && a.IsAnyString():
+			found = val.StringContains(b, a)
+			handled = true
+		}
+		if handled {
+			if cmpOp == CMP_NOT_IN {
+				found = !found
+			}
+			stack[sp-2] = val.BoolVal(found)
+			return ip + 1, sp - 1, ctlNext
+		}
+	}
+	// Fast path for exact built-in tuple and string ordering/equality.
+	if cmpOp <= CMP_GTE {
+		if a.IsAnyString() && b.IsAnyString() && a.Type() == val.StrType && b.Type() == val.StrType {
+			var res bool
+			switch cmpOp {
+			case CMP_EQ:
+				res = val.StringEquals(a, b)
+			case CMP_NEQ:
+				res = !val.StringEquals(a, b)
+			default:
+				c := val.StringCompare(a, b)
+				switch cmpOp {
+				case CMP_LT:
+					res = c < 0
+				case CMP_LTE:
+					res = c <= 0
+				case CMP_GT:
+					res = c > 0
+				case CMP_GTE:
+					res = c >= 0
+				}
+			}
+			stack[sp-2] = val.BoolVal(res)
+			return ip + 1, sp - 1, ctlNext
+		}
+		if a.Kind() == val.KindTuple && b.Kind() == val.KindTuple && a.Type() == val.TupleType && b.Type() == val.TupleType {
+			origData := unsafe.SliceData(stack)
+			st.ip = ip
+			vm.execCtx.SP = sp
+			res := val.CompareTuplesFast(&vm.execCtx, a, b, cmpOp)
+			if unsafe.SliceData(vm.execCtx.Stack) != origData || (st.stackIsVM && unsafe.SliceData(vm.stack) != origData) {
+				stack = st.syncStackFromExecCtx(vm, stack)
+			}
+			if vm.execCtx.HasException() {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				st.raiseExc = exc
+				return ip, sp, ctlRaise
+			}
+			stack[sp-2] = res
+			if unsafe.SliceData(stack) == origData {
+				return ip + 1, sp - 1, ctlNext
+			}
+			return ip + 1, sp - 1, ctlReload
+		}
+	}
+	origData := unsafe.SliceData(stack)
 	st.ip = ip
 	vm.execCtx.SP = sp
 	res := vm.compareOpSafe(a, b, cmpOp)
-	stack = st.syncStackFromExecCtx(vm, stack)
+	if unsafe.SliceData(vm.execCtx.Stack) != origData || (st.stackIsVM && unsafe.SliceData(vm.stack) != origData) {
+		stack = st.syncStackFromExecCtx(vm, stack)
+	}
 	if vm.execCtx.HasException() {
 		exc := vm.execCtx.ActiveException
 		vm.execCtx.ClearException()
@@ -991,6 +1083,9 @@ func (vm *VM) opCompareSlow(st *loopState, inst uint32, ip, sp int) (int, int, l
 	stack[sp-2] = res
 	sp--
 	ip++
+	if unsafe.SliceData(stack) == origData {
+		return ip, sp, ctlNext
+	}
 	return ip, sp, ctlReload
 }
 

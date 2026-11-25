@@ -1789,6 +1789,7 @@ func (vm *VM) CallUserExcepthook(exc val.Value) bool {
 	}
 	tb := val.NoneVal()
 	if exc.IsInstance() {
+		vm.materializeDeferredTB(exc)
 		tb, _ = exc.AsInstance().GetAttr(nameTraceback)
 	}
 	vm.execCtx.SP = 0
@@ -2321,15 +2322,111 @@ func (vm *VM) resumeCoroutine(ctx *val.ExecContext, coro *val.PyCoroutine, sentV
 	return res, val.IterExhausted
 }
 
+// deferredTBEntry records a single unwound frame without allocating a PyFrame
+// or PyTraceback until __traceback__ / sys.exc_info() is actually observed.
+type deferredTBEntry struct {
+	co            *CodeObject
+	ip            int
+	globals       *val.PyDict
+	cells         []val.Value
+	inlineCallee  *CodeObject
+	inlineIP      int
+	inlineGlobals *val.PyDict
+	inlineCells   []val.Value
+}
+
+func init() {
+	val.MaterializeTracebackHook = func(ctx *val.ExecContext, exc val.Value) {
+		if ctx != nil && ctx.VM != nil {
+			if vm, ok := ctx.VM.(*VM); ok && vm != nil {
+				vm.materializeDeferredTB(exc)
+			}
+		}
+	}
+	val.ClearDeferredTracebackHook = func(ctx *val.ExecContext, exc val.Value) {
+		if ctx != nil && ctx.VM != nil {
+			if vm, ok := ctx.VM.(*VM); ok && vm != nil {
+				vm.clearDeferredTB(exc)
+			}
+		}
+	}
+}
+
+func (vm *VM) clearDeferredTB(exc val.Value) {
+	if vm.deferredTBExc == exc && vm.deferredTBExc.HeaderPtr() != nil {
+		clear(vm.deferredTBs)
+		vm.deferredTBs = vm.deferredTBs[:0]
+		vm.deferredTBExc = val.Value{}
+		vm.deferredTBBound = false
+	}
+}
+
+func (vm *VM) materializeDeferredTB(exc val.Value) {
+	if vm.deferredTBExc != exc || vm.deferredTBExc.HeaderPtr() == nil {
+		return
+	}
+	entries := vm.deferredTBs
+	vm.deferredTBExc = val.Value{}
+	vm.deferredTBBound = false
+	if len(entries) == 0 || !exc.IsInstance() {
+		clear(entries)
+		vm.deferredTBs = entries[:0]
+		return
+	}
+	curTB, _ := exc.AsInstance().GetAttr(nameTraceback)
+	if curTB.HeaderPtr() == nil {
+		curTB = val.NoneVal()
+	}
+	for i := range entries {
+		e := &entries[i]
+		var inlineFrame *val.PyFrame
+		if e.inlineCallee != nil {
+			inlineFrame = val.NewPyFrame(vm, -1, 0, NewCodeVal(e.inlineCallee), e.inlineGlobals, e.inlineCells)
+			inlineFrame.IP = e.inlineIP
+			inlineFrame.Detached = true
+			calleeLine := e.inlineCallee.LineAt(e.inlineIP)
+			curTB = val.NewTracebackVal(val.NewFrameVal(inlineFrame), calleeLine, e.inlineIP, curTB)
+		}
+		if e.co != nil {
+			f := val.NewPyFrame(vm, -1, 0, NewCodeVal(e.co), e.globals, e.cells)
+			f.IP = e.ip
+			f.Detached = true
+			frameVal := val.NewFrameVal(f)
+			if inlineFrame != nil {
+				inlineFrame.Back = frameVal
+			}
+			line := e.co.LineAt(e.ip)
+			curTB = val.NewTracebackVal(frameVal, line, e.ip, curTB)
+		}
+	}
+	clear(entries)
+	vm.deferredTBs = entries[:0]
+	exc.AsInstance().SetAttr(nameTraceback, curTB)
+}
+
 //go:noinline
 func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 	exc := st.raiseExc
 	st.raiseExc = val.Value{}
 
+	if vm.deferredTBExc.HeaderPtr() != nil && vm.deferredTBExc != exc {
+		vm.materializeDeferredTB(vm.deferredTBExc)
+	}
+	deferTB := exc.IsInstance() && !val.MultiThreadedFlag.Load()
+	if deferTB {
+		if vm.deferredTBExc != exc {
+			vm.deferredTBExc = exc
+			vm.deferredTBBound = false
+			clear(vm.deferredTBs)
+			vm.deferredTBs = vm.deferredTBs[:0]
+		}
+	}
+
 	curTB := val.NoneVal()
 	if exc.IsInstance() {
 		curTB, _ = exc.AsInstance().GetAttr(nameTraceback)
 	}
+	hasTB := !curTB.IsNone() || (deferTB && len(vm.deferredTBs) > 0)
 	// Frames popped for a caught handler skip the locals snapshot until the
 	// traceback is actually observed. Uncaught escapes to top-level callers
 	// keep the full snapshot so debuggers see locals.
@@ -2341,6 +2438,10 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 	faultFrameIdx := st.frameIdx
 
 	var inlineCalleeFrame *val.PyFrame
+	var deferredInlineCallee *CodeObject
+	var deferredInlineIP int
+	var deferredInlineGlobals *val.PyDict
+	var deferredInlineCells []val.Value
 	if site := st.cache.findInlineSite(ip); site != nil {
 		if ip < site.StubStart && site.Callee != nil {
 			calleeIP := int(site.IPMap[ip-site.BodyStart])
@@ -2352,13 +2453,21 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 				}
 				calleeCells = site.Fn.Closure
 			}
-			inlineCalleeFrame = val.NewPyFrame(vm, -1, st.base, NewCodeVal(site.Callee), calleeGlobals, calleeCells)
-			inlineCalleeFrame.IP = calleeIP
-			inlineCalleeFrame.Detach()
-			calleeLine := site.Callee.LineAt(calleeIP)
-			curTB = val.NewTracebackVal(val.NewFrameVal(inlineCalleeFrame), calleeLine, calleeIP, curTB)
-			if exc.IsInstance() {
-				exc.AsInstance().SetAttr(nameTraceback, curTB)
+			if deferTB {
+				deferredInlineCallee = site.Callee
+				deferredInlineIP = calleeIP
+				deferredInlineGlobals = calleeGlobals
+				deferredInlineCells = calleeCells
+			} else {
+				inlineCalleeFrame = val.NewPyFrame(vm, -1, st.base, NewCodeVal(site.Callee), calleeGlobals, calleeCells)
+				inlineCalleeFrame.IP = calleeIP
+				inlineCalleeFrame.Detach()
+				calleeLine := site.Callee.LineAt(calleeIP)
+				curTB = val.NewTracebackVal(val.NewFrameVal(inlineCalleeFrame), calleeLine, calleeIP, curTB)
+				hasTB = true
+				if exc.IsInstance() {
+					exc.AsInstance().SetAttr(nameTraceback, curTB)
+				}
 			}
 			savedSlot := st.base + site.SavedSlot
 			if savedSlot >= 0 && savedSlot < len(st.stack) {
@@ -2406,6 +2515,14 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 				}
 			}
 			if matched != nil {
+				if deferTB && deferredInlineCallee != nil {
+					vm.deferredTBs = append(vm.deferredTBs, deferredTBEntry{
+						inlineCallee:  deferredInlineCallee,
+						inlineIP:      deferredInlineIP,
+						inlineGlobals: deferredInlineGlobals,
+						inlineCells:   deferredInlineCells,
+					})
+				}
 				sp := st.base + co.NumLocals + matched.TargetStackDepth
 				if matched.PushLasti {
 					st.stack[sp] = val.Int64Val(int64(faultIP))
@@ -2427,16 +2544,32 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 			}
 		}
 
-		if (curTB.IsNone() || inlineCalleeFrame != nil) && faultCO != nil {
-			line := faultCO.LineAt(faultIP)
-			frameVal := vm.materializeFrame(faultFrameIdx)
-			if inlineCalleeFrame != nil {
-				inlineCalleeFrame.Back = frameVal
-				inlineCalleeFrame = nil
-			}
-			curTB = val.NewTracebackVal(frameVal, line, faultIP, curTB)
-			if exc.IsInstance() {
-				exc.AsInstance().SetAttr(nameTraceback, curTB)
+		if (!hasTB || inlineCalleeFrame != nil || deferredInlineCallee != nil) && faultCO != nil {
+			if deferTB {
+				vm.deferredTBs = append(vm.deferredTBs, deferredTBEntry{
+					co:            faultCO,
+					ip:            faultIP,
+					globals:       st.globals,
+					cells:         st.cells,
+					inlineCallee:  deferredInlineCallee,
+					inlineIP:      deferredInlineIP,
+					inlineGlobals: deferredInlineGlobals,
+					inlineCells:   deferredInlineCells,
+				})
+				deferredInlineCallee = nil
+				hasTB = true
+			} else {
+				line := faultCO.LineAt(faultIP)
+				frameVal := vm.materializeFrame(faultFrameIdx)
+				if inlineCalleeFrame != nil {
+					inlineCalleeFrame.Back = frameVal
+					inlineCalleeFrame = nil
+				}
+				curTB = val.NewTracebackVal(frameVal, line, faultIP, curTB)
+				hasTB = true
+				if exc.IsInstance() {
+					exc.AsInstance().SetAttr(nameTraceback, curTB)
+				}
 			}
 		}
 
@@ -2559,6 +2692,10 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 				st.globals = caller.globals
 			}
 			var poppedInlineCallee *val.PyFrame
+			var poppedDefInlineCallee *CodeObject
+			var poppedDefInlineIP int
+			var poppedDefInlineGlobals *val.PyDict
+			var poppedDefInlineCells []val.Value
 			if site := st.cache.findInlineSite(callerIP); site != nil {
 				if callerIP < site.StubStart && site.Callee != nil {
 					calleeIP := int(site.IPMap[callerIP-site.BodyStart])
@@ -2570,11 +2707,18 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 						}
 						calleeCells = site.Fn.Closure
 					}
-					poppedInlineCallee = val.NewPyFrame(vm, -1, st.base, NewCodeVal(site.Callee), calleeGlobals, calleeCells)
-					poppedInlineCallee.IP = calleeIP
-					poppedInlineCallee.Detach()
-					calleeLine := site.Callee.LineAt(calleeIP)
-					curTB = val.NewTracebackVal(val.NewFrameVal(poppedInlineCallee), calleeLine, calleeIP, curTB)
+					if deferTB {
+						poppedDefInlineCallee = site.Callee
+						poppedDefInlineIP = calleeIP
+						poppedDefInlineGlobals = calleeGlobals
+						poppedDefInlineCells = calleeCells
+					} else {
+						poppedInlineCallee = val.NewPyFrame(vm, -1, st.base, NewCodeVal(site.Callee), calleeGlobals, calleeCells)
+						poppedInlineCallee.IP = calleeIP
+						poppedInlineCallee.Detach()
+						calleeLine := site.Callee.LineAt(calleeIP)
+						curTB = val.NewTracebackVal(val.NewFrameVal(poppedInlineCallee), calleeLine, calleeIP, curTB)
+					}
 					savedSlot := st.base + site.SavedSlot
 					if savedSlot >= 0 && savedSlot < len(st.stack) {
 						callerBase := int(st.stack[savedSlot].AsInt64())
@@ -2590,14 +2734,29 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 			st.ip = callerIP
 
 			if callerCO != nil {
-				line := callerCO.LineAt(callerIP)
-				frameVal := vm.materializeFrame(st.frameIdx)
-				if poppedInlineCallee != nil {
-					poppedInlineCallee.Back = frameVal
-				}
-				curTB = val.NewTracebackVal(frameVal, line, callerIP, curTB)
-				if exc.IsInstance() {
-					exc.AsInstance().SetAttr(nameTraceback, curTB)
+				if deferTB {
+					vm.deferredTBs = append(vm.deferredTBs, deferredTBEntry{
+						co:            callerCO,
+						ip:            callerIP,
+						globals:       st.globals,
+						cells:         st.cells,
+						inlineCallee:  poppedDefInlineCallee,
+						inlineIP:      poppedDefInlineIP,
+						inlineGlobals: poppedDefInlineGlobals,
+						inlineCells:   poppedDefInlineCells,
+					})
+					hasTB = true
+				} else {
+					line := callerCO.LineAt(callerIP)
+					frameVal := vm.materializeFrame(st.frameIdx)
+					if poppedInlineCallee != nil {
+						poppedInlineCallee.Back = frameVal
+					}
+					curTB = val.NewTracebackVal(frameVal, line, callerIP, curTB)
+					hasTB = true
+					if exc.IsInstance() {
+						exc.AsInstance().SetAttr(nameTraceback, curTB)
+					}
 				}
 			}
 			continue
@@ -2614,6 +2773,9 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 		}
 		for _, f := range pendingDetach {
 			f.Detach()
+		}
+		if deferTB {
+			vm.materializeDeferredTB(exc)
 		}
 
 		vm.unhandledException = exc

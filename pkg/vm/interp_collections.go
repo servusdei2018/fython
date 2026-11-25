@@ -115,6 +115,49 @@ func (vm *VM) opBuildSlice(st *loopState, inst uint32, ip, sp int) (int, int, lo
 	return ip, sp, ctlNext
 }
 
+// normalizeSimpleSlice handles the common step==1 slice bounds where start and
+// stop are each either None or Int64 without entering val.NormalizeSliceIndices.
+func normalizeSimpleSlice(startVal, stopVal val.Value, length int) (int, int, int, bool) {
+	var start int
+	switch {
+	case startVal.IsNone():
+		start = 0
+	case startVal.IsInt64():
+		start = int(startVal.AsInt64())
+		if start < 0 {
+			start += length
+			if start < 0 {
+				start = 0
+			}
+		} else if start > length {
+			start = length
+		}
+	default:
+		return 0, 0, 0, false
+	}
+	var stop int
+	switch {
+	case stopVal.IsNone():
+		stop = length
+	case stopVal.IsInt64():
+		stop = int(stopVal.AsInt64())
+		if stop < 0 {
+			stop += length
+			if stop < 0 {
+				stop = 0
+			}
+		} else if stop > length {
+			stop = length
+		}
+	default:
+		return 0, 0, 0, false
+	}
+	if stop <= start {
+		return start, start, 0, true
+	}
+	return start, stop, stop - start, true
+}
+
 //go:noinline
 func (vm *VM) opBinarySlice(st *loopState, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
@@ -217,12 +260,16 @@ func (vm *VM) opBinarySlice(st *loopState, ip, sp int) (int, int, loopCtl) {
 		stack[sp-3] = val.ObjectVal(&newMv.Header)
 		sp -= 2
 		ip++
-		return ip, sp, ctlReload
+		return ip, sp, ctlNext
 	}
 
 	if container.Kind() == val.KindBytes {
 		data := container.AsBytes().Data
-		start, stop, _, sliceLen, err := val.NormalizeSliceIndices(startVal, stopVal, val.NoneVal(), len(data))
+		start, stop, sliceLen, ok := normalizeSimpleSlice(startVal, stopVal, len(data))
+		var err error
+		if !ok {
+			start, stop, _, sliceLen, err = val.NormalizeSliceIndices(startVal, stopVal, val.NoneVal(), len(data))
+		}
 		if err == nil {
 			if sliceLen == 0 {
 				stack[sp-3] = val.NewBytesVal(nil)
@@ -231,13 +278,17 @@ func (vm *VM) opBinarySlice(st *loopState, ip, sp int) (int, int, loopCtl) {
 			}
 			sp -= 2
 			ip++
-			return ip, sp, ctlReload
+			return ip, sp, ctlNext
 		}
 	}
 
 	if container.Kind() == val.KindByteArray {
 		data := container.AsByteArray().Data
-		start, stop, _, sliceLen, err := val.NormalizeSliceIndices(startVal, stopVal, val.NoneVal(), len(data))
+		start, stop, sliceLen, ok := normalizeSimpleSlice(startVal, stopVal, len(data))
+		var err error
+		if !ok {
+			start, stop, _, sliceLen, err = val.NormalizeSliceIndices(startVal, stopVal, val.NoneVal(), len(data))
+		}
 		if err == nil {
 			if sliceLen == 0 {
 				stack[sp-3] = val.NewByteArrayVal(nil)
@@ -248,13 +299,17 @@ func (vm *VM) opBinarySlice(st *loopState, ip, sp int) (int, int, loopCtl) {
 			}
 			sp -= 2
 			ip++
-			return ip, sp, ctlReload
+			return ip, sp, ctlNext
 		}
 	}
 
 	if container.Kind() == val.KindList && container.Type() == val.ListType {
 		items := container.AsList().Items
-		start, stop, _, sliceLen, err := val.NormalizeSliceIndices(startVal, stopVal, val.NoneVal(), len(items))
+		start, stop, sliceLen, ok := normalizeSimpleSlice(startVal, stopVal, len(items))
+		var err error
+		if !ok {
+			start, stop, _, sliceLen, err = val.NormalizeSliceIndices(startVal, stopVal, val.NoneVal(), len(items))
+		}
 		if err == nil {
 			if sliceLen == 0 {
 				stack[sp-3] = val.NewListVal()
@@ -265,13 +320,17 @@ func (vm *VM) opBinarySlice(st *loopState, ip, sp int) (int, int, loopCtl) {
 			}
 			sp -= 2
 			ip++
-			return ip, sp, ctlReload
+			return ip, sp, ctlNext
 		}
 	}
 
 	if container.Kind() == val.KindTuple {
 		items := container.AsTuple().Items
-		start, stop, _, sliceLen, err := val.NormalizeSliceIndices(startVal, stopVal, val.NoneVal(), len(items))
+		start, stop, sliceLen, ok := normalizeSimpleSlice(startVal, stopVal, len(items))
+		var err error
+		if !ok {
+			start, stop, _, sliceLen, err = val.NormalizeSliceIndices(startVal, stopVal, val.NoneVal(), len(items))
+		}
 		if err == nil {
 			switch {
 			case sliceLen == 0:
@@ -294,13 +353,17 @@ func (vm *VM) opBinarySlice(st *loopState, ip, sp int) (int, int, loopCtl) {
 			}
 			sp -= 2
 			ip++
-			return ip, sp, ctlReload
+			return ip, sp, ctlNext
 		}
 	}
 
 	if val.IsInlineStrASCII(container) {
 		n := container.StringByteLen()
-		start, stop, _, sliceLen, err := val.NormalizeSliceIndices(startVal, stopVal, val.NoneVal(), n)
+		start, stop, sliceLen, ok := normalizeSimpleSlice(startVal, stopVal, n)
+		var err error
+		if !ok {
+			start, stop, _, sliceLen, err = val.NormalizeSliceIndices(startVal, stopVal, val.NoneVal(), n)
+		}
 		if err == nil {
 			if sliceLen == 0 {
 				stack[sp-3] = val.SmallStringVal("")
@@ -309,7 +372,7 @@ func (vm *VM) opBinarySlice(st *loopState, ip, sp int) (int, int, loopCtl) {
 			}
 			sp -= 2
 			ip++
-			return ip, sp, ctlReload
+			return ip, sp, ctlNext
 		}
 	}
 
@@ -704,6 +767,19 @@ func (vm *VM) opBuildMapUnpack(st *loopState, inst uint32, ip, sp int) (int, int
 		DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4))) == OP_CALL_FUNCTION_EX &&
 		DecodeArgA(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4))) == 1
 	if isCallEx {
+		if count == 1 {
+			dVal := stack[sp]
+			if dVal.IsDict() {
+				d := dVal.AsDict()
+				if d.Live == nil && !d.Shared && !val.MultiThreadedFlag.Load() {
+					if d.Len() == 0 {
+						vm.releaseSmallDictVal(dVal)
+						stack[sp] = val.NoneVal()
+					}
+					return ip + 1, sp + 1, ctlNext
+				}
+			}
+		}
 		allEmpty := true
 		for i := range count {
 			d := stack[sp+i]
@@ -1072,6 +1148,9 @@ func (vm *VM) acquireConstKeyDictEphemeral(count int, ephemeral bool) *val.PyDic
 				return d
 			}
 		}
+	}
+	if count <= 5 {
+		return val.NewSmallDictDirect(flags)
 	}
 	d := val.NewDictVal(count).AsDict()
 	if flags != 0 {

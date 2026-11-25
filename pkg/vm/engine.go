@@ -413,6 +413,7 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 		}
 		tb := val.NoneVal()
 		if lastExc.IsInstance() {
+			vmInstance.materializeDeferredTB(lastExc)
 			tb, _ = lastExc.AsInstance().GetAttr(nameTraceback)
 		}
 		return val.NewTupleVal(val.TypeVal(lastExc.Type()), lastExc, tb)
@@ -426,6 +427,7 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 		if lastExc.IsNone() || lastExc.HeaderPtr() == nil {
 			return val.NoneVal()
 		}
+		vmInstance.materializeDeferredTB(lastExc)
 		return lastExc
 	}))
 

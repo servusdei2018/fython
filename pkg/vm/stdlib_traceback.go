@@ -190,6 +190,11 @@ func (e *Engine) createTracebackModule() val.Value {
 		case len(args) == 1:
 			exc = args[0]
 			if exc.IsInstance() {
+				if ctx != nil && ctx.VM != nil {
+					if vmInstance, ok := ctx.VM.(*VM); ok && vmInstance != nil {
+						vmInstance.materializeDeferredTB(exc)
+					}
+				}
 				tb, _ = exc.AsInstance().GetAttr(nameTraceback)
 			}
 		case len(args) >= 3:
@@ -230,6 +235,7 @@ func (e *Engine) createTracebackModule() val.Value {
 		if exc.IsNone() || exc.HeaderPtr() == nil {
 			return val.NewStringVal("NoneType: None\n")
 		}
+		vmInstance.materializeDeferredTB(exc)
 		tb, _ := exc.AsInstance().GetAttr(nameTraceback)
 		var sb strings.Builder
 		sb.WriteString("Traceback (most recent call last):\n")

@@ -864,30 +864,153 @@ func jsonDumpsValue(ctx *val.ExecContext, v val.Value, opts jsonDumpOpts) (val.V
 		}
 	}
 	if buf == nil {
-		var stackBuf [256]byte
+		var stackBuf [512]byte
 		buf = stackBuf[:0]
 	}
 	var out []byte
-	if vmPtr != nil {
-		defer func() {
-			if vmPtr.jsonDumpBuf == nil {
-				if out != nil && cap(out) <= 65536 {
-					vmPtr.jsonDumpBuf = out[:0]
-				} else if cap(buf) <= 65536 && cap(buf) > 0 {
-					vmPtr.jsonDumpBuf = buf[:0]
-				}
-			}
-		}()
-	}
 	var err error
-	out, err = appendJSONValue(ctx, buf, v, opts, 0)
+	if !opts.hasIndent && !opts.sortKeys && opts.ensureASCII && opts.allowNaN &&
+		opts.itemSep == ", " && opts.keySep == ": " &&
+		(opts.defaultFn.IsUnbound() || opts.defaultFn.IsNone()) {
+		out, err = appendJSONValueDefault(ctx, buf, v)
+	} else {
+		out, err = appendJSONValue(ctx, buf, v, opts, 0)
+	}
 	if err != nil {
+		if vmPtr != nil && vmPtr.jsonDumpBuf == nil {
+			if out != nil && cap(out) <= 65536 {
+				vmPtr.jsonDumpBuf = out[:0]
+			} else if cap(buf) <= 65536 && cap(buf) > 0 {
+				vmPtr.jsonDumpBuf = buf[:0]
+			}
+		}
 		return val.NoneVal(), err
 	}
+	var res val.Value
 	if len(out) <= 7 {
-		return val.SmallStringFromBytes(out), nil
+		res = val.SmallStringFromBytes(out)
+	} else {
+		res = val.NewStringVal(string(out))
 	}
-	return val.NewStringVal(string(out)), nil
+	if vmPtr != nil && vmPtr.jsonDumpBuf == nil {
+		if out != nil && cap(out) <= 65536 {
+			vmPtr.jsonDumpBuf = out[:0]
+		} else if cap(buf) <= 65536 && cap(buf) > 0 {
+			vmPtr.jsonDumpBuf = buf[:0]
+		}
+	}
+	return res, nil
+}
+
+// appendJSONValueDefault is the specialized fast path for json.dumps(v) with
+// default options (ensure_ascii=True, sort_keys=False, indent=None, allow_nan=True,
+// separators=(', ', ': '), default=None).
+func appendJSONValueDefault(ctx *val.ExecContext, dst []byte, v val.Value) ([]byte, error) {
+	if v.IsInlineStr() {
+		return appendJSONStringVal(dst, v, true), nil
+	}
+	hdr := v.HeaderPtr()
+	if hdr == nil {
+		return append(dst, "null"...), nil
+	}
+	switch hdr.Kind {
+	case val.KindNone:
+		return append(dst, "null"...), nil
+	case val.KindBool:
+		if v.AsBool() {
+			return append(dst, "true"...), nil
+		}
+		return append(dst, "false"...), nil
+	case val.KindInt64:
+		return strconv.AppendInt(dst, v.AsInt64(), 10), nil
+	case val.KindFloat64:
+		f := v.AsFloat64()
+		if math.IsNaN(f) {
+			return append(dst, "NaN"...), nil
+		}
+		if math.IsInf(f, 0) {
+			if f < 0 {
+				return append(dst, "-Infinity"...), nil
+			}
+			return append(dst, "Infinity"...), nil
+		}
+		return val.AppendFloatRepr(dst, f), nil
+	case val.KindString:
+		ps := v.AsStringObj()
+		if ps.Buf != nil {
+			return appendJSONStringBytes(dst, ps.Buf, true), nil
+		}
+		return appendJSONStringBytes(dst, unsafe.Slice(unsafe.StringData(ps.Data), len(ps.Data)), true), nil
+	case val.KindList, val.KindTuple:
+		var items []val.Value
+		if hdr.Kind == val.KindList {
+			items = v.AsList().Items
+		} else {
+			items = v.AsTuple().Items
+		}
+		if len(items) == 0 {
+			return append(dst, "[]"...), nil
+		}
+		dst = append(dst, '[')
+		for i, item := range items {
+			if i > 0 {
+				dst = append(dst, ',', ' ')
+			}
+			var err error
+			dst, err = appendJSONValueDefault(ctx, dst, item)
+			if err != nil {
+				return dst, err
+			}
+		}
+		return append(dst, ']'), nil
+	case val.KindDict:
+		d := v.AsDict()
+		if d.Live == nil && !d.Shared && !val.MultiThreadedFlag.Load() {
+			if d.Len() == 0 {
+				return append(dst, "{}"...), nil
+			}
+			dst = append(dst, '{')
+			first := true
+			for i := range d.Entries {
+				e := &d.Entries[i]
+				if !e.Active {
+					continue
+				}
+				if first {
+					first = false
+				} else {
+					dst = append(dst, ',', ' ')
+				}
+				k := e.Key
+				switch {
+				case k.IsString():
+					ps := k.AsStringObj()
+					if ps.Buf != nil {
+						dst = appendJSONStringBytes(dst, ps.Buf, true)
+					} else {
+						dst = appendJSONStringBytes(dst, unsafe.Slice(unsafe.StringData(ps.Data), len(ps.Data)), true)
+					}
+				case k.IsInlineStr():
+					dst = appendJSONStringVal(dst, k, true)
+				default:
+					var err error
+					dst, err = appendJSONDictKey(dst, k, jsonDumpOpts{ensureASCII: true, allowNaN: true})
+					if err != nil {
+						return dst, err
+					}
+				}
+				dst = append(dst, ':', ' ')
+				var err error
+				dst, err = appendJSONValueDefault(ctx, dst, e.Value)
+				if err != nil {
+					return dst, err
+				}
+			}
+			return append(dst, '}'), nil
+		}
+		return appendJSONValue(ctx, dst, v, jsonDumpOpts{ensureASCII: true, allowNaN: true, itemSep: ", ", keySep: ": "}, 0)
+	}
+	return appendJSONValue(ctx, dst, v, jsonDumpOpts{ensureASCII: true, allowNaN: true, itemSep: ", ", keySep: ": "}, 0)
 }
 
 func appendJSONValue(ctx *val.ExecContext, dst []byte, v val.Value, opts jsonDumpOpts, level int) ([]byte, error) {

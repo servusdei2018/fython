@@ -29,6 +29,18 @@ var StrJoinBuiltin Value
 // enabling O(1) pointer-equality interception in the VM call handlers.
 var ListExtendBuiltin Value
 
+// ObjectSetAttrBuiltin is the cached PyBuiltinFunc Value for object.__setattr__,
+// enabling O(1) pointer-equality interception in opCallBoundNative.
+var ObjectSetAttrBuiltin Value
+
+// MaterializeTracebackHook materializes any deferred VM traceback entries onto
+// an exception instance before __traceback__ is observed.
+var MaterializeTracebackHook func(ctx *ExecContext, exc Value)
+
+// ClearDeferredTracebackHook drops any deferred VM traceback entries for exc
+// when __traceback__ is explicitly overwritten.
+var ClearDeferredTracebackHook func(ctx *ExecContext, exc Value)
+
 // PyTuple represents an immutable sequence of Values on the heap (used for kwnames and tuple constants).
 // Tuples with up to 4 elements store their backing array inline inside the same allocation (112 B size class).
 // Header MUST be at byte offset 0.
@@ -87,15 +99,16 @@ type PyBuiltinFunc struct {
 // default positional argument values, and keyword default values.
 // Header MUST be at byte offset 0.
 type PyFunction struct {
-	Header     ObjectHeader
-	Name       string
-	Code       Value
-	Defaults   []Value
-	KwDefaults *PyDict
-	Closure    []Value
-	CellPtrs   []*PyCell
-	Globals    *PyDict
-	Dict       *PyDict
+	Header         ObjectHeader
+	Name           string
+	Code           Value
+	Defaults       []Value
+	KwDefaults     *PyDict
+	Closure        []Value
+	CellPtrs       []*PyCell
+	Globals        *PyDict
+	Dict           *PyDict
+	inlineCellPtrs [2]*PyCell
 }
 
 // MethodPICEntry represents a single slot in a 4-way Polymorphic Inline Cache for method calls.
@@ -327,13 +340,6 @@ func NewFunctionValWithGlobals(name string, codeVal Value, defaults []Value, glo
 
 // NewFunctionValWithGlobalsAndClosure constructs a heap-allocated KindFunction Value bound to module globals and closure cells.
 func NewFunctionValWithGlobalsAndClosure(name string, codeVal Value, defaults []Value, closure []Value, globals *PyDict) Value {
-	var cellPtrs []*PyCell
-	if len(closure) > 0 {
-		cellPtrs = make([]*PyCell, len(closure))
-		for i, c := range closure {
-			cellPtrs[i] = c.AsCell()
-		}
-	}
 	obj := &PyFunction{
 		Header: ObjectHeader{
 			Kind: KindFunction,
@@ -343,8 +349,21 @@ func NewFunctionValWithGlobalsAndClosure(name string, codeVal Value, defaults []
 		Code:     codeVal,
 		Defaults: defaults,
 		Closure:  closure,
-		CellPtrs: cellPtrs,
 		Globals:  globals,
+	}
+	if n := len(closure); n > 0 {
+		if n <= len(obj.inlineCellPtrs) {
+			for i := range n {
+				obj.inlineCellPtrs[i] = closure[i].AsCell()
+			}
+			obj.CellPtrs = obj.inlineCellPtrs[:n]
+		} else {
+			cellPtrs := make([]*PyCell, n)
+			for i, c := range closure {
+				cellPtrs[i] = c.AsCell()
+			}
+			obj.CellPtrs = cellPtrs
+		}
 	}
 	return Value{num: 0, ptr: &obj.Header}
 }
@@ -7068,7 +7087,31 @@ func initTypes() {
 
 	// Initialize built-in exception types
 	BaseExceptionType = MustNewType("BaseException", []*PyType{ObjectType}, nil)
-	BaseExceptionType.Dict.Set(InternString("__traceback__"), NoneVal())
+	BaseExceptionType.Dict.Set(InternString("__traceback__"), NewPropertyVal(
+		NewBuiltinFuncVal("__traceback__.__get__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+			if len(args) < 1 || !args[0].IsInstance() {
+				return NoneVal()
+			}
+			if MaterializeTracebackHook != nil {
+				MaterializeTracebackHook(ctx, args[0])
+			}
+			if tb, ok := args[0].AsInstance().GetAttr(strTraceback); ok {
+				return tb
+			}
+			return NoneVal()
+		}),
+		NewBuiltinFuncVal("__traceback__.__set__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+			if len(args) < 2 || !args[0].IsInstance() {
+				return NoneVal()
+			}
+			if ClearDeferredTracebackHook != nil {
+				ClearDeferredTracebackHook(ctx, args[0])
+			}
+			args[0].AsInstance().SetAttr(strTraceback, args[1])
+			return NoneVal()
+		}),
+		NoneVal(),
+	))
 	BaseExceptionType.Dict.Set(InternString("__cause__"), NoneVal())
 	BaseExceptionType.Dict.Set(InternString("__context__"), NoneVal())
 	BaseExceptionType.Dict.Set(InternString("__suppress_context__"), BoolVal(false))
@@ -7118,6 +7161,9 @@ func initTypes() {
 		self := args[0]
 		tb := args[1]
 		if self.IsInstance() {
+			if ClearDeferredTracebackHook != nil {
+				ClearDeferredTracebackHook(ctx, self)
+			}
 			self.AsInstance().SetAttr(strTraceback, tb)
 		}
 		return self
@@ -8562,7 +8608,13 @@ func initTypes() {
 			return NoneVal()
 		}
 		obj := args[0]
-		interned := InternValue(args[1])
+		nameArg := args[1]
+		var interned Value
+		if hdr := nameArg.HeaderPtr(); hdr != nil && (hdr.Flags&FlagInterned) != 0 {
+			interned = nameArg
+		} else {
+			interned = InternValue(nameArg)
+		}
 		value := args[2]
 		tp := obj.Type()
 		if descr, _, foundInClass := tp.LookupMRO(interned); foundInClass {
@@ -8626,6 +8678,7 @@ func initTypes() {
 		ctx.Raise(NewAttributeError("'" + tp.Name + "' object cannot set attribute '" + interned.AsString() + "'"))
 		return NoneVal()
 	})
+	ObjectSetAttrBuiltin = objectSetAttrBuiltin
 	ObjectType.Dict.Set(DunderSetAttr, objectSetAttrBuiltin)
 
 	objectDelAttrBuiltin := NewBuiltinFuncVal("object.__delattr__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {

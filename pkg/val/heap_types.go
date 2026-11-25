@@ -627,6 +627,33 @@ func ListLenHint(v Value) (int, bool) {
 	}
 }
 
+// dict16Backing fuses the 16-slot index table and dense entry array into a
+// single heap allocation when the 16-slot table pool is empty.
+type dict16Backing struct {
+	entries [Dict16EntryCap]DictEntry
+	indices [16]byte
+}
+
+// dict32Backing fuses the 32-slot index table and dense entry array into a
+// single heap allocation for 11-20 key dicts (e.g. ASGI scope dicts).
+type dict32Backing struct {
+	entries [Dict32EntryCap]DictEntry
+	indices [32]byte
+}
+
+// NewSmallDictDirect allocates a fresh <=5-entry PyDict with inline storage
+// already bound, skipping generic initTable sizing.
+func NewSmallDictDirect(flags uint8) *PyDict {
+	d := &PyDict{
+		Header:     ObjectHeader{Kind: KindDict, Flags: flags, Type: DictType},
+		mask:       7,
+		VersionTag: 1,
+	}
+	d.indices = d.inlineIndices[:]
+	d.Entries = d.inlineEntries[:0]
+	return d
+}
+
 // NewDictVal constructs an empty heap-allocated KindDict Value with initial capacity.
 func NewDictVal(capacity int) Value {
 	obj := &PyDict{
@@ -2357,13 +2384,22 @@ func (d *PyDict) initTable(minEntries int) {
 			d.mask = 15
 			d.indexShift = 0
 		} else {
-			d.indices = make([]byte, 16)
+			b := &dict16Backing{}
+			d.indices = b.indices[:]
 			d.mask = 15
 			d.indexShift = 0
-			maxDense := Dict16EntryCap
-			if cap(d.Entries) < maxDense {
-				d.Entries = make([]DictEntry, 0, maxDense)
+			if cap(d.Entries) < Dict16EntryCap {
+				d.Entries = b.entries[:0]
 			}
+		}
+	case tableCap == 32 && shift == 0 && minEntries <= Dict32EntryCap:
+		d.Header.Flags &^= FlagEphemeralDict | FlagEphemeralFrameDict
+		b := &dict32Backing{}
+		d.indices = b.indices[:]
+		d.mask = 31
+		d.indexShift = 0
+		if cap(d.Entries) < Dict32EntryCap {
+			d.Entries = b.entries[:0]
 		}
 	default:
 		d.Header.Flags &^= FlagEphemeralDict | FlagEphemeralFrameDict
@@ -2371,9 +2407,6 @@ func (d *PyDict) initTable(minEntries int) {
 		d.mask = tableCap - 1
 		d.indexShift = shift
 		maxDense := int(tableCap) * 2 / 3
-		if tableCap == 32 && shift == 0 && minEntries <= Dict32EntryCap {
-			maxDense = Dict32EntryCap
-		}
 		if cap(d.Entries) < maxDense {
 			d.Entries = make([]DictEntry, 0, maxDense)
 		}

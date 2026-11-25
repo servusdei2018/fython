@@ -1,6 +1,8 @@
 package vm
 
 import (
+	"unsafe"
+
 	"github.com/servusdei2018/fython/pkg/val"
 )
 
@@ -71,7 +73,14 @@ func (vm *VM) opCleanupExc(st *loopState, ip, sp int) (int, int, loopCtl) {
 func (vm *VM) opPushExcInfo(st *loopState, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
 	vm.excStack = append(vm.excStack, vm.lastException)
-	vm.lastException = stack[sp-1]
+	exc := stack[sp-1]
+	vm.lastException = exc
+	if exc == vm.deferredTBExc && ip+1 < st.codeLen {
+		nextOp := DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4)))
+		if nextOp != OP_POP_TOP && nextOp != OP_POP_LOAD_FAST {
+			vm.deferredTBBound = true
+		}
+	}
 	ip++
 	return ip, sp, ctlNext
 }
@@ -85,6 +94,13 @@ func (vm *VM) opPopExcept(st *loopState, ip, sp int) (int, int, loopCtl) {
 		vm.excStack = vm.excStack[:n-1]
 	} else {
 		vm.lastException = val.NoneVal()
+	}
+	if discarded == vm.deferredTBExc && vm.deferredTBExc.HeaderPtr() != nil {
+		if vm.deferredTBBound {
+			vm.materializeDeferredTB(discarded)
+		} else {
+			vm.clearDeferredTB(discarded)
+		}
 	}
 	if hdr := discarded.HeaderPtr(); hdr != nil && hdr.Kind == val.KindInstance && (hdr.Flags&val.FlagEphemeralAttrErr) != 0 {
 		val.ReleaseLazyAttributeErrorCtx(&vm.execCtx, discarded)

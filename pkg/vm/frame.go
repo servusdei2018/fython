@@ -347,6 +347,7 @@ type CodeObject struct {
 	ClassCellIdx         int16
 	VarKWSafe            bool
 	MapTempSafe          []bool
+	MatchLocalSafe       [4]uint64
 	EffectiveLocals      int
 	FrameStackNeed       int
 	HasCells             bool
@@ -602,6 +603,27 @@ type VMCodeCache struct {
 	privateActive   bool
 	tier2Done       uint8
 	attrQueryPICExt [][4]AttrQueryPICEntry
+	setAttrIC       []setAttrICEntry
+}
+
+// setAttrICEntry caches monomorphic object.__setattr__(self, const_name, value)
+// resolutions at OP_CALL_BOUND_NATIVE sites (such as attrs/dataclass __init__).
+type setAttrICEntry struct {
+	name          val.Value
+	typeVer       uint64
+	shapeID       uint32
+	slotIdx       int32
+	nextShape     *val.Shape
+	isMemberDescr bool
+}
+
+func (c *VMCodeCache) ensureSetAttrIC() []setAttrICEntry {
+	if len(c.setAttrIC) < len(c.ic) {
+		n := make([]setAttrICEntry, len(c.ic))
+		copy(n, c.setAttrIC)
+		c.setAttrIC = n
+	}
+	return c.setAttrIC
 }
 
 func (c *VMCodeCache) ensureMethodPIC() [][4]val.MethodPICEntry {
@@ -918,6 +940,9 @@ type VM struct {
 	lastException        val.Value
 	unhandledException   val.Value
 	excStack             []val.Value
+	deferredTBExc        val.Value
+	deferredTBBound      bool
+	deferredTBs          []deferredTBEntry
 	context              *val.PyContext
 	bindingOSPath        bool
 	pendingVirtualenvPth bool
@@ -960,6 +985,8 @@ type VM struct {
 	// be handed out again by the next slice.
 	mvFree          []*val.PyMemoryView
 	matchFreeList   []*pyMatch
+	matchBoolOnly   bool
+	matchEphemeral  bool
 	lastReStr       *val.PyString
 	lastReStrLen    int
 	lastReRunes     []rune
@@ -1971,6 +1998,135 @@ func (co *CodeObject) computeParamShape() {
 	}
 	co.VarKWSafe = computeVarKWSafe(co)
 	co.MapTempSafe = computeLocalDictSafe(co)
+	co.MatchLocalSafe = computeLocalMatchSafe(co)
+}
+
+func (co *CodeObject) isMatchLocalSafe(r int) bool {
+	return uint(r) < 256 && (co.MatchLocalSafe[r>>6]&(uint64(1)<<uint(r&63))) != 0
+}
+
+// computeLocalMatchSafe conservatively marks local slots (0..255) that are only
+// ever consumed by truthiness tests or non-escaping Match methods/attributes
+// (group, groups, groupdict, start, end, span, lastgroup, lastindex, pos, endpos).
+// Used to safely recycle loop-carried ephemeral pyMatch objects on overwrite.
+func computeLocalMatchSafe(co *CodeObject) [4]uint64 {
+	var mask [4]uint64
+	if co.IsGenerator || co.IsCoroutine || co.HasCells || len(co.Code) == 0 || co.NumLocals <= 0 {
+		return mask
+	}
+	n := len(co.Code)
+	limitReg := min(co.NumLocals, 256)
+	var candidate [4]uint64
+	// Start with all non-parameter local slots as candidates, then eliminate any
+	// slot that has an unsafe load, store, or closure/attr escape.
+	for r := co.NumParams; r < limitReg; r++ {
+		candidate[r>>6] |= uint64(1) << uint(r&63)
+	}
+	clearBit := func(r int) {
+		if uint(r) < 256 {
+			candidate[r>>6] &^= uint64(1) << uint(r&63)
+		}
+	}
+	hasBit := func(r int) bool {
+		return uint(r) < 256 && (candidate[r>>6]&(uint64(1)<<uint(r&63))) != 0
+	}
+	for i := range n {
+		inst := co.Code[i]
+		op := DecodeOpcode(inst)
+		switch op {
+		case OP_LOAD_FAST:
+			r := int(DecodeArgBx(inst))
+			if !hasBit(r) {
+				continue
+			}
+			if i+1 >= n {
+				clearBit(r)
+				continue
+			}
+			w1 := co.Code[i+1]
+			op1 := DecodeOpcode(w1)
+			switch op1 {
+			case OP_JUMP_IF_FALSE, OP_JUMP_IF_TRUE, OP_UNARY_NOT, OP_POP_TOP:
+				continue
+			case OP_LOAD_ATTR:
+				cIdx := int(DecodeArgBx(w1))
+				if cIdx < len(co.Consts) {
+					name := co.Consts[cIdx]
+					if name.StringEquals("lastgroup") || name.StringEquals("lastindex") ||
+						name.StringEquals("pos") || name.StringEquals("endpos") {
+						continue
+					}
+				}
+				clearBit(r)
+			case OP_LOAD_METHOD:
+				// Verify method is a non-escaping Match accessor.
+				cIdx := int(DecodeArgBx(w1))
+				if cIdx < len(co.Consts) {
+					name := co.Consts[cIdx]
+					if name.StringEquals("group") || name.StringEquals("groups") ||
+						name.StringEquals("groupdict") || name.StringEquals("start") ||
+						name.StringEquals("end") || name.StringEquals("span") {
+						continue
+					}
+				}
+				clearBit(r)
+			default:
+				// Check for method call pattern: LOAD_FAST r; <0..3 simple args>; CALL_METHOD_PIC/DESCR
+				safe := false
+				depth := 0
+				scanLim := min(n, i+6)
+				for k := i + 1; k < scanLim; k++ {
+					wk := co.Code[k]
+					opk := DecodeOpcode(wk)
+					if opk == OP_CALL_METHOD_PIC || opk == OP_CALL_METHOD_DESCR || opk == OP_CALL_METHOD_DESCR_FAST {
+						if depth == int(DecodeArgA(wk)) {
+							mIdx := int(DecodeArgBx(wk))
+							if mIdx < len(co.Consts) {
+								mName := co.Consts[mIdx]
+								if mName.StringEquals("group") || mName.StringEquals("groups") ||
+									mName.StringEquals("groupdict") || mName.StringEquals("start") ||
+									mName.StringEquals("end") || mName.StringEquals("span") {
+									safe = true
+								}
+							}
+						}
+						break
+					}
+					switch opk {
+					case OP_LOAD_FAST, OP_LOAD_CONST, OP_LOAD_GLOBAL, OP_LOAD_DEREF:
+						depth++
+					default:
+						k = scanLim
+					}
+				}
+				if !safe {
+					clearBit(r)
+				}
+			}
+		case OP_LOAD_FAST_ATTR:
+			r := int(DecodeArgA(inst))
+			if !hasBit(r) {
+				continue
+			}
+			cIdx := int(DecodeArgBx(inst))
+			if cIdx < len(co.Consts) {
+				name := co.Consts[cIdx]
+				if name.StringEquals("lastgroup") || name.StringEquals("lastindex") ||
+					name.StringEquals("pos") || name.StringEquals("endpos") {
+					continue
+				}
+			}
+			clearBit(r)
+		case OP_STORE_FAST_ATTR, OP_LOAD_FAST_ATTR_MUL_SELF:
+			clearBit(int(DecodeArgA(inst)))
+		case OP_COMPARE_FAST_FAST, OP_SUBSCR_FAST_FAST, OP_FAST_ADD_INT_LOCALS:
+			clearBit(int(uint8(inst >> 8)))
+			clearBit(int(uint8(inst)))
+		case OP_SUBSCR_FAST_CONST:
+			clearBit(int(uint8(inst >> 8)))
+		}
+	}
+	return candidate
 }
 
 func isSafeScalarKeyConst(v val.Value) bool {

@@ -16,11 +16,14 @@ import (
 // indices for bytes.
 
 var (
-	PatternType      *val.PyType
-	MatchType        *val.PyType
-	ScannerType      *val.PyType
-	PatternErrorType *val.PyType
-	sreOnce          sync.Once
+	PatternType             *val.PyType
+	MatchType               *val.PyType
+	ScannerType             *val.PyType
+	PatternErrorType        *val.PyType
+	patternMatchBuiltin     val.Value
+	patternSearchBuiltin    val.Value
+	patternFullMatchBuiltin val.Value
+	sreOnce                 sync.Once
 )
 
 const flagMatchASCII uint8 = 1 << 1
@@ -602,7 +605,7 @@ func (p *pyPattern) posArgs(ctx *val.ExecContext, in []rune, posV, endV val.Valu
 }
 
 //go:noinline
-func (p *pyPattern) doMatchInlineASCII(ctx *val.ExecContext, mode sre.Mode, strVal, posV, endV val.Value) val.Value {
+func (p *pyPattern) doMatchInlineASCII(ctx *val.ExecContext, mode sre.Mode, strVal, posV, endV val.Value, boolOnly bool, extraFlags uint8) val.Value {
 	var inlineBuf [7]byte
 	raw := strVal.RawNum()
 	n := int(raw & 0xFF)
@@ -617,10 +620,26 @@ func (p *pyPattern) doMatchInlineASCII(ctx *val.ExecContext, mode sre.Mode, strV
 	if !matched {
 		return val.NoneVal()
 	}
-	return newMatch(ctx, p, strVal, caps, last, pos, end, 0)
+	if boolOnly {
+		return val.BoolVal(true)
+	}
+	return newMatch(ctx, p, strVal, caps, last, pos, end, extraFlags)
 }
 
 func (p *pyPattern) doMatch(ctx *val.ExecContext, mode sre.Mode, strVal, posV, endV val.Value) val.Value {
+	var boolOnly bool
+	var extraFlags uint8
+	if ctx != nil && !val.MultiThreadedFlag.Load() {
+		if vm, ok := ctx.VM.(*VM); ok && vm != nil {
+			if vm.matchBoolOnly {
+				boolOnly = true
+				vm.matchBoolOnly = false
+			} else if vm.matchEphemeral {
+				extraFlags = val.FlagEphemeralMatch
+				vm.matchEphemeral = false
+			}
+		}
+	}
 	if !p.IsBytes {
 		switch {
 		case strVal.IsString():
@@ -645,11 +664,14 @@ func (p *pyPattern) doMatch(ctx *val.ExecContext, mode sre.Mode, strVal, posV, e
 					if !matched {
 						return val.NoneVal()
 					}
-					return newMatch(ctx, p, strVal, caps, last, pos, end, flagMatchASCII)
+					if boolOnly {
+						return val.BoolVal(true)
+					}
+					return newMatch(ctx, p, strVal, caps, last, pos, end, flagMatchASCII|extraFlags)
 				}
 			}
 		case val.IsInlineStrASCII(strVal):
-			return p.doMatchInlineASCII(ctx, mode, strVal, posV, endV)
+			return p.doMatchInlineASCII(ctx, mode, strVal, posV, endV, boolOnly, extraFlags)
 		case strVal.IsInstance() && val.IsSubclass(strVal.Type(), val.StrType):
 			inst := strVal.AsInstance()
 			if len(inst.Slots) > 0 && inst.Slots[0].IsAnyString() {
@@ -662,7 +684,10 @@ func (p *pyPattern) doMatch(ctx *val.ExecContext, mode sre.Mode, strVal, posV, e
 					if !matched {
 						return val.NoneVal()
 					}
-					return newMatch(ctx, p, strVal, caps, last, pos, end, 0)
+					if boolOnly {
+						return val.BoolVal(true)
+					}
+					return newMatch(ctx, p, strVal, caps, last, pos, end, extraFlags)
 				}
 			}
 		}
@@ -683,7 +708,10 @@ func (p *pyPattern) doMatch(ctx *val.ExecContext, mode sre.Mode, strVal, posV, e
 	if !ok {
 		return val.NoneVal()
 	}
-	return newMatch(ctx, p, strVal, caps, last, pos, end, 0)
+	if boolOnly {
+		return val.BoolVal(true)
+	}
+	return newMatch(ctx, p, strVal, caps, last, pos, end, extraFlags)
 }
 
 func (p *pyPattern) iterateASCII(in []byte, pos, end int, fn func(caps []int32, last int) bool) {
@@ -1258,7 +1286,7 @@ func initSRETypes() {
 		}{{"match", sre.ModeMatch}, {"prefixmatch", sre.ModeMatch}, {"fullmatch", sre.ModeFullMatch}, {"search", sre.ModeSearch}} {
 			mode := spec.mode
 			name := spec.name
-			method(PatternType, name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			fnVal := val.NewBuiltinFuncVal(name, func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 				p := asPattern(args[0])
 				if len(kwnames) == 0 && len(args) >= 2 && len(args) <= 4 {
 					var posV, endV val.Value
@@ -1273,6 +1301,15 @@ func initSRETypes() {
 				b := bindArgs(name, args[1:], kwnames, "string", "pos", "endpos")
 				return p.doMatch(ctx, mode, required(name, b[0], "string"), b[1], b[2])
 			})
+			PatternType.Dict.Set(val.InternString(name), fnVal)
+			switch name {
+			case "match":
+				patternMatchBuiltin = fnVal
+			case "search":
+				patternSearchBuiltin = fnVal
+			case "fullmatch":
+				patternFullMatchBuiltin = fnVal
+			}
 		}
 		method(PatternType, "findall", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			p := asPattern(args[0])
