@@ -67,6 +67,14 @@ def python_for(executable):
 
 
 def measure_cold_start(executable, runs=COLD_START_RUNS, env=None):
+    # macOS Gatekeeper (syspolicyd) verifies the binary on first launch,
+    # inflating the first timing from ~8 ms to 67-91 ms. Warm up once
+    # untimed so the measured mean reflects steady-state startup.
+    if sys.platform == "darwin":
+        try:
+            subprocess.check_call([executable, "-c", "pass"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+        except Exception:
+            pass
     times = []
     for _ in range(runs):
         t0 = time.perf_counter()

@@ -1002,6 +1002,7 @@ type VM struct {
 	jsonParser           *jsonParser
 	jsonDumpBuf          []byte
 	jsonKeyCache         *[64]jsonKeyCacheEntry
+	jsonSchemaCache      *[16]*val.SplitDictKeys
 	maxSP                int
 	maxFrameIdx          int
 	// Continuous join drain state. While activeJoinGen is set, a generator
@@ -1463,6 +1464,9 @@ func (vm *VM) Reset() {
 	vm.jsonParser = nil
 	if vm.jsonKeyCache != nil {
 		clear(vm.jsonKeyCache[:])
+	}
+	if vm.jsonSchemaCache != nil {
+		clear(vm.jsonSchemaCache[:])
 	}
 	if cap(vm.jsonDumpBuf) > 65536 {
 		vm.jsonDumpBuf = nil

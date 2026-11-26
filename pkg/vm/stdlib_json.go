@@ -413,6 +413,15 @@ func (p *jsonParser) parseObject() (val.Value, error) {
 				return p.invokeHook(p.opts.objectPairsHook, val.NewListFromOwnedSlice(pairs))
 			}
 
+			if dictVal, ok := p.tryJSONSchemaCache(entries, n); ok {
+				clear(p.kvScratch[base:])
+				p.kvScratch = p.kvScratch[:base]
+				if p.opts.hasHooks && !p.opts.objectHook.IsUnbound() && !p.opts.objectHook.IsNone() {
+					return p.invokeHook(p.opts.objectHook, dictVal)
+				}
+				return dictVal, nil
+			}
+
 			dictVal := p.acquireSmallDict(n)
 			d := dictVal.AsDict()
 			for i := range entries {
@@ -440,6 +449,89 @@ func (p *jsonParser) parseObject() (val.Value, error) {
 		p.kvScratch = p.kvScratch[:base]
 		return val.NoneVal(), p.errNow("Expecting ',' delimiter")
 	}
+}
+
+// tryJSONSchemaCache reuses a per-VM split-table schema for repeated JSON
+// object shapes. It returns (dict, true) on hit or on a successful miss-build,
+// and (None, false) when the object must use the combined-dict fallback.
+func (p *jsonParser) tryJSONSchemaCache(entries []val.DictEntry, n int) (val.Value, bool) {
+	if n < 1 || n > 16 {
+		return val.NoneVal(), false
+	}
+	if p.vm == nil || val.MultiThreadedFlag.Load() {
+		return val.NoneVal(), false
+	}
+	if !p.opts.objectHook.IsUnbound() && !p.opts.objectHook.IsNone() {
+		return val.NoneVal(), false
+	}
+	if !p.opts.objectPairsHook.IsUnbound() && !p.opts.objectPairsHook.IsNone() {
+		return val.NoneVal(), false
+	}
+	var h uint32
+	for i := range n {
+		h = h*31 ^ entries[i].Hash
+	}
+	sig := h & 15
+	if p.vm.jsonSchemaCache == nil {
+		p.vm.jsonSchemaCache = new([16]*val.SplitDictKeys)
+	}
+	cache := p.vm.jsonSchemaCache
+	if sk := cache[sig]; sk != nil && sk.Count == n {
+		match := true
+		for i := range n {
+			if entries[i].Key != sk.Keys[i] && !val.StringEquals(entries[i].Key, sk.Keys[i]) {
+				match = false
+				break
+			}
+		}
+		if match {
+			if sk.DisableSplit.Load() {
+				return val.NoneVal(), false
+			}
+			return val.DictVal(val.NewSplitDictFromEntries(sk, entries, 0)), true
+		}
+	}
+	for i := range n {
+		for j := range i {
+			if entries[i].Key == entries[j].Key || val.StringEquals(entries[i].Key, entries[j].Key) {
+				return val.NoneVal(), false
+			}
+		}
+	}
+	sk := &val.SplitDictKeys{Count: n}
+	for i := range n {
+		sk.Keys[i] = entries[i].Key
+		sk.Hashes[i] = entries[i].Hash
+	}
+	var mask uint32
+	switch {
+	case n <= 5:
+		mask = 7
+	case n <= 10:
+		mask = 15
+	default:
+		mask = 31
+	}
+	sk.Mask = mask
+	for i := range n {
+		slot := sk.Hashes[i] & mask
+		for {
+			raw := sk.Indices[slot]
+			if raw == 0 {
+				sk.Indices[slot] = byte(i + 2)
+				break
+			}
+			existing := int(raw) - 2
+			if existing >= 0 && existing < i {
+				if sk.Keys[existing] == sk.Keys[i] || val.StringEquals(sk.Keys[existing], sk.Keys[i]) {
+					return val.NoneVal(), false
+				}
+			}
+			slot = (slot + 1) & mask
+		}
+	}
+	cache[sig] = sk
+	return val.DictVal(val.NewSplitDictFromEntries(sk, entries, 0)), true
 }
 
 func (p *jsonParser) parseArray() (val.Value, error) {

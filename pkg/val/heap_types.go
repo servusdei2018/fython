@@ -748,6 +748,63 @@ func NewSplitDict(keys *SplitDictKeys, values []Value, flags uint8) *PyDict {
 	}
 }
 
+// NewSplitDictFromEntries allocates a PEP 412 split-table PyDict copying
+// values directly from entries (zero intermediate Value slice, zero escape).
+// Caller guarantees len(entries) == keys.Count and entries hold unique keys.
+func NewSplitDictFromEntries(keys *SplitDictKeys, entries []DictEntry, flags uint8) *PyDict {
+	count := keys.Count
+	switch {
+	case count <= 4:
+		b := &splitDictBundle4{
+			dict: PyDict{
+				Header:     ObjectHeader{Kind: KindDict, Flags: flags, Type: DictType},
+				VersionTag: 1,
+				used:       int32(count),
+				filled:     int32(count),
+			},
+		}
+		for i := range count {
+			b.vals[i] = entries[i].Value
+		}
+		b.data.keys = keys
+		b.data.vals = b.vals[:count]
+		b.dict.split = &b.data
+		return &b.dict
+	case count <= 8:
+		b := &splitDictBundle8{
+			dict: PyDict{
+				Header:     ObjectHeader{Kind: KindDict, Flags: flags, Type: DictType},
+				VersionTag: 1,
+				used:       int32(count),
+				filled:     int32(count),
+			},
+		}
+		for i := range count {
+			b.vals[i] = entries[i].Value
+		}
+		b.data.keys = keys
+		b.data.vals = b.vals[:count]
+		b.dict.split = &b.data
+		return &b.dict
+	default:
+		b := &splitDictBundle16{
+			dict: PyDict{
+				Header:     ObjectHeader{Kind: KindDict, Flags: flags, Type: DictType},
+				VersionTag: 1,
+				used:       int32(count),
+				filled:     int32(count),
+			},
+		}
+		for i := range count {
+			b.vals[i] = entries[i].Value
+		}
+		b.data.keys = keys
+		b.data.vals = b.vals[:count]
+		b.dict.split = &b.data
+		return &b.dict
+	}
+}
+
 // IsSplit reports whether d currently uses a PEP 412 shared-key split table.
 func (d *PyDict) IsSplit() bool {
 	return d.split != nil

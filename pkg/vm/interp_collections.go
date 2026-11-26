@@ -879,12 +879,15 @@ func (vm *VM) opListExtend(st *loopState, inst uint32, ip, sp int) (int, int, lo
 		switch {
 		case iterVal.IsList():
 			added = len(iterVal.AsList().Items)
+			lst.Items = appendListGrown(lst.Items, added)
 			lst.Items = append(lst.Items, iterVal.AsList().Items...)
 		case iterVal.IsTuple():
 			added = len(iterVal.AsTuple().Items)
+			lst.Items = appendListGrown(lst.Items, added)
 			lst.Items = append(lst.Items, iterVal.AsTuple().Items...)
 		case iterVal.IsSet():
 			added = len(iterVal.AsSet().Items())
+			lst.Items = appendListGrown(lst.Items, added)
 			lst.Items = append(lst.Items, iterVal.AsSet().Items()...)
 		default:
 			st.stack = stack
@@ -899,6 +902,7 @@ func (vm *VM) opListExtend(st *loopState, inst uint32, ip, sp int) (int, int, lo
 				return ip, sp, ctlRaise
 			}
 			added = len(items)
+			lst.Items = appendListGrown(lst.Items, added)
 			lst.Items = append(lst.Items, items...)
 		}
 		for _, it := range lst.Items[len(lst.Items)-added:] {
@@ -907,6 +911,20 @@ func (vm *VM) opListExtend(st *loopState, inst uint32, ip, sp int) (int, int, lo
 	}
 	ip++
 	return ip, sp, ctlReload
+}
+
+// appendListGrown grows items once so the following append of added elements
+// never triggers repeated slice doubling.
+func appendListGrown(items []val.Value, added int) []val.Value {
+	if added <= 0 {
+		return items
+	}
+	if need := len(items) + added; need > cap(items) {
+		grown := make([]val.Value, len(items), need)
+		copy(grown, items)
+		return grown
+	}
+	return items
 }
 
 //go:noinline
