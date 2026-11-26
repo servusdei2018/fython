@@ -1067,6 +1067,22 @@ func (vm *VM) opBuildConstKeyMap(st *loopState, inst uint32, ip, sp int) (int, i
 	// O(1) hot path: constant tuple identity guarantees keys are unchanged,
 	// templateable, and duplicate-free without re-scanning.
 	if tmpl != nil && tmpl.Valid && tmpl.KeysTuple == keysVal && tmpl.Count == count {
+		if !tmpl.IsEphemeral {
+			if sk := tmpl.SplitKeys; sk != nil {
+				if !sk.DisableSplit.Load() {
+					for i := base; i < base+count; i++ {
+						val.ClearEphemeral(stack[i])
+						val.DetachStringBuf(stack[i])
+					}
+					d := val.NewSplitDict(sk, stack[base:base+count], 0)
+					stack[base] = val.DictVal(d)
+					return ip + 1, base + 1, ctlNext
+				}
+				// tmpl lives on a VM-private VMCodeCache (gated by !MultiThreadedFlag),
+				// so clearing SplitKeys avoids even the atomic load on future hits.
+				tmpl.SplitKeys = nil
+			}
+		}
 		d := vm.acquireConstKeyDictEphemeral(count, tmpl.IsEphemeral)
 		if d != nil {
 			if vm.fillConstKeyDict(d, tmpl, stack[base:base+count]) {
@@ -1091,6 +1107,15 @@ func (vm *VM) opBuildConstKeyMap(st *loopState, inst uint32, ip, sp int) (int, i
 		if vm.buildConstKeyTemplate(tmpl, keysVal, keys, count, st, ip) {
 			if ip >= 0 && ip < len(st.cache.ic) {
 				st.cache.ic[ip].Kind = ICKindConstKeyMap
+			}
+			if !tmpl.IsEphemeral && tmpl.SplitKeys != nil {
+				for i := base; i < base+count; i++ {
+					val.ClearEphemeral(stack[i])
+					val.DetachStringBuf(stack[i])
+				}
+				d := val.NewSplitDict(tmpl.SplitKeys, stack[base:base+count], 0)
+				stack[base] = val.DictVal(d)
+				return ip + 1, base + 1, ctlNext
 			}
 			d := vm.acquireConstKeyDictEphemeral(count, tmpl.IsEphemeral)
 			if d != nil && vm.fillConstKeyDict(d, tmpl, stack[base:base+count]) {
@@ -1260,6 +1285,25 @@ func (vm *VM) buildConstKeyTemplate(tmpl *ConstKeyMapTemplate, keysVal val.Value
 	tmpl.Indices8 = idx8
 	tmpl.Indices16 = idx16
 	tmpl.Indices32 = idx32
+	sk := &val.SplitDictKeys{
+		Count: count,
+	}
+	for i := range count {
+		sk.Keys[i] = keys[i]
+		sk.Hashes[i] = uint32(hashes[i])
+	}
+	switch {
+	case count <= 5:
+		copy(sk.Indices[:8], idx8[:])
+		sk.Mask = 7
+	case count <= 10:
+		copy(sk.Indices[:16], idx16[:])
+		sk.Mask = 15
+	default:
+		copy(sk.Indices[:32], idx32[:])
+		sk.Mask = 31
+	}
+	tmpl.SplitKeys = sk
 	ephemeral := isEphemeralMapSite(st, ip)
 	if !ephemeral && st.curCO != nil && ip < len(st.curCO.MapTempSafe) && st.curCO.MapTempSafe[ip] {
 		ephemeral = true

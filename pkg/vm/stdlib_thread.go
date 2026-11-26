@@ -566,6 +566,7 @@ func initThreadModule() {
 					}
 				case "kwargs":
 					if val.IsDict() {
+						val.AsDict().EnsureCombined()
 						for _, entry := range val.AsDict().Entries {
 							if entry.Active {
 								st.kwnames = append(st.kwnames, entry.Key)
@@ -739,6 +740,7 @@ func (e *Engine) createThreadModule() val.Value {
 		}
 		var kwNames []val.Value
 		if len(args) > 2 && args[2].IsDict() {
+			args[2].AsDict().EnsureCombined()
 			for _, entry := range args[2].AsDict().Entries {
 				if entry.Active {
 					kwNames = append(kwNames, entry.Key)

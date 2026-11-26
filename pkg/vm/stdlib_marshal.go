@@ -102,6 +102,7 @@ func marshalValue(b *bytes.Buffer, v val.Value) error {
 	if v.IsDict() {
 		b.WriteByte(tagDict)
 		d := v.AsDict()
+		d.EnsureCombined()
 		for _, kv := range d.Entries {
 			if err := marshalValue(b, kv.Key); err != nil {
 				return err

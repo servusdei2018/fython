@@ -1026,6 +1026,40 @@ func appendJSONValueDefault(ctx *val.ExecContext, dst []byte, v val.Value) ([]by
 				return append(dst, "{}"...), nil
 			}
 			dst = append(dst, '{')
+			if d.IsSplit() {
+				sk := d.SplitKeys()
+				sv := d.SplitValues()
+				for i := range sk.Count {
+					if i > 0 {
+						dst = append(dst, ',', ' ')
+					}
+					k := sk.Keys[i]
+					switch {
+					case k.IsString():
+						ps := k.AsStringObj()
+						if ps.Buf != nil {
+							dst = appendJSONStringBytes(dst, ps.Buf, true)
+						} else {
+							dst = appendJSONStringBytes(dst, unsafe.Slice(unsafe.StringData(ps.Data), len(ps.Data)), true)
+						}
+					case k.IsInlineStr():
+						dst = appendJSONStringVal(dst, k, true)
+					default:
+						var err error
+						dst, err = appendJSONDictKey(dst, k, jsonDumpOpts{ensureASCII: true, allowNaN: true})
+						if err != nil {
+							return dst, err
+						}
+					}
+					dst = append(dst, ':', ' ')
+					var err error
+					dst, err = appendJSONValueDefault(ctx, dst, sv[i])
+					if err != nil {
+						return dst, err
+					}
+				}
+				return append(dst, '}'), nil
+			}
 			first := true
 			for i := range d.Entries {
 				e := &d.Entries[i]

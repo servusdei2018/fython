@@ -785,6 +785,7 @@ func NewTypeWithMeta(name string, bases []*PyType, dict *PyDict, meta *PyType) (
 	if dict == nil {
 		dict = NewDictVal(4).AsDict()
 	} else {
+		dict.EnsureCombined()
 		// Ensure all existing keys in dict are canonicalized in the intern pool.
 		for i := range dict.Entries {
 			e := &dict.Entries[i]

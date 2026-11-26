@@ -334,6 +334,7 @@ func initSqliteTypes() {
 				}
 			case pArg.IsDict():
 				named = make(map[string]sqlite.Value)
+				pArg.AsDict().EnsureCombined()
 				for _, entry := range pArg.AsDict().Entries {
 					if entry.Active {
 						kStr := entry.Key.AsString()

@@ -61,9 +61,49 @@ const (
 	dictIndexOffset = 2
 )
 
+// SplitDictKeys holds an immutable shared key/hash/index table for PEP 412
+// split-table constant-key dicts (2..16 interned-string or primitive keys).
+type SplitDictKeys struct {
+	Keys         [16]Value
+	Hashes       [16]uint32
+	Indices      [32]byte
+	Count        int
+	Mask         uint32
+	Promotions   atomic.Uint32
+	DisableSplit atomic.Bool
+}
+
+// splitDictData links a split-table PyDict to its immutable shared keys and
+// compact value array (allocated inline inside splitDictBundle4/8/16).
+type splitDictData struct {
+	keys *SplitDictKeys
+	vals []Value
+}
+
+// splitDictBundle4/8/16 fuse a PyDict, its splitDictData header, and its
+// compact value array into a single heap allocation with PyDict.Header at
+// byte offset 0.
+type splitDictBundle4 struct {
+	dict PyDict
+	data splitDictData
+	vals [4]Value
+}
+
+type splitDictBundle8 struct {
+	dict PyDict
+	data splitDictData
+	vals [8]Value
+}
+
+type splitDictBundle16 struct {
+	dict PyDict
+	data splitDictData
+	vals [16]Value
+}
+
 // PyDict represents a Hettinger-style compact open-addressed dictionary with offset-0 ObjectHeader.
 // It separates the sparse hash index table (indices, dynamically sized as uint8, uint16, or uint32 per slot)
-// from the dense insertion-ordered Entries slice.
+// from the dense insertion-ordered Entries slice, or points split at a shared-key PEP 412 table.
 // Header MUST be at offset 0.
 type PyDict struct {
 	Header  ObjectHeader
@@ -78,9 +118,10 @@ type PyDict struct {
 	// then invalidates the owner version tag (and its subclasses), so lookup
 	// caches never need to trust call sites to invalidate explicitly.
 	owner      *PyType
+	split      *splitDictData
 	VersionTag uint64
-	used       int
-	filled     int
+	used       int32
+	filled     int32
 	mu         sync.RWMutex
 	mask       uint32
 	indexShift uint8 // 0: uint8 slots, 1: uint16 slots, 2: uint32 slots
@@ -654,6 +695,194 @@ type smallDictBundle struct {
 type smallDictBacking struct {
 	entries [5]DictEntry
 	indices [8]byte
+}
+
+// NewSplitDict allocates a PEP 412 split-table PyDict referencing immutable
+// shared keys and copying only values[:keys.Count] into a single fused heap
+// allocation (zero DictEntry key/hash copying and zero indices allocation).
+func NewSplitDict(keys *SplitDictKeys, values []Value, flags uint8) *PyDict {
+	count := keys.Count
+	switch {
+	case count <= 4:
+		b := &splitDictBundle4{
+			dict: PyDict{
+				Header:     ObjectHeader{Kind: KindDict, Flags: flags, Type: DictType},
+				VersionTag: 1,
+				used:       int32(count),
+				filled:     int32(count),
+			},
+		}
+		copy(b.vals[:count], values[:count])
+		b.data.keys = keys
+		b.data.vals = b.vals[:count]
+		b.dict.split = &b.data
+		return &b.dict
+	case count <= 8:
+		b := &splitDictBundle8{
+			dict: PyDict{
+				Header:     ObjectHeader{Kind: KindDict, Flags: flags, Type: DictType},
+				VersionTag: 1,
+				used:       int32(count),
+				filled:     int32(count),
+			},
+		}
+		copy(b.vals[:count], values[:count])
+		b.data.keys = keys
+		b.data.vals = b.vals[:count]
+		b.dict.split = &b.data
+		return &b.dict
+	default:
+		b := &splitDictBundle16{
+			dict: PyDict{
+				Header:     ObjectHeader{Kind: KindDict, Flags: flags, Type: DictType},
+				VersionTag: 1,
+				used:       int32(count),
+				filled:     int32(count),
+			},
+		}
+		copy(b.vals[:count], values[:count])
+		b.data.keys = keys
+		b.data.vals = b.vals[:count]
+		b.dict.split = &b.data
+		return &b.dict
+	}
+}
+
+// IsSplit reports whether d currently uses a PEP 412 shared-key split table.
+func (d *PyDict) IsSplit() bool {
+	return d.split != nil
+}
+
+// SplitKeys returns the immutable shared key table if d is split, or nil.
+func (d *PyDict) SplitKeys() *SplitDictKeys {
+	if d.split == nil {
+		return nil
+	}
+	return d.split.keys
+}
+
+// SplitValues returns the dense value slice if d is split, or nil.
+func (d *PyDict) SplitValues() []Value {
+	if d.split == nil {
+		return nil
+	}
+	return d.split.vals
+}
+
+// EnsureCombined promotes a split-table dict to a standard combined table if
+// needed. Safe to call on already-combined dicts (single nil check).
+func (d *PyDict) EnsureCombined() {
+	if d.split == nil {
+		return
+	}
+	if d.lockDict() {
+		defer d.mu.Unlock()
+	}
+	if d.split != nil {
+		d.promoteSplitToCombined()
+	}
+}
+
+//go:noinline
+func (d *PyDict) getSplitLocked(key Value) (Value, bool) {
+	if idx := d.splitLookup(key); idx >= 0 {
+		return d.split.vals[idx], true
+	}
+	return NoneVal(), false
+}
+
+//go:noinline
+func (d *PyDict) getWithSlotSplitLocked(key Value) (Value, int, bool) {
+	if idx := d.splitLookup(key); idx >= 0 {
+		return d.split.vals[idx], idx, true
+	}
+	return NoneVal(), -1, false
+}
+
+//go:noinline
+func (d *PyDict) setSplitLocked(key, value Value) bool {
+	if idx := d.splitLookup(key); idx >= 0 {
+		d.split.vals[idx] = value
+		d.bumpVersionTag()
+		if d.owner != nil {
+			d.owner.bumpVersion()
+		}
+		return true
+	}
+	d.promoteSplitToCombined()
+	return false
+}
+
+func (d *PyDict) splitLookup(key Value) int {
+	sk := d.split.keys
+	count := sk.Count
+	if count <= 5 {
+		keys := sk.Keys[:count]
+		for i := range keys {
+			if keys[i] == key || dictKeyEqual(keys[i], key) {
+				return i
+			}
+		}
+		return -1
+	}
+	h := HashValue(key)
+	mask := sk.Mask
+	slot := h & mask
+	for {
+		raw := sk.Indices[slot]
+		if raw == dictIndexEmpty {
+			return -1
+		}
+		idx := int(raw) - dictIndexOffset
+		if sk.Keys[idx] == key || (sk.Hashes[idx] == h && dictKeyEqual(sk.Keys[idx], key)) {
+			return idx
+		}
+		slot = (slot + 1) & mask
+	}
+}
+
+// promoteSplitToCombined performs one-way promotion of a split-table dict to a
+// standard combined PyDict table (reusing the pre-computed hashes and indices
+// without re-hashing). Caller must hold d.mu if concurrent.
+//
+//go:noinline
+func (d *PyDict) promoteSplitToCombined() {
+	sp := d.split
+	if sp == nil {
+		return
+	}
+	sk := sp.keys
+	if sk.Promotions.Add(1) >= 2 {
+		sk.DisableSplit.Store(true)
+	}
+	count := sk.Count
+	tableCap := int(sk.Mask) + 1
+	d.initTable(max(count, 4))
+	// Materialize entries directly; if tableCap matches sk.Mask+1 we can copy
+	// pre-computed indices directly without probing.
+	if int(d.mask)+1 == tableCap && d.indexShift == 0 && cap(d.Entries) >= count {
+		entries := d.Entries[:count]
+		for i := range count {
+			entries[i] = DictEntry{
+				Hash:   sk.Hashes[i],
+				Active: true,
+				Key:    sk.Keys[i],
+				Value:  sp.vals[i],
+			}
+		}
+		d.Entries = entries
+		copy(d.indices[:tableCap], sk.Indices[:tableCap])
+		d.used = int32(count)
+		d.filled = int32(count)
+		d.split = nil
+		return
+	}
+	d.used = 0
+	d.filled = 0
+	d.split = nil
+	for i := range count {
+		d.PutNewHashed(sk.Keys[i], sp.vals[i], sk.Hashes[i])
+	}
 }
 
 // NewSmallDictDirect allocates a fresh <=5-entry PyDict with fused small-table
@@ -1606,6 +1835,20 @@ func (it *PyIter) NextCtx(ctx *ExecContext) (Value, bool) {
 			return dict.liveIterNext(it)
 		}
 		locked := dict.rlockDict()
+		if sp := dict.split; sp != nil {
+			if it.Idx < sp.keys.Count {
+				key := sp.keys.Keys[it.Idx]
+				it.Idx++
+				if locked {
+					dict.mu.RUnlock()
+				}
+				return key, true
+			}
+			if locked {
+				dict.mu.RUnlock()
+			}
+			return NoneVal(), false
+		}
 		for it.Idx < len(dict.Entries) {
 			entry := &dict.Entries[it.Idx]
 			it.Idx++
@@ -2827,9 +3070,19 @@ func (d *PyDict) bumpVersionTag() {
 
 func (d *PyDict) setLocked(key, value Value) {
 	if len(d.indices) == 0 {
-		d.initTable(4)
+		if d.Live != nil {
+			d.Live.SetAttr(InternValue(key), value)
+			return
+		}
+		if d.split != nil {
+			if d.setSplitLocked(key, value) {
+				return
+			}
+		} else {
+			d.initTable(4)
+		}
 	}
-	if d.Live == nil && d.mask == 7 && d.indexShift == 0 {
+	if d.mask == 7 && d.indexShift == 0 {
 		for i := range d.Entries {
 			e := &d.Entries[i]
 			if e.Active && (e.Key == key || dictKeyEqual(e.Key, key)) {
@@ -2903,8 +3156,8 @@ func (d *PyDict) setLocked(key, value Value) {
 	}
 
 	// Inserting a new key: check if table needs resizing.
-	if (d.filled+1)*3 > int(d.mask+1)*2 || len(d.Entries)+dictIndexOffset >= d.maxIndexValue() {
-		d.resize(d.used + 1)
+	if (int(d.filled)+1)*3 > int(d.mask+1)*2 || len(d.Entries)+dictIndexOffset >= d.maxIndexValue() {
+		d.resize(int(d.used) + 1)
 		mask = d.mask
 		slot = h & mask
 		for d.readIndex(slot) != dictIndexEmpty {
@@ -2941,12 +3194,20 @@ func (d *PyDict) PutNew(key, value Value) {
 // updating in-place if the key already exists (matching Python duplicate-key semantics).
 func (d *PyDict) PutNewHashed(key, value Value, h uint32) {
 	if len(d.indices) == 0 {
-		d.initTable(4)
+		if d.Live != nil {
+			d.Live.SetAttr(InternValue(key), value)
+			return
+		}
+		if d.split != nil {
+			d.promoteSplitToCombined()
+		} else {
+			d.initTable(4)
+		}
 	}
 	mask := d.mask
 	slot := h & mask
-	if (d.filled+1)*3 > int(mask+1)*2 || len(d.Entries)+dictIndexOffset >= d.maxIndexValue() {
-		d.resize(d.used + 1)
+	if (int(d.filled)+1)*3 > int(mask+1)*2 || len(d.Entries)+dictIndexOffset >= d.maxIndexValue() {
+		d.resize(int(d.used) + 1)
 		mask = d.mask
 		slot = h & mask
 	}
@@ -3070,6 +3331,17 @@ func (d *PyDict) GetWithSlotHint(key Value, slotHint int) (Value, int, bool) {
 	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
+	if len(d.Entries) == 0 {
+		if sp := d.split; sp != nil {
+			if slotHint >= 0 && slotHint < sp.keys.Count && (sp.keys.Keys[slotHint] == key || dictKeyEqual(sp.keys.Keys[slotHint], key)) {
+				return sp.vals[slotHint], slotHint, true
+			}
+			if idx := d.splitLookup(key); idx >= 0 {
+				return sp.vals[idx], idx, true
+			}
+		}
+		return NoneVal(), -1, false
+	}
 	if slotHint >= 0 && slotHint < len(d.Entries) {
 		e := &d.Entries[slotHint]
 		if e.Active && dictKeyEqual(e.Key, key) {
@@ -3080,10 +3352,16 @@ func (d *PyDict) GetWithSlotHint(key Value, slotHint int) (Value, int, bool) {
 }
 
 func (d *PyDict) getWithSlotLocked(key Value) (Value, int, bool) {
-	if d.used == 0 {
+	if len(d.Entries) == 0 {
+		if d.Live != nil {
+			return d.liveGetWithSlot(key)
+		}
+		if d.split != nil {
+			return d.getWithSlotSplitLocked(key)
+		}
 		return NoneVal(), -1, false
 	}
-	if d.Live == nil && d.mask == 7 && d.indexShift == 0 {
+	if d.mask == 7 && d.indexShift == 0 {
 		for i := range d.Entries {
 			e := &d.Entries[i]
 			if e.Active && (e.Key == key || dictKeyEqual(e.Key, key)) {
@@ -3131,10 +3409,16 @@ func (d *PyDict) getWithSlotLocked(key Value) (Value, int, bool) {
 }
 
 func (d *PyDict) getLocked(key Value) (Value, bool) {
-	if d.used == 0 {
+	if len(d.Entries) == 0 {
+		if d.Live != nil {
+			return d.Live.GetAttr(key)
+		}
+		if d.split != nil {
+			return d.getSplitLocked(key)
+		}
 		return NoneVal(), false
 	}
-	if d.Live == nil && d.mask == 7 && d.indexShift == 0 {
+	if d.mask == 7 && d.indexShift == 0 {
 		for i := range d.Entries {
 			e := &d.Entries[i]
 			if e.Active && (e.Key == key || dictKeyEqual(e.Key, key)) {
@@ -3191,8 +3475,17 @@ func (d *PyDict) Delete(key Value) bool {
 }
 
 func (d *PyDict) deleteLocked(key Value) bool {
-	if d.used == 0 {
-		return false
+	if len(d.Entries) == 0 {
+		if d.Live != nil {
+			return d.Live.DeleteAttr(InternValue(key))
+		}
+		if d.split == nil {
+			return false
+		}
+		if d.splitLookup(key) < 0 {
+			return false
+		}
+		d.promoteSplitToCombined()
 	}
 
 	h := HashValue(key)
@@ -3231,7 +3524,7 @@ func (d *PyDict) Len() int {
 	if d.rlockDict() {
 		defer d.mu.RUnlock()
 	}
-	return d.used
+	return int(d.used)
 }
 
 // Keys returns a slice of all active keys in PyDict in a thread-safe manner.
@@ -3246,6 +3539,11 @@ func (d *PyDict) Keys() []Value {
 	}
 	if d.rlockDict() {
 		defer d.mu.RUnlock()
+	}
+	if sp := d.split; sp != nil {
+		keys := make([]Value, sp.keys.Count)
+		copy(keys, sp.keys.Keys[:sp.keys.Count])
+		return keys
 	}
 	keys := make([]Value, 0, d.used)
 	for i := range d.Entries {
@@ -3280,6 +3578,11 @@ func (d *PyDict) Values() []Value {
 	if d.rlockDict() {
 		defer d.mu.RUnlock()
 	}
+	if sp := d.split; sp != nil {
+		vals := make([]Value, sp.keys.Count)
+		copy(vals, sp.vals[:sp.keys.Count])
+		return vals
+	}
 	vals := make([]Value, 0, d.used)
 	for i := range d.Entries {
 		if d.Entries[i].Active {
@@ -3305,6 +3608,13 @@ func (d *PyDict) Items() []DictItem {
 	}
 	if d.rlockDict() {
 		defer d.mu.RUnlock()
+	}
+	if sp := d.split; sp != nil {
+		items := make([]DictItem, sp.keys.Count)
+		for i := range sp.keys.Count {
+			items[i] = DictItem{Key: sp.keys.Keys[i], Value: sp.vals[i]}
+		}
+		return items
 	}
 	items := make([]DictItem, 0, d.used)
 	for i := range d.Entries {
@@ -3352,10 +3662,29 @@ func SetVal(s *PySet) Value {
 // when tombstones are present.
 func (d *PyDict) Copy() *PyDict {
 	if d.Live == nil && !d.Shared && !MultiThreadedFlag.Load() {
+		if len(d.Entries) == 0 {
+			if sp := d.split; sp != nil {
+				sk := sp.keys
+				if !sk.DisableSplit.Load() {
+					return NewSplitDict(sk, sp.vals, 0)
+				}
+				var newD *PyDict
+				if sk.Count <= 5 {
+					newD = NewSmallDictDirect(0)
+				} else {
+					newD = NewDictVal(sk.Count).AsDict()
+				}
+				for i := range sk.Count {
+					newD.PutNewHashed(sk.Keys[i], sp.vals[i], sk.Hashes[i])
+				}
+				return newD
+			}
+			return &PyDict{Header: ObjectHeader{Kind: KindDict, Type: DictType}}
+		}
 		if d.used == 0 {
 			return &PyDict{Header: ObjectHeader{Kind: KindDict, Type: DictType}}
 		}
-		if d.used == d.filled && len(d.Entries) == d.used && len(d.indices) > 0 {
+		if d.used == d.filled && len(d.Entries) == int(d.used) && len(d.indices) > 0 {
 			if d.IsSmallInline() {
 				newD := NewSmallDictDirect(0)
 				copy(newD.Entries[:d.used], d.Entries[:d.used])
@@ -3385,7 +3714,7 @@ func (d *PyDict) Copy() *PyDict {
 		if d.used <= 5 {
 			newD = NewSmallDictDirect(0)
 		} else {
-			newD = NewDictVal(d.used).AsDict()
+			newD = NewDictVal(int(d.used)).AsDict()
 		}
 		for i := range d.Entries {
 			e := &d.Entries[i]
@@ -3413,12 +3742,22 @@ func (d *PyDict) UpdateFromDict(other *PyDict) {
 		if other.used == 0 {
 			return
 		}
-		need := d.used + other.used
+		if d.split != nil {
+			d.promoteSplitToCombined()
+		}
+		need := int(d.used) + int(other.used)
 		if len(d.indices) == 0 {
 			d.initTable(max(4, need))
-		} else if d.used != d.filled || (d.filled+other.used)*3 > int(d.mask+1)*2 || len(d.Entries)+other.used+dictIndexOffset >= d.maxIndexValue() {
+		} else if d.used != d.filled || (int(d.filled)+int(other.used))*3 > int(d.mask+1)*2 || len(d.Entries)+int(other.used)+dictIndexOffset >= d.maxIndexValue() {
 			// Resizing compacts away any tombstones so PutNewHashed is safe.
 			d.resize(need)
+		}
+		if osp := other.split; osp != nil {
+			sk := osp.keys
+			for i := range sk.Count {
+				d.PutNewHashed(sk.Keys[i], osp.vals[i], sk.Hashes[i])
+			}
+			return
 		}
 		for i := range other.Entries {
 			e := &other.Entries[i]
@@ -3442,11 +3781,18 @@ func NewSetFromDict(d *PyDict) Value {
 			Header: ObjectHeader{Kind: KindSet, Type: SetType},
 		}
 		if d.used > 0 {
-			s.dict.initTable(max(4, d.used))
-			for i := range d.Entries {
-				e := &d.Entries[i]
-				if e.Active {
-					s.dict.PutNewHashed(e.Key, NoneVal(), e.Hash)
+			s.dict.initTable(max(4, int(d.used)))
+			if sp := d.split; sp != nil {
+				sk := sp.keys
+				for i := range sk.Count {
+					s.dict.PutNewHashed(sk.Keys[i], NoneVal(), sk.Hashes[i])
+				}
+			} else {
+				for i := range d.Entries {
+					e := &d.Entries[i]
+					if e.Active {
+						s.dict.PutNewHashed(e.Key, NoneVal(), e.Hash)
+					}
 				}
 			}
 		}
@@ -3460,7 +3806,7 @@ func NewSetFromDict(d *PyDict) Value {
 func (s *PySet) Copy() *PySet {
 	d := &s.dict
 	if d.Live == nil && !d.Shared && !MultiThreadedFlag.Load() {
-		if d.used > 0 && d.used == d.filled && len(d.Entries) == d.used && len(d.indices) > 0 {
+		if d.used > 0 && d.used == d.filled && len(d.Entries) == int(d.used) && len(d.indices) > 0 {
 			entries := make([]DictEntry, len(d.Entries), cap(d.Entries))
 			copy(entries, d.Entries)
 			indices := make([]byte, len(d.indices))
@@ -3481,7 +3827,7 @@ func (s *PySet) Copy() *PySet {
 			Header: ObjectHeader{Kind: KindSet, Type: SetType},
 		}
 		if d.used > 0 {
-			out.dict.initTable(max(4, d.used))
+			out.dict.initTable(max(4, int(d.used)))
 			for i := range d.Entries {
 				e := &d.Entries[i]
 				if e.Active {
@@ -4237,6 +4583,14 @@ func (d *PyDict) ActiveEntries() []DictEntry {
 	if d.rlockDict() {
 		defer d.mu.RUnlock()
 	}
+	if sp := d.split; sp != nil {
+		sk := sp.keys
+		out := make([]DictEntry, sk.Count)
+		for i := range sk.Count {
+			out[i] = DictEntry{Hash: sk.Hashes[i], Active: true, Key: sk.Keys[i], Value: sp.vals[i]}
+		}
+		return out
+	}
 	out := make([]DictEntry, 0, d.used)
 	for i := range d.Entries {
 		if d.Entries[i].Active {
@@ -4264,6 +4618,15 @@ func (d *PyDict) ForEachActive(fn func(key, value Value) bool) {
 	if d.Shared || MultiThreadedFlag.Load() {
 		for _, e := range d.ActiveEntries() {
 			if !fn(e.Key, e.Value) {
+				return
+			}
+		}
+		return
+	}
+	if sp := d.split; sp != nil {
+		sk := sp.keys
+		for i := range sk.Count {
+			if !fn(sk.Keys[i], sp.vals[i]) {
 				return
 			}
 		}
@@ -4300,6 +4663,15 @@ func (d *PyDict) ForEachActiveErr(fn func(key, value Value) error) error {
 		}
 		return nil
 	}
+	if sp := d.split; sp != nil {
+		sk := sp.keys
+		for i := range sk.Count {
+			if err := fn(sk.Keys[i], sp.vals[i]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	for i := 0; ; i++ {
 		if i >= len(d.Entries) {
 			break
@@ -4321,8 +4693,8 @@ func (d *PyDict) Indices() []byte {
 
 // SetUsedFilled sets the dense/sparse occupancy counters for template fills.
 func (d *PyDict) SetUsedFilled(used, filled int) {
-	d.used = used
-	d.filled = filled
+	d.used = int32(used)
+	d.filled = int32(filled)
 }
 
 // BumpVersion bumps the dict version tag for template fills.
@@ -4343,6 +4715,10 @@ func (d *PyDict) Clear() {
 	}
 	if d.lockDict() {
 		defer d.mu.Unlock()
+	}
+	if d.split != nil {
+		clear(d.split.vals)
+		d.split = nil
 	}
 	clear(d.Entries)
 	d.Entries = d.Entries[:0]
@@ -4372,6 +4748,9 @@ func (d *PyDict) PopItem() (Value, Value, bool) {
 	}
 	if d.lockDict() {
 		defer d.mu.Unlock()
+	}
+	if d.split != nil {
+		d.promoteSplitToCombined()
 	}
 	for i := len(d.Entries) - 1; i >= 0; i-- {
 		e := &d.Entries[i]

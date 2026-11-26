@@ -547,6 +547,7 @@ type ConstKeyMapTemplate struct {
 	Indices32   [32]byte
 	Keys        [16]val.Value
 	KeysTuple   val.Value
+	SplitKeys   *val.SplitDictKeys
 	Count       int
 	Valid       bool
 	IsEphemeral bool

@@ -597,6 +597,7 @@ func installPosix(osMod *val.PyModule) {
 		var names []val.Value
 		if args[0].IsModule() {
 			dict := args[0].AsModule().Dict
+			dict.EnsureCombined()
 			for _, entry := range dict.Entries {
 				if entry.Active && entry.Key.IsAnyString() {
 					k := entry.Key.AsString()

@@ -1350,6 +1350,7 @@ func (vm *VM) opCallFunctionEx(st *loopState, inst uint32, ip, sp int) (int, int
 						// f(*a, **kw) -> def g(*args, **kwargs) (or def m(self, *args, **kwargs)) forwarding fast path.
 						kwValid := true
 						if kwDict != nil {
+							kwDict.EnsureCombined()
 							for i := range kwDict.Entries {
 								e := &kwDict.Entries[i]
 								if e.Active && !e.Key.IsAnyString() {
@@ -1428,6 +1429,7 @@ func (vm *VM) opCallFunctionEx(st *loopState, inst uint32, ip, sp int) (int, int
 					if posCount+kwLen <= argCount {
 						var matchedMask uint32
 						directOK := true
+						kwDict.EnsureCombined()
 						for i := range kwDict.Entries {
 							e := &kwDict.Entries[i]
 							if !e.Active {
@@ -1483,6 +1485,7 @@ func (vm *VM) opCallFunctionEx(st *loopState, inst uint32, ip, sp int) (int, int
 				}
 				var kwnames []val.Value
 				if kwLen > 0 {
+					kwDict.EnsureCombined()
 					kwCount := 0
 					for i := range kwDict.Entries {
 						e := &kwDict.Entries[i]

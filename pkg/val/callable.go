@@ -178,8 +178,26 @@ func NewTupleVal(items ...Value) Value {
 	return NewTupleFromSlice(items)
 }
 
+// tupleBundle4/6/8 fuse a PyTuple with its 4..8 element backing array into a
+// single heap allocation while keeping PyTuple.Header at byte offset 0 and
+// unsafe.Sizeof(PyTuple{}) at 96 bytes.
+type tupleBundle4 struct {
+	t   PyTuple
+	buf [4]Value
+}
+
+type tupleBundle6 struct {
+	t   PyTuple
+	buf [6]Value
+}
+
+type tupleBundle8 struct {
+	t   PyTuple
+	buf [8]Value
+}
+
 // NewTupleFromSlice constructs a tuple copying elements from src.
-// For 1..3 elements, it performs a single allocation with no separate slice backing array.
+// For 1..8 elements, it performs a single heap allocation with no separate slice backing array.
 func NewTupleFromSlice(src []Value) Value {
 	n := len(src)
 	if n == 0 && TupleType != nil {
@@ -205,6 +223,32 @@ func NewTupleFromSlice(src []Value) Value {
 		}
 		obj.Items = obj.inline[:n]
 		return Value{num: 0, ptr: &obj.Header}
+	}
+	switch {
+	case n == 4:
+		b := &tupleBundle4{
+			t: PyTuple{Header: ObjectHeader{Kind: KindTuple, Type: TupleType}},
+		}
+		b.buf[0] = src[0]
+		b.buf[1] = src[1]
+		b.buf[2] = src[2]
+		b.buf[3] = src[3]
+		b.t.Items = b.buf[:4]
+		return Value{num: 0, ptr: &b.t.Header}
+	case n <= 6:
+		b := &tupleBundle6{
+			t: PyTuple{Header: ObjectHeader{Kind: KindTuple, Type: TupleType}},
+		}
+		copy(b.buf[:n], src)
+		b.t.Items = b.buf[:n]
+		return Value{num: 0, ptr: &b.t.Header}
+	case n <= 8:
+		b := &tupleBundle8{
+			t: PyTuple{Header: ObjectHeader{Kind: KindTuple, Type: TupleType}},
+		}
+		copy(b.buf[:n], src)
+		b.t.Items = b.buf[:n]
+		return Value{num: 0, ptr: &b.t.Header}
 	}
 	items := make([]Value, n)
 	copy(items, src)

@@ -317,6 +317,7 @@ func initFunctoolsTypes() {
 				boundArgs = allArgs
 				allKw := val.NewDictVal(16).AsDict()
 				if inner.Keywords != nil {
+					inner.Keywords.EnsureCombined()
 					for _, entry := range inner.Keywords.Entries {
 						if entry.Active {
 							allKw.Set(entry.Key, entry.Value)
@@ -324,6 +325,7 @@ func initFunctoolsTypes() {
 					}
 				}
 				if kwDict != nil {
+					kwDict.EnsureCombined()
 					for _, entry := range kwDict.Entries {
 						if entry.Active {
 							allKw.Set(entry.Key, entry.Value)
@@ -377,6 +379,7 @@ func initFunctoolsTypes() {
 			mergedKwMap := make(map[string]val.Value)
 			var kwOrder []string
 			if part.Keywords != nil {
+				part.Keywords.EnsureCombined()
 				for _, entry := range part.Keywords.Entries {
 					if entry.Active {
 						k := entry.Key.AsString()

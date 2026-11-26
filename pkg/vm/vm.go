@@ -968,6 +968,46 @@ func (vm *VM) bindFunctionArgs(co *CodeObject, defaults []val.Value, kwDefaults 
 	return argBase + numLocals
 }
 
+// cellBundle* fuse the closure value slice, cell pointer slice, and exact-count
+// PyCell structs into a single heap allocation for functions with 1..4 total
+// cell/free slots (replacing N+2 separate allocations without over-allocating
+// unused PyCell structs when nFree > 0).
+type cellBundle1 struct {
+	vals  [1]val.Value
+	ptrs  [1]*val.PyCell
+	cells [1]val.PyCell
+}
+
+type cellBundle1Free1 struct {
+	vals  [2]val.Value
+	ptrs  [2]*val.PyCell
+	cells [1]val.PyCell
+}
+
+type cellBundle2 struct {
+	vals  [2]val.Value
+	ptrs  [2]*val.PyCell
+	cells [2]val.PyCell
+}
+
+type cellBundle1Free3 struct {
+	vals  [4]val.Value
+	ptrs  [4]*val.PyCell
+	cells [1]val.PyCell
+}
+
+type cellBundle2Free2 struct {
+	vals  [4]val.Value
+	ptrs  [4]*val.PyCell
+	cells [2]val.PyCell
+}
+
+type cellBundle4 struct {
+	vals  [4]val.Value
+	ptrs  [4]*val.PyCell
+	cells [4]val.PyCell
+}
+
 func (vm *VM) setupCalleeCellsWithPool(callee *CodeObject, target val.Value, stack []val.Value, newBase int, argc int, usePool bool) ([]val.Value, []*val.PyCell) {
 	nCells := len(callee.CellVars)
 	nFree := len(callee.FreeVars)
@@ -978,14 +1018,7 @@ func (vm *VM) setupCalleeCellsWithPool(callee *CodeObject, target val.Value, sta
 		fn := target.AsFunction()
 		return fn.Closure, fn.CellPtrs
 	}
-	var res []val.Value
-	var ptrs []*val.PyCell
-	if usePool {
-		res, ptrs = vm.acquireGenCellSlices(nCells + nFree)
-	} else {
-		res = make([]val.Value, nCells+nFree)
-		ptrs = make([]*val.PyCell, nCells+nFree)
-	}
+	total := nCells + nFree
 	if len(callee.CellParamIndices) != nCells {
 		callee.InitCellParamIndices()
 	}
@@ -993,14 +1026,74 @@ func (vm *VM) setupCalleeCellsWithPool(callee *CodeObject, target val.Value, sta
 	if !target.IsFunction() && argc < boundLimit {
 		boundLimit = argc
 	}
-	for i := range nCells {
-		initVal := val.NoneVal()
-		if p := callee.CellParamIndices[i]; p >= 0 && p < boundLimit {
-			initVal = stack[newBase+p]
+	var res []val.Value
+	var ptrs []*val.PyCell
+	var cells []val.PyCell
+	switch {
+	case !usePool && total == 1:
+		b := &cellBundle1{}
+		res = b.vals[:]
+		ptrs = b.ptrs[:]
+		cells = b.cells[:1]
+	case !usePool && total == 2 && nCells == 1:
+		b := &cellBundle1Free1{}
+		res = b.vals[:]
+		ptrs = b.ptrs[:]
+		cells = b.cells[:1]
+	case !usePool && total == 2:
+		b := &cellBundle2{}
+		res = b.vals[:]
+		ptrs = b.ptrs[:]
+		cells = b.cells[:2]
+	case !usePool && total <= 4 && nCells == 1:
+		b := &cellBundle1Free3{}
+		res = b.vals[:total]
+		ptrs = b.ptrs[:total]
+		cells = b.cells[:1]
+	case !usePool && total <= 4 && nCells == 2:
+		b := &cellBundle2Free2{}
+		res = b.vals[:total]
+		ptrs = b.ptrs[:total]
+		cells = b.cells[:2]
+	case !usePool && total <= 4:
+		b := &cellBundle4{}
+		res = b.vals[:total]
+		ptrs = b.ptrs[:total]
+		cells = b.cells[:nCells]
+	case usePool:
+		res, ptrs = vm.acquireGenCellSlices(total)
+		if nCells > 1 {
+			cells = make([]val.PyCell, nCells)
 		}
-		cVal := val.NewCellVal(initVal)
-		res[i] = cVal
-		ptrs[i] = cVal.AsCell()
+	default:
+		res = make([]val.Value, total)
+		ptrs = make([]*val.PyCell, total)
+		if nCells > 1 {
+			cells = make([]val.PyCell, nCells)
+		}
+	}
+	if cells != nil {
+		for i := range nCells {
+			initVal := val.NoneVal()
+			if p := callee.CellParamIndices[i]; p >= 0 && p < boundLimit {
+				initVal = stack[newBase+p]
+			}
+			c := &cells[i]
+			c.Header = val.ObjectHeader{Kind: val.KindCell, Type: val.CellType}
+			c.Value = initVal
+			res[i] = val.ObjectVal(&c.Header)
+			ptrs[i] = c
+		}
+	} else {
+		for i := range nCells {
+			initVal := val.NoneVal()
+			if p := callee.CellParamIndices[i]; p >= 0 && p < boundLimit {
+				initVal = stack[newBase+p]
+			}
+			cVal := val.NewCellVal(initVal)
+			res[i] = cVal
+			ptrs[i] = cVal.AsCell()
+		}
 	}
 	if target.IsFunction() {
 		fn := target.AsFunction()
@@ -1787,7 +1880,7 @@ func (vm *VM) releaseSmallDictFlag(d *val.PyDict, flag uint8) {
 	if d == nil || (d.Header.Flags&flag) == 0 || val.MultiThreadedFlag.Load() {
 		return
 	}
-	if d.Shared || d.Live != nil || d.Attrs != nil || d.Header.Type != val.DictType {
+	if d.Shared || d.Live != nil || d.Attrs != nil || d.IsSplit() || d.Header.Type != val.DictType {
 		d.Header.Flags &^= val.FlagEphemeralDict | val.FlagEphemeralFrameDict
 		return
 	}
@@ -5395,6 +5488,14 @@ func (vm *VM) unpackMapIntoSafe(resDict *val.PyDict, mapping val.Value) {
 	if mapping.IsDict() {
 		d := mapping.AsDict()
 		if !d.Shared && d.Live == nil && !val.MultiThreadedFlag.Load() {
+			if d.IsSplit() {
+				sk := d.SplitKeys()
+				sv := d.SplitValues()
+				for i := range sk.Count {
+					resDict.Set(sk.Keys[i], sv[i])
+				}
+				return
+			}
 			for i := range d.Entries {
 				e := &d.Entries[i]
 				if e.Active {
@@ -5479,17 +5580,31 @@ func (vm *VM) callFunctionExSafe(callable, argsVal, kwDictVal val.Value, hasKW b
 		}
 		kwnames = make([]val.Value, 0, kwLen)
 		if d.Live == nil && !d.Shared && !val.MultiThreadedFlag.Load() {
-			for i := range d.Entries {
-				e := &d.Entries[i]
-				if !e.Active {
-					continue
+			if d.IsSplit() {
+				sk := d.SplitKeys()
+				sv := d.SplitValues()
+				for i := range sk.Count {
+					k := sk.Keys[i]
+					if !k.IsAnyString() {
+						vm.execCtx.Raise(val.NewTypeError("keywords must be strings"))
+						return val.NoneVal()
+					}
+					kwnames = append(kwnames, val.InternValue(k))
+					argsSlice = append(argsSlice, sv[i])
 				}
-				if !e.Key.IsAnyString() {
-					vm.execCtx.Raise(val.NewTypeError("keywords must be strings"))
-					return val.NoneVal()
+			} else {
+				for i := range d.Entries {
+					e := &d.Entries[i]
+					if !e.Active {
+						continue
+					}
+					if !e.Key.IsAnyString() {
+						vm.execCtx.Raise(val.NewTypeError("keywords must be strings"))
+						return val.NoneVal()
+					}
+					kwnames = append(kwnames, val.InternValue(e.Key))
+					argsSlice = append(argsSlice, e.Value)
 				}
-				kwnames = append(kwnames, val.InternValue(e.Key))
-				argsSlice = append(argsSlice, e.Value)
 			}
 		} else {
 			for _, item := range d.Items() {
