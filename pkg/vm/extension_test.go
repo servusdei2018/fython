@@ -34,6 +34,9 @@ func buildExtension(t *testing.T, name, src string, suffix string, limited bool)
 	// Build extension
 	extOut := filepath.Join(dir, name+suffix)
 	args := []string{"-fPIC", "-shared"}
+	if runtime.GOOS == "darwin" {
+		args = append(args, "-undefined", "dynamic_lookup")
+	}
 	if limited {
 		args = append(args, "-DPy_LIMITED_API=0x030A0000")
 	}

@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -120,30 +121,42 @@ print(f"STANDALONE_SUCCESS:{res}:{sys.argv[1]}:{packaging.__name__}")
 	// PATH="", HOME=temp, working directory outside source tree
 	isolatedDir := t.TempDir()
 	homeDir := t.TempDir()
-	runCmd := exec.Command(outBin, "deployed_payload")
-	runCmd.Dir = isolatedDir
-	runCmd.Env = []string{
-		"HOME=" + homeDir,
-		"PATH=",
-	}
-
-	var stdout, stderr bytes.Buffer
-	runCmd.Stdout = &stdout
-	runCmd.Stderr = &stderr
-
-	start := time.Now()
-	err = runCmd.Run()
-	duration := time.Since(start)
-
-	if err != nil {
-		t.Fatalf("standalone binary execution failed: %v\nstdout: %s\nstderr: %s", err, stdout.String(), stderr.String())
-	}
-
-	outStr := strings.TrimSpace(stdout.String())
 	wantPrefix := "STANDALONE_SUCCESS:49:deployed_payload:packaging"
-	if outStr != wantPrefix {
-		t.Fatalf("got output %q, want %q", outStr, wantPrefix)
+
+	runBundled := func() time.Duration {
+		t.Helper()
+		runCmd := exec.Command(outBin, "deployed_payload")
+		runCmd.Dir = isolatedDir
+		runCmd.Env = []string{
+			"HOME=" + homeDir,
+			"PATH=",
+		}
+
+		var stdout, stderr bytes.Buffer
+		runCmd.Stdout = &stdout
+		runCmd.Stderr = &stderr
+
+		start := time.Now()
+		err := runCmd.Run()
+		duration := time.Since(start)
+
+		if err != nil {
+			t.Fatalf("standalone binary execution failed: %v\nstdout: %s\nstderr: %s", err, stdout.String(), stderr.String())
+		}
+
+		outStr := strings.TrimSpace(stdout.String())
+		if outStr != wantPrefix {
+			t.Fatalf("got output %q, want %q", outStr, wantPrefix)
+		}
+		return duration
 	}
+
+	if runtime.GOOS == "darwin" {
+		// Clear macOS syspolicyd first-launch verification on freshly written binaries.
+		_ = runBundled()
+	}
+
+	duration := runBundled()
 
 	t.Logf("Standalone binary executed successfully in %v (< 25 ms)", duration)
 	if duration > 25*time.Millisecond {

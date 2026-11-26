@@ -147,12 +147,37 @@ type oracleResult struct {
 	Lineno int
 }
 
+func isPython315(py string) bool {
+	cmd := exec.Command(py, "-c", "import sys; sys.exit(0 if sys.version_info >= (3, 15) else 1)")
+	return cmd.Run() == nil
+}
+
+func findPython315(t *testing.T) string {
+	t.Helper()
+	if env := os.Getenv("FYTHON_ORACLE_PYTHON"); env != "" {
+		if isPython315(env) {
+			return env
+		}
+		t.Skipf("FYTHON_ORACLE_PYTHON=%q is not Python >= 3.15", env)
+	}
+	if py, err := exec.LookPath("python3.15"); err == nil && isPython315(py) {
+		return py
+	}
+	if venvPy, err := filepath.Abs("../../benchmarks/.venv/bin/python"); err == nil {
+		if _, err := os.Stat(venvPy); err == nil && isPython315(venvPy) {
+			return venvPy
+		}
+	}
+	if py, err := exec.LookPath("python3"); err == nil && isPython315(py) {
+		return py
+	}
+	t.Skip("python >= 3.15 not available")
+	return ""
+}
+
 func runOracle(t *testing.T, args []string) map[string]oracleResult {
 	t.Helper()
-	py, err := exec.LookPath("python3")
-	if err != nil {
-		t.Skip("python3 not available")
-	}
+	py := findPython315(t)
 	cmd := exec.Command(py, append([]string{"oracle.py"}, args...)...)
 	out, err := cmd.StdoutPipe()
 	if err != nil {

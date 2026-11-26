@@ -477,7 +477,7 @@ PyObject *PyErr_GetContext(void) {
     return ((PyObject *(*)(void))dispatch[69])();
 }
 
-// --- Milestone 2: custom types + buffer protocol ---
+// --- Custom types + buffer protocol ---
 typedef struct {
     const char *name;
     int basicsize;

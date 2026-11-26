@@ -56,7 +56,7 @@ PyMODINIT_FUNC PyInit_bufmod(void){ return PyModule_Create2(&d,0); }
 		suffix = ".so"
 	}
 	dir, shimOut := buildExtension(t, "bufmod", src, suffix, false)
-	// rebuild shim after milestone2 shim changes (buildExtension already rebuilds shim from source)
+	// buildExtension already rebuilds shim from source
 	t.Setenv("FYTHON_SHIM", shimOut)
 	engine := vm.NewEngine()
 	engine.SetCompileHook(compiler.CompileSource)

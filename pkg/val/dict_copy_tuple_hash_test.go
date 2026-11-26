@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func TestWave7ConcurrentDictSetCopyAndTupleHash(t *testing.T) {
+func TestConcurrentDictSetCopyAndTupleHash(t *testing.T) {
 	d := NewDictVal(32).AsDict()
 	for i := range 32 {
 		d.Set(NewStringVal("k"+string(rune('a'+i%26))+string(rune('0'+i/26))), Int64Val(int64(i)))

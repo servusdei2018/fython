@@ -2,7 +2,7 @@ package vm_test
 
 import "testing"
 
-func TestStage3LRUCacheInvariants(t *testing.T) {
+func TestLRUCacheInvariants(t *testing.T) {
 	script := `
 import functools
 
@@ -56,7 +56,7 @@ assert typed_id.cache_info().currsize == 1
 	runSnippet(t, script)
 }
 
-func TestStage3GeneratorShortCircuitAndReducers(t *testing.T) {
+func TestGeneratorShortCircuitAndReducers(t *testing.T) {
 	script := `
 from itertools import islice, chain, repeat
 
@@ -128,7 +128,7 @@ assert list(islice(repeat("inf"), 4)) == ["inf", "inf", "inf", "inf"]
 	runSnippet(t, script)
 }
 
-func TestStage3MatchFreelistSubSafety(t *testing.T) {
+func TestMatchFreelistSubSafety(t *testing.T) {
 	script := `
 import re
 

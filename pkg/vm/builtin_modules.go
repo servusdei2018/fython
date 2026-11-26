@@ -1,6 +1,8 @@
 package vm
 
 import (
+	"runtime"
+
 	"github.com/servusdei2018/fython/pkg/val"
 )
 
@@ -78,6 +80,7 @@ func init() {
 		"_struct":           func(vm *VM) val.Value { return vm.engine.createStructModule() },
 		"_csv":              func(vm *VM) val.Value { return vm.engine.createCsvModule() },
 		"zlib":              func(vm *VM) val.Value { return vm.engine.createZlibModule() },
+		"pyexpat":           func(vm *VM) val.Value { return vm.engine.createPyExpatModule() },
 		"errno":             func(vm *VM) val.Value { return vm.engine.createErrnoModule() },
 		"termios":           func(vm *VM) val.Value { return vm.engine.createTermiosModule() },
 		"fcntl":             func(vm *VM) val.Value { return vm.engine.createFcntlModule() },
@@ -120,6 +123,9 @@ func init() {
 			}
 			return testMod
 		},
+	}
+	if runtime.GOOS == "darwin" {
+		builtinModuleLoaders["_scproxy"] = func(vm *VM) val.Value { return vm.engine.createScproxyModule() }
 	}
 }
 

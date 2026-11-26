@@ -598,7 +598,7 @@ assert unpack_with_view(bytearray(b"abcd")) == 6 * (ord("a") + 5)
 	}
 }
 
-func TestStage5CoroutineClosureQuickeningAndDefaultsGuard(t *testing.T) {
+func TestCoroutineClosureQuickeningAndDefaultsGuard(t *testing.T) {
 	eng, v := runPySource(t, `
 import asyncio
 
@@ -639,7 +639,7 @@ assert res == sum(2 + i + 1 for i in range(12)), res
 	defer eng.ReleaseVM(v)
 }
 
-func TestStage5MethodPICStaticClassMethodAndShadowing(t *testing.T) {
+func TestMethodPICStaticClassMethodAndShadowing(t *testing.T) {
 	eng, v := runPySource(t, `
 class Base:
     @staticmethod
@@ -699,7 +699,7 @@ for _ in range(10):
 	defer eng.ReleaseVM(v)
 }
 
-func TestStage5StoreAttrTransitionInvalidation(t *testing.T) {
+func TestStoreAttrTransitionInvalidation(t *testing.T) {
 	eng, v := runPySource(t, `
 class Box:
     def __init__(self, a, b):

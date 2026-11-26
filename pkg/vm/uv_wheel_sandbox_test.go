@@ -167,8 +167,8 @@ func TestExtensionFromUnextractedWheel(t *testing.T) {
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
 	entries := map[string][]byte{
-		"fython_testext.cpython-315-x86_64-linux-gnu.so": soData,
-		"demo_bin-1.0.dist-info/METADATA":                []byte("Metadata-Version: 2.1\nName: demo-bin\nVersion: 1.0\n"),
+		"fython_testext" + suffix:         soData,
+		"demo_bin-1.0.dist-info/METADATA": []byte("Metadata-Version: 2.1\nName: demo-bin\nVersion: 1.0\n"),
 	}
 	for name, data := range entries {
 		fw, err := zw.Create(name)

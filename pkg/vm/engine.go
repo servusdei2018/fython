@@ -262,6 +262,7 @@ func (e *Engine) newSysModulesWithDiscovery() (*val.PyDict, []string) {
 	sysMod.Dict.Set(val.InternString("hexversion"), val.Int64Val(0x030f00f0))
 	sysMod.Dict.Set(val.InternString("api_version"), val.Int64Val(1013))
 	sysMod.Dict.Set(val.InternString("platform"), val.InternString(runtime.GOOS))
+	sysMod.Dict.Set(val.InternString("_framework"), val.InternString(""))
 	sysMod.Dict.Set(val.InternString("abiflags"), val.InternString(""))
 	sysMod.Dict.Set(val.InternString("winver"), val.NoneVal())
 	sysMod.Dict.Set(val.InternString("byteorder"), val.InternString("little"))

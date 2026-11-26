@@ -75,6 +75,7 @@ import fcntl
 import grp
 import pwd
 import resource
+import sys
 import termios
 
 assert termios.IFLAG == 0
@@ -84,7 +85,7 @@ assert fcntl.F_GETFL > 0
 assert fcntl.LOCK_EX > 0
 assert resource.RLIMIT_NOFILE > 0
 assert pwd.getpwuid(0)[0] == "root"
-assert grp.getgrgid(0)[0] == "root"
+assert grp.getgrgid(0)[0] == ("wheel" if sys.platform == "darwin" else "root")
 `)
 }
 
