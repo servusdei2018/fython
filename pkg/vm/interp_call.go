@@ -44,6 +44,16 @@ func (vm *VM) syncCalleeCode(st *loopState, callee *CodeObject, cc *VMCodeCache)
 
 //go:noinline
 func (vm *VM) setCalleeCells(st *loopState, callee *CodeObject, fn *val.PyFunction, newBase int) {
+	if callee.DirectCaptureCount > 0 && fn != nil {
+		copy(st.stack[newBase+callee.DirectCaptureBase:], fn.Closure[:callee.DirectCaptureCount])
+		if !callee.HasCellVars {
+			st.cells = nil
+			st.cellPtrs = nil
+			vm.activeCells = nil
+			vm.activeCellPtrs = nil
+			return
+		}
+	}
 	if !callee.HasCellVars && fn != nil && fn.Closure != nil {
 		st.cells = fn.Closure
 		st.cellPtrs = fn.CellPtrs
@@ -239,13 +249,13 @@ func resolveSuperDirect(st *loopState, stack []val.Value, newBase, argc int) (*v
 		return nil, val.Value{}, false
 	}
 	idx := int(st.curCO.ClassCellIdx)
-	if idx < 0 || idx >= len(st.cells) {
+	if idx < 0 || (idx >= len(st.cellPtrs) && idx >= len(st.cells)) {
 		return nil, val.Value{}, false
 	}
 	var c *val.PyCell
 	if idx < len(st.cellPtrs) && st.cellPtrs[idx] != nil {
 		c = st.cellPtrs[idx]
-	} else if st.cells[idx].IsCell() {
+	} else if idx < len(st.cells) && st.cells[idx].IsCell() {
 		c = st.cells[idx].AsCell()
 	}
 	if c == nil || c.Value.IsUnbound() || !c.Value.IsType() {
@@ -1057,7 +1067,7 @@ unwrapKw:
 		if minCap > len(stack) {
 			stack = vm.growStack(st, stack, minCap)
 		}
-		nextSP, ok := vm.bindFunctionArgsSafe(callee, fn.Defaults, fn.KwDefaults, stack, newBase, totalArgs, kwnames)
+		nextSP, ok := vm.bindFunctionArgsSafeWithCache(callee, fn.Defaults, fn.KwDefaults, stack, newBase, totalArgs, kwnames, st.cache, ip)
 		if !ok {
 			exc := vm.execCtx.ActiveException
 			vm.execCtx.ClearException()
@@ -1634,7 +1644,7 @@ func (vm *VM) opCallFunctionEx(st *loopState, inst uint32, ip, sp int) (int, int
 				if kwDict != nil {
 					vm.releaseSmallDict(kwDict)
 				}
-				nextSP, ok := vm.bindFunctionArgsSafe(callee, fn.Defaults, fn.KwDefaults, stack, newBase, totalArgs, kwnames)
+				nextSP, ok := vm.bindFunctionArgsSafeWithCache(callee, fn.Defaults, fn.KwDefaults, stack, newBase, totalArgs, kwnames, st.cache, ip)
 				if len(kwnames) > 0 {
 					clear(vm.kwNamesScratch[:len(kwnames)])
 				}
@@ -4621,7 +4631,9 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 							pic[3] = newPic
 						}
 						if tFn != nil {
-							vm.tryInlineMethod(st, ip, totalArgs, tFn, receiver)
+							if pic[1].Shape == nil {
+								vm.tryInlineMethod(st, ip, totalArgs, tFn, receiver)
+							}
 							if rIP, rSP, rCtl, handled := vm.pushFuncPositional(st, tFn, nil, stack, ip, sp, newBase, retSP, totalArgs, ip+1); handled {
 								return rIP, rSP, rCtl
 							}

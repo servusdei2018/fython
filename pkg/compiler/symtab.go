@@ -95,6 +95,17 @@ type Scope struct {
 	// CompID identifies an inlined comprehension (its arena index) so the
 	// compiler can find the hidden slots that preserve shadowed locals.
 	CompID uint32
+
+	// Direct-capture analysis metadata (for provably immutable single-site captures).
+	HasDynamicHazard  bool
+	Deleted           map[string]bool
+	BindCount         map[string]int
+	NonTopLevelBound  map[string]bool
+	TopLevelBindOrder map[string]int
+	ChildDefInLoop    bool
+	ChildDefOrder     int
+	DirectCaptures    []string
+	DirectCaptureBase int
 }
 
 // AnnEntry is one `name: annotation` statement in a module or class body.
@@ -149,6 +160,34 @@ type SymbolTable struct {
 	// condDepth is >0 while visiting statements nested in control flow
 	// (if/for/while/try/with/match) of the current scope.
 	condDepth int
+	// loopDepth is >0 while visiting statements/expressions nested in a loop
+	// (for/async for/while/comprehension) of the current scope.
+	loopDepth int
+	// stmtSeq is a monotonically increasing order counter within the traversal.
+	stmtSeq int
+}
+
+func (st *SymbolTable) recordBind(s *Scope, name string, condDepth int) {
+	if s == nil || name == "" {
+		return
+	}
+	s.Bound[name] = true
+	if s.BindCount == nil {
+		s.BindCount = make(map[string]int)
+	}
+	s.BindCount[name]++
+	if condDepth > 0 {
+		if s.NonTopLevelBound == nil {
+			s.NonTopLevelBound = make(map[string]bool)
+		}
+		s.NonTopLevelBound[name] = true
+	} else {
+		st.stmtSeq++
+		if s.TopLevelBindOrder == nil {
+			s.TopLevelBindOrder = make(map[string]int)
+		}
+		s.TopLevelBindOrder[name] = st.stmtSeq
+	}
 }
 
 // BuildSymbolTable analyzes the AST and returns the resolved top-level Scope.
@@ -172,6 +211,7 @@ func BuildSymbolTable(src []byte, arena *ASTArena, topStmts []StmtID) (*Scope, e
 	if err := st.resolveScope(st.top); err != nil {
 		return nil, err
 	}
+	st.promoteDirectCaptures(st.top)
 
 	return st.top, nil
 }
@@ -209,11 +249,15 @@ func (st *SymbolTable) visitStmt(stmtID StmtID) error {
 		st.condDepth++
 		defer func() { st.condDepth-- }()
 	}
+	switch stmt.Kind {
+	case StmtKindFor, StmtKindAsyncFor, StmtKindWhile:
+		st.loopDepth++
+		defer func() { st.loopDepth-- }()
+	}
 
 	switch stmt.Kind {
 	case StmtKindFuncDef, StmtKindAsyncFuncDef:
 		fnDef := &st.arena.FuncDefs[stmt.Extra]
-		st.cur.Bound[fnDef.Name] = true
 
 		// Evaluate decorators in enclosing scope
 		for _, dec := range st.arena.GetExprSlice(fnDef.Decorators) {
@@ -231,6 +275,13 @@ func (st *SymbolTable) visitStmt(stmtID StmtID) error {
 
 		// Function scope
 		fnScope := NewScope(ScopeFunction, fnDef.Name, st.cur)
+		st.stmtSeq++
+		fnScope.ChildDefInLoop = st.loopDepth > 0 || st.condDepth > 0
+		fnScope.ChildDefOrder = st.stmtSeq
+		// Record the function's own name binding AFTER ChildDefOrder because
+		// OP_MAKE_FUNCTION executes before STORE_FAST fnDef.Name (self-recursive
+		// closures must use a real PyCell, never direct capture).
+		st.recordBind(st.cur, fnDef.Name, st.condDepth)
 		if stmt.Kind == StmtKindAsyncFuncDef || fnDef.IsAsync {
 			fnScope.IsCoroutine = true
 		}
@@ -259,18 +310,18 @@ func (st *SymbolTable) visitStmt(stmtID StmtID) error {
 			fnScope.Bound[p] = true
 		}
 
-		saved, savedCond := st.cur, st.condDepth
-		st.cur, st.condDepth = fnScope, 0
+		saved, savedCond, savedLoop := st.cur, st.condDepth, st.loopDepth
+		st.cur, st.condDepth, st.loopDepth = fnScope, 0, 0
 		for _, sID := range st.arena.StmtIDs[fnDef.Body.Start : fnDef.Body.Start+fnDef.Body.Count] {
 			if err := st.visitStmt(sID); err != nil {
 				return err
 			}
 		}
-		st.cur, st.condDepth = saved, savedCond
+		st.cur, st.condDepth, st.loopDepth = saved, savedCond, savedLoop
 
 	case StmtKindClassDef:
 		clsDef := &st.arena.ClassDefs[stmt.Extra]
-		st.cur.Bound[clsDef.Name] = true
+		st.recordBind(st.cur, clsDef.Name, st.condDepth)
 
 		// Evaluate decorators in enclosing scope
 		for _, dec := range st.arena.GetExprSlice(clsDef.Decorators) {
@@ -434,7 +485,7 @@ func (st *SymbolTable) visitStmt(stmtID StmtID) error {
 				}
 			}
 			if h.Name != "" {
-				st.cur.Bound[h.Name] = true
+				st.recordBind(st.cur, h.Name, st.condDepth)
 			}
 			for _, sID := range st.arena.StmtIDs[h.Body.Start : h.Body.Start+h.Body.Count] {
 				if err := st.visitStmt(sID); err != nil {
@@ -492,10 +543,10 @@ func (st *SymbolTable) visitStmt(stmtID StmtID) error {
 		if imp != nil {
 			for _, alias := range st.arena.GetAliasSlice(imp.Aliases) {
 				if alias.AsName != "" {
-					st.cur.Bound[alias.AsName] = true
+					st.recordBind(st.cur, alias.AsName, st.condDepth)
 				} else {
 					parts := strings.Split(alias.Name, ".")
-					st.cur.Bound[parts[0]] = true
+					st.recordBind(st.cur, parts[0], st.condDepth)
 				}
 			}
 		}
@@ -508,7 +559,7 @@ func (st *SymbolTable) visitStmt(stmtID StmtID) error {
 				if alias.AsName != "" {
 					target = alias.AsName
 				}
-				st.cur.Bound[target] = true
+				st.recordBind(st.cur, target, st.condDepth)
 			}
 		}
 
@@ -535,7 +586,7 @@ func (st *SymbolTable) visitStmt(stmtID StmtID) error {
 
 	case StmtKindTypeAlias:
 		alias := &st.arena.TypeAliases[stmt.Extra]
-		st.cur.Bound[alias.Name] = true
+		st.recordBind(st.cur, alias.Name, st.condDepth)
 		for _, tp := range st.arena.GetTypeParamSlice(alias.TypeParams) {
 			st.cur.Bound[tp.Name] = true
 			if tp.Bound != ExprNone {
@@ -624,7 +675,7 @@ func (st *SymbolTable) bindAndVisitPattern(patID PatternID) error {
 		}
 	case PatternKindCapture:
 		if pat.Name != "" && pat.Name != "_" {
-			st.cur.Bound[pat.Name] = true
+			st.recordBind(st.cur, pat.Name, st.condDepth)
 		}
 	case PatternKindWildcard:
 		// _ does not bind
@@ -635,7 +686,7 @@ func (st *SymbolTable) bindAndVisitPattern(patID PatternID) error {
 			}
 		}
 		if pat.Name != "" && pat.Name != "_" {
-			st.cur.Bound[pat.Name] = true
+			st.recordBind(st.cur, pat.Name, st.condDepth)
 		}
 	case PatternKindOr:
 		count := uint32(pat.Expr1)
@@ -662,7 +713,7 @@ func (st *SymbolTable) bindAndVisitPattern(patID PatternID) error {
 			}
 		}
 		if pat.Name != "" && pat.Name != "_" {
-			st.cur.Bound[pat.Name] = true
+			st.recordBind(st.cur, pat.Name, st.condDepth)
 		}
 	case PatternKindClass:
 		if pat.Expr1 != ExprNone {
@@ -692,6 +743,10 @@ func (st *SymbolTable) visitDelete(exprID ExprID) {
 	case ExprKindName:
 		name := string(st.src[expr.Start:expr.End])
 		st.cur.Bound[name] = true
+		if st.cur.Deleted == nil {
+			st.cur.Deleted = make(map[string]bool)
+		}
+		st.cur.Deleted[name] = true
 	case ExprKindTuple, ExprKindList:
 		slice := st.arena.ExprSlices[expr.Extra]
 		for _, elem := range st.arena.ExprIDs[slice.Start : slice.Start+slice.Count] {
@@ -713,7 +768,7 @@ func (st *SymbolTable) bindTarget(targetID ExprID) {
 	switch expr.Kind {
 	case ExprKindName:
 		name := string(st.src[expr.Start:expr.End])
-		st.cur.Bound[name] = true
+		st.recordBind(st.cur, name, st.condDepth)
 	case ExprKindTuple, ExprKindList:
 		slice := st.arena.ExprSlices[expr.Extra]
 		for _, elemID := range st.arena.ExprIDs[slice.Start : slice.Start+slice.Count] {
@@ -739,6 +794,9 @@ func (st *SymbolTable) visitExpr(exprID ExprID) error {
 	case ExprKindName:
 		name := string(st.src[expr.Start:expr.End])
 		st.cur.Used[name] = true
+		if name == "exec" || name == "eval" || name == "locals" {
+			st.cur.HasDynamicHazard = true
+		}
 
 	case ExprKindUnary:
 		return st.visitExpr(expr.Left)
@@ -897,6 +955,9 @@ func (st *SymbolTable) visitExpr(exprID ExprID) error {
 			}
 		}
 		lambdaScope := NewScope(ScopeFunction, "<lambda>", st.cur)
+		st.stmtSeq++
+		lambdaScope.ChildDefInLoop = st.loopDepth > 0 || st.condDepth > 0
+		lambdaScope.ChildDefOrder = st.stmtSeq
 		st.Scopes = append(st.Scopes, lambdaScope)
 		params := st.arena.GetIdentSlice(fnDef.ParamNames)
 		lambdaScope.ParamNames = append(lambdaScope.ParamNames, params...)
@@ -912,23 +973,23 @@ func (st *SymbolTable) visitExpr(exprID ExprID) error {
 			}
 			lambdaScope.Bound[p] = true
 		}
-		saved := st.cur
-		st.cur = lambdaScope
+		saved, savedCond, savedLoop := st.cur, st.condDepth, st.loopDepth
+		st.cur, st.condDepth, st.loopDepth = lambdaScope, 0, 0
 		// The parser stores a lambda body as a synthesized `return <expr>`
 		// statement; Left is unused.
 		for _, sID := range st.arena.StmtIDs[fnDef.Body.Start : fnDef.Body.Start+fnDef.Body.Count] {
 			if err := st.visitStmt(sID); err != nil {
-				st.cur = saved
+				st.cur, st.condDepth, st.loopDepth = saved, savedCond, savedLoop
 				return err
 			}
 		}
 		if expr.Left != ExprNone {
 			if err := st.visitExpr(expr.Left); err != nil {
-				st.cur = saved
+				st.cur, st.condDepth, st.loopDepth = saved, savedCond, savedLoop
 				return err
 			}
 		}
-		st.cur = saved
+		st.cur, st.condDepth, st.loopDepth = saved, savedCond, savedLoop
 
 	case ExprKindStarred:
 		return st.visitExpr(expr.Left)
@@ -945,7 +1006,7 @@ func (st *SymbolTable) visitExpr(exprID ExprID) error {
 			targetExpr := st.arena.GetExpr(expr.Left)
 			if targetExpr != nil && targetExpr.Kind == ExprKindName {
 				name := string(st.src[targetExpr.Start:targetExpr.End])
-				targetScope.Bound[name] = true
+				st.recordBind(targetScope, name, st.condDepth)
 			}
 		}
 		return st.visitExpr(expr.Left)
@@ -1436,4 +1497,231 @@ func removeString(slice []string, s string) []string {
 		}
 	}
 	return res
+}
+
+func paramSlotIndex(params []string, name string) int {
+	idx := 0
+	for _, p := range params {
+		clean := p
+		if strings.HasPrefix(p, "**") {
+			clean = p[2:]
+		} else if strings.HasPrefix(p, "*") {
+			clean = p[1:]
+		}
+		if clean == "" {
+			continue
+		}
+		if clean == name {
+			return idx
+		}
+		idx++
+	}
+	return -1
+}
+
+// descendantNeedsCell reports whether any descendant of scope s mutates,
+// deletes, or requires a real PyCell for name (including any descendant
+// that cannot itself be promoted to pure direct capture).
+func descendantNeedsCell(s *Scope, name string) bool {
+	capturers := 0
+	for _, ch := range s.Children {
+		if ch.Kind == ScopeComprehension {
+			if descendantNeedsCell(ch, name) {
+				return true
+			}
+			continue
+		}
+		if !containsString(ch.FreeVars, name) {
+			continue
+		}
+		capturers++
+		if capturers > 1 {
+			return true
+		}
+		if ch.Kind != ScopeFunction || ch.Name == "<genexpr>" || ch.AnnOwner != nil || ch.CanSeeClass || ch.ChildDefInLoop || ch.HasDynamicHazard {
+			return true
+		}
+		if ch.ExplicitNL[name] || ch.Deleted[name] {
+			return true
+		}
+		// Every OTHER freevar of ch must also be direct-eligible from s; otherwise
+		// ch will not be promoted and will emit OP_LOAD_CLOSURE for name.
+		for _, otherFV := range ch.FreeVars {
+			if otherFV == name {
+				continue
+			}
+			if otherFV == "__class__" || otherFV == annClassDictName || otherFV == annCondAnnotations {
+				return true
+			}
+			if ch.ExplicitNL[otherFV] || ch.Deleted[otherFV] || s.Deleted[otherFV] {
+				return true
+			}
+			if containsString(s.FreeVars, otherFV) {
+				// Passthrough from outer: will only be direct if outer also promotes it,
+				// so verify no deeper descendant needs a cell.
+				if descendantNeedsCell(ch, otherFV) {
+					return true
+				}
+				continue
+			}
+			if !containsString(s.CellVars, otherFV) {
+				return true
+			}
+			if pIdx := paramSlotIndex(s.ParamNames, otherFV); pIdx >= 0 {
+				if s.BindCount[otherFV] > 0 {
+					return true
+				}
+			} else {
+				if s.BindCount[otherFV] != 1 || s.NonTopLevelBound[otherFV] {
+					return true
+				}
+				if s.TopLevelBindOrder[otherFV] == 0 || s.TopLevelBindOrder[otherFV] >= ch.ChildDefOrder {
+					return true
+				}
+			}
+			if descendantNeedsCell(ch, otherFV) {
+				return true
+			}
+		}
+		if descendantNeedsCell(ch, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// promoteDirectCaptures promotes pure read-only, single-site, non-loop
+// captures from PyCell storage into hidden trailing OP_LOAD_FAST slots on
+// inner functions, eliminating PyCell / cellBundle allocations in the outer
+// function without altering VM.runLoopWithGlobals.
+func (st *SymbolTable) promoteDirectCaptures(outer *Scope) {
+	if outer == nil {
+		return
+	}
+	if outer.Kind == ScopeFunction && !outer.HasDynamicHazard && outer.AnnOwner == nil && !outer.CanSeeClass {
+		// Count how many direct children of outer capture each name.
+		childCapturers := make(map[string]int)
+		var countCapturers func(cur *Scope)
+		countCapturers = func(cur *Scope) {
+			for _, ch := range cur.Children {
+				if ch.Kind == ScopeComprehension {
+					countCapturers(ch)
+					continue
+				}
+				for _, fv := range ch.FreeVars {
+					childCapturers[fv]++
+				}
+			}
+		}
+		countCapturers(outer)
+
+		for _, child := range outer.Children {
+			if child.Kind != ScopeFunction || child.AnnOwner != nil || child.CanSeeClass || child.ChildDefInLoop || child.HasDynamicHazard {
+				continue
+			}
+			if len(child.FreeVars) == 0 || child.Name == "<genexpr>" {
+				continue
+			}
+			// Require every freevar of child to be eligible (pure direct capture).
+			allEligible := true
+			for _, fv := range child.FreeVars {
+				if fv == child.Name || fv == "__class__" || fv == annClassDictName || fv == annCondAnnotations {
+					allEligible = false
+					break
+				}
+				if child.ExplicitNL[fv] || child.Deleted[fv] || outer.Deleted[fv] {
+					allEligible = false
+					break
+				}
+				if childCapturers[fv] != 1 {
+					allEligible = false
+					break
+				}
+				if descendantNeedsCell(child, fv) {
+					allEligible = false
+					break
+				}
+				// fv must either be an outer direct-capture (already immutable StorageFastLocal)
+				// or an outer CellVar owned by outer (not an outer FreeVar cell).
+				if containsString(outer.DirectCaptures, fv) {
+					continue
+				}
+				if !containsString(outer.CellVars, fv) {
+					allEligible = false
+					break
+				}
+				pIdx := paramSlotIndex(outer.ParamNames, fv)
+				if pIdx >= 0 {
+					// Parameter: must never be rebound in outer body.
+					if outer.BindCount[fv] > 0 {
+						allEligible = false
+						break
+					}
+				} else {
+					// Local: must be bound exactly once at top-level strictly before child def.
+					if outer.BindCount[fv] != 1 || outer.NonTopLevelBound[fv] {
+						allEligible = false
+						break
+					}
+					if outer.TopLevelBindOrder[fv] == 0 || outer.TopLevelBindOrder[fv] >= child.ChildDefOrder {
+						allEligible = false
+						break
+					}
+				}
+			}
+			if !allEligible {
+				continue
+			}
+
+			// Promote every freevar of child to a hidden trailing OP_LOAD_FAST slot.
+			child.DirectCaptureBase = child.NumSlots
+			child.DirectCaptures = append([]string(nil), child.FreeVars...)
+			for i, fv := range child.FreeVars {
+				sym := child.Symbols[fv]
+				if sym == nil {
+					sym = &Symbol{Name: fv}
+					child.Symbols[fv] = sym
+				}
+				sym.Storage = StorageFastLocal
+				sym.Offset = child.DirectCaptureBase + i
+
+				if containsString(outer.CellVars, fv) {
+					outer.CellVars = removeString(outer.CellVars, fv)
+					oSym := outer.Symbols[fv]
+					if oSym == nil {
+						oSym = &Symbol{Name: fv}
+						outer.Symbols[fv] = oSym
+					}
+					oSym.Storage = StorageFastLocal
+					if pIdx := paramSlotIndex(outer.ParamNames, fv); pIdx >= 0 {
+						oSym.Offset = pIdx
+					} else {
+						oSym.Offset = outer.NumSlots
+						outer.NumSlots++
+						outer.FastLocals = append(outer.FastLocals, fv)
+					}
+				}
+			}
+			child.NumSlots += len(child.FreeVars)
+
+			// Recompute outer's remaining CellVars and FreeVars offsets.
+			for idx, cv := range outer.CellVars {
+				if sym := outer.Symbols[cv]; sym != nil {
+					sym.Offset = idx
+				}
+			}
+			for idx, fv := range outer.FreeVars {
+				if !containsString(outer.DirectCaptures, fv) {
+					if sym := outer.Symbols[fv]; sym != nil {
+						sym.Offset = len(outer.CellVars) + idx
+					}
+				}
+			}
+		}
+	}
+
+	// Recurse top-down so grandchildren can also see promoted direct captures.
+	for _, ch := range outer.Children {
+		st.promoteDirectCaptures(ch)
+	}
 }

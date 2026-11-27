@@ -167,11 +167,32 @@ type PySuper struct {
 	Self      Value
 }
 
+// pyFuncCellBundle4 fuses a PyFunction with 3..4 closure cell pointers into a
+// single heap allocation (Header remains at byte offset 0).
+type pyFuncCellBundle4 struct {
+	fn   PyFunction
+	ptrs [4]*PyCell
+}
+
+// pyFuncDirectBundle4 fuses a PyFunction with 1..4 immutable direct-captured
+// values into a single heap allocation (Header remains at byte offset 0).
+type pyFuncDirectBundle4 struct {
+	fn   PyFunction
+	vals [4]Value
+}
+
+// nonNilEmptyClosure is a zero-allocation non-nil sentinel stored in
+// PyFunction.Closure when cell pointers are held in CellPtrs without a
+// separate []Value backing slice.
+var nonNilEmptyClosure = []Value{}
+
 // Compile-time assertions that every callable/descriptor heap struct places Header at byte offset 0.
 var (
 	_ [0 - unsafe.Offsetof(PyTuple{}.Header)]byte
 	_ [0 - unsafe.Offsetof(PyBuiltinFunc{}.Header)]byte
 	_ [0 - unsafe.Offsetof(PyFunction{}.Header)]byte
+	_ [0 - unsafe.Offsetof(pyFuncCellBundle4{}.fn.Header)]byte
+	_ [0 - unsafe.Offsetof(pyFuncDirectBundle4{}.fn.Header)]byte
 	_ [0 - unsafe.Offsetof(PyBoundMethod{}.Header)]byte
 	_ [0 - unsafe.Offsetof(PyProperty{}.Header)]byte
 	_ [0 - unsafe.Offsetof(PySuper{}.Header)]byte
@@ -396,8 +417,67 @@ func NewFunctionValWithGlobals(name string, codeVal Value, defaults []Value, glo
 	return Value{num: 0, ptr: &obj.Header}
 }
 
-// NewFunctionValWithGlobalsAndClosure constructs a heap-allocated KindFunction Value bound to module globals and closure cells.
-func NewFunctionValWithGlobalsAndClosure(name string, codeVal Value, defaults []Value, closure []Value, globals *PyDict) Value {
+// NewFunctionValWithCellPtrs constructs a heap-allocated KindFunction Value
+// reading closure cell Values directly from a stack slice without allocating a
+// temporary closure tuple. For 1..2 cells it stores pointers inline in
+// PyFunction (1 alloc, 160 B); for 3..4 cells it uses a fused bundle (1 alloc, 192 B).
+func NewFunctionValWithCellPtrs(name string, codeVal Value, defaults []Value, cellVals []Value, globals *PyDict) Value {
+	n := len(cellVals)
+	if n == 0 {
+		obj := &PyFunction{
+			Header: ObjectHeader{
+				Kind: KindFunction,
+				Type: FunctionType,
+			},
+			Name:     name,
+			Code:     codeVal,
+			Defaults: defaults,
+			Globals:  globals,
+		}
+		return Value{num: 0, ptr: &obj.Header}
+	}
+	if n <= len(PyFunction{}.inlineCellPtrs) {
+		obj := &PyFunction{
+			Header: ObjectHeader{
+				Kind: KindFunction,
+				Type: FunctionType,
+			},
+			Name:     name,
+			Code:     codeVal,
+			Defaults: defaults,
+			Closure:  nonNilEmptyClosure,
+			Globals:  globals,
+		}
+		for i := range n {
+			obj.inlineCellPtrs[i] = cellVals[i].AsCell()
+		}
+		obj.CellPtrs = obj.inlineCellPtrs[:n]
+		return Value{num: 0, ptr: &obj.Header}
+	}
+	if n <= 4 {
+		b := &pyFuncCellBundle4{
+			fn: PyFunction{
+				Header: ObjectHeader{
+					Kind: KindFunction,
+					Type: FunctionType,
+				},
+				Name:     name,
+				Code:     codeVal,
+				Defaults: defaults,
+				Closure:  nonNilEmptyClosure,
+				Globals:  globals,
+			},
+		}
+		for i := range n {
+			b.ptrs[i] = cellVals[i].AsCell()
+		}
+		b.fn.CellPtrs = b.ptrs[:n]
+		return Value{num: 0, ptr: &b.fn.Header}
+	}
+	cellPtrs := make([]*PyCell, n)
+	for i, c := range cellVals {
+		cellPtrs[i] = c.AsCell()
+	}
 	obj := &PyFunction{
 		Header: ObjectHeader{
 			Kind: KindFunction,
@@ -406,24 +486,57 @@ func NewFunctionValWithGlobalsAndClosure(name string, codeVal Value, defaults []
 		Name:     name,
 		Code:     codeVal,
 		Defaults: defaults,
-		Closure:  closure,
+		Closure:  nonNilEmptyClosure,
+		CellPtrs: cellPtrs,
 		Globals:  globals,
 	}
-	if n := len(closure); n > 0 {
-		if n <= len(obj.inlineCellPtrs) {
-			for i := range n {
-				obj.inlineCellPtrs[i] = closure[i].AsCell()
-			}
-			obj.CellPtrs = obj.inlineCellPtrs[:n]
-		} else {
-			cellPtrs := make([]*PyCell, n)
-			for i, c := range closure {
-				cellPtrs[i] = c.AsCell()
-			}
-			obj.CellPtrs = cellPtrs
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+// NewFunctionValWithDirectCaptures constructs a heap-allocated KindFunction Value
+// holding provably immutable direct-captured values in fn.Closure (with CellPtrs == nil).
+// For 1..4 values it fuses the backing array into a single heap allocation.
+func NewFunctionValWithDirectCaptures(name string, codeVal Value, defaults []Value, directVals []Value, globals *PyDict) Value {
+	n := len(directVals)
+	if n == 0 {
+		return NewFunctionValWithCellPtrs(name, codeVal, defaults, nil, globals)
+	}
+	if n <= 4 {
+		b := &pyFuncDirectBundle4{
+			fn: PyFunction{
+				Header: ObjectHeader{
+					Kind: KindFunction,
+					Type: FunctionType,
+				},
+				Name:     name,
+				Code:     codeVal,
+				Defaults: defaults,
+				Globals:  globals,
+			},
 		}
+		copy(b.vals[:n], directVals)
+		b.fn.Closure = b.vals[:n]
+		return Value{num: 0, ptr: &b.fn.Header}
+	}
+	vals := make([]Value, n)
+	copy(vals, directVals)
+	obj := &PyFunction{
+		Header: ObjectHeader{
+			Kind: KindFunction,
+			Type: FunctionType,
+		},
+		Name:     name,
+		Code:     codeVal,
+		Defaults: defaults,
+		Closure:  vals,
+		Globals:  globals,
 	}
 	return Value{num: 0, ptr: &obj.Header}
+}
+
+// NewFunctionValWithGlobalsAndClosure constructs a heap-allocated KindFunction Value bound to module globals and closure cells.
+func NewFunctionValWithGlobalsAndClosure(name string, codeVal Value, defaults []Value, closure []Value, globals *PyDict) Value {
+	return NewFunctionValWithCellPtrs(name, codeVal, defaults, closure, globals)
 }
 
 // AsFunction performs a zero-cost offset-0 downcast from Value to *PyFunction.
@@ -854,7 +967,20 @@ func newFunctionFromArgs(args []Value, kwnames []Value) Value {
 			name = n
 		}
 	}
-	fv := NewFunctionValWithGlobalsAndClosure(name, slots[0], defaults, closure, slots[1].AsDict())
+	var fv Value
+	if CodeInspectorHook != nil && CodeInspectorHook.DirectCaptureCount(slots[0]) > 0 && len(closure) > 0 {
+		raw := make([]Value, len(closure))
+		for i, cv := range closure {
+			if cv.IsCell() {
+				raw[i] = cv.AsCell().Get()
+			} else {
+				raw[i] = cv
+			}
+		}
+		fv = NewFunctionValWithDirectCaptures(name, slots[0], defaults, raw, slots[1].AsDict())
+	} else {
+		fv = NewFunctionValWithGlobalsAndClosure(name, slots[0], defaults, closure, slots[1].AsDict())
+	}
 	if set[5] && !slots[5].IsNone() {
 		if !slots[5].IsDict() {
 			panic("TypeError: arg 6 (kwdefaults) must be None or dict")
@@ -969,8 +1095,30 @@ func functionTpGetAttr(ctx *ExecContext, obj, name Value) Value {
 				return v
 			}
 		}
+		if len(fn.CellPtrs) > 0 {
+			items := make([]Value, len(fn.CellPtrs))
+			for i, c := range fn.CellPtrs {
+				items[i] = ObjectVal(&c.Header)
+			}
+			return NewTupleFromSlice(items)
+		}
 		if len(fn.Closure) > 0 {
-			return NewTupleVal(fn.Closure...)
+			// Direct-captured immutable values: lazily materialize and cache PyCells
+			// in fn.CellPtrs so repeated reads preserve f.__closure__[i] identity.
+			cells := make([]*PyCell, len(fn.Closure))
+			items := make([]Value, len(fn.Closure))
+			for i, v := range fn.Closure {
+				if v.IsCell() {
+					cells[i] = v.AsCell()
+					items[i] = v
+				} else {
+					cv := NewCellVal(v)
+					cells[i] = cv.AsCell()
+					items[i] = cv
+				}
+			}
+			fn.CellPtrs = cells
+			return NewTupleFromSlice(items)
 		}
 		return NoneVal()
 	case "__globals__":
@@ -2687,10 +2835,24 @@ func localsProxyCollectPairs(p *PyLocalsProxy) []DictEntry {
 				}
 			}
 			freevars := CodeInspectorHook.FreeVars(f.CO)
+			dcCount := CodeInspectorHook.DirectCaptureCount(f.CO)
+			dcBase := CodeInspectorHook.DirectCaptureBase(f.CO)
 			for j, name := range freevars {
 				s := name.AsString()
 				if seen[s] {
 					continue
+				}
+				if j < dcCount {
+					if vm, ok := f.VM.(FrameVM); ok {
+						seen[s] = true
+						entries = append(entries, DictEntry{
+							Hash:   HashValue(name),
+							Active: true,
+							Key:    name,
+							Value:  vm.GetStackVal(f.BaseOffset + dcBase + j),
+						})
+						continue
+					}
 				}
 				cellIdx := len(cellvars) + j
 				if cellIdx < len(f.Cells) && f.Cells[cellIdx].IsCell() {
@@ -2752,8 +2914,15 @@ func localsProxyMpSubscript(ctx *ExecContext, obj, key Value) Value {
 				}
 			}
 			freevars := CodeInspectorHook.FreeVars(f.CO)
+			dcCount := CodeInspectorHook.DirectCaptureCount(f.CO)
+			dcBase := CodeInspectorHook.DirectCaptureBase(f.CO)
 			for j, name := range freevars {
 				if name.AsString() == keyStr {
+					if j < dcCount {
+						if vm, ok := f.VM.(FrameVM); ok {
+							return vm.GetStackVal(f.BaseOffset + dcBase + j)
+						}
+					}
 					cellIdx := len(cellvars) + j
 					if cellIdx < len(f.Cells) && f.Cells[cellIdx].IsCell() {
 						return f.Cells[cellIdx].AsCell().Value

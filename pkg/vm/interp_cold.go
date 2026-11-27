@@ -838,8 +838,13 @@ func (vm *VM) dispatchColdOpcode(st *loopState, op Opcode, inst uint32, ip, sp i
 		dstReg := uint8(inst >> 16)
 		cellIdx := uint8(inst >> 8)
 		idxReg := uint8(inst)
-		if int(cellIdx) < len(st.cells) {
-			cell := (*val.PyCell)(unsafe.Pointer(st.cells[cellIdx].HeaderPtr()))
+		var cell *val.PyCell
+		if int(cellIdx) < len(st.cellPtrs) && st.cellPtrs[cellIdx] != nil {
+			cell = st.cellPtrs[cellIdx]
+		} else if int(cellIdx) < len(st.cells) {
+			cell = (*val.PyCell)(unsafe.Pointer(st.cells[cellIdx].HeaderPtr()))
+		}
+		if cell != nil {
 			cVal := cell.Value
 			if cVal.IsList() {
 				iv := locals[idxReg]

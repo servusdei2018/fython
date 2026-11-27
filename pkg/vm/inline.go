@@ -224,7 +224,10 @@ func canInlineCallee(fn *val.PyFunction, callee *CodeObject, caller *CodeObject)
 	if len(fn.Defaults) != 0 || fn.KwDefaults != nil {
 		return false
 	}
-	if len(callee.FreeVars) != 0 && (fn.Closure == nil || len(fn.Closure) < len(callee.FreeVars)) {
+	if callee.DirectCaptureCount > 0 {
+		return false
+	}
+	if len(callee.FreeVars) != 0 && len(fn.CellPtrs) < len(callee.FreeVars) && len(fn.Closure) < len(callee.FreeVars) {
 		return false
 	}
 	if caller.NumLocals+callee.NumLocals > 220 {
@@ -778,6 +781,11 @@ func (vm *VM) tryInlineDunder(st *loopState, ip int, dunder val.Value, dfn *val.
 			return false
 		}
 	}
+	for _, cp := range dfn.CellPtrs {
+		if cp != nil && cp.Get().IsNotImplemented() {
+			return false
+		}
+	}
 	for _, cv := range dfn.Closure {
 		if cv.IsNotImplemented() || (cv.IsCell() && cv.AsCell().Get().IsNotImplemented()) {
 			return false
@@ -858,7 +866,7 @@ func spliceInlineBody(vm *VM, st *loopState, guardIP int, guardOp Opcode, origCa
 		if len(callee.CellVars) != 0 {
 			return 0, false
 		}
-		if fn == nil || fn.Closure == nil || len(fn.Closure) < len(callee.FreeVars) {
+		if fn == nil || (len(fn.CellPtrs) < len(callee.FreeVars) && len(fn.Closure) < len(callee.FreeVars)) {
 			return 0, false
 		}
 		for i := range body {
@@ -866,15 +874,22 @@ func spliceInlineBody(vm *VM, st *loopState, guardIP int, guardOp Opcode, origCa
 				continue
 			}
 			idx := int(DecodeArgBx(body[i]))
-			if idx < 0 || idx >= len(callee.FreeVars) || idx >= len(fn.Closure) {
+			if idx < 0 || idx >= len(callee.FreeVars) {
 				return 0, false
 			}
-			cellVal := fn.Closure[idx]
 			var inner val.Value
-			if cellVal.HeaderPtr() != nil && cellVal.HeaderPtr().Kind == val.KindCell {
-				inner = cellVal.AsCell().Get()
-			} else {
-				inner = cellVal
+			switch {
+			case idx < len(fn.CellPtrs) && fn.CellPtrs[idx] != nil:
+				inner = fn.CellPtrs[idx].Get()
+			case idx < len(fn.Closure):
+				cellVal := fn.Closure[idx]
+				if cellVal.HeaderPtr() != nil && cellVal.HeaderPtr().Kind == val.KindCell {
+					inner = cellVal.AsCell().Get()
+				} else {
+					inner = cellVal
+				}
+			default:
+				return 0, false
 			}
 			found := -1
 			for j, c := range newConsts {
@@ -1053,6 +1068,11 @@ func spliceInlineBody(vm *VM, st *loopState, guardIP int, guardOp Opcode, origCa
 		n := make([]*val.SplitDictKeys, needIC)
 		copy(n, cache.dictKwSplit)
 		cache.dictKwSplit = n
+	}
+	if len(cache.callKwSplit) != 0 && len(cache.callKwSplit) < needIC {
+		n := make([]*val.SplitDictKeys, needIC)
+		copy(n, cache.callKwSplit)
+		cache.callKwSplit = n
 	}
 	cache.active = newActive
 	cache.codePtr = unsafe.Pointer(unsafe.SliceData(newActive))

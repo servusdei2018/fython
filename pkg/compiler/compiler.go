@@ -2149,28 +2149,30 @@ func (c *Compiler) compileFuncDef(stmt *ASTStmt) error {
 	}
 
 	fnCodeObj := &vm.CodeObject{
-		Name:            fnDef.Name,
-		QualName:        qualName,
-		FileName:        c.filename,
-		FirstLineNo:     int(firstLine),
-		PosOnlyArgCount: int(fnDef.PosOnlyCount),
-		KWOnlyArgCount:  int(fnDef.KWOnlyCount),
-		Code:            subCompiler.finalizedCode(),
-		Consts:          subCompiler.constPool.Slice(),
-		ParamNames:      paramValSlice,
-		VarNames:        varNames,
-		CellVars:        cellValSlice,
-		FreeVars:        freeValSlice,
-		NumLocals:       numLocals,
-		NumParams:       len(paramNames),
-		MaxStackSize:    maxStack,
-		IsGenerator:     fnScope.IsGenerator,
-		IsCoroutine:     fnScope.IsCoroutine,
-		CanSuspend:      canSuspend,
-		Flags:           coFlags,
-		Doc:             fnDoc,
-		ExceptionTable:  subCompiler.exceptionTable,
-		LineSpans:       subCompiler.lineSpans,
+		Name:               fnDef.Name,
+		QualName:           qualName,
+		FileName:           c.filename,
+		FirstLineNo:        int(firstLine),
+		PosOnlyArgCount:    int(fnDef.PosOnlyCount),
+		KWOnlyArgCount:     int(fnDef.KWOnlyCount),
+		Code:               subCompiler.finalizedCode(),
+		Consts:             subCompiler.constPool.Slice(),
+		ParamNames:         paramValSlice,
+		VarNames:           varNames,
+		CellVars:           cellValSlice,
+		FreeVars:           freeValSlice,
+		NumLocals:          numLocals,
+		NumParams:          len(paramNames),
+		DirectCaptureBase:  fnScope.DirectCaptureBase,
+		DirectCaptureCount: len(fnScope.DirectCaptures),
+		MaxStackSize:       maxStack,
+		IsGenerator:        fnScope.IsGenerator,
+		IsCoroutine:        fnScope.IsCoroutine,
+		CanSuspend:         canSuspend,
+		Flags:              coFlags,
+		Doc:                fnDoc,
+		ExceptionTable:     subCompiler.exceptionTable,
+		LineSpans:          subCompiler.lineSpans,
 	}
 
 	var flags uint8
@@ -2304,21 +2306,35 @@ func (c *Compiler) compileFuncDef(stmt *ASTStmt) error {
 		c.emitOp(vm.OP_BUILD_MAP, 0, uint16(len(kwDefaults)))
 	}
 
-	// Closure cells (if FreeVars > 0)
-	if len(fnScope.FreeVars) > 0 {
+	// Closure cells or direct captures (if FreeVars > 0): pushed directly without wrapping in a tuple.
+	var closCount uint16
+	if len(fnScope.DirectCaptures) > 0 {
+		flags |= 0x10
+		closCount = uint16(len(fnScope.DirectCaptures))
+		if d := c.stackDepth + len(fnScope.DirectCaptures) + 4; d > c.maxStackDepth {
+			c.maxStackDepth = d
+		}
+		for _, fv := range fnScope.DirectCaptures {
+			sym := c.scope.Symbols[fv]
+			c.emitOp(vm.OP_LOAD_FAST, 0, uint16(sym.Offset))
+		}
+	} else if len(fnScope.FreeVars) > 0 {
 		flags |= 0x01
+		closCount = uint16(len(fnScope.FreeVars))
+		if d := c.stackDepth + len(fnScope.FreeVars) + 4; d > c.maxStackDepth {
+			c.maxStackDepth = d
+		}
 		for _, fv := range fnScope.FreeVars {
 			if err := c.emitLoadClosure(fv); err != nil {
 				return err
 			}
 		}
-		c.emitOp(vm.OP_BUILD_TUPLE, 0, uint16(len(fnScope.FreeVars)))
 	}
 
 	coVal := vm.NewCodeVal(fnCodeObj)
 	coIdx := c.constPool.Add(coVal)
 	c.emitOp(vm.OP_LOAD_CONST, 0, coIdx)
-	c.emitOp(vm.OP_MAKE_FUNCTION, flags, 0)
+	c.emitOp(vm.OP_MAKE_FUNCTION, flags, closCount)
 
 	// Apply decorators in reverse order
 	for range slices.Backward(decorators) {
@@ -2447,14 +2463,16 @@ func (c *Compiler) compileClassDef(stmt *ASTStmt) error {
 	coVal := vm.NewCodeVal(clsCodeObj)
 	coIdx := c.constPool.Add(coVal)
 	if clsScope != nil && len(clsScope.FreeVars) > 0 {
+		if d := c.stackDepth + len(clsScope.FreeVars) + 4; d > c.maxStackDepth {
+			c.maxStackDepth = d
+		}
 		for _, fv := range clsScope.FreeVars {
 			if err := c.emitLoadClosure(fv); err != nil {
 				return err
 			}
 		}
-		c.emitOp(vm.OP_BUILD_TUPLE, 0, uint16(len(clsScope.FreeVars)))
 		c.emitOp(vm.OP_LOAD_CONST, 0, coIdx)
-		c.emitOp(vm.OP_MAKE_FUNCTION, 0x01, 0)
+		c.emitOp(vm.OP_MAKE_FUNCTION, 0x01, uint16(len(clsScope.FreeVars)))
 	} else {
 		c.emitOp(vm.OP_LOAD_CONST, 0, coIdx)
 	}
@@ -4506,19 +4524,23 @@ func (c *Compiler) compileGenExp(expr *ASTExpr) error {
 	}
 
 	var flags uint8
+	var closCount uint16
 	if len(genScope.FreeVars) > 0 {
 		flags |= 0x01
+		closCount = uint16(len(genScope.FreeVars))
+		if d := c.stackDepth + len(genScope.FreeVars) + 4; d > c.maxStackDepth {
+			c.maxStackDepth = d
+		}
 		for _, fv := range genScope.FreeVars {
 			if err := c.emitLoadClosure(fv); err != nil {
 				return err
 			}
 		}
-		c.emitOp(vm.OP_BUILD_TUPLE, 0, uint16(len(genScope.FreeVars)))
 	}
 
 	codeIdx := c.constPool.Add(vm.NewCodeVal(genCodeObj))
 	c.emitOp(vm.OP_LOAD_CONST, 0, codeIdx)
-	c.emitOp(vm.OP_MAKE_FUNCTION, flags, 0)
+	c.emitOp(vm.OP_MAKE_FUNCTION, flags, closCount)
 	c.emitOp(vm.OP_LOAD_FAST, 0, uint16(iterSlot))
 	c.emitOp(vm.OP_CALL, 1, vm.CallFromStack)
 
@@ -4619,37 +4641,53 @@ func (c *Compiler) compileLambda(expr *ASTExpr) error {
 	}
 
 	lambdaCodeObj := &vm.CodeObject{
-		Name:         "<lambda>",
-		QualName:     lambdaQualName,
-		FileName:     c.filename,
-		FirstLineNo:  int(firstLine),
-		Code:         subCompiler.finalizedCode(),
-		Consts:       subCompiler.constPool.Slice(),
-		ParamNames:   paramValSlice,
-		VarNames:     varNames,
-		CellVars:     cellValSlice,
-		FreeVars:     freeValSlice,
-		NumLocals:    numLocals,
-		NumParams:    len(paramNames),
-		MaxStackSize: numLocals + subCompiler.maxStackDepth + 16,
-		Flags:        coFlags,
-		LineSpans:    subCompiler.lineSpans,
+		Name:               "<lambda>",
+		QualName:           lambdaQualName,
+		FileName:           c.filename,
+		FirstLineNo:        int(firstLine),
+		Code:               subCompiler.finalizedCode(),
+		Consts:             subCompiler.constPool.Slice(),
+		ParamNames:         paramValSlice,
+		VarNames:           varNames,
+		CellVars:           cellValSlice,
+		FreeVars:           freeValSlice,
+		NumLocals:          numLocals,
+		NumParams:          len(paramNames),
+		DirectCaptureBase:  lambdaScope.DirectCaptureBase,
+		DirectCaptureCount: len(lambdaScope.DirectCaptures),
+		MaxStackSize:       numLocals + subCompiler.maxStackDepth + 16,
+		Flags:              coFlags,
+		LineSpans:          subCompiler.lineSpans,
 	}
 
-	if len(lambdaScope.FreeVars) > 0 {
+	var closCount uint16
+	if len(lambdaScope.DirectCaptures) > 0 {
+		flags |= 0x10
+		closCount = uint16(len(lambdaScope.DirectCaptures))
+		if d := c.stackDepth + len(lambdaScope.DirectCaptures) + 4; d > c.maxStackDepth {
+			c.maxStackDepth = d
+		}
+		for _, fv := range lambdaScope.DirectCaptures {
+			sym := c.scope.Symbols[fv]
+			c.emitOp(vm.OP_LOAD_FAST, 0, uint16(sym.Offset))
+		}
+	} else if len(lambdaScope.FreeVars) > 0 {
 		flags |= 0x01
+		closCount = uint16(len(lambdaScope.FreeVars))
+		if d := c.stackDepth + len(lambdaScope.FreeVars) + 4; d > c.maxStackDepth {
+			c.maxStackDepth = d
+		}
 		for _, fv := range lambdaScope.FreeVars {
 			if err := c.emitLoadClosure(fv); err != nil {
 				return err
 			}
 		}
-		c.emitOp(vm.OP_BUILD_TUPLE, 0, uint16(len(lambdaScope.FreeVars)))
 	}
 
 	coVal := vm.NewCodeVal(lambdaCodeObj)
 	coIdx := c.constPool.Add(coVal)
 	c.emitOp(vm.OP_LOAD_CONST, 0, coIdx)
-	c.emitOp(vm.OP_MAKE_FUNCTION, flags, 0)
+	c.emitOp(vm.OP_MAKE_FUNCTION, flags, closCount)
 
 	return nil
 }
@@ -4774,14 +4812,16 @@ func (c *Compiler) emitAnnotateFunction() error {
 	coIdx := c.constPool.Add(vm.NewCodeVal(co))
 
 	if len(as.FreeVars) > 0 {
+		if d := c.stackDepth + len(as.FreeVars) + 4; d > c.maxStackDepth {
+			c.maxStackDepth = d
+		}
 		for _, fv := range as.FreeVars {
 			if err := c.emitLoadClosure(fv); err != nil {
 				return err
 			}
 		}
-		c.emitOp(vm.OP_BUILD_TUPLE, 0, uint16(len(as.FreeVars)))
 		c.emitOp(vm.OP_LOAD_CONST, 0, coIdx)
-		c.emitOp(vm.OP_MAKE_FUNCTION, 0x01, 0)
+		c.emitOp(vm.OP_MAKE_FUNCTION, 0x01, uint16(len(as.FreeVars)))
 	} else {
 		c.emitOp(vm.OP_LOAD_CONST, 0, coIdx)
 		c.emitOp(vm.OP_MAKE_FUNCTION, 0, 0)

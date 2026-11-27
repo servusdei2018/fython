@@ -308,34 +308,36 @@ const (
 // Header is placed at offset 0 so a *CodeObject can be stored inside a val.Value (KindCode)
 // in a constant pool with zero-cost downcasting.
 type CodeObject struct {
-	Header           val.ObjectHeader
-	ID               uint32
-	Name             string
-	QualName         string
-	FileName         string
-	FirstLineNo      int
-	Doc              val.Value
-	PosOnlyArgCount  int
-	KWOnlyArgCount   int
-	Code             []uint32
-	Consts           []val.Value
-	ParamNames       []val.Value
-	VarNames         []val.Value
-	CellVars         []val.Value
-	FreeVars         []val.Value
-	CellParamIndices []int
-	NumLocals        int
-	NumParams        int
-	MaxStackSize     int
-	IsGenerator      bool
-	IsCoroutine      bool
-	CanSuspend       bool
-	Flags            uint32
-	ExceptionTable   []ExceptionEntry
-	LineSpans        []LineSpanEntry
-	Hotness          int32
-	IsTier2Optimized int32
-	GenStackHint     atomic.Int32
+	Header             val.ObjectHeader
+	ID                 uint32
+	Name               string
+	QualName           string
+	FileName           string
+	FirstLineNo        int
+	Doc                val.Value
+	PosOnlyArgCount    int
+	KWOnlyArgCount     int
+	Code               []uint32
+	Consts             []val.Value
+	ParamNames         []val.Value
+	VarNames           []val.Value
+	CellVars           []val.Value
+	FreeVars           []val.Value
+	CellParamIndices   []int
+	NumLocals          int
+	NumParams          int
+	DirectCaptureBase  int
+	DirectCaptureCount int
+	MaxStackSize       int
+	IsGenerator        bool
+	IsCoroutine        bool
+	CanSuspend         bool
+	Flags              uint32
+	ExceptionTable     []ExceptionEntry
+	LineSpans          []LineSpanEntry
+	Hotness            int32
+	IsTier2Optimized   int32
+	GenStackHint       atomic.Int32
 	// SimplePositionalOnly reports that every parameter of the code object is
 	// a required positional-only parameter: no keyword-only parameter, no
 	// *args and no **kwargs. PositionalParamCount is then the exact number of
@@ -491,6 +493,9 @@ func reloadCode(co *CodeObject, cache *VMCodeCache, gen int32) []uint32 {
 	if len(cache.dictKwSplit) > 0 && len(cache.dictKwSplit) != len(newStream) {
 		cache.dictKwSplit = nil
 	}
+	if len(cache.callKwSplit) > 0 && len(cache.callKwSplit) != len(newStream) {
+		cache.callKwSplit = nil
+	}
 	return cache.active
 }
 
@@ -598,6 +603,7 @@ type VMCodeCache struct {
 	inlineSites  []inlineSite
 	constKeyMaps []ConstKeyMapTemplate
 	dictKwSplit  []*val.SplitDictKeys
+	callKwSplit  []*val.SplitDictKeys
 	// hotness counts how often this VM executed the code object. It is
 	// VM-local, so it never shares a cache line with another VM.
 	hotness uint32
@@ -755,6 +761,15 @@ func (c *VMCodeCache) ensureDictKwSplit(n int) []*val.SplitDictKeys {
 		c.dictKwSplit = nw
 	}
 	return c.dictKwSplit
+}
+
+func (c *VMCodeCache) ensureCallKwSplit(n int) []*val.SplitDictKeys {
+	if len(c.callKwSplit) < n {
+		nw := make([]*val.SplitDictKeys, n)
+		copy(nw, c.callKwSplit)
+		c.callKwSplit = nw
+	}
+	return c.callKwSplit
 }
 
 // quickenAt writes a quickened instruction word into this VM's private copy of
@@ -1594,15 +1609,26 @@ func (vm *VM) materializeFrame(targetIdx int) val.Value {
 	co := fSlot.codeObject()
 	baseOffset := fSlot.baseOffset
 	var cells []val.Value
+	var cellPtrs []*val.PyCell
 	var extraLocals val.Value
 	if (fSlot.flags&frameFlagHasAux) != 0 && targetIdx < len(vm.frameAux) {
 		cells = vm.frameAux[targetIdx].cells
+		cellPtrs = vm.frameAux[targetIdx].cellPtrs
 		extraLocals = vm.frameAux[targetIdx].locals
 	}
 	if co == nil && targetIdx == vm.activeFrameIdx {
 		co = vm.activeCO
 		baseOffset = vm.activeBaseOffset
 		cells = vm.activeCells
+		cellPtrs = vm.activeCellPtrs
+	}
+	if len(cells) == 0 && len(cellPtrs) > 0 {
+		cells = make([]val.Value, len(cellPtrs))
+		for i, cp := range cellPtrs {
+			if cp != nil {
+				cells[i] = val.ObjectVal(&cp.Header)
+			}
+		}
 	}
 	if co == nil && targetIdx == 0 {
 		co = &vm.rootCO
@@ -1672,6 +1698,22 @@ func (defaultCodeInspector) FreeVars(code val.Value) []val.Value {
 		return nil
 	}
 	return co.FreeVars
+}
+
+func (defaultCodeInspector) DirectCaptureBase(code val.Value) int {
+	co := AsCodeObject(code)
+	if co == nil {
+		return 0
+	}
+	return co.DirectCaptureBase
+}
+
+func (defaultCodeInspector) DirectCaptureCount(code val.Value) int {
+	co := AsCodeObject(code)
+	if co == nil {
+		return 0
+	}
+	return co.DirectCaptureCount
 }
 
 func (defaultCodeInspector) Name(code val.Value) string {

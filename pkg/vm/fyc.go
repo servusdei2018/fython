@@ -17,7 +17,7 @@ const (
 	// FycMagic is the 4-byte magic signature for Fython bytecode files ("FYTH" in ASCII).
 	FycMagic uint32 = 0x48545946
 	// FycVersion is the current bytecode format version.
-	FycVersion uint32 = 9
+	FycVersion uint32 = 12
 	// FycHeaderSize is the fixed size of the .fyc file header in bytes.
 	FycHeaderSize = 64
 )
@@ -261,6 +261,10 @@ func encodeCodeObject(buf []byte, co *CodeObject, sc *stringCollector) []byte {
 		binary.LittleEndian.PutUint32(tmp4[:], sc.add(v.AsString()))
 		buf = append(buf, tmp4[:]...)
 	}
+	binary.LittleEndian.PutUint32(tmp4[:], uint32(co.DirectCaptureBase))
+	buf = append(buf, tmp4[:]...)
+	binary.LittleEndian.PutUint32(tmp4[:], uint32(co.DirectCaptureCount))
+	buf = append(buf, tmp4[:]...)
 
 	// ExceptionTable
 	binary.LittleEndian.PutUint32(tmp4[:], uint32(len(co.ExceptionTable)))
@@ -648,6 +652,14 @@ func decodeCodeObject(r *binaryReader, stringTable []val.Value) (*CodeObject, er
 		}
 		freeVars[i] = stringTable[idx]
 	}
+	directCaptureBase, err := r.readUint32()
+	if err != nil {
+		return nil, err
+	}
+	directCaptureCount, err := r.readUint32()
+	if err != nil {
+		return nil, err
+	}
 
 	// ExceptionTable
 	excLen, err := r.readUint32()
@@ -723,27 +735,29 @@ func decodeCodeObject(r *binaryReader, stringTable []val.Value) (*CodeObject, er
 	}
 
 	co := &CodeObject{
-		Name:            name,
-		QualName:        qualName,
-		FileName:        fileName,
-		FirstLineNo:     int(firstLineNo),
-		PosOnlyArgCount: int(posOnlyArgCount),
-		KWOnlyArgCount:  int(kwOnlyArgCount),
-		Code:            code,
-		Consts:          consts,
-		ParamNames:      paramNames,
-		VarNames:        varNames,
-		CellVars:        cellVars,
-		FreeVars:        freeVars,
-		NumLocals:       int(numLocals),
-		NumParams:       int(numParams),
-		MaxStackSize:    int(maxStackSize),
-		Flags:           flags,
-		Doc:             docVal,
-		IsGenerator:     (flags & CO_GENERATOR) != 0,
-		IsCoroutine:     (flags & CO_COROUTINE) != 0,
-		ExceptionTable:  excTable,
-		LineSpans:       lineSpans,
+		Name:               name,
+		QualName:           qualName,
+		FileName:           fileName,
+		FirstLineNo:        int(firstLineNo),
+		PosOnlyArgCount:    int(posOnlyArgCount),
+		KWOnlyArgCount:     int(kwOnlyArgCount),
+		Code:               code,
+		Consts:             consts,
+		ParamNames:         paramNames,
+		VarNames:           varNames,
+		CellVars:           cellVars,
+		FreeVars:           freeVars,
+		NumLocals:          int(numLocals),
+		NumParams:          int(numParams),
+		DirectCaptureBase:  int(directCaptureBase),
+		DirectCaptureCount: int(directCaptureCount),
+		MaxStackSize:       int(maxStackSize),
+		Flags:              flags,
+		Doc:                docVal,
+		IsGenerator:        (flags & CO_GENERATOR) != 0,
+		IsCoroutine:        (flags & CO_COROUTINE) != 0,
+		ExceptionTable:     excTable,
+		LineSpans:          lineSpans,
 	}
 	return co.Init(), nil
 }

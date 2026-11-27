@@ -17,7 +17,11 @@ func (vm *VM) opLoadLocals(st *loopState, ip, sp int) (int, int, loopCtl) {
 func (vm *VM) opLoadClosure(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
 	bx := int(uint16(inst))
-	stack[sp] = st.cells[bx]
+	if bx < len(st.cellPtrs) && st.cellPtrs[bx] != nil {
+		stack[sp] = val.ObjectVal(&st.cellPtrs[bx].Header)
+	} else {
+		stack[sp] = st.cells[bx]
+	}
 	sp++
 	ip++
 	return ip, sp, ctlNext
@@ -30,10 +34,23 @@ func (vm *VM) opMakeFunction(st *loopState, inst uint32, ip, sp int) (int, int, 
 	sp--
 	codeVal := stack[sp]
 	var closureSlice []val.Value
+	isDirectCapture := (flags & 0x10) != 0
 	if (flags & 0x01) != 0 {
-		sp--
-		closureVal := stack[sp]
-		closureSlice = closureVal.AsTuple().Items
+		nClos := int(uint16(inst))
+		sp -= nClos
+		closureSlice = stack[sp : sp+nClos]
+	} else if isDirectCapture {
+		nDirect := int(uint16(inst))
+		sp -= nDirect
+		closureSlice = stack[sp : sp+nDirect]
+		for i := range nDirect {
+			v := closureSlice[i]
+			val.ClearEphemeral(v)
+			val.DetachStringBuf(v)
+			if vm.hasTrackedViews {
+				markViewEscaped(v)
+			}
+		}
 	}
 	var kwdefaultsDict *val.PyDict
 	if (flags & 0x08) != 0 {
@@ -55,7 +72,12 @@ func (vm *VM) opMakeFunction(st *loopState, inst uint32, ip, sp int) (int, int, 
 		annotateVal = stack[sp]
 	}
 	callee := AsCodeObject(codeVal)
-	fnVal := val.NewFunctionValWithGlobalsAndClosure(callee.Name, codeVal, defaultsSlice, closureSlice, st.globals)
+	var fnVal val.Value
+	if isDirectCapture {
+		fnVal = val.NewFunctionValWithDirectCaptures(callee.Name, codeVal, defaultsSlice, closureSlice, st.globals)
+	} else {
+		fnVal = val.NewFunctionValWithCellPtrs(callee.Name, codeVal, defaultsSlice, closureSlice, st.globals)
+	}
 	fn := fnVal.AsFunction()
 	fn.KwDefaults = kwdefaultsDict
 	if (flags & 0x04) != 0 {

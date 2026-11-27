@@ -71,7 +71,13 @@ func (vm *VM) opLoadFromDictOr(st *loopState, inst uint32, ip, sp int) (int, int
 		if opcodeOf(inst) == OP_LOAD_FROM_DICT_OR_GLOBALS {
 			res, found = vm.globalOrBuiltin(st.globals, nameVal)
 		} else {
-			cell := (*val.PyCell)(unsafe.Pointer(st.cells[int(uint8(inst>>16))].HeaderPtr()))
+			idx := int(uint8(inst >> 16))
+			var cell *val.PyCell
+			if idx < len(st.cellPtrs) && st.cellPtrs[idx] != nil {
+				cell = st.cellPtrs[idx]
+			} else {
+				cell = (*val.PyCell)(unsafe.Pointer(st.cells[idx].HeaderPtr()))
+			}
 			res, found = cell.Value, true
 		}
 	}

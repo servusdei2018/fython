@@ -4292,6 +4292,8 @@ type CodeInspector interface {
 	VarNames(code Value) []Value
 	CellVars(code Value) []Value
 	FreeVars(code Value) []Value
+	DirectCaptureBase(code Value) int
+	DirectCaptureCount(code Value) int
 	Name(code Value) string
 	QualName(code Value) string
 	FileName(code Value) string
@@ -4427,7 +4429,15 @@ func (f *PyFrame) Detach() {
 			}
 		}
 		freevars := CodeInspectorHook.FreeVars(f.CO)
+		dcCount := CodeInspectorHook.DirectCaptureCount(f.CO)
+		dcBase := CodeInspectorHook.DirectCaptureBase(f.CO)
 		for j, name := range freevars {
+			if j < dcCount {
+				if vm, ok := f.VM.(FrameVM); ok {
+					snapshot.Set(name, vm.GetStackVal(f.BaseOffset+dcBase+j))
+					continue
+				}
+			}
 			cellIdx := len(cellvars) + j
 			if cellIdx < len(f.Cells) && f.Cells[cellIdx].IsCell() {
 				snapshot.Set(name, f.Cells[cellIdx].AsCell().Value)

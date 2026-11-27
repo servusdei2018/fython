@@ -2,6 +2,7 @@ package vm
 
 import (
 	"fmt"
+	"math/bits"
 	"runtime"
 	"sort"
 	"strings"
@@ -331,6 +332,7 @@ func (vm *VM) buildClass(classBody, nameVal val.Value, origBases []val.Value, kw
 	// Step 4: Class Body Execution & Zero-Arg super() (__class__ Cell)
 	var co *CodeObject
 	var closure []val.Value
+	var closurePtrs []*val.PyCell
 	switch {
 	case classBody.Kind() == val.KindCode:
 		co = AsCodeObject(classBody)
@@ -338,6 +340,7 @@ func (vm *VM) buildClass(classBody, nameVal val.Value, origBases []val.Value, kw
 		fn := classBody.AsFunction()
 		co = AsCodeObject(fn.Code)
 		closure = fn.Closure
+		closurePtrs = fn.CellPtrs
 	default:
 		panic("TypeError: class body must be code object or function")
 	}
@@ -359,9 +362,12 @@ func (vm *VM) buildClass(classBody, nameVal val.Value, origBases []val.Value, kw
 			}
 		}
 		for j := range nFree {
-			if j < len(closure) && closure[j].HeaderPtr() != nil {
+			switch {
+			case j < len(closurePtrs) && closurePtrs[j] != nil:
+				bodyCells[nCells+j] = val.ObjectVal(&closurePtrs[j].Header)
+			case j < len(closure) && closure[j].HeaderPtr() != nil:
 				bodyCells[nCells+j] = closure[j]
-			} else {
+			default:
 				bodyCells[nCells+j] = val.NewCellVal(val.UnboundVal())
 			}
 		}
@@ -679,7 +685,10 @@ func (vm *VM) callFromHook(ctx *val.ExecContext, callable val.Value, argBase int
 		}
 		vm.ensureFrameCapacity(nextFrame + 4)
 		var cells []val.Value
-		if len(co.CellVars) != 0 || len(co.FreeVars) != 0 {
+		if co.DirectCaptureCount > 0 {
+			copy(ctx.Stack[argBase+co.DirectCaptureBase:], fn.Closure[:co.DirectCaptureCount])
+		}
+		if len(co.CellVars) != 0 || (len(co.FreeVars) != 0 && co.DirectCaptureCount == 0) {
 			cells = vm.setupCalleeCells(co, callable, ctx.Stack, argBase, nargs)
 		}
 		vm.unhandledException = val.NoneVal()
@@ -799,6 +808,73 @@ func (vm *VM) callFromHook(ctx *val.ExecContext, callable val.Value, argBase int
 // bindFunctionArgs binds positional, keyword, and default arguments in-place on stack[argBase:]
 // with 0 heap allocations, returning the initial sp for the callee frame.
 func (vm *VM) bindFunctionArgs(co *CodeObject, defaults []val.Value, kwDefaults *val.PyDict, stack []val.Value, argBase int, nargs int, kwnames []val.Value) int {
+	return vm.bindFunctionArgsWithCache(co, defaults, kwDefaults, stack, argBase, nargs, kwnames, nil, -1)
+}
+
+func (vm *VM) buildSplitOrCombinedKwDict(extraKeys, extraVals []val.Value, callerCache *VMCodeCache, callerIP int) *val.PyDict {
+	n := len(extraKeys)
+	if callerCache != nil && callerIP >= 0 && callerIP < len(callerCache.active) {
+		var sk *val.SplitDictKeys
+		if callerIP < len(callerCache.callKwSplit) {
+			sk = callerCache.callKwSplit[callerIP]
+		}
+		if sk != nil {
+			matched := sk.Count == n
+			if matched {
+				for i := range n {
+					if sk.Keys[i] != extraKeys[i] && !val.StringEquals(sk.Keys[i], extraKeys[i]) {
+						matched = false
+						break
+					}
+				}
+			}
+			if matched && !sk.DisableSplit.Load() {
+				for i := range n {
+					v := extraVals[i]
+					val.ClearEphemeral(v)
+					val.DetachStringBuf(v)
+					if vm.hasTrackedViews {
+						markViewEscaped(v)
+					}
+				}
+				return val.NewSplitDict(sk, extraVals, 0)
+			}
+			// Either DisableSplit is set or keys mismatched at a polymorphic call site:
+			// fall back to a combined dict without replacing the cached slot.
+		} else {
+			if sk = buildSplitDictKeys(extraKeys); sk != nil {
+				callerCache.ensureCallKwSplit(len(callerCache.active))[callerIP] = sk
+				for i := range n {
+					v := extraVals[i]
+					val.ClearEphemeral(v)
+					val.DetachStringBuf(v)
+					if vm.hasTrackedViews {
+						markViewEscaped(v)
+					}
+				}
+				return val.NewSplitDict(sk, extraVals, 0)
+			}
+		}
+	}
+	var d *val.PyDict
+	if n <= 5 {
+		d = val.NewSmallDictDirect(0)
+	} else {
+		d = val.NewDictVal(n).AsDict()
+	}
+	for i := range n {
+		v := extraVals[i]
+		val.ClearEphemeral(v)
+		val.DetachStringBuf(v)
+		if vm.hasTrackedViews {
+			markViewEscaped(v)
+		}
+		d.Set(extraKeys[i], v)
+	}
+	return d
+}
+
+func (vm *VM) bindFunctionArgsWithCache(co *CodeObject, defaults []val.Value, kwDefaults *val.PyDict, stack []val.Value, argBase int, nargs int, kwnames []val.Value, callerCache *VMCodeCache, callerIP int) int {
 	numParams := co.NumParams
 	if len(kwnames) == 0 && co.SimplePositionalOnly && nargs == co.PositionalParamCount &&
 		len(defaults) == 0 && kwDefaults == nil {
@@ -879,12 +955,27 @@ func (vm *VM) bindFunctionArgs(co *CodeObject, defaults []val.Value, kwDefaults 
 		}
 		copy(extraPos, stack[argBase+posParamCount:argBase+posCount])
 	}
-	for i := range numParams {
-		vm.kwSet[i] = false
+	useBitmask := numParams <= 64 && len(paramNames) <= 64
+	var boundMask uint64
+	var kwSet []bool
+	if useBitmask {
+		if posBound >= 64 {
+			boundMask = ^uint64(0)
+		} else {
+			boundMask = (uint64(1) << posBound) - 1
+		}
+	} else {
+		kwSet = make([]bool, max(numParams, len(paramNames)))
+		for i := 0; i < posBound && i < len(kwSet); i++ {
+			kwSet[i] = true
+		}
 	}
-	for i := 0; i < posBound && i < numParams; i++ {
-		vm.kwSet[i] = true
-	}
+
+	useSplitCache := varKWIdx >= 0 && !co.VarKWSafe && !val.MultiThreadedFlag.Load() &&
+		callerCache != nil && callerIP >= 0 && callerIP < len(callerCache.active)
+	var extraKeysBuf [16]val.Value
+	var extraValsBuf [16]val.Value
+	extraCount := 0
 
 	var kwDict *val.PyDict
 	for i := range kwCount {
@@ -903,26 +994,47 @@ func (vm *VM) bindFunctionArgs(co *CodeObject, defaults []val.Value, kwDefaults 
 		}
 		switch {
 		case foundIdx >= 0:
-			if foundIdx < posBound || vm.kwSet[foundIdx] {
-				panic("vm: TypeError: multiple values for argument '" + kwName.AsString() + "'")
-			}
-			stack[argBase+foundIdx] = kwVal
-			vm.kwSet[foundIdx] = true
-		case varKWIdx >= 0:
-			if kwDict == nil {
-				if co.VarKWSafe {
-					kwDict = vm.acquireSmallDictFlags(4, val.FlagEphemeralFrameDict).AsDict()
-				} else {
-					kwDict = val.NewDictVal(4).AsDict()
+			if useBitmask {
+				if foundIdx < posBound || (boundMask&(uint64(1)<<foundIdx)) != 0 {
+					panic("vm: TypeError: multiple values for argument '" + kwName.AsString() + "'")
 				}
+				stack[argBase+foundIdx] = kwVal
+				boundMask |= uint64(1) << foundIdx
+			} else {
+				if foundIdx < posBound || kwSet[foundIdx] {
+					panic("vm: TypeError: multiple values for argument '" + kwName.AsString() + "'")
+				}
+				stack[argBase+foundIdx] = kwVal
+				kwSet[foundIdx] = true
 			}
-			kwDict.Set(kwName, kwVal)
+		case varKWIdx >= 0:
+			if useSplitCache && kwDict == nil && extraCount < 16 {
+				extraKeysBuf[extraCount] = kwName
+				extraValsBuf[extraCount] = kwVal
+				extraCount++
+			} else {
+				if kwDict == nil {
+					if co.VarKWSafe {
+						kwDict = vm.acquireSmallDictFlags(4, val.FlagEphemeralFrameDict).AsDict()
+					} else {
+						kwDict = val.NewDictVal(max(4, extraCount+1)).AsDict()
+					}
+					for k := range extraCount {
+						kwDict.Set(extraKeysBuf[k], extraValsBuf[k])
+					}
+					extraCount = 0
+				}
+				kwDict.Set(kwName, kwVal)
+			}
 		default:
 			panic("vm: TypeError: unexpected keyword argument '" + kwName.AsString() + "'")
 		}
 	}
 
 	if varKWIdx >= 0 {
+		if kwDict == nil && extraCount > 0 {
+			kwDict = vm.buildSplitOrCombinedKwDict(extraKeysBuf[:extraCount], extraValsBuf[:extraCount], callerCache, callerIP)
+		}
 		if kwDict == nil {
 			if co.VarKWSafe {
 				stack[argBase+varKWIdx] = vm.acquireSmallDictFlags(0, val.FlagEphemeralFrameDict)
@@ -932,7 +1044,13 @@ func (vm *VM) bindFunctionArgs(co *CodeObject, defaults []val.Value, kwDefaults 
 		} else {
 			stack[argBase+varKWIdx] = val.DictVal(kwDict)
 		}
-		vm.kwSet[varKWIdx] = true
+		if useBitmask {
+			if varKWIdx < 64 {
+				boundMask |= uint64(1) << varKWIdx
+			}
+		} else {
+			kwSet[varKWIdx] = true
+		}
 	}
 
 	if varArgsIdx >= 0 {
@@ -941,15 +1059,30 @@ func (vm *VM) bindFunctionArgs(co *CodeObject, defaults []val.Value, kwDefaults 
 		} else {
 			stack[argBase+varArgsIdx] = val.EmptyTupleVal()
 		}
-		vm.kwSet[varArgsIdx] = true
+		if useBitmask {
+			if varArgsIdx < 64 {
+				boundMask |= uint64(1) << varArgsIdx
+			}
+		} else {
+			kwSet[varArgsIdx] = true
+		}
 	}
 
 	defStart := posParamCount - len(defaults)
-	for i := range paramNames {
-		if i == varArgsIdx || i == varKWIdx {
-			continue
+	if useBitmask {
+		var allMask uint64
+		if len(paramNames) == 64 {
+			allMask = ^uint64(0)
+		} else {
+			allMask = (uint64(1) << len(paramNames)) - 1
 		}
-		if !vm.kwSet[i] {
+		missing := allMask &^ boundMask
+		for missing != 0 {
+			i := bits.TrailingZeros64(missing)
+			missing &= missing - 1
+			if i == varArgsIdx || i == varKWIdx {
+				continue
+			}
 			switch {
 			case i >= defStart && i < posParamCount && len(defaults) > 0:
 				stack[argBase+i] = defaults[i-defStart]
@@ -961,6 +1094,26 @@ func (vm *VM) bindFunctionArgs(co *CodeObject, defaults []val.Value, kwDefaults 
 				}
 			default:
 				panic("vm: TypeError: missing required argument '" + paramNames[i].AsString() + "' in " + co.Name)
+			}
+		}
+	} else {
+		for i := range paramNames {
+			if i == varArgsIdx || i == varKWIdx {
+				continue
+			}
+			if !kwSet[i] {
+				switch {
+				case i >= defStart && i < posParamCount && len(defaults) > 0:
+					stack[argBase+i] = defaults[i-defStart]
+				case kwDefaults != nil && i < len(paramNames):
+					if v, ok := kwDefaults.Get(paramNames[i]); ok {
+						stack[argBase+i] = v
+					} else {
+						panic("vm: TypeError: missing required argument '" + paramNames[i].AsString() + "' in " + co.Name)
+					}
+				default:
+					panic("vm: TypeError: missing required argument '" + paramNames[i].AsString() + "' in " + co.Name)
+				}
 			}
 		}
 	}
@@ -1011,6 +1164,9 @@ type cellBundle4 struct {
 func (vm *VM) setupCalleeCellsWithPool(callee *CodeObject, target val.Value, stack []val.Value, newBase int, argc int, usePool bool) ([]val.Value, []*val.PyCell) {
 	nCells := len(callee.CellVars)
 	nFree := len(callee.FreeVars)
+	if callee.DirectCaptureCount > 0 {
+		nFree = 0
+	}
 	if nCells == 0 && nFree == 0 {
 		return nil, nil
 	}
@@ -1099,11 +1255,12 @@ func (vm *VM) setupCalleeCellsWithPool(callee *CodeObject, target val.Value, sta
 		fn := target.AsFunction()
 		closure := fn.Closure
 		closurePtrs := fn.CellPtrs
-		for j := 0; j < nFree && j < len(closure); j++ {
-			res[nCells+j] = closure[j]
+		for j := range nFree {
 			if j < len(closurePtrs) && closurePtrs[j] != nil {
 				ptrs[nCells+j] = closurePtrs[j]
-			} else {
+				res[nCells+j] = val.ObjectVal(&closurePtrs[j].Header)
+			} else if j < len(closure) {
+				res[nCells+j] = closure[j]
 				ptrs[nCells+j] = closure[j].AsCell()
 			}
 		}
@@ -1124,7 +1281,16 @@ func (vm *VM) setupCalleeCellsForFn(callee *CodeObject, fn *val.PyFunction, stac
 }
 
 func (vm *VM) setupCalleeCells(callee *CodeObject, target val.Value, stack []val.Value, newBase int, argc int) []val.Value {
-	cells, _ := vm.setupCalleeCellsAndPtrs(callee, target, stack, newBase, argc)
+	cells, ptrs := vm.setupCalleeCellsAndPtrs(callee, target, stack, newBase, argc)
+	if len(cells) == 0 && len(ptrs) > 0 {
+		out := make([]val.Value, len(ptrs))
+		for i, p := range ptrs {
+			if p != nil {
+				out[i] = val.ObjectVal(&p.Header)
+			}
+		}
+		return out
+	}
 	return cells
 }
 
@@ -1374,6 +1540,19 @@ func (vm *VM) initBuiltins() {
 			}
 			base := vmInstance.activeBaseOffset
 			activeCells := vmInstance.activeCells
+			activeCellPtrs := vmInstance.activeCellPtrs
+			cellAt := func(idx int) *val.PyCell {
+				if idx < 0 {
+					return nil
+				}
+				if idx < len(activeCellPtrs) && activeCellPtrs[idx] != nil {
+					return activeCellPtrs[idx]
+				}
+				if idx < len(activeCells) && activeCells[idx].IsCell() {
+					return activeCells[idx].AsCell()
+				}
+				return nil
+			}
 
 			stack := ctx.Stack
 			if len(stack) == 0 {
@@ -1391,25 +1570,18 @@ func (vm *VM) initBuiltins() {
 
 			var thisClass *val.PyType
 			found := false
-			if co.ClassCellIdx >= 0 && int(co.ClassCellIdx) < len(activeCells) {
-				c := activeCells[co.ClassCellIdx]
-				if c.IsCell() && !c.AsCell().Value.IsUnbound() && c.AsCell().Value.IsType() {
-					thisClass = c.AsCell().Value.AsType()
-					found = true
-				}
+			if c := cellAt(int(co.ClassCellIdx)); c != nil && !c.Value.IsUnbound() && c.Value.IsType() {
+				thisClass = c.Value.AsType()
+				found = true
 			}
 
 			if !found {
 				for i, fv := range co.FreeVars {
 					if fv.StringEquals("__class__") {
-						idx := len(co.CellVars) + i
-						if idx < len(activeCells) {
-							c := activeCells[idx]
-							if c.IsCell() && !c.AsCell().Value.IsUnbound() && c.AsCell().Value.IsType() {
-								thisClass = c.AsCell().Value.AsType()
-								found = true
-								break
-							}
+						if c := cellAt(len(co.CellVars) + i); c != nil && !c.Value.IsUnbound() && c.Value.IsType() {
+							thisClass = c.Value.AsType()
+							found = true
+							break
 						}
 					}
 				}
@@ -1417,13 +1589,10 @@ func (vm *VM) initBuiltins() {
 			if !found {
 				for i, cv := range co.CellVars {
 					if cv.StringEquals("__class__") {
-						if i < len(activeCells) {
-							c := activeCells[i]
-							if c.IsCell() && !c.AsCell().Value.IsUnbound() && c.AsCell().Value.IsType() {
-								thisClass = c.AsCell().Value.AsType()
-								found = true
-								break
-							}
+						if c := cellAt(i); c != nil && !c.Value.IsUnbound() && c.Value.IsType() {
+							thisClass = c.Value.AsType()
+							found = true
+							break
 						}
 					}
 				}
@@ -1939,7 +2108,10 @@ func (vm *VM) instantiateGenerator(co *CodeObject, callable val.Value, defaults 
 	gen, genVal := vm.acquireGenerator(co.Name, codeVal, genStack, poolCls, globals, ephemeral)
 	spAfterBind := vm.bindFunctionArgsToSlice(co, defaults, kwDefaults, gen.Stack, callerStack[argBase:argBase+nargs], kwnames)
 	gen.SP = spAfterBind
-	if len(co.CellVars) > 0 || len(co.FreeVars) > 0 {
+	if co.DirectCaptureCount > 0 && callable.IsFunction() {
+		copy(gen.Stack[co.DirectCaptureBase:], callable.AsFunction().Closure[:co.DirectCaptureCount])
+	}
+	if len(co.CellVars) > 0 || (len(co.FreeVars) > 0 && co.DirectCaptureCount == 0) {
 		gen.Cells, gen.CellPtrs = vm.setupCalleeCellsWithPool(co, callable, gen.Stack, 0, nargs, true)
 		if len(co.CellVars) > 0 || !callable.IsFunction() {
 			gen.OwnCells = true
@@ -2097,7 +2269,10 @@ func (vm *VM) instantiateCoroutine(co *CodeObject, callable val.Value, defaults 
 	coro, coroVal := vm.acquireCoroutine(co.Name, codeVal, coroStack, poolCls, globals, ephemeral)
 	spAfterBind := vm.bindFunctionArgsToSlice(co, defaults, kwDefaults, coro.Stack, callerStack[argBase:argBase+nargs], kwnames)
 	coro.SP = spAfterBind
-	if len(co.CellVars) > 0 || len(co.FreeVars) > 0 {
+	if co.DirectCaptureCount > 0 && callable.IsFunction() {
+		copy(coro.Stack[co.DirectCaptureBase:], callable.AsFunction().Closure[:co.DirectCaptureCount])
+	}
+	if len(co.CellVars) > 0 || (len(co.FreeVars) > 0 && co.DirectCaptureCount == 0) {
 		coro.Cells, coro.CellPtrs = vm.setupCalleeCellsWithPool(co, callable, coro.Stack, 0, nargs, true)
 		if len(co.CellVars) > 0 || !callable.IsFunction() {
 			coro.OwnCells = true
@@ -2532,6 +2707,14 @@ func (vm *VM) inlineDunderCompare(dunder val.Value, newBase, retSP int, cmpLeft,
 	st.consts = st.cache.frameConsts(dcallee)
 	st.base = newBase
 	switch {
+	case dcallee.DirectCaptureCount > 0:
+		copy(curStack[newBase+dcallee.DirectCaptureBase:], dfn.Closure[:dcallee.DirectCaptureCount])
+		if len(dcallee.CellVars) == 0 {
+			st.cells = nil
+			st.cellPtrs = nil
+		} else {
+			st.cells, st.cellPtrs = vm.setupCalleeCellsAndPtrs(dcallee, dunder, curStack, newBase, 2)
+		}
 	case len(dcallee.CellVars) == 0 && dfn.Closure != nil:
 		st.cells = dfn.Closure
 		st.cellPtrs = dfn.CellPtrs
@@ -3200,9 +3383,9 @@ func (vm *VM) runFrame(co *CodeObject, startBase int, startSP int, startFrameIdx
 	var cellPtrs []*val.PyCell
 	ownCellPtrs := false
 	switch {
-	case activeGen != nil && len(activeGen.CellPtrs) == len(startCells):
+	case activeGen != nil && len(activeGen.CellPtrs) > 0:
 		cellPtrs = activeGen.CellPtrs
-	case activeCoro != nil && len(activeCoro.CellPtrs) == len(startCells):
+	case activeCoro != nil && len(activeCoro.CellPtrs) > 0:
 		cellPtrs = activeCoro.CellPtrs
 	case len(startCells) > 0:
 		cellPtrs = vm.acquireGenCellPtrs(len(startCells))
@@ -4550,6 +4733,14 @@ func (vm *VM) saveFrameAux(st *loopState, frameIdx int) {
 
 //go:noinline
 func (vm *VM) switchCalleeCells(st *loopState, callee *CodeObject, fn *val.PyFunction) {
+	if callee.DirectCaptureCount > 0 {
+		copy(st.stack[st.base+callee.DirectCaptureBase:], fn.Closure[:callee.DirectCaptureCount])
+		st.cells = nil
+		st.cellPtrs = nil
+		vm.activeCells = nil
+		vm.activeCellPtrs = nil
+		return
+	}
 	if !callee.HasCells {
 		st.cells = nil
 		st.cellPtrs = nil
@@ -5284,7 +5475,20 @@ func (vm *VM) instantiateCoroutineSafe(co *CodeObject, callable val.Value, defau
 }
 
 func (vm *VM) bindFunctionArgsSafe(co *CodeObject, defaults []val.Value, kwDefaults *val.PyDict, stack []val.Value, argBase int, nargs int, kwnames []val.Value) (int, bool) {
-	nextSP := vm.bindFunctionArgs(co, defaults, kwDefaults, stack, argBase, nargs, kwnames)
+	return vm.bindFunctionArgsSafeWithCache(co, defaults, kwDefaults, stack, argBase, nargs, kwnames, nil, -1)
+}
+
+func (vm *VM) bindFunctionArgsSafeWithCache(co *CodeObject, defaults []val.Value, kwDefaults *val.PyDict, stack []val.Value, argBase int, nargs int, kwnames []val.Value, callerCache *VMCodeCache, callerIP int) (nextSP int, ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			if re, isRT := r.(runtime.Error); isRT {
+				panic(re)
+			}
+			vm.execCtx.Raise(panicToPyException(r))
+			ok = false
+		}
+	}()
+	nextSP = vm.bindFunctionArgsWithCache(co, defaults, kwDefaults, stack, argBase, nargs, kwnames, callerCache, callerIP)
 	return nextSP, !vm.execCtx.HasException()
 }
 
