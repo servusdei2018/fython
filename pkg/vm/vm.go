@@ -5290,6 +5290,9 @@ func (vm *VM) storeAttrInstanceSlow(instObj *val.PyInstance, obj, attrName, v va
 		if descr.IsMemberDescr() {
 			md := descr.AsMemberDescr()
 			if md.SlotIndex >= 0 && md.SlotIndex < len(instObj.Slots) && instObj.SetSlot(md.SlotIndex, v) {
+				if instObj.Shape != nil && (instType.Flags&val.FlagCustomSetAttr) == 0 {
+					insertAttrPIC(&curAttrPIC[ip], instObj.Shape, md.SlotIndex, typeVer)
+				}
 				curIC[ip] = ICSlot{
 					Kind:            ICKindSlotMember,
 					ExpectedTypeVer: typeVer,
@@ -5328,6 +5331,11 @@ func (vm *VM) storeAttrInstanceSlow(instObj *val.PyInstance, obj, attrName, v va
 		}
 	}
 
+	if instType.Flags&val.FlagForbidDynamicAttrs != 0 {
+		vm.execCtx.Raise(val.NewAttributeError("'" + instType.Name + "' object has no attribute '" + attrName.AsString() + "'"))
+		return
+	}
+
 	if slotIdx, ok := instObj.Shape.Lookup(attrName); ok {
 		instObj.SetSlot(slotIdx, v)
 		insertAttrPIC(&curAttrPIC[ip], instObj.Shape, slotIdx, typeVer)
@@ -5337,11 +5345,6 @@ func (vm *VM) storeAttrInstanceSlow(instObj *val.PyInstance, obj, attrName, v va
 			SlotIndex:       int32(slotIdx),
 			ExpectedTypeVer: typeVer,
 		}
-		return
-	}
-
-	if instType.Flags&val.FlagForbidDynamicAttrs != 0 {
-		vm.execCtx.Raise(val.NewAttributeError("'" + instType.Name + "' object has no attribute '" + attrName.AsString() + "'"))
 		return
 	}
 
