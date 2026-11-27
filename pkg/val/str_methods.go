@@ -243,33 +243,60 @@ func PyFormat(ctx *ExecContext, v Value, spec string) string {
 	return FormatValueCtx(ctx, v, spec, 0).AsString()
 }
 
-// strFormatImpl implements str.format / str.format_map.
-func strFormatImpl(ctx *ExecContext, format string, pos []Value, kw func(string) (Value, bool), depth int) string {
+// parseASCIIDecimal parses a non-negative ASCII decimal integer without
+// allocating a strconv.NumError on non-numeric strings.
+func parseASCIIDecimal(s string) (int, bool) {
+	if len(s) == 0 {
+		return 0, false
+	}
+	const maxDiv10 = int(^uint(0)>>1) / 10
+	const maxMod10 = int(^uint(0)>>1) % 10
+	n := 0
+	for i := range len(s) {
+		c := s[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		d := int(c - '0')
+		if n > maxDiv10 || (n == maxDiv10 && d > maxMod10) {
+			return 0, false
+		}
+		n = n*10 + d
+	}
+	return n, true
+}
+
+// strFormatAppend implements str.format / str.format_map into dst.
+func strFormatAppend(ctx *ExecContext, dst []byte, format string, pos []Value, kw func(string) (Value, bool), depth int) ([]byte, bool) {
 	if depth > 2 {
 		ctx.Raise(NewException(ValueErrorType, "Max string recursion exceeded"))
-		return ""
+		return dst, false
 	}
-	var sb strings.Builder
 	autoIdx := 0
 	n := len(format)
 	for i := 0; i < n; {
+		litStart := i
+		for i < n && format[i] != '{' && format[i] != '}' {
+			i++
+		}
+		if i > litStart {
+			dst = append(dst, format[litStart:i]...)
+		}
+		if i >= n {
+			break
+		}
 		c := format[i]
 		if c == '}' {
 			if i+1 < n && format[i+1] == '}' {
-				sb.WriteByte('}')
+				dst = append(dst, '}')
 				i += 2
 				continue
 			}
 			ctx.Raise(NewException(ValueErrorType, "Single '}' encountered in format string"))
-			return ""
-		}
-		if c != '{' {
-			sb.WriteByte(c)
-			i++
-			continue
+			return dst, false
 		}
 		if i+1 < n && format[i+1] == '{' {
-			sb.WriteByte('{')
+			dst = append(dst, '{')
 			i += 2
 			continue
 		}
@@ -289,7 +316,7 @@ func strFormatImpl(ctx *ExecContext, format string, pos []Value, kw func(string)
 		}
 		if j >= n {
 			ctx.Raise(NewException(ValueErrorType, "expected '}' before end of string"))
-			return ""
+			return dst, false
 		}
 		field := format[i+1 : j]
 		i = j + 1
@@ -311,14 +338,14 @@ func strFormatImpl(ctx *ExecContext, format string, pos []Value, kw func(string)
 				if ch == '!' {
 					if len(rest) < 2 {
 						ctx.Raise(NewException(ValueErrorType, "end of string while looking for conversion specifier"))
-						return ""
+						return dst, false
 					}
 					conv = rest[1]
 					rest = rest[2:]
 					if len(rest) > 0 {
 						if rest[0] != ':' {
 							ctx.Raise(NewException(ValueErrorType, "expected ':' after conversion specifier"))
-							return ""
+							return dst, false
 						}
 						spec = rest[1:]
 					}
@@ -346,30 +373,30 @@ func strFormatImpl(ctx *ExecContext, format string, pos []Value, kw func(string)
 		if first == "" {
 			if autoIdx < 0 {
 				ctx.Raise(NewException(ValueErrorType, "cannot switch from manual field specification to automatic field numbering"))
-				return ""
+				return dst, false
 			}
 			if autoIdx >= len(pos) {
 				ctx.Raise(NewException(IndexErrorType, "Replacement index"+strconv.Itoa(autoIdx)+" out of range for positional args tuple"))
-				return ""
+				return dst, false
 			}
 			obj = pos[autoIdx]
 			autoIdx++
-		} else if idx, err := strconv.Atoi(first); err == nil {
+		} else if idx, ok := parseASCIIDecimal(first); ok {
 			if autoIdx > 0 {
 				ctx.Raise(NewException(ValueErrorType, "cannot switch from automatic field numbering to manual field specification"))
-				return ""
+				return dst, false
 			}
 			autoIdx = -1
 			if idx >= len(pos) {
 				ctx.Raise(NewException(IndexErrorType, "Replacement index"+first+" out of range for positional args tuple"))
-				return ""
+				return dst, false
 			}
 			obj = pos[idx]
 		} else {
 			v, ok := kw(first)
 			if !ok {
 				ctx.Raise(NewException(KeyErrorType, PyStrRepr(first)))
-				return ""
+				return dst, false
 			}
 			obj = v
 		}
@@ -388,11 +415,11 @@ func strFormatImpl(ctx *ExecContext, format string, pos []Value, kw func(string)
 				k := strings.IndexByte(rest, ']')
 				if k < 0 {
 					ctx.Raise(NewException(ValueErrorType, "Missing ']' in format string"))
-					return ""
+					return dst, false
 				}
 				key := rest[1:k]
 				var keyVal Value
-				if ki, err := strconv.Atoi(key); err == nil {
+				if ki, ok := parseASCIIDecimal(key); ok {
 					keyVal = Int64Val(int64(ki))
 				} else {
 					keyVal = NewStringVal(key)
@@ -401,7 +428,7 @@ func strFormatImpl(ctx *ExecContext, format string, pos []Value, kw func(string)
 				rest = rest[k+1:]
 			default:
 				ctx.Raise(NewException(ValueErrorType, "Only '.' or '[' may follow ']' in format field specifier"))
-				return ""
+				return dst, false
 			}
 		}
 		switch conv {
@@ -414,11 +441,68 @@ func strFormatImpl(ctx *ExecContext, format string, pos []Value, kw func(string)
 			obj = NewStringVal(asciiEscape(PyRepr(ctx, obj)))
 		default:
 			ctx.Raise(NewException(ValueErrorType, "Unknown conversion specifier"+string(conv)))
-			return ""
+			return dst, false
 		}
-		sb.WriteString(PyFormat(ctx, obj, spec))
+		if spec == "" {
+			switch {
+			case obj.IsInlineStr():
+				dst, _ = AppendValueBytes(dst, obj)
+				continue
+			case obj.IsString() && obj.Type() == StrType:
+				dst = append(dst, obj.AsStringObj().Data...)
+				continue
+			case obj.IsInt64():
+				dst = strconv.AppendInt(dst, obj.AsInt64(), 10)
+				continue
+			case obj.IsBool():
+				if obj.AsBool() {
+					dst = append(dst, "True"...)
+				} else {
+					dst = append(dst, "False"...)
+				}
+				continue
+			case obj.IsFloat64():
+				dst = AppendFloatRepr(dst, obj.AsFloat64())
+				continue
+			case obj.IsNone():
+				dst = append(dst, "None"...)
+				continue
+			}
+		}
+		dst = append(dst, PyFormat(ctx, obj, spec)...)
 	}
-	return sb.String()
+	return dst, true
+}
+
+// strFormatImpl implements str.format / str.format_map returning a Go string.
+func strFormatImpl(ctx *ExecContext, format string, pos []Value, kw func(string) (Value, bool), depth int) string {
+	var stackBuf [128]byte
+	var buf []byte
+	if len(format)+32 <= len(stackBuf) {
+		buf = stackBuf[:0]
+	} else {
+		buf = make([]byte, 0, len(format)+32)
+	}
+	buf, ok := strFormatAppend(ctx, buf, format, pos, kw, depth)
+	if !ok {
+		return ""
+	}
+	return string(buf)
+}
+
+func strFormatValueImpl(ctx *ExecContext, format string, pos []Value, kw func(string) (Value, bool)) Value {
+	var stackBuf [128]byte
+	var buf []byte
+	if len(format)+32 <= len(stackBuf) {
+		buf = stackBuf[:0]
+	} else {
+		buf = make([]byte, 0, len(format)+32)
+	}
+	buf, ok := strFormatAppend(ctx, buf, format, pos, kw, 0)
+	if !ok {
+		return SmallStringVal("")
+	}
+	return NewStringFromBytes(buf)
 }
 
 // PyASCII computes ascii(v).
@@ -1176,37 +1260,59 @@ func initStrExtraMethods() {
 		} else if v, ok := kw["keepends"]; ok {
 			keep = v.IsTruthy()
 		}
-		var parts []string
+		if len(s) == 0 {
+			return NewListVal()
+		}
+		nLines := strings.Count(s, "\n") + 1
+		items := make([]Value, 0, nLines)
 		start := 0
 		for i := 0; i < len(s); {
-			r, sz := utf8.DecodeRuneInString(s[i:])
-			isBreak := false
-			brLen := sz
-			switch r {
-			case '\n', '\v', '\f', 0x1c, 0x1d, 0x1e, 0x85, 0x2028, 0x2029:
-				isBreak = true
-			case '\r':
-				isBreak = true
-				if i+1 < len(s) && s[i+1] == '\n' {
-					brLen = 2
+			b := s[i]
+			if b < 0x80 {
+				if b == '\n' || b == '\v' || b == '\f' || b == 0x1c || b == 0x1d || b == 0x1e {
+					if keep {
+						items = append(items, NewStringVal(s[start:i+1]))
+					} else {
+						items = append(items, NewStringVal(s[start:i]))
+					}
+					i++
+					start = i
+					continue
 				}
+				if b == '\r' {
+					brLen := 1
+					if i+1 < len(s) && s[i+1] == '\n' {
+						brLen = 2
+					}
+					if keep {
+						items = append(items, NewStringVal(s[start:i+brLen]))
+					} else {
+						items = append(items, NewStringVal(s[start:i]))
+					}
+					i += brLen
+					start = i
+					continue
+				}
+				i++
+				continue
 			}
-			if isBreak {
+			r, sz := utf8.DecodeRuneInString(s[i:])
+			if r == 0x85 || r == 0x2028 || r == 0x2029 {
 				if keep {
-					parts = append(parts, s[start:i+brLen])
+					items = append(items, NewStringVal(s[start:i+sz]))
 				} else {
-					parts = append(parts, s[start:i])
+					items = append(items, NewStringVal(s[start:i]))
 				}
-				i += brLen
+				i += sz
 				start = i
 				continue
 			}
 			i += sz
 		}
 		if start < len(s) {
-			parts = append(parts, s[start:])
+			items = append(items, NewStringVal(s[start:]))
 		}
-		return stringsToList(parts)
+		return NewListFromOwnedSlice(items)
 	})
 
 	// Strip variants accepting None.
@@ -1346,10 +1452,10 @@ func initStrExtraMethods() {
 	set("format", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		pargs, kw := splitStrKw(args, kwnames)
 		s := strSelf("format", pargs)
-		return NewStringVal(strFormatImpl(ctx, s, pargs[1:], func(name string) (Value, bool) {
+		return strFormatValueImpl(ctx, s, pargs[1:], func(name string) (Value, bool) {
 			v, ok := kw[name]
 			return v, ok
-		}, 0))
+		})
 	})
 	set("format_map", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		s := strSelf("format_map", args)
@@ -1358,8 +1464,8 @@ func initStrExtraMethods() {
 			return NoneVal()
 		}
 		mapping := args[1]
-		return NewStringVal(strFormatImpl(ctx, s, nil, func(name string) (Value, bool) {
+		return strFormatValueImpl(ctx, s, nil, func(name string) (Value, bool) {
 			return GetItemCtx(ctx, mapping, NewStringVal(name)), true
-		}, 0))
+		})
 	})
 }

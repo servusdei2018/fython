@@ -16,10 +16,7 @@ type asciiMatcher struct {
 }
 
 func (cs *charSet) hasByte(b byte) bool {
-	if b < 128 {
-		return cs.table[b]
-	}
-	return (cs.latinBits[b>>3]>>(uint(b)&7))&1 != 0
+	return cs.table[b]
 }
 
 // ExecASCIIInto runs the regexp directly against an ASCII or single-byte subject

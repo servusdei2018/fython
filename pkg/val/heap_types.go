@@ -671,6 +671,20 @@ func ListLenHint(v Value) (int, bool) {
 		return len(v.AsBytes().Data), true
 	case KindIter:
 		it := v.AsIter()
+		if it.Kind == IterKindRange {
+			if it.Step > 0 && it.Cur < it.Stop {
+				n := (it.Stop-it.Cur-1)/it.Step + 1
+				if n > 0 && n <= 1<<20 {
+					return int(n), true
+				}
+			} else if it.Step < 0 && it.Cur > it.Stop {
+				n := (it.Cur-it.Stop-1)/(-it.Step) + 1
+				if n > 0 && n <= 1<<20 {
+					return int(n), true
+				}
+			}
+			return 0, false
+		}
 		return ListLenHint(it.Obj)
 	default:
 		return 0, false
@@ -2750,6 +2764,24 @@ func (d *PyDict) initTable(minEntries int) {
 	}
 }
 
+// Reserve pre-sizes an empty combined PyDict to hold at least n entries in one
+// allocation. No-op for non-empty, live, split, or already-sufficient dicts.
+func (d *PyDict) Reserve(n int) {
+	if n <= 0 || d.Live != nil || d.split != nil {
+		return
+	}
+	if d.lockDict() {
+		defer d.mu.Unlock()
+	}
+	if d.used != 0 || d.filled != 0 || d.split != nil {
+		return
+	}
+	if len(d.indices) > 0 && int(d.mask+1)*2 >= n*3 {
+		return
+	}
+	d.initTable(n)
+}
+
 func (d *PyDict) readIndex(slot uint32) uint32 {
 	switch d.indexShift {
 	case 0:
@@ -3911,6 +3943,11 @@ func (s *PySet) Add(v Value) {
 	s.dict.Set(v, NoneVal())
 }
 
+// Reserve pre-sizes an empty PySet to hold at least n elements in one allocation.
+func (s *PySet) Reserve(n int) {
+	s.dict.Reserve(n)
+}
+
 // DictEntries returns the underlying dict entry slice for direct iteration.
 func (s *PySet) DictEntries() []DictEntry {
 	return s.dict.Entries
@@ -4227,6 +4264,58 @@ func NewTypeAliasTypeVal(name string, val Value, typeParams []Value) Value {
 		TypeParams: typeParams,
 	}
 	return Value{ptr: &tat.Header}
+}
+
+// FormatValueBytes formats a Value according to format specifier bytes without
+// forcing a stack-allocated spec slice to escape to the heap.
+func FormatValueBytes(v Value, spec []byte, conversion uint8) Value {
+	return FormatValueBytesCtx(nil, v, spec, conversion)
+}
+
+func FormatValueBytesCtx(ctx *ExecContext, v Value, spec []byte, conversion uint8) Value {
+	if conversion == 's' || conversion == 'r' || conversion == 'a' {
+		v = NewStringVal(v.String())
+	}
+	if len(spec) == 0 {
+		if v.IsAnyString() {
+			return v
+		}
+		if v.IsInt64() {
+			return IntToStringVal(v.AsInt64())
+		}
+		if v.IsFloat64() {
+			var buf [48]byte
+			return NewStringFromBytes(AppendFloatRepr(buf[:0], v.AsFloat64()))
+		}
+		if v.IsBool() {
+			if v.IsTruthy() {
+				return NewStringVal("True")
+			}
+			return NewStringVal("False")
+		}
+		if v.IsNone() {
+			return NewStringVal("None")
+		}
+		return NewStringVal(v.String())
+	}
+
+	switch {
+	case v.IsInt64():
+		return FormatInt64SpecBytesCtx(ctx, v.AsInt64(), spec)
+	case v.Kind() == KindBigInt:
+		return NewStringVal(FormatIntSpecCtx(ctx, &v.AsBigInt().Val, string(spec)))
+	case v.IsBool():
+		return NewStringVal(FormatBoolSpecCtx(ctx, v.AsBool(), string(spec)))
+	case v.IsFloat64():
+		return FormatFloatSpecBytesCtx(ctx, v.AsFloat64(), spec)
+	case v.IsAnyString():
+		var vbuf [7]byte
+		if vb := v.AsBytesScratch(&vbuf); vb != nil {
+			return FormatStrSpecBytesCtx(ctx, string(vb), spec)
+		}
+		return FormatStrSpecBytesCtx(ctx, v.AsString(), spec)
+	}
+	return RaiseTypeError(ctx, "unsupported format string passed to "+v.Type().Name+".__format__")
 }
 
 // FormatValue formats a Value according to format specifier spec and optional conversion ('s', 'r', 'a').

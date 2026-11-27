@@ -155,6 +155,13 @@ type jsonKeyCacheEntry struct {
 	hash   uint32
 }
 
+// jsonSchemaSet is one 2-way set-associative bucket in VM.jsonSchemaCache.
+// mru records the most-recently-used way (0 or 1) so misses evict the other way.
+type jsonSchemaSet struct {
+	ways [2]*val.SplitDictKeys
+	mru  uint8
+}
+
 // jsonParser provides single-pass, allocation-optimized JSON parsing into fython Values.
 type jsonParser struct {
 	src         []byte
@@ -473,10 +480,14 @@ func (p *jsonParser) tryJSONSchemaCache(entries []val.DictEntry, n int) (val.Val
 	}
 	sig := h & 15
 	if p.vm.jsonSchemaCache == nil {
-		p.vm.jsonSchemaCache = new([16]*val.SplitDictKeys)
+		p.vm.jsonSchemaCache = new([16]jsonSchemaSet)
 	}
-	cache := p.vm.jsonSchemaCache
-	if sk := cache[sig]; sk != nil && sk.Count == n {
+	set := &p.vm.jsonSchemaCache[sig]
+	for w := range 2 {
+		sk := set.ways[w]
+		if sk == nil || sk.Count != n {
+			continue
+		}
 		match := true
 		for i := range n {
 			if entries[i].Key != sk.Keys[i] && !val.StringEquals(entries[i].Key, sk.Keys[i]) {
@@ -485,6 +496,7 @@ func (p *jsonParser) tryJSONSchemaCache(entries []val.DictEntry, n int) (val.Val
 			}
 		}
 		if match {
+			set.mru = uint8(w)
 			if sk.DisableSplit.Load() {
 				return val.NoneVal(), false
 			}
@@ -530,7 +542,14 @@ func (p *jsonParser) tryJSONSchemaCache(entries []val.DictEntry, n int) (val.Val
 			slot = (slot + 1) & mask
 		}
 	}
-	cache[sig] = sk
+	victim := int(set.mru ^ 1)
+	if set.ways[0] == nil {
+		victim = 0
+	} else if set.ways[1] == nil {
+		victim = 1
+	}
+	set.ways[victim] = sk
+	set.mru = uint8(victim)
 	return val.DictVal(val.NewSplitDictFromEntries(sk, entries, 0)), true
 }
 

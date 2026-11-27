@@ -112,9 +112,10 @@ type charSet struct {
 	negate bool
 	fold   bool
 	ascii  bool
-	// ascii lookup table for runes < 128, precomputed at compile time.
-	table [128]bool
-	// latinBits is a 256-bit bitmap covering runes 0..255 for SWAR/SIMD scans.
+	// lookup table for runes < 256, precomputed at compile time (matching latinBits).
+	// Sized to 256 so byte-indexed ASCII/bytes scanners need zero bounds checks.
+	table [256]bool
+	// latinBits is a 256-bit bitmap covering runes 0..255 for SIMD scans.
 	latinBits [32]byte
 }
 

@@ -14,7 +14,7 @@ const (
 func scanCharSetBytesScalar(b []byte, cs *charSet) int {
 	tbl := &cs.table
 	for i, c := range b {
-		if c >= 0x80 || !tbl[c] {
+		if !tbl[c] {
 			return i
 		}
 	}
@@ -26,15 +26,7 @@ func scanCharSetBytesSWAR(b []byte, cs *charSet) int {
 	tbl := &cs.table
 	i := 0
 	for ; i+8 <= n; i += 8 {
-		w := binary.LittleEndian.Uint64(b[i:])
-		if w&swarHiBits != 0 {
-			for k := range 8 {
-				c := byte(w >> (k * 8))
-				if c >= 0x80 || !tbl[c] {
-					return i + k
-				}
-			}
-		}
+		w := binary.LittleEndian.Uint64(b[i : i+8])
 		if !tbl[byte(w)] {
 			return i
 		}
@@ -61,8 +53,7 @@ func scanCharSetBytesSWAR(b []byte, cs *charSet) int {
 		}
 	}
 	for ; i < n; i++ {
-		c := b[i]
-		if c >= 0x80 || !tbl[c] {
+		if !tbl[b[i]] {
 			return i
 		}
 	}

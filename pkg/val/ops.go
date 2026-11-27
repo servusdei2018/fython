@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 func RaiseTypeError(ctx *ExecContext, msg string) Value {
@@ -2161,8 +2162,277 @@ func MatMul(ctx *ExecContext, a, b Value) Value {
 	return raiseTypeError(ctx, "unsupported operand type(s) for @: '"+a.Type().Name+"' and '"+b.Type().Name+"'")
 }
 
+type pctSpec struct {
+	left  bool
+	plus  bool
+	space bool
+	zero  bool
+	alt   bool
+	width int // -1 if unspecified
+	prec  int // -1 if unspecified
+}
+
+func parsePctSpec(spec string) (pctSpec, bool) {
+	ps := pctSpec{width: -1, prec: -1}
+	i := 0
+	n := len(spec)
+	for i < n {
+		switch spec[i] {
+		case '-':
+			ps.left = true
+			i++
+		case '+':
+			ps.plus = true
+			i++
+		case ' ':
+			ps.space = true
+			i++
+		case '0':
+			ps.zero = true
+			i++
+		case '#':
+			ps.alt = true
+			i++
+		default:
+			goto widthDone
+		}
+	}
+widthDone:
+	if i < n && spec[i] >= '0' && spec[i] <= '9' {
+		w := 0
+		for i < n && spec[i] >= '0' && spec[i] <= '9' {
+			w = w*10 + int(spec[i]-'0')
+			if w > 1<<20 {
+				return ps, false
+			}
+			i++
+		}
+		ps.width = w
+	}
+	if i < n && spec[i] == '.' {
+		i++
+		p := 0
+		for i < n && spec[i] >= '0' && spec[i] <= '9' {
+			p = p*10 + int(spec[i]-'0')
+			if p > 1<<20 {
+				return ps, false
+			}
+			i++
+		}
+		ps.prec = p
+	}
+	if i != n {
+		return ps, false
+	}
+	return ps, true
+}
+
+func appendPadBytes(buf []byte, ch byte, count int) []byte {
+	for range count {
+		buf = append(buf, ch)
+	}
+	return buf
+}
+
+func appendPctInt64(buf []byte, n int64, convType byte, ps pctSpec) []byte {
+	neg := n < 0
+	var u uint64
+	if neg {
+		u = uint64(-n)
+	} else {
+		u = uint64(n)
+	}
+	base := 10
+	switch convType {
+	case 'x', 'X':
+		base = 16
+	case 'o':
+		base = 8
+	}
+	var numBuf [32]byte
+	digits := strconv.AppendUint(numBuf[:0], u, base)
+	if convType == 'X' {
+		for k := range digits {
+			if digits[k] >= 'a' && digits[k] <= 'f' {
+				digits[k] -= 'a' - 'A'
+			}
+		}
+	}
+	if u == 0 && ps.prec == 0 {
+		digits = digits[:0]
+	}
+	var sign byte
+	switch {
+	case neg:
+		sign = '-'
+	case ps.plus:
+		sign = '+'
+	case ps.space:
+		sign = ' '
+	}
+	var prefix string
+	if ps.alt {
+		switch convType {
+		case 'x':
+			prefix = "0x"
+		case 'X':
+			prefix = "0X"
+		case 'o':
+			prefix = "0o"
+		}
+	}
+	precZeros := 0
+	if ps.prec > len(digits) {
+		precZeros = ps.prec - len(digits)
+	}
+	if ps.alt && convType == 'o' && len(digits) == 0 && precZeros == 0 {
+		// CPython: "%#.0o" % 0 == "0o0"
+		precZeros = 1
+	}
+	signLen := 0
+	if sign != 0 {
+		signLen = 1
+	}
+	contentLen := signLen + len(prefix) + precZeros + len(digits)
+	pad := 0
+	if ps.width > contentLen {
+		pad = ps.width - contentLen
+	}
+	// Explicit precision or left-align overrides the '0' flag.
+	zeroPad := ps.zero && !ps.left && ps.prec < 0
+	if !ps.left && !zeroPad && pad > 0 {
+		buf = appendPadBytes(buf, ' ', pad)
+	}
+	if sign != 0 {
+		buf = append(buf, sign)
+	}
+	if prefix != "" {
+		buf = append(buf, prefix...)
+	}
+	if zeroPad && pad > 0 {
+		buf = appendPadBytes(buf, '0', pad)
+	}
+	if precZeros > 0 {
+		buf = appendPadBytes(buf, '0', precZeros)
+	}
+	buf = append(buf, digits...)
+	if ps.left && pad > 0 {
+		buf = appendPadBytes(buf, ' ', pad)
+	}
+	return buf
+}
+
+func appendPctFloat64(buf []byte, fVal float64, convType byte, ps pctSpec) []byte {
+	upper := convType == 'F' || convType == 'E' || convType == 'G'
+	var sign byte
+	var body []byte
+	var numBuf [64]byte
+	isSpecial := false
+	switch {
+	case math.IsNaN(fVal):
+		isSpecial = true
+		if ps.plus {
+			sign = '+'
+		} else if ps.space {
+			sign = ' '
+		}
+		if upper {
+			body = append(numBuf[:0], "NAN"...)
+		} else {
+			body = append(numBuf[:0], "nan"...)
+		}
+	case math.IsInf(fVal, 0):
+		isSpecial = true
+		switch {
+		case math.IsInf(fVal, -1):
+			sign = '-'
+		case ps.plus:
+			sign = '+'
+		case ps.space:
+			sign = ' '
+		}
+		if upper {
+			body = append(numBuf[:0], "INF"...)
+		} else {
+			body = append(numBuf[:0], "inf"...)
+		}
+	default:
+		neg := math.Signbit(fVal)
+		af := math.Abs(fVal)
+		switch {
+		case neg:
+			sign = '-'
+		case ps.plus:
+			sign = '+'
+		case ps.space:
+			sign = ' '
+		}
+		prec := ps.prec
+		if prec < 0 {
+			prec = 6
+		}
+		switch convType {
+		case 'f', 'F':
+			body = strconv.AppendFloat(numBuf[:0], af, 'f', prec, 64)
+			if ps.alt && prec == 0 {
+				body = append(body, '.')
+			}
+		case 'e', 'E':
+			body = strconv.AppendFloat(numBuf[:0], af, 'e', prec, 64)
+			if ps.alt && prec == 0 {
+				if ei := bytes.IndexByte(body, 'e'); ei >= 0 {
+					body = append(body, 0)
+					copy(body[ei+1:], body[ei:])
+					body[ei] = '.'
+				}
+			}
+		case 'g', 'G':
+			if prec == 0 {
+				prec = 1
+			}
+			if ps.alt {
+				body = append(numBuf[:0], floatBody(af, 'g', prec, true, false)...)
+			} else {
+				body = strconv.AppendFloat(numBuf[:0], af, 'g', prec, 64)
+			}
+		}
+		if upper {
+			for k := range body {
+				if body[k] >= 'a' && body[k] <= 'z' {
+					body[k] -= 'a' - 'A'
+				}
+			}
+		}
+	}
+	signLen := 0
+	if sign != 0 {
+		signLen = 1
+	}
+	contentLen := signLen + len(body)
+	pad := 0
+	if ps.width > contentLen {
+		pad = ps.width - contentLen
+	}
+	zeroPad := ps.zero && !ps.left && !isSpecial
+	if !ps.left && !zeroPad && pad > 0 {
+		buf = appendPadBytes(buf, ' ', pad)
+	}
+	if sign != 0 {
+		buf = append(buf, sign)
+	}
+	if zeroPad && pad > 0 {
+		buf = appendPadBytes(buf, '0', pad)
+	}
+	buf = append(buf, body...)
+	if ps.left && pad > 0 {
+		buf = appendPadBytes(buf, ' ', pad)
+	}
+	return buf
+}
+
 func formatStringModCtx(ctx *ExecContext, fmtStr string, arg Value) Value {
 	var items []Value
+	var singleItem [1]Value
 	var argDict *PyDict
 
 	hasPositional := false
@@ -2186,24 +2456,35 @@ func formatStringModCtx(ctx *ExecContext, fmtStr string, arg Value) Value {
 	case arg.IsDict() && !hasPositional:
 		argDict = arg.AsDict()
 	default:
-		items = []Value{arg}
+		singleItem[0] = arg
+		items = singleItem[:]
 	}
 
-	var sb strings.Builder
+	var stackBuf [128]byte
+	var buf []byte
+	if len(fmtStr)+32 <= len(stackBuf) {
+		buf = stackBuf[:0]
+	} else {
+		buf = make([]byte, 0, len(fmtStr)+32)
+	}
 	itemIdx := 0
 	i := 0
 	n := len(fmtStr)
 	hasAnyMapKey := false
 
 	for i < n {
-		ch := fmtStr[i]
-		if ch != '%' {
-			sb.WriteByte(ch)
+		litStart := i
+		for i < n && fmtStr[i] != '%' {
 			i++
-			continue
+		}
+		if i > litStart {
+			buf = append(buf, fmtStr[litStart:i]...)
+		}
+		if i >= n {
+			break
 		}
 		if i+1 < n && fmtStr[i+1] == '%' {
-			sb.WriteByte('%')
+			buf = append(buf, '%')
 			i += 2
 			continue
 		}
@@ -2225,7 +2506,11 @@ func formatStringModCtx(ctx *ExecContext, fmtStr string, arg Value) Value {
 
 		// Flags / width / precision: e.g. -0+ #, width, .prec, *
 		startSpec := i
+		hasStar := false
 		for i < n && (fmtStr[i] == '-' || fmtStr[i] == '+' || fmtStr[i] == '0' || fmtStr[i] == ' ' || fmtStr[i] == '#' || (fmtStr[i] >= '0' && fmtStr[i] <= '9') || fmtStr[i] == '.' || fmtStr[i] == '*') {
+			if fmtStr[i] == '*' {
+				hasStar = true
+			}
 			i++
 		}
 		if i >= n {
@@ -2235,17 +2520,19 @@ func formatStringModCtx(ctx *ExecContext, fmtStr string, arg Value) Value {
 		convType := fmtStr[i]
 		i++
 
-		for strings.Contains(specifier, "*") {
-			if itemIdx >= len(items) {
-				return raiseTypeError(ctx, "not enough arguments for format string")
+		if hasStar {
+			for strings.Contains(specifier, "*") {
+				if itemIdx >= len(items) {
+					return raiseTypeError(ctx, "not enough arguments for format string")
+				}
+				starVal := items[itemIdx]
+				itemIdx++
+				if !starVal.IsInt64() && !starVal.IsBool() {
+					return raiseTypeError(ctx, "* wants int")
+				}
+				starInt := starVal.AsInt64()
+				specifier = strings.Replace(specifier, "*", strconv.FormatInt(starInt, 10), 1)
 			}
-			starVal := items[itemIdx]
-			itemIdx++
-			if !starVal.IsInt64() && !starVal.IsBool() {
-				return raiseTypeError(ctx, "* wants int")
-			}
-			starInt := starVal.AsInt64()
-			specifier = strings.Replace(specifier, "*", strconv.FormatInt(starInt, 10), 1)
 		}
 
 		var val Value
@@ -2256,10 +2543,6 @@ func formatStringModCtx(ctx *ExecContext, fmtStr string, arg Value) Value {
 			var ok bool
 			val, ok = argDict.Get(InternString(mapKey))
 			if !ok {
-				if ctx != nil {
-					ctx.Raise(NewKeyError(NewStringVal(mapKey)))
-					return NoneVal()
-				}
 				ctx.Raise(NewKeyError(NewStringVal(mapKey)))
 				return NoneVal()
 			}
@@ -2271,77 +2554,97 @@ func formatStringModCtx(ctx *ExecContext, fmtStr string, arg Value) Value {
 			itemIdx++
 		}
 
-		// Convert value based on convType
-		var rendered string
+		// Fast direct-to-buffer paths for common format specifiers.
 		switch convType {
 		case 's':
+			if specifier == "" {
+				switch {
+				case val.IsAnyString():
+					buf, _ = AppendValueBytes(buf, val)
+				case val.IsInt64():
+					buf = strconv.AppendInt(buf, val.AsInt64(), 10)
+				case val.IsBool():
+					if val.AsBool() {
+						buf = append(buf, "True"...)
+					} else {
+						buf = append(buf, "False"...)
+					}
+				case val.IsFloat64():
+					buf = AppendFloatRepr(buf, val.AsFloat64())
+				case val.IsNone():
+					buf = append(buf, "None"...)
+				default:
+					buf = append(buf, modConvert(ctx, val, PyStr)...)
+				}
+				continue
+			}
+			var rendered string
 			if val.IsAnyString() {
 				rendered = val.AsString()
 			} else {
 				rendered = modConvert(ctx, val, PyStr)
 			}
+			buf = append(buf, fmt.Sprintf("%"+specifier+"s", rendered)...)
+			continue
 		case 'r':
-			rendered = modConvert(ctx, val, PyRepr)
+			rendered := modConvert(ctx, val, PyRepr)
+			if specifier != "" {
+				rendered = fmt.Sprintf("%"+specifier+"s", rendered)
+			}
+			buf = append(buf, rendered...)
+			continue
 		case 'a':
-			rendered = asciiEscape(modConvert(ctx, val, PyRepr))
-		case 'd', 'i', 'u':
-			if isAnyInt(val) {
-				rendered = fmt.Sprintf("%"+specifier+"d", toBigInt(val))
-			} else {
-				rendered = fmt.Sprintf("%"+specifier+"d", val.AsInt64())
+			rendered := asciiEscape(modConvert(ctx, val, PyRepr))
+			if specifier != "" {
+				rendered = fmt.Sprintf("%"+specifier+"s", rendered)
 			}
-		case 'x':
-			if isAnyInt(val) {
-				rendered = fmt.Sprintf("%"+specifier+"x", toBigInt(val))
-			} else {
-				rendered = fmt.Sprintf("%"+specifier+"x", val.AsInt64())
+			buf = append(buf, rendered...)
+			continue
+		case 'd', 'i', 'u', 'x', 'X', 'o':
+			if val.IsInt64() || val.IsBool() {
+				if ps, ok := parsePctSpec(specifier); ok {
+					buf = appendPctInt64(buf, val.AsInt64(), convType, ps)
+					continue
+				}
 			}
-		case 'X':
-			if isAnyInt(val) {
-				rendered = fmt.Sprintf("%"+specifier+"X", toBigInt(val))
-			} else {
-				rendered = fmt.Sprintf("%"+specifier+"X", val.AsInt64())
+			verb := convType
+			if verb == 'i' || verb == 'u' {
+				verb = 'd'
 			}
-		case 'o':
 			if isAnyInt(val) {
-				rendered = fmt.Sprintf("%"+specifier+"o", toBigInt(val))
+				buf = append(buf, fmt.Sprintf("%"+specifier+string(verb), toBigInt(val))...)
 			} else {
-				rendered = fmt.Sprintf("%"+specifier+"o", val.AsInt64())
+				buf = append(buf, fmt.Sprintf("%"+specifier+string(verb), val.AsInt64())...)
 			}
-		case 'f', 'F':
+			continue
+		case 'f', 'F', 'e', 'E', 'g', 'G':
 			fVal := toFloat64(val)
-			rendered = fmt.Sprintf("%"+specifier+"f", fVal)
-		case 'e', 'E':
-			fVal := toFloat64(val)
-			rendered = fmt.Sprintf("%"+specifier+"e", fVal)
-		case 'g', 'G':
-			fVal := toFloat64(val)
-			rendered = fmt.Sprintf("%"+specifier+"g", fVal)
+			if ps, ok := parsePctSpec(specifier); ok {
+				buf = appendPctFloat64(buf, fVal, convType, ps)
+				continue
+			}
+			buf = append(buf, fmt.Sprintf("%"+specifier+string(convType), fVal)...)
+			continue
 		case 'c':
 			switch {
 			case val.IsAnyString():
-				rendered = val.AsString()
+				buf, _ = AppendValueBytes(buf, val)
 			case val.IsInt64():
-				rendered = string(rune(val.AsInt64()))
+				buf = utf8.AppendRune(buf, rune(val.AsInt64()))
 			default:
 				return raiseTypeError(ctx, "%c requires int or char")
 			}
+			continue
 		default:
-			rendered = val.String()
+			buf = append(buf, val.String()...)
 		}
-
-		// Apply specifier padding if not already handled
-		if specifier != "" && (convType == 's' || convType == 'r' || convType == 'a') {
-			rendered = fmt.Sprintf("%"+specifier+"s", rendered)
-		}
-		sb.WriteString(rendered)
 	}
 
 	if !hasAnyMapKey && itemIdx < len(items) {
 		return raiseTypeError(ctx, "not all arguments converted during string formatting")
 	}
 
-	return NewStringVal(sb.String())
+	return NewStringFromBytes(buf)
 }
 
 // modConvert renders v with fn, borrowing a VM context only when no active

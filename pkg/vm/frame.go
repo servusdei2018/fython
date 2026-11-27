@@ -195,7 +195,7 @@ const (
 )
 
 type strJoinState struct {
-	buf    strings.Builder
+	buf    []byte
 	sep    val.Value
 	sepLen uint8
 	first  bool
@@ -1020,6 +1020,8 @@ type VM struct {
 	dict16FreeList       []*val.PyDict
 	dict32FreeList       []*val.PyDict
 	strJoinPool          []*strJoinState
+	strJoinScratch       [2][]byte
+	strJoinScratchLen    uint8
 	collectPool          []*collectState
 	loopStatePool        []*loopState
 	genStackPools        [5][][]val.Value
@@ -1032,7 +1034,7 @@ type VM struct {
 	jsonParser           *jsonParser
 	jsonDumpBuf          []byte
 	jsonKeyCache         *[64]jsonKeyCacheEntry
-	jsonSchemaCache      *[16]*val.SplitDictKeys
+	jsonSchemaCache      *[16]jsonSchemaSet
 	maxSP                int
 	maxFrameIdx          int
 	// Continuous join drain state. While activeJoinGen is set, a generator
@@ -1502,6 +1504,8 @@ func (vm *VM) Reset() {
 	if cap(vm.jsonDumpBuf) > 65536 {
 		vm.jsonDumpBuf = nil
 	}
+	vm.strJoinScratch = [2][]byte{}
+	vm.strJoinScratchLen = 0
 	vm.lastReStr = nil
 	vm.lastReStrLen = 0
 	vm.lastReRunes = nil

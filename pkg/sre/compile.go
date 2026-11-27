@@ -666,20 +666,15 @@ func (cs *charSet) slow(r rune) bool {
 func (cs *charSet) init() {
 	for i := range rune(256) {
 		if cs.slow(i) {
-			if i < 128 {
-				cs.table[i] = true
-			}
+			cs.table[i] = true
 			cs.latinBits[i>>3] |= 1 << (uint(i) & 7)
 		}
 	}
 }
 
 func (cs *charSet) has(r rune) bool {
-	if uint32(r) < 128 {
-		return cs.table[r]
-	}
 	if uint32(r) < 256 {
-		return (cs.latinBits[r>>3]>>(uint(r)&7))&1 != 0
+		return cs.table[r]
 	}
 	return cs.slow(r)
 }

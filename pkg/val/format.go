@@ -160,6 +160,307 @@ func parseFormatSpecCtx(ctx *ExecContext, spec, tname string, defaultAlign byte)
 	return fs, true
 }
 
+func parseFormatSpecBytesCtx(ctx *ExecContext, spec []byte, tname string, defaultAlign byte) (fmtSpec, bool) {
+	for _, b := range spec {
+		if b >= 0x80 {
+			return parseFormatSpecCtx(ctx, string(spec), tname, defaultAlign)
+		}
+	}
+	fs := fmtSpec{fill: ' ', width: -1, prec: -1}
+	i := 0
+	n := len(spec)
+	if n >= 2 && isAlignChar(rune(spec[1])) {
+		fs.fill, fs.fillSet, fs.align = rune(spec[0]), true, spec[1]
+		i = 2
+	} else if n >= 1 && isAlignChar(rune(spec[0])) {
+		fs.align = spec[0]
+		i = 1
+	}
+	if i < n && (spec[i] == '+' || spec[i] == '-' || spec[i] == ' ') {
+		fs.sign = spec[i]
+		i++
+	}
+	if i < n && spec[i] == 'z' {
+		fs.z = true
+		i++
+	}
+	if i < n && spec[i] == '#' {
+		fs.alt = true
+		i++
+	}
+	if !fs.fillSet && i < n && spec[i] == '0' {
+		fs.fill = '0'
+		fs.zero = true
+		if fs.align == 0 && defaultAlign == '>' {
+			fs.align = '='
+		}
+		i++
+	}
+	if i < n && spec[i] >= '0' && spec[i] <= '9' {
+		v := 0
+		for i < n && spec[i] >= '0' && spec[i] <= '9' {
+			v = v*10 + int(spec[i]-'0')
+			if v > math.MaxInt32 {
+				fmtValueErrorCtx(ctx, "Too many decimal digits in format string")
+				return fs, false
+			}
+			i++
+		}
+		fs.width = v
+	}
+	if i < n && (spec[i] == ',' || spec[i] == '_') {
+		fs.group = spec[i]
+		fs.groupAfter = true
+		i++
+		if i < n && (spec[i] == ',' || spec[i] == '_') {
+			if spec[i] != fs.group {
+				fmtValueErrorCtx(ctx, "Cannot specify both ',' and '_'.")
+				return fs, false
+			}
+			fmtValueErrorCtx(ctx, "Cannot specify '"+string(spec[i])+"' more than once")
+			return fs, false
+		}
+	}
+	if i < n && spec[i] == '.' {
+		i++
+		start := i
+		v := 0
+		for i < n && spec[i] >= '0' && spec[i] <= '9' {
+			v = v*10 + int(spec[i]-'0')
+			if v > math.MaxInt32 {
+				fmtValueErrorCtx(ctx, "Too many decimal digits in format string")
+				return fs, false
+			}
+			i++
+		}
+		if i == start {
+			fmtValueErrorCtx(ctx, "Format specifier missing precision")
+			return fs, false
+		}
+		fs.prec = v
+	}
+	if i < n && (spec[i] == ',' || spec[i] == '_') {
+		if fs.groupAfter {
+			fmtValueErrorCtx(ctx, "Cannot specify both ',' and '_'.")
+			return fs, false
+		}
+		fmtValueErrorCtx(ctx, "Invalid format specifier '"+string(spec)+"' for object of type '"+tname+"'")
+		return fs, false
+	}
+	if n-i > 1 {
+		fmtValueErrorCtx(ctx, "Invalid format specifier '"+string(spec)+"' for object of type '"+tname+"'")
+		return fs, false
+	}
+	if n-i == 1 {
+		fs.typ = spec[i]
+	}
+	if fs.groupAfter {
+		switch fs.typ {
+		case 0, 'd', 'e', 'f', 'g', 'E', 'G', '%', 'F':
+		case 'b', 'o', 'x', 'X':
+			if fs.group == ',' {
+				fmtValueErrorCtx(ctx, "Cannot specify ',' with '"+string(fs.typ)+"'.")
+				return fs, false
+			}
+		default:
+			if fs.typ > 32 && fs.typ < 128 {
+				fmtValueErrorCtx(ctx, "Cannot specify '"+string(fs.group)+"' with '"+string(fs.typ)+"'.")
+				return fs, false
+			}
+			fmtValueErrorCtx(ctx, "Cannot specify '"+string(fs.group)+"' with '\\x"+strconv.FormatInt(int64(fs.typ), 16)+"'.")
+			return fs, false
+		}
+	}
+	if fs.align == 0 {
+		fs.align = defaultAlign
+	}
+	return fs, true
+}
+
+// FormatInt64SpecBytesCtx formats n according to spec bytes without escaping spec.
+func FormatInt64SpecBytesCtx(ctx *ExecContext, n int64, spec []byte) Value {
+	if len(spec) == 0 || (len(spec) == 1 && spec[0] == 'd') {
+		return IntToStringVal(n)
+	}
+	fs, ok := parseFormatSpecBytesCtx(ctx, spec, "int", '>')
+	if !ok {
+		return SmallStringVal("")
+	}
+	// Fast path for common int64 specs without grouping or float coercion.
+	if !fs.groupAfter && !fs.z && fs.fill < 0x80 && fs.prec < 0 &&
+		(fs.typ == 0 || fs.typ == 'd' || fs.typ == 'x' || fs.typ == 'X' || fs.typ == 'o' || fs.typ == 'b') &&
+		(fs.align == '>' || fs.align == '<' || fs.align == '=') {
+		neg := n < 0
+		var u uint64
+		if neg {
+			u = uint64(-n)
+		} else {
+			u = uint64(n)
+		}
+		base := 10
+		switch fs.typ {
+		case 'x', 'X':
+			base = 16
+		case 'o':
+			base = 8
+		case 'b':
+			base = 2
+		}
+		var numBuf [72]byte
+		digits := strconv.AppendUint(numBuf[:0], u, base)
+		if fs.typ == 'X' {
+			for k := range digits {
+				if digits[k] >= 'a' && digits[k] <= 'f' {
+					digits[k] -= 'a' - 'A'
+				}
+			}
+		}
+		var sign byte
+		switch {
+		case neg:
+			sign = '-'
+		case fs.sign == '+':
+			sign = '+'
+		case fs.sign == ' ':
+			sign = ' '
+		}
+		var prefix string
+		if fs.alt {
+			switch fs.typ {
+			case 'x':
+				prefix = "0x"
+			case 'X':
+				prefix = "0X"
+			case 'o':
+				prefix = "0o"
+			case 'b':
+				prefix = "0b"
+			}
+		}
+		signLen := 0
+		if sign != 0 {
+			signLen = 1
+		}
+		contentLen := signLen + len(prefix) + len(digits)
+		pad := 0
+		if fs.width > contentLen {
+			pad = fs.width - contentLen
+		}
+		var outBuf [128]byte
+		var out []byte
+		if contentLen+pad <= len(outBuf) {
+			out = outBuf[:0]
+		} else {
+			out = make([]byte, 0, contentLen+pad)
+		}
+		fill := byte(fs.fill)
+		switch fs.align {
+		case '<':
+			if sign != 0 {
+				out = append(out, sign)
+			}
+			out = append(out, prefix...)
+			out = append(out, digits...)
+			out = appendPadBytes(out, fill, pad)
+		case '=':
+			if sign != 0 {
+				out = append(out, sign)
+			}
+			out = append(out, prefix...)
+			out = appendPadBytes(out, fill, pad)
+			out = append(out, digits...)
+		default: // '>'
+			out = appendPadBytes(out, fill, pad)
+			if sign != 0 {
+				out = append(out, sign)
+			}
+			out = append(out, prefix...)
+			out = append(out, digits...)
+		}
+		return NewStringFromBytes(out)
+	}
+	return NewStringVal(FormatIntSpecCtx(ctx, big.NewInt(n), string(spec)))
+}
+
+// FormatFloatSpecBytesCtx formats f according to spec bytes without escaping spec.
+func FormatFloatSpecBytesCtx(ctx *ExecContext, f float64, spec []byte) Value {
+	if len(spec) == 0 {
+		var buf [48]byte
+		return NewStringFromBytes(AppendFloatRepr(buf[:0], f))
+	}
+	fs, ok := parseFormatSpecBytesCtx(ctx, spec, "float", '>')
+	if !ok {
+		return SmallStringVal("")
+	}
+	// Fast path for common finite fixed-point/scientific specs without grouping or z-flag.
+	if !fs.groupAfter && !fs.z && fs.fill < 0x80 &&
+		(fs.typ == 'f' || fs.typ == 'F' || fs.typ == 'e' || fs.typ == 'E') &&
+		(fs.align == '>' || fs.align == '<' || fs.align == '=') &&
+		!math.IsNaN(f) && !math.IsInf(f, 0) {
+		ps := pctSpec{
+			left:  fs.align == '<',
+			plus:  fs.sign == '+',
+			space: fs.sign == ' ',
+			zero:  fs.align == '=' && fs.fill == '0',
+			alt:   fs.alt,
+			width: fs.width,
+			prec:  fs.prec,
+		}
+		if fs.align != '=' || fs.fill == '0' {
+			if fs.fill == ' ' || fs.fill == '0' {
+				var outBuf [128]byte
+				out := appendPctFloat64(outBuf[:0], f, fs.typ, ps)
+				return NewStringFromBytes(out)
+			}
+		}
+	}
+	return NewStringVal(formatFloatSpec(ctx, f, fs, "float"))
+}
+
+// FormatStrSpecBytesCtx formats s according to spec bytes without escaping spec.
+func FormatStrSpecBytesCtx(ctx *ExecContext, s string, spec []byte) Value {
+	if len(spec) == 0 {
+		return NewStringVal(s)
+	}
+	fs, ok := parseFormatSpecBytesCtx(ctx, spec, "str", '<')
+	if !ok {
+		return SmallStringVal("")
+	}
+	if fs.typ != 0 && fs.typ != 's' {
+		unknownFormatCodeCtx(ctx, rune(fs.typ), "str")
+		return SmallStringVal("")
+	}
+	if fs.groupAfter {
+		fmtValueErrorCtx(ctx, "Cannot specify '"+string(fs.group)+"' with 's'.")
+		return SmallStringVal("")
+	}
+	if fs.sign == ' ' {
+		fmtValueErrorCtx(ctx, "Space not allowed in string format specifier")
+		return SmallStringVal("")
+	}
+	if fs.sign != 0 {
+		fmtValueErrorCtx(ctx, "Sign not allowed in string format specifier")
+		return SmallStringVal("")
+	}
+	if fs.z {
+		fmtValueErrorCtx(ctx, "Negative zero coercion (z) not allowed in string format specifier")
+		return SmallStringVal("")
+	}
+	if fs.alt {
+		fmtValueErrorCtx(ctx, "Alternate form (#) not allowed in string format specifier")
+		return SmallStringVal("")
+	}
+	if fs.align == '=' {
+		fmtValueErrorCtx(ctx, "'=' alignment not allowed in string format specifier")
+		return SmallStringVal("")
+	}
+	if fs.prec >= 0 && utf8.RuneCountInString(s) > fs.prec {
+		r := []rune(s)
+		s = string(r[:fs.prec])
+	}
+	return NewStringVal(padFormatted(s, fs))
+}
+
 func unknownFormatCodeCtx(ctx *ExecContext, spec rune, tname string) {
 	c := string(spec)
 	if spec > 0x7e || spec < 0x20 {

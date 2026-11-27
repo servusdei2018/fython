@@ -89,7 +89,18 @@ func (vm *VM) opMapAdd(st *loopState, inst uint32, ip, sp int) (int, int, loopCt
 	val.DetachStringBuf(k)
 	val.DetachStringBuf(v)
 	markViewEscaped(v)
-	dictVal.AsDict().Set(k, v)
+	d := dictVal.AsDict()
+	if compKind := DecodeArgA(inst); compKind != 0 && d.Len() == 0 {
+		if n, ok := listAppendHint(stack, sp, depth-1); ok {
+			if compKind == 2 {
+				n = max(n/2, 1)
+			}
+			if n > 5 {
+				d.Reserve(n)
+			}
+		}
+	}
+	d.Set(k, v)
 	ip++
 	return ip, sp, ctlNext
 }
@@ -548,20 +559,28 @@ func (vm *VM) opFormatValue(st *loopState, inst uint32, ip, sp int) (int, int, l
 	hasSpec := uint16(inst) != 0
 	var specStr string
 	var specBuf [7]byte
+	var specBytes []byte
 	if hasSpec {
 		specVal := stack[sp-1]
 		sp--
 		if sb := specVal.AsBytesScratch(&specBuf); sb != nil {
-			specStr = unsafe.String(unsafe.SliceData(sb), len(sb))
+			specBytes = sb
 		} else {
 			specStr = specVal.AsString()
 		}
 	}
 	valToFormat := stack[sp-1]
 	if conversion == 0 && (valToFormat.IsInt64() || valToFormat.IsAnyString() || valToFormat.IsFloat64()) {
-		stack[sp-1] = val.FormatValue(valToFormat, specStr, 0)
+		if specBytes != nil {
+			stack[sp-1] = val.FormatValueBytes(valToFormat, specBytes, 0)
+		} else {
+			stack[sp-1] = val.FormatValue(valToFormat, specStr, 0)
+		}
 		ip++
 		return ip, sp, ctlReload
+	}
+	if specBytes != nil {
+		specStr = string(specBytes)
 	}
 	st.stack = stack
 	st.ip = ip
@@ -737,7 +756,18 @@ func (vm *VM) opSetAdd(st *loopState, inst uint32, ip, sp int) (int, int, loopCt
 	val.DetachStringBuf(item)
 	markViewEscaped(item)
 	setVal := stack[sp-offset]
-	setVal.AsSet().Add(item)
+	s := setVal.AsSet()
+	if compKind := DecodeArgA(inst); compKind != 0 && s.Len() == 0 {
+		if n, ok := listAppendHint(stack, sp, offset); ok {
+			if compKind == 2 {
+				n = max(n/2, 1)
+			}
+			if n > 0 {
+				s.Reserve(n)
+			}
+		}
+	}
+	s.Add(item)
 	ip++
 	return ip, sp, ctlNext
 }

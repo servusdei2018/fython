@@ -3395,9 +3395,11 @@ func (c *Compiler) compileDictComp(expr *ASTExpr) error {
 	// 1. Build initial comprehension dict (ArgA=1 selects 1-alloc fused small dict)
 	c.emitOp(vm.OP_BUILD_MAP, 1, 0)
 
-	var compileClause func(currIdx uint32, depth int) error
-	compileClause = func(currIdx uint32, depth int) error {
+	var compileClause func(currIdx uint32, depth int, hasFilter bool) error
+	compileClause = func(currIdx uint32, depth int, hasFilter bool) error {
 		curr := &c.arena.Comps[currIdx]
+		ifConds := c.arena.GetExprSlice(curr.IfConds)
+		filtered := hasFilter || len(ifConds) > 0
 		if curr.IsAsync {
 			if err := c.compileExpr(curr.Iter); err != nil {
 				return err
@@ -3427,7 +3429,7 @@ func (c *Compiler) compileDictComp(expr *ASTExpr) error {
 			}
 
 			var ifSkips []int
-			for _, ifCond := range c.arena.GetExprSlice(curr.IfConds) {
+			for _, ifCond := range ifConds {
 				if err := c.compileExpr(ifCond); err != nil {
 					return err
 				}
@@ -3435,7 +3437,7 @@ func (c *Compiler) compileDictComp(expr *ASTExpr) error {
 			}
 
 			if curr.Next != 0 {
-				if err := compileClause(curr.Next-1, depth+1); err != nil {
+				if err := compileClause(curr.Next-1, depth+1, filtered); err != nil {
 					return err
 				}
 			} else {
@@ -3483,7 +3485,7 @@ func (c *Compiler) compileDictComp(expr *ASTExpr) error {
 		}
 
 		var ifSkips []int
-		for _, ifCond := range c.arena.GetExprSlice(curr.IfConds) {
+		for _, ifCond := range ifConds {
 			if err := c.compileExpr(ifCond); err != nil {
 				return err
 			}
@@ -3491,7 +3493,7 @@ func (c *Compiler) compileDictComp(expr *ASTExpr) error {
 		}
 
 		if curr.Next != 0 {
-			if err := compileClause(curr.Next-1, depth+1); err != nil {
+			if err := compileClause(curr.Next-1, depth+1, filtered); err != nil {
 				return err
 			}
 		} else {
@@ -3501,7 +3503,11 @@ func (c *Compiler) compileDictComp(expr *ASTExpr) error {
 			if err := c.compileExpr(expr.Right); err != nil {
 				return err
 			}
-			c.emitOp(vm.OP_MAP_ADD, 0, uint16(depth+2))
+			compKind := uint8(1) // 1 = unfiltered comprehension, 2 = filtered comprehension
+			if filtered {
+				compKind = 2
+			}
+			c.emitOp(vm.OP_MAP_ADD, compKind, uint16(depth+2))
 		}
 
 		c.emitOp(vm.OP_JUMP, 0, uint16(loopStart))
@@ -3512,7 +3518,7 @@ func (c *Compiler) compileDictComp(expr *ASTExpr) error {
 		return nil
 	}
 
-	return compileClause(expr.Extra, 1)
+	return compileClause(expr.Extra, 1, false)
 }
 
 func isJumpOp(op vm.Opcode) bool {
@@ -4298,9 +4304,11 @@ func (c *Compiler) compileSetComp(expr *ASTExpr) error {
 	// 1. Build initial empty set
 	c.emitOp(vm.OP_BUILD_SET, 0, 0)
 
-	var compileClause func(currIdx uint32, depth int) error
-	compileClause = func(currIdx uint32, depth int) error {
+	var compileClause func(currIdx uint32, depth int, hasFilter bool) error
+	compileClause = func(currIdx uint32, depth int, hasFilter bool) error {
 		curr := &c.arena.Comps[currIdx]
+		ifConds := c.arena.GetExprSlice(curr.IfConds)
+		filtered := hasFilter || len(ifConds) > 0
 		if curr.IsAsync {
 			if err := c.compileExpr(curr.Iter); err != nil {
 				return err
@@ -4330,7 +4338,7 @@ func (c *Compiler) compileSetComp(expr *ASTExpr) error {
 			}
 
 			var ifSkips []int
-			for _, ifCond := range c.arena.GetExprSlice(curr.IfConds) {
+			for _, ifCond := range ifConds {
 				if err := c.compileExpr(ifCond); err != nil {
 					return err
 				}
@@ -4338,7 +4346,7 @@ func (c *Compiler) compileSetComp(expr *ASTExpr) error {
 			}
 
 			if curr.Next != 0 {
-				if err := compileClause(curr.Next-1, depth+1); err != nil {
+				if err := compileClause(curr.Next-1, depth+1, filtered); err != nil {
 					return err
 				}
 			} else {
@@ -4386,7 +4394,7 @@ func (c *Compiler) compileSetComp(expr *ASTExpr) error {
 		}
 
 		var ifSkips []int
-		for _, ifCond := range c.arena.GetExprSlice(curr.IfConds) {
+		for _, ifCond := range ifConds {
 			if err := c.compileExpr(ifCond); err != nil {
 				return err
 			}
@@ -4394,14 +4402,18 @@ func (c *Compiler) compileSetComp(expr *ASTExpr) error {
 		}
 
 		if curr.Next != 0 {
-			if err := compileClause(curr.Next-1, depth+1); err != nil {
+			if err := compileClause(curr.Next-1, depth+1, filtered); err != nil {
 				return err
 			}
 		} else {
 			if err := c.compileExpr(expr.Left); err != nil {
 				return err
 			}
-			c.emitOp(vm.OP_SET_ADD, 0, uint16(depth+1))
+			compKind := uint8(1) // 1 = unfiltered comprehension, 2 = filtered comprehension
+			if filtered {
+				compKind = 2
+			}
+			c.emitOp(vm.OP_SET_ADD, compKind, uint16(depth+1))
 		}
 
 		c.emitOp(vm.OP_JUMP, 0, uint16(loopStart))
@@ -4412,7 +4424,7 @@ func (c *Compiler) compileSetComp(expr *ASTExpr) error {
 		return nil
 	}
 
-	return compileClause(expr.Extra, 1)
+	return compileClause(expr.Extra, 1, false)
 }
 
 func (c *Compiler) compileGenExp(expr *ASTExpr) error {

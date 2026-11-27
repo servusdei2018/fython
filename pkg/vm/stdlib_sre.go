@@ -642,7 +642,7 @@ func (p *pyPattern) doMatchInlineASCII(ctx *val.ExecContext, mode sre.Mode, strV
 		vm, _ = ctx.VM.(*VM)
 	}
 	reSt, owned := acquireReExecState(vm)
-	var capsBuf [32]int32
+	var capsBuf [64]int32
 	caps, last, matched := p.Re.ExecASCIIIntoWithState(reSt, inBytes, pos, end, mode, false, capsBuf[:0])
 	releaseReExecState(vm, reSt, owned)
 	if !matched {
@@ -732,7 +732,7 @@ func (p *pyPattern) doMatch(ctx *val.ExecContext, mode sre.Mode, strVal, posV, e
 	}
 	pos, end := p.posArgs(ctx, in, posV, endV)
 	reSt, owned := acquireReExecState(vm)
-	var capsBuf [32]int32
+	var capsBuf [64]int32
 	caps, last, ok := p.Re.ExecIntoWithState(reSt, in, pos, end, mode, false, capsBuf[:0])
 	releaseReExecState(vm, reSt, owned)
 	if !ok {
@@ -745,7 +745,7 @@ func (p *pyPattern) doMatch(ctx *val.ExecContext, mode sre.Mode, strVal, posV, e
 }
 
 func (p *pyPattern) iterateASCII(in []byte, pos, end int, fn func(caps []int32, last int) bool) {
-	var capsBuf [32]int32
+	var capsBuf [64]int32
 	mustAdv := false
 	for {
 		caps, last, ok := p.Re.ExecASCIIInto(in, pos, end, sre.ModeSearch, mustAdv, capsBuf[:0])
@@ -763,7 +763,7 @@ func (p *pyPattern) iterateASCII(in []byte, pos, end int, fn func(caps []int32, 
 // iterate drives the CPython 3.7+ iteration protocol used by findall,
 // finditer, sub and split: after an empty match the next match must advance.
 func (p *pyPattern) iterate(in []rune, pos, end int, fn func(caps []int32, last int) bool) {
-	var capsBuf [32]int32
+	var capsBuf [64]int32
 	mustAdv := false
 	for {
 		caps, last, ok := p.Re.ExecInto(in, pos, end, sre.ModeSearch, mustAdv, capsBuf[:0])
@@ -905,7 +905,109 @@ func (p *pyPattern) split(ctx *val.ExecContext, strVal, maxV val.Value) val.Valu
 	return val.NewListVal(out...)
 }
 
+func (p *pyPattern) subASCII(ctx *val.ExecContext, repl, strVal val.Value, inBytes []byte, count int64) (val.Value, int64) {
+	var tmpl *sre.Template
+	var litBytes []byte
+	isLiteral := false
+	isCallable := false
+	switch {
+	case repl.IsAnyString():
+		replStr := repl.AsString()
+		if strings.IndexByte(replStr, '\\') < 0 {
+			litBytes = unsafe.Slice(unsafe.StringData(replStr), len(replStr))
+			isLiteral = true
+		} else {
+			t, err := p.Re.ParseTemplate([]rune(replStr))
+			if err != nil {
+				raiseReError(ctx, err.(*sre.Error), repl)
+				return val.NoneVal(), 0
+			}
+			tmpl = t
+		}
+	case repl.IsBytes() || repl.IsByteArray():
+		ctx.Raise(val.NewException(val.TypeErrorType, "expected str instance, bytes found"))
+		return val.NoneVal(), 0
+	default:
+		isCallable = true
+	}
+
+	var vm *VM
+	if ctx != nil && !val.MultiThreadedFlag.Load() {
+		vm, _ = ctx.VM.(*VM)
+	}
+	reSt, owned := acquireReExecState(vm)
+	var capsBuf [64]int32
+	var out []byte
+	pos := 0
+	lastPos := 0
+	end := len(inBytes)
+	mustAdv := false
+	n := int64(0)
+	var matchFlags uint8
+	if strVal.IsString() {
+		matchFlags = flagMatchASCII
+	}
+
+	for count <= 0 || n < count {
+		caps, last, ok := p.Re.ExecASCIIIntoWithState(reSt, inBytes, pos, end, sre.ModeSearch, mustAdv, capsBuf[:0])
+		if !ok {
+			break
+		}
+		if out == nil {
+			out = make([]byte, 0, len(inBytes))
+		}
+		out = append(out, inBytes[lastPos:int(caps[0])]...)
+		switch {
+		case isCallable:
+			// Release reSt around Python callback in case repl invokes regexes reentrantly.
+			releaseReExecState(vm, reSt, owned)
+			// Non-ephemeral Match so callable repl(m) may retain m safely.
+			mv := newMatch(ctx, p, strVal, caps, last, 0, end, matchFlags)
+			res := ctx.Invoke1(repl, mv)
+			if ctx != nil && ctx.HasException() {
+				return val.NoneVal(), 0
+			}
+			if !res.IsNone() {
+				if res.IsAnyString() {
+					out, _ = val.AppendValueBytes(out, res)
+				} else {
+					panic("TypeError: expected str instance, " + typeNameOf(res) + " found")
+				}
+			}
+			reSt, owned = acquireReExecState(vm)
+		case isLiteral:
+			out = append(out, litBytes...)
+		default:
+			out = tmpl.ExpandBytesInt32(out, inBytes, caps)
+		}
+		lastPos = int(caps[1])
+		pos = int(caps[1])
+		mustAdv = caps[1] == caps[0]
+		n++
+	}
+	releaseReExecState(vm, reSt, owned)
+
+	if n == 0 {
+		if strVal.IsAnyString() && strVal.Type() == val.StrType {
+			return strVal, 0
+		}
+		return val.NewStringFromBytes(inBytes), 0
+	}
+	out = append(out, inBytes[lastPos:]...)
+	return val.NewStringFromBytes(out), n
+}
+
 func (p *pyPattern) sub(ctx *val.ExecContext, repl, strVal, countV val.Value) (val.Value, int64) {
+	if !p.IsBytes {
+		var inlineBuf [7]byte
+		if inBytes, ok := asciiSubjectBytesCtx(ctx, strVal, &inlineBuf); ok {
+			count := max(intArg(ctx, countV, 0), 0)
+			if ctx != nil && ctx.HasException() {
+				return val.NoneVal(), 0
+			}
+			return p.subASCII(ctx, repl, strVal, inBytes, count)
+		}
+	}
 	var buf [7]rune
 	in := p.subjectInto(strVal, &buf)
 	count := intArg(ctx, countV, 0)
@@ -969,13 +1071,10 @@ func (p *pyPattern) sub(ctx *val.ExecContext, repl, strVal, countV val.Value) (v
 		out = append(out, in[lastPos:int(caps[0])]...)
 		switch {
 		case isCallable:
-			mv := newMatch(ctx, p, strVal, caps, last, 0, len(in), val.FlagEphemeralMatch)
+			mv := newMatch(ctx, p, strVal, caps, last, 0, len(in), 0)
 			res := ctx.Invoke1(repl, mv)
-			if vm, ok := ctx.VM.(*VM); ok && vm != nil && !val.MultiThreadedFlag.Load() {
-				m := (*pyMatch)(unsafe.Pointer(mv.HeaderPtr()))
-				if (m.Header.Flags&val.FlagEphemeralMatch) != 0 && res.HeaderPtr() != &m.Header {
-					vm.releaseMatch(m)
-				}
+			if ctx != nil && ctx.HasException() {
+				return false
 			}
 			out = append(out, p.valueRunes(res)...)
 		case isLiteral:
@@ -987,6 +1086,9 @@ func (p *pyPattern) sub(ctx *val.ExecContext, repl, strVal, countV val.Value) (v
 		n++
 		return true
 	})
+	if ctx != nil && ctx.HasException() {
+		return val.NoneVal(), 0
+	}
 	out = append(out, in[lastPos:]...)
 	return p.fromRunes(out), n
 }
@@ -1021,7 +1123,7 @@ func (sc *pyScanner) step(ctx *val.ExecContext, mode sre.Mode) val.Value {
 	if sc.done || sc.next > sc.EndPos {
 		return val.NoneVal()
 	}
-	var capsBuf [32]int32
+	var capsBuf [64]int32
 	var caps []int32
 	var last int
 	var ok bool

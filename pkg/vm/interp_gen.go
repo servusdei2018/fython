@@ -131,6 +131,8 @@ func (vm *VM) saveAndPushInlineFrame(
 	vm.activeFrameIdx = st.frameIdx
 }
 
+const maxStrJoinScratchCap = 65536
+
 func (vm *VM) acquireStrJoinState(sep val.Value) *strJoinState {
 	var js *strJoinState
 	if n := len(vm.strJoinPool); n > 0 {
@@ -140,7 +142,13 @@ func (vm *VM) acquireStrJoinState(sep val.Value) *strJoinState {
 	} else {
 		js = &strJoinState{}
 	}
-	js.buf.Reset()
+	if vm.strJoinScratchLen > 0 {
+		vm.strJoinScratchLen--
+		js.buf = vm.strJoinScratch[vm.strJoinScratchLen][:0]
+		vm.strJoinScratch[vm.strJoinScratchLen] = nil
+	} else {
+		js.buf = nil
+	}
 	js.sep = sep
 	js.sepLen = uint8(min(sep.StringByteLen(), 255))
 	js.first = true
@@ -152,7 +160,11 @@ func (vm *VM) releaseStrJoinState(js *strJoinState) {
 	if js == nil {
 		return
 	}
-	js.buf.Reset()
+	if buf := js.buf; cap(buf) > 0 && cap(buf) <= maxStrJoinScratchCap && vm.strJoinScratchLen < uint8(len(vm.strJoinScratch)) {
+		vm.strJoinScratch[vm.strJoinScratchLen] = buf[:0]
+		vm.strJoinScratchLen++
+	}
+	js.buf = nil
 	js.sep = val.Value{}
 	js.sepLen = 0
 	js.first = true
@@ -166,27 +178,23 @@ func (js *strJoinState) appendValue(v val.Value) bool {
 	if !v.IsAnyString() {
 		return false
 	}
-	if js.buf.Cap() == 0 {
-		js.buf.Grow(8192)
+	if cap(js.buf) == 0 {
+		js.buf = make([]byte, 0, 256)
 	}
 	if !js.first && js.sepLen > 0 {
-		js.sep.WriteToBuilder(&js.buf)
+		js.buf, _ = val.AppendValueBytes(js.buf, js.sep)
 	}
 	js.first = false
 	js.count++
-	v.WriteToBuilder(&js.buf)
+	js.buf, _ = val.AppendValueBytes(js.buf, v)
 	return true
 }
 
 func (js *strJoinState) materialize() val.Value {
-	n := js.buf.Len()
-	if n == 0 {
-		return val.NewStringVal("")
+	if len(js.buf) == 0 {
+		return val.SmallStringVal("")
 	}
-	if n <= 7 {
-		return val.SmallStringVal(js.buf.String())
-	}
-	return val.NewStringVal(js.buf.String())
+	return val.NewStringFromBytes(js.buf)
 }
 
 func (vm *VM) acquireCollectState(mode uint8) *collectState {

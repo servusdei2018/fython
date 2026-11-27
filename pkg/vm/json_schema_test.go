@@ -144,3 +144,62 @@ assert not errors, f"concurrent errors: {errors}"
 `)
 	defer eng.ReleaseVM(v)
 }
+
+func TestJSONSchemaTwoWayCollisionsAndDisableSplit(t *testing.T) {
+	// Find 4 distinct 2-key schemas that collide in the same 4-bit set (sig = h & 15)
+	// regardless of the process maphash seed.
+	type schema struct {
+		k1, k2 string
+		json   string
+	}
+	buckets := make(map[uint32][]schema)
+	var target []schema
+	for i := range 200 {
+		k1 := "a" + string(rune('0'+(i/10)%10)) + string(rune('0'+i%10))
+		k2 := "b" + string(rune('0'+(i/10)%10)) + string(rune('0'+i%10))
+		h1 := val.HashValue(val.InternString(k1))
+		h2 := val.HashValue(val.InternString(k2))
+		sig := ((h1 * 31) ^ h2) & 15
+		sc := schema{k1: k1, k2: k2, json: `{"` + k1 + `": 1, "` + k2 + `": 2}`}
+		buckets[sig] = append(buckets[sig], sc)
+		if len(buckets[sig]) == 4 {
+			target = buckets[sig]
+			break
+		}
+	}
+	if len(target) < 4 {
+		t.Fatalf("failed to find 4 colliding schemas")
+	}
+
+	src := `
+import json
+s0 = '` + target[0].json + `'
+s1 = '` + target[1].json + `'
+s2 = '` + target[2].json + `'
+s3 = '` + target[3].json + `'
+
+# Alternate 2 colliding schemas: both stay resident in the 2-way set.
+for _ in range(50):
+    d0 = json.loads(s0)
+    d1 = json.loads(s1)
+    assert d0["` + target[0].k1 + `"] == 1 and d0["` + target[0].k2 + `"] == 2
+    assert d1["` + target[1].k1 + `"] == 1 and d1["` + target[1].k2 + `"] == 2
+
+# Trigger DisableSplit on s0 by mutating parsed instances with a new key,
+# while s1 continues hitting the other way cleanly.
+for _ in range(20):
+    m = json.loads(s0)
+    m["extra"] = 99
+    assert m["extra"] == 99
+    assert json.loads(s1)["` + target[1].k1 + `"] == 1
+
+# Cycle through all 4 colliding schemas to exercise 2-way LRU replacement.
+for _ in range(10):
+    assert json.loads(s0)["` + target[0].k2 + `"] == 2
+    assert json.loads(s1)["` + target[1].k2 + `"] == 2
+    assert json.loads(s2)["` + target[2].k2 + `"] == 2
+    assert json.loads(s3)["` + target[3].k2 + `"] == 2
+`
+	eng, v := runPySource(t, src)
+	defer eng.ReleaseVM(v)
+}

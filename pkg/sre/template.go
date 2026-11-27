@@ -3,6 +3,7 @@ package sre
 import (
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // TemplatePart is either a literal run or a group reference.
@@ -160,6 +161,27 @@ func (t *Template) ExpandInt32(dst []rune, input []rune, caps []int32) []rune {
 	for _, p := range t.Parts {
 		if p.Group < 0 {
 			dst = append(dst, p.Lit...)
+			continue
+		}
+		s, e := int(caps[2*p.Group]), int(caps[2*p.Group+1])
+		if s >= 0 && e >= 0 {
+			dst = append(dst, input[s:e]...)
+		}
+	}
+	return dst
+}
+
+// ExpandBytesInt32 appends the UTF-8 expansion of the template for an ASCII byte subject.
+func (t *Template) ExpandBytesInt32(dst []byte, input []byte, caps []int32) []byte {
+	for _, p := range t.Parts {
+		if p.Group < 0 {
+			for _, r := range p.Lit {
+				if r < 0x80 {
+					dst = append(dst, byte(r))
+				} else {
+					dst = utf8.AppendRune(dst, r)
+				}
+			}
 			continue
 		}
 		s, e := int(caps[2*p.Group]), int(caps[2*p.Group+1])
