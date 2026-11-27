@@ -1992,6 +1992,15 @@ func init() {
 			standaloneVMPool.Put(v)
 		}
 	}
+	val.AcquireExecContextDirectHook = func() *val.ExecContext {
+		v := standaloneVMPool.Get().(*VM)
+		return &v.execCtx
+	}
+	val.ReleaseExecContextDirectHook = func(ctx *val.ExecContext) {
+		v := ctx.VM.(*VM)
+		v.Reset()
+		standaloneVMPool.Put(v)
+	}
 	val.AcquireDictTable16Hook = acquireDictTable16
 	val.ReleaseDictTable16Hook = releaseDictTable16
 	val.AcquireEphemeralTupleHook = acquireEphemeralTuplePooled

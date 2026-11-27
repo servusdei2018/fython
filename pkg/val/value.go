@@ -138,6 +138,10 @@ const (
 	FlagIsBytesSub uint32 = 1 << 11
 	// FlagIsTupleSub marks any strict subclass of TupleType.
 	FlagIsTupleSub uint32 = 1 << 12
+	// FlagDefaultIntEq marks a strict int subclass whose resolved __eq__ is IntType's built-in int.__eq__.
+	FlagDefaultIntEq uint32 = 1 << 13
+	// FlagDefaultStrEq marks a strict str subclass whose resolved __eq__ is StrType's built-in str.__eq__.
+	FlagDefaultStrEq uint32 = 1 << 14
 )
 
 // String returns the human-readable name of the Kind.
@@ -792,6 +796,130 @@ func objectTruthyCtx(ctx *ExecContext, v Value) bool {
 	return true
 }
 
+// hasCustomEq reports whether v's type defines a non-default __eq__ that must be
+// dispatched via RichCompare rather than handled by equalsDefaultPrimSub.
+func hasCustomEq(v Value) bool {
+	tp := v.Type()
+	if tp == nil || tp.dunderEq.ptr == nil {
+		return false
+	}
+	if tp == IntType || tp == BoolType || tp == FloatType || tp == BigIntType || tp == ComplexType || tp == StrType {
+		return false
+	}
+	if (tp.Flags & (FlagDefaultIntEq | FlagDefaultStrEq)) != 0 {
+		return false
+	}
+	return true
+}
+
+// equalsDefaultPrimSub provides a zero-allocation fast path for equality comparisons
+// involving int or str subclasses that inherit built-in int.__eq__ or str.__eq__.
+// Returns (equal, true) when resolved without dunder dispatch, or (false, false)
+// to fall back to RichCompare.
+func equalsDefaultPrimSub(a, b Value) (bool, bool) {
+	if a.ptr == nil || b.ptr == nil {
+		return false, false
+	}
+	if a.ptr.Kind == KindMappingProxy || b.ptr.Kind == KindMappingProxy {
+		return false, false
+	}
+
+	aFlags := uint32(0)
+	if a.ptr.Kind == KindInstance && a.ptr.Type != nil {
+		aFlags = a.ptr.Type.Flags
+	}
+	bFlags := uint32(0)
+	if b.ptr.Kind == KindInstance && b.ptr.Type != nil {
+		bFlags = b.ptr.Type.Flags
+	}
+
+	aIsIntSub := (aFlags & FlagDefaultIntEq) != 0
+	bIsIntSub := (bFlags & FlagDefaultIntEq) != 0
+	if aIsIntSub || bIsIntSub {
+		if (!aIsIntSub && hasCustomEq(a)) || (!bIsIntSub && hasCustomEq(b)) {
+			return false, false
+		}
+		ua := a
+		if aIsIntSub {
+			inst := (*PyInstance)(unsafe.Pointer(a.ptr))
+			if len(inst.Slots) == 0 {
+				return false, false
+			}
+			inner := inst.Slots[0]
+			if inner.ptr != &tagInt64 && (inner.ptr == nil || inner.ptr.Kind != KindBigInt) {
+				return false, false
+			}
+			ua = inner
+		}
+		ub := b
+		if bIsIntSub {
+			inst := (*PyInstance)(unsafe.Pointer(b.ptr))
+			if len(inst.Slots) == 0 {
+				return false, false
+			}
+			inner := inst.Slots[0]
+			if inner.ptr != &tagInt64 && (inner.ptr == nil || inner.ptr.Kind != KindBigInt) {
+				return false, false
+			}
+			ub = inner
+		}
+		if ua.ptr == &tagInt64 && ub.ptr == &tagInt64 {
+			return ua.num == ub.num, true
+		}
+		if ua.ptr.Kind == KindComplex || ub.ptr.Kind == KindComplex {
+			if r, ok := complexCompare(ua, ub, CmpEQ); ok {
+				return r.AsBool(), true
+			}
+			return false, false
+		}
+		aNum := ua.ptr == &tagInt64 || ua.ptr == &tagBool || ua.ptr == &tagFloat64 || ua.ptr.Kind == KindBigInt
+		bNum := ub.ptr == &tagInt64 || ub.ptr == &tagBool || ub.ptr == &tagFloat64 || ub.ptr.Kind == KindBigInt
+		if aNum && bNum {
+			return equalsStructural(ua, ub), true
+		}
+		return false, true
+	}
+
+	aIsStrSub := (aFlags & FlagDefaultStrEq) != 0
+	bIsStrSub := (bFlags & FlagDefaultStrEq) != 0
+	if aIsStrSub || bIsStrSub {
+		if (!aIsStrSub && hasCustomEq(a)) || (!bIsStrSub && hasCustomEq(b)) {
+			return false, false
+		}
+		ua := a
+		if aIsStrSub {
+			inst := (*PyInstance)(unsafe.Pointer(a.ptr))
+			if len(inst.Slots) == 0 {
+				return false, false
+			}
+			inner := inst.Slots[0]
+			if inner.ptr != &tagInlineStr && (inner.ptr == nil || inner.ptr.Kind != KindString) {
+				return false, false
+			}
+			ua = inner
+		}
+		ub := b
+		if bIsStrSub {
+			inst := (*PyInstance)(unsafe.Pointer(b.ptr))
+			if len(inst.Slots) == 0 {
+				return false, false
+			}
+			inner := inst.Slots[0]
+			if inner.ptr != &tagInlineStr && (inner.ptr == nil || inner.ptr.Kind != KindString) {
+				return false, false
+			}
+			ub = inner
+		}
+		if (ua.ptr == &tagInlineStr || ua.ptr.Kind == KindString) &&
+			(ub.ptr == &tagInlineStr || ub.ptr.Kind == KindString) {
+			return StringEquals(ua, ub), true
+		}
+		return false, true
+	}
+
+	return false, false
+}
+
 // Equals performs Python value equality comparison (a == b).
 func Equals(a, b Value) bool {
 	if a.ptr == b.ptr {
@@ -803,6 +931,12 @@ func Equals(a, b Value) bool {
 		}
 		// Identical heap object pointer.
 		return true
+	}
+
+	if (a.ptr != nil && a.ptr.Kind == KindInstance) || (b.ptr != nil && b.ptr.Kind == KindInstance) {
+		if eq, handled := equalsDefaultPrimSub(a, b); handled {
+			return eq
+		}
 	}
 
 	// Custom __eq__ dispatch on user classes

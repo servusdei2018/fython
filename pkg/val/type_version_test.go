@@ -66,7 +66,11 @@ func TestTypeLookupCacheSkipsNonInternedNames(t *testing.T) {
 		t.Fatalf("non-interned lookup must still resolve")
 	}
 	for i := range typeLookupCache {
-		if e := typeLookupCache[i].Load(); e != nil && e.name == heapName {
+		s := &typeLookupCache[i]
+		s.mu.Lock()
+		cached := s.ver != 0 && s.name == heapName
+		s.mu.Unlock()
+		if cached {
 			t.Fatalf("non-interned heap string was cached")
 		}
 	}

@@ -30,6 +30,20 @@ type ExecContext struct {
 // to obtain a temporary VM ExecContext when invoked without an explicit ctx.
 var AcquireExecContextHook func() (*ExecContext, func())
 
+// AcquireExecContextDirectHook and ReleaseExecContextDirectHook provide a
+// zero-allocation pair for acquiring and releasing a pooled VM ExecContext
+// without allocating a release closure.
+var (
+	AcquireExecContextDirectHook func() *ExecContext
+	ReleaseExecContextDirectHook func(*ExecContext)
+)
+
+// invokeArgBufPool recycles small argument buffers for invoke1Slow/invoke2Slow/
+// invoke3Slow when ctx == nil, avoiding per-call heap slice allocations.
+var invokeArgBufPool = sync.Pool{
+	New: func() any { return new([3]Value) },
+}
+
 // ResolveLazyImportHook allows resolving a PyLazyImport placeholder through the VM.
 var ResolveLazyImportHook func(vm any, mod *PyModule, name Value, lazyVal Value) (Value, error)
 
@@ -121,19 +135,34 @@ func (ctx *ExecContext) Invoke1(callable, a Value) Value {
 
 //go:noinline
 func (ctx *ExecContext) invoke1Slow(callable, a Value) Value {
-	if !callable.IsBuiltinFunc() && (ctx == nil || ctx.CallHook == nil) && AcquireExecContextHook != nil {
-		tmpCtx, release := AcquireExecContextHook()
-		defer release()
-		return tmpCtx.Invoke1(callable, a)
+	if !callable.IsBuiltinFunc() && (ctx == nil || ctx.CallHook == nil) {
+		if AcquireExecContextDirectHook != nil && ReleaseExecContextDirectHook != nil {
+			tmpCtx := AcquireExecContextDirectHook()
+			res := tmpCtx.Invoke1(callable, a)
+			ReleaseExecContextDirectHook(tmpCtx)
+			return res
+		}
+		if AcquireExecContextHook != nil {
+			tmpCtx, release := AcquireExecContextHook()
+			defer release()
+			return tmpCtx.Invoke1(callable, a)
+		}
 	}
-	args := []Value{a}
+	buf := invokeArgBufPool.Get().(*[3]Value)
+	buf[0] = a
+	var res Value
 	if callable.IsBuiltinFunc() {
-		return callable.AsBuiltinFunc().Fn(ctx, callable, args, nil)
+		res = callable.AsBuiltinFunc().Fn(ctx, callable, buf[:1], nil)
+	} else if tpCall := callable.Type().Slots.TpCall; tpCall != nil {
+		res = tpCall(ctx, callable, buf[:1], nil)
+	} else {
+		buf[0] = Value{}
+		invokeArgBufPool.Put(buf)
+		return RaiseTypeError(ctx, "'"+callable.Type().Name+"' object is not callable")
 	}
-	if tpCall := callable.Type().Slots.TpCall; tpCall != nil {
-		return tpCall(ctx, callable, args, nil)
-	}
-	return RaiseTypeError(ctx, "'"+callable.Type().Name+"' object is not callable")
+	buf[0] = Value{}
+	invokeArgBufPool.Put(buf)
+	return res
 }
 
 // Invoke2 invokes callable with 2 positional arguments (a, b) with 0 heap allocations.
@@ -159,19 +188,37 @@ func (ctx *ExecContext) Invoke2(callable, a, b Value) Value {
 
 //go:noinline
 func (ctx *ExecContext) invoke2Slow(callable, a, b Value) Value {
-	if !callable.IsBuiltinFunc() && (ctx == nil || ctx.CallHook == nil) && AcquireExecContextHook != nil {
-		tmpCtx, release := AcquireExecContextHook()
-		defer release()
-		return tmpCtx.Invoke2(callable, a, b)
+	if !callable.IsBuiltinFunc() && (ctx == nil || ctx.CallHook == nil) {
+		if AcquireExecContextDirectHook != nil && ReleaseExecContextDirectHook != nil {
+			tmpCtx := AcquireExecContextDirectHook()
+			res := tmpCtx.Invoke2(callable, a, b)
+			ReleaseExecContextDirectHook(tmpCtx)
+			return res
+		}
+		if AcquireExecContextHook != nil {
+			tmpCtx, release := AcquireExecContextHook()
+			defer release()
+			return tmpCtx.Invoke2(callable, a, b)
+		}
 	}
-	args := []Value{a, b}
+	buf := invokeArgBufPool.Get().(*[3]Value)
+	buf[0] = a
+	buf[1] = b
+	var res Value
 	if callable.IsBuiltinFunc() {
-		return callable.AsBuiltinFunc().Fn(ctx, callable, args, nil)
+		res = callable.AsBuiltinFunc().Fn(ctx, callable, buf[:2], nil)
+	} else if tpCall := callable.Type().Slots.TpCall; tpCall != nil {
+		res = tpCall(ctx, callable, buf[:2], nil)
+	} else {
+		buf[0] = Value{}
+		buf[1] = Value{}
+		invokeArgBufPool.Put(buf)
+		return RaiseTypeError(ctx, "'"+callable.Type().Name+"' object is not callable")
 	}
-	if tpCall := callable.Type().Slots.TpCall; tpCall != nil {
-		return tpCall(ctx, callable, args, nil)
-	}
-	return RaiseTypeError(ctx, "'"+callable.Type().Name+"' object is not callable")
+	buf[0] = Value{}
+	buf[1] = Value{}
+	invokeArgBufPool.Put(buf)
+	return res
 }
 
 // Invoke3 invokes callable with 3 positional arguments (a, b, c) with 0 heap allocations.
@@ -198,19 +245,40 @@ func (ctx *ExecContext) Invoke3(callable, a, b, c Value) Value {
 
 //go:noinline
 func (ctx *ExecContext) invoke3Slow(callable, a, b, c Value) Value {
-	if !callable.IsBuiltinFunc() && (ctx == nil || ctx.CallHook == nil) && AcquireExecContextHook != nil {
-		tmpCtx, release := AcquireExecContextHook()
-		defer release()
-		return tmpCtx.Invoke3(callable, a, b, c)
+	if !callable.IsBuiltinFunc() && (ctx == nil || ctx.CallHook == nil) {
+		if AcquireExecContextDirectHook != nil && ReleaseExecContextDirectHook != nil {
+			tmpCtx := AcquireExecContextDirectHook()
+			res := tmpCtx.Invoke3(callable, a, b, c)
+			ReleaseExecContextDirectHook(tmpCtx)
+			return res
+		}
+		if AcquireExecContextHook != nil {
+			tmpCtx, release := AcquireExecContextHook()
+			defer release()
+			return tmpCtx.Invoke3(callable, a, b, c)
+		}
 	}
-	args := []Value{a, b, c}
+	buf := invokeArgBufPool.Get().(*[3]Value)
+	buf[0] = a
+	buf[1] = b
+	buf[2] = c
+	var res Value
 	if callable.IsBuiltinFunc() {
-		return callable.AsBuiltinFunc().Fn(ctx, callable, args, nil)
+		res = callable.AsBuiltinFunc().Fn(ctx, callable, buf[:3], nil)
+	} else if tpCall := callable.Type().Slots.TpCall; tpCall != nil {
+		res = tpCall(ctx, callable, buf[:3], nil)
+	} else {
+		buf[0] = Value{}
+		buf[1] = Value{}
+		buf[2] = Value{}
+		invokeArgBufPool.Put(buf)
+		return RaiseTypeError(ctx, "'"+callable.Type().Name+"' object is not callable")
 	}
-	if tpCall := callable.Type().Slots.TpCall; tpCall != nil {
-		return tpCall(ctx, callable, args, nil)
-	}
-	return RaiseTypeError(ctx, "'"+callable.Type().Name+"' object is not callable")
+	buf[0] = Value{}
+	buf[1] = Value{}
+	buf[2] = Value{}
+	invokeArgBufPool.Put(buf)
+	return res
 }
 
 // Call invokes callable with arbitrary positional arguments and keyword names.
@@ -1049,23 +1117,37 @@ func MustNewType(name string, bases []*PyType, dict *PyDict) *PyType {
 }
 
 // LookupMRO searches t.MRO in linearization order for internedName. Results
-// (including misses) are served from a global cache keyed on the type version
-// tag and the interned name, so a hit costs one integer and one 16-byte
-// identity compare and never walks the MRO. Names that are not interned
+// (including misses) are served from a global allocation-free cache keyed on
+// the type version tag and the interned name, so a hit never walks the MRO
+// and a miss never allocates on the heap. Names that are not interned
 // (neither inline nor FlagInterned) bypass the cache.
 func (t *PyType) LookupMRO(internedName Value) (Value, *PyType, bool) {
 	if !internedName.IsInterned() {
 		return t.lookupMROUncached(internedName)
 	}
 	ver := t.Version()
-	slot := &typeLookupCache[typeLookupSlot(ver, internedName)]
-	if e := slot.Load(); e != nil && e.ver == ver && e.name == internedName {
-		return e.val, e.owner, e.found
+	if ver == 0 {
+		return t.lookupMROUncached(internedName)
 	}
+	slot := &typeLookupCache[typeLookupSlot(ver, internedName)]
+	slot.mu.Lock()
+	if ver != 0 && slot.ver == ver && slot.name == internedName {
+		v, owner, found := slot.val, slot.owner, slot.found
+		slot.mu.Unlock()
+		return v, owner, found
+	}
+	slot.mu.Unlock()
+
 	v, owner, ok := t.lookupMROUncached(internedName)
 	// Only publish when the type was not mutated while we walked it.
-	if t.Version() == ver {
-		slot.Store(&typeLookupEntry{ver: ver, name: internedName, val: v, owner: owner, found: ok})
+	if ver != 0 && t.Version() == ver {
+		slot.mu.Lock()
+		slot.ver = ver
+		slot.name = internedName
+		slot.val = v
+		slot.owner = owner
+		slot.found = ok
+		slot.mu.Unlock()
 	}
 	return v, owner, ok
 }
@@ -1089,18 +1171,34 @@ func (t *PyType) LookupMROAfter(startClass *PyType, internedName Value) (Value, 
 		return t.lookupMROAfterUncached(startClass, internedName)
 	}
 	ver := t.Version()
-	slot := &superLookupCache[typeLookupSlot(ver^uint64(uintptr(unsafe.Pointer(startClass))), internedName)]
-	if e := slot.Load(); e != nil && e.ver == ver && e.start == startClass && e.name == internedName {
-		return e.val, e.owner, e.found
+	if ver == 0 {
+		return t.lookupMROAfterUncached(startClass, internedName)
 	}
+	slot := &superLookupCache[typeLookupSlot(ver^uint64(uintptr(unsafe.Pointer(startClass))), internedName)]
+	slot.mu.Lock()
+	if ver != 0 && slot.ver == ver && slot.start == startClass && slot.name == internedName {
+		v, owner, found := slot.val, slot.owner, slot.found
+		slot.mu.Unlock()
+		return v, owner, found
+	}
+	slot.mu.Unlock()
+
 	v, owner, ok := t.lookupMROAfterUncached(startClass, internedName)
-	if t.Version() == ver {
-		slot.Store(&superLookupEntry{ver: ver, start: startClass, name: internedName, val: v, owner: owner, found: ok})
+	if ver != 0 && t.Version() == ver {
+		slot.mu.Lock()
+		slot.ver = ver
+		slot.start = startClass
+		slot.name = internedName
+		slot.val = v
+		slot.owner = owner
+		slot.found = ok
+		slot.mu.Unlock()
 	}
 	return v, owner, ok
 }
 
 type superLookupEntry struct {
+	mu    sync.Mutex
 	ver   uint64
 	start *PyType
 	name  Value
@@ -1109,7 +1207,7 @@ type superLookupEntry struct {
 	found bool
 }
 
-var superLookupCache [typeLookupCacheSize]atomic.Pointer[superLookupEntry]
+var superLookupCache [typeLookupCacheSize]superLookupEntry
 
 func (t *PyType) lookupMROAfterUncached(startClass *PyType, internedName Value) (Value, *PyType, bool) {
 	mro := t.MRO
@@ -1201,6 +1299,7 @@ func (t *PyType) SetDict(d *PyDict) {
 const typeLookupCacheSize = 4096
 
 type typeLookupEntry struct {
+	mu    sync.Mutex
 	ver   uint64
 	name  Value
 	val   Value
@@ -1208,14 +1307,30 @@ type typeLookupEntry struct {
 	found bool
 }
 
-var typeLookupCache [typeLookupCacheSize]atomic.Pointer[typeLookupEntry]
+var typeLookupCache [typeLookupCacheSize]typeLookupEntry
 
 // FlushTypeLookupCache drops every cached lookup so that types and values
 // referenced only by the cache can be collected (called from gc.collect()).
 func FlushTypeLookupCache() {
 	for i := range typeLookupCache {
-		typeLookupCache[i].Store(nil)
-		superLookupCache[i].Store(nil)
+		s := &typeLookupCache[i]
+		s.mu.Lock()
+		s.ver = 0
+		s.name = Value{}
+		s.val = Value{}
+		s.owner = nil
+		s.found = false
+		s.mu.Unlock()
+
+		ss := &superLookupCache[i]
+		ss.mu.Lock()
+		ss.ver = 0
+		ss.start = nil
+		ss.name = Value{}
+		ss.val = Value{}
+		ss.owner = nil
+		ss.found = false
+		ss.mu.Unlock()
 	}
 }
 
@@ -1495,8 +1610,19 @@ func (t *PyType) syncDunderSlots() {
 	}
 	if fn, owner, ok := t.lookupMROUncached(DunderEq); ok && owner != ObjectType {
 		t.dunderEq = fn
+		switch {
+		case (t.Flags&FlagIsIntSub) != 0 && owner == IntType && IntEqBuiltin.ptr != nil && fn == IntEqBuiltin:
+			t.Flags |= FlagDefaultIntEq
+			t.Flags &^= FlagDefaultStrEq
+		case (t.Flags&FlagIsStrSub) != 0 && owner == StrType && StrEqBuiltin.ptr != nil && fn == StrEqBuiltin:
+			t.Flags |= FlagDefaultStrEq
+			t.Flags &^= FlagDefaultIntEq
+		default:
+			t.Flags &^= FlagDefaultIntEq | FlagDefaultStrEq
+		}
 	} else {
 		t.dunderEq = Value{}
+		t.Flags &^= FlagDefaultIntEq | FlagDefaultStrEq
 	}
 	if fn, owner, ok := t.lookupMROUncached(DunderNe); ok && owner != ObjectType {
 		t.dunderNe = fn

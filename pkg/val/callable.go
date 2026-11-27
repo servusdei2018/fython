@@ -33,6 +33,13 @@ var ListExtendBuiltin Value
 // enabling O(1) pointer-equality interception in opCallBoundNative.
 var ObjectSetAttrBuiltin Value
 
+// IntEqBuiltin and StrEqBuiltin cache the canonical int.__eq__ and str.__eq__
+// built-in callables so syncDunderSlots can set FlagDefaultIntEq/FlagDefaultStrEq.
+var (
+	IntEqBuiltin Value
+	StrEqBuiltin Value
+)
+
 // MaterializeTracebackHook materializes any deferred VM traceback entries onto
 // an exception instance before __traceback__ is observed.
 var MaterializeTracebackHook func(ctx *ExecContext, exc Value)
@@ -3830,7 +3837,7 @@ func initTypes() {
 		ctx.Raise(NewException(TypeErrorType, "descriptor '__format__' requires a 'int' object"))
 		return NoneVal()
 	}))
-	IntType.Dict.Set(DunderEq, NewBuiltinFuncVal("int.__eq__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+	IntEqBuiltin = NewBuiltinFuncVal("int.__eq__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
 			return NotImplementedVal()
 		}
@@ -3845,7 +3852,8 @@ func initTypes() {
 			return BoolVal(float64(a) == args[1].AsFloat64())
 		}
 		return NotImplementedVal()
-	}))
+	})
+	IntType.Dict.Set(DunderEq, IntEqBuiltin)
 	IntType.Dict.Set(DunderNe, NewBuiltinFuncVal("int.__ne__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
 			return NotImplementedVal()
@@ -4686,7 +4694,7 @@ func initTypes() {
 		ctx.Raise(NewException(TypeErrorType, "descriptor '__format__' requires a 'str' object"))
 		return NoneVal()
 	}))
-	StrType.Dict.Set(DunderEq, NewBuiltinFuncVal("str.__eq__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+	StrEqBuiltin = NewBuiltinFuncVal("str.__eq__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
 			return NotImplementedVal()
 		}
@@ -4696,7 +4704,8 @@ func initTypes() {
 			return BoolVal(a == b)
 		}
 		return NotImplementedVal()
-	}))
+	})
+	StrType.Dict.Set(DunderEq, StrEqBuiltin)
 	StrType.Dict.Set(DunderNe, NewBuiltinFuncVal("str.__ne__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
 			return NotImplementedVal()
