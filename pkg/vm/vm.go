@@ -2754,20 +2754,33 @@ func (vm *VM) resumeCoroutine(ctx *val.ExecContext, coro *val.PyCoroutine, sentV
 		}
 		return val.NoneVal(), val.IterError
 	}
-	switch coro.State {
-	case val.CoroCreated:
-		if !sentVal.IsNone() && sentVal.HeaderPtr() != nil {
-			if ctx != nil {
-				ctx.Raise(val.NewTypeError("can't send non-None value to a just-started coroutine"))
-			}
+	var thrownExc val.Value
+	if ctx != nil && ctx.HasException() {
+		thrownExc = ctx.ActiveException
+		ctx.ClearException()
+		if coro.State == val.CoroCreated {
+			coro.State = val.CoroClosed
+			vm.releaseCoroutine(coro)
+			ctx.Raise(thrownExc)
 			return val.NoneVal(), val.IterError
 		}
-	case val.CoroSuspended:
-		coro.LastSent = sentVal
-		co := AsCodeObject(coro.Code)
-		if coro.IP < len(co.Code) && Opcode(co.Code[coro.IP]>>24) != OP_AWAIT && Opcode(co.Code[coro.IP]>>24) != OP_YIELD_FROM {
-			coro.Stack[coro.SP] = sentVal
-			coro.SP++
+	}
+	if thrownExc.IsNone() || thrownExc.HeaderPtr() == nil {
+		switch coro.State {
+		case val.CoroCreated:
+			if !sentVal.IsNone() && sentVal.HeaderPtr() != nil {
+				if ctx != nil {
+					ctx.Raise(val.NewTypeError("can't send non-None value to a just-started coroutine"))
+				}
+				return val.NoneVal(), val.IterError
+			}
+		case val.CoroSuspended:
+			coro.LastSent = sentVal
+			co := AsCodeObject(coro.Code)
+			if coro.IP < len(co.Code) && Opcode(co.Code[coro.IP]>>24) != OP_AWAIT && Opcode(co.Code[coro.IP]>>24) != OP_YIELD_FROM {
+				coro.Stack[coro.SP] = sentVal
+				coro.SP++
+			}
 		}
 	}
 
@@ -2779,6 +2792,9 @@ func (vm *VM) resumeCoroutine(ctx *val.ExecContext, coro *val.PyCoroutine, sentV
 	}
 	vm.ensureFrameCapacity(nextFrame + 4)
 	vm.unhandledException = val.NoneVal()
+	if !thrownExc.IsNone() && thrownExc.HeaderPtr() != nil {
+		vm.execCtx.Raise(thrownExc)
+	}
 	res := vm.runFrame(co, coro.Base, coro.SP, nextFrame, coro.Cells, coro.Globals, val.NoneVal(), coro.Stack, nil, coro)
 	if coro.State == val.CoroSuspended {
 		return res, val.IterYielded

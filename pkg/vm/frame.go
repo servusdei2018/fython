@@ -1152,6 +1152,7 @@ type VM struct {
 	limitsActive    bool
 	stepCount       uint64
 	eventLoop       *EventLoop
+	activeTask      *val.PyTask
 }
 
 // loadWindow returns the instruction window of co as a base pointer and a

@@ -33,6 +33,10 @@ var ListExtendBuiltin Value
 // enabling O(1) pointer-equality interception in opCallBoundNative.
 var ObjectSetAttrBuiltin Value
 
+// CancelledErrorFactory constructs an asyncio.CancelledError instance with the
+// given optional message. Wired by pkg/vm's initAsyncIOTypes.
+var CancelledErrorFactory func(msg string) Value
+
 // IntEqBuiltin and StrEqBuiltin cache the canonical int.__eq__ and str.__eq__
 // built-in callables so syncDunderSlots can set FlagDefaultIntEq/FlagDefaultStrEq.
 var (
@@ -7329,20 +7333,68 @@ func initTypes() {
 		return args[0]
 	}))
 
+	futureFromVal := func(v Value) *PyFuture {
+		if v.IsTask() {
+			return &v.AsTask().Future
+		}
+		return v.AsFuture()
+	}
+	parseCancelMsg := func(args []Value, kwnames []Value) Value {
+		msg := ""
+		numKw := len(kwnames)
+		posCount := len(args) - numKw
+		if posCount >= 2 && !args[1].IsNone() {
+			msg = args[1].String()
+		}
+		for i, kw := range kwnames {
+			if kw.AsString() == "msg" {
+				v := args[posCount+i]
+				if !v.IsNone() {
+					msg = v.String()
+				}
+			}
+		}
+		if CancelledErrorFactory != nil {
+			return CancelledErrorFactory(msg)
+		}
+		return NewException(BaseExceptionType, msg)
+	}
+
 	FutureType = MustNewType("Future", []*PyType{ObjectType}, nil)
+	FutureType.Slots.TpCall = func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		return NewFutureVal()
+	}
 	FutureType.Dict.Set(InternString("done"), NewBuiltinFuncVal("done", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
 			ctx.Raise(NewException(TypeErrorType, "done() takes at least 1 argument"))
 			return NoneVal()
 		}
-		return BoolVal(args[0].AsFuture().IsDone())
+		return BoolVal(futureFromVal(args[0]).IsDone())
+	}))
+	FutureType.Dict.Set(InternString("cancelled"), NewBuiltinFuncVal("cancelled", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			ctx.Raise(NewException(TypeErrorType, "cancelled() takes at least 1 argument"))
+			return NoneVal()
+		}
+		return BoolVal(futureFromVal(args[0]).IsCancelled())
+	}))
+	FutureType.Dict.Set(InternString("cancel"), NewBuiltinFuncVal("cancel", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			ctx.Raise(NewException(TypeErrorType, "cancel() takes at least 1 argument"))
+			return NoneVal()
+		}
+		exc := parseCancelMsg(args, kwnames)
+		if args[0].IsTask() {
+			return BoolVal(args[0].AsTask().Cancel(exc))
+		}
+		return BoolVal(args[0].AsFuture().Cancel(exc))
 	}))
 	FutureType.Dict.Set(InternString("result"), NewBuiltinFuncVal("result", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
 			ctx.Raise(NewException(TypeErrorType, "result() takes at least 1 argument"))
 			return NoneVal()
 		}
-		fut := args[0].AsFuture()
+		fut := futureFromVal(args[0])
 		res, exc := fut.Result()
 		if !exc.IsNone() && exc.HeaderPtr() != nil {
 			if ctx != nil {
@@ -7357,7 +7409,7 @@ func initTypes() {
 			ctx.Raise(NewException(TypeErrorType, "set_result() takes exactly one argument"))
 			return NoneVal()
 		}
-		args[0].AsFuture().SetResult(args[1])
+		futureFromVal(args[0]).SetResult(args[1])
 		return NoneVal()
 	}))
 
@@ -7366,7 +7418,7 @@ func initTypes() {
 			ctx.Raise(NewException(TypeErrorType, "set_exception() takes exactly one argument"))
 			return NoneVal()
 		}
-		args[0].AsFuture().SetException(args[1])
+		futureFromVal(args[0]).SetException(args[1])
 		return NoneVal()
 	}))
 
@@ -7379,14 +7431,10 @@ func initTypes() {
 	}))
 
 	TaskType = MustNewType("Task", []*PyType{FutureType}, nil)
-	if fn, ok := FutureType.Dict.Get(InternString("done")); ok {
-		TaskType.Dict.Set(InternString("done"), fn)
-	}
-	if fn, ok := FutureType.Dict.Get(InternString("result")); ok {
-		TaskType.Dict.Set(InternString("result"), fn)
-	}
-	if fn, ok := FutureType.Dict.Get(InternString("__await__")); ok {
-		TaskType.Dict.Set(InternString("__await__"), fn)
+	for _, m := range []string{"done", "cancelled", "cancel", "result", "__await__"} {
+		if fn, ok := FutureType.Dict.Get(InternString(m)); ok {
+			TaskType.Dict.Set(InternString(m), fn)
+		}
 	}
 
 	ChanType = MustNewType("chan", []*PyType{ObjectType}, nil)

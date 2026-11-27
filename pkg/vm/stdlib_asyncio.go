@@ -7,6 +7,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/servusdei2018/fython/pkg/val"
@@ -326,6 +327,12 @@ func initAsyncIOTypes() {
 		CancelledErrorType = val.MustNewType("CancelledError", []*val.PyType{val.BaseExceptionType}, nil)
 		InvalidStateErrorType = val.MustNewType("InvalidStateError", []*val.PyType{val.ExceptionType}, nil)
 		TimeoutErrorType = val.MustNewType("TimeoutError", []*val.PyType{val.ExceptionType}, nil)
+
+		val.CancelledErrorFactory = func(msg string) val.Value {
+			return val.NewException(CancelledErrorType, msg)
+		}
+
+		initAsyncIOQueueTypes()
 	})
 }
 
@@ -365,11 +372,17 @@ func (e *Engine) createAsyncioModule() val.Value {
 	mod.Dict.Set(val.InternString("StreamReader"), val.TypeVal(StreamReaderType))
 	mod.Dict.Set(val.InternString("StreamWriter"), val.TypeVal(StreamWriterType))
 	mod.Dict.Set(val.InternString("Server"), val.TypeVal(ServerType))
+	mod.Dict.Set(val.InternString("Queue"), val.TypeVal(AsyncQueueType))
+	mod.Dict.Set(val.InternString("LifoQueue"), val.TypeVal(LifoQueueType))
+	mod.Dict.Set(val.InternString("PriorityQueue"), val.TypeVal(PriorityQueueType))
 
 	// Exceptions
 	mod.Dict.Set(val.InternString("CancelledError"), val.TypeVal(CancelledErrorType))
 	mod.Dict.Set(val.InternString("InvalidStateError"), val.TypeVal(InvalidStateErrorType))
 	mod.Dict.Set(val.InternString("TimeoutError"), val.TypeVal(TimeoutErrorType))
+	mod.Dict.Set(val.InternString("QueueEmpty"), val.TypeVal(QueueEmptyType))
+	mod.Dict.Set(val.InternString("QueueFull"), val.TypeVal(QueueFullType))
+	mod.Dict.Set(val.InternString("QueueShutDown"), val.TypeVal(QueueShutDownType))
 
 	// coroutines submodule
 	coroSubmodVal := val.NewModuleVal("asyncio.coroutines", "")
@@ -436,6 +449,13 @@ func (e *Engine) createAsyncioModule() val.Value {
 		fut := futVal.AsFuture()
 
 		if secs <= 0 {
+			loop := GetCurrentEventLoopCtx(ctx)
+			if loop != nil && loop.running.Load() {
+				loop.CallSoonThreadsafe(func() {
+					fut.SetResult(result)
+				})
+				return futVal
+			}
 			fut.SetResult(result)
 			return futVal
 		}
@@ -465,8 +485,168 @@ func (e *Engine) createAsyncioModule() val.Value {
 		if ctx != nil && ctx.VM != nil {
 			parent = ctx.VM.(*VM).ActiveContext()
 		}
-		task := loop.CreateTaskIn(args[0], parent)
-		return val.ObjectVal(&task.Header)
+		target := args[0]
+		if target.IsCoroutine() {
+			task := loop.CreateTaskIn(target, parent)
+			return val.ObjectVal(&task.Header)
+		}
+		if target.Type().Slots.TpIterNext != nil {
+			task := loop.CreateTaskFromAwaitableIn(target, parent)
+			return val.ObjectVal(&task.Header)
+		}
+		ctx.Raise(val.NewTypeError("a coroutine was expected"))
+		return val.NoneVal()
+	}))
+
+	// asyncio.wait_for(fut, timeout)
+	mod.Dict.Set(val.InternString("wait_for"), val.NewBuiltinFuncVal("wait_for", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		numKw := len(kwnames)
+		posCount := len(args) - numKw
+		if posCount < 1 {
+			ctx.Raise(val.NewTypeError("wait_for() missing 1 required positional argument: 'fut'"))
+			return val.NoneVal()
+		}
+		target := args[0]
+		timeoutVal := val.NoneVal()
+		hasTimeout := false
+		if posCount >= 2 {
+			timeoutVal = args[1]
+			hasTimeout = true
+		}
+		for i, kw := range kwnames {
+			kwStr := kw.AsString()
+			v := args[posCount+i]
+			switch kwStr {
+			case "timeout":
+				if hasTimeout {
+					ctx.Raise(val.NewTypeError("wait_for() got multiple values for argument 'timeout'"))
+					return val.NoneVal()
+				}
+				timeoutVal = v
+				hasTimeout = true
+			case "fut":
+				ctx.Raise(val.NewTypeError("wait_for() got multiple values for argument 'fut'"))
+				return val.NoneVal()
+			default:
+				ctx.Raise(val.NewTypeError("wait_for() got an unexpected keyword argument '" + kwStr + "'"))
+				return val.NoneVal()
+			}
+		}
+
+		loop := GetCurrentEventLoopCtx(ctx)
+		if loop == nil {
+			loop = NewEventLoop(e, e.asyncMode)
+			SetCurrentEventLoop(loop)
+		}
+		var parent *val.PyContext
+		if ctx != nil && ctx.VM != nil {
+			parent = ctx.VM.(*VM).ActiveContext()
+		}
+
+		var innerFut *val.PyFuture
+		var cancelInner func(val.Value) bool
+		var innerVal val.Value
+
+		switch {
+		case target.IsFuture():
+			innerFut = target.AsFuture()
+			cancelInner = innerFut.Cancel
+			innerVal = target
+		case target.IsTask():
+			t := target.AsTask()
+			innerFut = &t.Future
+			cancelInner = t.Cancel
+			innerVal = target
+		case target.IsCoroutine():
+			t := loop.CreateTaskIn(target, parent)
+			innerFut = &t.Future
+			cancelInner = t.Cancel
+			innerVal = val.ObjectVal(&t.Header)
+		case target.Type().Slots.TpIterNext != nil:
+			t := loop.CreateTaskFromAwaitableIn(target, parent)
+			innerFut = &t.Future
+			cancelInner = t.Cancel
+			innerVal = val.ObjectVal(&t.Header)
+		default:
+			ctx.Raise(val.NewTypeError("wait_for() expects a coroutine, Task, or Future"))
+			return val.NoneVal()
+		}
+
+		if timeoutVal.IsNone() {
+			return innerVal
+		}
+
+		var secs float64
+		switch {
+		case timeoutVal.IsFloat64():
+			secs = timeoutVal.AsFloat64()
+		case timeoutVal.IsInt64():
+			secs = float64(timeoutVal.AsInt64())
+		default:
+			ctx.Raise(val.NewTypeError("timeout must be None, int, or float"))
+			return val.NoneVal()
+		}
+
+		outerVal := val.NewFutureVal()
+		outer := outerVal.AsFuture()
+
+		if secs <= 0 {
+			if innerFut.IsDone() {
+				res, exc := innerFut.Result()
+				if !exc.IsNone() && exc.HeaderPtr() != nil {
+					if innerFut.IsCancelled() {
+						outer.Cancel(exc)
+					} else {
+						outer.SetException(exc)
+					}
+				} else {
+					outer.SetResult(res)
+				}
+				return outerVal
+			}
+			cancelInner(newCancelledError(""))
+			outer.SetException(val.NewException(TimeoutErrorType, ""))
+			return outerVal
+		}
+
+		var finished atomic.Bool
+		timer := time.AfterFunc(time.Duration(secs*float64(time.Second)), func() {
+			loop.CallSoonThreadsafe(func() {
+				if finished.CompareAndSwap(false, true) {
+					cancelInner(newCancelledError(""))
+					outer.SetException(val.NewException(TimeoutErrorType, ""))
+				}
+			})
+		})
+
+		innerFut.AddDoneCallback(func(v val.Value) {
+			if finished.CompareAndSwap(false, true) {
+				timer.Stop()
+				res, exc := innerFut.Result()
+				if !exc.IsNone() && exc.HeaderPtr() != nil {
+					if innerFut.IsCancelled() {
+						outer.Cancel(exc)
+					} else {
+						outer.SetException(exc)
+					}
+				} else {
+					outer.SetResult(res)
+				}
+			}
+		})
+
+		outer.AddDoneCallback(func(v val.Value) {
+			if outer.IsCancelled() && finished.CompareAndSwap(false, true) {
+				timer.Stop()
+				_, exc := outer.Result()
+				if exc.IsNone() || exc.HeaderPtr() == nil {
+					exc = newCancelledError("")
+				}
+				cancelInner(exc)
+			}
+		})
+
+		return outerVal
 	}))
 
 	// asyncio.ensure_future(coro_or_future, *, loop=None)
@@ -520,7 +700,11 @@ func (e *Engine) createAsyncioModule() val.Value {
 			if ctx != nil && ctx.VM != nil {
 				parent = ctx.VM.(*VM).ActiveContext()
 			}
-			task := loop.CreateTaskIn(coro, parent)
+			if coro.IsCoroutine() {
+				task := loop.CreateTaskIn(coro, parent)
+				return val.ObjectVal(&task.Header)
+			}
+			task := loop.CreateTaskFromAwaitableIn(coro, parent)
 			return val.ObjectVal(&task.Header)
 		}
 		if ctx != nil {
@@ -581,6 +765,13 @@ func (e *Engine) createAsyncioModule() val.Value {
 				childFut = &aw.AsTask().Future
 			case aw.IsFuture():
 				childFut = aw.AsFuture()
+			case aw.Type().Slots.TpIterNext != nil:
+				var parent *val.PyContext
+				if ctx != nil && ctx.VM != nil {
+					parent = ctx.VM.(*VM).ActiveContext()
+				}
+				task := loop.CreateTaskFromAwaitableIn(aw, parent)
+				childFut = &task.Future
 			default:
 				results[idx] = aw
 				remaining--

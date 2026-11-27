@@ -1504,7 +1504,21 @@ func (vm *VM) opAwait(st *loopState, ip, sp int) (int, int, loopCtl) {
 			return ip, sp, ctlReload
 		case val.IterYielded:
 			if st.activeCoro != nil {
+				if vm.activeTask != nil {
+					if nextVal.IsFuture() {
+						vm.activeTask.SetWaiter(nextVal.AsFuture(), aw)
+					} else if nextVal.IsTask() {
+						vm.activeTask.SetWaiter(&nextVal.AsTask().Future, aw)
+					}
+				}
 				return vm.suspendActiveChain(st, nextVal, ip, sp)
+			}
+		default:
+			if vm.execCtx.HasException() {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				st.raiseExc = exc
+				return ip, sp, ctlRaise
 			}
 		}
 	} else {

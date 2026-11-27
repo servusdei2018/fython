@@ -105,6 +105,36 @@ type EventLoop struct {
 	stopChan   chan struct{}
 	running    atomic.Bool
 	activeTask atomic.Pointer[val.PyTask]
+	callSoonMu sync.Mutex
+	callSoon   []func()
+}
+
+// CallSoonThreadsafe schedules fn to run on the event loop thread.
+func (l *EventLoop) CallSoonThreadsafe(fn func()) {
+	if l == nil || fn == nil {
+		return
+	}
+	l.callSoonMu.Lock()
+	l.callSoon = append(l.callSoon, fn)
+	l.callSoonMu.Unlock()
+	select {
+	case l.queue.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (l *EventLoop) drainCallSoon() {
+	l.callSoonMu.Lock()
+	if len(l.callSoon) == 0 {
+		l.callSoonMu.Unlock()
+		return
+	}
+	cbs := l.callSoon
+	l.callSoon = nil
+	l.callSoonMu.Unlock()
+	for _, fn := range cbs {
+		fn()
+	}
 }
 
 var (
@@ -175,6 +205,25 @@ func (l *EventLoop) CreateTask(coroVal val.Value) *val.PyTask {
 	return l.CreateTaskIn(coroVal, nil)
 }
 
+func (l *EventLoop) cancelTask(task *val.PyTask, exc val.Value) bool {
+	if task.IsDone() {
+		return false
+	}
+	w, waitAw := task.PeekWaiter()
+	if !waitAw.IsNone() && waitAw.IsTask() {
+		if waitAw.AsTask().Cancel(exc) {
+			return true
+		}
+	} else if w != nil {
+		if w.Cancel(exc) {
+			return true
+		}
+	}
+	task.SetPendingCancel(exc)
+	l.queue.Push(task)
+	return true
+}
+
 // CreateTaskIn wraps a coroutine and stores a shallow copy of parent.
 // A nil parent starts from an empty context. The copy shares the parent's
 // snapshot, so spawn stays O(1) until the task calls ContextVar.set.
@@ -183,6 +232,24 @@ func (l *EventLoop) CreateTaskIn(coroVal val.Value, parent *val.PyContext) *val.
 	taskVal := val.NewTaskVal(coro)
 	task := taskVal.AsTask()
 	task.Loop = l
+	task.SetCancelHook(l.cancelTask)
+	if parent == nil {
+		task.Context = val.NewPyContext()
+	} else {
+		task.Context = parent.ShallowCopy()
+	}
+	l.queue.Push(task)
+	return task
+}
+
+// CreateTaskFromAwaitableIn wraps a non-coroutine awaitable (such as a native
+// asyncio.Queue awaitable) in a PyTask and enqueues it on the EventLoop.
+func (l *EventLoop) CreateTaskFromAwaitableIn(aw val.Value, parent *val.PyContext) *val.PyTask {
+	taskVal := val.NewTaskVal(nil)
+	task := taskVal.AsTask()
+	task.Awaitable = aw
+	task.Loop = l
+	task.SetCancelHook(l.cancelTask)
 	if parent == nil {
 		task.Context = val.NewPyContext()
 	} else {
@@ -258,6 +325,10 @@ func (l *EventLoop) RunUntilCompleteIn(target val.Value, parent *val.PyContext) 
 
 func (l *EventLoop) runSingleThread(rootTask *val.PyTask) (val.Value, error) {
 	for !rootTask.IsDone() {
+		l.drainCallSoon()
+		if rootTask.IsDone() {
+			break
+		}
 		task := l.queue.Pop()
 		if task == nil {
 			if rootTask.IsDone() {
@@ -302,6 +373,7 @@ func (l *EventLoop) runMultiCore(rootTask *val.PyTask) (val.Value, error) {
 				default:
 				}
 
+				l.drainCallSoon()
 				task := l.queue.Pop()
 				if task == nil {
 					select {
@@ -338,15 +410,101 @@ func (l *EventLoop) runMultiCore(rootTask *val.PyTask) (val.Value, error) {
 	return res, nil
 }
 
+func isCancelledError(exc val.Value) bool {
+	if CancelledErrorType == nil || exc.IsNone() || exc.HeaderPtr() == nil {
+		return false
+	}
+	return val.IsSubclass(exc.Type(), CancelledErrorType)
+}
+
 func (l *EventLoop) stepTask(vm *VM, task *val.PyTask) {
-	coro := task.Coro
-	if coro == nil || coro.State == val.CoroClosed {
+	task.StepLock()
+	defer task.StepUnlock()
+	if task.IsDone() {
 		return
 	}
 	if task.Context != nil {
 		prev := vm.context
 		vm.context = task.Context
 		defer func() { vm.context = prev }()
+	}
+
+	_, waitAw := task.ClearWaiter()
+	pendingCancel := task.TakePendingCancel()
+
+	// Direct non-coroutine awaitable task (e.g. create_task(q.get())).
+	if task.Coro == nil {
+		aw := task.Awaitable
+		if aw.IsNone() || aw.HeaderPtr() == nil {
+			return
+		}
+		if !pendingCancel.IsNone() && pendingCancel.HeaderPtr() != nil {
+			cancelQueueAwaitable(aw)
+			task.Awaitable = val.Value{}
+			task.Future.Cancel(pendingCancel)
+			return
+		}
+		tpIterNext := aw.Type().Slots.TpIterNext
+		if tpIterNext == nil {
+			task.Awaitable = val.Value{}
+			task.SetResult(aw)
+			return
+		}
+		nextVal, status := tpIterNext(&vm.execCtx, aw)
+		switch status {
+		case val.IterExhausted:
+			task.Awaitable = val.Value{}
+			task.SetResult(nextVal)
+		case val.IterYielded:
+			if nextVal.IsFuture() || nextVal.IsTask() {
+				fut := nextVal.AsFuture()
+				if nextVal.IsTask() {
+					fut = &nextVal.AsTask().Future
+				}
+				task.SetWaiter(fut, aw)
+				fut.AddDoneCallback(func(v val.Value) {
+					l.queue.Push(task)
+				})
+			} else {
+				l.queue.Push(task)
+			}
+		default:
+			exc := vm.execCtx.ActiveException
+			vm.execCtx.ClearException()
+			if exc.IsNone() || exc.HeaderPtr() == nil {
+				exc = vm.LastException()
+			}
+			task.Awaitable = val.Value{}
+			if isCancelledError(exc) {
+				task.Future.Cancel(exc)
+			} else {
+				task.SetException(exc)
+			}
+		}
+		return
+	}
+
+	coro := task.Coro
+	if coro.State == val.CoroClosed {
+		return
+	}
+
+	prevTask := vm.activeTask
+	vm.activeTask = task
+	defer func() { vm.activeTask = prevTask }()
+
+	if !pendingCancel.IsNone() && pendingCancel.HeaderPtr() != nil {
+		if !waitAw.IsNone() && waitAw.HeaderPtr() != nil {
+			cancelQueueAwaitable(waitAw)
+		}
+		if coro.State == val.CoroCreated {
+			coro.State = val.CoroClosed
+			task.Coro = nil
+			vm.releaseCoroutine(coro)
+			task.Future.Cancel(pendingCancel)
+			return
+		}
+		vm.execCtx.Raise(pendingCancel)
 	}
 
 	sent := task.NextSent
@@ -365,6 +523,9 @@ func (l *EventLoop) stepTask(vm *VM, task *val.PyTask) {
 			if aw.IsTask() {
 				fut = &aw.AsTask().Future
 			}
+			if w, _ := task.PeekWaiter(); w != fut {
+				task.SetWaiter(fut, aw)
+			}
 			fut.AddDoneCallback(func(v val.Value) {
 				l.queue.Push(task)
 			})
@@ -377,7 +538,12 @@ func (l *EventLoop) stepTask(vm *VM, task *val.PyTask) {
 		if exc.IsNone() || exc.HeaderPtr() == nil {
 			exc = vm.LastException()
 		}
-		task.SetException(exc)
+		vm.lastException = val.NoneVal()
+		if isCancelledError(exc) {
+			task.Future.Cancel(exc)
+		} else {
+			task.SetException(exc)
+		}
 		task.Coro = nil
 		vm.releaseCoroutine(coro)
 	}

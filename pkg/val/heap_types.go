@@ -531,6 +531,15 @@ type PyTask struct {
 	NextSent Value
 	// Context is the task's isolated context, a shallow copy taken at spawn.
 	Context *PyContext
+	// Awaitable is set when the task drives a non-coroutine awaitable directly.
+	Awaitable Value
+	// mu guards Waiter, WaitAwaitable, PendingCancel, and CancelHook for race-free cancellation.
+	mu            sync.Mutex
+	stepMu        sync.Mutex
+	Waiter        *PyFuture
+	WaitAwaitable Value
+	PendingCancel Value
+	CancelHook    func(*PyTask, Value) bool
 }
 
 // Compile-time assertions that every heap object places Header at offset 0.
@@ -2416,6 +2425,36 @@ func (f *PyFuture) DoneChan() <-chan struct{} {
 	return f.doneChan
 }
 
+// Cancel transitions a pending PyFuture into FutCancelled with exc as its
+// exception (typically asyncio.CancelledError), closes doneChan, and runs all
+// registered done callbacks. Returns false if the future was already done.
+func (f *PyFuture) Cancel(exc Value) bool {
+	f.mu.Lock()
+	if f.State != FutPending {
+		f.mu.Unlock()
+		return false
+	}
+	f.State = FutCancelled
+	f.ExcVal = exc
+	cbs := f.Callbacks
+	f.Callbacks = nil
+	close(f.doneChan)
+	f.mu.Unlock()
+
+	futVal := Value{num: 0, ptr: &f.Header}
+	for _, cb := range cbs {
+		cb(futVal)
+	}
+	return true
+}
+
+// IsCancelled reports whether the future completed via cancellation.
+func (f *PyFuture) IsCancelled() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.State == FutCancelled
+}
+
 // AsTask performs a zero-cost offset-0 downcast from Value to *PyTask.
 func (v Value) AsTask() *PyTask {
 	return (*PyTask)(unsafe.Pointer(v.ptr))
@@ -2439,6 +2478,10 @@ func (t *PyTask) IsDone() bool {
 	return t.Future.IsDone()
 }
 
+func (t *PyTask) IsCancelled() bool {
+	return t.Future.IsCancelled()
+}
+
 func (t *PyTask) Result() (Value, Value) {
 	return t.Future.Result()
 }
@@ -2453,6 +2496,74 @@ func (t *PyTask) SetException(exc Value) {
 
 func (t *PyTask) AddDoneCallback(cb func(Value)) {
 	t.Future.AddDoneCallback(cb)
+}
+
+func (t *PyTask) SetWaiter(w *PyFuture, aw Value) {
+	t.mu.Lock()
+	t.Waiter = w
+	t.WaitAwaitable = aw
+	t.mu.Unlock()
+}
+
+func (t *PyTask) ClearWaiter() (*PyFuture, Value) {
+	t.mu.Lock()
+	w := t.Waiter
+	aw := t.WaitAwaitable
+	t.Waiter = nil
+	t.WaitAwaitable = Value{}
+	t.mu.Unlock()
+	return w, aw
+}
+
+func (t *PyTask) PeekWaiter() (*PyFuture, Value) {
+	t.mu.Lock()
+	w := t.Waiter
+	aw := t.WaitAwaitable
+	t.mu.Unlock()
+	return w, aw
+}
+
+func (t *PyTask) SetPendingCancel(exc Value) {
+	t.mu.Lock()
+	if t.PendingCancel.IsNone() || t.PendingCancel.HeaderPtr() == nil {
+		t.PendingCancel = exc
+	}
+	t.mu.Unlock()
+}
+
+func (t *PyTask) TakePendingCancel() Value {
+	t.mu.Lock()
+	exc := t.PendingCancel
+	t.PendingCancel = Value{}
+	t.mu.Unlock()
+	return exc
+}
+
+func (t *PyTask) SetCancelHook(h func(*PyTask, Value) bool) {
+	t.mu.Lock()
+	t.CancelHook = h
+	t.mu.Unlock()
+}
+
+func (t *PyTask) StepLock() {
+	t.stepMu.Lock()
+}
+
+func (t *PyTask) StepUnlock() {
+	t.stepMu.Unlock()
+}
+
+func (t *PyTask) Cancel(exc Value) bool {
+	if t.Future.IsDone() {
+		return false
+	}
+	t.mu.Lock()
+	hook := t.CancelHook
+	t.mu.Unlock()
+	if hook != nil {
+		return hook(t, exc)
+	}
+	return t.Future.Cancel(exc)
 }
 
 // Standard Exception Constructors
