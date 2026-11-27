@@ -558,7 +558,7 @@ func (vm *VM) opForIterSlow(st *loopState, inst uint32, ip, sp int) (int, int, l
 		}
 		st.ip = ip
 		vm.execCtx.SP = sp
-		nextVal, ok := pyIter.Next()
+		nextVal, ok := pyIter.NextCtx(&vm.execCtx)
 		stack = st.syncStackFromVM(vm, stack)
 		if vm.execCtx.HasException() {
 			exc := vm.execCtx.ActiveException

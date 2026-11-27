@@ -113,11 +113,10 @@ func (sc *stringCollector) collectFromValue(v val.Value) {
 			sc.collectFromValue(item)
 		}
 	case val.KindSet:
-		for _, e := range v.AsSet().DictEntries() {
-			if e.Active {
-				sc.collectFromValue(e.Key)
-			}
-		}
+		v.AsSet().ForEach(func(k val.Value) bool {
+			sc.collectFromValue(k)
+			return true
+		})
 	case val.KindCode:
 		sc.collectFromCodeObject(AsCodeObject(v))
 	}
@@ -365,11 +364,10 @@ func encodeValue(buf []byte, v val.Value, sc *stringCollector) []byte {
 		s := v.AsSet()
 		binary.LittleEndian.PutUint32(tmp4[:], uint32(s.Len()))
 		buf = append(buf, tmp4[:]...)
-		for _, e := range s.DictEntries() {
-			if e.Active {
-				buf = encodeValue(buf, e.Key, sc)
-			}
-		}
+		s.ForEach(func(k val.Value) bool {
+			buf = encodeValue(buf, k, sc)
+			return true
+		})
 
 	default:
 		// Fallback for sentinels

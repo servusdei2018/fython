@@ -143,24 +143,23 @@ func exactTypeAndValueEqual(a, b val.Value) bool {
 			return false
 		}
 		// Match elements by strict type+value equality so {1} != {True} != {1.0}.
-		entriesA := sa.DictEntries()
-		entriesB := sb.DictEntries()
-		for i := range entriesA {
-			if !entriesA[i].Active {
-				continue
-			}
+		allMatch := true
+		sa.ForEach(func(ka val.Value) bool {
 			found := false
-			for j := range entriesB {
-				if entriesB[j].Active && exactTypeAndValueEqual(entriesA[i].Key, entriesB[j].Key) {
+			sb.ForEach(func(kb val.Value) bool {
+				if exactTypeAndValueEqual(ka, kb) {
 					found = true
-					break
+					return false
 				}
-			}
+				return true
+			})
 			if !found {
+				allMatch = false
 				return false
 			}
-		}
-		return true
+			return true
+		})
+		return allMatch
 
 	case val.KindCode:
 		// Code objects are distinct by pointer

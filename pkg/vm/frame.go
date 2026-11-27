@@ -1300,6 +1300,7 @@ func (vm *VM) acquireForIter(obj val.Value) val.Value {
 		it.Kind = val.IterKindDict
 	case obj.IsSet():
 		it.Kind = val.IterKindSet
+		it.Cur = int64(obj.AsSet().Len())
 	default:
 		it.Kind = val.IterKindInvalid
 	}

@@ -64,11 +64,12 @@ for i in range(25):
 assert len(captured_lt) == 25
 for idx in range(25):
     assert captured_lt[idx] == (idx, idx + 1), f"lt mismatch at {idx}: {captured_lt[idx]}"
-# captured_eq gets 4 entries per iteration (tuple cmp eq check + tuple-in + list-in + set-in)
-assert len(captured_eq) == 100
+# captured_eq gets 3 entries per iteration (tuple cmp eq check + tuple-in + list-in;
+# set-in skips __eq__ on hash mismatch per CPython).
+assert len(captured_eq) == 75
 for idx in range(25):
-    for j in range(4):
-        assert captured_eq[idx * 4 + j] == (idx, idx + 1), f"eq mismatch at {idx},{j}: {captured_eq[idx * 4 + j]}"
+    for j in range(3):
+        assert captured_eq[idx * 3 + j] == (idx, idx + 1), f"eq mismatch at {idx},{j}: {captured_eq[idx * 3 + j]}"
 
 # 3. Identity comparisons (CMP_IS / CMP_IS_NOT) must work cleanly
 for i in range(20):

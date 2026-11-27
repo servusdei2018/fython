@@ -2,6 +2,7 @@ package val
 
 import (
 	"errors"
+	"math"
 	"math/big"
 	"slices"
 	"strconv"
@@ -1695,6 +1696,7 @@ func NewIterVal(obj Value) Value {
 		it.Kind = IterKindGenerator
 	case obj.IsSet():
 		it.Kind = IterKindSet
+		it.Cur = int64(obj.AsSet().Len())
 	case obj.IsAnyString():
 		it.Kind = IterKindString
 	case obj.IsBytes():
@@ -1946,13 +1948,35 @@ func (it *PyIter) NextCtx(ctx *ExecContext) (Value, bool) {
 		}
 		return NoneVal(), false
 	case IterKindSet:
+		if it.Idx < 0 {
+			return NoneVal(), false
+		}
 		set := it.Obj.AsSet()
-		for it.Idx < len(set.dict.Entries) {
-			entry := &set.dict.Entries[it.Idx]
-			it.Idx++
-			if entry.Active {
-				return entry.Key, true
+		locked := set.lockSet()
+		if int64(set.count) != it.Cur {
+			if locked {
+				set.mu.Unlock()
 			}
+			if ctx != nil {
+				ctx.Raise(NewException(RuntimeErrorType, "Set changed size during iteration"))
+			}
+			return NoneVal(), false
+		}
+		entries := set.entries
+		for it.Idx < len(entries) {
+			entry := &entries[it.Idx]
+			it.Idx++
+			if entry.State == setEntryOccupied {
+				key := entry.Key
+				if locked {
+					set.mu.Unlock()
+				}
+				return key, true
+			}
+		}
+		it.Idx = -1
+		if locked {
+			set.mu.Unlock()
 		}
 		return NoneVal(), false
 	case IterKindGenerator:
@@ -3723,10 +3747,208 @@ func (d *PyDict) Items() []DictItem {
 	return items
 }
 
-// PySet represents a heap-allocated Python set backed by an open-addressing PyDict table.
+const (
+	setEntryEmpty     uint8 = 0
+	setEntryOccupied  uint8 = 1
+	setEntryTombstone uint8 = 2
+)
+
+// setEntry is a 24-byte key-only open-addressing slot with 1 pointer-bearing field (Key.ptr).
+type setEntry struct {
+	Key   Value
+	Hash  uint32
+	State uint8
+	_     [3]byte
+}
+
+// PySet represents a heap-allocated Python set backed by a flat power-of-two
+// key-only open-addressing hash table.
+// Header MUST be at offset 0.
 type PySet struct {
-	Header ObjectHeader
-	dict   PyDict
+	Header  ObjectHeader
+	entries []setEntry
+	count   int32
+	used    int32
+	mask    uint32
+	ver     uint32
+	mu      sync.Mutex
+}
+
+type setKeyHash struct {
+	key  Value
+	hash uint32
+}
+
+func setTableCap(minEntries int) int {
+	if minEntries <= 5 {
+		return 8
+	}
+	need := (minEntries*3 + 1) / 2
+	cap := 8
+	for cap < need {
+		cap <<= 1
+	}
+	return cap
+}
+
+func (s *PySet) lockSet() bool {
+	if !setRaceEnabled && !MultiThreadedFlag.Load() {
+		return false
+	}
+	s.mu.Lock()
+	return true
+}
+
+func (s *PySet) initTable(minEntries int) {
+	cap := setTableCap(minEntries)
+	s.entries = make([]setEntry, cap)
+	s.mask = uint32(cap - 1)
+	s.count = 0
+	s.used = 0
+	s.ver++
+}
+
+func (s *PySet) rehash(minEntries int) {
+	cap := setTableCap(minEntries)
+	newEntries := make([]setEntry, cap)
+	newMask := uint32(cap - 1)
+	for i := range s.entries {
+		e := &s.entries[i]
+		if e.State != setEntryOccupied {
+			continue
+		}
+		h := e.Hash
+		idx := h & newMask
+		perturb := h
+		for newEntries[idx].State != setEntryEmpty {
+			perturb >>= 5
+			idx = (idx*5 + 1 + perturb) & newMask
+		}
+		newEntries[idx] = setEntry{
+			Key:   e.Key,
+			Hash:  h,
+			State: setEntryOccupied,
+		}
+	}
+	s.entries = newEntries
+	s.mask = newMask
+	s.used = s.count
+	s.ver++
+}
+
+// putUniqueHashed inserts a key known not to be present in a freshly sized,
+// tombstone-free table (zero equality callbacks, zero re-hashing).
+func (s *PySet) putUniqueHashed(key Value, h uint32) {
+	entries := s.entries
+	mask := s.mask
+	idx := h & mask
+	perturb := h
+	for entries[idx].State != setEntryEmpty {
+		perturb >>= 5
+		idx = (idx*5 + 1 + perturb) & mask
+	}
+	entries[idx] = setEntry{
+		Key:   key,
+		Hash:  h,
+		State: setEntryOccupied,
+	}
+	s.count++
+	s.used++
+}
+
+// int64EqualFloat64 reports exact mathematical equality between int64 and float64
+// across the entire 64-bit domain without losing precision above 2^53.
+func int64EqualFloat64(i int64, f float64) bool {
+	if math.Trunc(f) != f {
+		return false
+	}
+	// All float64 values in [-2^63, 2^63) convert losslessly to int64.
+	if f < -9223372036854775808.0 || f >= 9223372036854775808.0 {
+		return false
+	}
+	return int64(f) == i
+}
+
+// setKeyEqualFast resolves key equality without invoking Python callbacks.
+// Returns (equal, true) when resolved, or (false, false) when dictKeyEqual must be called.
+func setKeyEqualFast(a, b Value) (bool, bool) {
+	if a == b {
+		return true, true
+	}
+	if a.ptr == &tagInt64 && b.ptr == &tagInt64 {
+		return false, true
+	}
+	if a.ptr == &tagInlineStr && b.ptr == &tagInlineStr {
+		return false, true
+	}
+	if a.ptr == &tagBool && b.ptr == &tagBool {
+		return false, true
+	}
+	if a.ptr == &tagFloat64 && b.ptr == &tagFloat64 {
+		return math.Float64frombits(a.num) == math.Float64frombits(b.num), true
+	}
+	if a.ptr == nil || b.ptr == nil {
+		return false, true
+	}
+	if (a.ptr.Flags & b.ptr.Flags & FlagInterned) != 0 {
+		return false, true
+	}
+	if (a.ptr == &tagInlineStr || a.ptr.Kind == KindString) &&
+		(b.ptr == &tagInlineStr || b.ptr.Kind == KindString) {
+		return StringEquals(a, b), true
+	}
+	if a.ptr == &tagInt64 && b.ptr == &tagBool {
+		return a.num == b.num, true
+	}
+	if a.ptr == &tagBool && b.ptr == &tagInt64 {
+		return a.num == b.num, true
+	}
+	if a.ptr == &tagInt64 && b.ptr == &tagFloat64 {
+		return int64EqualFloat64(int64(a.num), math.Float64frombits(b.num)), true
+	}
+	if a.ptr == &tagFloat64 && b.ptr == &tagInt64 {
+		return int64EqualFloat64(int64(b.num), math.Float64frombits(a.num)), true
+	}
+	if a.ptr == &tagBool && b.ptr == &tagFloat64 {
+		return float64(a.num) == math.Float64frombits(b.num), true
+	}
+	if a.ptr == &tagFloat64 && b.ptr == &tagBool {
+		return math.Float64frombits(a.num) == float64(b.num), true
+	}
+	if a.ptr.Kind == KindBigInt || b.ptr.Kind == KindBigInt {
+		aNum := a.ptr.Kind == KindBigInt || a.ptr == &tagInt64 || a.ptr == &tagBool || a.ptr == &tagFloat64
+		bNum := b.ptr.Kind == KindBigInt || b.ptr == &tagInt64 || b.ptr == &tagBool || b.ptr == &tagFloat64
+		if aNum && bNum {
+			return equalsStructural(a, b), true
+		}
+	}
+	if a.ptr.Kind == KindInstance || b.ptr.Kind == KindInstance {
+		if eq, handled := equalsDefaultPrimSub(a, b); handled {
+			return eq, true
+		}
+	}
+	return false, false
+}
+
+func (s *PySet) snapshotEntries() []setKeyHash {
+	locked := s.lockSet()
+	if s.count == 0 {
+		if locked {
+			s.mu.Unlock()
+		}
+		return nil
+	}
+	out := make([]setKeyHash, 0, s.count)
+	for i := range s.entries {
+		e := &s.entries[i]
+		if e.State == setEntryOccupied {
+			out = append(out, setKeyHash{key: e.Key, hash: e.Hash})
+		}
+	}
+	if locked {
+		s.mu.Unlock()
+	}
+	return out
 }
 
 // NewSetVal constructs a new PySet Value.
@@ -3737,11 +3959,10 @@ func NewSetVal(items ...Value) Value {
 			Type: SetType,
 		},
 	}
-	s.dict.Header = ObjectHeader{Kind: KindDict, Type: DictType}
 	if len(items) > 0 {
-		s.dict.initTable(len(items))
+		s.initTable(len(items))
 		for _, item := range items {
-			s.dict.Set(item, NoneVal())
+			s.addHashed(item, HashValue(item))
 		}
 	}
 	return Value{ptr: &s.Header}
@@ -3872,24 +4093,24 @@ func (d *PyDict) UpdateFromDict(other *PyDict) {
 }
 
 // NewSetFromDict creates a new PySet containing the keys of d, using a pre-sized
-// PutNewHashed fast path for concrete single-threaded non-live dicts.
+// putUniqueHashed fast path for concrete single-threaded non-live dicts.
 func NewSetFromDict(d *PyDict) Value {
-	if d.Live == nil && !d.Shared && !MultiThreadedFlag.Load() {
+	if d.Live == nil && !d.Shared && !setRaceEnabled && !MultiThreadedFlag.Load() {
 		s := &PySet{
 			Header: ObjectHeader{Kind: KindSet, Type: SetType},
 		}
 		if d.used > 0 {
-			s.dict.initTable(max(4, int(d.used)))
+			s.initTable(int(d.used))
 			if sp := d.split; sp != nil {
 				sk := sp.keys
 				for i := range sk.Count {
-					s.dict.PutNewHashed(sk.Keys[i], NoneVal(), sk.Hashes[i])
+					s.putUniqueHashed(sk.Keys[i], sk.Hashes[i])
 				}
 			} else {
 				for i := range d.Entries {
 					e := &d.Entries[i]
 					if e.Active {
-						s.dict.PutNewHashed(e.Key, NoneVal(), e.Hash)
+						s.putUniqueHashed(e.Key, e.Hash)
 					}
 				}
 			}
@@ -3903,113 +4124,207 @@ func newEmptySetFor(tp *PyType) *PySet {
 	if tp == nil {
 		tp = SetType
 	}
-	s := &PySet{
+	return &PySet{
 		Header: ObjectHeader{Kind: KindSet, Type: tp},
 	}
-	s.dict.Header = ObjectHeader{Kind: KindDict, Type: DictType}
+}
+
+func newSetWithCap(tp *PyType, n int) *PySet {
+	s := newEmptySetFor(tp)
+	if n > 0 {
+		s.initTable(n)
+	}
 	return s
 }
 
-// containsHashed checks whether key with pre-computed hash h is present in d.
-func (d *PyDict) containsHashed(key Value, h uint32) bool {
-	if d == nil || d.used == 0 {
-		return false
-	}
-	if d.Live != nil || d.Shared || d.split != nil || len(d.indices) == 0 || MultiThreadedFlag.Load() {
-		_, ok := d.Get(key)
-		return ok
-	}
-	mask := d.mask
-	slot := h & mask
-	if d.indexShift == 0 {
-		for {
-			raw := d.indices[slot]
-			if raw == dictIndexEmpty {
-				return false
-			}
-			if raw != dictIndexDummy {
-				e := &d.Entries[int(raw)-dictIndexOffset]
-				if e.Key == key || (e.Hash == h && e.Active && dictKeyEqual(e.Key, key)) {
-					return true
-				}
-			}
-			slot = (slot + 1) & mask
-		}
-	}
-	for {
-		raw := d.readIndex(slot)
-		if raw == dictIndexEmpty {
-			return false
-		}
-		if raw != dictIndexDummy {
-			e := &d.Entries[int(raw)-dictIndexOffset]
-			if e.Key == key || (e.Hash == h && e.Active && dictKeyEqual(e.Key, key)) {
-				return true
-			}
-		}
-		slot = (slot + 1) & mask
-	}
-}
-
-// Copy returns a shallow copy of s, using a zero-probe memcpy fast path when
-// tombstone-free and a pre-sized PutNewHashed compaction path otherwise.
+// Copy returns a shallow copy of s, using a zero-probe memmove fast path when
+// tombstone-free (safe under s.mu in both single-threaded and multi-threaded/-race modes)
+// and a pre-sized putUniqueHashed compaction path when tombstones are present.
 func (s *PySet) Copy() *PySet {
-	d := &s.dict
 	tp := s.Header.Type
 	if tp == nil {
 		tp = SetType
 	}
-	if d.Live == nil && !d.Shared && !MultiThreadedFlag.Load() {
-		if d.used > 0 && d.used == d.filled && len(d.Entries) == int(d.used) && len(d.indices) > 0 {
-			entries := make([]DictEntry, len(d.Entries), cap(d.Entries))
-			copy(entries, d.Entries)
-			indices := make([]byte, len(d.indices))
-			copy(indices, d.indices)
-			return &PySet{
-				Header: ObjectHeader{Kind: KindSet, Type: tp},
-				dict: PyDict{
-					Header:     ObjectHeader{Kind: KindDict, Type: DictType},
-					Entries:    entries,
-					indices:    indices,
-					used:       d.used,
-					filled:     d.filled,
-					mask:       d.mask,
-					indexShift: d.indexShift,
-				},
-			}
+	locked := s.lockSet()
+	if s.count == 0 {
+		if locked {
+			s.mu.Unlock()
 		}
-		out := newEmptySetFor(tp)
-		if d.used > 0 {
-			out.dict.initTable(max(4, int(d.used)))
-			for i := range d.Entries {
-				e := &d.Entries[i]
-				if e.Active {
-					out.dict.PutNewHashed(e.Key, NoneVal(), e.Hash)
-				}
-			}
+		return newEmptySetFor(tp)
+	}
+	if s.count == s.used && len(s.entries) > 0 {
+		dst := make([]setEntry, len(s.entries))
+		copy(dst, s.entries)
+		out := &PySet{
+			Header:  ObjectHeader{Kind: KindSet, Type: tp},
+			entries: dst,
+			count:   s.count,
+			used:    s.used,
+			mask:    s.mask,
+		}
+		if locked {
+			s.mu.Unlock()
 		}
 		return out
 	}
-	out := newEmptySetFor(tp)
-	for _, it := range s.Items() {
-		out.Add(it)
+	out := newSetWithCap(tp, int(s.count))
+	for i := range s.entries {
+		e := &s.entries[i]
+		if e.State == setEntryOccupied {
+			out.putUniqueHashed(e.Key, e.Hash)
+		}
+	}
+	if locked {
+		s.mu.Unlock()
 	}
 	return out
 }
 
 // Add adds an element to the set.
 func (s *PySet) Add(v Value) {
-	s.dict.Set(v, NoneVal())
+	s.addValue(v)
 }
 
-// Reserve pre-sizes an empty PySet to hold at least n elements in one allocation.
+func (s *PySet) addValue(v Value) {
+	s.addHashed(v, HashValue(v))
+}
+
+func (s *PySet) addHashed(v Value, h uint32) {
+	locked := s.lockSet()
+	for {
+		if len(s.entries) == 0 {
+			s.initTable(1)
+		}
+		entries := s.entries
+		mask := s.mask
+		idx := h & mask
+		perturb := h
+		firstTombstone := -1
+		restarted := false
+		for {
+			e := &entries[idx]
+			switch e.State {
+			case setEntryEmpty:
+				if firstTombstone >= 0 {
+					entries[firstTombstone] = setEntry{
+						Key:   v,
+						Hash:  h,
+						State: setEntryOccupied,
+					}
+					s.count++
+					s.ver++
+					if locked {
+						s.mu.Unlock()
+					}
+					return
+				}
+				if (int(s.used)+1)*3 > len(entries)*2 {
+					s.rehash(int(s.count) + 1)
+					restarted = true
+					break
+				}
+				entries[idx] = setEntry{
+					Key:   v,
+					Hash:  h,
+					State: setEntryOccupied,
+				}
+				s.count++
+				s.used++
+				s.ver++
+				if locked {
+					s.mu.Unlock()
+				}
+				return
+			case setEntryTombstone:
+				if firstTombstone < 0 {
+					firstTombstone = int(idx)
+				}
+			case setEntryOccupied:
+				if e.Key == v {
+					if locked {
+						s.mu.Unlock()
+					}
+					return
+				}
+				if e.Hash == h {
+					eq, resolved := setKeyEqualFast(e.Key, v)
+					if !resolved {
+						ver := s.ver
+						candKey := e.Key
+						if locked {
+							s.mu.Unlock()
+						}
+						eq = dictKeyEqual(candKey, v)
+						if locked {
+							s.mu.Lock()
+						}
+						if eq {
+							if locked {
+								s.mu.Unlock()
+							}
+							return
+						}
+						if s.ver != ver {
+							restarted = true
+							break
+						}
+					} else if eq {
+						if locked {
+							s.mu.Unlock()
+						}
+						return
+					}
+				}
+			}
+			if restarted {
+				break
+			}
+			perturb >>= 5
+			idx = (idx*5 + 1 + perturb) & mask
+		}
+	}
+}
+
+// Reserve pre-sizes a PySet to hold at least n additional elements in one allocation.
 func (s *PySet) Reserve(n int) {
-	s.dict.Reserve(n)
+	if n > 0 {
+		s.reserveImpl(n)
+	}
 }
 
-// DictEntries returns the underlying dict entry slice for direct iteration.
-func (s *PySet) DictEntries() []DictEntry {
-	return s.dict.Entries
+func (s *PySet) reserveImpl(n int) {
+	locked := s.lockSet()
+	if len(s.entries) == 0 {
+		s.initTable(n)
+	} else if (int(s.used)+n)*3 > len(s.entries)*2 {
+		s.rehash(int(s.count) + n)
+	}
+	if locked {
+		s.mu.Unlock()
+	}
+}
+
+// ForEach invokes fn for each element in the set until fn returns false.
+func (s *PySet) ForEach(fn func(key Value) bool) {
+	if s == nil {
+		return
+	}
+	if setRaceEnabled || MultiThreadedFlag.Load() {
+		for _, item := range s.snapshotEntries() {
+			if !fn(item.key) {
+				return
+			}
+		}
+		return
+	}
+	for i := range s.entries {
+		e := &s.entries[i]
+		if e.State == setEntryOccupied {
+			if !fn(e.Key) {
+				return
+			}
+		}
+	}
 }
 
 // IsUnhashableValue reports whether v contains an unhashable type name.
@@ -4053,53 +4368,167 @@ func (s *PySet) AddChecked(v Value) (Value, bool) {
 	if badType, bad := isUnhashableValue(v); bad {
 		return NewTypeError("unhashable type: '" + badType + "'"), false
 	}
-	s.dict.Set(v, NoneVal())
+	s.Add(v)
 	return Value{}, true
 }
 
 // Contains reports whether v is an element of the set.
 func (s *PySet) Contains(v Value) bool {
-	_, ok := s.dict.Get(v)
-	return ok
+	return s.containsValue(v)
+}
+
+func (s *PySet) containsValue(v Value) bool {
+	return s.containsHashed(v, HashValue(v))
+}
+
+func (s *PySet) containsHashed(v Value, h uint32) bool {
+	if s == nil {
+		return false
+	}
+	locked := s.lockSet()
+probe:
+	for {
+		if s.count == 0 || len(s.entries) == 0 {
+			if locked {
+				s.mu.Unlock()
+			}
+			return false
+		}
+		entries := s.entries
+		mask := s.mask
+		idx := h & mask
+		perturb := h
+		for {
+			e := &entries[idx]
+			if e.State == setEntryEmpty {
+				if locked {
+					s.mu.Unlock()
+				}
+				return false
+			}
+			if e.State == setEntryOccupied {
+				if e.Key == v {
+					if locked {
+						s.mu.Unlock()
+					}
+					return true
+				}
+				if e.Hash == h {
+					eq, resolved := setKeyEqualFast(e.Key, v)
+					if !resolved {
+						ver := s.ver
+						candKey := e.Key
+						if locked {
+							s.mu.Unlock()
+						}
+						eq = dictKeyEqual(candKey, v)
+						if locked {
+							s.mu.Lock()
+						}
+						if eq {
+							if locked {
+								s.mu.Unlock()
+							}
+							return true
+						}
+						if s.ver != ver {
+							continue probe
+						}
+					} else if eq {
+						if locked {
+							s.mu.Unlock()
+						}
+						return true
+					}
+				}
+			}
+			perturb >>= 5
+			idx = (idx*5 + 1 + perturb) & mask
+		}
+	}
 }
 
 // Len returns the count of elements in the set.
 func (s *PySet) Len() int {
-	return s.dict.Len()
+	if !setRaceEnabled && !MultiThreadedFlag.Load() {
+		return int(s.count)
+	}
+	return s.lenLocked()
+}
+
+//go:noinline
+func (s *PySet) lenLocked() int {
+	s.mu.Lock()
+	n := int(s.count)
+	s.mu.Unlock()
+	return n
 }
 
 // Items returns a slice of all elements in the set.
 func (s *PySet) Items() []Value {
-	return s.dict.Keys()
+	return s.itemsImpl()
+}
+
+func (s *PySet) itemsImpl() []Value {
+	locked := s.lockSet()
+	if s.count == 0 {
+		if locked {
+			s.mu.Unlock()
+		}
+		return nil
+	}
+	out := make([]Value, 0, s.count)
+	for i := range s.entries {
+		e := &s.entries[i]
+		if e.State == setEntryOccupied {
+			out = append(out, e.Key)
+		}
+	}
+	if locked {
+		s.mu.Unlock()
+	}
+	return out
 }
 
 // Union returns a new set containing all elements from both s and other,
 // preserving the receiver's type.
 func (s *PySet) Union(other *PySet) Value {
-	if other == nil || other.Len() == 0 {
+	if other == nil || other == s {
 		return Value{ptr: &s.Copy().Header}
 	}
-	if s.Len() == 0 {
+	if setRaceEnabled || MultiThreadedFlag.Load() {
+		sItems := s.snapshotEntries()
+		oItems := other.snapshotEntries()
+		res := newSetWithCap(s.Header.Type, len(sItems)+len(oItems))
+		for _, it := range sItems {
+			res.putUniqueHashed(it.key, it.hash)
+		}
+		for _, it := range oItems {
+			res.addHashed(it.key, it.hash)
+		}
+		return Value{ptr: &res.Header}
+	}
+	if other.count == 0 {
+		return Value{ptr: &s.Copy().Header}
+	}
+	if s.count == 0 {
 		out := other.Copy()
 		if s.Header.Type != nil {
 			out.Header.Type = s.Header.Type
 		}
 		return Value{ptr: &out.Header}
 	}
-	res := newEmptySetFor(s.Header.Type)
-	total := s.Len() + other.Len()
-	res.dict.initTable(max(4, total))
-	for i := range s.dict.Entries {
-		e := &s.dict.Entries[i]
-		if e.Active {
-			res.dict.PutNewHashed(e.Key, NoneVal(), e.Hash)
+	res := newSetWithCap(s.Header.Type, int(s.count+other.count))
+	for i := range s.entries {
+		e := &s.entries[i]
+		if e.State == setEntryOccupied {
+			res.putUniqueHashed(e.Key, e.Hash)
 		}
 	}
-	for i := range other.dict.Entries {
-		e := &other.dict.Entries[i]
-		if e.Active {
-			// PutNewHashed probes existing keys and updates in-place on a tombstone-free table.
-			res.dict.PutNewHashed(e.Key, NoneVal(), e.Hash)
+	for i := range other.entries {
+		e := &other.entries[i]
+		if e.State == setEntryOccupied {
+			res.addHashed(e.Key, e.Hash)
 		}
 	}
 	return Value{ptr: &res.Header}
@@ -4108,19 +4537,37 @@ func (s *PySet) Union(other *PySet) Value {
 // Intersection returns a new set containing elements present in both s and other,
 // always iterating the smaller set and probing the larger set.
 func (s *PySet) Intersection(other *PySet) Value {
-	res := newEmptySetFor(s.Header.Type)
-	if other == nil || s.Len() == 0 || other.Len() == 0 {
+	if other == s {
+		return Value{ptr: &s.Copy().Header}
+	}
+	if other == nil {
+		return Value{ptr: &newEmptySetFor(s.Header.Type).Header}
+	}
+	if setRaceEnabled || MultiThreadedFlag.Load() {
+		sItems := s.snapshotEntries()
+		if len(sItems) == 0 {
+			return Value{ptr: &newEmptySetFor(s.Header.Type).Header}
+		}
+		res := newSetWithCap(s.Header.Type, len(sItems))
+		for _, it := range sItems {
+			if other.containsHashed(it.key, it.hash) {
+				res.putUniqueHashed(it.key, it.hash)
+			}
+		}
 		return Value{ptr: &res.Header}
 	}
+	if s.count == 0 || other.count == 0 {
+		return Value{ptr: &newEmptySetFor(s.Header.Type).Header}
+	}
 	small, large := s, other
-	if other.Len() < s.Len() {
+	if other.count < s.count {
 		small, large = other, s
 	}
-	res.dict.initTable(max(4, small.Len()))
-	for i := range small.dict.Entries {
-		e := &small.dict.Entries[i]
-		if e.Active && large.dict.containsHashed(e.Key, e.Hash) {
-			res.dict.PutNewHashed(e.Key, NoneVal(), e.Hash)
+	res := newSetWithCap(s.Header.Type, int(small.count))
+	for i := range small.entries {
+		e := &small.entries[i]
+		if e.State == setEntryOccupied && large.containsHashed(e.Key, e.Hash) {
+			res.putUniqueHashed(e.Key, e.Hash)
 		}
 	}
 	return Value{ptr: &res.Header}
@@ -4128,28 +4575,49 @@ func (s *PySet) Intersection(other *PySet) Value {
 
 // SymmetricDifference returns a new set with elements in either s or other, but not both.
 func (s *PySet) SymmetricDifference(other *PySet) Value {
-	if other == nil || other.Len() == 0 {
+	if other == nil {
 		return Value{ptr: &s.Copy().Header}
 	}
-	if s.Len() == 0 {
+	if other == s {
+		return Value{ptr: &newEmptySetFor(s.Header.Type).Header}
+	}
+	if setRaceEnabled || MultiThreadedFlag.Load() {
+		sItems := s.snapshotEntries()
+		oItems := other.snapshotEntries()
+		res := newSetWithCap(s.Header.Type, len(sItems)+len(oItems))
+		for _, it := range sItems {
+			if !other.containsHashed(it.key, it.hash) {
+				res.putUniqueHashed(it.key, it.hash)
+			}
+		}
+		for _, it := range oItems {
+			if !s.containsHashed(it.key, it.hash) {
+				res.addHashed(it.key, it.hash)
+			}
+		}
+		return Value{ptr: &res.Header}
+	}
+	if other.count == 0 {
+		return Value{ptr: &s.Copy().Header}
+	}
+	if s.count == 0 {
 		out := other.Copy()
 		if s.Header.Type != nil {
 			out.Header.Type = s.Header.Type
 		}
 		return Value{ptr: &out.Header}
 	}
-	res := newEmptySetFor(s.Header.Type)
-	res.dict.initTable(max(4, s.Len()+other.Len()))
-	for i := range s.dict.Entries {
-		e := &s.dict.Entries[i]
-		if e.Active && !other.dict.containsHashed(e.Key, e.Hash) {
-			res.dict.PutNewHashed(e.Key, NoneVal(), e.Hash)
+	res := newSetWithCap(s.Header.Type, int(s.count+other.count))
+	for i := range s.entries {
+		e := &s.entries[i]
+		if e.State == setEntryOccupied && !other.containsHashed(e.Key, e.Hash) {
+			res.putUniqueHashed(e.Key, e.Hash)
 		}
 	}
-	for i := range other.dict.Entries {
-		e := &other.dict.Entries[i]
-		if e.Active && !s.dict.containsHashed(e.Key, e.Hash) {
-			res.dict.PutNewHashed(e.Key, NoneVal(), e.Hash)
+	for i := range other.entries {
+		e := &other.entries[i]
+		if e.State == setEntryOccupied && !s.containsHashed(e.Key, e.Hash) {
+			res.putUniqueHashed(e.Key, e.Hash)
 		}
 	}
 	return Value{ptr: &res.Header}
@@ -4157,49 +4625,184 @@ func (s *PySet) SymmetricDifference(other *PySet) Value {
 
 // Remove removes v from the set. Returns true if present.
 func (s *PySet) Remove(v Value) bool {
-	return s.dict.Delete(v)
+	return s.removeValue(v)
+}
+
+func (s *PySet) removeValue(v Value) bool {
+	return s.deleteHashed(v, HashValue(v))
 }
 
 // Discard removes v from the set if present.
 func (s *PySet) Discard(v Value) {
-	s.dict.Delete(v)
+	s.removeValue(v)
 }
 
-// Clear removes all elements from the set.
+func (s *PySet) deleteHashed(v Value, h uint32) bool {
+	locked := s.lockSet()
+probe:
+	for {
+		if s.count == 0 || len(s.entries) == 0 {
+			if locked {
+				s.mu.Unlock()
+			}
+			return false
+		}
+		entries := s.entries
+		mask := s.mask
+		idx := h & mask
+		perturb := h
+		for {
+			e := &entries[idx]
+			if e.State == setEntryEmpty {
+				if locked {
+					s.mu.Unlock()
+				}
+				return false
+			}
+			if e.State == setEntryOccupied {
+				if e.Key == v {
+					e.Key = Value{}
+					e.Hash = 0
+					e.State = setEntryTombstone
+					s.count--
+					s.ver++
+					if locked {
+						s.mu.Unlock()
+					}
+					return true
+				}
+				if e.Hash == h {
+					eq, resolved := setKeyEqualFast(e.Key, v)
+					if !resolved {
+						ver := s.ver
+						candKey := e.Key
+						if locked {
+							s.mu.Unlock()
+						}
+						eq = dictKeyEqual(candKey, v)
+						if locked {
+							s.mu.Lock()
+						}
+						if s.ver != ver {
+							continue probe
+						}
+						if eq {
+							e.Key = Value{}
+							e.Hash = 0
+							e.State = setEntryTombstone
+							s.count--
+							s.ver++
+							if locked {
+								s.mu.Unlock()
+							}
+							return true
+						}
+					} else if eq {
+						e.Key = Value{}
+						e.Hash = 0
+						e.State = setEntryTombstone
+						s.count--
+						s.ver++
+						if locked {
+							s.mu.Unlock()
+						}
+						return true
+					}
+				}
+			}
+			perturb >>= 5
+			idx = (idx*5 + 1 + perturb) & mask
+		}
+	}
+}
+
+// Clear removes all elements from the set, zeroing all slots for GC.
 func (s *PySet) Clear() {
-	s.dict.Clear()
+	s.clearImpl()
+}
+
+func (s *PySet) clearImpl() {
+	locked := s.lockSet()
+	if len(s.entries) > 64 {
+		s.entries = nil
+		s.mask = 0
+	} else if len(s.entries) > 0 {
+		clear(s.entries)
+	}
+	s.count = 0
+	s.used = 0
+	s.ver++
+	if locked {
+		s.mu.Unlock()
+	}
 }
 
 // Pop removes and returns an arbitrary element from the set without allocating.
 func (s *PySet) Pop() (Value, bool) {
-	if s.Len() == 0 {
+	locked := s.lockSet()
+	if s.count == 0 || len(s.entries) == 0 {
+		if locked {
+			s.mu.Unlock()
+		}
 		return NoneVal(), false
 	}
-	for i := range s.dict.Entries {
-		e := &s.dict.Entries[i]
-		if e.Active {
+	entries := s.entries
+	mask := s.mask
+	start := s.ver & mask
+	for step := range entries {
+		idx := (start + uint32(step)) & mask
+		e := &entries[idx]
+		if e.State == setEntryOccupied {
 			k := e.Key
-			s.dict.Delete(k)
+			e.Key = Value{}
+			e.Hash = 0
+			e.State = setEntryTombstone
+			s.count--
+			s.ver++
+			if locked {
+				s.mu.Unlock()
+			}
 			return k, true
 		}
+	}
+	if locked {
+		s.mu.Unlock()
 	}
 	return NoneVal(), false
 }
 
 // Difference returns a new set with elements in s that are not in other.
 func (s *PySet) Difference(other *PySet) Value {
-	if other == nil || other.Len() == 0 {
+	if other == nil {
 		return Value{ptr: &s.Copy().Header}
 	}
-	res := newEmptySetFor(s.Header.Type)
-	if s.Len() == 0 {
+	if other == s {
+		return Value{ptr: &newEmptySetFor(s.Header.Type).Header}
+	}
+	if setRaceEnabled || MultiThreadedFlag.Load() {
+		sItems := s.snapshotEntries()
+		if len(sItems) == 0 {
+			return Value{ptr: &newEmptySetFor(s.Header.Type).Header}
+		}
+		res := newSetWithCap(s.Header.Type, len(sItems))
+		for _, it := range sItems {
+			if !other.containsHashed(it.key, it.hash) {
+				res.putUniqueHashed(it.key, it.hash)
+			}
+		}
 		return Value{ptr: &res.Header}
 	}
-	res.dict.initTable(max(4, s.Len()))
-	for i := range s.dict.Entries {
-		e := &s.dict.Entries[i]
-		if e.Active && !other.dict.containsHashed(e.Key, e.Hash) {
-			res.dict.PutNewHashed(e.Key, NoneVal(), e.Hash)
+	if other.count == 0 {
+		return Value{ptr: &s.Copy().Header}
+	}
+	if s.count == 0 {
+		return Value{ptr: &newEmptySetFor(s.Header.Type).Header}
+	}
+	res := newSetWithCap(s.Header.Type, int(s.count))
+	for i := range s.entries {
+		e := &s.entries[i]
+		if e.State == setEntryOccupied && !other.containsHashed(e.Key, e.Hash) {
+			res.putUniqueHashed(e.Key, e.Hash)
 		}
 	}
 	return Value{ptr: &res.Header}
@@ -4207,18 +4810,36 @@ func (s *PySet) Difference(other *PySet) Value {
 
 // IsSubset reports whether every element in s is in other.
 func (s *PySet) IsSubset(other *PySet) bool {
+	if other == s {
+		return true
+	}
 	if other == nil {
 		return s.Len() == 0
 	}
-	if s.Len() > other.Len() {
-		return false
-	}
-	if s == other || s.Len() == 0 {
+	if setRaceEnabled || MultiThreadedFlag.Load() {
+		sItems := s.snapshotEntries()
+		if len(sItems) == 0 {
+			return true
+		}
+		if len(sItems) > other.Len() {
+			return false
+		}
+		for _, it := range sItems {
+			if !other.containsHashed(it.key, it.hash) {
+				return false
+			}
+		}
 		return true
 	}
-	for i := range s.dict.Entries {
-		e := &s.dict.Entries[i]
-		if e.Active && !other.dict.containsHashed(e.Key, e.Hash) {
+	if s.count > other.count {
+		return false
+	}
+	if s.count == 0 {
+		return true
+	}
+	for i := range s.entries {
+		e := &s.entries[i]
+		if e.State == setEntryOccupied && !other.containsHashed(e.Key, e.Hash) {
 			return false
 		}
 	}
@@ -4227,7 +4848,7 @@ func (s *PySet) IsSubset(other *PySet) bool {
 
 // IsSuperset reports whether every element in other is in s.
 func (s *PySet) IsSuperset(other *PySet) bool {
-	if other == nil {
+	if other == nil || other == s {
 		return true
 	}
 	return other.IsSubset(s)
@@ -4236,102 +4857,185 @@ func (s *PySet) IsSuperset(other *PySet) bool {
 // IsDisjoint reports whether s and other have no elements in common,
 // always iterating the smaller set and probing the larger set.
 func (s *PySet) IsDisjoint(other *PySet) bool {
-	if other == nil || s.Len() == 0 || other.Len() == 0 {
+	if other == s {
+		return s.Len() == 0
+	}
+	if other == nil {
 		return true
 	}
-	if s == other {
-		return false
+	if setRaceEnabled || MultiThreadedFlag.Load() {
+		sItems := s.snapshotEntries()
+		if len(sItems) == 0 {
+			return true
+		}
+		for _, it := range sItems {
+			if other.containsHashed(it.key, it.hash) {
+				return false
+			}
+		}
+		return true
+	}
+	if s.count == 0 || other.count == 0 {
+		return true
 	}
 	small, large := s, other
-	if other.Len() < s.Len() {
+	if other.count < s.count {
 		small, large = other, s
 	}
-	for i := range small.dict.Entries {
-		e := &small.dict.Entries[i]
-		if e.Active && large.dict.containsHashed(e.Key, e.Hash) {
+	for i := range small.entries {
+		e := &small.entries[i]
+		if e.State == setEntryOccupied && large.containsHashed(e.Key, e.Hash) {
 			return false
 		}
 	}
 	return true
 }
 
-// UpdateFromSet adds all elements of other into s without intermediate Keys() allocation.
+// UpdateFromSet adds all elements of other into s without intermediate allocation.
 func (s *PySet) UpdateFromSet(other *PySet) {
-	if other == nil || other == s || other.Len() == 0 {
+	if other == nil || other == s {
 		return
 	}
-	if s.Len() == 0 {
-		s.dict.Reserve(other.Len())
+	if setRaceEnabled || MultiThreadedFlag.Load() {
+		oItems := other.snapshotEntries()
+		if len(oItems) == 0 {
+			return
+		}
+		if s.Len() == 0 {
+			s.Reserve(len(oItems))
+		}
+		for _, it := range oItems {
+			s.addHashed(it.key, it.hash)
+		}
+		return
 	}
-	for i := range other.dict.Entries {
-		e := &other.dict.Entries[i]
-		if e.Active {
-			s.dict.Set(e.Key, NoneVal())
+	if other.count == 0 {
+		return
+	}
+	if s.count == 0 {
+		s.Reserve(int(other.count))
+	}
+	for i := range other.entries {
+		e := &other.entries[i]
+		if e.State == setEntryOccupied {
+			s.addHashed(e.Key, e.Hash)
 		}
 	}
 }
 
 // DifferenceUpdateFromSet removes all elements of other from s in place.
 func (s *PySet) DifferenceUpdateFromSet(other *PySet) {
-	if other == nil || s.Len() == 0 || other.Len() == 0 {
+	if other == nil {
 		return
 	}
 	if other == s {
 		s.Clear()
 		return
 	}
-	if other.Len() <= s.Len() {
-		for i := range other.dict.Entries {
-			e := &other.dict.Entries[i]
-			if e.Active {
-				s.dict.Delete(e.Key)
+	if setRaceEnabled || MultiThreadedFlag.Load() {
+		oItems := other.snapshotEntries()
+		for _, it := range oItems {
+			s.deleteHashed(it.key, it.hash)
+		}
+		return
+	}
+	if s.count == 0 || other.count == 0 {
+		return
+	}
+	if other.count <= s.count {
+		for i := range other.entries {
+			e := &other.entries[i]
+			if e.State == setEntryOccupied {
+				s.deleteHashed(e.Key, e.Hash)
 			}
 		}
 		return
 	}
-	for i := range s.dict.Entries {
-		e := &s.dict.Entries[i]
-		if e.Active && other.dict.containsHashed(e.Key, e.Hash) {
-			s.dict.Delete(e.Key)
+	for i := range s.entries {
+		e := &s.entries[i]
+		if e.State == setEntryOccupied && other.containsHashed(e.Key, e.Hash) {
+			e.Key = Value{}
+			e.Hash = 0
+			e.State = setEntryTombstone
+			s.count--
+			s.ver++
 		}
 	}
 }
 
 // IntersectionUpdateFromSet keeps only elements of s that are also in other.
 func (s *PySet) IntersectionUpdateFromSet(other *PySet) {
-	if other == nil || other.Len() == 0 {
+	if other == s {
+		return
+	}
+	if other == nil {
 		s.Clear()
 		return
 	}
-	if other == s || s.Len() == 0 {
+	if setRaceEnabled || MultiThreadedFlag.Load() {
+		if other.Len() == 0 {
+			s.Clear()
+			return
+		}
+		sItems := s.snapshotEntries()
+		for _, it := range sItems {
+			if !other.containsHashed(it.key, it.hash) {
+				s.deleteHashed(it.key, it.hash)
+			}
+		}
 		return
 	}
-	for i := range s.dict.Entries {
-		e := &s.dict.Entries[i]
-		if e.Active && !other.dict.containsHashed(e.Key, e.Hash) {
-			s.dict.Delete(e.Key)
+	if other.count == 0 {
+		s.Clear()
+		return
+	}
+	if s.count == 0 {
+		return
+	}
+	for i := range s.entries {
+		e := &s.entries[i]
+		if e.State == setEntryOccupied && !other.containsHashed(e.Key, e.Hash) {
+			e.Key = Value{}
+			e.Hash = 0
+			e.State = setEntryTombstone
+			s.count--
+			s.ver++
 		}
 	}
 }
 
 // SymmetricDifferenceUpdateFromSet updates s to the symmetric difference of s and other.
 func (s *PySet) SymmetricDifferenceUpdateFromSet(other *PySet) {
-	if other == nil || other.Len() == 0 {
+	if other == nil {
 		return
 	}
 	if other == s {
 		s.Clear()
 		return
 	}
-	for i := range other.dict.Entries {
-		e := &other.dict.Entries[i]
-		if !e.Active {
+	if setRaceEnabled || MultiThreadedFlag.Load() {
+		oItems := other.snapshotEntries()
+		for _, it := range oItems {
+			if s.containsHashed(it.key, it.hash) {
+				s.deleteHashed(it.key, it.hash)
+			} else {
+				s.addHashed(it.key, it.hash)
+			}
+		}
+		return
+	}
+	if other.count == 0 {
+		return
+	}
+	for i := range other.entries {
+		e := &other.entries[i]
+		if e.State != setEntryOccupied {
 			continue
 		}
-		if s.dict.containsHashed(e.Key, e.Hash) {
-			s.dict.Delete(e.Key)
+		if s.containsHashed(e.Key, e.Hash) {
+			s.deleteHashed(e.Key, e.Hash)
 		} else {
-			s.dict.Set(e.Key, NoneVal())
+			s.addHashed(e.Key, e.Hash)
 		}
 	}
 }

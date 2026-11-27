@@ -331,7 +331,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		}
 
 		if it.IsIter() {
-			if nextVal, ok := it.AsIter().Next(); ok {
+			if nextVal, ok := it.AsIter().NextCtx(ctx); ok {
 				return nextVal
 			}
 			if ctx != nil && ctx.HasException() {
