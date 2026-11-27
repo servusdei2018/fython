@@ -488,6 +488,9 @@ func reloadCode(co *CodeObject, cache *VMCodeCache, gen int32) []uint32 {
 	cache.codePtr = unsafe.Pointer(unsafe.SliceData(newStream))
 	cache.codeLen = len(newStream)
 	cache.privateActive = false
+	if len(cache.dictKwSplit) > 0 && len(cache.dictKwSplit) != len(newStream) {
+		cache.dictKwSplit = nil
+	}
 	return cache.active
 }
 
@@ -594,6 +597,7 @@ type VMCodeCache struct {
 	inlineConsts []val.Value
 	inlineSites  []inlineSite
 	constKeyMaps []ConstKeyMapTemplate
+	dictKwSplit  []*val.SplitDictKeys
 	// hotness counts how often this VM executed the code object. It is
 	// VM-local, so it never shares a cache line with another VM.
 	hotness uint32
@@ -612,6 +616,8 @@ type VMCodeCache struct {
 	typeMethodPIC       [][4]typeMethodPICEntry
 	buildTupleEphemeral []uint8 // 0=unknown, 1=no, 2=yes (keyed by buildTupleGen == streamGen)
 	buildTupleGen       int32
+	forIterUnpack       []uint8 // 0=unknown, 1=ineligible, 2..4=unpack count+1 (keyed by forIterUnpackGen == streamGen)
+	forIterUnpackGen    int32
 }
 
 // typeMethodPICEntry caches polymorphic module/type method resolutions lazily
@@ -740,6 +746,15 @@ func (c *VMCodeCache) ensureConstKeyMaps(n int) []ConstKeyMapTemplate {
 		c.constKeyMaps = nw
 	}
 	return c.constKeyMaps
+}
+
+func (c *VMCodeCache) ensureDictKwSplit(n int) []*val.SplitDictKeys {
+	if len(c.dictKwSplit) < n {
+		nw := make([]*val.SplitDictKeys, n)
+		copy(nw, c.dictKwSplit)
+		c.dictKwSplit = nw
+	}
+	return c.dictKwSplit
 }
 
 // quickenAt writes a quickened instruction word into this VM's private copy of
@@ -1321,6 +1336,7 @@ func (vm *VM) releaseGeneratorStack(gen *val.PyGenerator) {
 	if gen == nil {
 		return
 	}
+	gen.ClearYieldTuple()
 	if gen.Stack != nil {
 		s := gen.Stack
 		gen.Stack = nil

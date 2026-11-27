@@ -1022,6 +1022,8 @@ func (vm *VM) opBuildMap(st *loopState, inst uint32, ip, sp int) (int, int, loop
 	count := int(uint16(inst))
 	var dictVal val.Value
 	switch {
+	case count == 0 && DecodeArgA(inst) == 1:
+		dictVal = val.DictVal(val.NewSmallDictDirect(0))
 	case count <= 16 && isEphemeralMapSite(st, ip):
 		dictVal = vm.acquireSmallDict(count, true)
 	case count <= 16 && st.curCO != nil && ip < len(st.curCO.MapTempSafe) && st.curCO.MapTempSafe[ip]:
@@ -1445,6 +1447,44 @@ func isCachedEphemeralTupleSite(st *loopState, ip int) bool {
 	return state == 2
 }
 
+// callerForIterUnpackCount returns the exact unpack arity (1..3) when callerIP
+// (the instruction immediately following OP_FOR_ITER or OP_FOR_ITER_GEN) is
+// OP_UNPACK_SEQUENCE(1..3) or OP_UNPACK_2_FAST, or 0 otherwise. Results are
+// cached per IP on the caller's VMCodeCache keyed by streamGen.
+func callerForIterUnpackCount(cache *VMCodeCache, callerIP int) int {
+	if cache == nil || callerIP < 0 || callerIP >= len(cache.active) {
+		return 0
+	}
+	var state uint8
+	if cache.forIterUnpackGen == cache.streamGen && callerIP < len(cache.forIterUnpack) {
+		state = cache.forIterUnpack[callerIP]
+	}
+	if state == 0 {
+		w := cache.active[callerIP]
+		switch DecodeOpcode(w) {
+		case OP_UNPACK_2_FAST:
+			state = 3 // count 2 + 1
+		case OP_UNPACK_SEQUENCE:
+			if c := int(DecodeArgBx(w)); c >= 1 && c <= 3 {
+				state = uint8(c + 1)
+			} else {
+				state = 1
+			}
+		default:
+			state = 1
+		}
+		if cache.forIterUnpackGen != cache.streamGen || len(cache.forIterUnpack) < len(cache.active) {
+			cache.forIterUnpack = make([]uint8, len(cache.active))
+			cache.forIterUnpackGen = cache.streamGen
+		}
+		cache.forIterUnpack[callerIP] = state
+	}
+	if state >= 2 {
+		return int(state - 1)
+	}
+	return 0
+}
+
 //go:noinline
 func (vm *VM) opBuildTuple(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
@@ -1458,6 +1498,30 @@ func (vm *VM) opBuildTuple(st *loopState, inst uint32, ip, sp int) (int, int, lo
 		val.ClearEphemeral(stack[i])
 		val.DetachStringBuf(stack[i])
 		markViewEscaped(stack[i])
+	}
+	if count <= 3 && ip+1 < st.codeLen && !val.MultiThreadedFlag.Load() &&
+		st.activeGen != nil && st.frameIdx == st.genFrameIdx && st.frameIdx > st.startFrameIdx &&
+		DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4))) == OP_YIELD_VALUE {
+		callerIdx := st.frameIdx - 1
+		if callerIdx < len(vm.frameAux) && vm.frameAux[callerIdx].genMode == genModeForIter {
+			caller := &vm.frames[callerIdx]
+			if callerForIterUnpackCount(caller.cache, caller.ip) == count {
+				gen := st.activeGen
+				t := gen.YieldTuple
+				if t == nil {
+					t = &val.PyTuple{
+						Header: val.ObjectHeader{Kind: val.KindTuple, Type: val.TupleType},
+					}
+					gen.YieldTuple = t
+				} else {
+					t.Header.Hash = 0
+					t.Header.Flags = 0
+				}
+				t.SetInline(stack[base:sp])
+				stack[base] = val.ObjectVal(&t.Header)
+				return ip + 1, base + 1, ctlNext
+			}
+		}
 	}
 	if count <= 8 && ip+1 < st.codeLen && !val.MultiThreadedFlag.Load() && isCachedEphemeralTupleSite(st, ip) {
 		stack[base] = vm.acquireEphemeralTuple(stack[base:sp])

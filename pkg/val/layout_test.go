@@ -20,6 +20,30 @@ var (
 )
 
 func TestCoreStructLayouts(t *testing.T) {
+	if got := unsafe.Sizeof(PyInstance{}); got != 56 {
+		t.Fatalf("unsafe.Sizeof(PyInstance{}) = %d, want 56", got)
+	}
+	if off := unsafe.Offsetof(PyInstance{}.Header); off != 0 {
+		t.Fatalf("unsafe.Offsetof(PyInstance{}.Header) = %d, want 0", off)
+	}
+	bundleChecks := []struct {
+		name     string
+		size     uintptr
+		maxClass uintptr
+	}{
+		{"pyInstanceBundle1", unsafe.Sizeof(pyInstanceBundle1{}), 80},
+		{"pyInstanceBundle2", unsafe.Sizeof(pyInstanceBundle2{}), 96},
+		{"pyInstanceBundle3", unsafe.Sizeof(pyInstanceBundle3{}), 112},
+		{"pyInstanceBundle4", unsafe.Sizeof(pyInstanceBundle4{}), 128},
+		{"pyInstanceBundle6", unsafe.Sizeof(pyInstanceBundle6{}), 160},
+		{"pyInstanceBundle8", unsafe.Sizeof(pyInstanceBundle8{}), 192},
+		{"pyInstanceBundle12", unsafe.Sizeof(pyInstanceBundle12{}), 256},
+	}
+	for _, bc := range bundleChecks {
+		if bc.size > bc.maxClass {
+			t.Fatalf("unsafe.Sizeof(%s{}) = %d, want <= %d", bc.name, bc.size, bc.maxClass)
+		}
+	}
 	if got := unsafe.Sizeof(PyTuple{}); got != 96 {
 		t.Fatalf("unsafe.Sizeof(PyTuple{}) = %d, want 96", got)
 	}

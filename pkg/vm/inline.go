@@ -1049,10 +1049,16 @@ func spliceInlineBody(vm *VM, st *loopState, guardIP int, guardOp Opcode, origCa
 		copy(n, cache.constKeyMaps)
 		cache.constKeyMaps = n
 	}
+	if len(cache.dictKwSplit) != 0 && len(cache.dictKwSplit) < needIC {
+		n := make([]*val.SplitDictKeys, needIC)
+		copy(n, cache.dictKwSplit)
+		cache.dictKwSplit = n
+	}
 	cache.active = newActive
 	cache.codePtr = unsafe.Pointer(unsafe.SliceData(newActive))
 	cache.codeLen = len(newActive)
 	cache.privateActive = true
+	cache.forIterUnpack = nil
 	cache.ensureInlineExpect(len(newActive))
 	cache.inlineConsts = newConsts
 	cache.inlineSites = append(cache.inlineSites, inlineSite{

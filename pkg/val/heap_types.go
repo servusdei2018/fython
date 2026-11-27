@@ -422,6 +422,7 @@ type PyGenerator struct {
 	ReleaseHook func(gen *PyGenerator)
 	Stack       []Value
 	Cells       []Value
+	YieldTuple  *PyTuple
 	CellPtrs    []*PyCell
 	SP          int
 	Base        int
@@ -430,6 +431,15 @@ type PyGenerator struct {
 	State       GenState
 	PoolClass   uint8
 	OwnCells    bool
+}
+
+// ClearYieldTuple zeroes inline element references on the generator's reusable
+// yield tuple and clears the pointer so GC does not retain yielded values.
+func (g *PyGenerator) ClearYieldTuple() {
+	if g != nil && g.YieldTuple != nil {
+		g.YieldTuple.ClearInline()
+		g.YieldTuple = nil
+	}
 }
 
 // CoroutineState classifies the lifecycle state of a PyCoroutine.
@@ -2476,11 +2486,7 @@ func initExcShapes() {
 // NewKeyError constructs a KeyError instance lazily without allocating an args tuple until accessed.
 func NewKeyError(key Value) Value {
 	initExcShapes()
-	obj := &PyInstance{
-		Header: ObjectHeader{Kind: KindInstance, Type: KeyErrorType},
-		Shape:  keyErrShape,
-	}
-	obj.Slots = obj.bootstrap[:3]
+	obj := allocInstanceBundle(KeyErrorType, keyErrShape, 3, 3)
 	obj.Slots[0] = UnboundVal()
 	obj.Slots[1] = NoneVal()
 	obj.Slots[2] = key
@@ -2529,10 +2535,15 @@ func NewLazyAttributeErrorCtx(ctx *ExecContext, targetType *PyType, attrName Val
 		obj = ctx.LazyAttrErrFreeList[n]
 		ctx.LazyAttrErrFreeList[n] = nil
 		ctx.LazyAttrErrFreeList = ctx.LazyAttrErrFreeList[:n]
+		obj.Slots = obj.Slots[:4]
 	} else {
-		obj = &PyInstance{
-			Header: ObjectHeader{Kind: KindInstance, Type: AttributeErrorType},
+		b := &pyInstanceBundle4{
+			inst: PyInstance{
+				Header: ObjectHeader{Kind: KindInstance, Type: AttributeErrorType},
+			},
 		}
+		b.inst.Slots = b.slots[:4]
+		obj = &b.inst
 	}
 	var flags uint8
 	if ctx != nil && !MultiThreadedFlag.Load() {
@@ -2542,7 +2553,6 @@ func NewLazyAttributeErrorCtx(ctx *ExecContext, targetType *PyType, attrName Val
 	obj.Header.Type = AttributeErrorType
 	obj.Shape = lazyAttrErrShape
 	obj.dictView = nil
-	obj.Slots = obj.bootstrap[:4]
 	obj.Slots[0] = UnboundVal()
 	obj.Slots[1] = NoneVal()
 	if targetType != nil {
@@ -2567,12 +2577,15 @@ func ReleaseLazyAttributeErrorCtx(ctx *ExecContext, exc Value) {
 		return
 	}
 	inst := exc.AsInstance()
-	if lazyAttrErrShape == nil || inst.Shape != lazyAttrErrShape || inst.dictView != nil || !inst.Slots[0].IsUnbound() {
+	if lazyAttrErrShape == nil || inst.Shape != lazyAttrErrShape || inst.dictView != nil || len(inst.Slots) < 4 || !inst.Slots[0].IsUnbound() {
 		return
 	}
-	clear(inst.bootstrap[:4])
+	if cap(inst.Slots) != 4 {
+		return
+	}
+	clear(inst.Slots[:4])
 	inst.Header.Flags = 0
-	inst.Slots = nil
+	inst.Slots = inst.Slots[:0]
 	inst.Shape = nil
 	if ctx != nil && len(ctx.LazyAttrErrFreeList) < 64 {
 		ctx.LazyAttrErrFreeList = append(ctx.LazyAttrErrFreeList, inst)
@@ -2664,11 +2677,7 @@ func NewModuleNotFoundError(msg string) Value {
 // NewStopIteration constructs a StopIteration instance.
 func NewStopIteration(retVal Value) Value {
 	initExcShapes()
-	obj := &PyInstance{
-		Header: ObjectHeader{Kind: KindInstance, Type: StopIterationType},
-		Shape:  stopIterShape,
-	}
-	obj.Slots = obj.bootstrap[:3]
+	obj := allocInstanceBundle(StopIterationType, stopIterShape, 3, 3)
 	obj.Slots[1] = NoneVal()
 	if !retVal.IsNone() && retVal.ptr != nil && retVal.ptr != &tagNone {
 		obj.Slots[0] = NewTupleVal(retVal)

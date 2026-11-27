@@ -3374,8 +3374,8 @@ func (c *Compiler) compileListComp(expr *ASTExpr) error {
 func (c *Compiler) compileDictComp(expr *ASTExpr) error {
 	restore := c.compSaveLocals(expr.Extra)
 	defer restore()
-	// 1. Build initial empty dict
-	c.emitOp(vm.OP_BUILD_MAP, 0, 0)
+	// 1. Build initial comprehension dict (ArgA=1 selects 1-alloc fused small dict)
+	c.emitOp(vm.OP_BUILD_MAP, 1, 0)
 
 	var compileClause func(currIdx uint32, depth int) error
 	compileClause = func(currIdx uint32, depth int) error {

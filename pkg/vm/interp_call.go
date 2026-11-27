@@ -764,7 +764,127 @@ func insertKwPICEntry(entries *[2]KwPICEntry, e KwPICEntry) {
 	entries[1] = e
 }
 
+// buildSplitDictKeys constructs a shared immutable SplitDictKeys table for 1..16
+// unique templateable string keys (interned or inline strings).
+//
 //go:noinline
+func buildSplitDictKeys(keys []val.Value) *val.SplitDictKeys {
+	count := len(keys)
+	if count < 1 || count > 16 {
+		return nil
+	}
+	for _, k := range keys {
+		if !constKeyIsTemplateable(k) {
+			return nil
+		}
+	}
+	for i := range count {
+		for j := i + 1; j < count; j++ {
+			if keys[i] == keys[j] {
+				return nil
+			}
+		}
+	}
+	sk := &val.SplitDictKeys{Count: count}
+	var mask uint32
+	switch {
+	case count <= 5:
+		mask = 7
+	case count <= 10:
+		mask = 15
+	default:
+		mask = 31
+	}
+	sk.Mask = mask
+	for i := range count {
+		h := val.HashValue(keys[i])
+		sk.Keys[i] = keys[i]
+		sk.Hashes[i] = h
+		slot := h & mask
+		for sk.Indices[slot] != 0 {
+			slot = (slot + 1) & mask
+		}
+		sk.Indices[slot] = byte(i + 2)
+	}
+	return sk
+}
+
+// opCallDictKwFast handles dict(k1=v1, ...) at OP_CALL_KW sites using a per-IP
+// SplitDictKeys cache on the VM-private VMCodeCache, falling back to a combined
+// small/exact dict if SplitKeys is self-disabled or kwnames differ at this IP.
+func (vm *VM) opCallDictKwFast(st *loopState, stack []val.Value, ip, newBase, retSP, kwCount int, kwnames []val.Value) bool {
+	cache := st.cache
+	if cache == nil || ip < 0 || ip >= st.codeLen {
+		return false
+	}
+	vals := stack[newBase : newBase+kwCount]
+	var sk *val.SplitDictKeys
+	if ip < len(cache.dictKwSplit) {
+		sk = cache.dictKwSplit[ip]
+	}
+	if sk != nil {
+		matched := sk.Count == kwCount
+		if matched {
+			for i := range kwCount {
+				if sk.Keys[i] != kwnames[i] {
+					matched = false
+					break
+				}
+			}
+		}
+		if matched && !sk.DisableSplit.Load() {
+			for i := range kwCount {
+				val.ClearEphemeral(vals[i])
+				val.DetachStringBuf(vals[i])
+				if vm.hasTrackedViews {
+					markViewEscaped(vals[i])
+				}
+			}
+			d := val.NewSplitDict(sk, vals, 0)
+			stack[retSP] = val.DictVal(d)
+			return true
+		}
+		// Either DisableSplit is set or kwnames mismatched at this IP:
+		// keep the cached slot untouched and build a combined dict directly.
+		return vm.buildCombinedDictFromKw(stack, vals, kwnames, retSP)
+	}
+	sk = buildSplitDictKeys(kwnames)
+	if sk == nil {
+		return vm.buildCombinedDictFromKw(stack, vals, kwnames, retSP)
+	}
+	cache.ensureDictKwSplit(st.codeLen)[ip] = sk
+	for i := range kwCount {
+		val.ClearEphemeral(vals[i])
+		val.DetachStringBuf(vals[i])
+		if vm.hasTrackedViews {
+			markViewEscaped(vals[i])
+		}
+	}
+	d := val.NewSplitDict(sk, vals, 0)
+	stack[retSP] = val.DictVal(d)
+	return true
+}
+
+func (vm *VM) buildCombinedDictFromKw(stack, vals, kwnames []val.Value, retSP int) bool {
+	var d *val.PyDict
+	if len(kwnames) <= 5 {
+		d = val.NewSmallDictDirect(0)
+	} else {
+		d = val.NewDictVal(len(kwnames)).AsDict()
+	}
+	for i, kn := range kwnames {
+		v := vals[i]
+		val.ClearEphemeral(v)
+		val.DetachStringBuf(v)
+		if vm.hasTrackedViews {
+			markViewEscaped(v)
+		}
+		d.Set(kn, v)
+	}
+	stack[retSP] = val.DictVal(d)
+	return true
+}
+
 func (vm *VM) opCallKw(st *loopState, inst uint32, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
 	totalArgs := int(uint8(inst >> 16))
@@ -1009,6 +1129,11 @@ unwrapKw:
 
 	case val.KindType:
 		tp := target.AsType()
+		if tp == val.DictType && posCount == 0 && kwCount >= 1 && kwCount <= 16 && !val.MultiThreadedFlag.Load() {
+			if vm.opCallDictKwFast(st, stack, ip, newBase, retSP, kwCount, kwnames) {
+				return ip + 1, retSP + 1, ctlNext
+			}
+		}
 		if canFastInstantiate(tp) {
 			if !tp.HasInit() && len(kwnames) == 0 {
 				stack[retSP] = val.NewInstanceOfType(tp)

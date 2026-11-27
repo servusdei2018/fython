@@ -50,21 +50,26 @@ type PyTuple struct {
 	inline [3]Value
 }
 
-// SetInline copies up to 3 elements into t's inline storage and binds t.Items.
+// SetInline copies up to 3 elements into t's inline storage, zeroes any
+// trailing unused slots to prevent stale GC retention, and binds t.Items.
 func (t *PyTuple) SetInline(src []Value) {
 	n := len(src)
 	switch n {
 	case 1:
 		t.inline[0] = src[0]
+		t.inline[1] = Value{}
+		t.inline[2] = Value{}
 	case 2:
 		t.inline[0] = src[0]
 		t.inline[1] = src[1]
+		t.inline[2] = Value{}
 	case 3:
 		t.inline[0] = src[0]
 		t.inline[1] = src[1]
 		t.inline[2] = src[2]
 	default:
 		copy(t.inline[:n], src)
+		clear(t.inline[n:])
 	}
 	t.Items = t.inline[:n]
 }
@@ -5569,9 +5574,42 @@ func initTypes() {
 		if len(args) > 0 && args[0].IsType() {
 			cls = args[0].AsType()
 		}
-		d := NewDictVal(16).AsDict()
-		d.Header.Type = cls
-		return Value{num: uint64(KindDict), ptr: &d.Header}
+		if cls != DictType {
+			d := NewDictVal(16).AsDict()
+			d.Header.Type = cls
+			return Value{num: uint64(KindDict), ptr: &d.Header}
+		}
+		posArgs := max(len(args)-1-len(kwnames), 0)
+		if posArgs == 0 && len(kwnames) == 0 {
+			return NewDictVal(0)
+		}
+		totalHint := len(kwnames)
+		if posArgs == 1 {
+			other := args[1]
+			switch {
+			case other.IsDict():
+				totalHint += other.AsDict().Len()
+			case other.IsMappingProxy() && other.AsMappingProxy().Mapping.IsDict():
+				totalHint += other.AsMappingProxy().Mapping.AsDict().Len()
+			case other.IsList():
+				totalHint += len(other.AsList().Items)
+			case other.IsTuple():
+				totalHint += len(other.AsTuple().Items)
+			case other.IsSet():
+				totalHint += other.AsSet().Len()
+			default:
+				if totalHint == 0 {
+					totalHint = 1
+				}
+			}
+		}
+		if totalHint == 0 {
+			return NewDictVal(0)
+		}
+		if totalHint <= 5 {
+			return DictVal(NewSmallDictDirect(0))
+		}
+		return NewDictVal(totalHint)
 	})
 	DictType.Dict.Set(DunderNew, dictNewBuiltin)
 	DictType.dunderNew = dictNewBuiltin
@@ -9101,17 +9139,17 @@ func newPrimSubInstance(subcls *PyType, prim Value) Value {
 	if shape == nil {
 		shape = defaultRootShape
 	}
-	obj := &PyInstance{
-		Header: ObjectHeader{Kind: KindInstance, Type: subcls},
-		Shape:  shape,
+	n := max(1, len(shape.Attrs))
+	capHint := n
+	if (subcls.Flags & FlagForbidDynamicAttrs) == 0 {
+		if pred := int(subcls.likelySlotCap.Load()); pred > capHint {
+			capHint = pred
+		}
 	}
-	if pred := int(subcls.likelySlotCap.Load()); pred > len(obj.bootstrap) {
-		slots := make([]Value, 1, pred)
-		slots[0] = prim
-		obj.Slots = slots
-	} else {
-		obj.bootstrap[0] = prim
-		obj.Slots = obj.bootstrap[:1]
+	obj := allocInstanceBundle(subcls, shape, n, capHint)
+	obj.Slots[0] = prim
+	for i := 1; i < n; i++ {
+		obj.Slots[i] = UnboundVal()
 	}
 	return Value{num: 0, ptr: &obj.Header}
 }

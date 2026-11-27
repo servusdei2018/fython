@@ -205,20 +205,110 @@ func (inst *PyInstance) lock() *sync.RWMutex {
 // and a flat contiguous slice of attribute Values (never backed by a PyDict or Go map).
 // Header MUST be at offset 0.
 type PyInstance struct {
-	Header    ObjectHeader
-	Shape     *Shape
-	Slots     []Value
-	bootstrap [6]Value
-	dictView  *PyDict
+	Header   ObjectHeader
+	Shape    *Shape
+	Slots    []Value
+	dictView *PyDict
 }
 
-// Compile-time assertions that PyInstance.Header is at byte offset 0 and the
-// struct stays at 152 bytes (inside Go's 160-byte size class).
+// Fused size-class instance bundles place PyInstance at offset 0 (preserving
+// Header at offset 0) followed by an inline fixed-size Value array so instances
+// with 1..12 attributes allocate in a single heap object sized to their slot count.
+type pyInstanceBundle1 struct {
+	inst  PyInstance
+	slots [1]Value
+}
+
+type pyInstanceBundle2 struct {
+	inst  PyInstance
+	slots [2]Value
+}
+
+type pyInstanceBundle3 struct {
+	inst  PyInstance
+	slots [3]Value
+}
+
+type pyInstanceBundle4 struct {
+	inst  PyInstance
+	slots [4]Value
+}
+
+type pyInstanceBundle6 struct {
+	inst  PyInstance
+	slots [6]Value
+}
+
+type pyInstanceBundle8 struct {
+	inst  PyInstance
+	slots [8]Value
+}
+
+type pyInstanceBundle12 struct {
+	inst  PyInstance
+	slots [12]Value
+}
+
+// Compile-time assertions that PyInstance.Header is at byte offset 0, the
+// decoupled struct stays at 56 bytes (Go's 64-byte size class), and every
+// fused bundle places inst at offset 0.
 var (
 	_ [0 - unsafe.Offsetof(PyInstance{}.Header)]byte
-	_ [152 - unsafe.Sizeof(PyInstance{})]byte
-	_ [unsafe.Sizeof(PyInstance{}) - 152]byte
+	_ [56 - unsafe.Sizeof(PyInstance{})]byte
+	_ [unsafe.Sizeof(PyInstance{}) - 56]byte
+	_ [0 - unsafe.Offsetof(pyInstanceBundle1{}.inst)]byte
+	_ [0 - unsafe.Offsetof(pyInstanceBundle2{}.inst)]byte
+	_ [0 - unsafe.Offsetof(pyInstanceBundle3{}.inst)]byte
+	_ [0 - unsafe.Offsetof(pyInstanceBundle4{}.inst)]byte
+	_ [0 - unsafe.Offsetof(pyInstanceBundle6{}.inst)]byte
+	_ [0 - unsafe.Offsetof(pyInstanceBundle8{}.inst)]byte
+	_ [0 - unsafe.Offsetof(pyInstanceBundle12{}.inst)]byte
 )
+
+// allocInstanceBundle allocates a PyInstance with len(Slots) == initLen and
+// cap(Slots) >= max(initLen, capHint), using a single fused bundle for 0..12
+// slots and a decoupled backing slice above 12 slots.
+func allocInstanceBundle(cls *PyType, shape *Shape, initLen, capHint int) *PyInstance {
+	slotCap := max(initLen, capHint)
+	switch {
+	case slotCap <= 0:
+		return &PyInstance{Header: ObjectHeader{Kind: KindInstance, Type: cls}, Shape: shape}
+	case slotCap == 1:
+		b := &pyInstanceBundle1{inst: PyInstance{Header: ObjectHeader{Kind: KindInstance, Type: cls}, Shape: shape}}
+		b.inst.Slots = b.slots[:initLen]
+		return &b.inst
+	case slotCap == 2:
+		b := &pyInstanceBundle2{inst: PyInstance{Header: ObjectHeader{Kind: KindInstance, Type: cls}, Shape: shape}}
+		b.inst.Slots = b.slots[:initLen]
+		return &b.inst
+	case slotCap == 3:
+		b := &pyInstanceBundle3{inst: PyInstance{Header: ObjectHeader{Kind: KindInstance, Type: cls}, Shape: shape}}
+		b.inst.Slots = b.slots[:initLen]
+		return &b.inst
+	case slotCap == 4:
+		b := &pyInstanceBundle4{inst: PyInstance{Header: ObjectHeader{Kind: KindInstance, Type: cls}, Shape: shape}}
+		b.inst.Slots = b.slots[:initLen]
+		return &b.inst
+	case slotCap <= 6:
+		b := &pyInstanceBundle6{inst: PyInstance{Header: ObjectHeader{Kind: KindInstance, Type: cls}, Shape: shape}}
+		b.inst.Slots = b.slots[:initLen]
+		return &b.inst
+	case slotCap <= 8:
+		b := &pyInstanceBundle8{inst: PyInstance{Header: ObjectHeader{Kind: KindInstance, Type: cls}, Shape: shape}}
+		b.inst.Slots = b.slots[:initLen]
+		return &b.inst
+	case slotCap <= 12:
+		b := &pyInstanceBundle12{inst: PyInstance{Header: ObjectHeader{Kind: KindInstance, Type: cls}, Shape: shape}}
+		b.inst.Slots = b.slots[:initLen]
+		return &b.inst
+	default:
+		return &PyInstance{
+			Header: ObjectHeader{Kind: KindInstance, Type: cls},
+			Shape:  shape,
+			Slots:  make([]Value, initLen, slotCap),
+		}
+	}
+}
 
 // NewInstanceVal constructs a new heap-allocated KindInstance Value with the given initial Shape.
 // If shape is nil, DefaultRootShape() is used.
@@ -227,15 +317,7 @@ func NewInstanceVal(shape *Shape) Value {
 		shape = defaultRootShape
 	}
 	n := len(shape.Attrs)
-	obj := &PyInstance{
-		Header: ObjectHeader{Kind: KindInstance, Type: ObjectType},
-		Shape:  shape,
-	}
-	if n <= len(obj.bootstrap) {
-		obj.Slots = obj.bootstrap[:n]
-	} else {
-		obj.Slots = make([]Value, n, max(8, n))
-	}
+	obj := allocInstanceBundle(ObjectType, shape, n, n)
 	return Value{num: 0, ptr: &obj.Header}
 }
 
@@ -263,16 +345,7 @@ func AllocCInstanceStub(v Value) unsafe.Pointer {
 // populate every slot in [0, len(shape.Attrs)) before exposing the instance.
 func NewInstanceWithShape(cls *PyType, shape *Shape) *PyInstance {
 	n := len(shape.Attrs)
-	obj := &PyInstance{
-		Header: ObjectHeader{Kind: KindInstance, Type: cls},
-		Shape:  shape,
-	}
-	if n <= len(obj.bootstrap) {
-		obj.Slots = obj.bootstrap[:n]
-	} else {
-		obj.Slots = make([]Value, n)
-	}
-	return obj
+	return allocInstanceBundle(cls, shape, n, n)
 }
 
 // NewInstanceOfType constructs a new heap-allocated KindInstance Value belonging to cls.
@@ -297,23 +370,13 @@ func NewInstanceOfType(cls *PyType) Value {
 		shape = defaultRootShape
 	}
 	n := len(shape.Attrs)
-	obj := &PyInstance{
-		Header: ObjectHeader{Kind: KindInstance, Type: cls},
-		Shape:  shape,
-	}
-	if n <= len(obj.bootstrap) {
-		if pred := int(cls.likelySlotCap.Load()); pred > len(obj.bootstrap) {
-			obj.Slots = make([]Value, n, pred)
-		} else {
-			obj.Slots = obj.bootstrap[:n]
-		}
-	} else {
-		capHint := max(8, n)
+	capHint := n
+	if (cls.Flags & FlagForbidDynamicAttrs) == 0 {
 		if pred := int(cls.likelySlotCap.Load()); pred > capHint {
 			capHint = pred
 		}
-		obj.Slots = make([]Value, n, capHint)
 	}
+	obj := allocInstanceBundle(cls, shape, n, capHint)
 	return Value{num: 0, ptr: &obj.Header}
 }
 
@@ -372,10 +435,10 @@ func (inst *PyInstance) SetSlot(idx int, val Value) bool {
 }
 
 // noteSlotCap monotonically bumps cls.likelySlotCap up to min(c, 64) so future
-// instances of multi-attribute classes pre-allocate Slots once without growing
-// past bootstrap mid-__init__.
+// instances of dynamic-attribute classes allocate the matching fused slot bundle
+// in one allocation without overflowing mid-__init__.
 func (t *PyType) noteSlotCap(c int) {
-	if t == nil || c <= 6 {
+	if t == nil || c <= 0 {
 		return
 	}
 	if c > 64 {
@@ -394,12 +457,15 @@ func (t *PyType) noteSlotCap(c int) {
 }
 
 // ExtendBootstrapSlot appends v into inst.Slots at slotIdx when slotIdx is the
-// next contiguous slot and fits within existing capacity (either inline bootstrap
-// or a pre-allocated Slots slice).
+// next contiguous slot and fits within existing capacity (fused bundle or
+// pre-allocated Slots slice).
 func (inst *PyInstance) ExtendBootstrapSlot(slotIdx int, v Value) bool {
 	if slotIdx == len(inst.Slots) && slotIdx < cap(inst.Slots) {
 		inst.Slots = inst.Slots[:slotIdx+1]
 		inst.Slots[slotIdx] = v
+		if tp := inst.Header.Type; tp != nil && slotIdx+1 > int(tp.likelySlotCap.Load()) {
+			tp.noteSlotCap(slotIdx + 1)
+		}
 		return true
 	}
 	return false
@@ -415,6 +481,9 @@ func (inst *PyInstance) ApplyShapeTransition(newShape *Shape, slotIdx int, v Val
 		case slotIdx == len(inst.Slots) && slotIdx < cap(inst.Slots):
 			inst.Slots = inst.Slots[:slotIdx+1]
 			inst.Slots[slotIdx] = v
+			if tp := inst.Header.Type; tp != nil && slotIdx+1 > int(tp.likelySlotCap.Load()) {
+				tp.noteSlotCap(slotIdx + 1)
+			}
 		default:
 			inst.Slots = inst.appendSlot(v)
 		}
@@ -429,6 +498,9 @@ func (inst *PyInstance) ApplyShapeTransition(newShape *Shape, slotIdx int, v Val
 	case slotIdx == len(inst.Slots) && slotIdx < cap(inst.Slots):
 		inst.Slots = inst.Slots[:slotIdx+1]
 		inst.Slots[slotIdx] = v
+		if tp := inst.Header.Type; tp != nil && slotIdx+1 > int(tp.likelySlotCap.Load()) {
+			tp.noteSlotCap(slotIdx + 1)
+		}
 	default:
 		inst.Slots = inst.appendSlot(v)
 	}
@@ -532,20 +604,14 @@ func (inst *PyInstance) appendSlot(value Value) []Value {
 	if n < cap(inst.Slots) {
 		s := inst.Slots[:n+1]
 		s[n] = value
+		if tp := inst.Header.Type; tp != nil && len(s) > int(tp.likelySlotCap.Load()) {
+			tp.noteSlotCap(len(s))
+		}
 		return s
 	}
-	if n == len(inst.bootstrap) && n > 0 && &inst.Slots[0] == &inst.bootstrap[0] {
-		newSlots := make([]Value, n+1, n+4)
-		copy(newSlots, inst.bootstrap[:])
-		newSlots[n] = value
-		if inst.Header.Type != nil {
-			inst.Header.Type.noteSlotCap(cap(newSlots))
-		}
-		return newSlots
-	}
 	inst.Slots = append(inst.Slots, value)
-	if inst.Header.Type != nil && cap(inst.Slots) > len(inst.bootstrap) {
-		inst.Header.Type.noteSlotCap(cap(inst.Slots))
+	if tp := inst.Header.Type; tp != nil && len(inst.Slots) > int(tp.likelySlotCap.Load()) {
+		tp.noteSlotCap(len(inst.Slots))
 	}
 	return inst.Slots
 }
