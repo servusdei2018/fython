@@ -39,6 +39,8 @@ func (vm *VM) Run(code []uint32, consts []val.Value, numLocals int) (res val.Val
 		vm.rootCO.MaxStackSize = numLocals + 64
 		vm.rootCO.IsTier2Optimized = 0
 		vm.rootCO.Hotness = 0
+		vm.rootCO.regCode.Store(nil)
+		vm.rootCO.regState.Store(0)
 		vm.rootCO.stream = nil
 		vm.rootCO.ParamShapeComputed = false
 		vm.rootCO.computeParamShape()
@@ -47,6 +49,12 @@ func (vm *VM) Run(code []uint32, consts []val.Value, numLocals int) (res val.Val
 		vm.rootCache.codeLen = 0
 		vm.rootCache.privateActive = false
 		vm.rootCache.tier2Done = 0
+		vm.rootCache.regCode = nil
+		vm.rootCache.regEntryInstalled = false
+		vm.rootCache.regIC = nil
+		vm.rootCache.regAttrPIC = nil
+		vm.rootCache.regMethodPIC = nil
+		vm.rootCache.regTransitionIC = nil
 		if len(vm.rootCache.ic) > 0 {
 			clear(vm.rootCache.ic)
 			clear(vm.rootCache.methodPIC)
@@ -585,13 +593,12 @@ func (vm *VM) callSimpleFuncFromHook(ctx *val.ExecContext, co *CodeObject, fnGlo
 		st.codeLen = cc.codeLen
 		st.consts = cc.frameConsts(co)
 		if cc.tier2Done == 0 {
-			if atomic.LoadInt32(&co.IsTier2Optimized) != 0 {
-				cc.tier2Done = 1
+			maybeOptimizeCodeObject(vm, co, cc)
+			if atomic.LoadInt32(&co.StreamGen) != cc.streamGen {
+				st.codePtr, st.codeLen = vm.loadWindow(co, cc)
 			} else {
-				maybeOptimizeCodeObject(vm, co, cc)
-				if atomic.LoadInt32(&co.StreamGen) != cc.streamGen {
-					st.codePtr, st.codeLen = vm.loadWindow(co, cc)
-				}
+				st.codePtr = cc.codePtr
+				st.codeLen = cc.codeLen
 			}
 		}
 	} else {
@@ -3491,8 +3498,14 @@ func (vm *VM) runFrame(co *CodeObject, startBase int, startSP int, startFrameIdx
 	st.consts = st.cache.frameConsts(co)
 	vm.activeState = st
 
-	if atomic.LoadInt32(&co.IsTier2Optimized) == 0 {
+	if st.cache.tier2Done == 0 && !co.IsGenerator && !co.IsCoroutine {
 		maybeOptimizeCodeObject(vm, co, st.cache)
+		if atomic.LoadInt32(&co.StreamGen) != st.cache.streamGen {
+			st.codePtr, st.codeLen = vm.loadWindow(co, st.cache)
+		} else {
+			st.codePtr = st.cache.codePtr
+			st.codeLen = st.cache.codeLen
+		}
 	}
 
 	if (activeGen != nil || activeCoro != nil) && vm.execCtx.HasException() {
@@ -4715,9 +4728,6 @@ func (vm *VM) runLoopWithGlobals(st *loopState) val.Value {
 //go:noinline
 func (vm *VM) maybeOptimizeFast(callee *CodeObject, cc *VMCodeCache) {
 	maybeOptimizeCodeObject(vm, callee, cc)
-	if atomic.LoadInt32(&callee.IsTier2Optimized) != 0 {
-		cc.tier2Done = 1
-	}
 }
 
 //go:noinline

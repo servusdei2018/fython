@@ -34,10 +34,21 @@ func (vm *VM) checkPeriodicSafepoint(frameIdx int) {
 //go:noinline
 func (vm *VM) syncCalleeCode(st *loopState, callee *CodeObject, cc *VMCodeCache) {
 	st.codePtr, st.codeLen = vm.loadWindow(callee, cc)
-	if atomic.LoadInt32(&callee.IsTier2Optimized) == 0 && len(callee.ExceptionTable) == 0 && !callee.IsGenerator && !callee.IsCoroutine {
-		maybeOptimizeCodeObject(vm, callee, cc)
-		if atomic.LoadInt32(&callee.StreamGen) != cc.streamGen {
-			st.codePtr, st.codeLen = vm.loadWindow(callee, cc)
+	if !callee.IsGenerator && !callee.IsCoroutine {
+		if rc := callee.regCode.Load(); rc != nil {
+			cc.installRegEntry(rc)
+			cc.tier2Done = 1
+			st.codePtr = cc.codePtr
+			st.codeLen = cc.codeLen
+			return
+		}
+		if cc.tier2Done == 0 {
+			maybeOptimizeCodeObject(vm, callee, cc)
+			if atomic.LoadInt32(&callee.StreamGen) != cc.streamGen {
+				st.codePtr, st.codeLen = vm.loadWindow(callee, cc)
+			}
+			st.codePtr = cc.codePtr
+			st.codeLen = cc.codeLen
 		}
 	}
 }
@@ -116,10 +127,6 @@ func (vm *VM) pushCalleeFrame(
 	st.cache = cc
 	switch {
 	case cc.tier2Done != 0 && atomic.LoadInt32(&callee.StreamGen) == cc.streamGen:
-		st.codePtr = cc.codePtr
-		st.codeLen = cc.codeLen
-	case atomic.LoadInt32(&callee.StreamGen) == cc.streamGen && atomic.LoadInt32(&callee.IsTier2Optimized) != 0:
-		cc.tier2Done = 1
 		st.codePtr = cc.codePtr
 		st.codeLen = cc.codeLen
 	default:

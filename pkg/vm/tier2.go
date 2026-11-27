@@ -8,32 +8,80 @@ import (
 )
 
 // tier2HotnessThreshold is the number of executions after which a code object
-// is handed to the Tier-2 optimizer.
+// is handed to the Tier-1 superinstruction optimizer.
 const tier2HotnessThreshold = 8
 
-// maybeOptimizeCodeObject counts how often the VM executed co and triggers the
-// Tier-2 optimizer once the hotness threshold is exceeded.
-//
-// The counter is VM-local whenever the runtime is single-threaded, so the hot
-// loop never touches a cache line shared with another VM. In a multi-threaded
-// runtime the shared atomic counter of the code object is used instead.
-//
-// The caller passes the code cache of co when it already has it at hand: the
-// cache holds the counter, and looking it up again would cost more than the
-// counter itself.
+// regCompileHotnessThreshold is the number of executions after which a Tier B
+// code object is promoted to the 3-address register VM.
+const regCompileHotnessThreshold = 16
+
+// maybeCompileRegCode promotes co to RegCode once it crosses
+// regCompileHotnessThreshold and installs OP_ENTER_REG on cache.
+func maybeCompileRegCode(vm *VM, co *CodeObject, cache *VMCodeCache) {
+	if co == nil || co == &vm.rootCO {
+		return
+	}
+	if rc := co.regCode.Load(); rc != nil {
+		if cache != nil {
+			cache.installRegEntry(rc)
+		}
+		return
+	}
+	if co.regState.Load() != 0 {
+		return
+	}
+	if co.IsGenerator || co.IsCoroutine || co.CanSuspend ||
+		(co.Flags&(CO_GENERATOR|CO_COROUTINE|CO_ASYNC_GENERATOR)) != 0 {
+		co.regState.Store(2)
+		return
+	}
+	var count uint32
+	if val.IsMultiThreaded() {
+		count = uint32(atomic.LoadInt32(&co.Hotness))
+	} else if cache != nil {
+		count = cache.hotness
+	}
+	if count < regCompileHotnessThreshold {
+		return
+	}
+	if !co.regState.CompareAndSwap(0, 1) {
+		if rc := co.regCode.Load(); rc != nil && cache != nil {
+			cache.installRegEntry(rc)
+		}
+		return
+	}
+	rc := compileRegCode(co)
+	if rc == nil {
+		co.regState.Store(2)
+		return
+	}
+	co.regCode.Store(rc)
+	if cache != nil {
+		cache.installRegEntry(rc)
+	}
+}
+
 func maybeOptimizeCodeObject(vm *VM, co *CodeObject, cache *VMCodeCache) {
 	if co == nil {
 		return
 	}
-	if atomic.LoadInt32(&co.IsTier2Optimized) != 0 {
+	if rc := co.regCode.Load(); rc != nil {
 		if cache != nil {
+			cache.installRegEntry(rc)
 			cache.tier2Done = 1
 		}
 		return
 	}
 	if val.IsMultiThreaded() {
-		if atomic.AddInt32(&co.Hotness, 1) >= tier2HotnessThreshold {
+		h := atomic.AddInt32(&co.Hotness, 1)
+		if h >= tier2HotnessThreshold && atomic.LoadInt32(&co.IsTier2Optimized) == 0 && len(co.ExceptionTable) == 0 {
 			OptimizeCodeObject(co)
+		}
+		if h >= regCompileHotnessThreshold {
+			maybeCompileRegCode(vm, co, cache)
+			if cache != nil && co.regState.Load() != 0 {
+				cache.tier2Done = 1
+			}
 		}
 		return
 	}
@@ -41,8 +89,14 @@ func maybeOptimizeCodeObject(vm *VM, co *CodeObject, cache *VMCodeCache) {
 		cache = vm.cacheFor(co)
 	}
 	cache.hotness++
-	if cache.hotness >= tier2HotnessThreshold {
+	if cache.hotness >= tier2HotnessThreshold && atomic.LoadInt32(&co.IsTier2Optimized) == 0 && len(co.ExceptionTable) == 0 {
 		OptimizeCodeObject(co)
+	}
+	if cache.hotness >= regCompileHotnessThreshold {
+		maybeCompileRegCode(vm, co, cache)
+		if co.regState.Load() != 0 {
+			cache.tier2Done = 1
+		}
 	}
 }
 

@@ -1535,7 +1535,7 @@ func (vm *VM) opBuildTuple(st *loopState, inst uint32, ip, sp int) (int, int, lo
 		callerIdx := st.frameIdx - 1
 		if callerIdx < len(vm.frameAux) && vm.frameAux[callerIdx].genMode == genModeForIter {
 			caller := &vm.frames[callerIdx]
-			if callerForIterUnpackCount(caller.cache, caller.ip) == count {
+			if (caller.flags&frameFlagReg) == 0 && callerForIterUnpackCount(caller.cache, caller.ip) == count {
 				gen := st.activeGen
 				t := gen.YieldTuple
 				if t == nil {

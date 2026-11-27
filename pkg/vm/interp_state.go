@@ -32,6 +32,7 @@ type loopState struct {
 	globals       *val.PyDict
 	curLocals     val.Value
 	cache         *VMCodeCache
+	regCode       *RegCode
 	stack         []val.Value
 	activeGen     *val.PyGenerator
 	activeCoro    *val.PyCoroutine
@@ -196,6 +197,9 @@ func (vm *VM) syncActiveFrame(st *loopState, ip int) {
 		vm.maxSP = st.base + 256
 	}
 	if frameIdx >= 0 && frameIdx < len(vm.frames) {
+		if st.regCode != nil {
+			ip = st.regCode.tier1PC(ip)
+		}
 		saved := &vm.frames[frameIdx]
 		saved.cache = st.cache
 		saved.ip = ip

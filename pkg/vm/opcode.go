@@ -235,6 +235,7 @@ const (
 	OP_BUILD_CONST_KEY_MAP
 	OP_COMPARE_FAST_FAST
 	OP_CALL_FAST_ATTR_DESCR
+	OP_ENTER_REG
 )
 
 // Comparison operation codes for OP_COMPARE_OP (passed in ArgA field).
@@ -595,6 +596,8 @@ func (op Opcode) String() string {
 		return "OP_COMPARE_FAST_FAST"
 	case OP_CALL_FAST_ATTR_DESCR:
 		return "OP_CALL_FAST_ATTR_DESCR"
+	case OP_ENTER_REG:
+		return "OP_ENTER_REG"
 	default:
 		return "OP_UNKNOWN"
 	}

@@ -1273,6 +1273,8 @@ func (vm *VM) dispatchColdOpcode(st *loopState, op Opcode, inst uint32, ip, sp i
 		return vm.opCallInstanceDunderSlow(st, inst, ip, sp)
 	case OP_UNPACK_3_FAST:
 		return vm.opUnpackStoreFastSlow(st, op, inst, ip, sp)
+	case OP_ENTER_REG:
+		return vm.enterRegFromTier1(st, ip, sp)
 	default:
 		panic("vm: unknown opcode")
 	}

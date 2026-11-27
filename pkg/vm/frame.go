@@ -226,6 +226,7 @@ const (
 	frameFlagHasAux      uint8 = 1 << 4 // caller saved cells/cellPtrs/locals in vm.frameAux[idx]
 	frameFlagHasShadow   uint8 = 1 << 5 // frame has materialized shadowFrame in vm.frameAux[idx]
 	frameFlagGenOrCoro   uint8 = 1 << 6 // inline generator/coroutine suspension frame (frameAux.gen* valid)
+	frameFlagReg         uint8 = 1 << 7 // frame is executing in RegCode (ip is regIP, retSP is caller dstReg)
 )
 
 const frameFlagSlowReturn = frameFlagHasAux | frameFlagCmp | frameFlagGenOrCoro
@@ -371,6 +372,10 @@ type CodeObject struct {
 	// inlineMeta caches static per-CodeObject inlining eligibility and scan
 	// metadata keyed by StreamGen in a single race-free atomic word.
 	inlineMeta atomic.Uint64
+	// regCode publishes the immutable Tier-2 register bytecode once compiled.
+	// regState: 0 = uncompiled, 1 = compiling/compiled, 2 = ineligible.
+	regCode  atomic.Pointer[RegCode]
+	regState atomic.Int32
 }
 
 // Active returns the instruction slice that must be executed for this code
@@ -483,6 +488,10 @@ func reloadCode(co *CodeObject, cache *VMCodeCache, gen int32) []uint32 {
 		cache.codePtr = unsafe.Pointer(unsafe.SliceData(priv))
 		cache.codeLen = len(priv)
 		cache.streamGen = gen
+		cache.regEntryInstalled = false
+		if rc := co.regCode.Load(); rc != nil {
+			cache.installRegEntry(rc)
+		}
 		return cache.active
 	}
 	cache.streamGen = gen
@@ -490,11 +499,15 @@ func reloadCode(co *CodeObject, cache *VMCodeCache, gen int32) []uint32 {
 	cache.codePtr = unsafe.Pointer(unsafe.SliceData(newStream))
 	cache.codeLen = len(newStream)
 	cache.privateActive = false
+	cache.regEntryInstalled = false
 	if len(cache.dictKwSplit) > 0 && len(cache.dictKwSplit) != len(newStream) {
 		cache.dictKwSplit = nil
 	}
 	if len(cache.callKwSplit) > 0 && len(cache.callKwSplit) != len(newStream) {
 		cache.callKwSplit = nil
+	}
+	if rc := co.regCode.Load(); rc != nil {
+		cache.installRegEntry(rc)
 	}
 	return cache.active
 }
@@ -624,6 +637,13 @@ type VMCodeCache struct {
 	buildTupleGen       int32
 	forIterUnpack       []uint8 // 0=unknown, 1=ineligible, 2..4=unpack count+1 (keyed by forIterUnpackGen == streamGen)
 	forIterUnpackGen    int32
+	regCode             *RegCode
+	regEntryInstalled   bool
+	regGlobals          *val.PyDict
+	regIC               []ICSlot
+	regAttrPIC          [][4]AttrPICEntry
+	regMethodPIC        [][4]val.MethodPICEntry
+	regTransitionIC     []TransitionICEntry
 }
 
 // typeMethodPICEntry caches polymorphic module/type method resolutions lazily
@@ -788,6 +808,62 @@ func (c *VMCodeCache) quickenAt(ip int, newInst uint32) unsafe.Pointer {
 	}
 	c.active[ip] = newInst
 	return c.codePtr
+}
+
+// installRegEntry patches this VM's private instruction stream at co.EntryIP
+// with OP_ENTER_REG so any Tier-1 entry path dispatches into VM.runRegLoop
+// without modifying VM.runLoopWithGlobals.
+//
+//go:noinline
+func (c *VMCodeCache) installRegEntry(rc *RegCode) {
+	if c == nil || rc == nil || c.co == nil {
+		return
+	}
+	c.regCode = rc
+	if c.regEntryInstalled {
+		return
+	}
+	entryIP := c.co.EntryIP
+	if entryIP >= 0 && entryIP < len(c.active) {
+		c.quickenAt(entryIP, Encode(OP_ENTER_REG, 0, 0))
+		c.regEntryInstalled = true
+	}
+}
+
+func (c *VMCodeCache) ensureRegIC(n int) []ICSlot {
+	if len(c.regIC) < n {
+		nw := make([]ICSlot, n)
+		copy(nw, c.regIC)
+		c.regIC = nw
+	}
+	return c.regIC
+}
+
+func (c *VMCodeCache) ensureRegAttrPIC(n int) [][4]AttrPICEntry {
+	if len(c.regAttrPIC) < n {
+		nw := make([][4]AttrPICEntry, n)
+		copy(nw, c.regAttrPIC)
+		c.regAttrPIC = nw
+	}
+	return c.regAttrPIC
+}
+
+func (c *VMCodeCache) ensureRegMethodPIC(n int) [][4]val.MethodPICEntry {
+	if len(c.regMethodPIC) < n {
+		nw := make([][4]val.MethodPICEntry, n)
+		copy(nw, c.regMethodPIC)
+		c.regMethodPIC = nw
+	}
+	return c.regMethodPIC
+}
+
+func (c *VMCodeCache) ensureRegTransitionIC(n int) []TransitionICEntry {
+	if len(c.regTransitionIC) < n {
+		nw := make([]TransitionICEntry, n)
+		copy(nw, c.regTransitionIC)
+		c.regTransitionIC = nw
+	}
+	return c.regTransitionIC
 }
 
 // ensureKwPIC lazily allocates the OP_CALL_KW PIC slab for this code object.
@@ -1146,6 +1222,10 @@ func (vm *VM) getCodeCacheSlow(co *CodeObject) *VMCodeCache {
 		cache.codePtr = unsafe.Pointer(unsafe.SliceData(cache.active))
 		cache.codeLen = len(cache.active)
 		cache.privateActive = false
+		cache.regEntryInstalled = false
+		if rc := co.regCode.Load(); rc != nil {
+			cache.installRegEntry(rc)
+		}
 	}
 	if len(cache.ic) < len(co.Code) {
 		cache.ic = make([]ICSlot, len(co.Code))
@@ -1603,7 +1683,13 @@ func (vm *VM) materializeFrame(targetIdx int) val.Value {
 	}
 	fSlot := &vm.frames[targetIdx]
 	fIP := fSlot.ip
-	if site := fSlot.cache.findInlineSite(fIP); site != nil {
+	if (fSlot.flags&frameFlagReg) != 0 && fSlot.cache != nil && fSlot.cache.regCode != nil {
+		regIP := fIP
+		if targetIdx < vm.activeFrameIdx && regIP > 0 {
+			regIP--
+		}
+		fIP = fSlot.cache.regCode.tier1PC(regIP)
+	} else if site := fSlot.cache.findInlineSite(fIP); site != nil {
 		fIP = site.GuardIP
 	}
 	if (fSlot.flags&frameFlagHasShadow) != 0 && targetIdx < len(vm.frameAux) && vm.frameAux[targetIdx].shadowFrame != nil {
