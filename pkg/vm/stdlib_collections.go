@@ -18,81 +18,189 @@ var (
 
 type pyDeque struct {
 	Header val.ObjectHeader
-	Items  []val.Value
-	MaxLen int // -1 for unbounded
-	Mu     sync.RWMutex
+	buf    []val.Value // length is 0 or a power of 2
+	head   int         // index of logical element 0
+	count  int         // active element count
+	mask   int         // len(buf) - 1 (0 when len(buf) == 0)
+	MaxLen int         // -1 for unbounded
+	ver    uint64      // bumped on every structural mutation
+	Mu     sync.Mutex
 }
 
-func (d *pyDeque) appendRightNoLock(v val.Value) {
-	if d.MaxLen >= 0 && len(d.Items) >= d.MaxLen {
-		if d.MaxLen == 0 {
-			return
+func nextDequePow2(n int) int {
+	c := 8
+	for c < n {
+		c <<= 1
+	}
+	return c
+}
+
+func (d *pyDeque) growLocked(minCap int) {
+	newCap := max(len(d.buf)*2, 8)
+	for newCap < minCap {
+		newCap <<= 1
+	}
+	newBuf := make([]val.Value, newCap)
+	if d.count > 0 {
+		first := len(d.buf) - d.head
+		if first >= d.count {
+			copy(newBuf, d.buf[d.head:d.head+d.count])
+		} else {
+			copy(newBuf, d.buf[d.head:])
+			copy(newBuf[first:], d.buf[:d.count-first])
 		}
-		copy(d.Items, d.Items[1:])
-		d.Items[len(d.Items)-1] = v
+	}
+	d.buf = newBuf
+	d.head = 0
+	d.mask = newCap - 1
+}
+
+func (d *pyDeque) snapshotLocked() []val.Value {
+	if d.count == 0 {
+		return nil
+	}
+	out := make([]val.Value, d.count)
+	first := len(d.buf) - d.head
+	if first >= d.count {
+		copy(out, d.buf[d.head:d.head+d.count])
+	} else {
+		copy(out, d.buf[d.head:])
+		copy(out[first:], d.buf[:d.count-first])
+	}
+	return out
+}
+
+func (d *pyDeque) appendRightLocked(v val.Value) {
+	if d.MaxLen == 0 {
+		d.ver++
 		return
 	}
-	d.Items = append(d.Items, v)
+	if d.MaxLen > 0 && d.count >= d.MaxLen {
+		if d.count == len(d.buf) {
+			d.buf[d.head] = v
+		} else {
+			d.buf[d.head] = val.Value{}
+			d.buf[(d.head+d.count)&d.mask] = v
+		}
+		d.head = (d.head + 1) & d.mask
+		d.ver++
+		return
+	}
+	if d.count == len(d.buf) {
+		d.growLocked(d.count + 1)
+	}
+	d.buf[(d.head+d.count)&d.mask] = v
+	d.count++
+	d.ver++
+}
+
+func (d *pyDeque) appendLeftLocked(v val.Value) {
+	if d.MaxLen == 0 {
+		d.ver++
+		return
+	}
+	if d.MaxLen > 0 && d.count >= d.MaxLen {
+		if d.count == len(d.buf) {
+			d.head = (d.head - 1) & d.mask
+			d.buf[d.head] = v
+		} else {
+			tail := (d.head + d.count - 1) & d.mask
+			d.buf[tail] = val.Value{}
+			d.head = (d.head - 1) & d.mask
+			d.buf[d.head] = v
+		}
+		d.ver++
+		return
+	}
+	if d.count == len(d.buf) {
+		d.growLocked(d.count + 1)
+	}
+	d.head = (d.head - 1) & d.mask
+	d.buf[d.head] = v
+	d.count++
+	d.ver++
 }
 
 func (d *pyDeque) appendRightFast(v val.Value) {
-	if val.MultiThreadedFlag.Load() {
-		d.appendRight(v)
-		return
-	}
-	d.appendRightNoLock(v)
+	d.Mu.Lock()
+	d.appendRightLocked(v)
+	d.Mu.Unlock()
 }
 
 func (d *pyDeque) extendRightSlice(items []val.Value) {
 	if len(items) == 0 {
 		return
 	}
-	if val.MultiThreadedFlag.Load() {
-		d.Mu.Lock()
-		defer d.Mu.Unlock()
-	}
-	if d.MaxLen < 0 {
-		d.Items = append(d.Items, items...)
+	d.Mu.Lock()
+	defer d.Mu.Unlock()
+	if d.MaxLen == 0 {
+		d.ver++
 		return
 	}
-	if d.MaxLen == 0 {
-		d.Items = d.Items[:0]
+	if d.MaxLen < 0 {
+		need := d.count + len(items)
+		if need > len(d.buf) {
+			d.growLocked(need)
+		}
+		for _, v := range items {
+			d.buf[(d.head+d.count)&d.mask] = v
+			d.count++
+		}
+		d.ver++
 		return
 	}
 	if len(items) >= d.MaxLen {
 		tail := items[len(items)-d.MaxLen:]
-		if cap(d.Items) >= d.MaxLen {
-			d.Items = d.Items[:d.MaxLen]
+		if len(d.buf) < d.MaxLen {
+			newCap := nextDequePow2(d.MaxLen)
+			d.buf = make([]val.Value, newCap)
+			d.mask = newCap - 1
 		} else {
-			d.Items = make([]val.Value, d.MaxLen)
+			clear(d.buf)
 		}
-		copy(d.Items, tail)
+		copy(d.buf, tail)
+		d.head = 0
+		d.count = d.MaxLen
+		d.ver++
 		return
 	}
-	total := len(d.Items) + len(items)
-	if total <= d.MaxLen {
-		d.Items = append(d.Items, items...)
+	need := min(d.count+len(items), d.MaxLen)
+	if need > len(d.buf) {
+		d.growLocked(need)
+	}
+	for _, v := range items {
+		d.appendRightLocked(v)
+	}
+}
+
+func (d *pyDeque) extendLeftSlice(items []val.Value) {
+	if len(items) == 0 {
 		return
 	}
-	drop := total - d.MaxLen
-	keep := len(d.Items) - drop
-	copy(d.Items, d.Items[drop:])
-	d.Items = append(d.Items[:keep], items...)
+	d.Mu.Lock()
+	defer d.Mu.Unlock()
+	if d.MaxLen == 0 {
+		d.ver++
+		return
+	}
+	need := d.count + len(items)
+	if d.MaxLen > 0 && need > d.MaxLen {
+		need = d.MaxLen
+	}
+	if need > len(d.buf) {
+		d.growLocked(need)
+	}
+	for _, v := range items {
+		d.appendLeftLocked(v)
+	}
 }
 
 func (d *pyDeque) extendFromIterable(ctx *val.ExecContext, iterable val.Value) {
 	if iterable.HeaderPtr() == &d.Header {
-		// Self-extension: snapshot current items so extending doesn't loop.
-		if val.MultiThreadedFlag.Load() {
-			d.Mu.RLock()
-			snap := make([]val.Value, len(d.Items))
-			copy(snap, d.Items)
-			d.Mu.RUnlock()
-			d.extendRightSlice(snap)
-			return
-		}
-		snap := make([]val.Value, len(d.Items))
-		copy(snap, d.Items)
+		// Self-extension: snapshot under lock, then extend outside lock.
+		d.Mu.Lock()
+		snap := d.snapshotLocked()
+		d.Mu.Unlock()
 		d.extendRightSlice(snap)
 		return
 	}
@@ -111,56 +219,99 @@ func (d *pyDeque) extendFromIterable(ctx *val.ExecContext, iterable val.Value) {
 	d.extendRightSlice(items)
 }
 
+func (d *pyDeque) extendLeftFromIterable(ctx *val.ExecContext, iterable val.Value) {
+	if iterable.HeaderPtr() == &d.Header {
+		d.Mu.Lock()
+		snap := d.snapshotLocked()
+		d.Mu.Unlock()
+		d.extendLeftSlice(snap)
+		return
+	}
+	items := val.ExtractIterableItems(ctx, iterable)
+	if ctx != nil && ctx.HasException() {
+		return
+	}
+	d.extendLeftSlice(items)
+}
+
 func (d *pyDeque) appendRight(v val.Value) {
 	d.Mu.Lock()
-	defer d.Mu.Unlock()
-	d.appendRightNoLock(v)
+	d.appendRightLocked(v)
+	d.Mu.Unlock()
 }
 
 func (d *pyDeque) appendLeft(v val.Value) {
 	d.Mu.Lock()
-	defer d.Mu.Unlock()
-	if d.MaxLen >= 0 && len(d.Items) >= d.MaxLen {
-		if d.MaxLen == 0 {
-			return
-		}
-		copy(d.Items[1:], d.Items[:len(d.Items)-1])
-		d.Items[0] = v
-		return
-	}
-	newItems := make([]val.Value, len(d.Items)+1)
-	newItems[0] = v
-	copy(newItems[1:], d.Items)
-	d.Items = newItems
+	d.appendLeftLocked(v)
+	d.Mu.Unlock()
 }
 
 func (d *pyDeque) popRight(ctx *val.ExecContext) val.Value {
 	d.Mu.Lock()
-	defer d.Mu.Unlock()
-	if len(d.Items) == 0 {
+	if d.count == 0 {
+		d.Mu.Unlock()
 		return val.RaiseIndexError(ctx, "pop from an empty deque")
 	}
-	idx := len(d.Items) - 1
-	v := d.Items[idx]
-	d.Items = d.Items[:idx]
+	idx := (d.head + d.count - 1) & d.mask
+	v := d.buf[idx]
+	d.buf[idx] = val.Value{}
+	d.count--
+	d.ver++
+	d.Mu.Unlock()
 	return v
 }
 
 func (d *pyDeque) popLeft(ctx *val.ExecContext) val.Value {
 	d.Mu.Lock()
-	defer d.Mu.Unlock()
-	if len(d.Items) == 0 {
+	if d.count == 0 {
+		d.Mu.Unlock()
 		return val.RaiseIndexError(ctx, "pop from an empty deque")
 	}
-	v := d.Items[0]
-	d.Items = d.Items[1:]
+	v := d.buf[d.head]
+	d.buf[d.head] = val.Value{}
+	d.head = (d.head + 1) & d.mask
+	d.count--
+	d.ver++
+	d.Mu.Unlock()
 	return v
+}
+
+func (d *pyDeque) removeAtLocked(idx int) {
+	if idx == 0 {
+		d.buf[d.head] = val.Value{}
+		d.head = (d.head + 1) & d.mask
+		d.count--
+		d.ver++
+		return
+	}
+	if idx == d.count-1 {
+		tail := (d.head + d.count - 1) & d.mask
+		d.buf[tail] = val.Value{}
+		d.count--
+		d.ver++
+		return
+	}
+	if idx < d.count-1-idx {
+		for i := idx; i > 0; i-- {
+			d.buf[(d.head+i)&d.mask] = d.buf[(d.head+i-1)&d.mask]
+		}
+		d.buf[d.head] = val.Value{}
+		d.head = (d.head + 1) & d.mask
+	} else {
+		for i := idx; i < d.count-1; i++ {
+			d.buf[(d.head+i)&d.mask] = d.buf[(d.head+i+1)&d.mask]
+		}
+		tail := (d.head + d.count - 1) & d.mask
+		d.buf[tail] = val.Value{}
+	}
+	d.count--
+	d.ver++
 }
 
 func (d *pyDeque) rotate(n int) {
 	d.Mu.Lock()
 	defer d.Mu.Unlock()
-	l := len(d.Items)
+	l := d.count
 	if l <= 1 {
 		return
 	}
@@ -171,12 +322,33 @@ func (d *pyDeque) rotate(n int) {
 	if n == 0 {
 		return
 	}
-	// rotate right by n: last n elements move to front
-	split := l - n
-	rotated := make([]val.Value, l)
-	copy(rotated, d.Items[split:])
-	copy(rotated[n:], d.Items[:split])
-	d.Items = rotated
+	// When the ring buffer is completely full, rotating is O(1): shift head.
+	if l == len(d.buf) {
+		d.head = (d.head - n) & d.mask
+		d.ver++
+		return
+	}
+	if n <= l-n {
+		// Move n elements from right to left.
+		for range n {
+			tail := (d.head + l - 1) & d.mask
+			v := d.buf[tail]
+			d.buf[tail] = val.Value{}
+			d.head = (d.head - 1) & d.mask
+			d.buf[d.head] = v
+		}
+	} else {
+		// Move (l - n) elements from left to right.
+		steps := l - n
+		for range steps {
+			v := d.buf[d.head]
+			d.buf[d.head] = val.Value{}
+			tail := (d.head + l) & d.mask
+			d.buf[tail] = v
+			d.head = (d.head + 1) & d.mask
+		}
+	}
+	d.ver++
 }
 
 type pyTupleGetter struct {
@@ -226,18 +398,58 @@ func initCollectionsTypes() {
 
 		DequeType.Slots.SqLen = func(ctx *val.ExecContext, o val.Value) int64 {
 			deq := (*pyDeque)(unsafe.Pointer(o.HeaderPtr()))
-			deq.Mu.RLock()
-			defer deq.Mu.RUnlock()
-			return int64(len(deq.Items))
+			deq.Mu.Lock()
+			n := deq.count
+			deq.Mu.Unlock()
+			return int64(n)
 		}
 
 		DequeType.Slots.TpIter = func(ctx *val.ExecContext, o val.Value) val.Value {
 			deq := (*pyDeque)(unsafe.Pointer(o.HeaderPtr()))
-			deq.Mu.RLock()
-			defer deq.Mu.RUnlock()
-			itemsCopy := make([]val.Value, len(deq.Items))
-			copy(itemsCopy, deq.Items)
-			return val.NewIterVal(val.NewListVal(itemsCopy...))
+			deq.Mu.Lock()
+			startVer := deq.ver
+			deq.Mu.Unlock()
+			idx := 0
+			return val.NewIterValWithNext(func() (val.Value, bool) {
+				deq.Mu.Lock()
+				if deq.ver != startVer {
+					deq.Mu.Unlock()
+					if ctx != nil {
+						ctx.Raise(val.NewException(val.RuntimeErrorType, "deque mutated during iteration"))
+					} else {
+						panic("RuntimeError: deque mutated during iteration")
+					}
+					return val.NoneVal(), false
+				}
+				if idx >= deq.count {
+					deq.Mu.Unlock()
+					return val.NoneVal(), false
+				}
+				v := deq.buf[(deq.head+idx)&deq.mask]
+				idx++
+				deq.Mu.Unlock()
+				return v, true
+			})
+		}
+
+		DequeType.Slots.TpGetAttr = func(ctx *val.ExecContext, obj, name val.Value) val.Value {
+			if name.AsString() == "maxlen" {
+				deq := (*pyDeque)(unsafe.Pointer(obj.HeaderPtr()))
+				if deq.MaxLen < 0 {
+					return val.NoneVal()
+				}
+				return val.Int64Val(int64(deq.MaxLen))
+			}
+			return val.ObjectGetAttr(ctx, obj, name)
+		}
+
+		DequeType.Slots.TpSetAttr = func(ctx *val.ExecContext, obj, name, value val.Value) val.Value {
+			if name.AsString() == "maxlen" {
+				ctx.Raise(val.NewException(val.AttributeErrorType, "attribute 'maxlen' of 'collections.deque' objects is not writable"))
+				return val.NoneVal()
+			}
+			ctx.Raise(val.NewException(val.AttributeErrorType, "'collections.deque' object has no attribute '"+name.AsString()+"'"))
+			return val.NoneVal()
 		}
 
 		DequeType.Slots.MpSubscript = func(ctx *val.ExecContext, o, key val.Value) val.Value {
@@ -246,17 +458,19 @@ func initCollectionsTypes() {
 				return val.NoneVal()
 			}
 			deq := (*pyDeque)(unsafe.Pointer(o.HeaderPtr()))
-			deq.Mu.RLock()
-			defer deq.Mu.RUnlock()
+			deq.Mu.Lock()
 			idx := int(key.AsInt64())
 			if idx < 0 {
-				idx += len(deq.Items)
+				idx += deq.count
 			}
-			if idx < 0 || idx >= len(deq.Items) {
+			if idx < 0 || idx >= deq.count {
+				deq.Mu.Unlock()
 				ctx.Raise(val.NewException(val.IndexErrorType, "deque index out of range"))
 				return val.NoneVal()
 			}
-			return deq.Items[idx]
+			v := deq.buf[(deq.head+idx)&deq.mask]
+			deq.Mu.Unlock()
+			return v
 		}
 
 		DequeType.Slots.MpAssSubscript = func(ctx *val.ExecContext, o, key, value val.Value) val.Value {
@@ -266,16 +480,22 @@ func initCollectionsTypes() {
 			}
 			deq := (*pyDeque)(unsafe.Pointer(o.HeaderPtr()))
 			deq.Mu.Lock()
-			defer deq.Mu.Unlock()
 			idx := int(key.AsInt64())
 			if idx < 0 {
-				idx += len(deq.Items)
+				idx += deq.count
 			}
-			if idx < 0 || idx >= len(deq.Items) {
+			if idx < 0 || idx >= deq.count {
+				deq.Mu.Unlock()
 				ctx.Raise(val.NewException(val.IndexErrorType, "deque index out of range"))
 				return val.NoneVal()
 			}
-			deq.Items[idx] = value
+			if value.IsUnbound() {
+				deq.removeAtLocked(idx)
+				deq.Mu.Unlock()
+				return val.NoneVal()
+			}
+			deq.buf[(deq.head+idx)&deq.mask] = value
+			deq.Mu.Unlock()
 			return val.NoneVal()
 		}
 
@@ -328,7 +548,12 @@ func initCollectionsTypes() {
 
 		registerDequeMethod("clear", func(ctx *val.ExecContext, deq *pyDeque, args []val.Value) val.Value {
 			deq.Mu.Lock()
-			deq.Items = nil
+			if len(deq.buf) > 0 {
+				clear(deq.buf)
+			}
+			deq.head = 0
+			deq.count = 0
+			deq.ver++
 			deq.Mu.Unlock()
 			return val.NoneVal()
 		})
@@ -347,21 +572,76 @@ func initCollectionsTypes() {
 				ctx.Raise(val.NewException(val.TypeErrorType, "extendleft() takes exactly one argument"))
 				return val.NoneVal()
 			}
-			for _, v := range val.ExtractIterableItems(ctx, args[0]) {
-				deq.appendLeft(v)
-			}
+			deq.extendLeftFromIterable(ctx, args[0])
 			return val.NoneVal()
 		})
 
 		registerDequeMethod("copy", func(ctx *val.ExecContext, deq *pyDeque, args []val.Value) val.Value {
-			deq.Mu.RLock()
-			defer deq.Mu.RUnlock()
+			deq.Mu.Lock()
+			snap := deq.snapshotLocked()
+			maxLen := deq.MaxLen
+			deq.Mu.Unlock()
 			newDeq := &pyDeque{
 				Header: val.ObjectHeader{Kind: val.KindNative, Type: DequeType},
-				Items:  append([]val.Value(nil), deq.Items...),
-				MaxLen: deq.MaxLen,
+				MaxLen: maxLen,
+			}
+			if len(snap) > 0 {
+				newCap := nextDequePow2(len(snap))
+				newDeq.buf = make([]val.Value, newCap)
+				copy(newDeq.buf, snap)
+				newDeq.count = len(snap)
+				newDeq.mask = newCap - 1
 			}
 			return val.ObjectVal(&newDeq.Header)
+		})
+
+		registerDequeMethod("insert", func(ctx *val.ExecContext, deq *pyDeque, args []val.Value) val.Value {
+			if len(args) < 2 || !args[0].IsInt64() {
+				ctx.Raise(val.NewException(val.TypeErrorType, "insert() takes an integer index and a value"))
+				return val.NoneVal()
+			}
+			idx := int(args[0].AsInt64())
+			v := args[1]
+			deq.Mu.Lock()
+			if deq.MaxLen >= 0 && deq.count >= deq.MaxLen {
+				deq.Mu.Unlock()
+				ctx.Raise(val.NewException(val.IndexErrorType, "deque already at its maximum size"))
+				return val.NoneVal()
+			}
+			if idx < 0 {
+				idx += deq.count
+				if idx < 0 {
+					idx = 0
+				}
+			}
+			if idx >= deq.count {
+				deq.appendRightLocked(v)
+				deq.Mu.Unlock()
+				return val.NoneVal()
+			}
+			if idx == 0 {
+				deq.appendLeftLocked(v)
+				deq.Mu.Unlock()
+				return val.NoneVal()
+			}
+			if deq.count == len(deq.buf) {
+				deq.growLocked(deq.count + 1)
+			}
+			if idx <= deq.count-idx {
+				deq.head = (deq.head - 1) & deq.mask
+				for i := range idx {
+					deq.buf[(deq.head+i)&deq.mask] = deq.buf[(deq.head+i+1)&deq.mask]
+				}
+			} else {
+				for i := deq.count; i > idx; i-- {
+					deq.buf[(deq.head+i)&deq.mask] = deq.buf[(deq.head+i-1)&deq.mask]
+				}
+			}
+			deq.buf[(deq.head+idx)&deq.mask] = v
+			deq.count++
+			deq.ver++
+			deq.Mu.Unlock()
+			return val.NoneVal()
 		})
 
 		registerDequeMethod("remove", func(ctx *val.ExecContext, deq *pyDeque, args []val.Value) val.Value {
@@ -369,21 +649,90 @@ func initCollectionsTypes() {
 				ctx.Raise(val.NewException(val.TypeErrorType, "remove() takes exactly one argument"))
 				return val.NoneVal()
 			}
-			valTarget := args[0]
+			target := args[0]
 			deq.Mu.Lock()
-			defer deq.Mu.Unlock()
-			idx := -1
-			for i, it := range deq.Items {
-				if val.Equals(it, valTarget) {
-					idx = i
-					break
+			startVer := deq.ver
+			n := deq.count
+			deq.Mu.Unlock()
+			for i := range n {
+				deq.Mu.Lock()
+				if deq.ver != startVer {
+					deq.Mu.Unlock()
+					ctx.Raise(val.NewException(val.IndexErrorType, "deque mutated during remove()."))
+					return val.NoneVal()
+				}
+				it := deq.buf[(deq.head+i)&deq.mask]
+				deq.Mu.Unlock()
+				eq := val.RichCompare(ctx, it, target, val.CmpEQ)
+				if ctx != nil && ctx.HasException() {
+					return val.NoneVal()
+				}
+				if eq.IsTruthy() {
+					deq.Mu.Lock()
+					if deq.ver != startVer {
+						deq.Mu.Unlock()
+						ctx.Raise(val.NewException(val.IndexErrorType, "deque mutated during remove()."))
+						return val.NoneVal()
+					}
+					deq.removeAtLocked(i)
+					deq.Mu.Unlock()
+					return val.NoneVal()
 				}
 			}
-			if idx < 0 {
-				ctx.Raise(val.NewException(val.ValueErrorType, "deque.remove(x): x not in deque"))
+			ctx.Raise(val.NewException(val.ValueErrorType, "deque.remove(x): x not in deque"))
+			return val.NoneVal()
+		})
+
+		registerDequeMethod("index", func(ctx *val.ExecContext, deq *pyDeque, args []val.Value) val.Value {
+			if len(args) < 1 {
+				ctx.Raise(val.NewException(val.TypeErrorType, "index() takes at least 1 argument"))
 				return val.NoneVal()
 			}
-			deq.Items = append(deq.Items[:idx], deq.Items[idx+1:]...)
+			target := args[0]
+			deq.Mu.Lock()
+			startVer := deq.ver
+			n := deq.count
+			deq.Mu.Unlock()
+			start, stop := 0, n
+			if len(args) >= 2 && args[1].IsInt64() {
+				start = int(args[1].AsInt64())
+				if start < 0 {
+					start += n
+					if start < 0 {
+						start = 0
+					}
+				}
+			}
+			if len(args) >= 3 && args[2].IsInt64() {
+				stop = int(args[2].AsInt64())
+				if stop < 0 {
+					stop += n
+					if stop < 0 {
+						stop = 0
+					}
+				}
+				if stop > n {
+					stop = n
+				}
+			}
+			for i := start; i < stop; i++ {
+				deq.Mu.Lock()
+				if deq.ver != startVer {
+					deq.Mu.Unlock()
+					ctx.Raise(val.NewException(val.RuntimeErrorType, "deque mutated during iteration"))
+					return val.NoneVal()
+				}
+				it := deq.buf[(deq.head+i)&deq.mask]
+				deq.Mu.Unlock()
+				eq := val.RichCompare(ctx, it, target, val.CmpEQ)
+				if ctx != nil && ctx.HasException() {
+					return val.NoneVal()
+				}
+				if eq.IsTruthy() {
+					return val.Int64Val(int64(i))
+				}
+			}
+			ctx.Raise(val.NewException(val.ValueErrorType, target.String()+" is not in deque"))
 			return val.NoneVal()
 		})
 
@@ -392,12 +741,26 @@ func initCollectionsTypes() {
 				ctx.Raise(val.NewException(val.TypeErrorType, "count() takes exactly one argument"))
 				return val.NoneVal()
 			}
-			valTarget := args[0]
-			deq.Mu.RLock()
-			defer deq.Mu.RUnlock()
+			target := args[0]
+			deq.Mu.Lock()
+			startVer := deq.ver
+			n := deq.count
+			deq.Mu.Unlock()
 			cnt := int64(0)
-			for _, it := range deq.Items {
-				if val.Equals(it, valTarget) {
+			for i := range n {
+				deq.Mu.Lock()
+				if deq.ver != startVer {
+					deq.Mu.Unlock()
+					ctx.Raise(val.NewException(val.RuntimeErrorType, "deque mutated during iteration"))
+					return val.NoneVal()
+				}
+				it := deq.buf[(deq.head+i)&deq.mask]
+				deq.Mu.Unlock()
+				eq := val.RichCompare(ctx, it, target, val.CmpEQ)
+				if ctx != nil && ctx.HasException() {
+					return val.NoneVal()
+				}
+				if eq.IsTruthy() {
 					cnt++
 				}
 			}
@@ -406,11 +769,205 @@ func initCollectionsTypes() {
 
 		registerDequeMethod("reverse", func(ctx *val.ExecContext, deq *pyDeque, args []val.Value) val.Value {
 			deq.Mu.Lock()
-			defer deq.Mu.Unlock()
-			for i, j := 0, len(deq.Items)-1; i < j; i, j = i+1, j-1 {
-				deq.Items[i], deq.Items[j] = deq.Items[j], deq.Items[i]
+			for i, j := 0, deq.count-1; i < j; i, j = i+1, j-1 {
+				pi := (deq.head + i) & deq.mask
+				pj := (deq.head + j) & deq.mask
+				deq.buf[pi], deq.buf[pj] = deq.buf[pj], deq.buf[pi]
 			}
+			deq.ver++
+			deq.Mu.Unlock()
 			return val.NoneVal()
+		})
+
+		registerDequeMethod("__reversed__", func(ctx *val.ExecContext, deq *pyDeque, args []val.Value) val.Value {
+			deq.Mu.Lock()
+			startVer := deq.ver
+			idx := deq.count - 1
+			deq.Mu.Unlock()
+			return val.NewIterValWithNext(func() (val.Value, bool) {
+				deq.Mu.Lock()
+				if deq.ver != startVer {
+					deq.Mu.Unlock()
+					if ctx != nil {
+						ctx.Raise(val.NewException(val.RuntimeErrorType, "deque mutated during iteration"))
+					} else {
+						panic("RuntimeError: deque mutated during iteration")
+					}
+					return val.NoneVal(), false
+				}
+				if idx < 0 {
+					deq.Mu.Unlock()
+					return val.NoneVal(), false
+				}
+				v := deq.buf[(deq.head+idx)&deq.mask]
+				idx--
+				deq.Mu.Unlock()
+				return v, true
+			})
+		})
+
+		registerDequeMethod("__contains__", func(ctx *val.ExecContext, deq *pyDeque, args []val.Value) val.Value {
+			if len(args) < 1 {
+				return val.BoolVal(false)
+			}
+			target := args[0]
+			deq.Mu.Lock()
+			startVer := deq.ver
+			n := deq.count
+			deq.Mu.Unlock()
+			for i := range n {
+				deq.Mu.Lock()
+				if deq.ver != startVer {
+					deq.Mu.Unlock()
+					ctx.Raise(val.NewException(val.RuntimeErrorType, "deque mutated during iteration"))
+					return val.NoneVal()
+				}
+				it := deq.buf[(deq.head+i)&deq.mask]
+				deq.Mu.Unlock()
+				eq := val.RichCompare(ctx, it, target, val.CmpEQ)
+				if ctx != nil && ctx.HasException() {
+					return val.NoneVal()
+				}
+				if eq.IsTruthy() {
+					return val.BoolVal(true)
+				}
+			}
+			return val.BoolVal(false)
+		})
+
+		registerDequeMethod("__delitem__", func(ctx *val.ExecContext, deq *pyDeque, args []val.Value) val.Value {
+			if len(args) < 1 || !args[0].IsInt64() {
+				ctx.Raise(val.NewException(val.TypeErrorType, "deque indices must be integers"))
+				return val.NoneVal()
+			}
+			deq.Mu.Lock()
+			idx := int(args[0].AsInt64())
+			if idx < 0 {
+				idx += deq.count
+			}
+			if idx < 0 || idx >= deq.count {
+				deq.Mu.Unlock()
+				ctx.Raise(val.NewException(val.IndexErrorType, "deque index out of range"))
+				return val.NoneVal()
+			}
+			deq.removeAtLocked(idx)
+			deq.Mu.Unlock()
+			return val.NoneVal()
+		})
+
+		registerDequeMethod("__eq__", func(ctx *val.ExecContext, deq *pyDeque, args []val.Value) val.Value {
+			if len(args) < 1 || args[0].Type() != DequeType {
+				return val.NotImplementedVal()
+			}
+			other := (*pyDeque)(unsafe.Pointer(args[0].HeaderPtr()))
+			if deq == other {
+				return val.BoolVal(true)
+			}
+			deq.Mu.Lock()
+			a := deq.snapshotLocked()
+			deq.Mu.Unlock()
+			other.Mu.Lock()
+			b := other.snapshotLocked()
+			other.Mu.Unlock()
+			if len(a) != len(b) {
+				return val.BoolVal(false)
+			}
+			for i := range a {
+				eq := val.RichCompare(ctx, a[i], b[i], val.CmpEQ)
+				if ctx != nil && ctx.HasException() {
+					return val.NoneVal()
+				}
+				if !eq.IsTruthy() {
+					return val.BoolVal(false)
+				}
+			}
+			return val.BoolVal(true)
+		})
+
+		registerDequeMethod("__ne__", func(ctx *val.ExecContext, deq *pyDeque, args []val.Value) val.Value {
+			if len(args) < 1 || args[0].Type() != DequeType {
+				return val.NotImplementedVal()
+			}
+			other := (*pyDeque)(unsafe.Pointer(args[0].HeaderPtr()))
+			if deq == other {
+				return val.BoolVal(false)
+			}
+			deq.Mu.Lock()
+			a := deq.snapshotLocked()
+			deq.Mu.Unlock()
+			other.Mu.Lock()
+			b := other.snapshotLocked()
+			other.Mu.Unlock()
+			if len(a) != len(b) {
+				return val.BoolVal(true)
+			}
+			for i := range a {
+				eq := val.RichCompare(ctx, a[i], b[i], val.CmpEQ)
+				if ctx != nil && ctx.HasException() {
+					return val.NoneVal()
+				}
+				if !eq.IsTruthy() {
+					return val.BoolVal(true)
+				}
+			}
+			return val.BoolVal(false)
+		})
+
+		registerDequeMethod("__add__", func(ctx *val.ExecContext, deq *pyDeque, args []val.Value) val.Value {
+			if len(args) < 1 || args[0].Type() != DequeType {
+				ctx.Raise(val.NewException(val.TypeErrorType, "can only concatenate deque to deque"))
+				return val.NoneVal()
+			}
+			other := (*pyDeque)(unsafe.Pointer(args[0].HeaderPtr()))
+			deq.Mu.Lock()
+			a := deq.snapshotLocked()
+			maxLen := deq.MaxLen
+			deq.Mu.Unlock()
+			var b []val.Value
+			if other == deq {
+				b = a
+			} else {
+				other.Mu.Lock()
+				b = other.snapshotLocked()
+				other.Mu.Unlock()
+			}
+			res := &pyDeque{
+				Header: val.ObjectHeader{Kind: val.KindNative, Type: DequeType},
+				MaxLen: maxLen,
+			}
+			res.extendRightSlice(a)
+			res.extendRightSlice(b)
+			return val.ObjectVal(&res.Header)
+		})
+
+		registerDequeMethod("__iadd__", func(ctx *val.ExecContext, deq *pyDeque, args []val.Value) val.Value {
+			if len(args) < 1 {
+				ctx.Raise(val.NewException(val.TypeErrorType, "__iadd__() takes exactly one argument"))
+				return val.NoneVal()
+			}
+			deq.extendFromIterable(ctx, args[0])
+			return val.ObjectVal(&deq.Header)
+		})
+
+		registerDequeMethod("__mul__", func(ctx *val.ExecContext, deq *pyDeque, args []val.Value) val.Value {
+			if len(args) < 1 || !args[0].IsInt64() {
+				return val.NotImplementedVal()
+			}
+			n := int(args[0].AsInt64())
+			deq.Mu.Lock()
+			snap := deq.snapshotLocked()
+			maxLen := deq.MaxLen
+			deq.Mu.Unlock()
+			res := &pyDeque{
+				Header: val.ObjectHeader{Kind: val.KindNative, Type: DequeType},
+				MaxLen: maxLen,
+			}
+			if n > 0 && len(snap) > 0 && maxLen != 0 {
+				for range n {
+					res.extendRightSlice(snap)
+				}
+			}
+			return val.ObjectVal(&res.Header)
 		})
 
 		// 2. TupleGetterType
@@ -477,10 +1034,10 @@ func initCollectionsTypes() {
 
 		DequeType.Dict.Set(val.InternString("__repr__"), val.NewBuiltinFuncVal("deque.__repr__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			deq := (*pyDeque)(val.AsPointer(args[0]))
-			deq.Mu.RLock()
-			items := append([]val.Value(nil), deq.Items...)
+			deq.Mu.Lock()
+			items := deq.snapshotLocked()
 			maxLen := deq.MaxLen
-			deq.Mu.RUnlock()
+			deq.Mu.Unlock()
 			var sb strings.Builder
 			sb.WriteString("deque([")
 			for i, it := range items {

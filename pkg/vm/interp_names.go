@@ -229,17 +229,28 @@ func (vm *VM) opFastStreamWriteLocalConst(st *loopState, inst uint32, ip, sp int
 		switch receiver.Type() {
 		case StringIOType:
 			sio := (*pyStringIO)(val.AsPointer(receiver))
-			if sio.pos == len(sio.buf) {
+			if !sio.isClosed && sio.asciiOnly && sio.newlineMode == sioNewlineLF && sio.pos == len(sio.buf) && arg.IsAnyString() {
 				if arg.Kind() == val.KindString {
 					data := arg.AsStringObj().Data
-					if cap(sio.buf)-len(sio.buf) < len(data) {
-						newCap := max(cap(sio.buf)*2, 131072)
-						newBuf := make([]byte, len(sio.buf), newCap)
-						copy(newBuf, sio.buf)
-						sio.buf = newBuf
+					if isASCIIString(data) {
+						if cap(sio.buf)-len(sio.buf) < len(data) {
+							newCap := max(cap(sio.buf)*2, 131072)
+							newBuf := make([]byte, len(sio.buf), newCap)
+							copy(newBuf, sio.buf)
+							sio.buf = newBuf
+						}
+						sio.buf = append(sio.buf, data...)
+						sio.pos = len(sio.buf)
+						sio.bytePos = len(sio.buf)
+						if ip+4 < st.codeLen && DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+4)*4))) == OP_JUMP {
+							ip = int(DecodeArgBx(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+4)*4))))
+							return ip, sp, ctlReload
+						}
+						ip += 4
+						return ip, sp, ctlReload
 					}
-					sio.buf = append(sio.buf, data...)
-					sio.pos = len(sio.buf)
+				} else {
+					appendStringIOWrite(sio, arg)
 					if ip+4 < st.codeLen && DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+4)*4))) == OP_JUMP {
 						ip = int(DecodeArgBx(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+4)*4))))
 						return ip, sp, ctlReload
@@ -247,14 +258,6 @@ func (vm *VM) opFastStreamWriteLocalConst(st *loopState, inst uint32, ip, sp int
 					ip += 4
 					return ip, sp, ctlReload
 				}
-				sio.buf, _ = val.AppendValueBytes(sio.buf, arg)
-				sio.pos = len(sio.buf)
-				if ip+4 < st.codeLen && DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+4)*4))) == OP_JUMP {
-					ip = int(DecodeArgBx(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+4)*4))))
-					return ip, sp, ctlReload
-				}
-				ip += 4
-				return ip, sp, ctlReload
 			}
 		case FileType:
 			pf := (*pyFile)(val.AsPointer(receiver))

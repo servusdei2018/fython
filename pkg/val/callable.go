@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/big"
 	"math/bits"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -7849,7 +7850,15 @@ func initTypes() {
 		if args[0].IsSet() {
 			s := args[0].AsSet()
 			for _, other := range args[1:] {
-				for _, it := range ExtractIterableItems(ctx, other) {
+				if other.IsSet() {
+					s.UpdateFromSet(other.AsSet())
+					continue
+				}
+				items := ExtractIterableItems(ctx, other)
+				if ctx != nil && ctx.HasException() {
+					return NoneVal()
+				}
+				for _, it := range items {
 					s.Add(it)
 				}
 			}
@@ -7865,17 +7874,16 @@ func initTypes() {
 		if args[0].IsSet() {
 			s := args[0].AsSet()
 			for _, other := range args[1:] {
-				otherSet := NewSetVal(ExtractIterableItems(ctx, other)...).AsSet()
-				// keep only items in otherSet
-				var toRemove []Value
-				for _, it := range s.Items() {
-					if !otherSet.Contains(it) {
-						toRemove = append(toRemove, it)
-					}
+				if other.IsSet() {
+					s.IntersectionUpdateFromSet(other.AsSet())
+					continue
 				}
-				for _, it := range toRemove {
-					s.Discard(it)
+				items := ExtractIterableItems(ctx, other)
+				if ctx != nil && ctx.HasException() {
+					return NoneVal()
 				}
+				otherSet := NewSetVal(items...).AsSet()
+				s.IntersectionUpdateFromSet(otherSet)
 			}
 		}
 		return NoneVal()
@@ -7889,7 +7897,15 @@ func initTypes() {
 		if args[0].IsSet() {
 			s := args[0].AsSet()
 			for _, other := range args[1:] {
-				for _, it := range ExtractIterableItems(ctx, other) {
+				if other.IsSet() {
+					s.DifferenceUpdateFromSet(other.AsSet())
+					continue
+				}
+				items := ExtractIterableItems(ctx, other)
+				if ctx != nil && ctx.HasException() {
+					return NoneVal()
+				}
+				for _, it := range items {
 					s.Discard(it)
 				}
 			}
@@ -7904,25 +7920,16 @@ func initTypes() {
 		}
 		if args[0].IsSet() {
 			s := args[0].AsSet()
-			otherSet := NewSetVal(ExtractIterableItems(ctx, args[1])...).AsSet()
-			var toAdd []Value
-			var toRemove []Value
-			for _, it := range s.Items() {
-				if otherSet.Contains(it) {
-					toRemove = append(toRemove, it)
-				}
+			if args[1].IsSet() {
+				s.SymmetricDifferenceUpdateFromSet(args[1].AsSet())
+				return NoneVal()
 			}
-			for _, it := range otherSet.Items() {
-				if !s.Contains(it) {
-					toAdd = append(toAdd, it)
-				}
+			items := ExtractIterableItems(ctx, args[1])
+			if ctx != nil && ctx.HasException() {
+				return NoneVal()
 			}
-			for _, it := range toRemove {
-				s.Discard(it)
-			}
-			for _, it := range toAdd {
-				s.Add(it)
-			}
+			otherSet := NewSetVal(items...).AsSet()
+			s.SymmetricDifferenceUpdateFromSet(otherSet)
 		}
 		return NoneVal()
 	}))
@@ -7932,57 +7939,91 @@ func initTypes() {
 			ctx.Raise(NewException(TypeErrorType, "descriptor 'union' of 'set' object needs an argument"))
 			return NoneVal()
 		}
-		res := NewSetVal()
-		if args[0].IsSet() {
-			res = NewSetVal(args[0].AsSet().Items()...)
-		}
-		resSet := res.AsSet()
-		for _, other := range args[1:] {
-			for _, it := range ExtractIterableItems(ctx, other) {
-				resSet.Add(it)
-			}
-		}
-		return res
-	}))
-
-	SetType.Dict.Set(InternString("intersection"), NewBuiltinFuncVal("intersection", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		if len(args) < 2 {
-			return args[0]
-		}
 		if !args[0].IsSet() {
 			return NewSetVal()
 		}
+		s := args[0].AsSet()
+		if len(args) == 1 {
+			return SetVal(s.Copy())
+		}
+		if len(args) == 2 && args[1].IsSet() {
+			return s.Union(args[1].AsSet())
+		}
+		resSet := s.Copy()
+		for _, other := range args[1:] {
+			if other.IsSet() {
+				resSet.UpdateFromSet(other.AsSet())
+				continue
+			}
+			items := ExtractIterableItems(ctx, other)
+			if ctx != nil && ctx.HasException() {
+				return NoneVal()
+			}
+			for _, it := range items {
+				resSet.Add(it)
+			}
+		}
+		return SetVal(resSet)
+	}))
+
+	SetType.Dict.Set(InternString("intersection"), NewBuiltinFuncVal("intersection", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 || !args[0].IsSet() {
+			return NewSetVal()
+		}
+		if len(args) == 1 {
+			return SetVal(args[0].AsSet().Copy())
+		}
 		cur := args[0].AsSet()
 		for _, other := range args[1:] {
-			otherSet := NewSetVal(ExtractIterableItems(ctx, other)...).AsSet()
+			if other.IsSet() {
+				cur = cur.Intersection(other.AsSet()).AsSet()
+				continue
+			}
+			items := ExtractIterableItems(ctx, other)
+			if ctx != nil && ctx.HasException() {
+				return NoneVal()
+			}
+			otherSet := NewSetVal(items...).AsSet()
 			cur = cur.Intersection(otherSet).AsSet()
 		}
 		return SetVal(cur)
 	}))
 
 	SetType.Dict.Set(InternString("difference"), NewBuiltinFuncVal("difference", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		if len(args) < 2 {
-			return args[0]
-		}
-		if !args[0].IsSet() {
+		if len(args) < 1 || !args[0].IsSet() {
 			return NewSetVal()
+		}
+		if len(args) == 1 {
+			return SetVal(args[0].AsSet().Copy())
 		}
 		cur := args[0].AsSet()
 		for _, other := range args[1:] {
-			otherSet := NewSetVal(ExtractIterableItems(ctx, other)...).AsSet()
+			if other.IsSet() {
+				cur = cur.Difference(other.AsSet()).AsSet()
+				continue
+			}
+			items := ExtractIterableItems(ctx, other)
+			if ctx != nil && ctx.HasException() {
+				return NoneVal()
+			}
+			otherSet := NewSetVal(items...).AsSet()
 			cur = cur.Difference(otherSet).AsSet()
 		}
 		return SetVal(cur)
 	}))
 
 	SetType.Dict.Set(InternString("symmetric_difference"), NewBuiltinFuncVal("symmetric_difference", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		if len(args) < 2 {
-			return args[0]
-		}
-		if !args[0].IsSet() {
+		if len(args) < 2 || !args[0].IsSet() {
 			return NewSetVal()
 		}
-		otherSet := NewSetVal(ExtractIterableItems(ctx, args[1])...).AsSet()
+		if args[1].IsSet() {
+			return args[0].AsSet().SymmetricDifference(args[1].AsSet())
+		}
+		items := ExtractIterableItems(ctx, args[1])
+		if ctx != nil && ctx.HasException() {
+			return NoneVal()
+		}
+		otherSet := NewSetVal(items...).AsSet()
 		return args[0].AsSet().SymmetricDifference(otherSet)
 	}))
 
@@ -7990,7 +8031,14 @@ func initTypes() {
 		if len(args) < 2 || !args[0].IsSet() {
 			return BoolVal(false)
 		}
-		otherSet := NewSetVal(ExtractIterableItems(ctx, args[1])...).AsSet()
+		if args[1].IsSet() {
+			return BoolVal(args[0].AsSet().IsSubset(args[1].AsSet()))
+		}
+		items := ExtractIterableItems(ctx, args[1])
+		if ctx != nil && ctx.HasException() {
+			return NoneVal()
+		}
+		otherSet := NewSetVal(items...).AsSet()
 		return BoolVal(args[0].AsSet().IsSubset(otherSet))
 	}))
 
@@ -7998,16 +8046,35 @@ func initTypes() {
 		if len(args) < 2 || !args[0].IsSet() {
 			return BoolVal(false)
 		}
-		otherSet := NewSetVal(ExtractIterableItems(ctx, args[1])...).AsSet()
-		return BoolVal(args[0].AsSet().IsSuperset(otherSet))
+		if args[1].IsSet() {
+			return BoolVal(args[0].AsSet().IsSuperset(args[1].AsSet()))
+		}
+		items := ExtractIterableItems(ctx, args[1])
+		if ctx != nil && ctx.HasException() {
+			return NoneVal()
+		}
+		s := args[0].AsSet()
+		for _, it := range items {
+			if !s.Contains(it) {
+				return BoolVal(false)
+			}
+		}
+		return BoolVal(true)
 	}))
 
 	SetType.Dict.Set(InternString("isdisjoint"), NewBuiltinFuncVal("isdisjoint", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 || !args[0].IsSet() {
 			return BoolVal(true)
 		}
-		otherSet := NewSetVal(ExtractIterableItems(ctx, args[1])...).AsSet()
-		return BoolVal(args[0].AsSet().Intersection(otherSet).AsSet().Len() == 0)
+		s := args[0].AsSet()
+		if args[1].IsSet() {
+			return BoolVal(s.IsDisjoint(args[1].AsSet()))
+		}
+		items := ExtractIterableItems(ctx, args[1])
+		if ctx != nil && ctx.HasException() {
+			return NoneVal()
+		}
+		return BoolVal(!slices.ContainsFunc(items, s.Contains))
 	}))
 
 	SetType.Dict.Set(InternString("__contains__"), NewBuiltinFuncVal("__contains__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {

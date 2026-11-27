@@ -1,7 +1,6 @@
 package vm
 
 import (
-	"io"
 	"os"
 	"sync/atomic"
 	"unsafe"
@@ -3670,7 +3669,7 @@ func (vm *VM) opCallMethodSlow(st *loopState, inst uint32, ip, sp int) (int, int
 		case StringIOType:
 			sio := (*pyStringIO)(val.AsPointer(receiver))
 			arg := stack[retSP+1]
-			if sio.pos == len(sio.buf) {
+			if !sio.isClosed && sio.asciiOnly && sio.newlineMode == sioNewlineLF && sio.pos == len(sio.buf) && arg.IsAnyString() {
 				written := appendStringIOWrite(sio, arg)
 				stack[retSP] = val.Int64Val(int64(written))
 				sp = retSP + 1
@@ -3913,7 +3912,7 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 		case StringIOType:
 			sio := (*pyStringIO)(val.AsPointer(receiver))
 			arg := stack[newBase+1]
-			if sio.pos == len(sio.buf) {
+			if !sio.isClosed && sio.asciiOnly && sio.newlineMode == sioNewlineLF && sio.pos == len(sio.buf) && arg.IsAnyString() {
 				written := appendStringIOWrite(sio, arg)
 				stack[retSP] = val.Int64Val(int64(written))
 				sp = retSP + 1
@@ -3970,71 +3969,28 @@ func (vm *VM) opCallMethodPICSlow(st *loopState, inst uint32, ip, sp int) (int, 
 			case nameGetValue:
 				if tp == StringIOType {
 					sio := (*pyStringIO)(val.AsPointer(receiver))
-					s := string(sio.buf)
-					ps := &val.PyString{
-						Header: val.ObjectHeader{
-							Kind: val.KindString,
-							Type: val.StrType,
-						},
-						Data: s,
+					if !sio.isClosed {
+						s := string(sio.buf)
+						ps := &val.PyString{
+							Header: val.ObjectHeader{
+								Kind: val.KindString,
+								Type: val.StrType,
+							},
+							Data: s,
+						}
+						stack[retSP] = val.ObjectVal(&ps.Header)
+						sp = retSP + 1
+						ip++
+						return ip, sp, ctlReload
 					}
-					stack[retSP] = val.ObjectVal(&ps.Header)
-					sp = retSP + 1
-					ip++
-					return ip, sp, ctlReload
 				}
 			case nameRead:
 				if tp == FileType {
 					pf := (*pyFile)(val.AsPointer(receiver))
 					if !pf.isClosed && pf.f != nil {
-						buf := make([]byte, 65536)
-						n, err := pf.f.Read(buf)
-						if (err == nil || err == io.EOF) && n < len(buf) {
-							if pf.binary {
-								stack[retSP] = val.NewBytesVal(buf[:n])
-							} else {
-								s := unsafe.String(unsafe.SliceData(buf), n)
-								ps := &val.PyString{
-									Header: val.ObjectHeader{
-										Kind: val.KindString,
-										Type: val.StrType,
-									},
-									Data: s,
-								}
-								stack[retSP] = val.ObjectVal(&ps.Header)
-							}
-							sp = retSP + 1
-							ip++
-							return ip, sp, ctlReload
-						}
-						stat, err := pf.f.Stat()
-						if err == nil && stat.Mode().IsRegular() {
-							remSize := stat.Size()
-							if remSize == 0 {
-								if pf.binary {
-									stack[retSP] = val.NewBytesVal(nil)
-								} else {
-									stack[retSP] = val.NewStringVal("")
-								}
-								sp = retSP + 1
-								ip++
-								return ip, sp, ctlReload
-							}
-							buf2 := make([]byte, remSize)
-							readN, _ := io.ReadFull(pf.f, buf2)
-							if pf.binary {
-								stack[retSP] = val.NewBytesVal(buf2[:readN])
-							} else {
-								s := unsafe.String(unsafe.SliceData(buf2), readN)
-								ps := &val.PyString{
-									Header: val.ObjectHeader{
-										Kind: val.KindString,
-										Type: val.StrType,
-									},
-									Data: s,
-								}
-								stack[retSP] = val.ObjectVal(&ps.Header)
-							}
+						data, closed, err := pf.readAllBytes(val.IsMultiThreaded())
+						if !closed && (err == nil || len(data) > 0) {
+							stack[retSP] = pf.readResultVal(data)
 							sp = retSP + 1
 							ip++
 							return ip, sp, ctlReload

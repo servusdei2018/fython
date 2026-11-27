@@ -386,21 +386,64 @@ func (e *Engine) createMathModule() val.Value {
 	}))
 
 	// factorial(n)
+	factorialTable := [21]int64{
+		1, 1, 2, 6, 24, 120, 720, 5040, 40320, 362880, 3628800,
+		39916800, 479001600, 6227020800, 87178291200, 1307674368000,
+		20922789888000, 355687428096000, 6402373705728000,
+		121645100408832000, 2432902008176640000,
+	}
 	mod.Dict.Set(val.InternString("factorial"), val.NewBuiltinFuncVal("factorial", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		if len(args) < 1 {
-			ctx.Raise(val.NewException(val.TypeErrorType, "factorial() takes exactly one argument"))
+		if len(kwnames) > 0 {
+			ctx.Raise(val.NewException(val.TypeErrorType, "math.factorial() takes no keyword arguments"))
 			return val.NoneVal()
 		}
-		n := args[0].AsInt64()
+		if len(args) != 1 {
+			ctx.Raise(val.NewException(val.TypeErrorType, "math.factorial() takes exactly one argument"))
+			return val.NoneVal()
+		}
+		arg := args[0]
+		if !arg.IsInt64() && !arg.IsBool() && arg.Kind() != val.KindBigInt {
+			if tp := arg.Type(); tp != nil {
+				if idxFn, _, ok := tp.LookupMRO(nameIndex); ok {
+					arg = ctx.Invoke1(idxFn, arg)
+					if ctx.HasException() {
+						return val.NoneVal()
+					}
+				}
+			}
+		}
+		var n int64
+		switch {
+		case arg.IsInt64():
+			n = arg.AsInt64()
+		case arg.IsBool():
+			if arg.AsBool() {
+				n = 1
+			}
+		case arg.Kind() == val.KindBigInt:
+			bi := &arg.AsBigInt().Val
+			if bi.Sign() < 0 {
+				ctx.Raise(val.NewException(val.ValueErrorType, "factorial() not defined for negative values"))
+				return val.NoneVal()
+			}
+			if !bi.IsInt64() {
+				ctx.Raise(val.NewException(val.OverflowErrorType, "factorial() argument should not exceed 9223372036854775807"))
+				return val.NoneVal()
+			}
+			n = bi.Int64()
+		default:
+			ctx.Raise(val.NewException(val.TypeErrorType, "'"+arg.Type().Name+"' object cannot be interpreted as an integer"))
+			return val.NoneVal()
+		}
 		if n < 0 {
 			ctx.Raise(val.NewException(val.ValueErrorType, "factorial() not defined for negative values"))
 			return val.NoneVal()
 		}
-		res := int64(1)
-		for i := int64(2); i <= n; i++ {
-			res *= i
+		if n <= 20 {
+			return val.Int64Val(factorialTable[n])
 		}
-		return val.Int64Val(res)
+		res := new(big.Int).MulRange(1, n)
+		return val.NewBigIntVal(res)
 	}))
 
 	return modVal

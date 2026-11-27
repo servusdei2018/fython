@@ -2,12 +2,14 @@ package vm
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"os"
 	"runtime"
 	"strings"
 	"sync"
+	"unicode/utf8"
 	"unsafe"
 
 	"github.com/servusdei2018/fython/pkg/val"
@@ -29,23 +31,129 @@ var (
 )
 
 type pyBytesIO struct {
-	inst val.PyInstance // must be first: Header lives at offset 0
-	buf  []byte
-	pos  int
-	mu   sync.RWMutex
+	inst     val.PyInstance // must be first: Header lives at offset 0
+	buf      []byte
+	pos      int
+	isClosed bool
+	mu       sync.RWMutex
 }
+
+const (
+	sioNewlineLF    uint8 = 0 // default "\n": no translation
+	sioNewlineEmpty uint8 = 1 // "": no translation
+	sioNewlineNone  uint8 = 2 // None: universal newlines (\r\n, \r -> \n)
+	sioNewlineCR    uint8 = 3 // "\r": translate \n -> \r
+	sioNewlineCRLF  uint8 = 4 // "\r\n": translate \n -> \r\n
+)
 
 type strIOBufBox struct {
 	b []byte
 }
 
 type pyStringIO struct {
-	inst    val.PyInstance // must be first: Header lives at offset 0
-	buf     []byte
-	pos     int
-	mu      sync.RWMutex
-	box     *strIOBufBox
-	cleanup runtime.Cleanup
+	inst        val.PyInstance // must be first: Header lives at offset 0
+	buf         []byte
+	pos         int // Unicode code-point offset (== bytePos when asciiOnly)
+	bytePos     int // cached byte offset into buf (-1 if unresolved)
+	asciiOnly   bool
+	newlineMode uint8
+	isClosed    bool
+	mu          sync.RWMutex
+	box         *strIOBufBox
+	cleanup     runtime.Cleanup
+}
+
+func isASCIIBytes(b []byte) bool {
+	for _, c := range b {
+		if c >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+func isASCIIString(s string) bool {
+	for i := range len(s) {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+func translateSIONewlines(b []byte, mode uint8) []byte {
+	switch mode {
+	case sioNewlineLF, sioNewlineEmpty:
+		return b
+	case sioNewlineNone:
+		return normalizeUniversalNewlines(b)
+	case sioNewlineCR:
+		if bytes.IndexByte(b, '\n') < 0 {
+			return b
+		}
+		out := make([]byte, len(b))
+		for i, c := range b {
+			if c == '\n' {
+				out[i] = '\r'
+			} else {
+				out[i] = c
+			}
+		}
+		return out
+	case sioNewlineCRLF:
+		if bytes.IndexByte(b, '\n') < 0 {
+			return b
+		}
+		out := make([]byte, 0, len(b)+8)
+		for _, c := range b {
+			if c == '\n' {
+				out = append(out, '\r', '\n')
+			} else {
+				out = append(out, c)
+			}
+		}
+		return out
+	}
+	return b
+}
+
+func runeIndexToByteOffset(b []byte, runeIdx int) int {
+	if runeIdx <= 0 {
+		return 0
+	}
+	off := 0
+	for r := 0; r < runeIdx && off < len(b); r++ {
+		if b[off] < 0x80 {
+			off++
+		} else {
+			_, size := utf8.DecodeRune(b[off:])
+			off += size
+		}
+	}
+	return off
+}
+
+func (sio *pyStringIO) runeLenLocked() int {
+	if sio.asciiOnly {
+		return len(sio.buf)
+	}
+	return utf8.RuneCount(sio.buf)
+}
+
+func (sio *pyStringIO) resolveBytePosLocked() int {
+	if sio.asciiOnly {
+		if sio.pos > len(sio.buf) {
+			return len(sio.buf)
+		}
+		sio.bytePos = sio.pos
+		return sio.pos
+	}
+	if sio.bytePos >= 0 && sio.bytePos <= len(sio.buf) {
+		return sio.bytePos
+	}
+	bOff := runeIndexToByteOffset(sio.buf, sio.pos)
+	sio.bytePos = bOff
+	return bOff
 }
 
 var stringIOBufPool = sync.Pool{
@@ -73,8 +181,10 @@ func newStringIO(cls *val.PyType) *pyStringIO {
 			Header: val.ObjectHeader{Kind: val.KindInstance, Type: cls},
 			Shape:  cls.RootShape,
 		},
-		buf: box.b[:0],
-		box: box,
+		buf:         box.b[:0],
+		asciiOnly:   true,
+		newlineMode: sioNewlineLF,
+		box:         box,
 	}
 	sio.cleanup = runtime.AddCleanup(sio, releaseStrIOBox, box)
 	return sio
@@ -92,8 +202,17 @@ func appendStringIOWrite(sio *pyStringIO, arg val.Value) int {
 	if sio.box != nil && cap(sio.buf) != cap(sio.box.b) {
 		sio.box.b = sio.buf[:0]
 	}
-	sio.pos = len(sio.buf)
-	return sio.pos - oldLen
+	added := sio.buf[oldLen:]
+	if isASCIIBytes(added) {
+		sio.pos = len(sio.buf)
+		sio.bytePos = len(sio.buf)
+		return len(added)
+	}
+	sio.asciiOnly = false
+	runes := utf8.RuneCount(added)
+	sio.pos += runes
+	sio.bytePos = len(sio.buf)
+	return runes
 }
 
 func releaseStringIOBuf(sio *pyStringIO) {
@@ -110,6 +229,8 @@ func releaseStringIOBuf(sio *pyStringIO) {
 	}
 	sio.buf = nil
 	sio.pos = 0
+	sio.bytePos = 0
+	sio.isClosed = true
 }
 
 type pyFile struct {
@@ -150,6 +271,135 @@ func (pf *pyFile) ensureReader() *bufio.Reader {
 	return pf.reader
 }
 
+func normalizeUniversalNewlines(b []byte) []byte {
+	if bytes.IndexByte(b, '\r') < 0 {
+		return b
+	}
+	out := make([]byte, 0, len(b))
+	for i := 0; i < len(b); i++ {
+		if b[i] == '\r' {
+			if i+1 < len(b) && b[i+1] == '\n' {
+				i++
+			}
+			out = append(out, '\n')
+		} else {
+			out = append(out, b[i])
+		}
+	}
+	return out
+}
+
+func (pf *pyFile) readResultVal(data []byte) val.Value {
+	if pf.binary {
+		if len(data) == 0 {
+			return val.NewBytesVal(nil)
+		}
+		return val.NewBytesVal(data)
+	}
+	data = normalizeUniversalNewlines(data)
+	if len(data) == 0 {
+		return val.NewStringVal("")
+	}
+	s := unsafe.String(unsafe.SliceData(data), len(data))
+	ps := &val.PyString{
+		Header: val.ObjectHeader{
+			Kind: val.KindString,
+			Type: val.StrType,
+		},
+		Data: s,
+	}
+	return val.ObjectVal(&ps.Header)
+}
+
+func (pf *pyFile) readAllBytes(isMT bool) (data []byte, closed bool, err error) {
+	if isMT {
+		pf.mu.Lock()
+		defer pf.mu.Unlock()
+	}
+	if pf.isClosed {
+		return nil, true, nil
+	}
+	pf.flushLocked()
+	if pf.f == nil {
+		return nil, false, nil
+	}
+	if pf.reader != nil && pf.reader.Buffered() > 0 {
+		data, err = io.ReadAll(pf.reader)
+		return data, false, err
+	}
+	if stat, statErr := pf.f.Stat(); statErr == nil && stat.Mode().IsRegular() {
+		if curPos, seekErr := pf.f.Seek(0, io.SeekCurrent); seekErr == nil {
+			rem := max(stat.Size()-curPos, 0)
+			initCap := max(int(rem)+1, 512)
+			buf := make([]byte, 0, initCap)
+			for {
+				if len(buf) == cap(buf) {
+					newCap := max(cap(buf)*2, 512)
+					grown := make([]byte, len(buf), newCap)
+					copy(grown, buf)
+					buf = grown
+				}
+				n, rerr := pf.f.Read(buf[len(buf):cap(buf)])
+				buf = buf[:len(buf)+n]
+				if rerr != nil {
+					if rerr == io.EOF {
+						return buf, false, nil
+					}
+					return buf, false, rerr
+				}
+			}
+		}
+	}
+	data, err = io.ReadAll(pf.ensureReader())
+	return data, false, err
+}
+
+func readFileTextRunes(rdr *bufio.Reader, n int) []byte {
+	var out []byte
+	for count := 0; count < n; {
+		// Fast path: inspect buffered bytes for a pure-ASCII, CR-free prefix.
+		if avail := rdr.Buffered(); avail > 0 {
+			need := n - count
+			if avail > need {
+				avail = need
+			}
+			peeked, _ := rdr.Peek(avail)
+			asciiEnd := 0
+			for asciiEnd < len(peeked) {
+				c := peeked[asciiEnd]
+				if c >= 0x80 || c == '\r' {
+					break
+				}
+				asciiEnd++
+			}
+			if asciiEnd > 0 {
+				if out == nil {
+					out = make([]byte, 0, n)
+				}
+				out = append(out, peeked[:asciiEnd]...)
+				_, _ = rdr.Discard(asciiEnd)
+				count += asciiEnd
+				continue
+			}
+		}
+		r, _, err := rdr.ReadRune()
+		if err != nil {
+			break
+		}
+		if r == '\r' {
+			if b, perr := rdr.Peek(1); perr == nil && len(b) == 1 && b[0] == '\n' {
+				_, _ = rdr.Discard(1)
+			}
+			out = append(out, '\n')
+			count++
+			continue
+		}
+		out = utf8.AppendRune(out, r)
+		count++
+	}
+	return out
+}
+
 // EnsureIOTypes initializes BytesIOType, StringIOType, and FileType.
 func EnsureIOTypes() {
 	initIOTypes()
@@ -165,11 +415,21 @@ func initIOTypes() {
 				return val.NoneVal()
 			}
 			bio := (*pyBytesIO)(val.AsPointer(args[0]))
-			bio.mu.Lock()
-			defer bio.mu.Unlock()
+			isMT := val.IsMultiThreaded()
+			if isMT {
+				bio.mu.Lock()
+				defer bio.mu.Unlock()
+			}
+			if bio.isClosed {
+				ctx.Raise(val.NewException(val.ValueErrorType, "I/O operation on closed file."))
+				return val.NoneVal()
+			}
 			n := -1
 			if len(args) >= 2 && args[1].IsInt64() {
 				n = int(args[1].AsInt64())
+			}
+			if bio.pos >= len(bio.buf) {
+				return val.NewBytesVal(nil)
 			}
 			if n < 0 || bio.pos+n > len(bio.buf) {
 				n = len(bio.buf) - bio.pos
@@ -189,8 +449,15 @@ func initIOTypes() {
 				return val.NoneVal()
 			}
 			bio := (*pyBytesIO)(val.AsPointer(args[0]))
-			bio.mu.Lock()
-			defer bio.mu.Unlock()
+			isMT := val.IsMultiThreaded()
+			if isMT {
+				bio.mu.Lock()
+				defer bio.mu.Unlock()
+			}
+			if bio.isClosed {
+				ctx.Raise(val.NewException(val.ValueErrorType, "I/O operation on closed file."))
+				return val.NoneVal()
+			}
 			var data []byte
 			switch {
 			case args[1].IsBytes():
@@ -203,20 +470,49 @@ func initIOTypes() {
 				ctx.Raise(val.NewException(val.TypeErrorType, "a bytes-like object is required"))
 				return val.NoneVal()
 			}
-			if bio.pos+len(data) > len(bio.buf) {
-				newBuf := make([]byte, bio.pos+len(data))
-				copy(newBuf, bio.buf)
-				bio.buf = newBuf
+			n := len(data)
+			if n == 0 {
+				return val.Int64Val(0)
 			}
-			copy(bio.buf[bio.pos:], data)
-			bio.pos += len(data)
-			return val.Int64Val(int64(len(data)))
+			end := bio.pos + n
+			switch {
+			case bio.pos == len(bio.buf):
+				bio.buf = append(bio.buf, data...)
+			case end <= len(bio.buf):
+				copy(bio.buf[bio.pos:], data)
+			default:
+				oldLen := len(bio.buf)
+				if end > cap(bio.buf) {
+					newCap := max(cap(bio.buf)*2, end, 64)
+					newBuf := make([]byte, end, newCap)
+					copy(newBuf, bio.buf)
+					bio.buf = newBuf
+				} else {
+					bio.buf = bio.buf[:end]
+					if bio.pos > oldLen {
+						clear(bio.buf[oldLen:bio.pos])
+					}
+				}
+				copy(bio.buf[bio.pos:], data)
+			}
+			bio.pos = end
+			return val.Int64Val(int64(n))
 		}))
 
 		BytesIOType.Dict.Set(val.InternString("getvalue"), val.NewBuiltinFuncVal("getvalue", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			bio := (*pyBytesIO)(val.AsPointer(args[0]))
-			bio.mu.RLock()
-			defer bio.mu.RUnlock()
+			isMT := val.IsMultiThreaded()
+			if isMT {
+				bio.mu.RLock()
+				defer bio.mu.RUnlock()
+			}
+			if bio.isClosed {
+				ctx.Raise(val.NewException(val.ValueErrorType, "I/O operation on closed file."))
+				return val.NoneVal()
+			}
+			if len(bio.buf) == 0 {
+				return val.NewBytesVal(nil)
+			}
 			res := make([]byte, len(bio.buf))
 			copy(res, bio.buf)
 			return val.NewBytesVal(res)
@@ -230,6 +526,10 @@ func initIOTypes() {
 			bio := (*pyBytesIO)(val.AsPointer(args[0]))
 			bio.mu.Lock()
 			defer bio.mu.Unlock()
+			if bio.isClosed {
+				ctx.Raise(val.NewException(val.ValueErrorType, "I/O operation on closed file."))
+				return val.NoneVal()
+			}
 			offset := int(args[1].AsInt64())
 			whence := 0
 			if len(args) >= 3 && args[2].IsInt64() {
@@ -253,6 +553,10 @@ func initIOTypes() {
 			bio := (*pyBytesIO)(val.AsPointer(args[0]))
 			bio.mu.RLock()
 			defer bio.mu.RUnlock()
+			if bio.isClosed {
+				ctx.Raise(val.NewException(val.ValueErrorType, "I/O operation on closed file."))
+				return val.NoneVal()
+			}
 			return val.Int64Val(int64(bio.pos))
 		}))
 
@@ -261,6 +565,7 @@ func initIOTypes() {
 			bio.mu.Lock()
 			bio.buf = nil
 			bio.pos = 0
+			bio.isClosed = true
 			bio.mu.Unlock()
 			return val.NoneVal()
 		}))
@@ -269,21 +574,20 @@ func initIOTypes() {
 			bio := (*pyBytesIO)(val.AsPointer(args[0]))
 			bio.mu.Lock()
 			defer bio.mu.Unlock()
+			if bio.isClosed {
+				ctx.Raise(val.NewException(val.ValueErrorType, "I/O operation on closed file."))
+				return val.NoneVal()
+			}
 			if bio.pos >= len(bio.buf) {
 				return val.NewBytesVal(nil)
 			}
 			start := bio.pos
-			nl := -1
-			for i := start; i < len(bio.buf); i++ {
-				if bio.buf[i] == '\n' {
-					nl = i
-					break
-				}
-			}
+			nl := bytes.IndexByte(bio.buf[start:], '\n')
 			if nl >= 0 {
-				bio.pos = nl + 1
-				res := make([]byte, nl+1-start)
-				copy(res, bio.buf[start:nl+1])
+				end := start + nl + 1
+				bio.pos = end
+				res := make([]byte, end-start)
+				copy(res, bio.buf[start:end])
 				return val.NewBytesVal(res)
 			}
 			bio.pos = len(bio.buf)
@@ -296,35 +600,66 @@ func initIOTypes() {
 			bio := (*pyBytesIO)(val.AsPointer(args[0]))
 			bio.mu.Lock()
 			defer bio.mu.Unlock()
+			if bio.isClosed {
+				ctx.Raise(val.NewException(val.ValueErrorType, "I/O operation on closed file."))
+				return val.NoneVal()
+			}
 			var lines []val.Value
 			for bio.pos < len(bio.buf) {
 				start := bio.pos
-				nl := -1
-				for i := start; i < len(bio.buf); i++ {
-					if bio.buf[i] == '\n' {
-						nl = i
-						break
-					}
-				}
+				nl := bytes.IndexByte(bio.buf[start:], '\n')
+				var end int
 				if nl >= 0 {
-					bio.pos = nl + 1
-					res := make([]byte, nl+1-start)
-					copy(res, bio.buf[start:nl+1])
-					lines = append(lines, val.NewBytesVal(res))
+					end = start + nl + 1
 				} else {
-					bio.pos = len(bio.buf)
-					res := make([]byte, len(bio.buf)-start)
-					copy(res, bio.buf[start:])
-					lines = append(lines, val.NewBytesVal(res))
+					end = len(bio.buf)
 				}
+				bio.pos = end
+				res := make([]byte, end-start)
+				copy(res, bio.buf[start:end])
+				lines = append(lines, val.NewBytesVal(res))
 			}
 			return val.NewListVal(lines...)
+		}))
+
+		BytesIOType.Slots.TpIter = func(ctx *val.ExecContext, o val.Value) val.Value {
+			return val.NewIterValWithNext(func() (val.Value, bool) {
+				bio := (*pyBytesIO)(val.AsPointer(o))
+				bio.mu.Lock()
+				defer bio.mu.Unlock()
+				if bio.isClosed || bio.pos >= len(bio.buf) {
+					return val.NoneVal(), false
+				}
+				start := bio.pos
+				nl := bytes.IndexByte(bio.buf[start:], '\n')
+				var end int
+				if nl >= 0 {
+					end = start + nl + 1
+				} else {
+					end = len(bio.buf)
+				}
+				bio.pos = end
+				res := make([]byte, end-start)
+				copy(res, bio.buf[start:end])
+				return val.NewBytesVal(res), true
+			})
+		}
+		BytesIOType.Dict.Set(val.InternString("__iter__"), val.NewBuiltinFuncVal("__iter__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+			if len(args) < 1 {
+				ctx.Raise(val.NewException(val.TypeErrorType, "__iter__() missing self"))
+				return val.NoneVal()
+			}
+			return BytesIOType.Slots.TpIter(ctx, args[0])
 		}))
 
 		BytesIOType.Dict.Set(val.InternString("truncate"), val.NewBuiltinFuncVal("truncate", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			bio := (*pyBytesIO)(val.AsPointer(args[0]))
 			bio.mu.Lock()
 			defer bio.mu.Unlock()
+			if bio.isClosed {
+				ctx.Raise(val.NewException(val.ValueErrorType, "I/O operation on closed file."))
+				return val.NoneVal()
+			}
 			size := bio.pos
 			if len(args) > 1 && !args[1].IsNone() && args[1].IsInt64() {
 				size = int(args[1].AsInt64())
@@ -333,12 +668,12 @@ func initIOTypes() {
 				ctx.Raise(val.NewException(val.ValueErrorType, "Negative size not allowed"))
 				return val.NoneVal()
 			}
+			// CPython semantics: truncate does not move pos, and size > len(buf)
+			// leaves the buffer unchanged while returning size.
 			if size < len(bio.buf) {
 				bio.buf = bio.buf[:size]
-			} else if size > len(bio.buf) {
-				bio.buf = append(bio.buf, make([]byte, size-len(bio.buf))...)
 			}
-			return val.Int64Val(int64(len(bio.buf)))
+			return val.Int64Val(int64(size))
 		}))
 
 		BytesIOType.Dict.Set(val.DunderNew, val.NewBuiltinFuncVal("__new__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -390,21 +725,61 @@ func initIOTypes() {
 		StringIOType = val.MustNewType("StringIO", []*val.PyType{val.ObjectType}, nil)
 		StringIOType.Dict.Set(val.InternString("read"), val.NewBuiltinFuncVal("read", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			sio := (*pyStringIO)(val.AsPointer(args[0]))
-			sio.mu.Lock()
-			defer sio.mu.Unlock()
+			isMT := val.IsMultiThreaded()
+			if isMT {
+				sio.mu.Lock()
+				defer sio.mu.Unlock()
+			}
+			if sio.isClosed {
+				ctx.Raise(val.NewException(val.ValueErrorType, "I/O operation on closed file."))
+				return val.NoneVal()
+			}
 			n := -1
 			if len(args) >= 2 && args[1].IsInt64() {
 				n = int(args[1].AsInt64())
 			}
-			if n < 0 || sio.pos+n > len(sio.buf) {
-				n = len(sio.buf) - sio.pos
+			if sio.asciiOnly {
+				if sio.pos >= len(sio.buf) {
+					return val.NewStringVal("")
+				}
+				if n < 0 || sio.pos+n > len(sio.buf) {
+					n = len(sio.buf) - sio.pos
+				}
+				if n <= 0 {
+					return val.NewStringVal("")
+				}
+				res := sio.buf[sio.pos : sio.pos+n]
+				sio.pos += n
+				sio.bytePos = sio.pos
+				return val.NewStringVal(string(res))
 			}
-			if n <= 0 {
+			bStart := sio.resolveBytePosLocked()
+			if bStart >= len(sio.buf) {
 				return val.NewStringVal("")
 			}
-			res := sio.buf[sio.pos : sio.pos+n]
-			sio.pos += n
-			return val.NewStringVal(string(res))
+			if n == 0 {
+				return val.NewStringVal("")
+			}
+			if n < 0 {
+				res := sio.buf[bStart:]
+				sio.pos += utf8.RuneCount(res)
+				sio.bytePos = len(sio.buf)
+				return val.NewStringVal(string(res))
+			}
+			bEnd := bStart
+			readRunes := 0
+			for readRunes < n && bEnd < len(sio.buf) {
+				if sio.buf[bEnd] < 0x80 {
+					bEnd++
+				} else {
+					_, sz := utf8.DecodeRune(sio.buf[bEnd:])
+					bEnd += sz
+				}
+				readRunes++
+			}
+			sio.pos += readRunes
+			sio.bytePos = bEnd
+			return val.NewStringVal(string(sio.buf[bStart:bEnd]))
 		}))
 
 		StringIOType.Dict.Set(val.InternString("write"), val.NewBuiltinFuncVal("write", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -416,37 +791,111 @@ func initIOTypes() {
 			isMT := val.IsMultiThreaded()
 			if isMT {
 				sio.mu.Lock()
+				defer sio.mu.Unlock()
+			}
+			if sio.isClosed {
+				ctx.Raise(val.NewException(val.ValueErrorType, "I/O operation on closed file."))
+				return val.NoneVal()
 			}
 			v := args[1]
-			oldLen := len(sio.buf)
-			if sio.pos == oldLen {
-				written := appendStringIOWrite(sio, v)
-				if isMT {
-					sio.mu.Unlock()
-				}
-				return val.Int64Val(int64(written))
-			} else {
-				var stackTmp [64]byte
-				tmp, ok := val.AppendValueBytes(stackTmp[:0], v)
-				if !ok {
-					s := v.AsString()
-					view := unsafe.Slice(unsafe.StringData(s), len(s))
-					tmp = append(stackTmp[:0], view...)
-				}
-				if sio.pos+len(tmp) <= len(sio.buf) {
-					copy(sio.buf[sio.pos:], tmp)
-				} else {
-					sio.buf = append(sio.buf[:sio.pos], tmp...)
-				}
-				if sio.box != nil && cap(sio.buf) != cap(sio.box.b) {
-					sio.box.b = sio.buf[:0]
-				}
-				sio.pos += len(tmp)
-				if isMT {
-					sio.mu.Unlock()
-				}
-				return val.Int64Val(int64(len(tmp)))
+			if !v.IsAnyString() {
+				ctx.Raise(val.NewException(val.TypeErrorType, "string argument expected, got '"+v.Type().Name+"'"))
+				return val.NoneVal()
 			}
+			if sio.asciiOnly && sio.newlineMode == sioNewlineLF && sio.pos == len(sio.buf) {
+				written := appendStringIOWrite(sio, v)
+				return val.Int64Val(int64(written))
+			}
+			var stackTmp [64]byte
+			raw, ok := val.AppendValueBytes(stackTmp[:0], v)
+			if !ok {
+				s := v.AsString()
+				view := unsafe.Slice(unsafe.StringData(s), len(s))
+				raw = append(stackTmp[:0], view...)
+			}
+			data := translateSIONewlines(raw, sio.newlineMode)
+			origRunes := len(raw)
+			if !isASCIIBytes(raw) {
+				sio.asciiOnly = false
+				origRunes = utf8.RuneCount(raw)
+			}
+			dataRunes := len(data)
+			if !isASCIIBytes(data) {
+				sio.asciiOnly = false
+				dataRunes = utf8.RuneCount(data)
+			}
+			bufRunes := sio.runeLenLocked()
+			switch {
+			case sio.pos == bufRunes:
+				sio.buf = append(sio.buf, data...)
+				sio.pos += dataRunes
+				sio.bytePos = len(sio.buf)
+			case sio.pos > bufRunes:
+				pad := sio.pos - bufRunes
+				need := len(sio.buf) + pad + len(data)
+				if need > cap(sio.buf) {
+					newCap := max(cap(sio.buf)*2, need)
+					newBuf := make([]byte, len(sio.buf)+pad, newCap)
+					copy(newBuf, sio.buf)
+					newBuf = append(newBuf, data...)
+					sio.buf = newBuf
+				} else {
+					oldLen := len(sio.buf)
+					sio.buf = sio.buf[:oldLen+pad]
+					clear(sio.buf[oldLen:])
+					sio.buf = append(sio.buf, data...)
+				}
+				sio.pos += dataRunes
+				sio.bytePos = len(sio.buf)
+			default:
+				bStart := sio.resolveBytePosLocked()
+				if sio.asciiOnly {
+					end := bStart + len(data)
+					if end <= len(sio.buf) {
+						copy(sio.buf[bStart:], data)
+					} else {
+						sio.buf = append(sio.buf[:bStart], data...)
+					}
+					sio.pos = end
+					sio.bytePos = end
+				} else {
+					bEnd := bStart
+					for r := 0; r < dataRunes && bEnd < len(sio.buf); r++ {
+						if sio.buf[bEnd] < 0x80 {
+							bEnd++
+						} else {
+							_, sz := utf8.DecodeRune(sio.buf[bEnd:])
+							bEnd += sz
+						}
+					}
+					oldSpan := bEnd - bStart
+					newSpan := len(data)
+					if oldSpan == newSpan {
+						copy(sio.buf[bStart:bEnd], data)
+					} else {
+						tailLen := len(sio.buf) - bEnd
+						newLen := bStart + newSpan + tailLen
+						if newLen > cap(sio.buf) {
+							newCap := max(cap(sio.buf)*2, newLen)
+							newBuf := make([]byte, newLen, newCap)
+							copy(newBuf, sio.buf[:bStart])
+							copy(newBuf[bStart:], data)
+							copy(newBuf[bStart+newSpan:], sio.buf[bEnd:])
+							sio.buf = newBuf
+						} else {
+							sio.buf = sio.buf[:newLen]
+							copy(sio.buf[bStart+newSpan:], sio.buf[bEnd:bEnd+tailLen])
+							copy(sio.buf[bStart:], data)
+						}
+					}
+					sio.pos += dataRunes
+					sio.bytePos = bStart + newSpan
+				}
+			}
+			if sio.box != nil && cap(sio.buf) != cap(sio.box.b) {
+				sio.box.b = sio.buf[:0]
+			}
+			return val.Int64Val(int64(origRunes))
 		}))
 
 		StringIOType.Dict.Set(val.InternString("getvalue"), val.NewBuiltinFuncVal("getvalue", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -455,6 +904,10 @@ func initIOTypes() {
 			if isMT {
 				sio.mu.RLock()
 				defer sio.mu.RUnlock()
+			}
+			if sio.isClosed {
+				ctx.Raise(val.NewException(val.ValueErrorType, "I/O operation on closed file."))
+				return val.NoneVal()
 			}
 			n := len(sio.buf)
 			if n == 0 {
@@ -484,6 +937,10 @@ func initIOTypes() {
 			sio := (*pyStringIO)(val.AsPointer(args[0]))
 			sio.mu.Lock()
 			defer sio.mu.Unlock()
+			if sio.isClosed {
+				ctx.Raise(val.NewException(val.ValueErrorType, "I/O operation on closed file."))
+				return val.NoneVal()
+			}
 			offset := int(args[1].AsInt64())
 			whence := 0
 			if len(args) >= 3 && args[2].IsInt64() {
@@ -495,10 +952,18 @@ func initIOTypes() {
 			case 1:
 				sio.pos += offset
 			case 2:
-				sio.pos = len(sio.buf) + offset
+				sio.pos = sio.runeLenLocked() + offset
 			}
 			if sio.pos < 0 {
 				sio.pos = 0
+			}
+			switch {
+			case sio.asciiOnly:
+				sio.bytePos = sio.pos
+			case sio.pos == 0:
+				sio.bytePos = 0
+			default:
+				sio.bytePos = -1
 			}
 			return val.Int64Val(int64(sio.pos))
 		}))
@@ -507,6 +972,10 @@ func initIOTypes() {
 			sio := (*pyStringIO)(val.AsPointer(args[0]))
 			sio.mu.RLock()
 			defer sio.mu.RUnlock()
+			if sio.isClosed {
+				ctx.Raise(val.NewException(val.ValueErrorType, "I/O operation on closed file."))
+				return val.NoneVal()
+			}
 			return val.Int64Val(int64(sio.pos))
 		}))
 
@@ -551,46 +1020,66 @@ func initIOTypes() {
 			sio := (*pyStringIO)(val.AsPointer(args[0]))
 			sio.mu.Lock()
 			defer sio.mu.Unlock()
-			if sio.pos >= len(sio.buf) {
+			if sio.isClosed {
+				ctx.Raise(val.NewException(val.ValueErrorType, "I/O operation on closed file."))
+				return val.NoneVal()
+			}
+			bStart := sio.resolveBytePosLocked()
+			if bStart >= len(sio.buf) {
 				return val.NewStringVal("")
 			}
-			start := sio.pos
-			nl := -1
-			for i := start; i < len(sio.buf); i++ {
-				if sio.buf[i] == '\n' {
-					nl = i
-					break
-				}
+			delim := byte('\n')
+			if sio.newlineMode == sioNewlineCR {
+				delim = '\r'
 			}
+			nl := bytes.IndexByte(sio.buf[bStart:], delim)
+			var bEnd int
 			if nl >= 0 {
-				sio.pos = nl + 1
-				return val.NewStringVal(string(sio.buf[start : nl+1]))
+				bEnd = bStart + nl + 1
+			} else {
+				bEnd = len(sio.buf)
 			}
-			sio.pos = len(sio.buf)
-			return val.NewStringVal(string(sio.buf[start:]))
+			line := sio.buf[bStart:bEnd]
+			if sio.asciiOnly {
+				sio.pos = bEnd
+			} else {
+				sio.pos += utf8.RuneCount(line)
+			}
+			sio.bytePos = bEnd
+			return val.NewStringVal(string(line))
 		}))
 
 		StringIOType.Dict.Set(val.InternString("readlines"), val.NewBuiltinFuncVal("readlines", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			sio := (*pyStringIO)(val.AsPointer(args[0]))
 			sio.mu.Lock()
 			defer sio.mu.Unlock()
+			if sio.isClosed {
+				ctx.Raise(val.NewException(val.ValueErrorType, "I/O operation on closed file."))
+				return val.NoneVal()
+			}
+			delim := byte('\n')
+			if sio.newlineMode == sioNewlineCR {
+				delim = '\r'
+			}
 			var lines []val.Value
-			for sio.pos < len(sio.buf) {
-				start := sio.pos
-				nl := -1
-				for i := start; i < len(sio.buf); i++ {
-					if sio.buf[i] == '\n' {
-						nl = i
-						break
-					}
-				}
+			bStart := sio.resolveBytePosLocked()
+			for bStart < len(sio.buf) {
+				nl := bytes.IndexByte(sio.buf[bStart:], delim)
+				var bEnd int
 				if nl >= 0 {
-					sio.pos = nl + 1
-					lines = append(lines, val.NewStringVal(string(sio.buf[start:nl+1])))
+					bEnd = bStart + nl + 1
 				} else {
-					sio.pos = len(sio.buf)
-					lines = append(lines, val.NewStringVal(string(sio.buf[start:])))
+					bEnd = len(sio.buf)
 				}
+				line := sio.buf[bStart:bEnd]
+				if sio.asciiOnly {
+					sio.pos = bEnd
+				} else {
+					sio.pos += utf8.RuneCount(line)
+				}
+				sio.bytePos = bEnd
+				lines = append(lines, val.NewStringVal(string(line)))
+				bStart = bEnd
 			}
 			return val.NewListVal(lines...)
 		}))
@@ -599,6 +1088,10 @@ func initIOTypes() {
 			sio := (*pyStringIO)(val.AsPointer(args[0]))
 			sio.mu.Lock()
 			defer sio.mu.Unlock()
+			if sio.isClosed {
+				ctx.Raise(val.NewException(val.ValueErrorType, "I/O operation on closed file."))
+				return val.NoneVal()
+			}
 			size := sio.pos
 			if len(args) > 1 && !args[1].IsNone() && args[1].IsInt64() {
 				size = int(args[1].AsInt64())
@@ -607,36 +1100,58 @@ func initIOTypes() {
 				ctx.Raise(val.NewException(val.ValueErrorType, "Negative size not allowed"))
 				return val.NoneVal()
 			}
-			if size < len(sio.buf) {
-				sio.buf = sio.buf[:size]
-			} else if size > len(sio.buf) {
-				sio.buf = append(sio.buf, make([]byte, size-len(sio.buf))...)
+			// CPython semantics: truncate does not move pos, and size > len
+			// leaves the buffer unchanged while returning size.
+			if sio.asciiOnly {
+				if size < len(sio.buf) {
+					sio.buf = sio.buf[:size]
+				}
+			} else {
+				bCut := runeIndexToByteOffset(sio.buf, size)
+				if bCut < len(sio.buf) {
+					sio.buf = sio.buf[:bCut]
+					if sio.bytePos > bCut {
+						sio.bytePos = -1
+					}
+				}
 			}
-			return val.Int64Val(int64(len(sio.buf)))
+			return val.Int64Val(int64(size))
 		}))
 
 		StringIOType.Slots.TpIter = func(ctx *val.ExecContext, o val.Value) val.Value {
 			return val.NewIterValWithNext(func() (val.Value, bool) {
 				sio := (*pyStringIO)(val.AsPointer(o))
-				sio.mu.Lock()
-				defer sio.mu.Unlock()
-				if sio.pos >= len(sio.buf) {
+				isMT := val.IsMultiThreaded()
+				if isMT {
+					sio.mu.Lock()
+					defer sio.mu.Unlock()
+				}
+				if sio.isClosed {
 					return val.NoneVal(), false
 				}
-				start := sio.pos
-				nl := -1
-				for i := start; i < len(sio.buf); i++ {
-					if sio.buf[i] == '\n' {
-						nl = i
-						break
-					}
+				bStart := sio.resolveBytePosLocked()
+				if bStart >= len(sio.buf) {
+					return val.NoneVal(), false
 				}
+				delim := byte('\n')
+				if sio.newlineMode == sioNewlineCR {
+					delim = '\r'
+				}
+				nl := bytes.IndexByte(sio.buf[bStart:], delim)
+				var bEnd int
 				if nl >= 0 {
-					sio.pos = nl + 1
-					return val.NewStringVal(string(sio.buf[start : nl+1])), true
+					bEnd = bStart + nl + 1
+				} else {
+					bEnd = len(sio.buf)
 				}
-				sio.pos = len(sio.buf)
-				return val.NewStringVal(string(sio.buf[start:])), true
+				line := sio.buf[bStart:bEnd]
+				if sio.asciiOnly {
+					sio.pos = bEnd
+				} else {
+					sio.pos += utf8.RuneCount(line)
+				}
+				sio.bytePos = bEnd
+				return val.NewStringVal(string(line)), true
 			})
 		}
 		StringIOType.Dict.Set(val.InternString("__iter__"), val.NewBuiltinFuncVal("__iter__", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -677,9 +1192,42 @@ func initIOTypes() {
 			} else if v, ok := kwArg(args[1:], kwnames, "initial_value"); ok {
 				src = v
 			}
+			nlMode := sioNewlineLF
+			var nlVal val.Value
+			hasNL := false
+			if len(pa) > 1 {
+				nlVal = pa[1]
+				hasNL = true
+			} else if v, ok := kwArg(args[1:], kwnames, "newline"); ok {
+				nlVal = v
+				hasNL = true
+			}
+			if hasNL {
+				if nlVal.IsNone() {
+					nlMode = sioNewlineNone
+				} else if nlVal.IsAnyString() {
+					switch nlVal.AsString() {
+					case "\n":
+						nlMode = sioNewlineLF
+					case "":
+						nlMode = sioNewlineEmpty
+					case "\r":
+						nlMode = sioNewlineCR
+					case "\r\n":
+						nlMode = sioNewlineCRLF
+					default:
+						ctx.Raise(val.NewException(val.ValueErrorType, "illegal newline value: "+nlVal.AsString()))
+						return val.NoneVal()
+					}
+				}
+			}
+			sio.newlineMode = nlMode
 			var initBytes []byte
 			if !src.IsNone() && src.IsAnyString() {
 				initBytes, _ = val.AppendValueBytes(sio.buf[:0], src)
+				if nlMode != sioNewlineLF && nlMode != sioNewlineEmpty {
+					initBytes = translateSIONewlines(initBytes, nlMode)
+				}
 			} else {
 				if sio.buf == nil {
 					initBytes = make([]byte, 0, 131072)
@@ -688,7 +1236,10 @@ func initIOTypes() {
 				}
 			}
 			sio.buf = initBytes
+			sio.asciiOnly = isASCIIBytes(initBytes)
 			sio.pos = 0
+			sio.bytePos = 0
+			sio.isClosed = false
 			return val.NoneVal()
 		}))
 		StringIOType.InvalidateVersion()
@@ -731,6 +1282,24 @@ func initIOTypes() {
 		FileType.Dict.Set(val.InternString("read"), val.NewBuiltinFuncVal("read", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 			pf := (*pyFile)(val.AsPointer(args[0]))
 			isMT := val.IsMultiThreaded()
+			n := -1
+			if len(args) >= 2 && args[1].IsInt64() {
+				n = int(args[1].AsInt64())
+			}
+			if n < 0 {
+				content, closed, err := pf.readAllBytes(isMT)
+				if closed {
+					ctx.Raise(val.NewException(val.ValueErrorType, "I/O operation on closed file."))
+					return val.NoneVal()
+				}
+				if err != nil && len(content) == 0 {
+					if pf.binary {
+						return val.NewBytesVal(nil)
+					}
+					return val.NewStringVal("")
+				}
+				return pf.readResultVal(content)
+			}
 			if isMT {
 				pf.mu.Lock()
 			}
@@ -741,100 +1310,35 @@ func initIOTypes() {
 				ctx.Raise(val.NewException(val.ValueErrorType, "I/O operation on closed file."))
 				return val.NoneVal()
 			}
-			n := -1
-			if len(args) >= 2 && args[1].IsInt64() {
-				n = int(args[1].AsInt64())
-			}
-			if n < 0 {
-				pf.flushLocked()
-				if pf.reader == nil || pf.reader.Buffered() == 0 {
-					stat, err := pf.f.Stat()
-					if err == nil && stat.Mode().IsRegular() && stat.Size() >= 0 {
-						var curPos int64
-						if pf.reader != nil {
-							curPos, _ = pf.f.Seek(0, io.SeekCurrent)
-						}
-						remSize := stat.Size()
-						if curPos >= 0 && curPos <= remSize {
-							remSize -= curPos
-						}
-						if remSize == 0 {
-							if isMT {
-								pf.mu.Unlock()
-							}
-							if pf.binary {
-								return val.NewBytesVal(nil)
-							}
-							return val.NewStringVal("")
-						}
-						if remSize > 0 {
-							buf := make([]byte, remSize)
-							readN, _ := io.ReadFull(pf.f, buf)
-							if readN > 0 {
-								buf = buf[:readN]
-								if pf.binary {
-									if isMT {
-										pf.mu.Unlock()
-									}
-									return val.NewBytesVal(buf)
-								}
-								s := unsafe.String(unsafe.SliceData(buf), readN)
-								ps := &val.PyString{
-									Header: val.ObjectHeader{
-										Kind: val.KindString,
-										Type: val.StrType,
-									},
-									Data: s,
-								}
-								if isMT {
-									pf.mu.Unlock()
-								}
-								return val.ObjectVal(&ps.Header)
-							}
-						}
-					}
-				}
-				content, err := io.ReadAll(pf.ensureReader())
-				if err != nil && len(content) == 0 {
-					if isMT {
-						pf.mu.Unlock()
-					}
-					if pf.binary {
-						return val.NewBytesVal(nil)
-					}
-					return val.NewStringVal("")
-				}
+			if n == 0 {
 				if isMT {
 					pf.mu.Unlock()
 				}
-				if pf.binary {
-					return val.NewBytesVal(content)
-				}
-				s := unsafe.String(unsafe.SliceData(content), len(content))
-				ps := &val.PyString{
-					Header: val.ObjectHeader{
-						Kind: val.KindString,
-						Type: val.StrType,
-					},
-					Data: s,
-				}
-				return val.ObjectVal(&ps.Header)
-			}
-			buf := make([]byte, n)
-			readN, _ := io.ReadFull(pf.ensureReader(), buf)
-			if isMT {
-				pf.mu.Unlock()
-			}
-			if readN <= 0 {
 				if pf.binary {
 					return val.NewBytesVal(nil)
 				}
 				return val.NewStringVal("")
 			}
+			pf.flushLocked()
 			if pf.binary {
+				buf := make([]byte, n)
+				readN, _ := io.ReadFull(pf.ensureReader(), buf)
+				if isMT {
+					pf.mu.Unlock()
+				}
+				if readN <= 0 {
+					return val.NewBytesVal(nil)
+				}
 				return val.NewBytesVal(buf[:readN])
 			}
-			s := unsafe.String(unsafe.SliceData(buf), readN)
+			out := readFileTextRunes(pf.ensureReader(), n)
+			if isMT {
+				pf.mu.Unlock()
+			}
+			if len(out) == 0 {
+				return val.NewStringVal("")
+			}
+			s := unsafe.String(unsafe.SliceData(out), len(out))
 			ps := &val.PyString{
 				Header: val.ObjectHeader{
 					Kind: val.KindString,
@@ -853,6 +1357,7 @@ func initIOTypes() {
 				ctx.Raise(val.NewException(val.ValueErrorType, "I/O operation on closed file."))
 				return val.NoneVal()
 			}
+			pf.flushLocked()
 			line, err := pf.ensureReader().ReadBytes('\n')
 			if err != nil && len(line) == 0 {
 				if pf.binary {
@@ -860,10 +1365,7 @@ func initIOTypes() {
 				}
 				return val.NewStringVal("")
 			}
-			if pf.binary {
-				return val.NewBytesVal(line)
-			}
-			return val.NewStringVal(string(line))
+			return pf.readResultVal(line)
 		}))
 
 		FileType.Dict.Set(val.InternString("readlines"), val.NewBuiltinFuncVal("readlines", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -874,16 +1376,13 @@ func initIOTypes() {
 				ctx.Raise(val.NewException(val.ValueErrorType, "I/O operation on closed file."))
 				return val.NoneVal()
 			}
+			pf.flushLocked()
 			rdr := pf.ensureReader()
 			var lines []val.Value
 			for {
 				line, err := rdr.ReadBytes('\n')
 				if len(line) > 0 {
-					if pf.binary {
-						lines = append(lines, val.NewBytesVal(line))
-					} else {
-						lines = append(lines, val.NewStringVal(string(line)))
-					}
+					lines = append(lines, pf.readResultVal(line))
 				}
 				if err != nil {
 					break

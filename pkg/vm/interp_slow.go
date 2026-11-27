@@ -679,7 +679,7 @@ func (vm *VM) opForIterRangeWriteLoop(st *loopState, inst uint32, ip, sp int) (i
 			switch receiver.Type() {
 			case StringIOType:
 				sio := (*pyStringIO)(val.AsPointer(receiver))
-				if sio.pos == len(sio.buf) {
+				if !sio.isClosed && sio.asciiOnly && sio.newlineMode == sioNewlineLF && sio.pos == len(sio.buf) && isASCIIString(data) {
 					needed := rem * len(data)
 					oldLen := len(sio.buf)
 					if cap(sio.buf)-oldLen < needed {
@@ -697,6 +697,7 @@ func (vm *VM) opForIterRangeWriteLoop(st *loopState, inst uint32, ip, sp int) (i
 						done += copied
 					}
 					sio.pos = len(sio.buf)
+					sio.bytePos = len(sio.buf)
 					locals[targetReg] = val.Int64Val(int64(stop - 1))
 					sp--
 					return jumpTarget, sp, ctlNext

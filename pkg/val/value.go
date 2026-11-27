@@ -894,15 +894,7 @@ func equalsStructural(a, b Value) bool {
 	if a.ptr.Kind == KindSet && b.ptr.Kind == KindSet {
 		sa := a.AsSet()
 		sb := b.AsSet()
-		if sa.Len() != sb.Len() {
-			return false
-		}
-		for _, k := range sa.Items() {
-			if !sb.Contains(k) {
-				return false
-			}
-		}
-		return true
+		return sa.Len() == sb.Len() && sa.IsSubset(sb)
 	}
 
 	// Numeric cross-type equality (int64, float64, bool, bigint).

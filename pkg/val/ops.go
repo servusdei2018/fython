@@ -809,25 +809,17 @@ func RichCompare(ctx *ExecContext, a, b Value, op uint8) Value {
 		sb := b.AsSet()
 		switch op {
 		case CmpEQ:
-			return BoolVal(equalsStructural(a, b))
+			return BoolVal(sa.Len() == sb.Len() && sa.IsSubset(sb))
 		case CmpNEQ:
-			return BoolVal(!equalsStructural(a, b))
+			return BoolVal(sa.Len() != sb.Len() || !sa.IsSubset(sb))
 		case CmpLTE:
-			if sa.Len() > sb.Len() {
-				return BoolVal(false)
-			}
-			for _, k := range sa.Items() {
-				if !sb.Contains(k) {
-					return BoolVal(false)
-				}
-			}
-			return BoolVal(true)
+			return BoolVal(sa.IsSubset(sb))
 		case CmpLT:
-			return BoolVal(sa.Len() < sb.Len() && RichCompare(ctx, a, b, CmpLTE).IsTruthy())
+			return BoolVal(sa.Len() < sb.Len() && sa.IsSubset(sb))
 		case CmpGTE:
-			return RichCompare(ctx, b, a, CmpLTE)
+			return BoolVal(sb.IsSubset(sa))
 		case CmpGT:
-			return BoolVal(sa.Len() > sb.Len() && RichCompare(ctx, b, a, CmpLTE).IsTruthy())
+			return BoolVal(sa.Len() > sb.Len() && sb.IsSubset(sa))
 		}
 	}
 
@@ -1889,13 +1881,46 @@ func BitOr(ctx *ExecContext, a, b Value) Value {
 		}
 	}
 	if a.IsDict() && b.IsDict() {
-		merged := NewDictVal(a.AsDict().Len() + b.AsDict().Len())
+		da := a.AsDict()
+		db := b.AsDict()
+		merged := NewDictVal(da.Len() + db.Len())
 		md := merged.AsDict()
-		for _, e := range a.AsDict().ActiveEntries() {
-			md.Set(e.Key, e.Value)
-		}
-		for _, e := range b.AsDict().ActiveEntries() {
-			md.Set(e.Key, e.Value)
+		if da.Live == nil && db.Live == nil && !da.Shared && !db.Shared && !MultiThreadedFlag.Load() {
+			if sp := da.split; sp != nil {
+				sk := sp.keys
+				for i := range sk.Count {
+					md.PutNewHashed(sk.Keys[i], sp.vals[i], sk.Hashes[i])
+				}
+			} else {
+				for i := range da.Entries {
+					e := &da.Entries[i]
+					if e.Active {
+						md.PutNewHashed(e.Key, e.Value, e.Hash)
+					}
+				}
+			}
+			if sp := db.split; sp != nil {
+				sk := sp.keys
+				for i := range sk.Count {
+					md.PutNewHashed(sk.Keys[i], sp.vals[i], sk.Hashes[i])
+				}
+			} else {
+				for i := range db.Entries {
+					e := &db.Entries[i]
+					if e.Active {
+						md.PutNewHashed(e.Key, e.Value, e.Hash)
+					}
+				}
+			}
+		} else {
+			da.ForEachActive(func(k, v Value) bool {
+				md.Set(k, v)
+				return true
+			})
+			db.ForEachActive(func(k, v Value) bool {
+				md.Set(k, v)
+				return true
+			})
 		}
 		return merged
 	}

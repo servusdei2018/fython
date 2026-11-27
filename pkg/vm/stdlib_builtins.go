@@ -873,6 +873,11 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			}
 			return val.NewIterVal(val.NewTupleVal(rev...))
 		}
+		if tp := a.Type(); tp != nil {
+			if revFn, _, ok := tp.LookupMRO(val.InternString("__reversed__")); ok && !revFn.IsNone() {
+				return ctx.Invoke1(revFn, a)
+			}
+		}
 		return val.RaiseTypeError(ctx, "object is not reversible")
 	}))
 

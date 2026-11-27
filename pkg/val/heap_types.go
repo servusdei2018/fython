@@ -3899,10 +3899,66 @@ func NewSetFromDict(d *PyDict) Value {
 	return NewSetVal(d.Keys()...)
 }
 
+func newEmptySetFor(tp *PyType) *PySet {
+	if tp == nil {
+		tp = SetType
+	}
+	s := &PySet{
+		Header: ObjectHeader{Kind: KindSet, Type: tp},
+	}
+	s.dict.Header = ObjectHeader{Kind: KindDict, Type: DictType}
+	return s
+}
+
+// containsHashed checks whether key with pre-computed hash h is present in d.
+func (d *PyDict) containsHashed(key Value, h uint32) bool {
+	if d == nil || d.used == 0 {
+		return false
+	}
+	if d.Live != nil || d.Shared || d.split != nil || len(d.indices) == 0 || MultiThreadedFlag.Load() {
+		_, ok := d.Get(key)
+		return ok
+	}
+	mask := d.mask
+	slot := h & mask
+	if d.indexShift == 0 {
+		for {
+			raw := d.indices[slot]
+			if raw == dictIndexEmpty {
+				return false
+			}
+			if raw != dictIndexDummy {
+				e := &d.Entries[int(raw)-dictIndexOffset]
+				if e.Key == key || (e.Hash == h && e.Active && dictKeyEqual(e.Key, key)) {
+					return true
+				}
+			}
+			slot = (slot + 1) & mask
+		}
+	}
+	for {
+		raw := d.readIndex(slot)
+		if raw == dictIndexEmpty {
+			return false
+		}
+		if raw != dictIndexDummy {
+			e := &d.Entries[int(raw)-dictIndexOffset]
+			if e.Key == key || (e.Hash == h && e.Active && dictKeyEqual(e.Key, key)) {
+				return true
+			}
+		}
+		slot = (slot + 1) & mask
+	}
+}
+
 // Copy returns a shallow copy of s, using a zero-probe memcpy fast path when
 // tombstone-free and a pre-sized PutNewHashed compaction path otherwise.
 func (s *PySet) Copy() *PySet {
 	d := &s.dict
+	tp := s.Header.Type
+	if tp == nil {
+		tp = SetType
+	}
 	if d.Live == nil && !d.Shared && !MultiThreadedFlag.Load() {
 		if d.used > 0 && d.used == d.filled && len(d.Entries) == int(d.used) && len(d.indices) > 0 {
 			entries := make([]DictEntry, len(d.Entries), cap(d.Entries))
@@ -3910,8 +3966,9 @@ func (s *PySet) Copy() *PySet {
 			indices := make([]byte, len(d.indices))
 			copy(indices, d.indices)
 			return &PySet{
-				Header: ObjectHeader{Kind: KindSet, Type: SetType},
+				Header: ObjectHeader{Kind: KindSet, Type: tp},
 				dict: PyDict{
+					Header:     ObjectHeader{Kind: KindDict, Type: DictType},
 					Entries:    entries,
 					indices:    indices,
 					used:       d.used,
@@ -3921,9 +3978,7 @@ func (s *PySet) Copy() *PySet {
 				},
 			}
 		}
-		out := &PySet{
-			Header: ObjectHeader{Kind: KindSet, Type: SetType},
-		}
+		out := newEmptySetFor(tp)
 		if d.used > 0 {
 			out.dict.initTable(max(4, int(d.used)))
 			for i := range d.Entries {
@@ -3935,7 +3990,11 @@ func (s *PySet) Copy() *PySet {
 		}
 		return out
 	}
-	return NewSetVal(s.Items()...).AsSet()
+	out := newEmptySetFor(tp)
+	for _, it := range s.Items() {
+		out.Add(it)
+	}
+	return out
 }
 
 // Add adds an element to the set.
@@ -4014,28 +4073,54 @@ func (s *PySet) Items() []Value {
 	return s.dict.Keys()
 }
 
-// Union returns a new set containing all elements from both s and other.
+// Union returns a new set containing all elements from both s and other,
+// preserving the receiver's type.
 func (s *PySet) Union(other *PySet) Value {
-	res := NewSetVal().AsSet()
-	for _, it := range s.Items() {
-		res.Add(it)
+	if other == nil || other.Len() == 0 {
+		return Value{ptr: &s.Copy().Header}
 	}
-	if other != nil {
-		for _, it := range other.Items() {
-			res.Add(it)
+	if s.Len() == 0 {
+		out := other.Copy()
+		if s.Header.Type != nil {
+			out.Header.Type = s.Header.Type
+		}
+		return Value{ptr: &out.Header}
+	}
+	res := newEmptySetFor(s.Header.Type)
+	total := s.Len() + other.Len()
+	res.dict.initTable(max(4, total))
+	for i := range s.dict.Entries {
+		e := &s.dict.Entries[i]
+		if e.Active {
+			res.dict.PutNewHashed(e.Key, NoneVal(), e.Hash)
+		}
+	}
+	for i := range other.dict.Entries {
+		e := &other.dict.Entries[i]
+		if e.Active {
+			// PutNewHashed probes existing keys and updates in-place on a tombstone-free table.
+			res.dict.PutNewHashed(e.Key, NoneVal(), e.Hash)
 		}
 	}
 	return Value{ptr: &res.Header}
 }
 
-// Intersection returns a new set containing elements present in both s and other.
+// Intersection returns a new set containing elements present in both s and other,
+// always iterating the smaller set and probing the larger set.
 func (s *PySet) Intersection(other *PySet) Value {
-	res := NewSetVal().AsSet()
-	if other != nil {
-		for _, it := range s.Items() {
-			if other.Contains(it) {
-				res.Add(it)
-			}
+	res := newEmptySetFor(s.Header.Type)
+	if other == nil || s.Len() == 0 || other.Len() == 0 {
+		return Value{ptr: &res.Header}
+	}
+	small, large := s, other
+	if other.Len() < s.Len() {
+		small, large = other, s
+	}
+	res.dict.initTable(max(4, small.Len()))
+	for i := range small.dict.Entries {
+		e := &small.dict.Entries[i]
+		if e.Active && large.dict.containsHashed(e.Key, e.Hash) {
+			res.dict.PutNewHashed(e.Key, NoneVal(), e.Hash)
 		}
 	}
 	return Value{ptr: &res.Header}
@@ -4043,17 +4128,28 @@ func (s *PySet) Intersection(other *PySet) Value {
 
 // SymmetricDifference returns a new set with elements in either s or other, but not both.
 func (s *PySet) SymmetricDifference(other *PySet) Value {
-	res := NewSetVal().AsSet()
-	for _, it := range s.Items() {
-		if other == nil || !other.Contains(it) {
-			res.Add(it)
+	if other == nil || other.Len() == 0 {
+		return Value{ptr: &s.Copy().Header}
+	}
+	if s.Len() == 0 {
+		out := other.Copy()
+		if s.Header.Type != nil {
+			out.Header.Type = s.Header.Type
+		}
+		return Value{ptr: &out.Header}
+	}
+	res := newEmptySetFor(s.Header.Type)
+	res.dict.initTable(max(4, s.Len()+other.Len()))
+	for i := range s.dict.Entries {
+		e := &s.dict.Entries[i]
+		if e.Active && !other.dict.containsHashed(e.Key, e.Hash) {
+			res.dict.PutNewHashed(e.Key, NoneVal(), e.Hash)
 		}
 	}
-	if other != nil {
-		for _, it := range other.Items() {
-			if !s.Contains(it) {
-				res.Add(it)
-			}
+	for i := range other.dict.Entries {
+		e := &other.dict.Entries[i]
+		if e.Active && !s.dict.containsHashed(e.Key, e.Hash) {
+			res.dict.PutNewHashed(e.Key, NoneVal(), e.Hash)
 		}
 	}
 	return Value{ptr: &res.Header}
@@ -4074,23 +4170,36 @@ func (s *PySet) Clear() {
 	s.dict.Clear()
 }
 
-// Pop removes and returns an arbitrary element from the set.
+// Pop removes and returns an arbitrary element from the set without allocating.
 func (s *PySet) Pop() (Value, bool) {
-	keys := s.dict.Keys()
-	if len(keys) == 0 {
+	if s.Len() == 0 {
 		return NoneVal(), false
 	}
-	k := keys[0]
-	s.dict.Delete(k)
-	return k, true
+	for i := range s.dict.Entries {
+		e := &s.dict.Entries[i]
+		if e.Active {
+			k := e.Key
+			s.dict.Delete(k)
+			return k, true
+		}
+	}
+	return NoneVal(), false
 }
 
 // Difference returns a new set with elements in s that are not in other.
 func (s *PySet) Difference(other *PySet) Value {
-	res := NewSetVal().AsSet()
-	for _, it := range s.Items() {
-		if other == nil || !other.Contains(it) {
-			res.Add(it)
+	if other == nil || other.Len() == 0 {
+		return Value{ptr: &s.Copy().Header}
+	}
+	res := newEmptySetFor(s.Header.Type)
+	if s.Len() == 0 {
+		return Value{ptr: &res.Header}
+	}
+	res.dict.initTable(max(4, s.Len()))
+	for i := range s.dict.Entries {
+		e := &s.dict.Entries[i]
+		if e.Active && !other.dict.containsHashed(e.Key, e.Hash) {
+			res.dict.PutNewHashed(e.Key, NoneVal(), e.Hash)
 		}
 	}
 	return Value{ptr: &res.Header}
@@ -4101,8 +4210,15 @@ func (s *PySet) IsSubset(other *PySet) bool {
 	if other == nil {
 		return s.Len() == 0
 	}
-	for _, k := range s.Items() {
-		if !other.Contains(k) {
+	if s.Len() > other.Len() {
+		return false
+	}
+	if s == other || s.Len() == 0 {
+		return true
+	}
+	for i := range s.dict.Entries {
+		e := &s.dict.Entries[i]
+		if e.Active && !other.dict.containsHashed(e.Key, e.Hash) {
 			return false
 		}
 	}
@@ -4115,6 +4231,109 @@ func (s *PySet) IsSuperset(other *PySet) bool {
 		return true
 	}
 	return other.IsSubset(s)
+}
+
+// IsDisjoint reports whether s and other have no elements in common,
+// always iterating the smaller set and probing the larger set.
+func (s *PySet) IsDisjoint(other *PySet) bool {
+	if other == nil || s.Len() == 0 || other.Len() == 0 {
+		return true
+	}
+	if s == other {
+		return false
+	}
+	small, large := s, other
+	if other.Len() < s.Len() {
+		small, large = other, s
+	}
+	for i := range small.dict.Entries {
+		e := &small.dict.Entries[i]
+		if e.Active && large.dict.containsHashed(e.Key, e.Hash) {
+			return false
+		}
+	}
+	return true
+}
+
+// UpdateFromSet adds all elements of other into s without intermediate Keys() allocation.
+func (s *PySet) UpdateFromSet(other *PySet) {
+	if other == nil || other == s || other.Len() == 0 {
+		return
+	}
+	if s.Len() == 0 {
+		s.dict.Reserve(other.Len())
+	}
+	for i := range other.dict.Entries {
+		e := &other.dict.Entries[i]
+		if e.Active {
+			s.dict.Set(e.Key, NoneVal())
+		}
+	}
+}
+
+// DifferenceUpdateFromSet removes all elements of other from s in place.
+func (s *PySet) DifferenceUpdateFromSet(other *PySet) {
+	if other == nil || s.Len() == 0 || other.Len() == 0 {
+		return
+	}
+	if other == s {
+		s.Clear()
+		return
+	}
+	if other.Len() <= s.Len() {
+		for i := range other.dict.Entries {
+			e := &other.dict.Entries[i]
+			if e.Active {
+				s.dict.Delete(e.Key)
+			}
+		}
+		return
+	}
+	for i := range s.dict.Entries {
+		e := &s.dict.Entries[i]
+		if e.Active && other.dict.containsHashed(e.Key, e.Hash) {
+			s.dict.Delete(e.Key)
+		}
+	}
+}
+
+// IntersectionUpdateFromSet keeps only elements of s that are also in other.
+func (s *PySet) IntersectionUpdateFromSet(other *PySet) {
+	if other == nil || other.Len() == 0 {
+		s.Clear()
+		return
+	}
+	if other == s || s.Len() == 0 {
+		return
+	}
+	for i := range s.dict.Entries {
+		e := &s.dict.Entries[i]
+		if e.Active && !other.dict.containsHashed(e.Key, e.Hash) {
+			s.dict.Delete(e.Key)
+		}
+	}
+}
+
+// SymmetricDifferenceUpdateFromSet updates s to the symmetric difference of s and other.
+func (s *PySet) SymmetricDifferenceUpdateFromSet(other *PySet) {
+	if other == nil || other.Len() == 0 {
+		return
+	}
+	if other == s {
+		s.Clear()
+		return
+	}
+	for i := range other.dict.Entries {
+		e := &other.dict.Entries[i]
+		if !e.Active {
+			continue
+		}
+		if s.dict.containsHashed(e.Key, e.Hash) {
+			s.dict.Delete(e.Key)
+		} else {
+			s.dict.Set(e.Key, NoneVal())
+		}
+	}
 }
 
 // PyExceptionGroup represents a PEP 654 ExceptionGroup / BaseExceptionGroup.
