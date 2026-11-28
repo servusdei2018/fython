@@ -132,6 +132,10 @@ func compSaveName(compID uint32, name string) string {
 	return fmt.Sprintf(".save%d.%s", compID, name)
 }
 
+func compCellName(compID uint32, name string) string {
+	return fmt.Sprintf(".cell%d.%s", compID, name)
+}
+
 // NewScope creates a new Scope node in the symbol table tree.
 func NewScope(kind ScopeKind, name string, parent *Scope) *Scope {
 	s := &Scope{
@@ -1109,11 +1113,37 @@ func (st *SymbolTable) resolveScope(s *Scope) error {
 	}
 
 	if s.Kind == ScopeModule {
+		if s.ClosureSlots == nil {
+			s.ClosureSlots = make(map[string]int)
+		}
+		for idx, cv := range s.CellVars {
+			if sym := s.Symbols[cv]; sym != nil && sym.Storage == StorageCell {
+				sym.Offset = idx
+			} else {
+				s.Symbols[cv] = &Symbol{Name: cv, Storage: StorageCell, Offset: idx}
+			}
+			s.ClosureSlots[cv] = idx
+		}
 		for name := range s.Bound {
+			if sym := s.Symbols[name]; sym != nil && sym.Storage == StorageCell {
+				continue
+			}
 			s.Symbols[name] = &Symbol{Name: name, Storage: StorageGlobal}
 		}
 		for name := range s.Used {
+			if s.Symbols[name] != nil {
+				continue
+			}
 			s.Symbols[name] = &Symbol{Name: name, Storage: StorageGlobal}
+		}
+		for idx, fv := range s.FreeVars {
+			off := len(s.CellVars) + idx
+			if sym := s.Symbols[fv]; sym != nil && sym.Storage == StorageCell {
+				s.ClosureSlots[fv] = sym.Offset
+				continue
+			}
+			s.ClosureSlots[fv] = off
+			s.Symbols[fv] = &Symbol{Name: fv, Storage: StorageFree, Offset: off}
 		}
 		return nil
 	}
@@ -1175,13 +1205,14 @@ func (st *SymbolTable) resolveScope(s *Scope) error {
 		for _, name := range boundNames {
 			s.Symbols[name] = &Symbol{Name: name, Storage: StorageFastLocal}
 			s.FastLocals = append(s.FastLocals, name)
+			if comprehensionTargetCaptured(s, name) {
+				continue
+			}
 			fn := s.Parent
 			for fn != nil && fn.Kind == ScopeComprehension {
 				fn = fn.Parent
 			}
 			if fn != nil && fn.Kind == ScopeFunction && (fn.Bound[name] || isParam(fn.ParamNames, name)) {
-				// The comprehension shares this slot with a local of the
-				// enclosing function. Reserve a hidden slot to restore it.
 				hidden := compSaveName(s.CompID, name)
 				if fn.Symbols[hidden] == nil {
 					fn.Symbols[hidden] = &Symbol{Name: hidden, Storage: StorageFastLocal}
@@ -1212,6 +1243,36 @@ func (st *SymbolTable) resolveScope(s *Scope) error {
 				st.markAncestorCell(s.Parent, name)
 			default:
 				s.Symbols[name] = &Symbol{Name: name, Storage: StorageGlobal}
+			}
+		}
+		for _, name := range boundNames {
+			if !comprehensionTargetCaptured(s, name) {
+				continue
+			}
+			encl := s.Parent
+			for encl != nil && encl.Kind == ScopeComprehension {
+				encl = encl.Parent
+			}
+			if encl == nil {
+				continue
+			}
+			if encl != nil && (encl.Kind == ScopeFunction || encl.Kind == ScopeModule || encl.Kind == ScopeClass) {
+				hidden := compCellName(s.CompID, name)
+				switch sym := encl.Symbols[hidden]; {
+				case sym == nil:
+					encl.Symbols[hidden] = &Symbol{Name: hidden, Storage: StorageCell}
+					encl.CellVars = append(encl.CellVars, hidden)
+				case sym.Storage != StorageCell:
+					sym.Storage = StorageCell
+					if !containsString(encl.CellVars, hidden) {
+						encl.CellVars = append(encl.CellVars, hidden)
+					}
+					encl.FastLocals = removeString(encl.FastLocals, hidden)
+				default:
+					if !containsString(encl.CellVars, hidden) {
+						encl.CellVars = append(encl.CellVars, hidden)
+					}
+				}
 			}
 		}
 		offset := 0
@@ -1446,7 +1507,7 @@ func (st *SymbolTable) isBoundInFunctionAncestors(start *Scope, name string) boo
 			}
 			continue
 		}
-		if p.Kind == ScopeFunction {
+		if p.Kind == ScopeFunction || p.Kind == ScopeComprehension {
 			if p.Bound[name] {
 				return true
 			}
@@ -1480,6 +1541,25 @@ func (st *SymbolTable) isCapturedByDescendants(s *Scope, name string) bool {
 		return false
 	}
 	return check(s)
+}
+
+func comprehensionTargetCaptured(compScope *Scope, name string) bool {
+	var check func(cur *Scope) bool
+	check = func(cur *Scope) bool {
+		for _, child := range cur.Children {
+			if containsString(child.FreeVars, name) {
+				return true
+			}
+			if child.Used[name] && !child.Bound[name] && child.Kind == ScopeFunction {
+				return true
+			}
+			if check(child) {
+				return true
+			}
+		}
+		return false
+	}
+	return check(compScope)
 }
 
 func isParam(params []string, name string) bool {

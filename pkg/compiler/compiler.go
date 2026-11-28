@@ -91,6 +91,7 @@ type Compiler struct {
 	optimize       int
 	hasSliceOps    bool
 	compLocalSlots map[string]int
+	compCellRemap  map[string]string
 }
 
 func buildLineStarts(src []byte) []int {
@@ -129,10 +130,28 @@ func (c *Compiler) nextChildScope(kind ScopeKind, name string) *Scope {
 			c.nextChildIdx = i + 1
 			return child
 		}
+		if found := findNestedScope(child, kind, name); found != nil {
+			return found
+		}
 	}
 	for _, child := range c.scope.Children {
 		if child.Kind == kind && (name == "" || child.Name == name) {
 			return child
+		}
+		if found := findNestedScope(child, kind, name); found != nil {
+			return found
+		}
+	}
+	return nil
+}
+
+func findNestedScope(root *Scope, kind ScopeKind, name string) *Scope {
+	for _, child := range root.Children {
+		if child.Kind == kind && (name == "" || child.Name == name) {
+			return child
+		}
+		if found := findNestedScope(child, kind, name); found != nil {
+			return found
 		}
 	}
 	return nil
@@ -224,6 +243,14 @@ func CompileWithFilenameAndOptimize(src []byte, arena *ASTArena, filename string
 	for i, fl := range c.scope.FastLocals {
 		varNames[i] = val.InternString(fl)
 	}
+	cellValSlice := make([]val.Value, len(c.scope.CellVars))
+	for i, cv := range c.scope.CellVars {
+		cellValSlice[i] = val.InternString(cv)
+	}
+	freeValSlice := make([]val.Value, len(c.scope.FreeVars))
+	for i, fv := range c.scope.FreeVars {
+		freeValSlice[i] = val.InternString(fv)
+	}
 
 	co := &vm.CodeObject{
 		Name:           "<module>",
@@ -233,6 +260,8 @@ func CompileWithFilenameAndOptimize(src []byte, arena *ASTArena, filename string
 		Code:           c.finalizedCode(),
 		Consts:         c.constPool.Slice(),
 		VarNames:       varNames,
+		CellVars:       cellValSlice,
+		FreeVars:       freeValSlice,
 		NumLocals:      frameLocalCount(c.scope),
 		NumParams:      0,
 		MaxStackSize:   c.maxStackDepth + 16,
@@ -315,6 +344,14 @@ func CompileSourceModeWithOptimize(src []byte, filename string, mode CompileMode
 		for i, fl := range c.scope.FastLocals {
 			varNames[i] = val.InternString(fl)
 		}
+		cellValSlice := make([]val.Value, len(c.scope.CellVars))
+		for i, cv := range c.scope.CellVars {
+			cellValSlice[i] = val.InternString(cv)
+		}
+		freeValSlice := make([]val.Value, len(c.scope.FreeVars))
+		for i, fv := range c.scope.FreeVars {
+			freeValSlice[i] = val.InternString(fv)
+		}
 		co := &vm.CodeObject{
 			Name:           "<module>",
 			QualName:       "<module>",
@@ -323,6 +360,8 @@ func CompileSourceModeWithOptimize(src []byte, filename string, mode CompileMode
 			Code:           c.finalizedCode(),
 			Consts:         c.constPool.Slice(),
 			VarNames:       varNames,
+			CellVars:       cellValSlice,
+			FreeVars:       freeValSlice,
 			NumLocals:      frameLocalCount(c.scope),
 			NumParams:      0,
 			MaxStackSize:   c.maxStackDepth + 16,
@@ -382,6 +421,14 @@ func CompileSourceModeWithOptimize(src []byte, filename string, mode CompileMode
 	for i, fl := range c.scope.FastLocals {
 		varNames[i] = val.InternString(fl)
 	}
+	cellValSlice := make([]val.Value, len(c.scope.CellVars))
+	for i, cv := range c.scope.CellVars {
+		cellValSlice[i] = val.InternString(cv)
+	}
+	freeValSlice := make([]val.Value, len(c.scope.FreeVars))
+	for i, fv := range c.scope.FreeVars {
+		freeValSlice[i] = val.InternString(fv)
+	}
 	co := &vm.CodeObject{
 		Name:           "<module>",
 		QualName:       "<module>",
@@ -390,6 +437,8 @@ func CompileSourceModeWithOptimize(src []byte, filename string, mode CompileMode
 		Code:           c.finalizedCode(),
 		Consts:         c.constPool.Slice(),
 		VarNames:       varNames,
+		CellVars:       cellValSlice,
+		FreeVars:       freeValSlice,
 		NumLocals:      frameLocalCount(c.scope),
 		NumParams:      0,
 		MaxStackSize:   c.maxStackDepth + 16,
@@ -1009,6 +1058,18 @@ func (c *Compiler) closureSlot(name string) (uint16, error) {
 }
 
 func (c *Compiler) emitLoadClosure(name string) error {
+	if hidden, ok := c.compCellRemap[name]; ok {
+		if sym := c.scope.Symbols[hidden]; sym != nil {
+			c.emitOp(vm.OP_LOAD_CLOSURE, 0, uint16(sym.Offset))
+			return nil
+		}
+		if c.scope.ClosureSlots != nil {
+			if off, ok := c.scope.ClosureSlots[hidden]; ok {
+				c.emitOp(vm.OP_LOAD_CLOSURE, 0, uint16(off))
+				return nil
+			}
+		}
+	}
 	off, err := c.closureSlot(name)
 	if err != nil {
 		return err
@@ -1022,6 +1083,12 @@ func (c *Compiler) compileNameLoad(name string) error {
 		idx := c.constPool.Add(val.BoolVal(c.optimize == 0))
 		c.emitOp(vm.OP_LOAD_CONST, 0, idx)
 		return nil
+	}
+	if hidden, ok := c.compCellRemap[name]; ok {
+		if sym := c.scope.Symbols[hidden]; sym != nil {
+			c.emitOp(vm.OP_LOAD_DEREF, 0, uint16(sym.Offset))
+			return nil
+		}
 	}
 	if slot, ok := c.compLocalSlots[name]; ok {
 		c.emitOp(vm.OP_LOAD_FAST, 0, uint16(slot))
@@ -1082,6 +1149,12 @@ func (c *Compiler) compileNameLoad(name string) error {
 func (c *Compiler) compileNameStore(name string) error {
 	if name == "__debug__" {
 		return errors.New("SyntaxError: cannot assign to __debug__")
+	}
+	if hidden, ok := c.compCellRemap[name]; ok {
+		if sym := c.scope.Symbols[hidden]; sym != nil {
+			c.emitOp(vm.OP_STORE_DEREF, 0, uint16(sym.Offset))
+			return nil
+		}
 	}
 	if slot, ok := c.compLocalSlots[name]; ok {
 		c.emitOp(vm.OP_STORE_FAST, 0, uint16(slot))
@@ -3302,6 +3375,11 @@ func (c *Compiler) compBindNonFuncLocals(idx uint32) func() {
 	}
 	saved := make([]savedEntry, 0, len(names))
 	for _, name := range names {
+		if hidden := compCellName(idx, name); hidden != "" {
+			if sym := c.scope.Symbols[hidden]; sym != nil && (sym.Storage == StorageCell || sym.Storage == StorageFree) {
+				continue
+			}
+		}
 		prev, had := c.compLocalSlots[name]
 		saved = append(saved, savedEntry{name: name, prev: prev, hadOld: had})
 		c.compLocalSlots[name] = c.allocTempLocal()
@@ -3312,6 +3390,53 @@ func (c *Compiler) compBindNonFuncLocals(idx uint32) func() {
 				c.compLocalSlots[s.name] = s.prev
 			} else {
 				delete(c.compLocalSlots, s.name)
+			}
+		}
+	}
+}
+
+func (c *Compiler) compBindCellRemap(idx uint32) func() {
+	if c.scope == nil {
+		return func() {}
+	}
+	names := c.compTargetNames(idx)
+	if len(names) == 0 {
+		return func() {}
+	}
+	if c.compCellRemap == nil {
+		c.compCellRemap = make(map[string]string)
+	}
+	type savedEntry struct {
+		name   string
+		prev   string
+		hadOld bool
+	}
+	saved := make([]savedEntry, 0, len(names))
+	for _, name := range names {
+		hidden := compCellName(idx, name)
+		sym := c.scope.Symbols[hidden]
+		if sym == nil || (sym.Storage != StorageCell && sym.Storage != StorageFree) {
+			if c.scope.ClosureSlots != nil {
+				if _, ok := c.scope.ClosureSlots[hidden]; !ok {
+					continue
+				}
+			} else {
+				continue
+			}
+		}
+		prev, had := c.compCellRemap[name]
+		saved = append(saved, savedEntry{name: name, prev: prev, hadOld: had})
+		c.compCellRemap[name] = hidden
+	}
+	if len(saved) == 0 {
+		return func() {}
+	}
+	return func() {
+		for _, s := range slices.Backward(saved) {
+			if s.hadOld {
+				c.compCellRemap[s.name] = s.prev
+			} else {
+				delete(c.compCellRemap, s.name)
 			}
 		}
 	}
@@ -3344,6 +3469,8 @@ func (c *Compiler) compSaveLocals(idx uint32) (restore func()) {
 func (c *Compiler) compileListComp(expr *ASTExpr) error {
 	restore := c.compSaveLocals(expr.Extra)
 	defer restore()
+	restoreCell := c.compBindCellRemap(expr.Extra)
+	defer restoreCell()
 	// 1. Build initial empty list
 	c.emitOp(vm.OP_BUILD_LIST, 0, 0)
 
@@ -3468,6 +3595,8 @@ func (c *Compiler) compileListComp(expr *ASTExpr) error {
 func (c *Compiler) compileDictComp(expr *ASTExpr) error {
 	restore := c.compSaveLocals(expr.Extra)
 	defer restore()
+	restoreCell := c.compBindCellRemap(expr.Extra)
+	defer restoreCell()
 	// 1. Build initial comprehension dict (ArgA=1 selects 1-alloc fused small dict)
 	c.emitOp(vm.OP_BUILD_MAP, 1, 0)
 
@@ -4381,6 +4510,8 @@ func (c *Compiler) compileDeleteTarget(targetID ExprID) error {
 func (c *Compiler) compileSetComp(expr *ASTExpr) error {
 	restore := c.compSaveLocals(expr.Extra)
 	defer restore()
+	restoreCell := c.compBindCellRemap(expr.Extra)
+	defer restoreCell()
 	// 1. Build initial empty set
 	c.emitOp(vm.OP_BUILD_SET, 0, 0)
 

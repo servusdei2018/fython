@@ -9615,6 +9615,27 @@ func initTypes() {
 		}
 		return NewStringVal(decoded)
 	}))
+	BytesType.Dict.Set(InternString("__mod__"), NewBuiltinFuncVal("__mod__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			if ctx != nil {
+				ctx.Raise(NewTypeError("not enough arguments for format string"))
+			}
+			return NoneVal()
+		}
+		self := args[0]
+		var data []byte
+		if self.IsBytes() {
+			data = self.AsBytes().Data
+		} else if d, ok := unwrapBytesData(self); ok {
+			data = d
+		} else {
+			if ctx != nil {
+				ctx.Raise(NewTypeError("unsupported operand type(s) for %: 'bytes' and '" + bytesFormatTypeName(args[1]) + "'"))
+			}
+			return NoneVal()
+		}
+		return formatBytesModCtx(ctx, data, args[1], false)
+	}))
 
 	ByteArrayType = MustNewType("bytearray", []*PyType{ObjectType}, nil)
 	ByteArrayType.Dict.Set(InternString("__hash__"), NoneVal())
@@ -9731,6 +9752,27 @@ func initTypes() {
 			panic(err.Error())
 		}
 		return NewStringVal(decoded)
+	}))
+	ByteArrayType.Dict.Set(InternString("__mod__"), NewBuiltinFuncVal("__mod__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 {
+			if ctx != nil {
+				ctx.Raise(NewTypeError("not enough arguments for format string"))
+			}
+			return NoneVal()
+		}
+		self := args[0]
+		var data []byte
+		if self.IsByteArray() {
+			data = self.AsByteArray().Data
+		} else if d, ok := unwrapBytesData(self); ok {
+			data = d
+		} else {
+			if ctx != nil {
+				ctx.Raise(NewTypeError("unsupported operand type(s) for %: 'bytearray' and '" + bytesFormatTypeName(args[1]) + "'"))
+			}
+			return NoneVal()
+		}
+		return formatBytesModCtx(ctx, data, args[1], true)
 	}))
 
 	initBytesMethods()

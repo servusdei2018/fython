@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"runtime"
 	"sync"
 	"unsafe"
 
@@ -12,7 +13,17 @@ func (vm *VM) instantiateAsyncGenerator(co *CodeObject, callable val.Value, defa
 	return agVal
 }
 
-func (vm *VM) instantiateAsyncGeneratorSafe(co *CodeObject, callable val.Value, defaults []val.Value, kwDefaults *val.PyDict, callerStack []val.Value, argBase int, nargs int, kwnames []val.Value, globals *val.PyDict) (val.Value, bool) {
+func (vm *VM) instantiateAsyncGeneratorSafe(co *CodeObject, callable val.Value, defaults []val.Value, kwDefaults *val.PyDict, callerStack []val.Value, argBase int, nargs int, kwnames []val.Value, globals *val.PyDict) (res val.Value, ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			if re, isRT := r.(runtime.Error); isRT {
+				panic(re)
+			}
+			vm.execCtx.Raise(panicToPyException(r))
+			res = val.NoneVal()
+			ok = false
+		}
+	}()
 	need := max(64, co.NumLocals+max(co.MaxStackSize, len(co.Code))+16)
 	agStack, poolCls := vm.acquireGeneratorStack(need)
 	var codeVal val.Value
@@ -30,8 +41,8 @@ func (vm *VM) instantiateAsyncGeneratorSafe(co *CodeObject, callable val.Value, 
 	ag.StepHook = vm.stepAsyncGen
 	ag.ReleaseHook = vm.releaseAsyncGenStack
 
-	spAfterBind := vm.bindFunctionArgsToSlice(co, defaults, kwDefaults, ag.Stack, callerStack[argBase:argBase+nargs], kwnames)
-	if vm.execCtx.HasException() {
+	spAfterBind, okBind := vm.bindFunctionArgsToSliceSafe(co, defaults, kwDefaults, ag.Stack, callerStack[argBase:argBase+nargs], kwnames)
+	if !okBind || vm.execCtx.HasException() {
 		vm.releaseAsyncGenStack(ag)
 		return val.NoneVal(), false
 	}

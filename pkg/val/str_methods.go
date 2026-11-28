@@ -1247,7 +1247,7 @@ func initStrExtraMethods() {
 	})
 	set("casefold", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		s := strSelf("casefold", args)
-		return NewStringVal(strings.ReplaceAll(strings.ToLower(s), "ß", "ss"))
+		return NewStringVal(strCasefoldSpecial(s))
 	})
 
 	// Padding / alignment.
@@ -1787,6 +1787,11 @@ func strCaseTransformUTF8Tail(buf []byte, rest string, toUpper bool) Value {
 			continue
 		}
 		r, sz := utf8.DecodeRuneInString(rest[i:])
+		if next, ok := appendCaseSpecial(buf, r, toUpper); ok {
+			buf = next
+			i += sz
+			continue
+		}
 		var mapped rune
 		if toUpper {
 			mapped = unicode.ToUpper(r)
@@ -1801,6 +1806,93 @@ func strCaseTransformUTF8Tail(buf []byte, rest string, toUpper bool) Value {
 		i += sz
 	}
 	return strTranslateOwnedBytes(buf)
+}
+
+func appendCaseSpecial(buf []byte, r rune, toUpper bool) ([]byte, bool) {
+	if toUpper {
+		switch r {
+		case 0x00DF:
+			return append(buf, 'S', 'S'), true
+		case 0xFB00:
+			return append(buf, 'F', 'F'), true
+		case 0xFB01:
+			return append(buf, 'F', 'I'), true
+		case 0xFB02:
+			return append(buf, 'F', 'L'), true
+		case 0xFB03:
+			return append(buf, 'F', 'F', 'I'), true
+		case 0xFB04:
+			return append(buf, 'F', 'F', 'L'), true
+		case 0xFB05, 0xFB06:
+			return append(buf, 'S', 'T'), true
+		case 0x0149:
+			return append(buf, 0xCA, 0xBC, 'N'), true
+		case 0x01F0:
+			return append(buf, 'J', 0xCC, 0x8C), true
+		case 0x0390:
+			return append(buf, 0xCE, 0x99, 0xCC, 0x88, 0xCC, 0x81), true
+		case 0x03B0:
+			return append(buf, 0xCE, 0xA5, 0xCC, 0x88, 0xCC, 0x81), true
+		}
+		return buf, false
+	}
+	if r == 0x0130 {
+		return append(buf, 'i', 0xCC, 0x87), true
+	}
+	return buf, false
+}
+
+func strCasefoldSpecial(s string) string {
+	hasNonASCII := false
+	for i := range len(s) {
+		if s[i] >= 0x80 {
+			hasNonASCII = true
+			break
+		}
+	}
+	if !hasNonASCII {
+		return strings.ToLower(s)
+	}
+	var buf []byte
+	buf = make([]byte, 0, len(s)+8)
+	for _, r := range s {
+		switch r {
+		case 0x00DF:
+			buf = append(buf, 's', 's')
+		case 0xFB00:
+			buf = append(buf, 'f', 'f')
+		case 0xFB01:
+			buf = append(buf, 'f', 'i')
+		case 0xFB02:
+			buf = append(buf, 'f', 'l')
+		case 0xFB03:
+			buf = append(buf, 'f', 'f', 'i')
+		case 0xFB04:
+			buf = append(buf, 'f', 'f', 'l')
+		case 0xFB05, 0xFB06:
+			buf = append(buf, 's', 't')
+		case 0x0149:
+			buf = append(buf, 0xCA, 0xBC, 'n')
+		case 0x01F0:
+			buf = append(buf, 'j', 0xCC, 0x8C)
+		case 0x0390:
+			buf = append(buf, 0xCE, 0xB9, 0xCC, 0x88, 0xCC, 0x81)
+		case 0x03B0:
+			buf = append(buf, 0xCF, 0x85, 0xCC, 0x88, 0xCC, 0x81)
+		case 0x0130:
+			buf = append(buf, 'i', 0xCC, 0x87)
+		default:
+			if r < 0x80 {
+				if r >= 'A' && r <= 'Z' {
+					r += 'a' - 'A'
+				}
+				buf = append(buf, byte(r))
+			} else {
+				buf = utf8.AppendRune(buf, unicode.ToLower(r))
+			}
+		}
+	}
+	return string(buf)
 }
 
 func appendTranslatedValue(ctx *ExecContext, out []byte, mapped Value) ([]byte, bool) {

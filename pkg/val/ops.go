@@ -1356,6 +1356,12 @@ func ModCtx(ctx *ExecContext, a, b Value) Value {
 	if a.IsAnyString() {
 		return formatStringModCtx(ctx, a.AsString(), b)
 	}
+	if a.IsBytes() {
+		return formatBytesModCtx(ctx, a.AsBytes().Data, b, false)
+	}
+	if a.IsByteArray() {
+		return formatBytesModCtx(ctx, a.AsByteArray().Data, b, true)
+	}
 	if a.Kind() == KindComplex || b.Kind() == KindComplex {
 		return raiseTypeError(ctx, "can't take modulo of complex number")
 	}

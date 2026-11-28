@@ -103,7 +103,11 @@ func (vm *VM) RunCode(co *CodeObject) (res val.Value) {
 			res = val.NoneVal()
 		}
 	}()
-	return vm.runFrame(co, 0, co.NumLocals, 0, nil, vm.globals, val.NoneVal(), vm.stack, nil, nil)
+	var cells []val.Value
+	if len(co.CellVars) > 0 {
+		cells = vm.makeModuleCells(co)
+	}
+	return vm.runFrame(co, 0, co.NumLocals, 0, cells, vm.globals, val.NoneVal(), vm.stack, nil, nil)
 }
 
 // RunCodeWithGlobals executes a *CodeObject using a custom module globals dictionary.
@@ -185,12 +189,32 @@ func (vm *VM) ensureFrameCapacity(minFrames int) {
 	vm.engine.releaseFrameSlab(oldFrames)
 }
 
+func (vm *VM) makeModuleCells(co *CodeObject) []val.Value {
+	nCells := len(co.CellVars)
+	nFree := len(co.FreeVars)
+	total := nCells + nFree
+	if total == 0 {
+		return nil
+	}
+	cells := make([]val.Value, total)
+	for i := range nCells {
+		cells[i] = val.NewCellVal(val.UnboundVal())
+	}
+	for j := range nFree {
+		cells[nCells+j] = val.NewCellVal(val.UnboundVal())
+	}
+	return cells
+}
+
 func (vm *VM) runNestedCode(co *CodeObject, globals *val.PyDict, locals val.Value, cells []val.Value) val.Value {
 	extra := co.NumLocals + max(co.MaxStackSize, len(co.Code)) + 64
 	base, nextFrame := vm.nextNestedStackAndFrame(extra)
 	savedSP := vm.execCtx.SP
 	savedFrameIdx := vm.activeFrameIdx
 	vm.unhandledException = val.NoneVal()
+	if cells == nil && len(co.CellVars) > 0 {
+		cells = vm.makeModuleCells(co)
+	}
 	res := vm.runFrame(co, base, base+co.NumLocals, nextFrame, cells, globals, locals, vm.stack, nil, nil)
 	vm.execCtx.SP = savedSP
 	vm.activeFrameIdx = savedFrameIdx
@@ -471,7 +495,16 @@ func wrapImplicitClassMethods(ns *val.PyDict) {
 }
 
 // Vectorcall invokes a Python or native callable using a contiguous argument slice and optional keyword names.
-func (vm *VM) Vectorcall(callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+func (vm *VM) Vectorcall(callable val.Value, args []val.Value, kwnames []val.Value) (res val.Value) {
+	defer func() {
+		if r := recover(); r != nil {
+			if re, isRT := r.(runtime.Error); isRT {
+				panic(re)
+			}
+			vm.execCtx.Raise(panicToPyException(r))
+			res = val.NoneVal()
+		}
+	}()
 	base, _ := vm.nextNestedStackAndFrame(len(args) + 64)
 	savedStack := vm.execCtx.Stack
 	onAltStack := len(savedStack) > 0 && len(vm.stack) > 0 && &savedStack[0] != &vm.stack[0]
@@ -633,7 +666,16 @@ func (vm *VM) callSimpleFuncFromHook(ctx *val.ExecContext, co *CodeObject, fnGlo
 }
 
 // callFromHook executes a callable whose arguments are already placed on vm.stack[argBase : argBase+nargs].
-func (vm *VM) callFromHook(ctx *val.ExecContext, callable val.Value, argBase int, nargs int, kwnames []val.Value) val.Value {
+func (vm *VM) callFromHook(ctx *val.ExecContext, callable val.Value, argBase int, nargs int, kwnames []val.Value) (res val.Value) {
+	defer func() {
+		if r := recover(); r != nil {
+			if re, isRT := r.(runtime.Error); isRT {
+				panic(re)
+			}
+			ctx.Raise(panicToPyException(r))
+			res = val.NoneVal()
+		}
+	}()
 	switch callable.Kind() {
 	case val.KindBuiltinFunc:
 		savedSP := ctx.SP
@@ -682,8 +724,9 @@ func (vm *VM) callFromHook(ctx *val.ExecContext, callable val.Value, argBase int
 			}
 			spAfterBind = argBase + numLocals
 		} else {
-			spAfterBind = vm.bindFunctionArgs(co, fn.Defaults, fn.KwDefaults, ctx.Stack, argBase, nargs, kwnames)
-			if ctx.HasException() {
+			var okBind bool
+			spAfterBind, okBind = vm.bindFunctionArgsSafeWithCache(co, fn.Defaults, fn.KwDefaults, ctx.Stack, argBase, nargs, kwnames, nil, -1)
+			if !okBind || ctx.HasException() {
 				return val.NoneVal()
 			}
 		}
@@ -733,8 +776,8 @@ func (vm *VM) callFromHook(ctx *val.ExecContext, callable val.Value, argBase int
 				ctx.Stack = ensureStack(ctx.Stack, need)
 			}
 		}
-		spAfterBind := vm.bindFunctionArgs(co, nil, nil, ctx.Stack, argBase, nargs, kwnames)
-		if ctx.HasException() {
+		spAfterBind, okBind := vm.bindFunctionArgsSafeWithCache(co, nil, nil, ctx.Stack, argBase, nargs, kwnames, nil, -1)
+		if !okBind || ctx.HasException() {
 			return val.NoneVal()
 		}
 		savedSP := ctx.SP
@@ -816,12 +859,6 @@ func (vm *VM) callFromHook(ctx *val.ExecContext, callable val.Value, argBase int
 		ctx.Raise(val.NewException(val.TypeErrorType, fmt.Sprintf("'%s' object is not callable in %s (%s:%d)", callable.Type().Name, name, file, line)))
 		return val.NoneVal()
 	}
-}
-
-// bindFunctionArgs binds positional, keyword, and default arguments in-place on stack[argBase:]
-// with 0 heap allocations, returning the initial sp for the callee frame.
-func (vm *VM) bindFunctionArgs(co *CodeObject, defaults []val.Value, kwDefaults *val.PyDict, stack []val.Value, argBase int, nargs int, kwnames []val.Value) int {
-	return vm.bindFunctionArgsWithCache(co, defaults, kwDefaults, stack, argBase, nargs, kwnames, nil, -1)
 }
 
 func (vm *VM) buildSplitOrCombinedKwDict(extraKeys, extraVals []val.Value, callerCache *VMCodeCache, callerIP int) *val.PyDict {
@@ -2128,7 +2165,11 @@ func (vm *VM) instantiateGenerator(co *CodeObject, callable val.Value, defaults 
 		codeVal = callable
 	}
 	gen, genVal := vm.acquireGenerator(co.Name, codeVal, genStack, poolCls, globals, ephemeral)
-	spAfterBind := vm.bindFunctionArgsToSlice(co, defaults, kwDefaults, gen.Stack, callerStack[argBase:argBase+nargs], kwnames)
+	spAfterBind, okBind := vm.bindFunctionArgsToSliceSafe(co, defaults, kwDefaults, gen.Stack, callerStack[argBase:argBase+nargs], kwnames)
+	if !okBind || vm.execCtx.HasException() {
+		vm.releaseGeneratorStack(gen)
+		return val.NoneVal()
+	}
 	gen.SP = spAfterBind
 	if co.DirectCaptureCount > 0 && callable.IsFunction() {
 		copy(gen.Stack[co.DirectCaptureBase:], callable.AsFunction().Closure[:co.DirectCaptureCount])
@@ -2299,7 +2340,11 @@ func (vm *VM) instantiateCoroutine(co *CodeObject, callable val.Value, defaults 
 		codeVal = callable
 	}
 	coro, coroVal := vm.acquireCoroutine(co.Name, codeVal, coroStack, poolCls, globals, ephemeral)
-	spAfterBind := vm.bindFunctionArgsToSlice(co, defaults, kwDefaults, coro.Stack, callerStack[argBase:argBase+nargs], kwnames)
+	spAfterBind, okBind := vm.bindFunctionArgsToSliceSafe(co, defaults, kwDefaults, coro.Stack, callerStack[argBase:argBase+nargs], kwnames)
+	if !okBind || vm.execCtx.HasException() {
+		vm.releaseCoroutineStack(coro)
+		return val.NoneVal()
+	}
 	coro.SP = spAfterBind
 	if co.DirectCaptureCount > 0 && callable.IsFunction() {
 		copy(coro.Stack[co.DirectCaptureBase:], callable.AsFunction().Closure[:co.DirectCaptureCount])
@@ -2478,6 +2523,20 @@ func (vm *VM) bindFunctionArgsToSlice(co *CodeObject, defaults []val.Value, kwDe
 	}
 
 	return numLocals
+}
+
+func (vm *VM) bindFunctionArgsToSliceSafe(co *CodeObject, defaults []val.Value, kwDefaults *val.PyDict, dst []val.Value, src []val.Value, kwnames []val.Value) (nextSP int, ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			if re, isRT := r.(runtime.Error); isRT {
+				panic(re)
+			}
+			vm.execCtx.Raise(panicToPyException(r))
+			ok = false
+		}
+	}()
+	nextSP = vm.bindFunctionArgsToSlice(co, defaults, kwDefaults, dst, src, kwnames)
+	return nextSP, !vm.execCtx.HasException()
 }
 
 func (vm *VM) resumeGenerator(ctx *val.ExecContext, gen *val.PyGenerator, sentVal val.Value) (val.Value, val.IterStatus) {
@@ -5667,13 +5726,33 @@ func (vm *VM) setItemSafe(obj, key, v val.Value) {
 	val.SetItemCtx(&vm.execCtx, obj, key, v)
 }
 
-func (vm *VM) instantiateGeneratorSafe(co *CodeObject, callable val.Value, defaults []val.Value, kwDefaults *val.PyDict, callerStack []val.Value, argBase int, nargs int, kwnames []val.Value, globals *val.PyDict, ephemeral bool) (val.Value, bool) {
-	res := vm.instantiateGenerator(co, callable, defaults, kwDefaults, callerStack, argBase, nargs, kwnames, globals, ephemeral)
+func (vm *VM) instantiateGeneratorSafe(co *CodeObject, callable val.Value, defaults []val.Value, kwDefaults *val.PyDict, callerStack []val.Value, argBase int, nargs int, kwnames []val.Value, globals *val.PyDict, ephemeral bool) (res val.Value, ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			if re, isRT := r.(runtime.Error); isRT {
+				panic(re)
+			}
+			vm.execCtx.Raise(panicToPyException(r))
+			res = val.NoneVal()
+			ok = false
+		}
+	}()
+	res = vm.instantiateGenerator(co, callable, defaults, kwDefaults, callerStack, argBase, nargs, kwnames, globals, ephemeral)
 	return res, !vm.execCtx.HasException()
 }
 
-func (vm *VM) instantiateCoroutineSafe(co *CodeObject, callable val.Value, defaults []val.Value, kwDefaults *val.PyDict, callerStack []val.Value, argBase int, nargs int, kwnames []val.Value, globals *val.PyDict, ephemeral bool) (val.Value, bool) {
-	res := vm.instantiateCoroutine(co, callable, defaults, kwDefaults, callerStack, argBase, nargs, kwnames, globals, ephemeral)
+func (vm *VM) instantiateCoroutineSafe(co *CodeObject, callable val.Value, defaults []val.Value, kwDefaults *val.PyDict, callerStack []val.Value, argBase int, nargs int, kwnames []val.Value, globals *val.PyDict, ephemeral bool) (res val.Value, ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			if re, isRT := r.(runtime.Error); isRT {
+				panic(re)
+			}
+			vm.execCtx.Raise(panicToPyException(r))
+			res = val.NoneVal()
+			ok = false
+		}
+	}()
+	res = vm.instantiateCoroutine(co, callable, defaults, kwDefaults, callerStack, argBase, nargs, kwnames, globals, ephemeral)
 	return res, !vm.execCtx.HasException()
 }
 
@@ -5945,7 +6024,16 @@ func (vm *VM) unpackMapIntoSafe(resDict *val.PyDict, mapping val.Value) {
 	}
 }
 
-func (vm *VM) callFunctionExSafe(callable, argsVal, kwDictVal val.Value, hasKW bool) val.Value {
+func (vm *VM) callFunctionExSafe(callable, argsVal, kwDictVal val.Value, hasKW bool) (res val.Value) {
+	defer func() {
+		if r := recover(); r != nil {
+			if re, isRT := r.(runtime.Error); isRT {
+				panic(re)
+			}
+			vm.execCtx.Raise(panicToPyException(r))
+			res = val.NoneVal()
+		}
+	}()
 	var posArgs []val.Value
 	switch {
 	case argsVal.IsTuple():
