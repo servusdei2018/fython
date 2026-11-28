@@ -907,7 +907,7 @@ func isSimpleCompareDunder(dunder val.Value) (*val.PyFunction, *CodeObject, bool
 	}
 	dfn := dunder.AsFunction()
 	dcallee := AsCodeObject(dfn.Code)
-	if !dcallee.IsGenerator && !dcallee.IsCoroutine &&
+	if !dcallee.IsGenerator && !dcallee.IsCoroutine && !dcallee.IsAsyncGenerator &&
 		dcallee.SimplePositionalOnly && dcallee.PositionalParamCount == 2 && dcallee.NumParams == 2 &&
 		len(dfn.Defaults) == 0 && dfn.KwDefaults == nil &&
 		dcallee.KWOnlyArgCount == 0 && (dcallee.Flags&(CO_VARARGS|CO_VARKEYWORDS)) == 0 {

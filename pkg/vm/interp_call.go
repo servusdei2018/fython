@@ -33,7 +33,7 @@ func (vm *VM) checkPeriodicSafepoint(frameIdx int) {
 //go:noinline
 func (vm *VM) syncCalleeCode(st *loopState, callee *CodeObject, cc *VMCodeCache) {
 	st.codePtr, st.codeLen = vm.loadWindow(callee, cc)
-	if !callee.IsGenerator && !callee.IsCoroutine {
+	if !callee.IsGenerator && !callee.IsCoroutine && !callee.IsAsyncGenerator {
 		if rc := callee.regCode.Load(); rc != nil {
 			cc.installRegEntry(rc)
 			cc.tier2Done = 1
@@ -531,6 +531,21 @@ func (vm *VM) pushFuncPositional(
 		stack[retSP] = genVal
 		return retIP, retSP + 1, ctlReload, true
 	}
+	if callee.IsAsyncGenerator {
+		fnGlobals := fn.Globals
+		if fnGlobals == nil {
+			fnGlobals = st.globals
+		}
+		agVal, ok := vm.instantiateAsyncGeneratorSafe(callee, val.ObjectVal(&fn.Header), fn.Defaults, fn.KwDefaults, stack, argBase, argCount, nil, fnGlobals)
+		if !ok {
+			exc := vm.execCtx.ActiveException
+			vm.execCtx.ClearException()
+			st.raiseExc = exc
+			return ip, sp, ctlRaise, true
+		}
+		stack[retSP] = agVal
+		return retIP, retSP + 1, ctlReload, true
+	}
 	if callee.IsCoroutine {
 		isDirectAwait := isDirectAwaitCallSite(st, ip)
 		if !isDirectAwait || callee.CanSuspend {
@@ -594,7 +609,7 @@ func (vm *VM) pushTypeInitPositional(
 	}
 	initFunc := initFn.AsFunction()
 	callee := AsCodeObject(initFunc.Code)
-	if callee.IsGenerator || callee.IsCoroutine {
+	if callee.IsGenerator || callee.IsCoroutine || callee.IsAsyncGenerator {
 		return 0, 0, ctlNext, false
 	}
 	initBase := argBase
@@ -657,7 +672,7 @@ func buildKwPICEntry(
 	kwnames []val.Value,
 ) (KwPICEntry, bool) {
 	kwCount := len(kwnames)
-	if kwCount == 0 || kwCount > 8 || callee.IsGenerator || callee.IsCoroutine {
+	if kwCount == 0 || kwCount > 8 || callee.IsGenerator || callee.IsCoroutine || callee.IsAsyncGenerator {
 		return KwPICEntry{}, false
 	}
 	if !callee.ParamShapeComputed {
@@ -973,6 +988,17 @@ unwrapKw:
 			}
 			retIP = ip + 3
 		}
+		if callee.IsAsyncGenerator {
+			agVal, ok := vm.instantiateAsyncGeneratorSafe(callee, target, fn.Defaults, fn.KwDefaults, stack, newBase, totalArgs, kwnames, fnGlobals)
+			if !ok {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				st.raiseExc = exc
+				return ip, sp, ctlRaise
+			}
+			stack[retSP] = agVal
+			return ip + 1, retSP + 1, ctlReload
+		}
 		if callee.IsGenerator {
 			genVal, ok := vm.instantiateGeneratorSafe(callee, target, fn.Defaults, fn.KwDefaults, stack, newBase, totalArgs, kwnames, fnGlobals, isEphemeralGenCallSite(st, ip, retSP))
 			if !ok {
@@ -1098,6 +1124,17 @@ unwrapKw:
 			}
 			retIP = ip + 3
 		}
+		if callee.IsAsyncGenerator {
+			agVal, ok := vm.instantiateAsyncGeneratorSafe(callee, target, nil, nil, stack, newBase, totalArgs, kwnames, st.globals)
+			if !ok {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				st.raiseExc = exc
+				return ip, sp, ctlRaise
+			}
+			stack[retSP] = agVal
+			return ip + 1, retSP + 1, ctlReload
+		}
 		if callee.IsGenerator {
 			genVal, ok := vm.instantiateGeneratorSafe(callee, target, nil, nil, stack, newBase, totalArgs, kwnames, st.globals, isEphemeralGenCallSite(st, ip, retSP))
 			if !ok {
@@ -1160,7 +1197,7 @@ unwrapKw:
 				if initFn.IsFunction() {
 					initFunc := initFn.AsFunction()
 					callee := AsCodeObject(initFunc.Code)
-					if !callee.IsGenerator && !callee.IsCoroutine {
+					if !callee.IsGenerator && !callee.IsCoroutine && !callee.IsAsyncGenerator {
 						totalInitArgs := totalArgs + 1
 						initPosCount := posCount + 1
 						// Fast path: OP_CALL_KW PIC hit for class instantiation + __init__(self, ...).
@@ -1261,7 +1298,7 @@ unwrapKw:
 			if dc := target.Type().DunderCallVal(); dc.IsFunction() {
 				fn := dc.AsFunction()
 				callee := AsCodeObject(fn.Code)
-				if !callee.IsGenerator && !callee.IsCoroutine {
+				if !callee.IsGenerator && !callee.IsCoroutine && !callee.IsAsyncGenerator {
 					minCap := max(newBase+1+totalArgs+256, newBase+1+callee.NumLocals+64)
 					if minCap > len(stack) {
 						stack = vm.growStack(st, stack, minCap)
@@ -1351,7 +1388,7 @@ func (vm *VM) opCallFunctionEx(st *loopState, inst uint32, ip, sp int) (int, int
 	if target.IsFunction() {
 		fn := target.AsFunction()
 		callee := AsCodeObject(fn.Code)
-		if !callee.IsGenerator && !callee.IsCoroutine {
+		if !callee.IsGenerator && !callee.IsCoroutine && !callee.IsAsyncGenerator {
 			var posArgs []val.Value
 			argsOK := false
 			switch {
@@ -3162,6 +3199,17 @@ unwrapCall:
 			stack[retSP] = genVal
 			return ip + 1, retSP + 1, ctlReload
 		}
+		if callee.IsAsyncGenerator {
+			agVal, ok := vm.instantiateAsyncGeneratorSafe(callee, target, nil, nil, stack, newBase, argc, nil, st.globals)
+			if !ok {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				st.raiseExc = exc
+				return ip, sp, ctlRaise
+			}
+			stack[retSP] = agVal
+			return ip + 1, retSP + 1, ctlReload
+		}
 		if callee.IsCoroutine && (!isDirectAwait || callee.CanSuspend) {
 			return vm.dispatchCoroutineCall(st, callee, target, nil, nil, stack, ip, sp, newBase, retSP, argc, nil, st.globals, isDirectAwait)
 		}
@@ -3201,6 +3249,17 @@ unwrapCall:
 				return ip, sp, ctlRaise
 			}
 			stack[retSP] = genVal
+			return ip + 1, retSP + 1, ctlReload
+		}
+		if callee.IsAsyncGenerator {
+			agVal, ok := vm.instantiateAsyncGeneratorSafe(callee, target, fn.Defaults, fn.KwDefaults, stack, newBase, argc, nil, fnGlobals)
+			if !ok {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				st.raiseExc = exc
+				return ip, sp, ctlRaise
+			}
+			stack[retSP] = agVal
 			return ip + 1, retSP + 1, ctlReload
 		}
 		if callee.IsCoroutine && (!isDirectAwait || callee.CanSuspend) {
@@ -3327,7 +3386,7 @@ unwrapCall:
 			if initFn.IsFunction() {
 				initFunc := initFn.AsFunction()
 				callee := AsCodeObject(initFunc.Code)
-				if !callee.IsGenerator && !callee.IsCoroutine {
+				if !callee.IsGenerator && !callee.IsCoroutine && !callee.IsAsyncGenerator {
 					initBase := retSP
 					totalInitArgs := argc + 1
 					minCap := max(initBase+totalInitArgs+256, initBase+callee.NumLocals+64)
@@ -3391,7 +3450,7 @@ unwrapCall:
 				if newFn := tp.DunderNewVal(); newFn.IsFunction() {
 					newFunc := newFn.AsFunction()
 					callee := AsCodeObject(newFunc.Code)
-					if !callee.IsGenerator && !callee.IsCoroutine {
+					if !callee.IsGenerator && !callee.IsCoroutine && !callee.IsAsyncGenerator {
 						initBase := retSP
 						totalNewArgs := argc + 1
 						minCap := max(initBase+totalNewArgs+256, initBase+callee.NumLocals+64)
@@ -3498,7 +3557,7 @@ unwrapCall:
 			if dc := target.Type().DunderCallVal(); dc.IsFunction() {
 				fn := dc.AsFunction()
 				callee := AsCodeObject(fn.Code)
-				if !callee.IsGenerator && !callee.IsCoroutine {
+				if !callee.IsGenerator && !callee.IsCoroutine && !callee.IsAsyncGenerator {
 					minCap := max(newBase+1+argc+256, newBase+1+callee.NumLocals+64)
 					if minCap > len(stack) {
 						stack = vm.growStack(st, stack, minCap)
@@ -3714,7 +3773,7 @@ func (vm *VM) opCallMethodSlow(st *loopState, inst uint32, ip, sp int) (int, int
 		if fnGlobals == nil {
 			fnGlobals = st.globals
 		}
-		if callee == st.curCO && !callee.IsGenerator && (!callee.IsCoroutine || (isDirectAwait && !callee.CanSuspend)) && argc == callee.NumParams && len(fn.Defaults) == 0 && fn.KwDefaults == nil && callee.KWOnlyArgCount == 0 && (callee.Flags&(CO_VARARGS|CO_VARKEYWORDS)) == 0 && len(callee.CellVars) == 0 {
+		if callee == st.curCO && !callee.IsGenerator && !callee.IsAsyncGenerator && (!callee.IsCoroutine || (isDirectAwait && !callee.CanSuspend)) && argc == callee.NumParams && len(fn.Defaults) == 0 && fn.KwDefaults == nil && callee.KWOnlyArgCount == 0 && (callee.Flags&(CO_VARARGS|CO_VARKEYWORDS)) == 0 && len(callee.CellVars) == 0 {
 			if st.frameIdx+2 > len(vm.frames) {
 				vm.ensureFrameCapacity(st.frameIdx + 2)
 			}
@@ -3775,6 +3834,17 @@ func (vm *VM) opCallMethodSlow(st *loopState, inst uint32, ip, sp int) (int, int
 			stack[retSP] = genVal
 			return ip + 1, retSP + 1, ctlReload
 		}
+		if callee.IsAsyncGenerator {
+			agVal, ok := vm.instantiateAsyncGeneratorSafe(callee, callable, fn.Defaults, fn.KwDefaults, stack, newBase, totalArgs, nil, fnGlobals)
+			if !ok {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				st.raiseExc = exc
+				return ip, sp, ctlRaise
+			}
+			stack[retSP] = agVal
+			return ip + 1, retSP + 1, ctlReload
+		}
 		if callee.IsCoroutine && (!isDirectAwait || callee.CanSuspend) {
 			return vm.dispatchCoroutineCall(st, callee, callable, fn.Defaults, fn.KwDefaults, stack, ip, sp, newBase, retSP, totalArgs, nil, fnGlobals, isDirectAwait)
 		}
@@ -3820,6 +3890,17 @@ func (vm *VM) opCallMethodSlow(st *loopState, inst uint32, ip, sp int) (int, int
 				return ip, sp, ctlRaise
 			}
 			stack[retSP] = genVal
+			return ip + 1, retSP + 1, ctlReload
+		}
+		if callee.IsAsyncGenerator {
+			agVal, ok := vm.instantiateAsyncGeneratorSafe(callee, callable, nil, nil, stack, newBase, totalArgs, nil, st.globals)
+			if !ok {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				st.raiseExc = exc
+				return ip, sp, ctlRaise
+			}
+			stack[retSP] = agVal
 			return ip + 1, retSP + 1, ctlReload
 		}
 		if callee.IsCoroutine && (!isDirectAwait || callee.CanSuspend) {
@@ -5179,7 +5260,7 @@ func (vm *VM) callNativeSlow(st *loopState, target val.Value, ip, sp, newBase, r
 			case val.KindFunction:
 				fn := target.AsFunction()
 				callee := AsCodeObject(fn.Code)
-				if !callee.IsGenerator && !callee.IsCoroutine {
+				if !callee.IsGenerator && !callee.IsCoroutine && !callee.IsAsyncGenerator {
 					if rIP, rSP, rCtl, handled := vm.pushFuncPositional(st, fn, nil, stack, ip, sp, newBase, retSP, argc, ip+1); handled {
 						return rIP, rSP, rCtl
 					}

@@ -909,7 +909,7 @@ func (vm *VM) runRegLoop(st *loopState, rc *RegCode, entryFrameIdx int) (val.Val
 								if targetFn != nil {
 									callee := AsCodeObject(targetFn.Code)
 									totalArgs := argc + 1
-									if !callee.IsGenerator && !callee.IsCoroutine &&
+									if !callee.IsGenerator && !callee.IsCoroutine && !callee.IsAsyncGenerator &&
 										callee.SimplePositionalOnly && totalArgs == callee.PositionalParamCount &&
 										!callee.HasCellVars && (len(callee.FreeVars) == 0 || targetFn.Closure != nil) {
 										cc := st.cache
@@ -2124,7 +2124,7 @@ func (vm *VM) regCallPosSlow(st *loopState, rc *RegCode, rd, funcReg uint8, argc
 	if target.IsFunction() && !vm.hasTrackedViews {
 		fn := target.AsFunction()
 		callee := AsCodeObject(fn.Code)
-		if callee != nil && !callee.IsGenerator && !callee.IsCoroutine &&
+		if callee != nil && !callee.IsGenerator && !callee.IsCoroutine && !callee.IsAsyncGenerator &&
 			callee.SimplePositionalOnly && argc == callee.PositionalParamCount &&
 			len(fn.Defaults) == 0 && fn.KwDefaults == nil && !callee.HasCellVars {
 			cc := vm.fastCalleeCache(callee)
@@ -2304,7 +2304,7 @@ func (vm *VM) regCallMethodPICSlow(st *loopState, rc *RegCode, rd, recvReg uint8
 			if fn != nil {
 				callee := AsCodeObject(fn.Code)
 				totalArgs := argc + 1
-				if callee != nil && !callee.IsGenerator && !callee.IsCoroutine &&
+				if callee != nil && !callee.IsGenerator && !callee.IsCoroutine && !callee.IsAsyncGenerator &&
 					callee.SimplePositionalOnly && totalArgs == callee.PositionalParamCount &&
 					len(fn.Defaults) == 0 && fn.KwDefaults == nil && !callee.HasCellVars {
 					cc := vm.fastCalleeCache(callee)
@@ -2340,7 +2340,7 @@ func (vm *VM) regCallMethodPICSlow(st *loopState, rc *RegCode, rd, recvReg uint8
 				if argc > 0 {
 					copy(st.stack[scratchBase+1:scratchBase+1+argc], st.stack[argStart:argStart+argc])
 				}
-				if callee != nil && !callee.IsGenerator && !callee.IsCoroutine &&
+				if callee != nil && !callee.IsGenerator && !callee.IsCoroutine && !callee.IsAsyncGenerator &&
 					callee.SimplePositionalOnly && totalArgs == callee.PositionalParamCount &&
 					len(fn.Defaults) == 0 && fn.KwDefaults == nil && !callee.HasCellVars &&
 					callee.DirectCaptureCount == 0 {

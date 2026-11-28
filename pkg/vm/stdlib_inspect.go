@@ -401,9 +401,15 @@ func (e *Engine) createInspectModule() val.Value {
 		co := callableCode(args)
 		return val.BoolVal(co != nil && co.IsCoroutine && !co.IsGenerator)
 	}))
+	mod.Dict.Set(val.InternString("isasyncgen"), val.NewBuiltinFuncVal("isasyncgen", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			return val.BoolVal(false)
+		}
+		return val.BoolVal(args[0].IsAsyncGenerator())
+	}))
 	mod.Dict.Set(val.InternString("isasyncgenfunction"), val.NewBuiltinFuncVal("isasyncgenfunction", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		co := callableCode(args)
-		return val.BoolVal(co != nil && co.IsGenerator && co.IsCoroutine)
+		return val.BoolVal(co != nil && co.IsAsyncGenerator)
 	}))
 
 	// getattr_static(obj, attr, default=_sentinel)

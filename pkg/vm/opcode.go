@@ -236,6 +236,8 @@ const (
 	OP_COMPARE_FAST_FAST
 	OP_CALL_FAST_ATTR_DESCR
 	OP_ENTER_REG
+	OP_GET_AITER
+	OP_GET_ANEXT
 )
 
 // Comparison operation codes for OP_COMPARE_OP (passed in ArgA field).
@@ -598,6 +600,10 @@ func (op Opcode) String() string {
 		return "OP_CALL_FAST_ATTR_DESCR"
 	case OP_ENTER_REG:
 		return "OP_ENTER_REG"
+	case OP_GET_AITER:
+		return "OP_GET_AITER"
+	case OP_GET_ANEXT:
+		return "OP_GET_ANEXT"
 	default:
 		return "OP_UNKNOWN"
 	}

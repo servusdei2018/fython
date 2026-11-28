@@ -699,6 +699,10 @@ func (vm *VM) dispatchColdOpcode(st *loopState, op Opcode, inst uint32, ip, sp i
 		return vm.opGetAwaitable(st, ip, sp)
 	case OP_AWAIT:
 		return vm.opAwait(st, ip, sp)
+	case OP_GET_AITER:
+		return vm.opGetAIter(st, ip, sp)
+	case OP_GET_ANEXT:
+		return vm.opGetANext(st, ip, sp)
 	case OP_CHECK_EXC_MATCH:
 		return vm.opCheckExcMatch(st, ip, sp)
 	case OP_CLEANUP_EXC:

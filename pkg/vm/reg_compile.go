@@ -245,7 +245,7 @@ func compileRegCode(co *CodeObject) *RegCode {
 	if co == nil || len(co.Code) == 0 || len(co.Code) > 65535 {
 		return nil
 	}
-	if co.IsGenerator || co.IsCoroutine || co.CanSuspend ||
+	if co.IsGenerator || co.IsCoroutine || co.IsAsyncGenerator || co.CanSuspend ||
 		(co.Flags&(CO_GENERATOR|CO_COROUTINE|CO_ASYNC_GENERATOR)) != 0 {
 		return nil
 	}
@@ -322,7 +322,7 @@ func compileRegCode(co *CodeObject) *RegCode {
 				co.Consts[DecodeArgBx(inst)].AsString() == "super" {
 				return nil
 			}
-		case OP_YIELD_VALUE, OP_YIELD_FROM, OP_AWAIT, OP_GET_AWAITABLE,
+		case OP_YIELD_VALUE, OP_YIELD_FROM, OP_AWAIT, OP_GET_AWAITABLE, OP_GET_AITER, OP_GET_ANEXT,
 			OP_LOAD_NAME, OP_STORE_NAME, OP_DELETE_NAME, OP_LOAD_LOCALS,
 			OP_LOAD_FROM_DICT_OR_GLOBALS, OP_LOAD_FROM_DICT_OR_DEREF,
 			OP_BUILD_TEMPLATE, OP_PRINT_EXPR, OP_STORE_FAST_VIEW:

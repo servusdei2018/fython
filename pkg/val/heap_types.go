@@ -484,6 +484,84 @@ type PyCoroutine struct {
 	OwnCells    bool
 }
 
+// AsyncGenState classifies the lifecycle state of a PyAsyncGenerator.
+type AsyncGenState uint8
+
+const (
+	AsyncGenCreated AsyncGenState = iota
+	AsyncGenRunning
+	AsyncGenSuspended
+	AsyncGenClosed
+)
+
+// AsyncGenStepResult classifies the outcome of a single step of PyAsyncGenerator.
+type AsyncGenStepResult uint8
+
+const (
+	AsyncGenStepYielded AsyncGenStepResult = iota // Suspended at OP_YIELD_VALUE
+	AsyncGenStepAwait                             // Suspended at inner OP_AWAIT
+	AsyncGenStepDone                              // Returned normally / exhausted
+	AsyncGenStepError                             // Unhandled exception raised
+)
+
+// AsyncGenAwaitState classifies the lifecycle state of PyAsyncGenASend / PyAsyncGenAThrow.
+type AsyncGenAwaitState uint8
+
+const (
+	AsyncGenAwaitInit AsyncGenAwaitState = iota
+	AsyncGenAwaitIter
+	AsyncGenAwaitClosed
+)
+
+// PyAsyncGenerator represents a frame-detaching PEP 525 Python async generator on the heap.
+// Header MUST be at offset 0. Pointer-bearing fields precede the scalar tail.
+type PyAsyncGenerator struct {
+	Header           ObjectHeader
+	Name             string
+	QualName         string
+	Code             Value
+	Globals          *PyDict
+	AgAwait          Value
+	YieldVal         Value
+	LastSent         Value
+	ActiveAwaitable  Value
+	StepHook         func(ctx *ExecContext, ag *PyAsyncGenerator, awaitable Value, sent Value, thrown Value, isClose bool) (Value, AsyncGenStepResult)
+	ReleaseHook      func(ag *PyAsyncGenerator)
+	Stack            []Value
+	Cells            []Value
+	CellPtrs         []*PyCell
+	SP               int
+	Base             int
+	IP               int
+	MaxSP            int
+	State            AsyncGenState
+	PoolClass        uint8
+	Running          bool
+	SuspendedOnAwait bool
+	OwnCells         bool
+}
+
+// PyAsyncGenASend is the native awaitable returned by async_generator.asend() and __anext__().
+// Header MUST be at offset 0.
+type PyAsyncGenASend struct {
+	Header  ObjectHeader
+	Ag      *PyAsyncGenerator
+	SentVal Value
+	State   AsyncGenAwaitState
+}
+
+// PyAsyncGenAThrow is the native awaitable returned by async_generator.athrow() and aclose().
+// Header MUST be at offset 0.
+type PyAsyncGenAThrow struct {
+	Header  ObjectHeader
+	Ag      *PyAsyncGenerator
+	ExcType Value
+	ExcVal  Value
+	ExcTB   Value
+	State   AsyncGenAwaitState
+	IsClose bool
+}
+
 // FutureState classifies the lifecycle state of a PyFuture.
 type FutureState uint8
 
@@ -559,6 +637,9 @@ var (
 	_ [0 - unsafe.Offsetof(PyIter{}.Header)]byte
 	_ [0 - unsafe.Offsetof(PyGenerator{}.Header)]byte
 	_ [0 - unsafe.Offsetof(PyCoroutine{}.Header)]byte
+	_ [0 - unsafe.Offsetof(PyAsyncGenerator{}.Header)]byte
+	_ [0 - unsafe.Offsetof(PyAsyncGenASend{}.Header)]byte
+	_ [0 - unsafe.Offsetof(PyAsyncGenAThrow{}.Header)]byte
 	_ [0 - unsafe.Offsetof(PyFuture{}.Header)]byte
 	_ [0 - unsafe.Offsetof(PyTask{}.Header)]byte
 	_ [0 - unsafe.Offsetof(PyChan{}.Header)]byte
@@ -2341,6 +2422,245 @@ func (c *PyCoroutine) Close(ctx *ExecContext) {
 	c.State = CoroClosed
 	if c.ReleaseHook != nil && c.Stack != nil {
 		c.ReleaseHook(c)
+	}
+}
+
+// AsAsyncGenerator performs a zero-cost offset-0 downcast from Value to *PyAsyncGenerator.
+func (v Value) AsAsyncGenerator() *PyAsyncGenerator {
+	return (*PyAsyncGenerator)(unsafe.Pointer(v.ptr))
+}
+
+// IsAsyncGenASend reports whether v is a PyAsyncGenASend awaitable.
+func IsAsyncGenASend(v Value) bool {
+	return AsyncGenASendType != nil && v.ptr != nil && v.ptr.Type == AsyncGenASendType
+}
+
+// AsAsyncGenASend performs a zero-cost offset-0 downcast from Value to *PyAsyncGenASend.
+func AsAsyncGenASend(v Value) *PyAsyncGenASend {
+	return (*PyAsyncGenASend)(unsafe.Pointer(v.ptr))
+}
+
+// IsAsyncGenAThrow reports whether v is a PyAsyncGenAThrow awaitable.
+func IsAsyncGenAThrow(v Value) bool {
+	return AsyncGenAThrowType != nil && v.ptr != nil && v.ptr.Type == AsyncGenAThrowType
+}
+
+// AsAsyncGenAThrow performs a zero-cost offset-0 downcast from Value to *PyAsyncGenAThrow.
+func AsAsyncGenAThrow(v Value) *PyAsyncGenAThrow {
+	return (*PyAsyncGenAThrow)(unsafe.Pointer(v.ptr))
+}
+
+// NewAsyncGeneratorWithStack constructs a KindAsyncGenerator Value wrapping an existing stack slice.
+func NewAsyncGeneratorWithStack(name, qualName string, code Value, stack []Value, poolClass uint8, cells []Value, globals *PyDict) Value {
+	ag := &PyAsyncGenerator{
+		Header:    ObjectHeader{Kind: KindAsyncGenerator, Type: AsyncGeneratorType},
+		Name:      name,
+		QualName:  qualName,
+		Code:      code,
+		Globals:   globals,
+		AgAwait:   NoneVal(),
+		YieldVal:  NoneVal(),
+		LastSent:  NoneVal(),
+		Stack:     stack,
+		Cells:     cells,
+		PoolClass: poolClass,
+		State:     AsyncGenCreated,
+	}
+	return Value{num: 0, ptr: &ag.Header}
+}
+
+// NewAsyncGenASendVal constructs a PyAsyncGenASend awaitable without performing any state checks.
+func NewAsyncGenASendVal(ag *PyAsyncGenerator, sentVal Value) Value {
+	aw := &PyAsyncGenASend{
+		Header:  ObjectHeader{Kind: KindNative, Type: AsyncGenASendType},
+		Ag:      ag,
+		SentVal: sentVal,
+		State:   AsyncGenAwaitInit,
+	}
+	return Value{num: 0, ptr: &aw.Header}
+}
+
+// NewAsyncGenAThrowVal constructs a PyAsyncGenAThrow awaitable without performing any state checks.
+func NewAsyncGenAThrowVal(ag *PyAsyncGenerator, excType, excVal, excTB Value, isClose bool) Value {
+	aw := &PyAsyncGenAThrow{
+		Header:  ObjectHeader{Kind: KindNative, Type: AsyncGenAThrowType},
+		Ag:      ag,
+		ExcType: excType,
+		ExcVal:  excVal,
+		ExcTB:   excTB,
+		State:   AsyncGenAwaitInit,
+		IsClose: isClose,
+	}
+	return Value{num: 0, ptr: &aw.Header}
+}
+
+func normalizeAsyncGenThrowExc(ctx *ExecContext, excType, excVal, excTB Value) Value {
+	exc := excType
+	if exc.IsType() {
+		tp := exc.AsType()
+		if !IsSubclass(tp, BaseExceptionType) {
+			ctx.Raise(NewTypeError("exceptions must be classes deriving BaseException or instances of such a class"))
+			return NoneVal()
+		}
+		if !excVal.IsNone() && excVal.HeaderPtr() != nil {
+			switch {
+			case IsInstance(excVal, tp):
+				exc = excVal
+			case excVal.IsTuple():
+				exc = ctx.Call(exc, excVal.AsTuple().Items, nil)
+				if ctx.HasException() {
+					return NoneVal()
+				}
+			default:
+				exc = ctx.Invoke1(exc, excVal)
+				if ctx.HasException() {
+					return NoneVal()
+				}
+			}
+		} else {
+			exc = NewInstanceOfType(tp)
+		}
+	} else {
+		if !IsInstance(exc, BaseExceptionType) {
+			ctx.Raise(NewTypeError("exceptions must be classes deriving BaseException or instances of such a class"))
+			return NoneVal()
+		}
+		if !excVal.IsNone() && excVal.HeaderPtr() != nil {
+			ctx.Raise(NewTypeError("instance exception may not have a separate value"))
+			return NoneVal()
+		}
+	}
+	if !excTB.IsNone() && excTB.HeaderPtr() != nil && exc.IsInstance() {
+		exc.AsInstance().SetAttr(strTraceback, excTB)
+	}
+	return exc
+}
+
+// Step advances PyAsyncGenASend by one step (send or throw).
+func (aw *PyAsyncGenASend) Step(ctx *ExecContext, sendVal Value, thrown Value) (Value, IterStatus) {
+	if aw.State == AsyncGenAwaitClosed {
+		ctx.Raise(NewRuntimeError("cannot reuse already awaited asend()"))
+		return NoneVal(), IterError
+	}
+	ag := aw.Ag
+	var sent Value
+	if aw.State == AsyncGenAwaitInit {
+		if !thrown.IsNone() && thrown.HeaderPtr() != nil {
+			aw.State = AsyncGenAwaitClosed
+			ctx.Raise(thrown)
+			return NoneVal(), IterError
+		}
+		sent = aw.SentVal
+	} else {
+		sent = sendVal
+	}
+	if ag == nil || ag.StepHook == nil {
+		aw.State = AsyncGenAwaitClosed
+		ctx.Raise(NewException(StopAsyncIterationType, ""))
+		return NoneVal(), IterError
+	}
+	res, stepRes := ag.StepHook(ctx, ag, Value{ptr: &aw.Header}, sent, thrown, false)
+	switch stepRes {
+	case AsyncGenStepYielded:
+		aw.State = AsyncGenAwaitClosed
+		return res, IterExhausted
+	case AsyncGenStepAwait:
+		aw.State = AsyncGenAwaitIter
+		return res, IterYielded
+	case AsyncGenStepDone:
+		aw.State = AsyncGenAwaitClosed
+		ctx.Raise(NewException(StopAsyncIterationType, ""))
+		return NoneVal(), IterError
+	default:
+		aw.State = AsyncGenAwaitClosed
+		return NoneVal(), IterError
+	}
+}
+
+// Close closes this PyAsyncGenASend awaitable.
+func (aw *PyAsyncGenASend) Close() {
+	if aw.State != AsyncGenAwaitClosed {
+		aw.State = AsyncGenAwaitClosed
+		if aw.Ag != nil && aw.Ag.ActiveAwaitable.HeaderPtr() == &aw.Header {
+			aw.Ag.Running = false
+			aw.Ag.ActiveAwaitable = Value{}
+			aw.Ag.AgAwait = NoneVal()
+		}
+	}
+}
+
+// Step advances PyAsyncGenAThrow (athrow or aclose) by one step.
+func (aw *PyAsyncGenAThrow) Step(ctx *ExecContext, sendVal Value, thrown Value) (Value, IterStatus) {
+	if aw.State == AsyncGenAwaitClosed {
+		if aw.IsClose {
+			ctx.Raise(NewRuntimeError("cannot reuse already awaited aclose()"))
+		} else {
+			ctx.Raise(NewRuntimeError("cannot reuse already awaited athrow()"))
+		}
+		return NoneVal(), IterError
+	}
+	ag := aw.Ag
+	var sent Value
+	if aw.State == AsyncGenAwaitInit {
+		if !thrown.IsNone() && thrown.HeaderPtr() != nil {
+			aw.State = AsyncGenAwaitClosed
+			ctx.Raise(thrown)
+			return NoneVal(), IterError
+		}
+		if !aw.IsClose {
+			exc := normalizeAsyncGenThrowExc(ctx, aw.ExcType, aw.ExcVal, aw.ExcTB)
+			if ctx != nil && ctx.HasException() {
+				aw.State = AsyncGenAwaitClosed
+				return NoneVal(), IterError
+			}
+			thrown = exc
+		}
+		sent = NoneVal()
+	} else {
+		sent = sendVal
+	}
+	if ag == nil || ag.StepHook == nil {
+		aw.State = AsyncGenAwaitClosed
+		if aw.IsClose {
+			return NoneVal(), IterExhausted
+		}
+		ctx.Raise(NewException(StopAsyncIterationType, ""))
+		return NoneVal(), IterError
+	}
+	res, stepRes := ag.StepHook(ctx, ag, Value{ptr: &aw.Header}, sent, thrown, aw.IsClose)
+	switch stepRes {
+	case AsyncGenStepYielded:
+		aw.State = AsyncGenAwaitClosed
+		if aw.IsClose {
+			ctx.Raise(NewRuntimeError("async generator ignored GeneratorExit"))
+			return NoneVal(), IterError
+		}
+		return res, IterExhausted
+	case AsyncGenStepAwait:
+		aw.State = AsyncGenAwaitIter
+		return res, IterYielded
+	case AsyncGenStepDone:
+		aw.State = AsyncGenAwaitClosed
+		if aw.IsClose {
+			return NoneVal(), IterExhausted
+		}
+		ctx.Raise(NewException(StopAsyncIterationType, ""))
+		return NoneVal(), IterError
+	default:
+		aw.State = AsyncGenAwaitClosed
+		return NoneVal(), IterError
+	}
+}
+
+// Close closes this PyAsyncGenAThrow awaitable.
+func (aw *PyAsyncGenAThrow) Close() {
+	if aw.State != AsyncGenAwaitClosed {
+		aw.State = AsyncGenAwaitClosed
+		if aw.Ag != nil && aw.Ag.ActiveAwaitable.HeaderPtr() == &aw.Header {
+			aw.Ag.Running = false
+			aw.Ag.ActiveAwaitable = Value{}
+			aw.Ag.AgAwait = NoneVal()
+		}
 	}
 }
 

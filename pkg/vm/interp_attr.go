@@ -46,7 +46,7 @@ func (vm *VM) dispatchPropertyGet(st *loopState, fget val.Value, cc *VMCodeCache
 	if fget.IsFunction() {
 		fgetFn := fget.AsFunction()
 		callee := AsCodeObject(fgetFn.Code)
-		if !callee.IsGenerator && !callee.IsCoroutine {
+		if !callee.IsGenerator && !callee.IsCoroutine && !callee.IsAsyncGenerator {
 			newBase := sp - 1
 			retSP := sp - 1
 			minCap := max(newBase+256, newBase+callee.NumLocals+64)
@@ -89,7 +89,7 @@ func (vm *VM) cacheForPropertyFGet(fget val.Value) *VMCodeCache {
 		return nil
 	}
 	callee := AsCodeObject(fget.AsFunction().Code)
-	if callee == nil || callee.IsGenerator || callee.IsCoroutine {
+	if callee == nil || callee.IsGenerator || callee.IsCoroutine || callee.IsAsyncGenerator {
 		return nil
 	}
 	cc := vm.cacheFor(callee)

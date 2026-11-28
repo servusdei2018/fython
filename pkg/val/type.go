@@ -561,6 +561,9 @@ var (
 	RangeType             *PyType
 	GeneratorType         *PyType
 	CoroutineType         *PyType
+	AsyncGeneratorType    *PyType
+	AsyncGenASendType     *PyType
+	AsyncGenAThrowType    *PyType
 	FutureType            *PyType
 	TaskType              *PyType
 	ChanType              *PyType

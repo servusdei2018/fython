@@ -390,6 +390,56 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		return val.RaiseTypeError(ctx, "'"+it.Type().Name+"' object is not an iterator")
 	}))
 
+	// aiter(async_iterable)
+	d.Set(val.InternString("aiter"), val.NewBuiltinFuncVal("aiter", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) != 1 {
+			return val.RaiseTypeError(ctx, fmt.Sprintf("aiter() takes exactly one argument (%d given)", len(args)))
+		}
+		obj := args[0]
+		tp := obj.Type()
+		fn, _, ok := tp.LookupMRO(nameAIter)
+		if !ok || fn.IsNone() || fn.HeaderPtr() == nil {
+			return val.RaiseTypeError(ctx, "'"+tp.Name+"' object is not an async iterable")
+		}
+		return ctx.Invoke1(fn, obj)
+	}))
+
+	// anext(async_iterator[, default])
+	d.Set(val.InternString("anext"), val.NewBuiltinFuncVal("anext", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			return val.RaiseTypeError(ctx, "anext expected at least 1 argument, got 0")
+		}
+		if len(args) > 2 {
+			return val.RaiseTypeError(ctx, fmt.Sprintf("anext expected at most 2 arguments, got %d", len(args)))
+		}
+		it := args[0]
+		tp := it.Type()
+		fn, _, ok := tp.LookupMRO(nameANext)
+		if !ok || fn.IsNone() || fn.HeaderPtr() == nil {
+			return val.RaiseTypeError(ctx, "'"+tp.Name+"' object is not an async iterator")
+		}
+		aw := ctx.Invoke1(fn, it)
+		if ctx != nil && ctx.HasException() {
+			return val.NoneVal()
+		}
+		if len(args) == 1 {
+			return aw
+		}
+		// Convert custom __await__ objects to their iterator for _anext_awaitable.
+		if !aw.IsCoroutine() && !aw.IsFuture() && !aw.IsTask() && !val.IsAsyncGenASend(aw) && !val.IsAsyncGenAThrow(aw) {
+			awTp := aw.Type()
+			if awFn, _, hasAwait := awTp.LookupMRO(nameAwait); hasAwait && !awFn.IsNone() && awFn.HeaderPtr() != nil {
+				aw = ctx.Invoke1(awFn, aw)
+				if ctx != nil && ctx.HasException() {
+					return val.NoneVal()
+				}
+			} else if awTp.Slots.TpIterNext == nil {
+				return val.RaiseTypeError(ctx, "'anext' received an invalid object from __anext__: "+awTp.Name)
+			}
+		}
+		return newANextAwaitableVal(aw, args[1])
+	}))
+
 	// hasattr, getattr, setattr, delattr
 	d.Set(val.InternString("getattr"), val.NewBuiltinFuncVal("getattr", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 2 {

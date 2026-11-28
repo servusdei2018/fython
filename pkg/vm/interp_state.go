@@ -41,11 +41,12 @@ type loopState struct {
 	periodicTick  uint32
 
 	// Entry/exit handoff and helper channels.
-	ip            int
-	sp            int
-	result        val.Value
-	raiseExc      val.Value
-	delegatedRoot *val.PyGenerator
+	ip             int
+	sp             int
+	result         val.Value
+	raiseExc       val.Value
+	delegatedRoot  *val.PyGenerator
+	activeAsyncGen *val.PyAsyncGenerator
 }
 
 // Compile-time check that val.Value is 16 bytes for indexed stackPtr/constsPtr loads.
@@ -88,6 +89,8 @@ func (st *loopState) syncStackFromVM(vm *VM, curStack []val.Value) []val.Value {
 			st.activeGen.Stack = s
 		case st.activeCoro != nil:
 			st.activeCoro.Stack = s
+		case st.activeAsyncGen != nil:
+			st.activeAsyncGen.Stack = s
 		}
 		return s
 	}
@@ -111,6 +114,8 @@ func (st *loopState) syncStackFromExecCtx(vm *VM, curStack []val.Value) []val.Va
 			st.activeGen.Stack = s
 		case st.activeCoro != nil:
 			st.activeCoro.Stack = s
+		case st.activeAsyncGen != nil:
+			st.activeAsyncGen.Stack = s
 		case st.stackIsVM:
 			vm.stack = s
 		}

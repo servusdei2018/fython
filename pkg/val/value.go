@@ -61,6 +61,7 @@ const (
 	KindNative         // Heap-allocated native Go object with custom struct
 	KindComplex        // Heap-allocated complex number (*PyComplex)
 	KindLazyImport     // Heap-allocated lazy import placeholder (*PyLazyImport)
+	KindAsyncGenerator // Heap-allocated detached async generator frame (*PyAsyncGenerator)
 )
 
 // ObjectHeader Flags bitmask constants.
@@ -516,6 +517,11 @@ func (v Value) IsGenerator() bool {
 // IsCoroutine reports whether v is a heap-allocated PyCoroutine.
 func (v Value) IsCoroutine() bool {
 	return v.ptr != nil && v.ptr.Kind == KindCoroutine
+}
+
+// IsAsyncGenerator reports whether v is a heap-allocated PyAsyncGenerator.
+func (v Value) IsAsyncGenerator() bool {
+	return v.ptr != nil && v.ptr.Kind == KindAsyncGenerator
 }
 
 // IsFuture reports whether v is a heap-allocated PyFuture.
@@ -1438,6 +1444,8 @@ func (v Value) String() string {
 		return fmt.Sprintf("<generator object %s at %p>", v.AsGenerator().Name, v.ptr)
 	case KindCoroutine:
 		return fmt.Sprintf("<coroutine object %s at %p>", v.AsCoroutine().Name, v.ptr)
+	case KindAsyncGenerator:
+		return fmt.Sprintf("<async_generator object %s at %p>", v.AsAsyncGenerator().Name, v.ptr)
 	case KindFuture:
 		return fmt.Sprintf("<Future at %p>", v.ptr)
 	case KindTask:

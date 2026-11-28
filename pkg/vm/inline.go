@@ -30,7 +30,7 @@ func detectTrivial1SlotProperty(callee *CodeObject, fused []uint32, start, end i
 	if !callee.SimplePositionalOnly || callee.NumParams != 1 {
 		return 0, false
 	}
-	if callee.IsGenerator || callee.IsCoroutine || callee.CanSuspend || len(callee.ExceptionTable) != 0 {
+	if callee.IsGenerator || callee.IsCoroutine || callee.IsAsyncGenerator || callee.CanSuspend || len(callee.ExceptionTable) != 0 {
 		return 0, false
 	}
 	if start < 0 || start >= end || end > len(fused) {
@@ -95,7 +95,7 @@ func analyzeInlineCallee(callee *CodeObject) uint64 {
 			}
 		}
 	}
-	if callee.IsGenerator || callee.IsCoroutine || callee.CanSuspend {
+	if callee.IsGenerator || callee.IsCoroutine || callee.IsAsyncGenerator || callee.CanSuspend {
 		return reject()
 	}
 	if len(callee.ExceptionTable) != 0 {
@@ -155,7 +155,7 @@ func analyzeInlineCallee(callee *CodeObject) uint64 {
 			OP_STORE_GLOBAL, OP_DELETE_GLOBAL,
 			OP_LOAD_NAME, OP_STORE_NAME, OP_DELETE_NAME:
 			flags |= inlineMetaHasGlobals
-		case OP_YIELD_VALUE, OP_YIELD_FROM, OP_GET_AWAITABLE, OP_AWAIT,
+		case OP_YIELD_VALUE, OP_YIELD_FROM, OP_GET_AWAITABLE, OP_AWAIT, OP_GET_AITER, OP_GET_ANEXT,
 			OP_SETUP_RANGE, OP_FOR_ITER, OP_FOR_ITER_RANGE, OP_FOR_ITER_GEN,
 			OP_LOAD_CLOSURE, OP_MAKE_FUNCTION,
 			OP_FAST_LOOP_CMP_LT_CONST_JUMP,

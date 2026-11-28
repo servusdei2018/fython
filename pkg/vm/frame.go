@@ -234,23 +234,24 @@ const frameFlagSlowReturn = frameFlagHasAux | frameFlagCmp | frameFlagGenOrCoro
 // frameAux holds cold CallFrame state in VM.frameAux (lazily allocated side slice
 // indexed by frameIdx) so the hot CallFrame slab stays 64 bytes per entry.
 type frameAux struct {
-	cells         []val.Value
-	cellPtrs      []*val.PyCell
-	locals        val.Value
-	shadowFrame   *val.PyFrame
-	stack         []val.Value
-	activeGen     *val.PyGenerator
-	delegatedRoot *val.PyGenerator
-	activeCoro    *val.PyCoroutine
-	genFrameIdx   int
-	genMode       uint8
-	genDefault    val.Value
-	genExitIP     int
-	joinState     *strJoinState
-	collectState  *collectState
-	cmpLeft       val.Value
-	cmpRight      val.Value
-	cmpOp         uint8
+	cells          []val.Value
+	cellPtrs       []*val.PyCell
+	locals         val.Value
+	shadowFrame    *val.PyFrame
+	stack          []val.Value
+	activeGen      *val.PyGenerator
+	delegatedRoot  *val.PyGenerator
+	activeCoro     *val.PyCoroutine
+	activeAsyncGen *val.PyAsyncGenerator
+	genFrameIdx    int
+	genMode        uint8
+	genDefault     val.Value
+	genExitIP      int
+	joinState      *strJoinState
+	collectState   *collectState
+	cmpLeft        val.Value
+	cmpRight       val.Value
+	cmpOp          uint8
 }
 
 // CallFrame is an unboxed 64-byte (single cache line) hot value struct stored in
@@ -333,6 +334,7 @@ type CodeObject struct {
 	MaxStackSize       int
 	IsGenerator        bool
 	IsCoroutine        bool
+	IsAsyncGenerator   bool
 	CanSuspend         bool
 	Flags              uint32
 	ExceptionTable     []ExceptionEntry
@@ -960,7 +962,7 @@ func (co *CodeObject) Init() *CodeObject {
 	co.computeParamShape()
 	co.computeEntryIP()
 	co.initStream()
-	if len(co.Code) < 4 || co.IsGenerator || co.IsCoroutine {
+	if len(co.Code) < 4 || co.IsGenerator || co.IsCoroutine || co.IsAsyncGenerator {
 		co.IsTier2Optimized = 1
 	}
 	return co
@@ -2238,7 +2240,7 @@ func (co *CodeObject) computeParamShape() {
 		posCount = 0
 	}
 	co.PosParamCount = posCount
-	co.SimplePositionalOnly = simple && co.PositionalParamCount == len(co.ParamNames)
+	co.SimplePositionalOnly = simple && co.PositionalParamCount == len(co.ParamNames) && !co.IsAsyncGenerator
 	co.EffectiveLocals = max(co.NumLocals, co.NumParams)
 	co.FrameStackNeed = max(256, co.NumLocals+64)
 	co.HasCellVars = len(co.CellVars) > 0
@@ -2273,7 +2275,7 @@ func (co *CodeObject) isMatchLocalSafe(r int) bool {
 // Used to safely recycle loop-carried ephemeral pyMatch objects on overwrite.
 func computeLocalMatchSafe(co *CodeObject) [4]uint64 {
 	var mask [4]uint64
-	if co.IsGenerator || co.IsCoroutine || co.HasCells || len(co.Code) == 0 || co.NumLocals <= 0 {
+	if co.IsGenerator || co.IsCoroutine || co.IsAsyncGenerator || co.HasCells || len(co.Code) == 0 || co.NumLocals <= 0 {
 		return mask
 	}
 	n := len(co.Code)
@@ -2415,7 +2417,7 @@ func isSafeScalarKeyConst(v val.Value) bool {
 }
 
 func computeVarKWSafe(co *CodeObject) bool {
-	if co.VarKWIdx < 0 || co.VarKWIdx >= 256 || co.IsGenerator || co.IsCoroutine || co.HasCells || len(co.Code) == 0 {
+	if co.VarKWIdx < 0 || co.VarKWIdx >= 256 || co.IsGenerator || co.IsCoroutine || co.IsAsyncGenerator || co.HasCells || len(co.Code) == 0 {
 		return false
 	}
 	n := len(co.Code)
@@ -2555,7 +2557,7 @@ func computeVarKWSafe(co *CodeObject) bool {
 // already return pooled dicts to the freelist, so no new release sites are
 // needed; early exits simply leave the flagged dict for collection.
 func computeLocalDictSafe(co *CodeObject) []bool {
-	if co.IsGenerator || co.IsCoroutine || co.HasCells || len(co.Code) == 0 {
+	if co.IsGenerator || co.IsCoroutine || co.IsAsyncGenerator || co.HasCells || len(co.Code) == 0 {
 		return nil
 	}
 	n := len(co.Code)

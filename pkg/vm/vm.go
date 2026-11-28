@@ -655,6 +655,9 @@ func (vm *VM) callFromHook(ctx *val.ExecContext, callable val.Value, argBase int
 		if co.IsCoroutine {
 			return vm.instantiateCoroutine(co, callable, fn.Defaults, fn.KwDefaults, ctx.Stack, argBase, nargs, kwnames, fnGlobals, false)
 		}
+		if co.IsAsyncGenerator {
+			return vm.instantiateAsyncGenerator(co, callable, fn.Defaults, fn.KwDefaults, ctx.Stack, argBase, nargs, kwnames, fnGlobals)
+		}
 		if len(kwnames) == 0 && co.SimplePositionalOnly && co.KWOnlyArgCount == 0 &&
 			!co.IsGenerator && !co.IsCoroutine && !co.HasCells &&
 			nargs == co.PositionalParamCount && len(fn.Defaults) == 0 && fn.KwDefaults == nil {
@@ -717,6 +720,9 @@ func (vm *VM) callFromHook(ctx *val.ExecContext, callable val.Value, argBase int
 		}
 		if co.IsCoroutine {
 			return vm.instantiateCoroutine(co, callable, nil, nil, ctx.Stack, argBase, nargs, kwnames, vm.globals, false)
+		}
+		if co.IsAsyncGenerator {
+			return vm.instantiateAsyncGenerator(co, callable, nil, nil, ctx.Stack, argBase, nargs, kwnames, vm.globals)
 		}
 		need := argBase + co.NumLocals + co.MaxStackSize + 256
 		if need > len(ctx.Stack) {
@@ -3224,6 +3230,12 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 			finishedCoro.State = val.CoroClosed
 			vm.releaseCoroutineStack(finishedCoro)
 		}
+		if st.activeAsyncGen != nil && st.frameIdx == st.genFrameIdx {
+			st.activeAsyncGen.State = val.AsyncGenClosed
+			st.activeAsyncGen.AgAwait = val.NoneVal()
+			st.activeAsyncGen.SuspendedOnAwait = false
+			vm.releaseAsyncGenStack(st.activeAsyncGen)
+		}
 
 		if st.frameIdx > st.startFrameIdx {
 			if (vm.frames[st.frameIdx].flags & frameFlagHasShadow) != 0 {
@@ -3271,6 +3283,7 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 					st.activeGen = aux.activeGen
 					st.delegatedRoot = aux.delegatedRoot
 					st.activeCoro = aux.activeCoro
+					st.activeAsyncGen = aux.activeAsyncGen
 					st.genFrameIdx = aux.genFrameIdx
 					aux.genMode = genModeNone
 					aux.genDefault = val.Value{}
@@ -3278,6 +3291,7 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 					aux.activeGen = nil
 					aux.delegatedRoot = nil
 					aux.activeCoro = nil
+					aux.activeAsyncGen = nil
 					if aux.joinState != nil {
 						vm.releaseStrJoinState(aux.joinState)
 						aux.joinState = nil
@@ -3423,6 +3437,12 @@ func (vm *VM) unwind(st *loopState, ip int) (int, int, loopCtl) {
 		if st.activeCoro != nil {
 			st.activeCoro.State = val.CoroClosed
 			vm.releaseCoroutineStack(st.activeCoro)
+		}
+		if st.activeAsyncGen != nil {
+			st.activeAsyncGen.State = val.AsyncGenClosed
+			st.activeAsyncGen.AgAwait = val.NoneVal()
+			st.activeAsyncGen.SuspendedOnAwait = false
+			vm.releaseAsyncGenStack(st.activeAsyncGen)
 		}
 		st.result = val.NoneVal()
 		return 0, 0, ctlExit
@@ -3658,7 +3678,7 @@ func (vm *VM) runFrame(co *CodeObject, startBase int, startSP int, startFrameIdx
 	st.consts = st.cache.frameConsts(co)
 	vm.activeState = st
 
-	if st.cache.tier2Done == 0 && !co.IsGenerator && !co.IsCoroutine {
+	if st.cache.tier2Done == 0 && !co.IsGenerator && !co.IsCoroutine && !co.IsAsyncGenerator {
 		maybeOptimizeCodeObject(vm, co, st.cache)
 		if atomic.LoadInt32(&co.StreamGen) != st.cache.streamGen {
 			st.codePtr, st.codeLen = vm.loadWindow(co, st.cache)

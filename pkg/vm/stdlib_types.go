@@ -292,6 +292,7 @@ func (e *Engine) createTypesModule() val.Value {
 	mod.Dict.Set(val.InternString("NotImplementedType"), val.TypeVal(val.NotImplementedType))
 	mod.Dict.Set(val.InternString("GeneratorType"), val.TypeVal(val.GeneratorType))
 	mod.Dict.Set(val.InternString("CoroutineType"), val.TypeVal(val.CoroutineType))
+	mod.Dict.Set(val.InternString("AsyncGeneratorType"), val.TypeVal(val.AsyncGeneratorType))
 	mod.Dict.Set(val.InternString("CellType"), val.TypeVal(val.CellType))
 	mod.Dict.Set(val.InternString("TracebackType"), val.TypeVal(val.TracebackType))
 	mod.Dict.Set(val.InternString("FrameType"), val.TypeVal(val.FrameType))

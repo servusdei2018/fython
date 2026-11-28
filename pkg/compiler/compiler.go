@@ -582,6 +582,9 @@ func (c *Compiler) compileStmt(stmtID StmtID) error {
 		}
 
 	case StmtKindReturn:
+		if c.scope != nil && c.scope.IsCoroutine && c.scope.IsGenerator && stmt.Expr1 != ExprNone {
+			return errors.New("SyntaxError: 'return' with value in async generator")
+		}
 		retSlot := -1
 		if stmt.Expr1 != ExprNone {
 			if err := c.compileExpr(stmt.Expr1); err != nil {
@@ -1462,10 +1465,7 @@ func (c *Compiler) compileAsyncForStmt(stmt *ASTStmt) error {
 	if err := c.compileExpr(stmt.Expr2); err != nil {
 		return err
 	}
-	// Call __aiter__()
-	_, aiterIdx := c.constPool.InternName("__aiter__")
-	c.emitOp(vm.OP_LOAD_METHOD, 0, aiterIdx)
-	c.emitOp(vm.OP_CALL_METHOD, 0, 0)
+	c.emitOp(vm.OP_GET_AITER, 0, 0)
 
 	iterSlot := c.allocTempLocal()
 	c.emitOp(vm.OP_STORE_FAST, 0, uint16(iterSlot))
@@ -1480,10 +1480,7 @@ func (c *Compiler) compileAsyncForStmt(stmt *ASTStmt) error {
 
 	// Load iter and call __anext__()
 	c.emitOp(vm.OP_LOAD_FAST, 0, uint16(iterSlot))
-	_, anextIdx := c.constPool.InternName("__anext__")
-	c.emitOp(vm.OP_LOAD_METHOD, 0, anextIdx)
-	c.emitOp(vm.OP_CALL_METHOD, 0, 0)
-	c.emitOp(vm.OP_GET_AWAITABLE, 0, 0)
+	c.emitOp(vm.OP_GET_ANEXT, 0, 0)
 
 	// Await anext, catching StopAsyncIteration
 	anextDepth := c.stackDepth
@@ -1517,7 +1514,7 @@ func (c *Compiler) compileAsyncForStmt(stmt *ASTStmt) error {
 	c.emitOp(vm.OP_CHECK_EXC_MATCH, 0, 0)
 	jumpNotMatch := c.emitOp(vm.OP_JUMP_IF_FALSE, 0, 0)
 
-	// Matched StopAsyncIteration: pop exception and jump out of loop
+	// Matched StopAsyncIteration: pop exception and jump out of loop (runs else:)
 	c.emitOp(vm.OP_POP_TOP, 0, 0)
 	jumpAfterLoop := c.emitOp(vm.OP_JUMP, 0, 0)
 
@@ -1526,11 +1523,6 @@ func (c *Compiler) compileAsyncForStmt(stmt *ASTStmt) error {
 	c.emitOp(vm.OP_RAISE, 1, 0)
 
 	c.patchJump(jumpAfterLoop, len(c.code))
-	endTarget := len(c.code)
-
-	for _, b := range loopCtx.Breaks {
-		c.patchJump(b, endTarget)
-	}
 	for _, cont := range loopCtx.Continues {
 		c.patchJump(cont, loopStart)
 	}
@@ -1543,6 +1535,11 @@ func (c *Compiler) compileAsyncForStmt(stmt *ASTStmt) error {
 				return err
 			}
 		}
+	}
+
+	afterElseTarget := len(c.code)
+	for _, b := range loopCtx.Breaks {
+		c.patchJump(b, afterElseTarget)
 	}
 
 	return nil
@@ -1984,6 +1981,9 @@ func (c *Compiler) compileYieldExpr(expr *ASTExpr) error {
 }
 
 func (c *Compiler) compileYieldFromExpr(expr *ASTExpr) error {
+	if c.scope != nil && c.scope.IsCoroutine {
+		return errors.New("SyntaxError: 'yield from' inside async function")
+	}
 	if err := c.compileExpr(expr.Left); err != nil {
 		return err
 	}
@@ -2090,11 +2090,18 @@ func (c *Compiler) compileFuncDef(stmt *ASTStmt) error {
 
 	maxStack := numLocals + subCompiler.maxStackDepth + 16
 	var coFlags uint32
-	if fnScope.IsGenerator {
-		coFlags |= vm.FlagGenerator | vm.CO_GENERATOR
-	}
-	if fnScope.IsCoroutine {
-		coFlags |= vm.FlagCoroutine | vm.CO_COROUTINE
+	isAsyncGen := fnScope.IsGenerator && fnScope.IsCoroutine
+	isGen := fnScope.IsGenerator && !fnScope.IsCoroutine
+	isCoro := fnScope.IsCoroutine && !fnScope.IsGenerator
+	if isAsyncGen {
+		coFlags |= vm.CO_ASYNC_GENERATOR
+	} else {
+		if isGen {
+			coFlags |= vm.FlagGenerator | vm.CO_GENERATOR
+		}
+		if isCoro {
+			coFlags |= vm.FlagCoroutine | vm.CO_COROUTINE
+		}
 	}
 	coFlags |= vm.CO_OPTIMIZED | vm.CO_NEWLOCALS
 	if len(fnScope.FreeVars) == 0 && len(fnScope.CellVars) == 0 {
@@ -2166,9 +2173,10 @@ func (c *Compiler) compileFuncDef(stmt *ASTStmt) error {
 		DirectCaptureBase:  fnScope.DirectCaptureBase,
 		DirectCaptureCount: len(fnScope.DirectCaptures),
 		MaxStackSize:       maxStack,
-		IsGenerator:        fnScope.IsGenerator,
-		IsCoroutine:        fnScope.IsCoroutine,
-		CanSuspend:         canSuspend,
+		IsGenerator:        isGen,
+		IsCoroutine:        isCoro,
+		IsAsyncGenerator:   isAsyncGen,
+		CanSuspend:         canSuspend || isAsyncGen,
 		Flags:              coFlags,
 		Doc:                fnDoc,
 		ExceptionTable:     subCompiler.exceptionTable,
@@ -3279,9 +3287,7 @@ func (c *Compiler) compileListComp(expr *ASTExpr) error {
 			if err := c.compileExpr(curr.Iter); err != nil {
 				return err
 			}
-			_, aiterIdx := c.constPool.InternName("__aiter__")
-			c.emitOp(vm.OP_LOAD_METHOD, 0, aiterIdx)
-			c.emitOp(vm.OP_CALL_METHOD, 0, 0)
+			c.emitOp(vm.OP_GET_AITER, 0, 0)
 
 			iterSlot := c.allocTempLocal()
 			c.emitOp(vm.OP_STORE_FAST, 0, uint16(iterSlot))
@@ -3289,12 +3295,9 @@ func (c *Compiler) compileListComp(expr *ASTExpr) error {
 			loopStart := len(c.code)
 
 			c.emitOp(vm.OP_LOAD_FAST, 0, uint16(iterSlot))
-			_, anextIdx := c.constPool.InternName("__anext__")
-			c.emitOp(vm.OP_LOAD_METHOD, 0, anextIdx)
-			c.emitOp(vm.OP_CALL_METHOD, 0, 0)
-			c.emitOp(vm.OP_GET_AWAITABLE, 0, 0)
+			c.emitOp(vm.OP_GET_ANEXT, 0, 0)
 
-			anextDepth := c.stackDepth
+			anextDepth := c.stackDepth + depth
 			anextStart := len(c.code)
 			c.emitOp(vm.OP_AWAIT, 0, 0)
 			anextEnd := len(c.code)
@@ -3312,14 +3315,14 @@ func (c *Compiler) compileListComp(expr *ASTExpr) error {
 			}
 
 			if curr.Next != 0 {
-				if err := compileClause(curr.Next-1, depth+1); err != nil {
+				if err := compileClause(curr.Next-1, depth); err != nil {
 					return err
 				}
 			} else {
 				if err := c.compileExpr(expr.Left); err != nil {
 					return err
 				}
-				c.emitOp(vm.OP_LIST_APPEND, 0, uint16(depth+1))
+				c.emitOp(vm.OP_LIST_APPEND, 0, uint16(depth))
 			}
 
 			c.emitOp(vm.OP_JUMP, 0, uint16(loopStart))
@@ -3404,9 +3407,7 @@ func (c *Compiler) compileDictComp(expr *ASTExpr) error {
 			if err := c.compileExpr(curr.Iter); err != nil {
 				return err
 			}
-			_, aiterIdx := c.constPool.InternName("__aiter__")
-			c.emitOp(vm.OP_LOAD_METHOD, 0, aiterIdx)
-			c.emitOp(vm.OP_CALL_METHOD, 0, 0)
+			c.emitOp(vm.OP_GET_AITER, 0, 0)
 
 			iterSlot := c.allocTempLocal()
 			c.emitOp(vm.OP_STORE_FAST, 0, uint16(iterSlot))
@@ -3414,12 +3415,9 @@ func (c *Compiler) compileDictComp(expr *ASTExpr) error {
 			loopStart := len(c.code)
 
 			c.emitOp(vm.OP_LOAD_FAST, 0, uint16(iterSlot))
-			_, anextIdx := c.constPool.InternName("__anext__")
-			c.emitOp(vm.OP_LOAD_METHOD, 0, anextIdx)
-			c.emitOp(vm.OP_CALL_METHOD, 0, 0)
-			c.emitOp(vm.OP_GET_AWAITABLE, 0, 0)
+			c.emitOp(vm.OP_GET_ANEXT, 0, 0)
 
-			anextDepth := c.stackDepth
+			anextDepth := c.stackDepth + depth
 			anextStart := len(c.code)
 			c.emitOp(vm.OP_AWAIT, 0, 0)
 			anextEnd := len(c.code)
@@ -3437,14 +3435,17 @@ func (c *Compiler) compileDictComp(expr *ASTExpr) error {
 			}
 
 			if curr.Next != 0 {
-				if err := compileClause(curr.Next-1, depth+1, filtered); err != nil {
+				if err := compileClause(curr.Next-1, depth, filtered); err != nil {
 					return err
 				}
 			} else {
 				if err := c.compileExpr(expr.Left); err != nil {
 					return err
 				}
-				c.emitOp(vm.OP_LIST_APPEND, 0, uint16(depth+1))
+				if err := c.compileExpr(expr.Right); err != nil {
+					return err
+				}
+				c.emitOp(vm.OP_MAP_ADD, 0, uint16(depth+1))
 			}
 
 			c.emitOp(vm.OP_JUMP, 0, uint16(loopStart))
@@ -4313,9 +4314,7 @@ func (c *Compiler) compileSetComp(expr *ASTExpr) error {
 			if err := c.compileExpr(curr.Iter); err != nil {
 				return err
 			}
-			_, aiterIdx := c.constPool.InternName("__aiter__")
-			c.emitOp(vm.OP_LOAD_METHOD, 0, aiterIdx)
-			c.emitOp(vm.OP_CALL_METHOD, 0, 0)
+			c.emitOp(vm.OP_GET_AITER, 0, 0)
 
 			iterSlot := c.allocTempLocal()
 			c.emitOp(vm.OP_STORE_FAST, 0, uint16(iterSlot))
@@ -4323,12 +4322,9 @@ func (c *Compiler) compileSetComp(expr *ASTExpr) error {
 			loopStart := len(c.code)
 
 			c.emitOp(vm.OP_LOAD_FAST, 0, uint16(iterSlot))
-			_, anextIdx := c.constPool.InternName("__anext__")
-			c.emitOp(vm.OP_LOAD_METHOD, 0, anextIdx)
-			c.emitOp(vm.OP_CALL_METHOD, 0, 0)
-			c.emitOp(vm.OP_GET_AWAITABLE, 0, 0)
+			c.emitOp(vm.OP_GET_ANEXT, 0, 0)
 
-			anextDepth := c.stackDepth
+			anextDepth := c.stackDepth + depth
 			anextStart := len(c.code)
 			c.emitOp(vm.OP_AWAIT, 0, 0)
 			anextEnd := len(c.code)
@@ -4346,14 +4342,14 @@ func (c *Compiler) compileSetComp(expr *ASTExpr) error {
 			}
 
 			if curr.Next != 0 {
-				if err := compileClause(curr.Next-1, depth+1, filtered); err != nil {
+				if err := compileClause(curr.Next-1, depth, filtered); err != nil {
 					return err
 				}
 			} else {
 				if err := c.compileExpr(expr.Left); err != nil {
 					return err
 				}
-				c.emitOp(vm.OP_LIST_APPEND, 0, uint16(depth+1))
+				c.emitOp(vm.OP_SET_ADD, 0, uint16(depth))
 			}
 
 			c.emitOp(vm.OP_JUMP, 0, uint16(loopStart))
@@ -4434,7 +4430,11 @@ func (c *Compiler) compileGenExp(expr *ASTExpr) error {
 	if err := c.compileExpr(comp.Iter); err != nil {
 		return err
 	}
-	c.emitOp(vm.OP_GET_ITER, 0, 0)
+	if comp.IsAsync {
+		c.emitOp(vm.OP_GET_AITER, 0, 0)
+	} else {
+		c.emitOp(vm.OP_GET_ITER, 0, 0)
+	}
 	iterSlot := c.allocTempLocal()
 	c.emitOp(vm.OP_STORE_FAST, 0, uint16(iterSlot))
 
@@ -4455,12 +4455,90 @@ func (c *Compiler) compileGenExp(expr *ASTExpr) error {
 		optimize:   c.optimize,
 	}
 
-	// Load parameter 0 (.0)
-	subCompiler.emitOp(vm.OP_LOAD_FAST, 0, 0)
-
-	var compileClause func(currIdx uint32) error
-	compileClause = func(currIdx uint32) error {
+	var compileClause func(currIdx uint32, isFirst bool, syncDepth int) error
+	compileClause = func(currIdx uint32, isFirst bool, syncDepth int) error {
 		curr := &c.arena.Comps[currIdx]
+		if curr.IsAsync {
+			var curIterSlot int
+			if isFirst {
+				curIterSlot = 0 // parameter .0 already holds the async iterator
+			} else {
+				if err := subCompiler.compileExpr(curr.Iter); err != nil {
+					return err
+				}
+				subCompiler.emitOp(vm.OP_GET_AITER, 0, 0)
+				curIterSlot = subCompiler.allocTempLocal()
+				subCompiler.emitOp(vm.OP_STORE_FAST, 0, uint16(curIterSlot))
+			}
+
+			loopStart := len(subCompiler.code)
+			subCompiler.emitOp(vm.OP_LOAD_FAST, 0, uint16(curIterSlot))
+			subCompiler.emitOp(vm.OP_GET_ANEXT, 0, 0)
+
+			anextDepth := subCompiler.stackDepth + syncDepth
+			anextStart := len(subCompiler.code)
+			subCompiler.emitOp(vm.OP_AWAIT, 0, 0)
+			anextEnd := len(subCompiler.code)
+
+			if err := subCompiler.compileStoreTarget(curr.Target); err != nil {
+				return err
+			}
+
+			var ifSkips []int
+			for _, ifCond := range c.arena.GetExprSlice(curr.IfConds) {
+				if err := subCompiler.compileExpr(ifCond); err != nil {
+					return err
+				}
+				ifSkips = append(ifSkips, subCompiler.emitOp(vm.OP_JUMP_IF_FALSE, 0, 0))
+			}
+
+			if curr.Next != 0 {
+				if err := compileClause(curr.Next-1, false, syncDepth); err != nil {
+					return err
+				}
+			} else {
+				if err := subCompiler.compileExpr(expr.Left); err != nil {
+					return err
+				}
+				subCompiler.emitOp(vm.OP_YIELD_VALUE, 0, 0)
+				subCompiler.emitOp(vm.OP_POP_TOP, 0, 0)
+			}
+
+			subCompiler.emitOp(vm.OP_JUMP, 0, uint16(loopStart))
+
+			excHandlerIP := len(subCompiler.code)
+			subCompiler.addExceptionRange(anextStart, anextEnd, excHandlerIP, anextDepth, false)
+
+			subCompiler.emitOp(vm.OP_DUP_TOP, 0, 0)
+			if err := subCompiler.compileNameLoad("StopAsyncIteration"); err != nil {
+				return err
+			}
+			subCompiler.emitOp(vm.OP_CHECK_EXC_MATCH, 0, 0)
+			jumpNotMatch := subCompiler.emitOp(vm.OP_JUMP_IF_FALSE, 0, 0)
+
+			subCompiler.emitOp(vm.OP_POP_TOP, 0, 0)
+			jumpAfterLoop := subCompiler.emitOp(vm.OP_JUMP, 0, 0)
+
+			subCompiler.patchJump(jumpNotMatch, len(subCompiler.code))
+			subCompiler.emitOp(vm.OP_RAISE, 1, 0)
+
+			subCompiler.patchJump(jumpAfterLoop, len(subCompiler.code))
+			for _, skip := range ifSkips {
+				subCompiler.patchJump(skip, loopStart)
+			}
+			return nil
+		}
+
+		if isFirst {
+			// Load parameter 0 (.0)
+			subCompiler.emitOp(vm.OP_LOAD_FAST, 0, 0)
+		} else {
+			if err := subCompiler.compileExpr(curr.Iter); err != nil {
+				return err
+			}
+			subCompiler.emitOp(vm.OP_GET_ITER, 0, 0)
+		}
+
 		loopStart := len(subCompiler.code)
 		jumpEnd := subCompiler.emitOp(vm.OP_FOR_ITER, 0, 0)
 
@@ -4477,13 +4555,7 @@ func (c *Compiler) compileGenExp(expr *ASTExpr) error {
 		}
 
 		if curr.Next != 0 {
-			nextIdx := curr.Next - 1
-			nextComp := &c.arena.Comps[nextIdx]
-			if err := subCompiler.compileExpr(nextComp.Iter); err != nil {
-				return err
-			}
-			subCompiler.emitOp(vm.OP_GET_ITER, 0, 0)
-			if err := compileClause(nextIdx); err != nil {
+			if err := compileClause(curr.Next-1, false, syncDepth+1); err != nil {
 				return err
 			}
 		} else {
@@ -4502,7 +4574,7 @@ func (c *Compiler) compileGenExp(expr *ASTExpr) error {
 		return nil
 	}
 
-	if err := compileClause(expr.Extra); err != nil {
+	if err := compileClause(expr.Extra, true, 0); err != nil {
 		return err
 	}
 	subCompiler.emitReturnNone()
@@ -4521,18 +4593,28 @@ func (c *Compiler) compileGenExp(expr *ASTExpr) error {
 		freeValSlice[i] = val.InternString(fv)
 	}
 
+	isAsyncGen := genScope.IsCoroutine
+	genFlags := vm.FlagGenerator | vm.CO_GENERATOR
+	if isAsyncGen {
+		genFlags = vm.CO_ASYNC_GENERATOR | vm.CO_OPTIMIZED | vm.CO_NEWLOCALS
+	}
 	genCodeObj := &vm.CodeObject{
-		Name:         "<genexpr>",
-		Code:         subCompiler.finalizedCode(),
-		Consts:       subCompiler.constPool.Slice(),
-		ParamNames:   paramNames,
-		CellVars:     cellValSlice,
-		FreeVars:     freeValSlice,
-		NumLocals:    numLocals,
-		NumParams:    1,
-		MaxStackSize: numLocals + subCompiler.maxStackDepth + 16,
-		IsGenerator:  true,
-		Flags:        vm.FlagGenerator,
+		Name:             "<genexpr>",
+		QualName:         c.qualnamePrefix + "<genexpr>",
+		Code:             subCompiler.finalizedCode(),
+		Consts:           subCompiler.constPool.Slice(),
+		ParamNames:       paramNames,
+		CellVars:         cellValSlice,
+		FreeVars:         freeValSlice,
+		NumLocals:        numLocals,
+		NumParams:        1,
+		MaxStackSize:     numLocals + subCompiler.maxStackDepth + 16,
+		IsGenerator:      !isAsyncGen,
+		IsAsyncGenerator: isAsyncGen,
+		CanSuspend:       isAsyncGen,
+		Flags:            genFlags,
+		ExceptionTable:   subCompiler.exceptionTable,
+		LineSpans:        subCompiler.lineSpans,
 	}
 
 	var flags uint8

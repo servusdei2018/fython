@@ -7359,6 +7359,288 @@ func initTypes() {
 		return args[0]
 	}))
 
+	AsyncGeneratorType = MustNewType("async_generator", []*PyType{ObjectType}, nil)
+	AsyncGeneratorType.Dict.Set(InternString("__aiter__"), NewBuiltinFuncVal("__aiter__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 || !args[0].IsAsyncGenerator() {
+			ctx.Raise(NewTypeError("__aiter__() requires an async_generator object"))
+			return NoneVal()
+		}
+		return args[0]
+	}))
+	AsyncGeneratorType.Dict.Set(InternString("__anext__"), NewBuiltinFuncVal("__anext__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 || !args[0].IsAsyncGenerator() {
+			ctx.Raise(NewTypeError("__anext__() requires an async_generator object"))
+			return NoneVal()
+		}
+		return NewAsyncGenASendVal(args[0].AsAsyncGenerator(), NoneVal())
+	}))
+	AsyncGeneratorType.Dict.Set(InternString("asend"), NewBuiltinFuncVal("asend", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) != 2 || !args[0].IsAsyncGenerator() {
+			ctx.Raise(NewTypeError("asend() takes exactly one argument"))
+			return NoneVal()
+		}
+		return NewAsyncGenASendVal(args[0].AsAsyncGenerator(), args[1])
+	}))
+	AsyncGeneratorType.Dict.Set(InternString("athrow"), NewBuiltinFuncVal("athrow", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 || len(args) > 4 || !args[0].IsAsyncGenerator() {
+			ctx.Raise(NewTypeError("athrow() takes from 1 to 3 arguments"))
+			return NoneVal()
+		}
+		excVal := NoneVal()
+		excTB := NoneVal()
+		if len(args) >= 3 {
+			excVal = args[2]
+		}
+		if len(args) >= 4 {
+			excTB = args[3]
+		}
+		return NewAsyncGenAThrowVal(args[0].AsAsyncGenerator(), args[1], excVal, excTB, false)
+	}))
+	AsyncGeneratorType.Dict.Set(InternString("aclose"), NewBuiltinFuncVal("aclose", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) != 1 || !args[0].IsAsyncGenerator() {
+			ctx.Raise(NewTypeError("aclose() takes no arguments"))
+			return NoneVal()
+		}
+		return NewAsyncGenAThrowVal(args[0].AsAsyncGenerator(), NoneVal(), NoneVal(), NoneVal(), true)
+	}))
+	AsyncGeneratorType.Dict.Set(InternString("ag_running"), NewPropertyVal(NewBuiltinFuncVal("ag_running", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 || !args[0].IsAsyncGenerator() {
+			return BoolVal(false)
+		}
+		return BoolVal(args[0].AsAsyncGenerator().Running)
+	}), NoneVal(), NoneVal()))
+	AsyncGeneratorType.Dict.Set(InternString("ag_await"), NewPropertyVal(NewBuiltinFuncVal("ag_await", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 || !args[0].IsAsyncGenerator() {
+			return NoneVal()
+		}
+		aw := args[0].AsAsyncGenerator().AgAwait
+		if aw.HeaderPtr() == nil {
+			return NoneVal()
+		}
+		return aw
+	}), NoneVal(), NoneVal()))
+	AsyncGeneratorType.Dict.Set(InternString("ag_code"), NewPropertyVal(NewBuiltinFuncVal("ag_code", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 || !args[0].IsAsyncGenerator() {
+			return NoneVal()
+		}
+		return args[0].AsAsyncGenerator().Code
+	}), NoneVal(), NoneVal()))
+	AsyncGeneratorType.Dict.Set(InternString("ag_frame"), NewPropertyVal(NewBuiltinFuncVal("ag_frame", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 || !args[0].IsAsyncGenerator() {
+			return NoneVal()
+		}
+		ag := args[0].AsAsyncGenerator()
+		if ag.State == AsyncGenClosed {
+			return NoneVal()
+		}
+		f := NewPyFrame(nil, -1, ag.Base, ag.Code, ag.Globals, ag.Cells)
+		f.IP = ag.IP
+		f.Detach()
+		return NewFrameVal(f)
+	}), NoneVal(), NoneVal()))
+	AsyncGeneratorType.Dict.Set(InternString("__name__"), NewPropertyVal(
+		NewBuiltinFuncVal("__name__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+			if len(args) < 1 || !args[0].IsAsyncGenerator() {
+				return NoneVal()
+			}
+			return NewStringVal(args[0].AsAsyncGenerator().Name)
+		}),
+		NewBuiltinFuncVal("__name__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+			if len(args) < 2 || !args[0].IsAsyncGenerator() {
+				return NoneVal()
+			}
+			if !args[1].IsAnyString() {
+				ctx.Raise(NewTypeError("__name__ must be set to a string object"))
+				return NoneVal()
+			}
+			args[0].AsAsyncGenerator().Name = args[1].AsString()
+			return NoneVal()
+		}),
+		NoneVal(),
+	))
+	AsyncGeneratorType.Dict.Set(InternString("__qualname__"), NewPropertyVal(
+		NewBuiltinFuncVal("__qualname__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+			if len(args) < 1 || !args[0].IsAsyncGenerator() {
+				return NoneVal()
+			}
+			return NewStringVal(args[0].AsAsyncGenerator().QualName)
+		}),
+		NewBuiltinFuncVal("__qualname__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+			if len(args) < 2 || !args[0].IsAsyncGenerator() {
+				return NoneVal()
+			}
+			if !args[1].IsAnyString() {
+				ctx.Raise(NewTypeError("__qualname__ must be set to a string object"))
+				return NoneVal()
+			}
+			args[0].AsAsyncGenerator().QualName = args[1].AsString()
+			return NoneVal()
+		}),
+		NoneVal(),
+	))
+
+	AsyncGenASendType = MustNewType("async_generator_asend", []*PyType{ObjectType}, nil)
+	AsyncGenASendType.Slots.TpIter = func(ctx *ExecContext, o Value) Value { return o }
+	AsyncGenASendType.Slots.TpIterNext = func(ctx *ExecContext, o Value) (Value, IterStatus) {
+		return AsAsyncGenASend(o).Step(ctx, NoneVal(), Value{})
+	}
+	AsyncGenASendType.Dict.Set(InternString("__await__"), NewBuiltinFuncVal("__await__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			ctx.Raise(NewTypeError("__await__() takes at least 1 argument"))
+			return NoneVal()
+		}
+		return args[0]
+	}))
+	AsyncGenASendType.Dict.Set(InternString("__iter__"), NewBuiltinFuncVal("__iter__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			ctx.Raise(NewTypeError("__iter__() takes at least 1 argument"))
+			return NoneVal()
+		}
+		return args[0]
+	}))
+	AsyncGenASendType.Dict.Set(InternString("__next__"), NewBuiltinFuncVal("__next__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 || !IsAsyncGenASend(args[0]) {
+			ctx.Raise(NewTypeError("__next__() requires an async_generator_asend object"))
+			return NoneVal()
+		}
+		v, status := AsAsyncGenASend(args[0]).Step(ctx, NoneVal(), Value{})
+		if status == IterExhausted {
+			ctx.Raise(NewStopIteration(v))
+			return NoneVal()
+		}
+		return v
+	}))
+	AsyncGenASendType.Dict.Set(InternString("send"), NewBuiltinFuncVal("send", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) != 2 || !IsAsyncGenASend(args[0]) {
+			ctx.Raise(NewTypeError("send() takes exactly one argument"))
+			return NoneVal()
+		}
+		aw := AsAsyncGenASend(args[0])
+		if aw.State == AsyncGenAwaitInit && !args[1].IsNone() && args[1].HeaderPtr() != nil {
+			ctx.Raise(NewTypeError("can't send non-None value to a just-started coroutine"))
+			return NoneVal()
+		}
+		v, status := aw.Step(ctx, args[1], Value{})
+		if status == IterExhausted {
+			ctx.Raise(NewStopIteration(v))
+			return NoneVal()
+		}
+		return v
+	}))
+	AsyncGenASendType.Dict.Set(InternString("throw"), NewBuiltinFuncVal("throw", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 || len(args) > 4 || !IsAsyncGenASend(args[0]) {
+			ctx.Raise(NewTypeError("throw() takes from 1 to 3 arguments"))
+			return NoneVal()
+		}
+		excVal := NoneVal()
+		excTB := NoneVal()
+		if len(args) >= 3 {
+			excVal = args[2]
+		}
+		if len(args) >= 4 {
+			excTB = args[3]
+		}
+		exc := normalizeAsyncGenThrowExc(ctx, args[1], excVal, excTB)
+		if ctx != nil && ctx.HasException() {
+			return NoneVal()
+		}
+		v, status := AsAsyncGenASend(args[0]).Step(ctx, NoneVal(), exc)
+		if status == IterExhausted {
+			ctx.Raise(NewStopIteration(v))
+			return NoneVal()
+		}
+		return v
+	}))
+	AsyncGenASendType.Dict.Set(InternString("close"), NewBuiltinFuncVal("close", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 || !IsAsyncGenASend(args[0]) {
+			ctx.Raise(NewTypeError("close() requires an async_generator_asend object"))
+			return NoneVal()
+		}
+		AsAsyncGenASend(args[0]).Close()
+		return NoneVal()
+	}))
+
+	AsyncGenAThrowType = MustNewType("async_generator_athrow", []*PyType{ObjectType}, nil)
+	AsyncGenAThrowType.Slots.TpIter = func(ctx *ExecContext, o Value) Value { return o }
+	AsyncGenAThrowType.Slots.TpIterNext = func(ctx *ExecContext, o Value) (Value, IterStatus) {
+		return AsAsyncGenAThrow(o).Step(ctx, NoneVal(), Value{})
+	}
+	AsyncGenAThrowType.Dict.Set(InternString("__await__"), NewBuiltinFuncVal("__await__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			ctx.Raise(NewTypeError("__await__() takes at least 1 argument"))
+			return NoneVal()
+		}
+		return args[0]
+	}))
+	AsyncGenAThrowType.Dict.Set(InternString("__iter__"), NewBuiltinFuncVal("__iter__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			ctx.Raise(NewTypeError("__iter__() takes at least 1 argument"))
+			return NoneVal()
+		}
+		return args[0]
+	}))
+	AsyncGenAThrowType.Dict.Set(InternString("__next__"), NewBuiltinFuncVal("__next__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 || !IsAsyncGenAThrow(args[0]) {
+			ctx.Raise(NewTypeError("__next__() requires an async_generator_athrow object"))
+			return NoneVal()
+		}
+		v, status := AsAsyncGenAThrow(args[0]).Step(ctx, NoneVal(), Value{})
+		if status == IterExhausted {
+			ctx.Raise(NewStopIteration(v))
+			return NoneVal()
+		}
+		return v
+	}))
+	AsyncGenAThrowType.Dict.Set(InternString("send"), NewBuiltinFuncVal("send", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) != 2 || !IsAsyncGenAThrow(args[0]) {
+			ctx.Raise(NewTypeError("send() takes exactly one argument"))
+			return NoneVal()
+		}
+		aw := AsAsyncGenAThrow(args[0])
+		if aw.State == AsyncGenAwaitInit && !args[1].IsNone() && args[1].HeaderPtr() != nil {
+			ctx.Raise(NewTypeError("can't send non-None value to a just-started coroutine"))
+			return NoneVal()
+		}
+		v, status := aw.Step(ctx, args[1], Value{})
+		if status == IterExhausted {
+			ctx.Raise(NewStopIteration(v))
+			return NoneVal()
+		}
+		return v
+	}))
+	AsyncGenAThrowType.Dict.Set(InternString("throw"), NewBuiltinFuncVal("throw", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 || len(args) > 4 || !IsAsyncGenAThrow(args[0]) {
+			ctx.Raise(NewTypeError("throw() takes from 1 to 3 arguments"))
+			return NoneVal()
+		}
+		excVal := NoneVal()
+		excTB := NoneVal()
+		if len(args) >= 3 {
+			excVal = args[2]
+		}
+		if len(args) >= 4 {
+			excTB = args[3]
+		}
+		exc := normalizeAsyncGenThrowExc(ctx, args[1], excVal, excTB)
+		if ctx != nil && ctx.HasException() {
+			return NoneVal()
+		}
+		v, status := AsAsyncGenAThrow(args[0]).Step(ctx, NoneVal(), exc)
+		if status == IterExhausted {
+			ctx.Raise(NewStopIteration(v))
+			return NoneVal()
+		}
+		return v
+	}))
+	AsyncGenAThrowType.Dict.Set(InternString("close"), NewBuiltinFuncVal("close", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 || !IsAsyncGenAThrow(args[0]) {
+			ctx.Raise(NewTypeError("close() requires an async_generator_athrow object"))
+			return NoneVal()
+		}
+		AsAsyncGenAThrow(args[0]).Close()
+		return NoneVal()
+	}))
+
 	futureFromVal := func(v Value) *PyFuture {
 		if v.IsTask() {
 			return &v.AsTask().Future

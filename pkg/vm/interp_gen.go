@@ -32,6 +32,7 @@ func (vm *VM) restoreCallerFrame(st *loopState, caller *CallFrame) {
 	st.activeGen = aux.activeGen
 	st.delegatedRoot = aux.delegatedRoot
 	st.activeCoro = aux.activeCoro
+	st.activeAsyncGen = aux.activeAsyncGen
 	st.genFrameIdx = aux.genFrameIdx
 	aux.cells = nil
 	aux.cellPtrs = nil
@@ -42,6 +43,7 @@ func (vm *VM) restoreCallerFrame(st *loopState, caller *CallFrame) {
 	aux.activeGen = nil
 	aux.delegatedRoot = nil
 	aux.activeCoro = nil
+	aux.activeAsyncGen = nil
 	caller.flags &^= frameFlagGenOrCoro | frameFlagHasAux
 	vm.activeCO = st.curCO
 	vm.activeBaseOffset = st.base
@@ -101,6 +103,7 @@ func (vm *VM) saveAndPushInlineFrame(
 	aux.activeGen = st.activeGen
 	aux.delegatedRoot = st.delegatedRoot
 	aux.activeCoro = st.activeCoro
+	aux.activeAsyncGen = st.activeAsyncGen
 	aux.genFrameIdx = st.genFrameIdx
 	aux.genMode = mode
 	aux.genDefault = defaultVal
@@ -115,6 +118,7 @@ func (vm *VM) saveAndPushInlineFrame(
 	st.activeGen = gen
 	st.delegatedRoot = nil
 	st.activeCoro = coro
+	st.activeAsyncGen = nil
 	st.stack = childStack
 	st.stackIsVM = false
 	vm.execCtx.Stack = childStack
@@ -1343,7 +1347,8 @@ func (vm *VM) opForIterGen(st *loopState, inst uint32, ip, sp int) (int, int, lo
 }
 
 func (vm *VM) suspendActiveChain(st *loopState, yieldVal val.Value, resumeIP, resumeSP int) (int, int, loopCtl) {
-	if st.activeGen != nil {
+	switch {
+	case st.activeGen != nil:
 		st.activeGen.YieldVal = yieldVal
 		st.activeGen.State = val.GenSuspended
 		st.activeGen.Stack = st.stack
@@ -1356,12 +1361,22 @@ func (vm *VM) suspendActiveChain(st *loopState, yieldVal val.Value, resumeIP, re
 			root.LeafReuseGen = st.activeGen.ReuseGen
 			st.delegatedRoot = nil
 		}
-	} else if st.activeCoro != nil {
+	case st.activeCoro != nil:
 		st.activeCoro.YieldVal = yieldVal
 		st.activeCoro.State = val.CoroSuspended
 		st.activeCoro.Stack = st.stack
 		st.activeCoro.SP = resumeSP
 		st.activeCoro.IP = resumeIP
+	case st.activeAsyncGen != nil:
+		st.activeAsyncGen.YieldVal = yieldVal
+		if resumeSP > 0 && resumeSP <= len(st.stack) {
+			st.activeAsyncGen.AgAwait = st.stack[resumeSP-1]
+		}
+		st.activeAsyncGen.State = val.AsyncGenSuspended
+		st.activeAsyncGen.SuspendedOnAwait = true
+		st.activeAsyncGen.Stack = st.stack
+		st.activeAsyncGen.SP = resumeSP
+		st.activeAsyncGen.IP = resumeIP
 	}
 	for st.frameIdx == st.genFrameIdx && st.frameIdx > st.startFrameIdx {
 		if (vm.frames[st.frameIdx].flags & frameFlagHasShadow) != 0 {
@@ -1401,6 +1416,18 @@ func (vm *VM) suspendActiveChain(st *loopState, yieldVal val.Value, resumeIP, re
 				st.activeCoro.Stack = st.stack
 				st.activeCoro.SP = retSP
 				st.activeCoro.IP = callerIP
+				continue
+			}
+			if st.activeAsyncGen != nil {
+				st.activeAsyncGen.YieldVal = yieldVal
+				if retSP > 0 && retSP <= len(st.stack) {
+					st.activeAsyncGen.AgAwait = st.stack[retSP-1]
+				}
+				st.activeAsyncGen.State = val.AsyncGenSuspended
+				st.activeAsyncGen.SuspendedOnAwait = true
+				st.activeAsyncGen.Stack = st.stack
+				st.activeAsyncGen.SP = retSP
+				st.activeAsyncGen.IP = callerIP
 				continue
 			}
 		}
@@ -1592,6 +1619,17 @@ func (vm *VM) opYieldValue(st *loopState, ip, sp int) (int, int, loopCtl) {
 			return ip + 1, sp + 1, ctlNext
 		}
 		return vm.suspendActiveChain(st, yieldVal, ip+1, sp)
+	}
+	if st.activeAsyncGen != nil {
+		st.activeAsyncGen.YieldVal = yieldVal
+		st.activeAsyncGen.AgAwait = val.NoneVal()
+		st.activeAsyncGen.State = val.AsyncGenSuspended
+		st.activeAsyncGen.SuspendedOnAwait = false
+		st.activeAsyncGen.Stack = st.stack
+		st.activeAsyncGen.SP = sp
+		st.activeAsyncGen.IP = ip + 1
+		st.result = yieldVal
+		return ip + 1, sp, ctlExit
 	}
 	ip++
 	return ip, sp, ctlNext
@@ -1922,17 +1960,26 @@ func (vm *VM) opAwait(st *loopState, ip, sp int) (int, int, loopCtl) {
 		if fut.IsDone() {
 			res, exc := fut.Result()
 			if !exc.IsNone() && exc.HeaderPtr() != nil {
+				if st.activeAsyncGen != nil {
+					st.activeAsyncGen.AgAwait = val.NoneVal()
+					st.activeAsyncGen.SuspendedOnAwait = false
+				}
 				st.raiseExc = exc
 				return ip, sp, ctlRaise
 			}
 			if st.activeCoro != nil {
 				st.activeCoro.LastSent = val.NoneVal()
 			}
+			if st.activeAsyncGen != nil {
+				st.activeAsyncGen.LastSent = val.NoneVal()
+				st.activeAsyncGen.AgAwait = val.NoneVal()
+				st.activeAsyncGen.SuspendedOnAwait = false
+			}
 			stack[sp-1] = res
 			ip++
 			return ip, sp, ctlReload
 		}
-		if st.activeCoro != nil {
+		if st.activeCoro != nil || st.activeAsyncGen != nil {
 			return vm.suspendActiveChain(st, aw, ip, sp)
 		}
 	} else if aw.IsCoroutine() {
@@ -1941,6 +1988,9 @@ func (vm *VM) opAwait(st *loopState, ip, sp int) (int, int, loopCtl) {
 		if st.activeCoro != nil {
 			sentVal = st.activeCoro.LastSent
 			st.activeCoro.LastSent = val.NoneVal()
+		} else if st.activeAsyncGen != nil {
+			sentVal = st.activeAsyncGen.LastSent
+			st.activeAsyncGen.LastSent = val.NoneVal()
 		}
 		return vm.pushInlineCoroutine(st, childCoro, ip, sp, sp, genModeAwait, sentVal)
 	} else if aw.IsGenerator() {
@@ -1949,6 +1999,9 @@ func (vm *VM) opAwait(st *loopState, ip, sp int) (int, int, loopCtl) {
 		if st.activeCoro != nil {
 			sentVal = st.activeCoro.LastSent
 			st.activeCoro.LastSent = val.NoneVal()
+		} else if st.activeAsyncGen != nil {
+			sentVal = st.activeAsyncGen.LastSent
+			st.activeAsyncGen.LastSent = val.NoneVal()
 		}
 		if vm.activeJoinGen == nil {
 			return vm.pushInlineGenerator(st, subiter, ip, sp, sp, 0, genModeAwait, val.Value{}, sentVal)
@@ -1956,11 +2009,15 @@ func (vm *VM) opAwait(st *loopState, ip, sp int) (int, int, loopCtl) {
 		nextVal, status := subiter.Send(&vm.execCtx, sentVal)
 		switch status {
 		case val.IterExhausted:
+			if st.activeAsyncGen != nil {
+				st.activeAsyncGen.AgAwait = val.NoneVal()
+				st.activeAsyncGen.SuspendedOnAwait = false
+			}
 			stack[sp-1] = subiter.RetVal
 			ip++
 			return ip, sp, ctlReload
 		case val.IterYielded:
-			if st.activeCoro != nil {
+			if st.activeCoro != nil || st.activeAsyncGen != nil {
 				return vm.suspendActiveChain(st, nextVal, ip, sp)
 			}
 		default:
@@ -1975,6 +2032,10 @@ func (vm *VM) opAwait(st *loopState, ip, sp int) (int, int, loopCtl) {
 		nextVal, status := tpIterNext(&vm.execCtx, aw)
 		switch status {
 		case val.IterExhausted:
+			if st.activeAsyncGen != nil {
+				st.activeAsyncGen.AgAwait = val.NoneVal()
+				st.activeAsyncGen.SuspendedOnAwait = false
+			}
 			stack[sp-1] = nextVal
 			ip++
 			return ip, sp, ctlReload
@@ -1989,8 +2050,15 @@ func (vm *VM) opAwait(st *loopState, ip, sp int) (int, int, loopCtl) {
 				}
 				return vm.suspendActiveChain(st, nextVal, ip, sp)
 			}
+			if st.activeAsyncGen != nil {
+				return vm.suspendActiveChain(st, nextVal, ip, sp)
+			}
 		default:
 			if vm.execCtx.HasException() {
+				if st.activeAsyncGen != nil {
+					st.activeAsyncGen.AgAwait = val.NoneVal()
+					st.activeAsyncGen.SuspendedOnAwait = false
+				}
 				exc := vm.execCtx.ActiveException
 				vm.execCtx.ClearException()
 				st.raiseExc = exc
@@ -2002,4 +2070,91 @@ func (vm *VM) opAwait(st *loopState, ip, sp int) (int, int, loopCtl) {
 		return ip, sp, ctlReload
 	}
 	return ip, sp, ctlReload
+}
+
+var (
+	nameAIter = val.InternString("__aiter__")
+	nameANext = val.InternString("__anext__")
+)
+
+//go:noinline
+func (vm *VM) opGetAIter(st *loopState, ip, sp int) (int, int, loopCtl) {
+	stack := st.stack
+	obj := stack[sp-1]
+	tp := obj.Type()
+	fn, _, ok := tp.LookupMRO(nameAIter)
+	if !ok || fn.IsNone() || fn.HeaderPtr() == nil {
+		st.raiseExc = val.NewTypeError("'async for' requires an object with __aiter__ method, got " + tp.Name)
+		return ip, sp, ctlRaise
+	}
+	res := vm.Vectorcall(fn, []val.Value{obj}, nil)
+	if vm.execCtx.HasException() {
+		exc := vm.execCtx.ActiveException
+		vm.execCtx.ClearException()
+		st.raiseExc = exc
+		return ip, sp, ctlRaise
+	}
+	resTp := res.Type()
+	if anextFn, _, hasANext := resTp.LookupMRO(nameANext); !hasANext || anextFn.IsNone() || anextFn.HeaderPtr() == nil {
+		st.raiseExc = val.NewTypeError("'async for' received an object from __aiter__ that does not implement __anext__: " + resTp.Name)
+		return ip, sp, ctlRaise
+	}
+	stack = st.syncStackFromVM(vm, stack)
+	stack[sp-1] = res
+	return ip + 1, sp, ctlReload
+}
+
+//go:noinline
+func (vm *VM) opGetANext(st *loopState, ip, sp int) (int, int, loopCtl) {
+	stack := st.stack
+	it := stack[sp-1]
+	tp := it.Type()
+	fn, _, ok := tp.LookupMRO(nameANext)
+	if !ok || fn.IsNone() || fn.HeaderPtr() == nil {
+		st.raiseExc = val.NewTypeError("'async for' received an object from __aiter__ that does not implement __anext__: " + tp.Name)
+		return ip, sp, ctlRaise
+	}
+	res := vm.Vectorcall(fn, []val.Value{it}, nil)
+	if vm.execCtx.HasException() {
+		exc := vm.execCtx.ActiveException
+		vm.execCtx.ClearException()
+		st.raiseExc = exc
+		return ip, sp, ctlRaise
+	}
+	stack = st.syncStackFromVM(vm, stack)
+	aw, okAw := vm.toAwaitableForAsyncFor(res)
+	if !okAw {
+		if vm.execCtx.HasException() {
+			exc := vm.execCtx.ActiveException
+			vm.execCtx.ClearException()
+			st.raiseExc = exc
+			return ip, sp, ctlRaise
+		}
+		st.raiseExc = val.NewTypeError("'async for' received an invalid object from __anext__: " + res.Type().Name)
+		return ip, sp, ctlRaise
+	}
+	stack[sp-1] = aw
+	return ip + 1, sp, ctlReload
+}
+
+func (vm *VM) toAwaitableForAsyncFor(obj val.Value) (val.Value, bool) {
+	if obj.IsCoroutine() || obj.IsFuture() || obj.IsTask() || val.IsAsyncGenASend(obj) || val.IsAsyncGenAThrow(obj) {
+		return obj, true
+	}
+	tp := obj.Type()
+	if awFn, _, ok := tp.LookupMRO(nameAwait); ok && !awFn.IsNone() && awFn.HeaderPtr() != nil {
+		res := vm.Vectorcall(awFn, []val.Value{obj}, nil)
+		if vm.execCtx.HasException() {
+			return val.NoneVal(), false
+		}
+		if res.IsCoroutine() || res.IsFuture() || res.IsTask() || res.IsGenerator() || res.IsIter() || res.Type().Slots.TpIterNext != nil {
+			return res, true
+		}
+		vm.execCtx.Raise(val.NewTypeError("__await__() returned non-iterator of type '" + res.Type().Name + "'"))
+		return val.NoneVal(), false
+	}
+	if tp.Slots.TpIter != nil && tp.Slots.TpIterNext != nil && !obj.IsGenerator() && !obj.IsIter() {
+		return obj, true
+	}
+	return val.NoneVal(), false
 }

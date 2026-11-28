@@ -439,7 +439,47 @@ func (l *EventLoop) stepTask(vm *VM, task *val.PyTask) {
 			return
 		}
 		if !pendingCancel.IsNone() && pendingCancel.HeaderPtr() != nil {
-			cancelQueueAwaitable(aw)
+			cancelPendingAwaitable(aw)
+			if val.IsAsyncGenASend(aw) || val.IsAsyncGenAThrow(aw) {
+				var nextVal val.Value
+				var status val.IterStatus
+				if val.IsAsyncGenASend(aw) {
+					nextVal, status = val.AsAsyncGenASend(aw).Step(&vm.execCtx, val.NoneVal(), pendingCancel)
+				} else {
+					nextVal, status = val.AsAsyncGenAThrow(aw).Step(&vm.execCtx, val.NoneVal(), pendingCancel)
+				}
+				switch status {
+				case val.IterExhausted:
+					task.Awaitable = val.Value{}
+					task.SetResult(nextVal)
+				case val.IterYielded:
+					if nextVal.IsFuture() || nextVal.IsTask() {
+						fut := nextVal.AsFuture()
+						if nextVal.IsTask() {
+							fut = &nextVal.AsTask().Future
+						}
+						task.SetWaiter(fut, aw)
+						fut.AddDoneCallback(func(v val.Value) {
+							l.queue.Push(task)
+						})
+					} else {
+						l.queue.Push(task)
+					}
+				default:
+					exc := vm.execCtx.ActiveException
+					vm.execCtx.ClearException()
+					if exc.IsNone() || exc.HeaderPtr() == nil {
+						exc = pendingCancel
+					}
+					task.Awaitable = val.Value{}
+					if isCancelledError(exc) {
+						task.Future.Cancel(exc)
+					} else {
+						task.SetException(exc)
+					}
+				}
+				return
+			}
 			task.Awaitable = val.Value{}
 			task.Future.Cancel(pendingCancel)
 			return
@@ -495,16 +535,58 @@ func (l *EventLoop) stepTask(vm *VM, task *val.PyTask) {
 
 	if !pendingCancel.IsNone() && pendingCancel.HeaderPtr() != nil {
 		if !waitAw.IsNone() && waitAw.HeaderPtr() != nil {
-			cancelQueueAwaitable(waitAw)
+			cancelPendingAwaitable(waitAw)
+			if val.IsAsyncGenASend(waitAw) || val.IsAsyncGenAThrow(waitAw) {
+				var nextVal val.Value
+				var status val.IterStatus
+				if val.IsAsyncGenASend(waitAw) {
+					nextVal, status = val.AsAsyncGenASend(waitAw).Step(&vm.execCtx, val.NoneVal(), pendingCancel)
+				} else {
+					nextVal, status = val.AsAsyncGenAThrow(waitAw).Step(&vm.execCtx, val.NoneVal(), pendingCancel)
+				}
+				switch status {
+				case val.IterYielded:
+					if nextVal.IsFuture() || nextVal.IsTask() {
+						fut := nextVal.AsFuture()
+						if nextVal.IsTask() {
+							fut = &nextVal.AsTask().Future
+						}
+						task.SetWaiter(fut, waitAw)
+						fut.AddDoneCallback(func(v val.Value) {
+							l.queue.Push(task)
+						})
+					} else {
+						l.queue.Push(task)
+					}
+					return
+				case val.IterExhausted:
+					// Async generator suppressed CancelledError and yielded a value.
+					// Push the yielded value into the suspended coroutine's OP_AWAIT result slot
+					// and advance past OP_AWAIT so the coroutine resumes with nextVal.
+					if coro.State == val.CoroSuspended && coro.SP > 0 && coro.SP <= len(coro.Stack) {
+						coro.Stack[coro.SP-1] = nextVal
+						coro.IP++
+					}
+					pendingCancel = val.Value{}
+				default:
+					exc := vm.execCtx.ActiveException
+					vm.execCtx.ClearException()
+					if !exc.IsNone() && exc.HeaderPtr() != nil {
+						pendingCancel = exc
+					}
+				}
+			}
 		}
-		if coro.State == val.CoroCreated {
-			coro.State = val.CoroClosed
-			task.Coro = nil
-			vm.releaseCoroutine(coro)
-			task.Future.Cancel(pendingCancel)
-			return
+		if !pendingCancel.IsNone() && pendingCancel.HeaderPtr() != nil {
+			if coro.State == val.CoroCreated {
+				coro.State = val.CoroClosed
+				task.Coro = nil
+				vm.releaseCoroutine(coro)
+				task.Future.Cancel(pendingCancel)
+				return
+			}
+			vm.execCtx.Raise(pendingCancel)
 		}
-		vm.execCtx.Raise(pendingCancel)
 	}
 
 	sent := task.NextSent

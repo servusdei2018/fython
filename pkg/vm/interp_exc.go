@@ -314,6 +314,10 @@ func (vm *VM) opReturnSlow(st *loopState, ip, sp int, retVal val.Value) (int, in
 		vm.restoreCallerFrame(st, caller)
 		if mode == genModeAwait || mode == genModeYieldFrom {
 			vm.releaseEphemeralCoroutine(coro)
+			if st.activeAsyncGen != nil {
+				st.activeAsyncGen.AgAwait = val.NoneVal()
+				st.activeAsyncGen.SuspendedOnAwait = false
+			}
 			st.stack[retSP-1] = retVal
 			return callerIP + 1, retSP, ctlReload
 		}
@@ -323,6 +327,16 @@ func (vm *VM) opReturnSlow(st *loopState, ip, sp int, retVal val.Value) (int, in
 		}
 		st.stack[retSP-1] = retVal
 		return callerIP + 1, retSP, ctlReload
+	}
+	if st.activeAsyncGen != nil && st.frameIdx == st.genFrameIdx {
+		ag := st.activeAsyncGen
+		ag.State = val.AsyncGenClosed
+		ag.AgAwait = val.NoneVal()
+		ag.SuspendedOnAwait = false
+		ag.SP = sp
+		vm.releaseAsyncGenStack(ag)
+		st.result = retVal
+		return ip, sp, ctlExit
 	}
 	if st.frameIdx == st.startFrameIdx {
 		st.result = retVal

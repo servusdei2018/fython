@@ -30,7 +30,7 @@ func maybeCompileRegCode(vm *VM, co *CodeObject, cache *VMCodeCache) {
 	if co.regState.Load() != 0 {
 		return
 	}
-	if co.IsGenerator || co.IsCoroutine || co.CanSuspend ||
+	if co.IsGenerator || co.IsCoroutine || co.IsAsyncGenerator || co.CanSuspend ||
 		(co.Flags&(CO_GENERATOR|CO_COROUTINE|CO_ASYNC_GENERATOR)) != 0 {
 		co.regState.Store(2)
 		return

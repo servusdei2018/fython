@@ -209,6 +209,9 @@ func encodeCodeObject(buf []byte, co *CodeObject, sc *stringCollector) []byte {
 	if co.IsCoroutine {
 		flags |= CO_COROUTINE
 	}
+	if co.IsAsyncGenerator {
+		flags |= CO_ASYNC_GENERATOR
+	}
 	binary.LittleEndian.PutUint32(tmp4[:], flags)
 	buf = append(buf, tmp4[:]...)
 
@@ -759,6 +762,7 @@ func decodeCodeObject(r *binaryReader, stringTable []val.Value) (*CodeObject, er
 		Doc:                docVal,
 		IsGenerator:        (flags & CO_GENERATOR) != 0,
 		IsCoroutine:        (flags & CO_COROUTINE) != 0,
+		IsAsyncGenerator:   (flags & CO_ASYNC_GENERATOR) != 0,
 		ExceptionTable:     excTable,
 		LineSpans:          lineSpans,
 	}

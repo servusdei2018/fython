@@ -928,6 +928,9 @@ func (st *SymbolTable) visitExpr(exprID ExprID) error {
 		st.cur = genScope
 		currGenComp := comp
 		for {
+			if currGenComp.IsAsync {
+				genScope.IsCoroutine = true
+			}
 			st.bindTarget(currGenComp.Target)
 			for _, ifCond := range st.arena.GetExprSlice(currGenComp.IfConds) {
 				if err := st.visitExpr(ifCond); err != nil {
@@ -1069,6 +1072,9 @@ func (st *SymbolTable) visitExpr(exprID ExprID) error {
 		}
 
 	case ExprKindAwait:
+		if st.cur != nil && st.cur.Name == "<genexpr>" {
+			st.cur.IsCoroutine = true
+		}
 		if expr.Left != ExprNone {
 			return st.visitExpr(expr.Left)
 		}
