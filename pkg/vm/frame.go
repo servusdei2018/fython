@@ -234,22 +234,23 @@ const frameFlagSlowReturn = frameFlagHasAux | frameFlagCmp | frameFlagGenOrCoro
 // frameAux holds cold CallFrame state in VM.frameAux (lazily allocated side slice
 // indexed by frameIdx) so the hot CallFrame slab stays 64 bytes per entry.
 type frameAux struct {
-	cells        []val.Value
-	cellPtrs     []*val.PyCell
-	locals       val.Value
-	shadowFrame  *val.PyFrame
-	stack        []val.Value
-	activeGen    *val.PyGenerator
-	activeCoro   *val.PyCoroutine
-	genFrameIdx  int
-	genMode      uint8
-	genDefault   val.Value
-	genExitIP    int
-	joinState    *strJoinState
-	collectState *collectState
-	cmpLeft      val.Value
-	cmpRight     val.Value
-	cmpOp        uint8
+	cells         []val.Value
+	cellPtrs      []*val.PyCell
+	locals        val.Value
+	shadowFrame   *val.PyFrame
+	stack         []val.Value
+	activeGen     *val.PyGenerator
+	delegatedRoot *val.PyGenerator
+	activeCoro    *val.PyCoroutine
+	genFrameIdx   int
+	genMode       uint8
+	genDefault    val.Value
+	genExitIP     int
+	joinState     *strJoinState
+	collectState  *collectState
+	cmpLeft       val.Value
+	cmpRight      val.Value
+	cmpOp         uint8
 }
 
 // CallFrame is an unboxed 64-byte (single cache line) hot value struct stored in
@@ -1105,6 +1106,10 @@ type VM struct {
 	genCellPtrPools      [8][][]*val.PyCell
 	genResumeHook        func(ctx *val.ExecContext, gen *val.PyGenerator, val val.Value) (val.Value, val.IterStatus)
 	genReleaseHook       func(gen *val.PyGenerator)
+	genCloseHook         func(ctx *val.ExecContext, gen *val.PyGenerator)
+	genRunningHook       func(gen *val.PyGenerator) bool
+	pendingDelegatedRoot *val.PyGenerator
+	excNeedsCallerTB     bool
 	coroResumeHook       func(ctx *val.ExecContext, coro *val.PyCoroutine, val val.Value) (val.Value, val.IterStatus)
 	coroReleaseHook      func(coro *val.PyCoroutine)
 	jsonParser           *jsonParser
@@ -1436,6 +1441,11 @@ func (vm *VM) releaseGeneratorStack(gen *val.PyGenerator) {
 		return
 	}
 	gen.ClearYieldTuple()
+	gen.SubGen = nil
+	gen.LeafGen = nil
+	gen.LeafReuseGen = 0
+	gen.YieldFrom = val.Value{}
+	gen.YieldVal = val.Value{}
 	if gen.Stack != nil {
 		s := gen.Stack
 		gen.Stack = nil

@@ -2,6 +2,7 @@ package vm
 
 import (
 	"fmt"
+	"slices"
 	"sync/atomic"
 	"unsafe"
 
@@ -14,16 +15,13 @@ func (vm *VM) restoreCallerFrame(st *loopState, caller *CallFrame) {
 	co := cc.co
 	st.curCO = co
 	st.cache = cc
-	if cc != nil && len(cc.active) > 0 {
-		st.codePtr = unsafe.Pointer(unsafe.SliceData(cc.active))
-		st.codeLen = len(cc.active)
-	} else if cc != nil {
+	if cc != nil {
 		st.codePtr = cc.codePtr
 		st.codeLen = cc.codeLen
 	}
 	st.consts = cc.frameConsts(co)
 	st.base = caller.baseOffset
-	aux := vm.frameAuxAt(callerIdx)
+	aux := &vm.frameAux[callerIdx]
 	st.cells = aux.cells
 	st.cellPtrs = aux.cellPtrs
 	st.globals = caller.globals
@@ -32,6 +30,7 @@ func (vm *VM) restoreCallerFrame(st *loopState, caller *CallFrame) {
 	st.stackIsVM = caller.stackIsVM()
 	vm.execCtx.Stack = aux.stack
 	st.activeGen = aux.activeGen
+	st.delegatedRoot = aux.delegatedRoot
 	st.activeCoro = aux.activeCoro
 	st.genFrameIdx = aux.genFrameIdx
 	aux.cells = nil
@@ -41,6 +40,7 @@ func (vm *VM) restoreCallerFrame(st *loopState, caller *CallFrame) {
 	aux.genDefault = val.Value{}
 	aux.stack = nil
 	aux.activeGen = nil
+	aux.delegatedRoot = nil
 	aux.activeCoro = nil
 	caller.flags &^= frameFlagGenOrCoro | frameFlagHasAux
 	vm.activeCO = st.curCO
@@ -85,12 +85,21 @@ func (vm *VM) saveAndPushInlineFrame(
 		flags |= frameFlagStackIsVM
 	}
 	saved.flags = flags
-	aux := vm.frameAuxAt(frameIdx)
+	var aux *frameAux
+	if frameIdx < len(vm.frameAux) {
+		aux = &vm.frameAux[frameIdx]
+		if frameIdx+1 > vm.maxFrameAuxLen {
+			vm.maxFrameAuxLen = frameIdx + 1
+		}
+	} else {
+		aux = vm.frameAuxAt(frameIdx)
+	}
 	aux.cells = st.cells
 	aux.cellPtrs = st.cellPtrs
 	aux.locals = st.curLocals
 	aux.stack = st.stack
 	aux.activeGen = st.activeGen
+	aux.delegatedRoot = st.delegatedRoot
 	aux.activeCoro = st.activeCoro
 	aux.genFrameIdx = st.genFrameIdx
 	aux.genMode = mode
@@ -104,6 +113,7 @@ func (vm *VM) saveAndPushInlineFrame(
 	}
 	st.genFrameIdx = st.frameIdx
 	st.activeGen = gen
+	st.delegatedRoot = nil
 	st.activeCoro = coro
 	st.stack = childStack
 	st.stackIsVM = false
@@ -111,7 +121,7 @@ func (vm *VM) saveAndPushInlineFrame(
 	st.curCO = callee
 	st.cache = vm.cacheFor(callee)
 	st.codePtr, st.codeLen = vm.loadWindow(callee, st.cache)
-	if atomic.LoadInt32(&callee.IsTier2Optimized) == 0 {
+	if st.cache.tier2Done == 0 && atomic.LoadInt32(&callee.IsTier2Optimized) == 0 {
 		maybeOptimizeCodeObject(vm, callee, st.cache)
 		st.codePtr, st.codeLen = vm.loadWindow(callee, st.cache)
 	}
@@ -129,6 +139,250 @@ func (vm *VM) saveAndPushInlineFrame(
 	vm.activeCells = st.cells
 	vm.activeCellPtrs = st.cellPtrs
 	vm.activeFrameIdx = st.frameIdx
+}
+
+func (vm *VM) switchInlineGeneratorInPlace(st *loopState, gen *val.PyGenerator) {
+	if st.frameIdx >= 0 && st.frameIdx < len(vm.frames) && (vm.frames[st.frameIdx].flags&frameFlagHasShadow) != 0 {
+		vm.frames[st.frameIdx].flags &^= frameFlagHasShadow
+		if st.frameIdx < len(vm.frameAux) && vm.frameAux[st.frameIdx].shadowFrame != nil {
+			vm.frameAux[st.frameIdx].shadowFrame.Detach()
+			vm.frameAux[st.frameIdx].shadowFrame = nil
+		}
+	}
+	callee := AsCodeObject(gen.Code)
+	minCap := max(gen.Base+64, gen.Base+callee.NumLocals+callee.MaxStackSize+16)
+	if minCap > len(gen.Stack) {
+		s, newCls := vm.acquireGeneratorStack(minCap)
+		copy(s, gen.Stack)
+		old := gen.Stack
+		gen.Stack = s
+		gen.PoolClass = newCls
+		vm.releaseStackSlice(old)
+	}
+	if len(gen.Cells) > 0 && len(gen.CellPtrs) == 0 {
+		ptrs := vm.acquireGenCellPtrs(len(gen.Cells))
+		for i, c := range gen.Cells {
+			ptrs[i] = c.AsCell()
+		}
+		gen.CellPtrs = ptrs
+	}
+	st.curLocals = val.NoneVal()
+	st.activeGen = gen
+	st.activeCoro = nil
+	st.stack = gen.Stack
+	st.stackIsVM = false
+	vm.execCtx.Stack = gen.Stack
+	st.curCO = callee
+	st.cache = vm.cacheFor(callee)
+	st.codePtr, st.codeLen = vm.loadWindow(callee, st.cache)
+	if st.cache.tier2Done == 0 && atomic.LoadInt32(&callee.IsTier2Optimized) == 0 {
+		maybeOptimizeCodeObject(vm, callee, st.cache)
+		st.codePtr, st.codeLen = vm.loadWindow(callee, st.cache)
+	}
+	st.consts = st.cache.frameConsts(callee)
+	st.base = gen.Base
+	st.cells = gen.Cells
+	st.cellPtrs = gen.CellPtrs
+	if gen.Globals != nil {
+		st.globals = gen.Globals
+	} else {
+		st.globals = vm.globals
+	}
+	vm.activeCO = st.curCO
+	vm.activeBaseOffset = st.base
+	vm.activeCells = st.cells
+	vm.activeCellPtrs = st.cellPtrs
+	vm.activeFrameIdx = st.frameIdx
+}
+
+func findDelegationParent(root, child *val.PyGenerator) *val.PyGenerator {
+	for p := root; p != nil && p != child; p = p.SubGen {
+		if p.SubGen == child {
+			return p
+		}
+	}
+	return nil
+}
+
+func resolveDelegationLeaf(root *val.PyGenerator) (*val.PyGenerator, bool) {
+	cur := root
+	for cur.SubGen != nil {
+		next := cur.SubGen
+		if next.State == val.GenRunning {
+			return nil, true
+		}
+		if next.State == val.GenClosed {
+			return cur, false
+		}
+		cur = next
+	}
+	return cur, false
+}
+
+func isOnDelegationChain(root, activeLeaf, target *val.PyGenerator) bool {
+	for p := root; p != nil; p = p.SubGen {
+		if p == target {
+			return true
+		}
+		if p == activeLeaf {
+			return false
+		}
+	}
+	return false
+}
+
+func (vm *VM) isGeneratorRunning(gen *val.PyGenerator) bool {
+	if gen == nil {
+		return false
+	}
+	if gen.State == val.GenRunning {
+		return true
+	}
+	st := vm.activeState
+	if st == nil {
+		return false
+	}
+	if st.delegatedRoot != nil && isOnDelegationChain(st.delegatedRoot, st.activeGen, gen) {
+		return true
+	}
+	limit := min(st.frameIdx, len(vm.frameAux))
+	for i := range limit {
+		if root := vm.frameAux[i].delegatedRoot; root != nil {
+			if isOnDelegationChain(root, vm.frameAux[i].activeGen, gen) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func stopIterationValue(exc val.Value) val.Value {
+	if exc.IsInstance() {
+		if v, ok := exc.AsInstance().GetAttr(val.InternString("value")); ok {
+			return v
+		}
+		if args, ok := exc.AsInstance().GetAttr(val.InternString("args")); ok && args.IsTuple() {
+			items := args.AsTuple().Items
+			if len(items) > 0 {
+				return items[0]
+			}
+		}
+	}
+	return val.NoneVal()
+}
+
+func (vm *VM) closeGenerator(ctx *val.ExecContext, gen *val.PyGenerator) {
+	if gen == nil {
+		return
+	}
+	if gen.State == val.GenRunning || vm.isGeneratorRunning(gen) {
+		if ctx != nil {
+			ctx.Raise(val.NewValueError("generator already executing"))
+		}
+		return
+	}
+	if gen.State == val.GenClosed || gen.State == val.GenCreated {
+		gen.State = val.GenClosed
+		vm.releaseGeneratorStack(gen)
+		return
+	}
+
+	var chainBuf [16]*val.PyGenerator
+	chain := chainBuf[:0]
+	for cur := gen; cur != nil; cur = cur.SubGen {
+		if cur.State == val.GenRunning {
+			if ctx != nil {
+				ctx.Raise(val.NewValueError("generator already executing"))
+			}
+			return
+		}
+		chain = append(chain, cur)
+	}
+	for _, g := range chain {
+		g.SubGen = nil
+		g.LeafGen = nil
+		g.LeafReuseGen = 0
+	}
+
+	pendingExc := val.NewInstanceOfType(val.GeneratorExitType)
+	pendingIsGenExit := true
+
+	for i, g := range slices.Backward(chain) {
+		if g.State == val.GenClosed || g.State == val.GenCreated {
+			g.State = val.GenClosed
+			vm.releaseGeneratorStack(g)
+			continue
+		}
+		if i == len(chain)-1 && g.YieldFrom.HeaderPtr() != nil {
+			subiter := g.YieldFrom
+			g.YieldFrom = val.Value{}
+			if !subiter.IsIter() {
+				if closeMethod, ok := vm.lookupSubiterMethod(subiter, "close"); ok {
+					_ = vm.Vectorcall(closeMethod, nil, nil)
+					if vm.execCtx.HasException() {
+						exc := vm.execCtx.ActiveException
+						vm.execCtx.ClearException()
+						if !val.IsInstance(exc, val.GeneratorExitType) && !val.IsInstance(exc, val.StopIterationType) {
+							pendingExc = exc
+							pendingIsGenExit = false
+						}
+					}
+				}
+			}
+		}
+		g.YieldFrom = val.Value{}
+		if ctx == nil {
+			g.State = val.GenClosed
+			vm.releaseGeneratorStack(g)
+			continue
+		}
+		ctx.Raise(pendingExc)
+		_, status := vm.resumeGenerator(ctx, g, val.NoneVal())
+		switch {
+		case status == val.IterYielded:
+			g.State = val.GenClosed
+			vm.releaseGeneratorStack(g)
+			pendingExc = val.NewRuntimeError("generator ignored GeneratorExit")
+			pendingIsGenExit = false
+		case ctx.HasException():
+			exc := ctx.ActiveException
+			ctx.ClearException()
+			if val.IsInstance(exc, val.GeneratorExitType) || val.IsInstance(exc, val.StopIterationType) {
+				pendingExc = val.NewInstanceOfType(val.GeneratorExitType)
+				pendingIsGenExit = true
+			} else {
+				pendingExc = exc
+				pendingIsGenExit = false
+			}
+		default:
+			g.State = val.GenClosed
+			vm.releaseGeneratorStack(g)
+			pendingExc = val.NewInstanceOfType(val.GeneratorExitType)
+			pendingIsGenExit = true
+		}
+	}
+
+	if !pendingIsGenExit && ctx != nil {
+		ctx.Raise(pendingExc)
+	}
+}
+
+func (vm *VM) lookupSubiterMethod(subiter val.Value, name string) (val.Value, bool) {
+	attr := val.InternString(name)
+	if subiter.IsInstance() {
+		if m, ok := subiter.AsInstance().GetAttr(attr); ok {
+			return m, true
+		}
+	}
+	if tp := subiter.Type(); tp != nil {
+		if m, _, ok := tp.LookupMRO(attr); ok && m.HeaderPtr() != nil && !m.IsUnbound() {
+			if m.IsFunction() || m.IsBuiltinFunc() {
+				return val.NewBoundMethodVal(subiter, m), true
+			}
+			return m, true
+		}
+	}
+	return val.Value{}, false
 }
 
 const maxStrJoinScratchCap = 65536
@@ -651,22 +905,52 @@ func (vm *VM) findGenDrainCaller(st *loopState) (int, uint8) {
 
 func (vm *VM) earlyStopGenDrainCaller(st *loopState, callerIdx int, resultVal val.Value, ip, sp, ipDelta int) (int, int, loopCtl) {
 	outermostGen := st.activeGen
-	if st.frameIdx-1 > callerIdx && callerIdx+1 < len(vm.frameAux) && vm.frameAux[callerIdx+1].activeGen != nil {
+	if st.delegatedRoot != nil {
+		outermostGen = st.delegatedRoot
+	} else if st.frameIdx-1 > callerIdx && callerIdx+1 < len(vm.frameAux) && vm.frameAux[callerIdx+1].activeGen != nil {
 		outermostGen = vm.frameAux[callerIdx+1].activeGen
 	}
 	releaseChain := outermostGen != nil && (outermostGen.Header.Flags&val.FlagEphemeralGen) != 0
 	if st.activeGen != nil {
 		gen := st.activeGen
+		root := st.delegatedRoot
+		st.delegatedRoot = nil
 		if releaseChain && (gen.Header.Flags&val.FlagEphemeralGen) != 0 {
-			gen.State = val.GenClosed
-			vm.releaseGeneratorStack(gen)
-			vm.releaseGenerator(gen)
+			if root != nil {
+				for cur := root; cur != nil; {
+					next := cur.SubGen
+					cur.SubGen = nil
+					cur.LeafGen = nil
+					cur.LeafReuseGen = 0
+					if (cur.Header.Flags & val.FlagEphemeralGen) != 0 {
+						cur.State = val.GenClosed
+						vm.releaseGeneratorStack(cur)
+						vm.releaseGenerator(cur)
+					} else {
+						cur.State = val.GenSuspended
+					}
+					if cur == gen {
+						break
+					}
+					cur = next
+				}
+			} else {
+				gen.State = val.GenClosed
+				vm.releaseGeneratorStack(gen)
+				vm.releaseGenerator(gen)
+			}
 		} else {
 			gen.YieldVal = val.NoneVal()
 			gen.State = val.GenSuspended
 			gen.Stack = st.stack
 			gen.SP = sp
 			gen.IP = ip + ipDelta
+			if root != nil {
+				root.YieldVal = val.NoneVal()
+				root.State = val.GenSuspended
+				root.LeafGen = gen
+				root.LeafReuseGen = gen.ReuseGen
+			}
 		}
 	}
 	for st.frameIdx > callerIdx {
@@ -722,7 +1006,9 @@ func (vm *VM) earlyStopGenDrainCaller(st *loopState, callerIdx int, resultVal va
 func (vm *VM) failGenDrainCaller(st *loopState, callerIdx int, badVal, errExc val.Value, ip, sp int) (int, int, loopCtl) {
 	if st.activeGen != nil {
 		gen := st.activeGen
-		if (gen.Header.Flags & val.FlagEphemeralGen) != 0 {
+		root := st.delegatedRoot
+		st.delegatedRoot = nil
+		if root == nil && (gen.Header.Flags&val.FlagEphemeralGen) != 0 {
 			gen.State = val.GenClosed
 			vm.releaseGeneratorStack(gen)
 		} else {
@@ -731,6 +1017,12 @@ func (vm *VM) failGenDrainCaller(st *loopState, callerIdx int, badVal, errExc va
 			gen.Stack = st.stack
 			gen.SP = sp
 			gen.IP = ip + 1
+			if root != nil {
+				root.YieldVal = badVal
+				root.State = val.GenSuspended
+				root.LeafGen = gen
+				root.LeafReuseGen = gen.ReuseGen
+			}
 		}
 	}
 	for st.frameIdx > callerIdx {
@@ -787,11 +1079,71 @@ func (vm *VM) failStrJoinNonString(st *loopState, js *strJoinState, callerIdx in
 	return vm.failGenDrainCaller(st, callerIdx, badVal, val.NewTypeError(errMsg), ip, sp)
 }
 
+//go:noinline
+func (vm *VM) pushInlineDelegatedSlow(st *loopState, gen *val.PyGenerator, callerIP, callerSP, retSP, jumpTarget int, mode uint8, defaultVal, sentVal val.Value) (int, int, loopCtl) {
+	target, runningErr := resolveDelegationLeaf(gen)
+	if runningErr {
+		st.raiseExc = val.NewValueError("generator already executing")
+		return callerIP, callerSP, ctlRaise
+	}
+	targetCO := AsCodeObject(target.Code)
+	var delegatedRoot *val.PyGenerator
+	if target != gen {
+		switch target.State {
+		case val.GenCreated:
+			if !sentVal.IsNone() && sentVal.HeaderPtr() != nil {
+				st.raiseExc = val.NewTypeError("can't send non-None value to a just-started generator")
+				return callerIP, callerSP, ctlRaise
+			}
+			if target.IP == 0 {
+				target.IP = targetCO.EntryIP
+			}
+		case val.GenSuspended:
+			target.LastSent = sentVal
+			if target.SubGen == nil && target.YieldFrom.HeaderPtr() == nil && target.IP < len(targetCO.Code) && DecodeOpcode(targetCO.Code[target.IP]) != OP_YIELD_FROM {
+				target.Stack[target.SP] = sentVal
+				target.SP++
+			}
+		}
+		gen.State = val.GenRunning
+		gen.LeafGen = target
+		gen.LeafReuseGen = target.ReuseGen
+		delegatedRoot = gen
+	} else {
+		gen.LastSent = sentVal
+	}
+	target.State = val.GenRunning
+	minCap := max(target.Base+64, target.Base+targetCO.NumLocals+targetCO.MaxStackSize+16)
+	if minCap > len(target.Stack) {
+		s, newCls := vm.acquireGeneratorStack(minCap)
+		copy(s, target.Stack)
+		old := target.Stack
+		target.Stack = s
+		target.PoolClass = newCls
+		vm.releaseStackSlice(old)
+	}
+	if len(target.Cells) > 0 && len(target.CellPtrs) == 0 {
+		ptrs := vm.acquireGenCellPtrs(len(target.Cells))
+		for i, c := range target.Cells {
+			ptrs[i] = c.AsCell()
+		}
+		target.CellPtrs = ptrs
+	}
+	vm.saveAndPushInlineFrame(
+		st, targetCO, target.Stack, target.Base, target.Cells, target.CellPtrs, target.Globals,
+		callerIP, retSP, jumpTarget, mode, defaultVal, target, nil,
+	)
+	st.delegatedRoot = delegatedRoot
+	return target.IP, target.SP, ctlReload
+}
+
 // pushInlineGenerator pushes gen onto vm.frames directly inside the active
 // runLoopWithGlobals without recursing into resumeGenerator/runFrame.
 //
 //go:noinline
 func (vm *VM) pushInlineGenerator(st *loopState, gen *val.PyGenerator, callerIP, callerSP, retSP, jumpTarget int, mode uint8, defaultVal, sentVal val.Value) (int, int, loopCtl) {
+	var delegatedRoot *val.PyGenerator
+	target := gen
 	switch gen.State {
 	case val.GenClosed:
 		switch mode {
@@ -864,38 +1216,48 @@ func (vm *VM) pushInlineGenerator(st *loopState, gen *val.PyGenerator, callerIP,
 			gen.IP = AsCodeObject(gen.Code).EntryIP
 		}
 	case val.GenSuspended:
-		gen.LastSent = sentVal
-		callee := AsCodeObject(gen.Code)
-		if gen.IP < len(callee.Code) && DecodeOpcode(callee.Code[gen.IP]) != OP_YIELD_FROM {
-			gen.Stack[gen.SP] = sentVal
-			gen.SP++
+		if gen.SubGen != nil {
+			leaf := gen.LeafGen
+			if leaf == nil || leaf.State != val.GenSuspended || leaf.SubGen != nil || leaf.ReuseGen != gen.LeafReuseGen {
+				return vm.pushInlineDelegatedSlow(st, gen, callerIP, callerSP, retSP, jumpTarget, mode, defaultVal, sentVal)
+			}
+			gen.State = val.GenRunning
+			delegatedRoot = gen
+			target = leaf
+		}
+		target.LastSent = sentVal
+		callee := AsCodeObject(target.Code)
+		if target.YieldFrom.HeaderPtr() == nil && target.IP < len(callee.Code) && DecodeOpcode(callee.Code[target.IP]) != OP_YIELD_FROM {
+			target.Stack[target.SP] = sentVal
+			target.SP++
 		}
 	}
 
-	gen.State = val.GenRunning
-	callee := AsCodeObject(gen.Code)
-	minCap := max(gen.Base+64, gen.Base+callee.NumLocals+callee.MaxStackSize+16)
-	if minCap > len(gen.Stack) {
+	target.State = val.GenRunning
+	callee := AsCodeObject(target.Code)
+	minCap := max(target.Base+64, target.Base+callee.NumLocals+callee.MaxStackSize+16)
+	if minCap > len(target.Stack) {
 		s, newCls := vm.acquireGeneratorStack(minCap)
-		copy(s, gen.Stack)
-		old := gen.Stack
-		gen.Stack = s
-		gen.PoolClass = newCls
+		copy(s, target.Stack)
+		old := target.Stack
+		target.Stack = s
+		target.PoolClass = newCls
 		vm.releaseStackSlice(old)
 	}
-	if len(gen.Cells) > 0 && len(gen.CellPtrs) == 0 {
-		ptrs := vm.acquireGenCellPtrs(len(gen.Cells))
-		for i, c := range gen.Cells {
+	if len(target.Cells) > 0 && len(target.CellPtrs) == 0 {
+		ptrs := vm.acquireGenCellPtrs(len(target.Cells))
+		for i, c := range target.Cells {
 			ptrs[i] = c.AsCell()
 		}
-		gen.CellPtrs = ptrs
+		target.CellPtrs = ptrs
 	}
 
 	vm.saveAndPushInlineFrame(
-		st, callee, gen.Stack, gen.Base, gen.Cells, gen.CellPtrs, gen.Globals,
-		callerIP, retSP, jumpTarget, mode, defaultVal, gen, nil,
+		st, callee, target.Stack, target.Base, target.Cells, target.CellPtrs, target.Globals,
+		callerIP, retSP, jumpTarget, mode, defaultVal, target, nil,
 	)
-	return gen.IP, gen.SP, ctlReload
+	st.delegatedRoot = delegatedRoot
+	return target.IP, target.SP, ctlReload
 }
 
 // pushInlineCoroutine pushes coro onto vm.frames directly inside the active
@@ -987,6 +1349,13 @@ func (vm *VM) suspendActiveChain(st *loopState, yieldVal val.Value, resumeIP, re
 		st.activeGen.Stack = st.stack
 		st.activeGen.SP = resumeSP
 		st.activeGen.IP = resumeIP
+		if root := st.delegatedRoot; root != nil {
+			root.YieldVal = yieldVal
+			root.State = val.GenSuspended
+			root.LeafGen = st.activeGen
+			root.LeafReuseGen = st.activeGen.ReuseGen
+			st.delegatedRoot = nil
+		}
 	} else if st.activeCoro != nil {
 		st.activeCoro.YieldVal = yieldVal
 		st.activeCoro.State = val.CoroSuspended
@@ -1046,7 +1415,7 @@ func (vm *VM) isDrainingActiveGen(st *loopState) bool {
 		return false
 	}
 	if st.frameIdx == st.startFrameIdx {
-		return st.activeGen == vm.activeDrainGen
+		return st.activeGen == vm.activeDrainGen || st.delegatedRoot == vm.activeDrainGen
 	}
 	if st.frameIdx != st.genFrameIdx {
 		return false
@@ -1210,7 +1579,7 @@ func (vm *VM) opYieldValue(st *loopState, ip, sp int) (int, int, loopCtl) {
 			stack[sp] = val.NoneVal()
 			return ip + 1, sp + 1, ctlNext
 		}
-		if vm.activeJoinGen == st.activeGen && st.frameIdx == st.startFrameIdx {
+		if vm.activeJoinGen != nil && (vm.activeJoinGen == st.activeGen || vm.activeJoinGen == st.delegatedRoot) && st.frameIdx == st.startFrameIdx {
 			vm.appendJoinItem(yieldVal)
 			stack[sp] = val.NoneVal()
 			sp++
@@ -1240,19 +1609,85 @@ func (vm *VM) opYieldFrom(st *loopState, ip, sp int) (int, int, loopCtl) {
 	}
 	sentVal := val.NoneVal()
 	if st.activeGen != nil {
-		sentVal = st.activeGen.LastSent
-		st.activeGen.LastSent = val.NoneVal()
+		// Per PEP 380, initial entry into `yield from sub` always primes/advances
+		// sub with None even when sub is already GenSuspended.
+		if st.activeGen.SubGen == nil && st.activeGen.YieldFrom.HeaderPtr() == nil {
+			st.activeGen.LastSent = val.NoneVal()
+		} else {
+			sentVal = st.activeGen.LastSent
+			st.activeGen.LastSent = val.NoneVal()
+		}
 	} else if st.activeCoro != nil {
 		sentVal = st.activeCoro.LastSent
 		st.activeCoro.LastSent = val.NoneVal()
 	}
-	if st.activeGen != nil && vm.activeJoinGen == st.activeGen && st.frameIdx == st.startFrameIdx {
+	if subiter.IsGenerator() {
+		subGen := subiter.AsGenerator()
+		if st.activeGen != nil && st.frameIdx == st.genFrameIdx {
+			curGen := st.activeGen
+			if subGen.State == val.GenClosed {
+				curGen.SubGen = nil
+				curGen.LeafGen = nil
+				curGen.LeafReuseGen = 0
+				curGen.YieldFrom = val.Value{}
+				stack[sp-1] = subGen.RetVal
+				vm.releaseGenerator(subGen)
+				return ip + 1, sp, ctlReload
+			}
+			if subGen.State == val.GenRunning {
+				st.raiseExc = val.NewValueError("generator already executing")
+				return ip, sp, ctlRaise
+			}
+			target := subGen
+			if subGen.State == val.GenSuspended && subGen.SubGen != nil {
+				t, runningErr := resolveDelegationLeaf(subGen)
+				if runningErr {
+					st.raiseExc = val.NewValueError("generator already executing")
+					return ip, sp, ctlRaise
+				}
+				target = t
+			}
+			switch target.State {
+			case val.GenCreated:
+				if !sentVal.IsNone() && sentVal.HeaderPtr() != nil {
+					st.raiseExc = val.NewTypeError("can't send non-None value to a just-started generator")
+					return ip, sp, ctlRaise
+				}
+				if target.IP == 0 {
+					target.IP = AsCodeObject(target.Code).EntryIP
+				}
+			case val.GenSuspended:
+				target.LastSent = sentVal
+				tco := AsCodeObject(target.Code)
+				if target.SubGen == nil && target.YieldFrom.HeaderPtr() == nil && target.IP < len(tco.Code) && DecodeOpcode(tco.Code[target.IP]) != OP_YIELD_FROM {
+					target.Stack[target.SP] = sentVal
+					target.SP++
+				}
+			}
+			curGen.Stack = stack
+			curGen.SP = sp
+			curGen.IP = ip
+			curGen.SubGen = subGen
+			curGen.YieldFrom = val.Value{}
+			if st.delegatedRoot == nil {
+				st.delegatedRoot = curGen
+				curGen.State = val.GenRunning
+			} else {
+				curGen.State = val.GenSuspended
+			}
+			st.delegatedRoot.LeafGen = target
+			st.delegatedRoot.LeafReuseGen = target.ReuseGen
+			target.State = val.GenRunning
+			vm.switchInlineGeneratorInPlace(st, target)
+			return target.IP, target.SP, ctlReload
+		}
+		return vm.pushInlineGenerator(st, subGen, ip, sp, sp, 0, genModeYieldFrom, val.Value{}, sentVal)
+	}
+	if st.activeGen != nil && vm.activeJoinGen != nil && (vm.activeJoinGen == st.activeGen || vm.activeJoinGen == st.delegatedRoot) && st.frameIdx == st.startFrameIdx {
 		for {
 			var nextVal val.Value
 			var status val.IterStatus
-			if subiter.IsGenerator() {
-				nextVal, status = subiter.AsGenerator().Send(&vm.execCtx, val.NoneVal())
-			} else if subiter.IsCoroutine() {
+			if subiter.IsCoroutine() {
 				nextVal, status = vm.resumeCoroutine(&vm.execCtx, subiter.AsCoroutine(), val.NoneVal())
 			} else if tpIterNext := subiter.Type().Slots.TpIterNext; tpIterNext != nil {
 				nextVal, status = tpIterNext(&vm.execCtx, subiter)
@@ -1265,20 +1700,18 @@ func (vm *VM) opYieldFrom(st *loopState, ip, sp int) (int, int, loopCtl) {
 			}
 			if status == val.IterExhausted {
 				retVal := val.NoneVal()
-				if subiter.IsGenerator() {
-					subGen := subiter.AsGenerator()
-					retVal = subGen.RetVal
-					vm.releaseGenerator(subGen)
-				} else if subiter.IsCoroutine() {
+				if subiter.IsCoroutine() {
 					retVal = subiter.AsCoroutine().RetVal
 					vm.releaseCoroutine(subiter.AsCoroutine())
 				}
+				st.activeGen.YieldFrom = val.Value{}
 				stack[sp-1] = retVal
 				break
 			}
 			if vm.execCtx.HasException() {
 				exc := vm.execCtx.ActiveException
 				vm.execCtx.ClearException()
+				st.activeGen.YieldFrom = val.Value{}
 				st.raiseExc = exc
 				return ip, sp, ctlRaise
 			}
@@ -1286,9 +1719,6 @@ func (vm *VM) opYieldFrom(st *loopState, ip, sp int) (int, int, loopCtl) {
 		}
 		ip++
 		return ip, sp, ctlReload
-	}
-	if subiter.IsGenerator() {
-		return vm.pushInlineGenerator(st, subiter.AsGenerator(), ip, sp, sp, 0, genModeYieldFrom, val.Value{}, sentVal)
 	}
 	if subiter.IsCoroutine() {
 		return vm.pushInlineCoroutine(st, subiter.AsCoroutine(), ip, sp, sp, genModeYieldFrom, sentVal)
@@ -1307,12 +1737,18 @@ func (vm *VM) opYieldFrom(st *loopState, ip, sp int) (int, int, loopCtl) {
 				continue
 			}
 			if status == val.IterExhausted {
+				if st.activeGen != nil {
+					st.activeGen.YieldFrom = val.Value{}
+				}
 				stack[sp-1] = val.NoneVal()
 				break
 			}
 			if vm.execCtx.HasException() {
 				exc := vm.execCtx.ActiveException
 				vm.execCtx.ClearException()
+				if st.activeGen != nil {
+					st.activeGen.YieldFrom = val.Value{}
+				}
 				st.raiseExc = exc
 				return ip, sp, ctlRaise
 			}
@@ -1353,12 +1789,18 @@ func (vm *VM) opYieldFrom(st *loopState, ip, sp int) (int, int, loopCtl) {
 				continue
 			}
 			if status == val.IterExhausted {
+				if st.activeGen != nil {
+					st.activeGen.YieldFrom = val.Value{}
+				}
 				stack[sp-1] = val.NoneVal()
 				break
 			}
 			if vm.execCtx.HasException() {
 				exc := vm.execCtx.ActiveException
 				vm.execCtx.ClearException()
+				if st.activeGen != nil {
+					st.activeGen.YieldFrom = val.Value{}
+				}
 				st.raiseExc = exc
 				return ip, sp, ctlRaise
 			}
@@ -1369,38 +1811,72 @@ func (vm *VM) opYieldFrom(st *loopState, ip, sp int) (int, int, loopCtl) {
 	}
 	var nextVal val.Value
 	var status val.IterStatus
-	if subiter.IsGenerator() {
-		nextVal, status = subiter.AsGenerator().Send(&vm.execCtx, sentVal)
-	} else if subiter.IsCoroutine() {
-		nextVal, status = vm.resumeCoroutine(&vm.execCtx, subiter.AsCoroutine(), sentVal)
+	if !sentVal.IsNone() && sentVal.HeaderPtr() != nil && !subiter.IsIter() {
+		if sendMethod, ok := vm.lookupSubiterMethod(subiter, "send"); ok {
+			nextVal = vm.Vectorcall(sendMethod, []val.Value{sentVal}, nil)
+			if vm.execCtx.HasException() {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				if val.IsInstance(exc, val.StopIterationType) {
+					if st.activeGen != nil {
+						st.activeGen.YieldFrom = val.Value{}
+					}
+					stack[sp-1] = stopIterationValue(exc)
+					return ip + 1, sp, ctlReload
+				}
+				if st.activeGen != nil {
+					st.activeGen.YieldFrom = val.Value{}
+				}
+				st.raiseExc = exc
+				return ip, sp, ctlRaise
+			}
+			status = val.IterYielded
+		} else {
+			if st.activeGen != nil {
+				st.activeGen.YieldFrom = val.Value{}
+			}
+			st.raiseExc = val.NewAttributeError(fmt.Sprintf("'%s' object has no attribute 'send'", subiter.Type().Name))
+			return ip, sp, ctlRaise
+		}
 	} else if tpIterNext := subiter.Type().Slots.TpIterNext; tpIterNext != nil {
 		nextVal, status = tpIterNext(&vm.execCtx, subiter)
 	} else {
+		if st.activeGen != nil {
+			st.activeGen.YieldFrom = val.Value{}
+		}
 		ip++
 		return ip, sp, ctlReload
 	}
 
 	switch {
 	case status == val.IterYielded:
-		if st.activeGen != nil || st.activeCoro != nil {
+		if st.activeGen != nil {
+			st.activeGen.YieldFrom = subiter
+			return vm.suspendActiveChain(st, nextVal, ip, sp)
+		}
+		if st.activeCoro != nil {
 			return vm.suspendActiveChain(st, nextVal, ip, sp)
 		}
 	case status == val.IterExhausted:
 		retVal := val.NoneVal()
-		if subiter.IsGenerator() {
-			subGen := subiter.AsGenerator()
-			retVal = subGen.RetVal
-			vm.releaseGenerator(subGen)
-		} else if subiter.IsCoroutine() {
-			coro := subiter.AsCoroutine()
-			retVal = coro.RetVal
-			vm.releaseEphemeralCoroutine(coro)
+		if subiter.IsInstance() && nextVal.HeaderPtr() != nil {
+			retVal = nextVal
+		}
+		if st.activeGen != nil {
+			st.activeGen.YieldFrom = val.Value{}
 		}
 		stack[sp-1] = retVal
 		ip++
 	case vm.execCtx.HasException():
 		exc := vm.execCtx.ActiveException
 		vm.execCtx.ClearException()
+		if st.activeGen != nil {
+			st.activeGen.YieldFrom = val.Value{}
+		}
+		if val.IsInstance(exc, val.StopIterationType) {
+			stack[sp-1] = stopIterationValue(exc)
+			return ip + 1, sp, ctlReload
+		}
 		st.raiseExc = exc
 		return ip, sp, ctlRaise
 	}

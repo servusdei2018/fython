@@ -175,6 +175,28 @@ func (vm *VM) opReturnSlow(st *loopState, ip, sp int, retVal val.Value) (int, in
 		gen.State = val.GenClosed
 		gen.SP = sp
 		vm.releaseGeneratorStack(gen)
+		if st.delegatedRoot != nil {
+			parent := findDelegationParent(st.delegatedRoot, gen)
+			vm.releaseGenerator(gen)
+			if parent != nil {
+				parent.SubGen = nil
+				parent.LeafGen = nil
+				parent.LeafReuseGen = 0
+				parent.YieldFrom = val.Value{}
+				parent.Stack[parent.SP-1] = retVal
+				parent.IP++
+				if parent == st.delegatedRoot {
+					st.delegatedRoot = nil
+				} else {
+					st.delegatedRoot.LeafGen = parent
+					st.delegatedRoot.LeafReuseGen = parent.ReuseGen
+					parent.State = val.GenRunning
+				}
+				vm.switchInlineGeneratorInPlace(st, parent)
+				return parent.IP, parent.SP, ctlReload
+			}
+			st.delegatedRoot = nil
+		}
 		if st.frameIdx == st.startFrameIdx {
 			st.result = retVal
 			return ip, sp, ctlExit

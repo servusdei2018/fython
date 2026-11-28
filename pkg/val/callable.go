@@ -7289,6 +7289,32 @@ func initTypes() {
 		}
 		return v
 	}))
+	GeneratorType.Dict.Set(InternString("gi_running"), NewPropertyVal(NewBuiltinFuncVal("gi_running", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 || !args[0].IsGenerator() {
+			return BoolVal(false)
+		}
+		gen := args[0].AsGenerator()
+		if gen.State == GenRunning {
+			return BoolVal(true)
+		}
+		if gen.IsRunningHook != nil {
+			return BoolVal(gen.IsRunningHook(gen))
+		}
+		return BoolVal(false)
+	}), NoneVal(), NoneVal()))
+	GeneratorType.Dict.Set(InternString("gi_yieldfrom"), NewPropertyVal(NewBuiltinFuncVal("gi_yieldfrom", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 || !args[0].IsGenerator() {
+			return NoneVal()
+		}
+		gen := args[0].AsGenerator()
+		if gen.SubGen != nil {
+			return ObjectVal(&gen.SubGen.Header)
+		}
+		if gen.YieldFrom.HeaderPtr() != nil {
+			return gen.YieldFrom
+		}
+		return NoneVal()
+	}), NoneVal(), NoneVal()))
 
 	CoroutineType = MustNewType("coroutine", []*PyType{ObjectType}, nil)
 	CoroutineType.Slots.TpIter = func(ctx *ExecContext, o Value) Value { return o }

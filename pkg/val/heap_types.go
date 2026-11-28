@@ -412,26 +412,33 @@ const (
 // PyGenerator represents a frame-detaching Python generator object on the heap.
 // Header MUST be at offset 0.
 type PyGenerator struct {
-	Header      ObjectHeader
-	Name        string
-	Code        Value
-	Globals     *PyDict
-	YieldVal    Value
-	RetVal      Value
-	LastSent    Value
-	ResumeHook  func(ctx *ExecContext, gen *PyGenerator, val Value) (Value, IterStatus)
-	ReleaseHook func(gen *PyGenerator)
-	Stack       []Value
-	Cells       []Value
-	YieldTuple  *PyTuple
-	CellPtrs    []*PyCell
-	SP          int
-	Base        int
-	IP          int
-	MaxSP       int
-	State       GenState
-	PoolClass   uint8
-	OwnCells    bool
+	Header        ObjectHeader
+	Name          string
+	Code          Value
+	Globals       *PyDict
+	YieldVal      Value
+	RetVal        Value
+	LastSent      Value
+	YieldFrom     Value
+	ResumeHook    func(ctx *ExecContext, gen *PyGenerator, val Value) (Value, IterStatus)
+	ReleaseHook   func(gen *PyGenerator)
+	CloseHook     func(ctx *ExecContext, gen *PyGenerator)
+	IsRunningHook func(gen *PyGenerator) bool
+	SubGen        *PyGenerator
+	LeafGen       *PyGenerator
+	Stack         []Value
+	Cells         []Value
+	YieldTuple    *PyTuple
+	CellPtrs      []*PyCell
+	SP            int
+	Base          int
+	IP            int
+	MaxSP         int
+	ReuseGen      uint32
+	LeafReuseGen  uint32
+	State         GenState
+	PoolClass     uint8
+	OwnCells      bool
 }
 
 // ClearYieldTuple zeroes inline element references on the generator's reusable
@@ -2236,6 +2243,10 @@ func (g *PyGenerator) Send(ctx *ExecContext, val Value) (Value, IterStatus) {
 
 // Close closes the generator, marks it GenClosed, and releases pooled stacks.
 func (g *PyGenerator) Close(ctx *ExecContext) {
+	if g.CloseHook != nil {
+		g.CloseHook(ctx, g)
+		return
+	}
 	if g.State == GenClosed || g.State == GenCreated {
 		g.State = GenClosed
 		if g.ReleaseHook != nil && g.Stack != nil {

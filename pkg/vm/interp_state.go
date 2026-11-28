@@ -41,10 +41,11 @@ type loopState struct {
 	periodicTick  uint32
 
 	// Entry/exit handoff and helper channels.
-	ip       int
-	sp       int
-	result   val.Value
-	raiseExc val.Value
+	ip            int
+	sp            int
+	result        val.Value
+	raiseExc      val.Value
+	delegatedRoot *val.PyGenerator
 }
 
 // Compile-time check that val.Value is 16 bytes for indexed stackPtr/constsPtr loads.
@@ -218,6 +219,7 @@ func (vm *VM) syncActiveFrame(st *loopState, ip int) {
 			aux.locals = st.curLocals
 			aux.stack = st.stack
 			aux.activeGen = st.activeGen
+			aux.delegatedRoot = st.delegatedRoot
 			aux.activeCoro = st.activeCoro
 			aux.genFrameIdx = st.genFrameIdx
 			flags |= frameFlagHasAux
