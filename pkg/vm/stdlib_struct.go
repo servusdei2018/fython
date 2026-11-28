@@ -8,7 +8,6 @@ import (
 	"math/big"
 	"strconv"
 	"sync"
-	"unicode"
 
 	"github.com/servusdei2018/fython/pkg/val"
 )
@@ -28,17 +27,25 @@ type structField struct {
 }
 
 type parsedFormat struct {
-	fmtStr   string
-	order    binary.ByteOrder
-	isNative bool
-	fields   []structField
-	size     int
-	numArgs  int
+	fmtStr    string
+	order     binary.ByteOrder
+	isNative  bool
+	bigEndian bool
+	fields    []structField
+	size      int
+	numArgs   int
 }
 
 var (
 	structCacheMu sync.RWMutex
 	structCache   = make(map[string]*parsedFormat)
+	// Fast identity cache for repeated same format object (common in loops).
+	// Same immutable Value implies same format content, so pointer/inline
+	// equality is sufficient without converting to Go string.
+	structFastMu    sync.RWMutex
+	structFastVal   val.Value
+	structFastPF    *parsedFormat
+	structFastValid bool
 )
 
 func getFormatString(v val.Value) (string, error) {
@@ -64,11 +71,13 @@ func parseStructFormat(fmtStr string) (*parsedFormat, error) {
 
 	var order binary.ByteOrder = binary.LittleEndian
 	isNative := true
-	runes := []rune(fmtStr)
+	// Format strings are ASCII; iterate bytes to avoid []rune allocation.
+	// Non-ASCII bytes are rejected as bad chars (parity with CPython).
 	idx := 0
+	n := len(fmtStr)
 
-	if len(runes) > 0 {
-		switch runes[0] {
+	if n > 0 {
+		switch fmtStr[0] {
 		case '@':
 			isNative = true
 			order = binary.LittleEndian
@@ -92,30 +101,36 @@ func parseStructFormat(fmtStr string) (*parsedFormat, error) {
 	totalSize := 0
 	numArgs := 0
 
-	for idx < len(runes) {
-		r := runes[idx]
-		if unicode.IsSpace(r) {
+	for idx < n {
+		r := fmtStr[idx]
+		if r == ' ' || r == '\t' || r == '\n' || r == '\r' || r == '\v' || r == '\f' {
 			idx++
 			continue
+		}
+		if r >= 0x80 {
+			return nil, fmt.Errorf("bad char in struct format: %c", rune(r))
 		}
 
 		repeat := 1
 		hasRepeat := false
-		if unicode.IsDigit(r) {
+		if r >= '0' && r <= '9' {
 			hasRepeat = true
 			start := idx
-			for idx < len(runes) && unicode.IsDigit(runes[idx]) {
+			for idx < n && fmtStr[idx] >= '0' && fmtStr[idx] <= '9' {
 				idx++
 			}
-			repNum, err := strconv.Atoi(string(runes[start:idx]))
+			repNum, err := strconv.Atoi(fmtStr[start:idx])
 			if err != nil {
 				return nil, errors.New("bad repeat count")
 			}
 			repeat = repNum
-			if idx >= len(runes) {
+			if idx >= n {
 				return nil, errors.New("repeat count without format character")
 			}
-			r = runes[idx]
+			r = fmtStr[idx]
+			if r >= 0x80 {
+				return nil, fmt.Errorf("bad char in struct format: %c", rune(r))
+			}
 		}
 		idx++
 
@@ -124,10 +139,10 @@ func parseStructFormat(fmtStr string) (*parsedFormat, error) {
 
 		// Complex types: Zf (2x float=8), Zd (2x double=16). Zg not supported by struct.
 		if r == 'Z' {
-			if idx >= len(runes) {
+			if idx >= n {
 				return nil, fmt.Errorf("bad char in struct format: %c", r)
 			}
-			sub := runes[idx]
+			sub := fmtStr[idx]
 			switch sub {
 			case 'f':
 				elemSize = 8
@@ -204,18 +219,99 @@ func parseStructFormat(fmtStr string) (*parsedFormat, error) {
 	}
 
 	pf := &parsedFormat{
-		fmtStr:   fmtStr,
-		order:    order,
-		isNative: isNative,
-		fields:   fields,
-		size:     totalSize,
-		numArgs:  numArgs,
+		fmtStr:    fmtStr,
+		order:     order,
+		isNative:  isNative,
+		bigEndian: order == binary.BigEndian,
+		fields:    fields,
+		size:      totalSize,
+		numArgs:   numArgs,
 	}
 
 	structCacheMu.Lock()
 	structCache[fmtStr] = pf
 	structCacheMu.Unlock()
 	return pf, nil
+}
+
+// parseStructFormatVal resolves a format Value to a compiled plan, using a
+// fast identity cache for the common case of the same format object reused
+// in a loop. Same immutable Value implies same content, so Value equality
+// avoids Go string conversion and map hashing on hits.
+// Only immutable str/bytes formats use the identity cache; mutable bytearray
+// formats always revalidate since the same object may hold new content.
+func parseStructFormatVal(v val.Value) (*parsedFormat, error) {
+	cacheable := v.IsAnyString() || v.IsBytes()
+	if cacheable {
+		structFastMu.RLock()
+		if structFastValid && structFastVal == v && structFastPF != nil {
+			pf := structFastPF
+			structFastMu.RUnlock()
+			return pf, nil
+		}
+		structFastMu.RUnlock()
+	}
+	fmtStr, err := getFormatString(v)
+	if err != nil {
+		return nil, err
+	}
+	pf, err := parseStructFormat(fmtStr)
+	if err != nil {
+		return nil, err
+	}
+	if cacheable {
+		structFastMu.Lock()
+		structFastVal = v
+		structFastPF = pf
+		structFastValid = true
+		structFastMu.Unlock()
+	}
+	return pf, nil
+}
+
+func putU16(pf *parsedFormat, buf []byte, v uint16) {
+	if pf.bigEndian {
+		binary.BigEndian.PutUint16(buf, v)
+	} else {
+		binary.LittleEndian.PutUint16(buf, v)
+	}
+}
+
+func putU32(pf *parsedFormat, buf []byte, v uint32) {
+	if pf.bigEndian {
+		binary.BigEndian.PutUint32(buf, v)
+	} else {
+		binary.LittleEndian.PutUint32(buf, v)
+	}
+}
+
+func putU64(pf *parsedFormat, buf []byte, v uint64) {
+	if pf.bigEndian {
+		binary.BigEndian.PutUint64(buf, v)
+	} else {
+		binary.LittleEndian.PutUint64(buf, v)
+	}
+}
+
+func getU16(pf *parsedFormat, buf []byte) uint16 {
+	if pf.bigEndian {
+		return binary.BigEndian.Uint16(buf)
+	}
+	return binary.LittleEndian.Uint16(buf)
+}
+
+func getU32(pf *parsedFormat, buf []byte) uint32 {
+	if pf.bigEndian {
+		return binary.BigEndian.Uint32(buf)
+	}
+	return binary.LittleEndian.Uint32(buf)
+}
+
+func getU64(pf *parsedFormat, buf []byte) uint64 {
+	if pf.bigEndian {
+		return binary.BigEndian.Uint64(buf)
+	}
+	return binary.LittleEndian.Uint64(buf)
 }
 
 func packValues(pf *parsedFormat, args []val.Value, buf []byte) error {
@@ -307,28 +403,28 @@ func packValues(pf *parsedFormat, args []val.Value, buf []byte) error {
 				if num < -32768 || num > 32767 {
 					return errors.New("short format requires -32768 <= number <= 32767")
 				}
-				pf.order.PutUint16(buf[offset:], uint16(int16(num)))
+				putU16(pf, buf[offset:], uint16(int16(num)))
 			case 'H':
 				num := v.AsInt64()
 				if num < 0 || num > 65535 {
 					return errors.New("ushort format requires 0 <= number <= 65535")
 				}
-				pf.order.PutUint16(buf[offset:], uint16(num))
+				putU16(pf, buf[offset:], uint16(num))
 			case 'i', 'l':
 				num := v.AsInt64()
 				if num < -2147483648 || num > 2147483647 {
 					return errors.New("int format requires -2147483648 <= number <= 2147483647")
 				}
-				pf.order.PutUint32(buf[offset:], uint32(int32(num)))
+				putU32(pf, buf[offset:], uint32(int32(num)))
 			case 'I', 'L':
 				num := v.AsInt64()
 				if num < 0 || num > 4294967295 {
 					return errors.New("uint format requires 0 <= number <= 4294967295")
 				}
-				pf.order.PutUint32(buf[offset:], uint32(num))
+				putU32(pf, buf[offset:], uint32(num))
 			case 'q', 'n':
 				num := v.AsInt64()
-				pf.order.PutUint64(buf[offset:], uint64(num))
+				putU64(pf, buf[offset:], uint64(num))
 			case 'Q', 'N', 'P':
 				var u uint64
 				switch {
@@ -339,7 +435,7 @@ func packValues(pf *parsedFormat, args []val.Value, buf []byte) error {
 				default:
 					return errors.New("required integer for Q format")
 				}
-				pf.order.PutUint64(buf[offset:], u)
+				putU64(pf, buf[offset:], u)
 			case 'f':
 				var fl float64
 				switch {
@@ -350,7 +446,7 @@ func packValues(pf *parsedFormat, args []val.Value, buf []byte) error {
 				default:
 					return errors.New("required float for f format")
 				}
-				pf.order.PutUint32(buf[offset:], math.Float32bits(float32(fl)))
+				putU32(pf, buf[offset:], math.Float32bits(float32(fl)))
 			case 'd':
 				var fl float64
 				switch {
@@ -361,7 +457,7 @@ func packValues(pf *parsedFormat, args []val.Value, buf []byte) error {
 				default:
 					return errors.New("required float for d format")
 				}
-				pf.order.PutUint64(buf[offset:], math.Float64bits(fl))
+				putU64(pf, buf[offset:], math.Float64bits(fl))
 			}
 			offset += field.size
 		}
@@ -415,38 +511,137 @@ func unpackValues(pf *parsedFormat, buf []byte) ([]val.Value, error) {
 			case 'B':
 				results = append(results, val.Int64Val(int64(buf[offset])))
 			case 'h':
-				u := pf.order.Uint16(buf[offset:])
+				u := getU16(pf, buf[offset:])
 				results = append(results, val.Int64Val(int64(int16(u))))
 			case 'H':
-				u := pf.order.Uint16(buf[offset:])
+				u := getU16(pf, buf[offset:])
 				results = append(results, val.Int64Val(int64(u)))
 			case 'i', 'l':
-				u := pf.order.Uint32(buf[offset:])
+				u := getU32(pf, buf[offset:])
 				results = append(results, val.Int64Val(int64(int32(u))))
 			case 'I', 'L':
-				u := pf.order.Uint32(buf[offset:])
+				u := getU32(pf, buf[offset:])
 				results = append(results, val.Int64Val(int64(u)))
 			case 'q', 'n':
-				u := pf.order.Uint64(buf[offset:])
+				u := getU64(pf, buf[offset:])
 				results = append(results, val.Int64Val(int64(u)))
 			case 'Q', 'N', 'P':
-				u := pf.order.Uint64(buf[offset:])
+				u := getU64(pf, buf[offset:])
 				if u <= math.MaxInt64 {
 					results = append(results, val.Int64Val(int64(u)))
 				} else {
 					results = append(results, val.NewBigIntVal(new(big.Int).SetUint64(u)))
 				}
 			case 'f':
-				bits := pf.order.Uint32(buf[offset:])
+				bits := getU32(pf, buf[offset:])
 				results = append(results, val.Float64Val(float64(math.Float32frombits(bits))))
 			case 'd':
-				bits := pf.order.Uint64(buf[offset:])
+				bits := getU64(pf, buf[offset:])
 				results = append(results, val.Float64Val(math.Float64frombits(bits)))
 			}
 			offset += field.size
 		}
 	}
 	return results, nil
+}
+
+// unpackValuesInto decodes buf into out (len == pf.numArgs) avoiding the
+// intermediate slice allocation in unpackValues. Returns error on short buffer.
+func unpackValuesInto(pf *parsedFormat, buf []byte, out []val.Value) error {
+	if len(buf) < pf.size {
+		return fmt.Errorf("unpack requires a buffer of at least %d bytes", pf.size)
+	}
+	idx := 0
+	offset := 0
+	for _, field := range pf.fields {
+		if field.op == 'x' {
+			offset += field.size
+			continue
+		}
+		if field.op == 's' {
+			b := make([]byte, field.count)
+			copy(b, buf[offset:offset+field.count])
+			out[idx] = val.NewBytesVal(b)
+			idx++
+			offset += field.count
+			continue
+		}
+		if field.op == 'p' {
+			pLen := int(buf[offset])
+			maxStr := field.count - 1
+			if pLen > maxStr {
+				pLen = maxStr
+			}
+			b := make([]byte, pLen)
+			copy(b, buf[offset+1:offset+1+pLen])
+			out[idx] = val.NewBytesVal(b)
+			idx++
+			offset += field.count
+			continue
+		}
+		for range field.count {
+			switch field.op {
+			case 'c':
+				out[idx] = val.NewBytesVal([]byte{buf[offset]})
+			case '?':
+				out[idx] = val.BoolVal(buf[offset] != 0)
+			case 'b':
+				out[idx] = val.Int64Val(int64(int8(buf[offset])))
+			case 'B':
+				out[idx] = val.Int64Val(int64(buf[offset]))
+			case 'h':
+				u := getU16(pf, buf[offset:])
+				out[idx] = val.Int64Val(int64(int16(u)))
+			case 'H':
+				u := getU16(pf, buf[offset:])
+				out[idx] = val.Int64Val(int64(u))
+			case 'i', 'l':
+				u := getU32(pf, buf[offset:])
+				out[idx] = val.Int64Val(int64(int32(u)))
+			case 'I', 'L':
+				u := getU32(pf, buf[offset:])
+				out[idx] = val.Int64Val(int64(u))
+			case 'q', 'n':
+				u := getU64(pf, buf[offset:])
+				out[idx] = val.Int64Val(int64(u))
+			case 'Q', 'N', 'P':
+				u := getU64(pf, buf[offset:])
+				if u <= math.MaxInt64 {
+					out[idx] = val.Int64Val(int64(u))
+				} else {
+					out[idx] = val.NewBigIntVal(new(big.Int).SetUint64(u))
+				}
+			case 'f':
+				bits := getU32(pf, buf[offset:])
+				out[idx] = val.Float64Val(float64(math.Float32frombits(bits)))
+			case 'd':
+				bits := getU64(pf, buf[offset:])
+				out[idx] = val.Float64Val(math.Float64frombits(bits))
+			}
+			idx++
+			offset += field.size
+		}
+	}
+	return nil
+}
+
+// tupleFromUnpack decodes buf into a new Tuple Value with minimal allocation.
+// For <=8 fields it decodes into a stack scratch array, saving the intermediate
+// slice allocation in unpackValues.
+func tupleFromUnpack(pf *parsedFormat, buf []byte) (val.Value, error) {
+	if pf.numArgs <= 8 {
+		var scratch [8]val.Value
+		out := scratch[:pf.numArgs]
+		if err := unpackValuesInto(pf, buf, out); err != nil {
+			return val.NoneVal(), err
+		}
+		return val.NewTupleVal(out...), nil
+	}
+	vals, err := unpackValues(pf, buf)
+	if err != nil {
+		return val.NoneVal(), err
+	}
+	return val.NewTupleVal(vals...), nil
 }
 
 type pyStruct struct {
@@ -469,12 +664,7 @@ func initStructTypes() {
 				exc := val.NewException(structErrorType, "Struct() takes at least 1 argument")
 				panic(exc)
 			}
-			fmtStr, err := getFormatString(pa[0])
-			if err != nil {
-				exc := val.NewException(structErrorType, err.Error())
-				panic(exc)
-			}
-			pf, err := parseStructFormat(fmtStr)
+			pf, err := parseStructFormatVal(pa[0])
 			if err != nil {
 				exc := val.NewException(structErrorType, err.Error())
 				panic(exc)
@@ -484,7 +674,7 @@ func initStructTypes() {
 					Header: val.ObjectHeader{Kind: val.KindInstance, Type: structType},
 					Shape:  structType.RootShape,
 				},
-				format: fmtStr,
+				format: pf.fmtStr,
 				pf:     pf,
 			}
 			return val.ObjectVal(&ps.inst.Header)
@@ -549,12 +739,12 @@ func initStructTypes() {
 				ctx.Raise(val.NewException(val.TypeErrorType, "unpack() requires bytes-like object"))
 				return val.NoneVal()
 			}
-			vals, err := unpackValues(ps.pf, b)
+			tv, err := tupleFromUnpack(ps.pf, b)
 			if err != nil {
 				exc := val.NewException(structErrorType, err.Error())
 				panic(exc)
 			}
-			return val.NewTupleVal(vals...)
+			return tv
 		}))
 
 		structType.Dict.Set(val.InternString("unpack_from"), val.NewBuiltinFuncVal("unpack_from", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -576,12 +766,12 @@ func initStructTypes() {
 				exc := val.NewException(structErrorType, "unpack_from requires buffer of at least required size")
 				panic(exc)
 			}
-			vals, err := unpackValues(ps.pf, b[offset:])
+			tv, err := tupleFromUnpack(ps.pf, b[offset:])
 			if err != nil {
 				exc := val.NewException(structErrorType, err.Error())
 				panic(exc)
 			}
-			return val.NewTupleVal(vals...)
+			return tv
 		}))
 
 		structType.Dict.Set(val.InternString("iter_unpack"), val.NewBuiltinFuncVal("iter_unpack", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -608,9 +798,9 @@ func initStructTypes() {
 				if curOffset >= len(b) {
 					return val.NoneVal(), false
 				}
-				vals, _ := unpackValues(ps.pf, b[curOffset:])
+				tv, _ := tupleFromUnpack(ps.pf, b[curOffset:])
 				curOffset += ps.pf.size
-				return val.NewTupleVal(vals...), true
+				return tv, true
 			})
 		}))
 	})
@@ -627,6 +817,10 @@ func (e *Engine) createStructModule() val.Value {
 		structCacheMu.Lock()
 		structCache = make(map[string]*parsedFormat)
 		structCacheMu.Unlock()
+		structFastMu.Lock()
+		structFastValid = false
+		structFastPF = nil
+		structFastMu.Unlock()
 		return val.NoneVal()
 	}))
 
@@ -641,12 +835,7 @@ func (e *Engine) createStructModule() val.Value {
 			exc := val.NewException(structErrorType, "calcsize() takes at least 1 argument")
 			panic(exc)
 		}
-		fmtStr, err := getFormatString(pa[0])
-		if err != nil {
-			exc := val.NewException(structErrorType, err.Error())
-			panic(exc)
-		}
-		pf, err := parseStructFormat(fmtStr)
+		pf, err := parseStructFormatVal(pa[0])
 		if err != nil {
 			exc := val.NewException(structErrorType, err.Error())
 			panic(exc)
@@ -661,12 +850,7 @@ func (e *Engine) createStructModule() val.Value {
 			exc := val.NewException(structErrorType, "pack() takes at least 1 argument")
 			panic(exc)
 		}
-		fmtStr, err := getFormatString(pa[0])
-		if err != nil {
-			exc := val.NewException(structErrorType, err.Error())
-			panic(exc)
-		}
-		pf, err := parseStructFormat(fmtStr)
+		pf, err := parseStructFormatVal(pa[0])
 		if err != nil {
 			exc := val.NewException(structErrorType, err.Error())
 			panic(exc)
@@ -686,12 +870,7 @@ func (e *Engine) createStructModule() val.Value {
 			exc := val.NewException(structErrorType, "pack_into() takes at least 3 arguments")
 			panic(exc)
 		}
-		fmtStr, err := getFormatString(pa[0])
-		if err != nil {
-			exc := val.NewException(structErrorType, err.Error())
-			panic(exc)
-		}
-		pf, err := parseStructFormat(fmtStr)
+		pf, err := parseStructFormatVal(pa[0])
 		if err != nil {
 			exc := val.NewException(structErrorType, err.Error())
 			panic(exc)
@@ -720,12 +899,7 @@ func (e *Engine) createStructModule() val.Value {
 			exc := val.NewException(structErrorType, "unpack() takes at least 2 arguments")
 			panic(exc)
 		}
-		fmtStr, err := getFormatString(pa[0])
-		if err != nil {
-			exc := val.NewException(structErrorType, err.Error())
-			panic(exc)
-		}
-		pf, err := parseStructFormat(fmtStr)
+		pf, err := parseStructFormatVal(pa[0])
 		if err != nil {
 			exc := val.NewException(structErrorType, err.Error())
 			panic(exc)
@@ -735,12 +909,12 @@ func (e *Engine) createStructModule() val.Value {
 			ctx.Raise(val.NewException(val.TypeErrorType, "unpack() requires bytes-like object"))
 			return val.NoneVal()
 		}
-		vals, err := unpackValues(pf, b)
+		tv, err := tupleFromUnpack(pf, b)
 		if err != nil {
 			exc := val.NewException(structErrorType, err.Error())
 			panic(exc)
 		}
-		return val.NewTupleVal(vals...)
+		return tv
 	})
 
 	// unpack_from(format, buffer, offset=0)
@@ -750,12 +924,7 @@ func (e *Engine) createStructModule() val.Value {
 			exc := val.NewException(structErrorType, "unpack_from() takes at least 2 arguments")
 			panic(exc)
 		}
-		fmtStr, err := getFormatString(pa[0])
-		if err != nil {
-			exc := val.NewException(structErrorType, err.Error())
-			panic(exc)
-		}
-		pf, err := parseStructFormat(fmtStr)
+		pf, err := parseStructFormatVal(pa[0])
 		if err != nil {
 			exc := val.NewException(structErrorType, err.Error())
 			panic(exc)
@@ -773,12 +942,12 @@ func (e *Engine) createStructModule() val.Value {
 			exc := val.NewException(structErrorType, "unpack_from requires buffer of at least required size")
 			panic(exc)
 		}
-		vals, err := unpackValues(pf, b[offset:])
+		tv, err := tupleFromUnpack(pf, b[offset:])
 		if err != nil {
 			exc := val.NewException(structErrorType, err.Error())
 			panic(exc)
 		}
-		return val.NewTupleVal(vals...)
+		return tv
 	})
 
 	// iter_unpack(format, buffer)
@@ -788,12 +957,7 @@ func (e *Engine) createStructModule() val.Value {
 			exc := val.NewException(structErrorType, "iter_unpack() takes at least 2 arguments")
 			panic(exc)
 		}
-		fmtStr, err := getFormatString(pa[0])
-		if err != nil {
-			exc := val.NewException(structErrorType, err.Error())
-			panic(exc)
-		}
-		pf, err := parseStructFormat(fmtStr)
+		pf, err := parseStructFormatVal(pa[0])
 		if err != nil {
 			exc := val.NewException(structErrorType, err.Error())
 			panic(exc)
@@ -816,9 +980,9 @@ func (e *Engine) createStructModule() val.Value {
 			if curOffset >= len(b) {
 				return val.NoneVal(), false
 			}
-			vals, _ := unpackValues(pf, b[curOffset:])
+			tv, _ := tupleFromUnpack(pf, b[curOffset:])
 			curOffset += pf.size
-			return val.NewTupleVal(vals...), true
+			return tv, true
 		})
 	})
 

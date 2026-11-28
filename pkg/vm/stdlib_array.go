@@ -222,7 +222,8 @@ func initArrayType() {
 		}
 		size, _ := arrayItemSize(a.typecode)
 		off := len(a.data)
-		a.data = append(a.data, make([]byte, size)...)
+		var zero [8]byte
+		a.data = append(a.data, zero[:size]...)
 		arraySetElement(a.data, off, a.typecode, args[1])
 		return val.NoneVal()
 	})
@@ -233,14 +234,30 @@ func initArrayType() {
 			return val.NoneVal()
 		}
 		size, _ := arrayItemSize(a.typecode)
+		// Bulk fast path for bytes-like and same-type arrays.
+		if v := args[1]; v.IsBytes() {
+			data := v.AsBytes().Data
+			if len(data)%size == 0 {
+				a.data = append(a.data, data...)
+				return val.NoneVal()
+			}
+		}
+		if v := args[1]; v.IsByteArray() {
+			data := v.AsByteArray().Data
+			if len(data)%size == 0 {
+				a.data = append(a.data, data...)
+				return val.NoneVal()
+			}
+		}
 		it := iterFor(ctx, args[1])
+		var zero [8]byte
 		for {
 			item, ok := it.Next()
 			if !ok {
 				break
 			}
 			off := len(a.data)
-			a.data = append(a.data, make([]byte, size)...)
+			a.data = append(a.data, zero[:size]...)
 			arraySetElement(a.data, off, a.typecode, item)
 		}
 		return val.NoneVal()
@@ -266,16 +283,18 @@ func initArrayType() {
 			ctx.Raise(val.NewException(val.TypeErrorType, "fromlist() argument must be a list"))
 			return val.NoneVal()
 		}
+		var zero [8]byte
 		for _, item := range items {
 			off := len(a.data)
-			a.data = append(a.data, make([]byte, size)...)
+			a.data = append(a.data, zero[:size]...)
 			arraySetElement(a.data, off, a.typecode, item)
 		}
 		return val.NoneVal()
 	})
 
 	setMethod("tobytes", func(ctx *val.ExecContext, a *pyArray, args []val.Value) val.Value {
-		return val.NewBytesVal(a.data)
+		cp := append([]byte(nil), a.data...)
+		return val.NewBytesVal(cp)
 	})
 
 	setMethod("tolist", func(ctx *val.ExecContext, a *pyArray, args []val.Value) val.Value {
@@ -359,14 +378,14 @@ func initArrayType() {
 		}
 		if args[1].IsSlice() {
 			sl := args[1].AsSlice()
-			start, _, _, length, err := val.NormalizeSliceIndices(sl.Start, sl.Stop, sl.Step, a.count())
+			start, _, step, length, err := val.NormalizeSliceIndices(sl.Start, sl.Stop, sl.Step, a.count())
 			if err != nil {
 				ctx.Raise(val.NewException(val.ValueErrorType, err.Error()))
 				return val.NoneVal()
 			}
 			items := make([]val.Value, 0, length)
 			for i := range length {
-				items = append(items, arrayGetElement(a.data, (start+i)*size, a.typecode))
+				items = append(items, arrayGetElement(a.data, (start+i*step)*size, a.typecode))
 			}
 			return val.NewListVal(items...)
 		}

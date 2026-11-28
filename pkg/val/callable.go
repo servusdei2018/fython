@@ -2464,6 +2464,54 @@ func memoryViewMpSubscript(ctx *ExecContext, a, idxVal Value) Value {
 		ctx.Raise(NewException(ValueErrorType, "operation on released memoryview"))
 		return NoneVal()
 	}
+	// Fast path: 1D contiguous int indexing without shape/strides allocation.
+	// Covers bytes/bytearray and cast 1D views which store Dim0/Stride0 inline.
+	if (idxVal.IsInt64() || idxVal.IsBool()) && mv.NDim == 1 && len(mv.Shape) <= 1 {
+		var n, stride int
+		if len(mv.Shape) == 1 {
+			n = mv.Shape[0]
+			if len(mv.Strides) == 1 {
+				stride = mv.Strides[0]
+			} else if mv.NDim == 1 {
+				stride = mv.Stride0
+				if stride == 0 {
+					stride = mv.ItemSize
+					if stride == 0 {
+						stride = 1
+					}
+				}
+			}
+		} else {
+			n = mv.Dim0
+			stride = mv.Stride0
+			if stride == 0 {
+				stride = mv.ItemSize
+				if stride == 0 {
+					stride = 1
+				}
+			}
+		}
+		itemSize := mv.ItemSize
+		if itemSize == 0 {
+			itemSize = 1
+		}
+		// Only take fast path when contiguous (stride == itemSize).
+		if stride == itemSize {
+			idx := int(idxVal.AsInt64())
+			if idx < 0 {
+				idx += n
+			}
+			if idx < 0 || idx >= n {
+				ctx.Raise(NewException(IndexErrorType, "index out of bounds"))
+				return NoneVal()
+			}
+			format := mv.Format
+			if format == "" {
+				format = "B"
+			}
+			return decodeValue(mv.Buf, idx*itemSize, format, itemSize)
+		}
+	}
 	shape := mvEffectiveShape(mv)
 	strides := mvEffectiveStrides(mv)
 	itemSize := mv.ItemSize
@@ -2552,6 +2600,53 @@ func memoryViewMpAssSubscript(ctx *ExecContext, a, idxVal, val Value) Value {
 	if mv.ReadOnly {
 		ctx.Raise(NewException(TypeErrorType, "cannot modify read-only memoryview"))
 		return NoneVal()
+	}
+	// Fast path: 1D contiguous scalar store without shape/strides allocation.
+	if (idxVal.IsInt64() || idxVal.IsBool()) && mv.NDim == 1 && len(mv.Shape) <= 1 {
+		var n, stride int
+		if len(mv.Shape) == 1 {
+			n = mv.Shape[0]
+			if len(mv.Strides) == 1 {
+				stride = mv.Strides[0]
+			} else {
+				stride = mv.Stride0
+				if stride == 0 {
+					stride = mv.ItemSize
+					if stride == 0 {
+						stride = 1
+					}
+				}
+			}
+		} else {
+			n = mv.Dim0
+			stride = mv.Stride0
+			if stride == 0 {
+				stride = mv.ItemSize
+				if stride == 0 {
+					stride = 1
+				}
+			}
+		}
+		itemSize := mv.ItemSize
+		if itemSize == 0 {
+			itemSize = 1
+		}
+		if stride == itemSize {
+			idx := int(idxVal.AsInt64())
+			if idx < 0 {
+				idx += n
+			}
+			if idx < 0 || idx >= n {
+				ctx.Raise(NewException(IndexErrorType, "index out of bounds"))
+				return NoneVal()
+			}
+			fmtCode := mv.Format
+			if fmtCode == "" {
+				fmtCode = "B"
+			}
+			encodeValue(mv.Buf, idx*itemSize, val, fmtCode, itemSize)
+			return NoneVal()
+		}
 	}
 	shape := mvEffectiveShape(mv)
 	strides := mvEffectiveStrides(mv)

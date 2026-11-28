@@ -16,6 +16,34 @@ var (
 	collectionsOnce sync.Once
 )
 
+// isExactCounterIterable reports whether iterable is one of the exact builtin
+// containers fast-pathed by _count_elements. Subclasses return false so the
+// caller honors a Python-level __iter__ override.
+func isExactCounterIterable(v val.Value) bool {
+	if v.IsInlineStr() {
+		return true
+	}
+	if v.IsString() && v.Type() == val.StrType {
+		return true
+	}
+	if v.IsList() && v.Type() == val.ListType {
+		return true
+	}
+	if v.IsTuple() && v.Type() == val.TupleType {
+		return true
+	}
+	if v.IsBytes() && v.Type() == val.BytesType {
+		return true
+	}
+	if v.IsByteArray() && v.Type() == val.ByteArrayType {
+		return true
+	}
+	if v.IsDict() && v.Type() == val.DictType {
+		return true
+	}
+	return false
+}
+
 type pyDeque struct {
 	Header val.ObjectHeader
 	buf    []val.Value // length is 0 or a power of 2
@@ -1181,24 +1209,121 @@ func (e *Engine) createCollectionsModule() val.Value {
 		}
 		mapping := args[0]
 		iterable := args[1]
-		elems := val.ExtractIterableItems(ctx, iterable)
-		if ctx != nil && ctx.HasException() {
-			return val.NoneVal()
-		}
 
 		if mapping.IsDict() {
 			d := mapping.AsDict()
-			for _, elem := range elems {
+			// Fast path: stream elements without materializing an intermediate
+			// slice. Covers exact str/list/tuple/bytes/bytearray/dict-keys,
+			// which are the common Counter inputs. Generic iterables fall
+			// back to ExtractIterableItems snapshot semantics.
+			// Exact-type guards preserve subclass __iter__ overrides.
+			countOne := func(elem val.Value) {
 				curCount, found := d.Get(elem)
-				if !found || !curCount.IsInt64() {
+				if !found {
 					d.Set(elem, val.Int64Val(1))
-				} else {
-					d.Set(elem, val.Int64Val(curCount.AsInt64()+1))
+					return
 				}
+				if curCount.IsInt64() {
+					d.Set(elem, val.Int64Val(curCount.AsInt64()+1))
+					return
+				}
+				// Non-int existing counts (BigInt, float, etc.): match
+				// CPython PyNumber_Add semantics instead of clobbering.
+				d.Set(elem, val.AddCtx(ctx, curCount, val.Int64Val(1)))
+			}
+			if iterable.IsInlineStr() || (iterable.IsString() && iterable.Type() == val.StrType) {
+				s := iterable.AsString()
+				for _, r := range s {
+					countOne(val.RuneVal(r))
+				}
+				return val.NoneVal()
+			}
+			if iterable.IsList() && iterable.Type() == val.ListType {
+				items := iterable.AsList().Items
+				for _, elem := range items {
+					if ctx != nil && ctx.HasException() {
+						return val.NoneVal()
+					}
+					countOne(elem)
+				}
+				return val.NoneVal()
+			}
+			if iterable.IsTuple() && iterable.Type() == val.TupleType {
+				items := iterable.AsTuple().Items
+				for _, elem := range items {
+					if ctx != nil && ctx.HasException() {
+						return val.NoneVal()
+					}
+					countOne(elem)
+				}
+				return val.NoneVal()
+			}
+			if iterable.IsBytes() && iterable.Type() == val.BytesType {
+				data := iterable.AsBytes().Data
+				for _, b := range data {
+					countOne(val.Int64Val(int64(b)))
+				}
+				return val.NoneVal()
+			}
+			if iterable.IsByteArray() && iterable.Type() == val.ByteArrayType {
+				data := iterable.AsByteArray().Data
+				for _, b := range data {
+					countOne(val.Int64Val(int64(b)))
+				}
+				return val.NoneVal()
+			}
+			if iterable.IsDict() && iterable.Type() == val.DictType {
+				keys := iterable.AsDict().Keys()
+				for _, elem := range keys {
+					countOne(elem)
+				}
+				return val.NoneVal()
+			}
+			// Subclass or generic iterable: honor a Python-level __iter__
+			// override before falling back to snapshot extraction. This
+			// matters for list/tuple/str/dict subclasses that define
+			// __iter__; exact builtins already returned above.
+			if ctx != nil && !isExactCounterIterable(iterable) {
+				if fn, _, ok := iterable.Type().LookupMRO(nameIter); ok && !fn.IsNone() {
+					itVal := ctx.Invoke1(fn, iterable)
+					if ctx.HasException() {
+						return val.NoneVal()
+					}
+					it := iterFor(ctx, itVal)
+					if ctx.HasException() {
+						return val.NoneVal()
+					}
+					for {
+						elem, ok := it.Next()
+						if !ok {
+							break
+						}
+						if ctx.HasException() {
+							return val.NoneVal()
+						}
+						countOne(elem)
+					}
+					if ctx.HasException() {
+						return val.NoneVal()
+					}
+					return val.NoneVal()
+				}
+			}
+			elems := val.ExtractIterableItems(ctx, iterable)
+			if ctx != nil && ctx.HasException() {
+				return val.NoneVal()
+			}
+
+			for _, elem := range elems {
+				countOne(elem)
 			}
 			return val.NoneVal()
 		}
 
+		elems := val.ExtractIterableItems(ctx, iterable)
+		if ctx != nil && ctx.HasException() {
+			return val.NoneVal()
+		}
 		for _, elem := range elems {
 			curVal := val.Int64Val(0)
 			getFn, _, okGet := mapping.Type().LookupMRO(nameGet)
