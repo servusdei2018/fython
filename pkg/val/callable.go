@@ -7730,6 +7730,34 @@ func initTypes() {
 		return NoneVal()
 	}))
 
+	FutureType.Dict.Set(InternString("exception"), NewBuiltinFuncVal("exception", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			ctx.Raise(NewException(TypeErrorType, "exception() takes at least 1 argument"))
+			return NoneVal()
+		}
+		fut := futureFromVal(args[0])
+		if !fut.IsDone() {
+			ctx.Raise(NewRuntimeError("Exception is not set."))
+			return NoneVal()
+		}
+		_, exc := fut.Result()
+		if fut.IsCancelled() {
+			if exc.IsNone() || exc.HeaderPtr() == nil {
+				if CancelledErrorFactory != nil {
+					exc = CancelledErrorFactory("")
+				} else {
+					exc = NewException(BaseExceptionType, "")
+				}
+			}
+			ctx.Raise(exc)
+			return NoneVal()
+		}
+		if exc.IsNone() || exc.HeaderPtr() == nil {
+			return NoneVal()
+		}
+		return exc
+	}))
+
 	FutureType.Dict.Set(InternString("__await__"), NewBuiltinFuncVal("__await__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
 			ctx.Raise(NewException(TypeErrorType, "__await__() takes at least 1 argument"))
@@ -7739,11 +7767,40 @@ func initTypes() {
 	}))
 
 	TaskType = MustNewType("Task", []*PyType{FutureType}, nil)
-	for _, m := range []string{"done", "cancelled", "cancel", "result", "__await__"} {
+	for _, m := range []string{"done", "cancelled", "cancel", "result", "exception", "__await__"} {
 		if fn, ok := FutureType.Dict.Get(InternString(m)); ok {
 			TaskType.Dict.Set(InternString(m), fn)
 		}
 	}
+	TaskType.Dict.Set(InternString("cancelling"), NewBuiltinFuncVal("cancelling", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 || !args[0].IsTask() {
+			ctx.Raise(NewTypeError("cancelling() requires a Task"))
+			return NoneVal()
+		}
+		return Int64Val(int64(args[0].AsTask().Cancelling()))
+	}))
+	TaskType.Dict.Set(InternString("uncancel"), NewBuiltinFuncVal("uncancel", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 || !args[0].IsTask() {
+			ctx.Raise(NewTypeError("uncancel() requires a Task"))
+			return NoneVal()
+		}
+		return Int64Val(int64(args[0].AsTask().Uncancel()))
+	}))
+	TaskType.Dict.Set(InternString("get_name"), NewBuiltinFuncVal("get_name", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 || !args[0].IsTask() {
+			ctx.Raise(NewTypeError("get_name() requires a Task"))
+			return NoneVal()
+		}
+		return NewStringVal(args[0].AsTask().GetName())
+	}))
+	TaskType.Dict.Set(InternString("set_name"), NewBuiltinFuncVal("set_name", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 || !args[0].IsTask() {
+			ctx.Raise(NewTypeError("set_name() takes exactly 1 argument"))
+			return NoneVal()
+		}
+		args[0].AsTask().SetName(args[1].String())
+		return NoneVal()
+	}))
 
 	ChanType = MustNewType("chan", []*PyType{ObjectType}, nil)
 	ChanType.Slots.TpIter = func(ctx *ExecContext, o Value) Value {
@@ -8069,22 +8126,192 @@ func initTypes() {
 		if callable.IsType() {
 			cls = callable.AsType()
 		}
-		msg := ""
-		if len(args) > 0 {
-			msg = args[0].AsString()
+		if len(args) < 2 {
+			ctx.Raise(NewTypeError("ExceptionGroup requires a message and a sequence of exceptions"))
+			return NoneVal()
 		}
+		if !args[0].IsAnyString() {
+			ctx.Raise(NewTypeError("argument 1 must be str"))
+			return NoneVal()
+		}
+		msg := args[0].AsString()
 		var excs []Value
-		if len(args) > 1 {
-			if args[1].IsList() {
-				excs = append(excs, args[1].AsList().Items...)
-			} else if args[1].IsTuple() {
-				excs = append(excs, args[1].AsTuple().Items...)
+		switch {
+		case args[1].IsList():
+			excs = append(excs, args[1].AsList().Items...)
+		case args[1].IsTuple():
+			excs = append(excs, args[1].AsTuple().Items...)
+		default:
+			ctx.Raise(NewTypeError("second argument (exceptions) must be a sequence"))
+			return NoneVal()
+		}
+		if len(excs) == 0 {
+			ctx.Raise(NewValueError("second argument (exceptions) must be a non-empty sequence"))
+			return NoneVal()
+		}
+		allException := true
+		for _, e := range excs {
+			if e.HeaderPtr() == nil || e.Type() == nil || !IsSubclass(e.Type(), BaseExceptionType) {
+				ctx.Raise(NewValueError("Item in exceptions is not a BaseException"))
+				return NoneVal()
 			}
+			if !IsSubclass(e.Type(), ExceptionType) {
+				allException = false
+			}
+		}
+		if IsSubclass(cls, ExceptionGroupType) && !allException {
+			ctx.Raise(NewTypeError("Cannot nest BaseExceptions in an ExceptionGroup"))
+			return NoneVal()
+		}
+		if cls == BaseExceptionGroupType && allException {
+			cls = ExceptionGroupType
 		}
 		return NewExceptionGroupVal(cls, msg, excs)
 	}
 	BaseExceptionGroupType.Slots.TpCall = egCall
 	ExceptionGroupType.Slots.TpCall = egCall
+
+	egMakePred := func(ctx *ExecContext, cond Value) (func(Value) (bool, bool), bool) {
+		if cond.IsType() {
+			tp := cond.AsType()
+			if !IsSubclass(tp, BaseExceptionType) {
+				ctx.Raise(NewTypeError("expected a BaseException subclass"))
+				return nil, false
+			}
+			return func(exc Value) (bool, bool) {
+				return exc.HeaderPtr() != nil && exc.Type() != nil && IsSubclass(exc.Type(), tp), true
+			}, true
+		}
+		if cond.IsTuple() {
+			items := cond.AsTuple().Items
+			tps := make([]*PyType, len(items))
+			for i, it := range items {
+				if !it.IsType() || !IsSubclass(it.AsType(), BaseExceptionType) {
+					ctx.Raise(NewTypeError("expected a tuple of BaseException subclasses"))
+					return nil, false
+				}
+				tps[i] = it.AsType()
+			}
+			return func(exc Value) (bool, bool) {
+				if exc.HeaderPtr() == nil || exc.Type() == nil {
+					return false, true
+				}
+				et := exc.Type()
+				for _, tp := range tps {
+					if IsSubclass(et, tp) {
+						return true, true
+					}
+				}
+				return false, true
+			}, true
+		}
+		if IsCallable(cond) {
+			return func(exc Value) (bool, bool) {
+				res := ctx.Call(cond, []Value{exc}, nil)
+				if ctx != nil && ctx.HasException() {
+					return false, false
+				}
+				return res.IsTruthy(), true
+			}, true
+		}
+		ctx.Raise(NewTypeError("expected an exception type, tuple of exception types, or callable"))
+		return nil, false
+	}
+
+	BaseExceptionGroupType.Dict.Set(InternString("message"), NewPropertyVal(
+		NewBuiltinFuncVal("BaseExceptionGroup.message", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+			if len(args) < 1 || !args[0].IsExceptionGroup() {
+				return NewStringVal("")
+			}
+			return NewStringVal(args[0].AsExceptionGroup().Message)
+		}),
+		NoneVal(),
+		NoneVal(),
+	))
+	BaseExceptionGroupType.Dict.Set(InternString("exceptions"), NewPropertyVal(
+		NewBuiltinFuncVal("BaseExceptionGroup.exceptions", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+			if len(args) < 1 || !args[0].IsExceptionGroup() {
+				return NewTupleVal()
+			}
+			return NewTupleVal(args[0].AsExceptionGroup().Exceptions...)
+		}),
+		NoneVal(),
+		NoneVal(),
+	))
+	BaseExceptionGroupType.Dict.Set(InternString("args"), NewPropertyVal(
+		NewBuiltinFuncVal("BaseExceptionGroup.args", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+			if len(args) < 1 || !args[0].IsExceptionGroup() {
+				return NewTupleVal()
+			}
+			eg := args[0].AsExceptionGroup()
+			return NewTupleVal(NewStringVal(eg.Message), NewTupleVal(eg.Exceptions...))
+		}),
+		NoneVal(),
+		NoneVal(),
+	))
+	BaseExceptionGroupType.Dict.Set(InternString("split"), NewBuiltinFuncVal("split", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 || !args[0].IsExceptionGroup() {
+			ctx.Raise(NewTypeError("split() takes exactly 1 argument"))
+			return NoneVal()
+		}
+		pred, ok := egMakePred(ctx, args[1])
+		if !ok {
+			return NoneVal()
+		}
+		m, r := args[0].AsExceptionGroup().SplitFunc(pred)
+		if ctx != nil && ctx.HasException() {
+			return NoneVal()
+		}
+		return NewTupleVal(m, r)
+	}))
+	BaseExceptionGroupType.Dict.Set(InternString("subgroup"), NewBuiltinFuncVal("subgroup", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 || !args[0].IsExceptionGroup() {
+			ctx.Raise(NewTypeError("subgroup() takes exactly 1 argument"))
+			return NoneVal()
+		}
+		pred, ok := egMakePred(ctx, args[1])
+		if !ok {
+			return NoneVal()
+		}
+		m, _ := args[0].AsExceptionGroup().SplitFunc(pred)
+		if ctx != nil && ctx.HasException() {
+			return NoneVal()
+		}
+		return m
+	}))
+	BaseExceptionGroupType.Dict.Set(InternString("__str__"), NewBuiltinFuncVal("__str__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 || !args[0].IsExceptionGroup() {
+			return NewStringVal("")
+		}
+		eg := args[0].AsExceptionGroup()
+		n := len(eg.Exceptions)
+		suffix := "s"
+		if n == 1 {
+			suffix = ""
+		}
+		return NewStringVal(fmt.Sprintf("%s (%d sub-exception%s)", eg.Message, n, suffix))
+	}))
+	BaseExceptionGroupType.Dict.Set(InternString("__repr__"), NewBuiltinFuncVal("__repr__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 || !args[0].IsExceptionGroup() {
+			return NewStringVal("ExceptionGroup('', [])")
+		}
+		eg := args[0].AsExceptionGroup()
+		var sb strings.Builder
+		sb.WriteString(eg.Header.Type.Name)
+		sb.WriteByte('(')
+		sb.WriteString(PyRepr(ctx, NewStringVal(eg.Message)))
+		sb.WriteString(", [")
+		for i, e := range eg.Exceptions {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteString(PyRepr(ctx, e))
+		}
+		sb.WriteString("])")
+		return NewStringVal(sb.String())
+	}))
+	BaseExceptionGroupType.InvalidateVersion()
+	ExceptionGroupType.InvalidateVersion()
 
 	// Set Type
 	SetType = MustNewType("set", []*PyType{ObjectType}, nil)

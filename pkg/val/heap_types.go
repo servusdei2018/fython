@@ -618,13 +618,15 @@ type PyTask struct {
 	Context *PyContext
 	// Awaitable is set when the task drives a non-coroutine awaitable directly.
 	Awaitable Value
-	// mu guards Waiter, WaitAwaitable, PendingCancel, and CancelHook for race-free cancellation.
+	// mu guards Waiter, WaitAwaitable, PendingCancel, CancelHook, Name, and cancelCount.
 	mu            sync.Mutex
 	stepMu        sync.Mutex
 	Waiter        *PyFuture
 	WaitAwaitable Value
 	PendingCancel Value
 	CancelHook    func(*PyTask, Value) bool
+	Name          string
+	cancelCount   int
 }
 
 // Compile-time assertions that every heap object places Header at offset 0.
@@ -2862,6 +2864,12 @@ func (t *PyTask) SetPendingCancel(exc Value) {
 	t.mu.Unlock()
 }
 
+func (t *PyTask) ClearPendingCancel() {
+	t.mu.Lock()
+	t.PendingCancel = Value{}
+	t.mu.Unlock()
+}
+
 func (t *PyTask) TakePendingCancel() Value {
 	t.mu.Lock()
 	exc := t.PendingCancel
@@ -2884,17 +2892,58 @@ func (t *PyTask) StepUnlock() {
 	t.stepMu.Unlock()
 }
 
+func (t *PyTask) Cancelling() int {
+	t.mu.Lock()
+	n := t.cancelCount
+	t.mu.Unlock()
+	return n
+}
+
+func (t *PyTask) Uncancel() int {
+	t.mu.Lock()
+	if t.cancelCount > 0 {
+		t.cancelCount--
+	}
+	n := t.cancelCount
+	t.mu.Unlock()
+	return n
+}
+
+func (t *PyTask) GetName() string {
+	t.mu.Lock()
+	name := t.Name
+	t.mu.Unlock()
+	return name
+}
+
+func (t *PyTask) SetName(name string) {
+	t.mu.Lock()
+	t.Name = name
+	t.mu.Unlock()
+}
+
 func (t *PyTask) Cancel(exc Value) bool {
 	if t.Future.IsDone() {
 		return false
 	}
 	t.mu.Lock()
 	hook := t.CancelHook
+	t.cancelCount++
 	t.mu.Unlock()
+	var ok bool
 	if hook != nil {
-		return hook(t, exc)
+		ok = hook(t, exc)
+	} else {
+		ok = t.Future.Cancel(exc)
 	}
-	return t.Future.Cancel(exc)
+	if !ok {
+		t.mu.Lock()
+		if t.cancelCount > 0 {
+			t.cancelCount--
+		}
+		t.mu.Unlock()
+	}
+	return ok
 }
 
 // Standard Exception Constructors
@@ -5694,30 +5743,73 @@ func NewExceptionGroupVal(cls *PyType, msg string, excs []Value) Value {
 // Split partitions the exception group according to matching condition against targetType.
 // Returns (matchingGroup, restGroup).
 func (eg *PyExceptionGroup) Split(targetType *PyType) (Value, Value) {
+	return eg.SplitFunc(func(exc Value) (bool, bool) {
+		if targetType == nil {
+			return false, true
+		}
+		if exc.IsType() {
+			return IsSubclass(exc.AsType(), targetType), true
+		}
+		if exc.ptr != nil && exc.Type() != nil {
+			return IsSubclass(exc.Type(), targetType), true
+		}
+		return false, true
+	})
+}
+
+// deriveGroupType returns ExceptionGroupType when all exceptions are Exception
+// subclasses and the source group is BaseExceptionGroupType; otherwise preserves cls.
+func deriveGroupType(cls *PyType, excs []Value) *PyType {
+	if cls == BaseExceptionGroupType {
+		allExc := true
+		for _, e := range excs {
+			if e.ptr == nil || e.Type() == nil || !IsSubclass(e.Type(), ExceptionType) {
+				allExc = false
+				break
+			}
+		}
+		if allExc {
+			return ExceptionGroupType
+		}
+	}
+	return cls
+}
+
+// SplitFunc recursively partitions the exception group using pred(exc) -> (matched, ok).
+// If pred returns ok=false (an exception was raised), SplitFunc aborts and returns (None, None).
+func (eg *PyExceptionGroup) SplitFunc(pred func(Value) (bool, bool)) (Value, Value) {
 	var matches []Value
 	var rest []Value
 	for _, exc := range eg.Exceptions {
-		matched := false
-		if exc.IsType() {
-			matched = IsSubclass(exc.AsType(), targetType)
-		} else if exc.ptr != nil && exc.Type() != nil {
-			matched = IsSubclass(exc.Type(), targetType)
+		matched, ok := pred(exc)
+		if !ok {
+			return NoneVal(), NoneVal()
 		}
 		if matched {
 			matches = append(matches, exc)
+			continue
+		}
+		if exc.IsExceptionGroup() {
+			subMatch, subRest := exc.AsExceptionGroup().SplitFunc(pred)
+			if !subMatch.IsNone() {
+				matches = append(matches, subMatch)
+			}
+			if !subRest.IsNone() {
+				rest = append(rest, subRest)
+			}
 		} else {
 			rest = append(rest, exc)
 		}
 	}
 	var matchVal Value
 	if len(matches) > 0 {
-		matchVal = NewExceptionGroupVal(eg.Header.Type, eg.Message, matches)
+		matchVal = NewExceptionGroupVal(deriveGroupType(eg.Header.Type, matches), eg.Message, matches)
 	} else {
 		matchVal = NoneVal()
 	}
 	var restVal Value
 	if len(rest) > 0 {
-		restVal = NewExceptionGroupVal(eg.Header.Type, eg.Message, rest)
+		restVal = NewExceptionGroupVal(deriveGroupType(eg.Header.Type, rest), eg.Message, rest)
 	} else {
 		restVal = NoneVal()
 	}

@@ -45,6 +45,7 @@ type CleanupKind int
 
 const (
 	CleanupWith CleanupKind = iota
+	CleanupAsyncWith
 	CleanupFinally
 	CleanupExcept
 )
@@ -545,6 +546,18 @@ func (c *Compiler) runCleanupsTo(target *CleanupBlock) error {
 			c.emitOp(vm.OP_LOAD_CONST, 0, noneIdx)
 			c.emitOp(vm.OP_LOAD_CONST, 0, noneIdx)
 			c.emitOp(vm.OP_CALL_METHOD_PIC, 3, exitIdx)
+			c.emitOp(vm.OP_POP_TOP, 0, 0)
+		case CleanupAsyncWith:
+			_, exitIdx := c.constPool.InternName("__aexit__")
+			noneIdx := c.constPool.Add(val.NoneVal())
+			c.emitOp(vm.OP_LOAD_FAST, 0, uint16(cl.TempSlot))
+			c.emitOp(vm.OP_LOAD_METHOD, 0, exitIdx)
+			c.emitOp(vm.OP_LOAD_CONST, 0, noneIdx)
+			c.emitOp(vm.OP_LOAD_CONST, 0, noneIdx)
+			c.emitOp(vm.OP_LOAD_CONST, 0, noneIdx)
+			c.emitOp(vm.OP_CALL_METHOD, 3, 0)
+			c.emitOp(vm.OP_GET_AWAITABLE, 0, 0)
+			c.emitOp(vm.OP_AWAIT, 0, 0)
 			c.emitOp(vm.OP_POP_TOP, 0, 0)
 		case CleanupFinally:
 			savedCleanup := c.activeCleanup
@@ -1918,9 +1931,17 @@ func (c *Compiler) compileAsyncWithItemRecursive(items []ASTWithItem, body uint3
 
 	depth := c.stackDepth
 	withStart := len(c.code)
+	cleanup := &CleanupBlock{
+		Kind:     CleanupAsyncWith,
+		Parent:   c.activeCleanup,
+		TempSlot: tempSlot,
+	}
+	c.activeCleanup = cleanup
 	if err := c.compileAsyncWithItemRecursive(items[1:], body); err != nil {
+		c.activeCleanup = cleanup.Parent
 		return err
 	}
+	c.activeCleanup = cleanup.Parent
 	withEnd := len(c.code)
 
 	// Normal exit: call __aexit__(None, None, None) and await

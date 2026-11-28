@@ -326,13 +326,14 @@ func initAsyncIOTypes() {
 		// Exceptions
 		CancelledErrorType = val.MustNewType("CancelledError", []*val.PyType{val.BaseExceptionType}, nil)
 		InvalidStateErrorType = val.MustNewType("InvalidStateError", []*val.PyType{val.ExceptionType}, nil)
-		TimeoutErrorType = val.MustNewType("TimeoutError", []*val.PyType{val.ExceptionType}, nil)
+		TimeoutErrorType = val.TimeoutErrorType
 
 		val.CancelledErrorFactory = func(msg string) val.Value {
 			return val.NewException(CancelledErrorType, msg)
 		}
 
 		initAsyncIOQueueTypes()
+		initAsyncIOSyncTypes()
 	})
 }
 
@@ -375,6 +376,13 @@ func (e *Engine) createAsyncioModule() val.Value {
 	mod.Dict.Set(val.InternString("Queue"), val.TypeVal(AsyncQueueType))
 	mod.Dict.Set(val.InternString("LifoQueue"), val.TypeVal(LifoQueueType))
 	mod.Dict.Set(val.InternString("PriorityQueue"), val.TypeVal(PriorityQueueType))
+	mod.Dict.Set(val.InternString("Event"), val.TypeVal(AsyncEventType))
+	mod.Dict.Set(val.InternString("Lock"), val.TypeVal(AsyncLockType))
+	mod.Dict.Set(val.InternString("Semaphore"), val.TypeVal(AsyncSemaphoreType))
+	mod.Dict.Set(val.InternString("BoundedSemaphore"), val.TypeVal(AsyncBoundedSemaphoreType))
+	mod.Dict.Set(val.InternString("Condition"), val.TypeVal(AsyncConditionType))
+	mod.Dict.Set(val.InternString("Timeout"), val.TypeVal(AsyncTimeoutType))
+	mod.Dict.Set(val.InternString("TaskGroup"), val.TypeVal(AsyncTaskGroupType))
 
 	// Exceptions
 	mod.Dict.Set(val.InternString("CancelledError"), val.TypeVal(CancelledErrorType))
@@ -466,14 +474,10 @@ func (e *Engine) createAsyncioModule() val.Value {
 		return futVal
 	}))
 
-	// asyncio.create_task(coro)
+	// asyncio.create_task(coro, *, name=None, context=None)
 	mod.Dict.Set(val.InternString("create_task"), val.NewBuiltinFuncVal("create_task", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		if len(args) < 1 {
-			if ctx != nil {
-				ctx.Raise(val.NewTypeError("create_task() takes at least 1 argument"))
-				return val.NoneVal()
-			}
-			ctx.Raise(val.NewException(val.TypeErrorType, "create_task() takes at least 1 argument"))
+			ctx.Raise(val.NewTypeError("create_task() takes at least 1 argument"))
 			return val.NoneVal()
 		}
 		loop := GetCurrentEventLoopCtx(ctx)
@@ -481,21 +485,97 @@ func (e *Engine) createAsyncioModule() val.Value {
 			loop = NewEventLoop(e, e.asyncMode)
 			SetCurrentEventLoop(loop)
 		}
-		var parent *val.PyContext
+		return createTaskOnLoop(ctx, loop, args, kwnames)
+	}))
+
+	// asyncio.timeout(delay)
+	mod.Dict.Set(val.InternString("timeout"), val.NewBuiltinFuncVal("timeout", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			ctx.Raise(val.NewTypeError("timeout() missing 1 required positional argument: 'delay'"))
+			return val.NoneVal()
+		}
+		if args[0].IsNone() {
+			return newTimeoutVal(false, 0)
+		}
+		var delay float64
+		switch {
+		case args[0].IsFloat64():
+			delay = args[0].AsFloat64()
+		case args[0].IsInt64():
+			delay = float64(args[0].AsInt64())
+		default:
+			ctx.Raise(val.NewTypeError("delay must be float, int, or None"))
+			return val.NoneVal()
+		}
+		loop := GetCurrentEventLoopCtx(ctx)
+		if loop == nil || !loop.IsRunning() {
+			ctx.Raise(val.NewRuntimeError("no running event loop"))
+			return val.NoneVal()
+		}
+		return newTimeoutVal(true, loop.Time()+delay)
+	}))
+
+	// asyncio.timeout_at(when)
+	mod.Dict.Set(val.InternString("timeout_at"), val.NewBuiltinFuncVal("timeout_at", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) < 1 {
+			ctx.Raise(val.NewTypeError("timeout_at() missing 1 required positional argument: 'when'"))
+			return val.NoneVal()
+		}
+		if args[0].IsNone() {
+			return newTimeoutVal(false, 0)
+		}
+		var when float64
+		switch {
+		case args[0].IsFloat64():
+			when = args[0].AsFloat64()
+		case args[0].IsInt64():
+			when = float64(args[0].AsInt64())
+		default:
+			ctx.Raise(val.NewTypeError("when must be float, int, or None"))
+			return val.NoneVal()
+		}
+		return newTimeoutVal(true, when)
+	}))
+
+	// asyncio.current_task(loop=None)
+	mod.Dict.Set(val.InternString("current_task"), val.NewBuiltinFuncVal("current_task", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		if len(args) == 0 || args[0].IsNone() {
+			loop := GetCurrentEventLoopCtx(ctx)
+			if loop == nil || !loop.IsRunning() {
+				ctx.Raise(val.NewRuntimeError("no running event loop"))
+				return val.NoneVal()
+			}
+		}
 		if ctx != nil && ctx.VM != nil {
-			parent = ctx.VM.(*VM).ActiveContext()
+			if t := ctx.VM.(*VM).activeTask; t != nil {
+				return val.ObjectVal(&t.Header)
+			}
 		}
-		target := args[0]
-		if target.IsCoroutine() {
-			task := loop.CreateTaskIn(target, parent)
-			return val.ObjectVal(&task.Header)
-		}
-		if target.Type().Slots.TpIterNext != nil {
-			task := loop.CreateTaskFromAwaitableIn(target, parent)
-			return val.ObjectVal(&task.Header)
-		}
-		ctx.Raise(val.NewTypeError("a coroutine was expected"))
 		return val.NoneVal()
+	}))
+
+	// asyncio.all_tasks(loop=None)
+	mod.Dict.Set(val.InternString("all_tasks"), val.NewBuiltinFuncVal("all_tasks", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		var loop *EventLoop
+		if len(args) >= 1 && !args[0].IsNone() {
+			if val.IsInstance(args[0], EventLoopType) {
+				loop = asEventLoopObj(args[0]).loop
+			}
+		}
+		if loop == nil {
+			loop = GetCurrentEventLoopCtx(ctx)
+			if loop == nil || !loop.IsRunning() {
+				ctx.Raise(val.NewRuntimeError("no running event loop"))
+				return val.NoneVal()
+			}
+		}
+		tasks := loop.AllTasks()
+		s := val.NewSetVal()
+		ps := s.AsSet()
+		for _, t := range tasks {
+			ps.Add(val.ObjectVal(&t.Header))
+		}
+		return s
 	}))
 
 	// asyncio.wait_for(fut, timeout)
@@ -903,13 +983,22 @@ func (e *Engine) createAsyncioModule() val.Value {
 	}))
 
 	// Event loop management
+	mod.Dict.Set(val.InternString("get_running_loop"), val.NewBuiltinFuncVal("get_running_loop", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
+		loop := GetCurrentEventLoopCtx(ctx)
+		if loop == nil || !loop.IsRunning() {
+			ctx.Raise(val.NewRuntimeError("no running event loop"))
+			return val.NoneVal()
+		}
+		return newPyEventLoopVal(loop)
+	}))
+
 	mod.Dict.Set(val.InternString("get_event_loop"), val.NewBuiltinFuncVal("get_event_loop", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		loop := GetCurrentEventLoopCtx(ctx)
 		if loop == nil {
 			loop = NewEventLoop(e, e.asyncMode)
 			SetCurrentEventLoop(loop)
 		}
-		return val.NewStringVal("<_UnixSelectorEventLoop running=True>")
+		return newPyEventLoopVal(loop)
 	}))
 
 	// Helper to set execution mode from Python

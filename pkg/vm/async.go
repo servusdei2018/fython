@@ -5,6 +5,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/servusdei2018/fython/pkg/val"
 )
@@ -107,6 +108,63 @@ type EventLoop struct {
 	activeTask atomic.Pointer[val.PyTask]
 	callSoonMu sync.Mutex
 	callSoon   []func()
+	tasksMu    sync.Mutex
+	tasks      map[*val.PyTask]struct{}
+	taskSeq    atomic.Uint64
+}
+
+// Time returns the event loop's monotonic clock in seconds (sharing time.monotonic()).
+func (l *EventLoop) Time() float64 {
+	return time.Since(startTime).Seconds()
+}
+
+// IsRunning reports whether the event loop is currently executing RunUntilComplete.
+func (l *EventLoop) IsRunning() bool {
+	return l != nil && l.running.Load()
+}
+
+func (l *EventLoop) trackTask(task *val.PyTask) {
+	if l == nil || task == nil {
+		return
+	}
+	if task.GetName() == "" {
+		seq := l.taskSeq.Add(1)
+		task.SetName(fmt.Sprintf("Task-%d", seq))
+	}
+	l.tasksMu.Lock()
+	if l.tasks == nil {
+		l.tasks = make(map[*val.PyTask]struct{})
+	}
+	l.tasks[task] = struct{}{}
+	l.tasksMu.Unlock()
+	task.AddDoneCallback(func(val.Value) {
+		l.untrackTask(task)
+	})
+}
+
+func (l *EventLoop) untrackTask(task *val.PyTask) {
+	if l == nil || task == nil {
+		return
+	}
+	l.tasksMu.Lock()
+	delete(l.tasks, task)
+	l.tasksMu.Unlock()
+}
+
+// AllTasks returns all currently pending (non-done) tasks registered on this loop.
+func (l *EventLoop) AllTasks() []*val.PyTask {
+	if l == nil {
+		return nil
+	}
+	l.tasksMu.Lock()
+	out := make([]*val.PyTask, 0, len(l.tasks))
+	for t := range l.tasks {
+		if !t.IsDone() {
+			out = append(out, t)
+		}
+	}
+	l.tasksMu.Unlock()
+	return out
 }
 
 // CallSoonThreadsafe schedules fn to run on the event loop thread.
@@ -238,6 +296,7 @@ func (l *EventLoop) CreateTaskIn(coroVal val.Value, parent *val.PyContext) *val.
 	} else {
 		task.Context = parent.ShallowCopy()
 	}
+	l.trackTask(task)
 	l.queue.Push(task)
 	return task
 }
@@ -255,6 +314,7 @@ func (l *EventLoop) CreateTaskFromAwaitableIn(aw val.Value, parent *val.PyContex
 	} else {
 		task.Context = parent.ShallowCopy()
 	}
+	l.trackTask(task)
 	l.queue.Push(task)
 	return task
 }
@@ -302,6 +362,7 @@ func (l *EventLoop) RunUntilCompleteIn(target val.Value, parent *val.PyContext) 
 		rootTask = l.CreateTaskIn(target, parent)
 	case target.IsTask():
 		rootTask = target.AsTask()
+		l.trackTask(rootTask)
 		l.queue.Push(rootTask)
 	case target.IsFuture():
 		fut := target.AsFuture()
@@ -432,6 +493,10 @@ func (l *EventLoop) stepTask(vm *VM, task *val.PyTask) {
 	_, waitAw := task.ClearWaiter()
 	pendingCancel := task.TakePendingCancel()
 
+	prevTask := vm.activeTask
+	vm.activeTask = task
+	defer func() { vm.activeTask = prevTask }()
+
 	// Direct non-coroutine awaitable task (e.g. create_task(q.get())).
 	if task.Coro == nil {
 		aw := task.Awaitable
@@ -439,6 +504,40 @@ func (l *EventLoop) stepTask(vm *VM, task *val.PyTask) {
 			return
 		}
 		if !pendingCancel.IsNone() && pendingCancel.HeaderPtr() != nil {
+			if isSyncAwaitableNeedingCancelStep(aw) {
+				nextVal, status := stepCancelSyncAwaitable(&vm.execCtx, aw, pendingCancel)
+				switch status {
+				case val.IterExhausted:
+					task.Awaitable = val.Value{}
+					task.SetResult(nextVal)
+				case val.IterYielded:
+					if nextVal.IsFuture() || nextVal.IsTask() {
+						fut := nextVal.AsFuture()
+						if nextVal.IsTask() {
+							fut = &nextVal.AsTask().Future
+						}
+						task.SetWaiter(fut, aw)
+						fut.AddDoneCallback(func(v val.Value) {
+							l.queue.Push(task)
+						})
+					} else {
+						l.queue.Push(task)
+					}
+				default:
+					exc := vm.execCtx.ActiveException
+					vm.execCtx.ClearException()
+					if exc.IsNone() || exc.HeaderPtr() == nil {
+						exc = pendingCancel
+					}
+					task.Awaitable = val.Value{}
+					if isCancelledError(exc) {
+						task.Future.Cancel(exc)
+					} else {
+						task.SetException(exc)
+					}
+				}
+				return
+			}
 			cancelPendingAwaitable(aw)
 			if val.IsAsyncGenASend(aw) || val.IsAsyncGenAThrow(aw) {
 				var nextVal val.Value
@@ -529,13 +628,41 @@ func (l *EventLoop) stepTask(vm *VM, task *val.PyTask) {
 		return
 	}
 
-	prevTask := vm.activeTask
-	vm.activeTask = task
-	defer func() { vm.activeTask = prevTask }()
-
 	if !pendingCancel.IsNone() && pendingCancel.HeaderPtr() != nil {
 		if !waitAw.IsNone() && waitAw.HeaderPtr() != nil {
-			cancelPendingAwaitable(waitAw)
+			if isSyncAwaitableNeedingCancelStep(waitAw) {
+				nextVal, status := stepCancelSyncAwaitable(&vm.execCtx, waitAw, pendingCancel)
+				switch status {
+				case val.IterYielded:
+					if nextVal.IsFuture() || nextVal.IsTask() {
+						fut := nextVal.AsFuture()
+						if nextVal.IsTask() {
+							fut = &nextVal.AsTask().Future
+						}
+						task.SetWaiter(fut, waitAw)
+						fut.AddDoneCallback(func(v val.Value) {
+							l.queue.Push(task)
+						})
+					} else {
+						l.queue.Push(task)
+					}
+					return
+				case val.IterExhausted:
+					if coro.State == val.CoroSuspended && coro.SP > 0 && coro.SP <= len(coro.Stack) {
+						coro.Stack[coro.SP-1] = nextVal
+						coro.IP++
+					}
+					pendingCancel = val.Value{}
+				default:
+					exc := vm.execCtx.ActiveException
+					vm.execCtx.ClearException()
+					if !exc.IsNone() && exc.HeaderPtr() != nil {
+						pendingCancel = exc
+					}
+				}
+			} else {
+				cancelPendingAwaitable(waitAw)
+			}
 			if val.IsAsyncGenASend(waitAw) || val.IsAsyncGenAThrow(waitAw) {
 				var nextVal val.Value
 				var status val.IterStatus

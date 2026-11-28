@@ -77,6 +77,10 @@ func cancelPendingAwaitable(v val.Value) {
 		cancelQueueAwaitable(v)
 		return
 	}
+	if syncAwaitableType != nil && v.Type() == syncAwaitableType {
+		cancelSyncAwaitable(v)
+		return
+	}
 	if val.IsAsyncGenASend(v) {
 		if ag := val.AsAsyncGenASend(v).Ag; ag != nil && !ag.AgAwait.IsNone() && ag.AgAwait.HeaderPtr() != nil {
 			cancelPendingAwaitable(ag.AgAwait)
