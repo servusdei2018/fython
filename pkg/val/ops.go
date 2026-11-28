@@ -257,9 +257,27 @@ func numericNbAdd(ctx *ExecContext, a, b Value) Value {
 	}
 	if (a.ptr.Kind == KindBigInt || a.ptr == &tagInt64 || a.ptr == &tagBool) &&
 		(b.ptr.Kind == KindBigInt || b.ptr == &tagInt64 || b.ptr == &tagBool) {
+		var la, lb [4]uint64
+		if unsignedLimbs(a, &la) && unsignedLimbs(b, &lb) {
+			var out [4]uint64
+			var carry uint64
+			c0, c1 := bits.Add64(la[0], lb[0], 0)
+			out[0] = c0
+			c1a, c2 := bits.Add64(la[1], lb[1], c1)
+			out[1] = c1a
+			c2a, c3 := bits.Add64(la[2], lb[2], c2)
+			out[2] = c2a
+			c3a, c4 := bits.Add64(la[3], lb[3], c3)
+			out[3] = c3a
+			carry = c4
+			_ = carry
+			if carry == 0 {
+				return limbsToValue(&out)
+			}
+		}
 		obj := &PyBigInt{Header: ObjectHeader{Kind: KindBigInt, Type: BigIntType}}
-		bigA := toBigInt(a)
-		bigB := toBigInt(b)
+		var tmpA, tmpB big.Int
+		bigA, bigB := bigIntPair(a, b, &tmpA, &tmpB)
 		obj.Val.Add(bigA, bigB)
 		return Value{num: 0, ptr: &obj.Header}
 	}
@@ -389,9 +407,22 @@ func numericNbSub(ctx *ExecContext, a, b Value) Value {
 	}
 	if (a.ptr.Kind == KindBigInt || a.ptr == &tagInt64 || a.ptr == &tagBool) &&
 		(b.ptr.Kind == KindBigInt || b.ptr == &tagInt64 || b.ptr == &tagBool) {
+		var la, lb [4]uint64
+		if unsignedLimbs(a, &la) && unsignedLimbs(b, &lb) && cmpLimbs(&la, &lb) >= 0 {
+			var out [4]uint64
+			b0, b1 := bits.Sub64(la[0], lb[0], 0)
+			out[0] = b0
+			b1a, b2 := bits.Sub64(la[1], lb[1], b1)
+			out[1] = b1a
+			b2a, b3 := bits.Sub64(la[2], lb[2], b2)
+			out[2] = b2a
+			b3a, _ := bits.Sub64(la[3], lb[3], b3)
+			out[3] = b3a
+			return limbsToValue(&out)
+		}
 		obj := &PyBigInt{Header: ObjectHeader{Kind: KindBigInt, Type: BigIntType}}
-		bigA := toBigInt(a)
-		bigB := toBigInt(b)
+		var tmpA, tmpB big.Int
+		bigA, bigB := bigIntPair(a, b, &tmpA, &tmpB)
 		obj.Val.Sub(bigA, bigB)
 		return Value{num: 0, ptr: &obj.Header}
 	}
@@ -521,8 +552,8 @@ func numericNbMul(ctx *ExecContext, a, b Value) Value {
 	if (a.ptr.Kind == KindBigInt || a.ptr == &tagInt64 || a.ptr == &tagBool) &&
 		(b.ptr.Kind == KindBigInt || b.ptr == &tagInt64 || b.ptr == &tagBool) {
 		obj := &PyBigInt{Header: ObjectHeader{Kind: KindBigInt, Type: BigIntType}}
-		bigA := toBigInt(a)
-		bigB := toBigInt(b)
+		var tmpA, tmpB big.Int
+		bigA, bigB := bigIntPair(a, b, &tmpA, &tmpB)
 		obj.Val.Mul(bigA, bigB)
 		return Value{num: 0, ptr: &obj.Header}
 	}
@@ -636,7 +667,27 @@ func RichCompare(ctx *ExecContext, a, b Value, op uint8) Value {
 	}
 
 	if isAnyInt(a) && isAnyInt(b) {
-		cmp := toBigInt(a).Cmp(toBigInt(b))
+		var la, lb [4]uint64
+		if unsignedLimbs(a, &la) && unsignedLimbs(b, &lb) {
+			cmp := cmpLimbs(&la, &lb)
+			switch op {
+			case CmpLT:
+				return BoolVal(cmp < 0)
+			case CmpLTE:
+				return BoolVal(cmp <= 0)
+			case CmpEQ:
+				return BoolVal(cmp == 0)
+			case CmpNEQ:
+				return BoolVal(cmp != 0)
+			case CmpGT:
+				return BoolVal(cmp > 0)
+			case CmpGTE:
+				return BoolVal(cmp >= 0)
+			}
+		}
+		var tmpA, tmpB big.Int
+		bigA, bigB := bigIntPair(a, b, &tmpA, &tmpB)
+		cmp := bigA.Cmp(bigB)
 		switch op {
 		case CmpLT:
 			return BoolVal(cmp < 0)
@@ -1205,6 +1256,80 @@ func toBigInt(v Value) *big.Int {
 	panic("val: cannot convert value to big.Int")
 }
 
+// bigIntOf resolves v to *big.Int without heap allocation for int64/bool,
+// writing into tmp. For BigInt it returns the live value pointer.
+func bigIntOf(v Value, tmp *big.Int) *big.Int {
+	if v.ptr != nil && v.ptr.Kind == KindBigInt {
+		return &v.AsBigInt().Val
+	}
+	return tmp.SetInt64(int64(v.num))
+}
+
+// bigIntPair resolves a,b to *big.Int using stack temporaries, avoiding the
+// two big.NewInt heap allocations that toBigInt performs for int64 operands.
+func bigIntPair(a, b Value, tmpA, tmpB *big.Int) (*big.Int, *big.Int) {
+	return bigIntOf(a, tmpA), bigIntOf(b, tmpB)
+}
+
+// unsignedLimbs extracts non-negative v into 4 little-endian uint64 limbs.
+// Reports false when v is negative or exceeds 256 bits.
+func unsignedLimbs(v Value, out *[4]uint64) bool {
+	if v.ptr == &tagInt64 || v.ptr == &tagBool {
+		iv := int64(v.num)
+		if iv < 0 {
+			return false
+		}
+		out[0], out[1], out[2], out[3] = uint64(iv), 0, 0, 0
+		return true
+	}
+	if v.ptr != nil && v.ptr.Kind == KindBigInt {
+		bi := &v.AsBigInt().Val
+		if bi.Sign() < 0 || bi.BitLen() > 256 {
+			return false
+		}
+		words := bi.Bits()
+		for i := range out {
+			if i < len(words) {
+				out[i] = uint64(words[i])
+			} else {
+				out[i] = 0
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// limbsToValue converts unsigned 4-limb magnitude to Int64 or BigInt.
+func limbsToValue(limbs *[4]uint64) Value {
+	if limbs[3] == 0 && limbs[2] == 0 && limbs[1] == 0 && limbs[0] <= math.MaxInt64 {
+		return Int64Val(int64(limbs[0]))
+	}
+	obj := &PyBigInt{Header: ObjectHeader{Kind: KindBigInt, Type: BigIntType}}
+	var words [4]big.Word
+	for i := range limbs {
+		words[i] = big.Word(limbs[i])
+	}
+	n := 4
+	for n > 0 && words[n-1] == 0 {
+		n--
+	}
+	obj.Val.SetBits(words[:n])
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+func cmpLimbs(a, b *[4]uint64) int {
+	for i := 3; i >= 0; i-- {
+		if a[i] < b[i] {
+			return -1
+		}
+		if a[i] > b[i] {
+			return 1
+		}
+	}
+	return 0
+}
+
 // ToBigInt converts an integer-like value to *big.Int.
 func ToBigInt(v Value) *big.Int {
 	return toBigInt(v)
@@ -1267,8 +1392,8 @@ func FloorDivCtx(ctx *ExecContext, a, b Value) Value {
 		return Float64Val(math.Floor(af / bf))
 	}
 	if isIntKind(a) && isIntKind(b) {
-		ba := toBigInt(a)
-		bb := toBigInt(b)
+		var tmpA, tmpB big.Int
+		ba, bb := bigIntPair(a, b, &tmpA, &tmpB)
 		if bb.Sign() == 0 {
 			return raiseZeroDivisionError(ctx, "integer division or modulo by zero")
 		}
@@ -1401,8 +1526,8 @@ func ModCtx(ctx *ExecContext, a, b Value) Value {
 		return Float64Val(rem)
 	}
 	if isIntKind(a) && isIntKind(b) {
-		ba := toBigInt(a)
-		bb := toBigInt(b)
+		var tmpA, tmpB big.Int
+		ba, bb := bigIntPair(a, b, &tmpA, &tmpB)
 		if bb.Sign() == 0 {
 			return raiseZeroDivisionError(ctx, "integer modulo by zero")
 		}
@@ -1478,14 +1603,16 @@ func PowCtx(ctx *ExecContext, a, b Value) Value {
 	}
 	aInt, bInt := isIntKind(a), isIntKind(b)
 	if aInt && bInt {
-		bb := toBigInt(b)
+		var tmpA, tmpB big.Int
+		ba, bb := bigIntPair(a, b, &tmpA, &tmpB)
 		if bb.Sign() >= 0 {
-			ba := toBigInt(a)
 			if !bb.IsInt64() {
 				switch {
-				case ba.Sign() == 0 || ba.Cmp(big.NewInt(1)) == 0:
-					return normBig(new(big.Int).Set(ba))
-				case ba.Cmp(big.NewInt(-1)) == 0:
+				case ba.Sign() == 0:
+					return Int64Val(0)
+				case ba.IsInt64() && ba.Int64() == 1:
+					return Int64Val(1)
+				case ba.IsInt64() && ba.Int64() == -1:
 					if bb.Bit(0) == 0 {
 						return Int64Val(1)
 					}
@@ -1498,7 +1625,7 @@ func PowCtx(ctx *ExecContext, a, b Value) Value {
 			}
 			return normBig(new(big.Int).Exp(ba, bb, nil))
 		}
-		if toBigInt(a).Sign() == 0 {
+		if ba.Sign() == 0 {
 			return raiseZeroDivisionError(ctx, "zero to a negative power")
 		}
 	}
@@ -1828,7 +1955,17 @@ func BitAnd(ctx *ExecContext, a, b Value) Value {
 		return Int64Val(int64(a.num) & int64(b.num))
 	}
 	if isAnyInt(a) && isAnyInt(b) {
-		return normBig(new(big.Int).And(toBigInt(a), toBigInt(b)))
+		var la, lb [4]uint64
+		if unsignedLimbs(a, &la) && unsignedLimbs(b, &lb) {
+			var out [4]uint64
+			for i := range out {
+				out[i] = la[i] & lb[i]
+			}
+			return limbsToValue(&out)
+		}
+		var tmpA, tmpB big.Int
+		bigA, bigB := bigIntPair(a, b, &tmpA, &tmpB)
+		return normBig(new(big.Int).And(bigA, bigB))
 	}
 	if a.IsSet() && b.IsSet() {
 		return a.AsSet().Intersection(b.AsSet())
@@ -1864,7 +2001,17 @@ func BitOr(ctx *ExecContext, a, b Value) Value {
 		return Int64Val(int64(a.num) | int64(b.num))
 	}
 	if isAnyInt(a) && isAnyInt(b) {
-		return normBig(new(big.Int).Or(toBigInt(a), toBigInt(b)))
+		var la, lb [4]uint64
+		if unsignedLimbs(a, &la) && unsignedLimbs(b, &lb) {
+			var out [4]uint64
+			for i := range out {
+				out[i] = la[i] | lb[i]
+			}
+			return limbsToValue(&out)
+		}
+		var tmpA, tmpB big.Int
+		bigA, bigB := bigIntPair(a, b, &tmpA, &tmpB)
+		return normBig(new(big.Int).Or(bigA, bigB))
 	}
 	if a.IsSet() && b.IsSet() {
 		return a.AsSet().Union(b.AsSet())
@@ -1969,7 +2116,17 @@ func BitXor(ctx *ExecContext, a, b Value) Value {
 		return Int64Val(int64(a.num) ^ int64(b.num))
 	}
 	if isAnyInt(a) && isAnyInt(b) {
-		return normBig(new(big.Int).Xor(toBigInt(a), toBigInt(b)))
+		var la, lb [4]uint64
+		if unsignedLimbs(a, &la) && unsignedLimbs(b, &lb) {
+			var out [4]uint64
+			for i := range out {
+				out[i] = la[i] ^ lb[i]
+			}
+			return limbsToValue(&out)
+		}
+		var tmpA, tmpB big.Int
+		bigA, bigB := bigIntPair(a, b, &tmpA, &tmpB)
+		return normBig(new(big.Int).Xor(bigA, bigB))
 	}
 	if a.IsSet() && b.IsSet() {
 		return a.AsSet().SymmetricDifference(b.AsSet())
@@ -2089,14 +2246,16 @@ func LShift(ctx *ExecContext, a, b Value) Value {
 		return normBig(res)
 	}
 	if isAnyInt(a) && isAnyInt(b) {
-		biB := toBigInt(b)
+		var tmpB big.Int
+		biB := bigIntOf(b, &tmpB)
 		if biB.Sign() < 0 {
 			return raiseValueError(ctx, "negative shift count")
 		}
 		if !biB.IsUint64() {
 			return raiseValueError(ctx, "shift count too large")
 		}
-		res := new(big.Int).Lsh(toBigInt(a), uint(biB.Uint64()))
+		var tmpA big.Int
+		res := new(big.Int).Lsh(bigIntOf(a, &tmpA), uint(biB.Uint64()))
 		return normBig(res)
 	}
 	if m, _, ok := a.Type().LookupMRO(strLshift); ok {
@@ -2135,17 +2294,18 @@ func RShift(ctx *ExecContext, a, b Value) Value {
 		return Int64Val(0)
 	}
 	if isAnyInt(a) && isAnyInt(b) {
-		biB := toBigInt(b)
+		var tmpA, tmpB big.Int
+		biB := bigIntOf(b, &tmpB)
 		if biB.Sign() < 0 {
 			return raiseValueError(ctx, "negative shift count")
 		}
 		if !biB.IsUint64() {
-			if toBigInt(a).Sign() < 0 {
+			if bigIntOf(a, &tmpA).Sign() < 0 {
 				return Int64Val(-1)
 			}
 			return Int64Val(0)
 		}
-		res := new(big.Int).Rsh(toBigInt(a), uint(biB.Uint64()))
+		res := new(big.Int).Rsh(bigIntOf(a, &tmpA), uint(biB.Uint64()))
 		return normBig(res)
 	}
 	if m, _, ok := a.Type().LookupMRO(strRshift); ok {
@@ -2192,9 +2352,9 @@ func Invert(ctx *ExecContext, a Value) Value {
 		return Int64Val(^n)
 	}
 	if isAnyInt(a) {
-		bi := toBigInt(a)
-		one := big.NewInt(1)
-		res := new(big.Int).Add(bi, one)
+		var tmpA, tmpOne big.Int
+		bi := bigIntOf(a, &tmpA)
+		res := new(big.Int).Add(bi, tmpOne.SetInt64(1))
 		res.Neg(res)
 		return normBig(res)
 	}
@@ -2256,8 +2416,8 @@ func Negative(ctx *ExecContext, a Value) Value {
 		return NewComplexVal(-c.Real, -c.Imag)
 	}
 	if isAnyInt(a) {
-		bi := toBigInt(a)
-		return normBig(new(big.Int).Neg(bi))
+		var tmpA big.Int
+		return normBig(new(big.Int).Neg(bigIntOf(a, &tmpA)))
 	}
 	if m, _, ok := a.Type().LookupMRO(strNeg); ok {
 		if ctx != nil {

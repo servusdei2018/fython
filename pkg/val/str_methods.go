@@ -775,6 +775,28 @@ func strSliceBounds(s string, args []Value) (string, int) {
 }
 
 func strFindImpl(s, sub string, extra []Value, last bool) int {
+	if len(extra) == 0 {
+		var idx int
+		if last {
+			idx = strings.LastIndex(s, sub)
+		} else {
+			idx = strings.Index(s, sub)
+		}
+		if idx < 0 {
+			return -1
+		}
+		if idx == 0 {
+			return 0
+		}
+		// Fast rune conversion: when the byte prefix is pure ASCII,
+		// byte index equals rune index with no full-string scan.
+		if IsASCII(s[:idx]) {
+			// If the remainder contains non-ASCII it does not affect the
+			// prefix count, so byte index is already the rune index.
+			return idx
+		}
+		return utf8.RuneCountInString(s[:idx])
+	}
 	ascii := isASCII(s)
 	if ascii {
 		if len(extra) == 0 {
@@ -1857,7 +1879,7 @@ func strCasefoldSpecial(s string) string {
 	buf = make([]byte, 0, len(s)+8)
 	for _, r := range s {
 		switch r {
-		case 0x00DF:
+		case 0x00DF, 0x1E9E:
 			buf = append(buf, 's', 's')
 		case 0xFB00:
 			buf = append(buf, 'f', 'f')
