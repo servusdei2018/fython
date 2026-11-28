@@ -101,12 +101,15 @@ func runPyPIScript(t *testing.T, engine *vm.Engine, wheelPaths []string, script 
 					tb := curTB.AsTraceback()
 					fnName := "?"
 					fileName := "?"
+					code := tb.Code
 					if !tb.Frame.IsNone() && tb.Frame.Kind() == val.KindFrame {
-						fr := tb.Frame.AsFrame()
-						if val.CodeInspectorHook != nil && fr.CO.Kind() == val.KindCode {
-							fnName = val.CodeInspectorHook.Name(fr.CO)
-							fileName = val.CodeInspectorHook.FileName(fr.CO)
+						if frCO := tb.Frame.AsFrame().CO; frCO.HeaderPtr() != nil {
+							code = frCO
 						}
+					}
+					if val.CodeInspectorHook != nil && code.HeaderPtr() != nil && code.Kind() == val.KindCode {
+						fnName = val.CodeInspectorHook.Name(code)
+						fileName = val.CodeInspectorHook.FileName(code)
 					}
 					fmt.Fprintf(&sb, "\n  File %q, line %d, in %s", fileName, tb.LineNo, fnName)
 					curTB = tb.Next

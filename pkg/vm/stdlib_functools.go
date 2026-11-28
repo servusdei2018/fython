@@ -624,6 +624,16 @@ func (e *Engine) createFunctoolsModule() val.Value {
 			acc = first
 		}
 
+		if vmInst, ok := ctx.VM.(*VM); ok && vmInst != nil {
+			if b, ok := vmInst.beginBatchCall(ctx, fn, 2); ok {
+				res, _ := foldBatched(vmInst, ctx, b, it, acc)
+				vmInst.finishBatch(ctx, b)
+				return res
+			}
+			if ctx.HasException() {
+				return val.NoneVal()
+			}
+		}
 		for {
 			item, ok := it.Next()
 			if !ok {

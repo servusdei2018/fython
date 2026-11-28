@@ -928,21 +928,55 @@ func (vm *VM) opListExtend(st *loopState, inst uint32, ip, sp int) (int, int, lo
 			added = len(iterVal.AsSet().Items())
 			lst.Items = appendListGrown(lst.Items, added)
 			lst.Items = append(lst.Items, iterVal.AsSet().Items()...)
-		default:
-			st.stack = stack
-			st.ip = ip
-			vm.execCtx.SP = sp
-			items := vm.extractIterableSafe(iterVal)
-			st.syncStackFromVM(vm, stack)
-			if vm.execCtx.HasException() {
-				exc := vm.execCtx.ActiveException
-				vm.execCtx.ClearException()
-				st.raiseExc = exc
-				return ip, sp, ctlRaise
+		case iterVal.IsRange():
+			start := int64(iterVal.RangeStart())
+			stop := int64(iterVal.RangeStop())
+			added = max(int(stop-start), 0)
+			if added > 0 {
+				base := len(lst.Items)
+				lst.Items = appendListGrown(lst.Items, added)
+				lst.Items = lst.Items[:base+added]
+				for i := range added {
+					lst.Items[base+i] = val.Int64Val(start + int64(i))
+				}
 			}
-			added = len(items)
-			lst.Items = appendListGrown(lst.Items, added)
-			lst.Items = append(lst.Items, items...)
+		default:
+			handled := false
+			if iterVal.IsIter() {
+				if it := iterVal.AsIter(); it.Kind == val.IterKindRange {
+					if n, ok := val.RangeLen(it.Cur, it.Stop, it.Step); ok {
+						added = n
+						if n > 0 {
+							base := len(lst.Items)
+							lst.Items = appendListGrown(lst.Items, n)
+							lst.Items = lst.Items[:base+n]
+							cur := it.Cur
+							for i := range n {
+								lst.Items[base+i] = val.Int64Val(cur)
+								cur += it.Step
+							}
+							it.Cur = it.Stop
+						}
+						handled = true
+					}
+				}
+			}
+			if !handled {
+				st.stack = stack
+				st.ip = ip
+				vm.execCtx.SP = sp
+				items := vm.extractIterableSafe(iterVal)
+				st.syncStackFromVM(vm, stack)
+				if vm.execCtx.HasException() {
+					exc := vm.execCtx.ActiveException
+					vm.execCtx.ClearException()
+					st.raiseExc = exc
+					return ip, sp, ctlRaise
+				}
+				added = len(items)
+				lst.Items = appendListGrown(lst.Items, added)
+				lst.Items = append(lst.Items, items...)
+			}
 		}
 		for _, it := range lst.Items[len(lst.Items)-added:] {
 			val.DetachStringBuf(it)

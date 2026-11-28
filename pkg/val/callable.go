@@ -300,6 +300,171 @@ func NewTupleFromSlice(src []Value) Value {
 	return Value{num: 0, ptr: &obj.Header}
 }
 
+// NewTupleFromOwnedSlice constructs a tuple taking ownership of src directly.
+// Callers must not retain or mutate src after the call. Small tuples (<=8)
+// copy into fused single-allocation bundles; large tuples wrap src without
+// an additional copy.
+func NewTupleFromOwnedSlice(src []Value) Value {
+	n := len(src)
+	if n == 0 && TupleType != nil {
+		return EmptyTupleVal()
+	}
+	if n <= len(PyTuple{}.inline) {
+		obj := &PyTuple{
+			Header: ObjectHeader{
+				Kind: KindTuple,
+				Type: TupleType,
+			},
+		}
+		switch n {
+		case 1:
+			obj.inline[0] = src[0]
+		case 2:
+			obj.inline[0] = src[0]
+			obj.inline[1] = src[1]
+		case 3:
+			obj.inline[0] = src[0]
+			obj.inline[1] = src[1]
+			obj.inline[2] = src[2]
+		}
+		obj.Items = obj.inline[:n]
+		return Value{num: 0, ptr: &obj.Header}
+	}
+	switch {
+	case n == 4:
+		b := &tupleBundle4{
+			t: PyTuple{Header: ObjectHeader{Kind: KindTuple, Type: TupleType}},
+		}
+		b.buf[0] = src[0]
+		b.buf[1] = src[1]
+		b.buf[2] = src[2]
+		b.buf[3] = src[3]
+		b.t.Items = b.buf[:4]
+		return Value{num: 0, ptr: &b.t.Header}
+	case n <= 6:
+		b := &tupleBundle6{
+			t: PyTuple{Header: ObjectHeader{Kind: KindTuple, Type: TupleType}},
+		}
+		copy(b.buf[:n], src)
+		b.t.Items = b.buf[:n]
+		return Value{num: 0, ptr: &b.t.Header}
+	case n <= 8:
+		b := &tupleBundle8{
+			t: PyTuple{Header: ObjectHeader{Kind: KindTuple, Type: TupleType}},
+		}
+		copy(b.buf[:n], src)
+		b.t.Items = b.buf[:n]
+		return Value{num: 0, ptr: &b.t.Header}
+	}
+	obj := &PyTuple{
+		Header: ObjectHeader{
+			Kind: KindTuple,
+			Type: TupleType,
+		},
+		Items: src,
+	}
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+// RangeLen computes the number of elements in range(start, stop, step).
+// ok is false for step == 0 or when the length overflows int.
+func RangeLen(start, stop, step int64) (n int, ok bool) {
+	return rangeLen(start, stop, step)
+}
+
+// rangeLen computes the number of elements in range(start, stop, step).
+// ok is false for step == 0 or when the length overflows int.
+func rangeLen(start, stop, step int64) (n int, ok bool) {
+	if step == 0 {
+		return 0, false
+	}
+	var length int64
+	if step > 0 {
+		if start >= stop {
+			return 0, true
+		}
+		length = (stop-start-1)/step + 1
+	} else {
+		if start <= stop {
+			return 0, true
+		}
+		length = (start-stop-1)/(-step) + 1
+	}
+	if length < 0 || int64(int(length)) != length {
+		return 0, false
+	}
+	return int(length), true
+}
+
+// newStridedTuple builds a tuple of n elements items[start + i*step]
+// with a single allocation and no intermediate slice.
+func newStridedTuple(items []Value, start, step, n int) Value {
+	if n <= len(PyTuple{}.inline) {
+		obj := &PyTuple{
+			Header: ObjectHeader{
+				Kind: KindTuple,
+				Type: TupleType,
+			},
+		}
+		cur := start
+		for i := range n {
+			obj.inline[i] = items[cur]
+			cur += step
+		}
+		obj.Items = obj.inline[:n]
+		return Value{num: 0, ptr: &obj.Header}
+	}
+	switch {
+	case n == 4:
+		b := &tupleBundle4{
+			t: PyTuple{Header: ObjectHeader{Kind: KindTuple, Type: TupleType}},
+		}
+		cur := start
+		for i := range 4 {
+			b.buf[i] = items[cur]
+			cur += step
+		}
+		b.t.Items = b.buf[:4]
+		return Value{num: 0, ptr: &b.t.Header}
+	case n <= 6:
+		b := &tupleBundle6{
+			t: PyTuple{Header: ObjectHeader{Kind: KindTuple, Type: TupleType}},
+		}
+		cur := start
+		for i := range n {
+			b.buf[i] = items[cur]
+			cur += step
+		}
+		b.t.Items = b.buf[:n]
+		return Value{num: 0, ptr: &b.t.Header}
+	case n <= 8:
+		b := &tupleBundle8{
+			t: PyTuple{Header: ObjectHeader{Kind: KindTuple, Type: TupleType}},
+		}
+		cur := start
+		for i := range n {
+			b.buf[i] = items[cur]
+			cur += step
+		}
+		b.t.Items = b.buf[:n]
+		return Value{num: 0, ptr: &b.t.Header}
+	}
+	backing := make([]Value, n)
+	cur := start
+	for i := range n {
+		backing[i] = items[cur]
+		cur += step
+	}
+	obj := &PyTuple{
+		Header: ObjectHeader{
+			Kind: KindTuple,
+			Type: TupleType,
+		},
+		Items: backing,
+	}
+	return Value{num: 0, ptr: &obj.Header}
+}
+
 // newTupleOfTypeFromSlice constructs a tuple of type cls copying elements from src.
 func newTupleOfTypeFromSlice(cls *PyType, src []Value) Value {
 	if cls == TupleType {
@@ -323,6 +488,88 @@ func newTupleOfTypeFromSlice(cls *PyType, src []Value) Value {
 	items := make([]Value, n)
 	copy(items, src)
 	obj.Items = items
+	return Value{num: 0, ptr: &obj.Header}
+}
+
+// newRangeTupleOfType builds tuple(cls) directly from range(start, stop, step)
+// with a single allocation and no intermediate slice.
+func newRangeTupleOfType(cls *PyType, start, step int64, n int) Value {
+	if cls == TupleType {
+		if n == 0 {
+			return EmptyTupleVal()
+		}
+		if n <= len(PyTuple{}.inline) {
+			obj := &PyTuple{
+				Header: ObjectHeader{Kind: KindTuple, Type: TupleType},
+			}
+			cur := start
+			for i := range n {
+				obj.inline[i] = Int64Val(cur)
+				cur += step
+			}
+			obj.Items = obj.inline[:n]
+			return Value{num: 0, ptr: &obj.Header}
+		}
+		switch {
+		case n == 4:
+			b := &tupleBundle4{t: PyTuple{Header: ObjectHeader{Kind: KindTuple, Type: TupleType}}}
+			cur := start
+			for i := range 4 {
+				b.buf[i] = Int64Val(cur)
+				cur += step
+			}
+			b.t.Items = b.buf[:4]
+			return Value{num: 0, ptr: &b.t.Header}
+		case n <= 6:
+			b := &tupleBundle6{t: PyTuple{Header: ObjectHeader{Kind: KindTuple, Type: TupleType}}}
+			cur := start
+			for i := range n {
+				b.buf[i] = Int64Val(cur)
+				cur += step
+			}
+			b.t.Items = b.buf[:n]
+			return Value{num: 0, ptr: &b.t.Header}
+		case n <= 8:
+			b := &tupleBundle8{t: PyTuple{Header: ObjectHeader{Kind: KindTuple, Type: TupleType}}}
+			cur := start
+			for i := range n {
+				b.buf[i] = Int64Val(cur)
+				cur += step
+			}
+			b.t.Items = b.buf[:n]
+			return Value{num: 0, ptr: &b.t.Header}
+		}
+		backing := make([]Value, n)
+		cur := start
+		for i := range backing {
+			backing[i] = Int64Val(cur)
+			cur += step
+		}
+		obj := &PyTuple{Header: ObjectHeader{Kind: KindTuple, Type: TupleType}, Items: backing}
+		return Value{num: 0, ptr: &obj.Header}
+	}
+	obj := &PyTuple{
+		Header: ObjectHeader{Kind: KindTuple, Type: cls},
+	}
+	if n == 0 {
+		return Value{num: 0, ptr: &obj.Header}
+	}
+	if n <= len(obj.inline) {
+		cur := start
+		for i := range n {
+			obj.inline[i] = Int64Val(cur)
+			cur += step
+		}
+		obj.Items = obj.inline[:n]
+		return Value{num: 0, ptr: &obj.Header}
+	}
+	backing := make([]Value, n)
+	cur := start
+	for i := range backing {
+		backing[i] = Int64Val(cur)
+		cur += step
+	}
+	obj.Items = backing
 	return Value{num: 0, ptr: &obj.Header}
 }
 
@@ -1913,7 +2160,7 @@ func listMpSubscript(ctx *ExecContext, a, idxVal Value) Value {
 		if step == 1 {
 			res := make([]Value, sliceLen)
 			copy(res, items[start:stop])
-			return NewListVal(res...)
+			return NewListFromOwnedSlice(res)
 		}
 		res := make([]Value, sliceLen)
 		cur := start
@@ -1921,7 +2168,7 @@ func listMpSubscript(ctx *ExecContext, a, idxVal Value) Value {
 			res[i] = items[cur]
 			cur += step
 		}
-		return NewListVal(res...)
+		return NewListFromOwnedSlice(res)
 	}
 	return listSqItem(ctx, a, idxVal)
 }
@@ -2013,13 +2260,7 @@ func tupleMpSubscript(ctx *ExecContext, a, idxVal Value) Value {
 			// Zero-copy sub-slice view! 0 element copies!
 			return NewTupleView(items[start:stop:stop])
 		}
-		res := make([]Value, sliceLen)
-		cur := start
-		for i := range sliceLen {
-			res[i] = items[cur]
-			cur += step
-		}
-		return NewTupleVal(res...)
+		return newStridedTuple(items, start, step, sliceLen)
 	}
 	return tupleSqItem(ctx, a, idxVal)
 }
@@ -2912,7 +3153,16 @@ func tracebackTpGetAttr(ctx *ExecContext, obj, name Value) Value {
 	tb := obj.AsTraceback()
 	switch name.AsString() {
 	case "tb_frame":
-		return tb.Frame
+		if !tb.Frame.IsNone() {
+			return tb.Frame
+		}
+		if f := tb.CachedFrame.Load(); f != nil {
+			return FrameValOf(f)
+		}
+		if tb.Code.HeaderPtr() != nil && LazyFrameHook != nil {
+			return LazyFrameHook(ctx, tb)
+		}
+		return NoneVal()
 	case "tb_lineno":
 		return Int64Val(int64(tb.LineNo))
 	case "tb_lasti":
@@ -3409,6 +3659,19 @@ func strNbMul(ctx *ExecContext, a, b Value) Value {
 
 // ExtractIterableItems returns all items from an iterable Value.
 func ExtractIterableItems(ctx *ExecContext, arg Value) []Value {
+	if arg.IsRange() {
+		start := int64(arg.RangeStart())
+		stop := int64(arg.RangeStop())
+		n := int(stop - start)
+		if n <= 0 {
+			return []Value{}
+		}
+		res := make([]Value, n)
+		for i := range res {
+			res[i] = Int64Val(start + int64(i))
+		}
+		return res
+	}
 	if arg.IsSet() {
 		return arg.AsSet().Items()
 	}
@@ -3516,6 +3779,20 @@ func ExtractIterableItems(ctx *ExecContext, arg Value) []Value {
 		}
 		var res []Value
 		switch it.Kind {
+		case IterKindRange:
+			if n, ok := rangeLen(it.Cur, it.Stop, it.Step); ok {
+				if n == 0 {
+					return []Value{}
+				}
+				res = make([]Value, n)
+				cur := it.Cur
+				for i := range res {
+					res[i] = Int64Val(cur)
+					cur += it.Step
+				}
+				it.Cur = it.Stop
+				return res
+			}
 		case IterKindRepeat:
 			if it.Stop >= 0 && it.Cur < it.Stop {
 				rem := int(it.Stop - it.Cur)
@@ -5539,7 +5816,58 @@ func initTypes() {
 		if len(args) == 0 {
 			return NewListVal()
 		}
-		return NewListVal(ExtractIterableItems(ctx, args[0])...)
+		src := args[0]
+		if src.IsRange() {
+			start := int64(src.RangeStart())
+			stop := int64(src.RangeStop())
+			n := int(stop - start)
+			if n <= 0 {
+				return NewListVal()
+			}
+			items := make([]Value, n)
+			for i := range items {
+				items[i] = Int64Val(start + int64(i))
+			}
+			return NewListFromOwnedSlice(items)
+		}
+		if src.IsList() {
+			l := src.AsList()
+			if MultiThreadedFlag.Load() {
+				l.mu.RLock()
+				cp := make([]Value, len(l.Items))
+				copy(cp, l.Items)
+				l.mu.RUnlock()
+				return NewListFromOwnedSlice(cp)
+			}
+			cp := make([]Value, len(l.Items))
+			copy(cp, l.Items)
+			return NewListFromOwnedSlice(cp)
+		}
+		if src.IsTuple() {
+			t := src.AsTuple()
+			cp := make([]Value, len(t.Items))
+			copy(cp, t.Items)
+			return NewListFromOwnedSlice(cp)
+		}
+		if src.IsIter() {
+			it := src.AsIter()
+			if it.Kind == IterKindRange {
+				if n, ok := rangeLen(it.Cur, it.Stop, it.Step); ok {
+					if n == 0 {
+						return NewListVal()
+					}
+					items := make([]Value, n)
+					cur := it.Cur
+					for i := range items {
+						items[i] = Int64Val(cur)
+						cur += it.Step
+					}
+					it.Cur = it.Stop
+					return NewListFromOwnedSlice(items)
+				}
+			}
+		}
+		return NewListVal(ExtractIterableItems(ctx, src)...)
 	}
 	listNewBuiltin := NewBuiltinFuncVal("list.__new__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		cls := ListType
@@ -5557,10 +5885,67 @@ func initTypes() {
 			return NoneVal()
 		}
 		l := args[0].AsList()
-		l.Items = l.Items[:0]
-		if len(args) > 1 {
-			l.Items = append(l.Items, ExtractIterableItems(ctx, args[1])...)
+		if len(args) <= 1 {
+			l.Items = l.Items[:0]
+			return NoneVal()
 		}
+		src := args[1]
+		if src.IsList() && src.AsList() == l {
+			cp := make([]Value, len(l.Items))
+			copy(cp, l.Items)
+			l.Items = cp
+			return NoneVal()
+		}
+		l.Items = l.Items[:0]
+		if src.IsRange() {
+			start := int64(src.RangeStart())
+			stop := int64(src.RangeStop())
+			n := int(stop - start)
+			if n > 0 {
+				items := make([]Value, n)
+				for i := range items {
+					items[i] = Int64Val(start + int64(i))
+				}
+				l.Items = items
+			}
+			return NoneVal()
+		}
+		if src.IsList() {
+			o := src.AsList()
+			if MultiThreadedFlag.Load() {
+				o.mu.RLock()
+				cp := make([]Value, len(o.Items))
+				copy(cp, o.Items)
+				o.mu.RUnlock()
+				l.Items = append(l.Items, cp...)
+			} else {
+				l.Items = append(l.Items, o.Items...)
+			}
+			return NoneVal()
+		}
+		if src.IsTuple() {
+			l.Items = append(l.Items, src.AsTuple().Items...)
+			return NoneVal()
+		}
+		if src.IsIter() {
+			it := src.AsIter()
+			if it.Kind == IterKindRange {
+				if n, ok := rangeLen(it.Cur, it.Stop, it.Step); ok {
+					if n > 0 {
+						items := make([]Value, n)
+						cur := it.Cur
+						for i := range items {
+							items[i] = Int64Val(cur)
+							cur += it.Step
+						}
+						it.Cur = it.Stop
+						l.Items = items
+					}
+					return NoneVal()
+				}
+			}
+		}
+		l.Items = append(l.Items, ExtractIterableItems(ctx, src)...)
 		return NoneVal()
 	})
 	ListType.Dict.Set(DunderInit, listInitBuiltin)
@@ -6228,6 +6613,12 @@ func initTypes() {
 			}
 			return newTupleOfTypeFromSlice(cls, l.Items)
 		}
+		if arg.IsRange() {
+			start := int64(arg.RangeStart())
+			stop := int64(arg.RangeStop())
+			n := max(int(stop-start), 0)
+			return newRangeTupleOfType(cls, start, 1, n)
+		}
 		if arg.IsGenerator() {
 			gen := arg.AsGenerator()
 			if DrainGeneratorHook != nil {
@@ -6257,6 +6648,14 @@ func initTypes() {
 			if it.Kind == IterKindInvalid {
 				ctx.Raise(NewException(TypeErrorType, "'"+it.Obj.Type().Name+"' object is not iterable"))
 				return NoneVal()
+			}
+			if it.Kind == IterKindRange {
+				if n, ok := rangeLen(it.Cur, it.Stop, it.Step); ok {
+					start := it.Cur
+					step := it.Step
+					it.Cur = it.Stop
+					return newRangeTupleOfType(cls, start, step, n)
+				}
 			}
 			var buf [8]Value
 			items := buf[:0]
@@ -7931,12 +8330,18 @@ func initTypes() {
 		if len(args) > 0 {
 			self := args[0]
 			if self.IsInstance() {
-				var tupleItems []Value
-				if len(args) > 1 {
-					tupleItems = make([]Value, len(args)-1)
+				if n := len(args) - 1; n <= 8 {
+					// Small raises (the common case, including zero args
+					// yielding the empty-tuple singleton) copy once
+					// directly into the fused inline/bundle tuple slots.
+					self.AsInstance().SetAttr(strArgs, NewTupleVal(args[1:]...))
+				} else {
+					// Large raises fill an exact slice once and hand it
+					// to the tuple without a second copy.
+					tupleItems := make([]Value, n)
 					copy(tupleItems, args[1:])
+					self.AsInstance().SetAttr(strArgs, NewTupleFromOwnedSlice(tupleItems))
 				}
-				self.AsInstance().SetAttr(strArgs, NewTupleVal(tupleItems...))
 				self.AsInstance().SetAttr(strTraceback, NoneVal())
 				self.AsInstance().SetAttr(strCause, NoneVal())
 				self.AsInstance().SetAttr(strContext, NoneVal())
@@ -10259,6 +10664,15 @@ func initTypes() {
 	TypeType.syncDunderSlots()
 	TypeType.Slots.TpCall = typeTpCall
 	TypeType.UsesDefaultTpCall = true
+
+	// The shared iterator over the empty tuple is immortal: every NextCtx on
+	// it reports exhaustion without touching mutable state.
+	exhaustedIter := &PyIter{
+		Header: ObjectHeader{Kind: KindIter, Type: IterType},
+		Kind:   IterKindTuple,
+		Obj:    EmptyTupleVal(),
+	}
+	emptyTupleIterVal = Value{num: 0, ptr: &exhaustedIter.Header}
 }
 
 // parseASCIIBase10Int64 parses an ASCII base-10 integer string with optional

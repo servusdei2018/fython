@@ -1490,6 +1490,12 @@ var emptyTuple = PyTuple{
 	Items: nil,
 }
 
+// emptyTupleIterVal is the shared immortal iterator over the empty tuple.
+// It is initialized in initTypes once TupleType and IterType are set. Every
+// NextCtx on it reports exhaustion without mutating state, so sharing it
+// across threads and loops is race-clean.
+var emptyTupleIterVal Value
+
 // EmptyTupleVal returns the singleton empty tuple Value.
 func EmptyTupleVal() Value {
 	return Value{num: 0, ptr: &emptyTuple.Header}
@@ -1788,6 +1794,11 @@ func (c *PyChan) Close() bool {
 func NewIterVal(obj Value) Value {
 	if obj.IsIter() {
 		return obj
+	}
+	// Iterating an empty tuple is always exhausted and touches no mutable
+	// state, so share a single immortal iterator instead of allocating.
+	if obj.IsTuple() && len(obj.AsTuple().Items) == 0 && emptyTupleIterVal.HeaderPtr() != nil {
+		return emptyTupleIterVal
 	}
 	it := &PyIter{
 		Header: ObjectHeader{Kind: KindIter, Type: IterType},
@@ -6622,12 +6633,45 @@ type PyLocalsProxy struct {
 
 // PyTraceback represents a node in an exception traceback chain.
 // Header MUST be at byte offset 0.
+//
+// A node is either eager (Frame holds the KindFrame, Code/Globals empty) or
+// lazy (Frame is None and Code/Globals carry lightweight frame metadata, with
+// the *PyFrame materialized on first tb_frame access and cached in
+// CachedFrame). Lazy nodes serve tb_lineno, tb_lasti, tb_next, and traceback
+// formatting without allocating a *PyFrame. Code, Globals, LineNo, and LastI
+// are immutable after publication; only CachedFrame mutates, via atomics, so
+// concurrent tb_frame reads are race-clean and preserve identity
+// (tb.tb_frame is tb.tb_frame).
 type PyTraceback struct {
-	Header ObjectHeader
-	Frame  Value // KindFrame
-	LineNo int
-	LastI  int
-	Next   Value // KindTraceback or None
+	Header      ObjectHeader
+	Frame       Value // KindFrame (eager) or None (lazy until materialized)
+	Next        Value // KindTraceback or None
+	Code        Value // KindCode for lazy nodes, None for eager ones
+	Globals     *PyDict
+	CachedFrame atomic.Pointer[PyFrame]
+	LineNo      int
+	LastI       int
+}
+
+// IsLazyTraceback reports whether tb carries lightweight metadata instead of
+// a materialized frame.
+func (tb *PyTraceback) IsLazy() bool {
+	return tb != nil && tb.Frame.IsNone() && !tb.Code.IsNone()
+}
+
+// TracebackFrame returns the node's frame Value without materializing: the
+// eager Frame, the atomically cached lazy frame, or None.
+func TracebackFrame(tb *PyTraceback) Value {
+	if tb == nil {
+		return NoneVal()
+	}
+	if !tb.Frame.IsNone() {
+		return tb.Frame
+	}
+	if f := tb.CachedFrame.Load(); f != nil {
+		return FrameValOf(f)
+	}
+	return NoneVal()
 }
 
 // PyWeakRef represents a weak reference to an object.
@@ -6761,6 +6805,14 @@ func NewFrameVal(f *PyFrame) Value {
 	return Value{ptr: &f.Header}
 }
 
+// FrameValOf wraps an already-initialized *PyFrame without touching its
+// header, for frames shared across threads (e.g. a lazily cached traceback
+// frame): concurrent NewFrameVal header writes would race even though they
+// store identical values.
+func FrameValOf(f *PyFrame) Value {
+	return Value{ptr: &f.Header}
+}
+
 // NewLocalsProxyVal wraps a *PyLocalsProxy as a Value with KindLocalsProxy.
 func NewLocalsProxyVal(p *PyLocalsProxy) Value {
 	p.Header.Kind = KindLocalsProxy
@@ -6779,6 +6831,34 @@ func NewTracebackVal(frame Value, lineno int, lasti int, next Value) Value {
 		LineNo: lineno,
 		LastI:  lasti,
 		Next:   next,
+		Code:   NoneVal(),
+	}
+	return Value{ptr: &tb.Header}
+}
+
+// LazyFrameHook materializes a lazy traceback node's *PyFrame on first
+// tb_frame access. Set by pkg/vm; nil means no VM is available and tb_frame
+// stays None. Implementations must cache with CompareAndSwap so concurrent
+// readers observe a single identical frame.
+var LazyFrameHook func(ctx *ExecContext, tb *PyTraceback) Value
+
+// NewLazyTracebackVal constructs a PyTraceback node carrying lightweight
+// frame metadata (code, globals, line) without allocating a *PyFrame. The
+// frame is materialized on first tb_frame access and cached, preserving
+// tb.tb_frame identity. Deferred-unwind frames are snapshot-free by design
+// (locals were never captured), so no cells or stack offsets are retained.
+func NewLazyTracebackVal(code Value, globals *PyDict, lineno int, lasti int, next Value) Value {
+	tb := &PyTraceback{
+		Header: ObjectHeader{
+			Kind: KindTraceback,
+			Type: TracebackType,
+		},
+		Frame:   NoneVal(),
+		Next:    next,
+		Code:    code,
+		Globals: globals,
+		LineNo:  lineno,
+		LastI:   lasti,
 	}
 	return Value{ptr: &tb.Header}
 }

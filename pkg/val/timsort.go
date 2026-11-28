@@ -692,8 +692,18 @@ func (st *timStateFast[T, C]) mergeAt(i int) {
 }
 
 func (st *timStateFast[T, C]) mergeLo(base1, len1, base2, len2 int) {
+	if len1 <= 64 {
+		var buf [64]T
+		tmp := buf[:len1]
+		st.mergeLoTmp(base1, len1, base2, len2, tmp)
+		clear(buf[:len1])
+		return
+	}
+	st.mergeLoTmp(base1, len1, base2, len2, st.ensureTmp(len1))
+}
+
+func (st *timStateFast[T, C]) mergeLoTmp(base1, len1, base2, len2 int, tmp []T) {
 	a := st.a
-	tmp := st.ensureTmp(len1)
 	copy(tmp, a[base1:base1+len1])
 
 	cursor1 := 0
@@ -803,8 +813,18 @@ outer:
 }
 
 func (st *timStateFast[T, C]) mergeHi(base1, len1, base2, len2 int) {
+	if len2 <= 64 {
+		var buf [64]T
+		tmp := buf[:len2]
+		st.mergeHiTmp(base1, len1, base2, len2, tmp)
+		clear(buf[:len2])
+		return
+	}
+	st.mergeHiTmp(base1, len1, base2, len2, st.ensureTmp(len2))
+}
+
+func (st *timStateFast[T, C]) mergeHiTmp(base1, len1, base2, len2 int, tmp []T) {
 	a := st.a
-	tmp := st.ensureTmp(len2)
 	copy(tmp, a[base2:base2+len2])
 
 	cursor1 := base1 + len1 - 1
@@ -1257,8 +1277,18 @@ func (st *timStateFallible[T, C]) mergeAt(i int) bool {
 }
 
 func (st *timStateFallible[T, C]) mergeLo(base1, len1, base2, len2 int) bool {
+	if len1 <= 64 {
+		var buf [64]T
+		tmp := buf[:len1]
+		ok := st.mergeLoTmp(base1, len1, base2, len2, tmp)
+		clear(buf[:len1])
+		return ok
+	}
+	return st.mergeLoTmp(base1, len1, base2, len2, st.ensureTmp(len1))
+}
+
+func (st *timStateFallible[T, C]) mergeLoTmp(base1, len1, base2, len2 int, tmp []T) bool {
 	a := st.a
-	tmp := st.ensureTmp(len1)
 	copy(tmp, a[base1:base1+len1])
 
 	cursor1 := 0
@@ -1380,8 +1410,18 @@ outer:
 }
 
 func (st *timStateFallible[T, C]) mergeHi(base1, len1, base2, len2 int) bool {
+	if len2 <= 64 {
+		var buf [64]T
+		tmp := buf[:len2]
+		ok := st.mergeHiTmp(base1, len1, base2, len2, tmp)
+		clear(buf[:len2])
+		return ok
+	}
+	return st.mergeHiTmp(base1, len1, base2, len2, st.ensureTmp(len2))
+}
+
+func (st *timStateFallible[T, C]) mergeHiTmp(base1, len1, base2, len2 int, tmp []T) bool {
 	a := st.a
-	tmp := st.ensureTmp(len2)
 	copy(tmp, a[base2:base2+len2])
 
 	cursor1 := base1 + len1 - 1
@@ -1509,6 +1549,14 @@ outer:
 
 // --- Dispatch helpers & Public Entrypoints ---
 
+// BatchApplyHook1 applies a single-argument Python function to every element
+// of items in one batched VM entry, reporting each key through setKey. It is
+// set by pkg/vm. Returning false without an exception on ctx declines the
+// fast path (unsupported callable shape) and the caller falls back to the
+// generic per-element loop; false with an exception set reports a key-function
+// failure.
+var BatchApplyHook1 func(ctx *ExecContext, fn Value, items []Value, setKey func(int, Value)) bool
+
 func evalSortKeys(ctx *ExecContext, items []Value, keyFn Value) ([]sortPair, bool) {
 	pairs := make([]sortPair, len(items))
 	var argBuf [1]Value
@@ -1524,6 +1572,18 @@ func evalSortKeys(ctx *ExecContext, items []Value, keyFn Value) ([]sortPair, boo
 			pairs[i] = sortPair{val: itm, key: k}
 		}
 		return pairs, true
+	}
+	if keyFn.IsFunction() && BatchApplyHook1 != nil {
+		for i, itm := range items {
+			pairs[i].val = itm
+		}
+		if BatchApplyHook1(ctx, keyFn, items, func(i int, k Value) { pairs[i].key = k }) {
+			return pairs, true
+		}
+		if ctx != nil && ctx.HasException() {
+			clear(pairs)
+			return nil, false
+		}
 	}
 	if tp := keyFn.Type(); tp != nil && tp.Slots.TpCall != nil && !keyFn.IsFunction() && !keyFn.IsType() {
 		tpCall := tp.Slots.TpCall

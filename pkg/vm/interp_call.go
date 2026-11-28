@@ -1440,7 +1440,24 @@ func (vm *VM) opCallFunctionEx(st *loopState, inst uint32, ip, sp int) (int, int
 				// without cells/defaults.
 				if !callee.IsGenerator && !callee.IsCoroutine &&
 					!callee.HasCells && len(fn.Defaults) == 0 && fn.KwDefaults == nil &&
-					callee.KWOnlyArgCount == 0 && argsVal.Kind() == val.KindTuple {
+					callee.KWOnlyArgCount == 0 && (argsVal.Kind() == val.KindTuple || argsVal.IsList()) {
+					// fwdTuple is the immutable *args tuple handed to the callee in the
+					// pure-forwarding cases below. For tuple args it is argsVal itself,
+					// verified exact-TupleType and non-ephemeral so a callee retaining
+					// *args can never alias a pooled/recycled tuple. For list args it
+					// is a fresh tuple stealing the backing of the CALL_EX builder
+					// list (the compiler always materializes *-positionals with
+					// OP_BUILD_LIST + OP_LIST_EXTEND/APPEND, so the list is dead
+					// after this point and its backing has no other references).
+					fwdTuple := val.Value{}
+					if argsVal.Kind() == val.KindTuple {
+						if h := argsVal.HeaderPtr(); h != nil && h.Type == val.TupleType &&
+							(h.Flags&val.FlagEphemeralTuple) == 0 {
+							fwdTuple = argsVal
+						}
+					} else if argsVal.IsList() {
+						fwdTuple = val.NewTupleFromOwnedSlice(argsVal.AsList().Items)
+					}
 					varFlags := callee.Flags & (CO_VARARGS | CO_VARKEYWORDS)
 					switch {
 					case kwDict == nil && varFlags == 0 && selfCount+len(posArgs) == callee.PositionalParamCount:
@@ -1469,7 +1486,7 @@ func (vm *VM) opCallFunctionEx(st *loopState, inst uint32, ip, sp int) (int, int
 
 					case kwDict == nil && varFlags == CO_VARARGS && selfCount+len(posArgs) >= callee.PosParamCount:
 						// Pure *args forwarding fast path (including def m(self, *args):).
-						if callee.PosParamCount == selfCount && argsVal.HeaderPtr().Type == val.TupleType {
+						if callee.PosParamCount == selfCount && fwdTuple.HeaderPtr() != nil {
 							if hasSelf {
 								if initType != nil {
 									initInst = val.NewInstanceOfType(initType)
@@ -1477,11 +1494,11 @@ func (vm *VM) opCallFunctionEx(st *loopState, inst uint32, ip, sp int) (int, int
 								}
 								stack[newBase] = selfVal
 							}
-							val.ClearEphemeral(argsVal)
+							val.ClearEphemeral(fwdTuple)
 							for l := selfCount; l < callee.NumLocals; l++ {
 								stack[newBase+l] = val.UnboundVal()
 							}
-							stack[newBase+callee.VarArgsIdx] = argsVal
+							stack[newBase+callee.VarArgsIdx] = fwdTuple
 							cc := vm.fastCalleeCache(callee)
 							nextIP, nextSP := vm.pushFrameFast(st, fn, cc, newBase+callee.NumLocals, callee.NumLocals, ip)
 							if initType != nil {
@@ -1507,7 +1524,7 @@ func (vm *VM) opCallFunctionEx(st *loopState, inst uint32, ip, sp int) (int, int
 							} else {
 								restItems := make([]val.Value, len(tail))
 								copy(restItems, tail)
-								restVal = val.NewTupleVal(restItems...)
+								restVal = val.NewTupleFromOwnedSlice(restItems)
 							}
 							vm.releaseEphemeralTupleVal(argsVal)
 							for l := callee.PosParamCount; l < callee.NumLocals; l++ {
@@ -1524,7 +1541,7 @@ func (vm *VM) opCallFunctionEx(st *loopState, inst uint32, ip, sp int) (int, int
 						}
 
 					case varFlags == (CO_VARARGS|CO_VARKEYWORDS) && callee.PosParamCount == selfCount &&
-						argsVal.HeaderPtr().Type == val.TupleType:
+						fwdTuple.HeaderPtr() != nil:
 						// f(*a, **kw) -> def g(*args, **kwargs) (or def m(self, *args, **kwargs)) forwarding fast path.
 						kwValid := true
 						if kwDict != nil {
@@ -1548,29 +1565,35 @@ func (vm *VM) opCallFunctionEx(st *loopState, inst uint32, ip, sp int) (int, int
 							var kwArg val.Value
 							switch {
 							case kwDict == nil:
-								kwArg = val.NewDictVal(0)
+								kwArg = vm.acquireSmallDictFlags(0, val.FlagEphemeralDict|val.FlagEphemeralFrameDict)
 							case kwDict.Header.Type == val.DictType &&
 								(kwDict.Header.Flags&val.FlagEphemeralDict) != 0 &&
 								kwDict.Live == nil && !kwDict.Shared:
-								kwDict.Header.Flags &^= val.FlagEphemeralDict | val.FlagEphemeralFrameDict
+								// Take VM ownership: clear the pooled-dict bit and mark
+								// frame ownership so a VarKWSafe callee recycles it at
+								// teardown. Non-VarKWSafe callees simply drop it.
+								// Escape is impossible for VarKWSafe callees (their
+								// analysis rejects any leaking use) and harmless
+								// otherwise (no teardown release without VarKWSafe).
+								kwDict.Header.Flags &^= val.FlagEphemeralDict
+								kwDict.Header.Flags |= val.FlagEphemeralFrameDict
 								kwArg = val.DictVal(kwDict)
 							default:
-								copied := val.NewDictVal(kwLen)
-								cd := copied.AsDict()
-								for i := range kwDict.Entries {
-									e := &kwDict.Entries[i]
-									if e.Active {
-										cd.Set(val.InternValue(e.Key), e.Value)
-									}
-								}
-								vm.releaseSmallDict(kwDict)
-								kwArg = copied
+								// Caller-owned mapping: copy it without ever handing the
+								// caller's dict to the callee. A VarKWSafe callee gets
+								// a pooled dict taking VM ownership (both ephemeral
+								// bits): chained forwards transfer it with zero further
+								// copies and the callee recycles it at teardown. Any
+								// other callee gets a split-cache dict (shared keys,
+								// private values) so terminal kwargs stay small; a
+								// pooled dict would leak its 352B bundle there.
+								kwArg = vm.copyForwardedKwDict(kwDict, kwLen, callee.VarKWSafe, st, ip)
 							}
-							val.ClearEphemeral(argsVal)
+							val.ClearEphemeral(fwdTuple)
 							for l := selfCount; l < callee.NumLocals; l++ {
 								stack[newBase+l] = val.UnboundVal()
 							}
-							stack[newBase+callee.VarArgsIdx] = argsVal
+							stack[newBase+callee.VarArgsIdx] = fwdTuple
 							stack[newBase+callee.VarKWIdx] = kwArg
 							cc := vm.fastCalleeCache(callee)
 							nextIP, nextSP := vm.pushFrameFast(st, fn, cc, newBase+callee.NumLocals, callee.NumLocals, ip)

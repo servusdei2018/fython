@@ -2960,6 +2960,9 @@ func (vm *VM) materializeDeferredTB(exc val.Value) {
 		e := &entries[i]
 		var inlineFrame *val.PyFrame
 		if e.inlineCallee != nil {
+			// Inlined callees keep eager frames: tb.tb_frame.f_back must
+			// resolve to the caller frame exactly as before. Inline sites
+			// are rare; the hot path below stays frame-free.
 			inlineFrame = val.NewPyFrame(vm, -1, 0, NewCodeVal(e.inlineCallee), e.inlineGlobals, e.inlineCells)
 			inlineFrame.IP = e.inlineIP
 			inlineFrame.Detached = true
@@ -2967,15 +2970,22 @@ func (vm *VM) materializeDeferredTB(exc val.Value) {
 			curTB = val.NewTracebackVal(val.NewFrameVal(inlineFrame), calleeLine, e.inlineIP, curTB)
 		}
 		if e.co != nil {
-			f := val.NewPyFrame(vm, -1, 0, NewCodeVal(e.co), e.globals, e.cells)
-			f.IP = e.ip
-			f.Detached = true
-			frameVal := val.NewFrameVal(f)
-			if inlineFrame != nil {
-				inlineFrame.Back = frameVal
-			}
 			line := e.co.LineAt(e.ip)
-			curTB = val.NewTracebackVal(frameVal, line, e.ip, curTB)
+			if inlineFrame != nil {
+				// Preserve the inline frame's f_back chain with an eager
+				// caller frame (rare inline path only).
+				f := val.NewPyFrame(vm, -1, 0, NewCodeVal(e.co), e.globals, e.cells)
+				f.IP = e.ip
+				f.Detached = true
+				frameVal := val.NewFrameVal(f)
+				inlineFrame.Back = frameVal
+				curTB = val.NewTracebackVal(frameVal, line, e.ip, curTB)
+			} else {
+				// Lazy node: no PyFrame until tb_frame is actually read.
+				// Deferred frames are snapshot-free by design (locals were
+				// never captured), so Code/Globals/LastI fully describe them.
+				curTB = val.NewLazyTracebackVal(NewCodeVal(e.co), e.globals, line, e.ip, curTB)
+			}
 		}
 	}
 	clear(entries)

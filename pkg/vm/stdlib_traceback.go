@@ -118,20 +118,28 @@ func formatTracebackChain(tbVal val.Value) []string {
 	curr := tbVal
 	for !curr.IsNone() && curr.IsTraceback() {
 		tb := curr.AsTraceback()
-		frameVal := tb.Frame
-		fnName := "<unknown>"
-		fileName := "<unknown>"
-		if frameVal.IsFrame() {
-			f := frameVal.AsFrame()
-			if val.CodeInspectorHook != nil && f.CO.HeaderPtr() != nil {
-				fnName = val.CodeInspectorHook.QualName(f.CO)
-				fileName = val.CodeInspectorHook.FileName(f.CO)
-			}
-		}
+		fnName, fileName := tracebackNodeLocation(tb)
 		lines = append(lines, fmt.Sprintf("  File \"%s\", line %d, in %s\n", fileName, tb.LineNo, fnName))
 		curr = tb.Next
 	}
 	return lines
+}
+
+// tracebackNodeLocation resolves (func, file) for a traceback node without
+// materializing lazy frames: eager nodes read f.CO, lazy nodes read Code.
+func tracebackNodeLocation(tb *val.PyTraceback) (fnName, fileName string) {
+	fnName, fileName = "<unknown>", "<unknown>"
+	code := tb.Code
+	if frameVal := tb.Frame; frameVal.IsFrame() {
+		if f := frameVal.AsFrame(); f.CO.HeaderPtr() != nil {
+			code = f.CO
+		}
+	}
+	if val.CodeInspectorHook != nil && !code.IsNone() && code.HeaderPtr() != nil {
+		fnName = val.CodeInspectorHook.QualName(code)
+		fileName = val.CodeInspectorHook.FileName(code)
+	}
+	return fnName, fileName
 }
 
 func (e *Engine) createTracebackModule() val.Value {
@@ -162,16 +170,7 @@ func (e *Engine) createTracebackModule() val.Value {
 		curr := args[0]
 		for !curr.IsNone() && curr.IsTraceback() {
 			tb := curr.AsTraceback()
-			frameVal := tb.Frame
-			fnName := "<unknown>"
-			fileName := "<unknown>"
-			if frameVal.IsFrame() {
-				f := frameVal.AsFrame()
-				if val.CodeInspectorHook != nil && f.CO.HeaderPtr() != nil {
-					fnName = val.CodeInspectorHook.QualName(f.CO)
-					fileName = val.CodeInspectorHook.FileName(f.CO)
-				}
-			}
+			fnName, fileName := tracebackNodeLocation(tb)
 			summary := newFrameSummaryVal(ctx, fileName, tb.LineNo, fnName, "")
 			listItems = append(listItems, summary)
 			curr = tb.Next
