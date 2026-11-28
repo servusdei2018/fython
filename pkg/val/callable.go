@@ -7840,7 +7840,7 @@ func initTypes() {
 		case arg.IsTuple():
 			return NewSetVal(arg.AsTuple().Items...)
 		case arg.IsSet():
-			return SetVal(arg.AsSet().Copy())
+			return SetVal(arg.AsSet().CopyWithType(SetType))
 		case arg.IsDict():
 			return NewSetFromDict(arg.AsDict())
 		}
@@ -7851,13 +7851,25 @@ func initTypes() {
 		return NewSetVal(items...)
 	}
 
+	rejectFrozenSetMutator := func(ctx *ExecContext, self Value, method string) bool {
+		if !self.IsSet() || self.AsSet().isFrozen() {
+			ctx.Raise(NewException(TypeErrorType, "descriptor '"+method+"' for 'set' objects doesn't apply to a '"+self.Type().Name+"' object"))
+			return true
+		}
+		return false
+	}
+
 	SetType.Dict.Set(InternString("add"), NewBuiltinFuncVal("add", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 2 {
 			ctx.Raise(NewException(TypeErrorType, "add() takes exactly 1 argument"))
 			return NoneVal()
 		}
-		if args[0].IsSet() {
-			args[0].AsSet().Add(args[1])
+		if rejectFrozenSetMutator(ctx, args[0], "add") {
+			return NoneVal()
+		}
+		if exc, ok := args[0].AsSet().AddChecked(args[1]); !ok {
+			ctx.Raise(exc)
+			return NoneVal()
 		}
 		return NoneVal()
 	}))
@@ -7867,11 +7879,12 @@ func initTypes() {
 			ctx.Raise(NewException(TypeErrorType, "remove() takes exactly 1 argument"))
 			return NoneVal()
 		}
-		if args[0].IsSet() {
-			if !args[0].AsSet().Remove(args[1]) {
-				ctx.Raise(NewException(KeyErrorType, fmt.Sprintf("%v", args[1])))
-				return NoneVal()
-			}
+		if rejectFrozenSetMutator(ctx, args[0], "remove") {
+			return NoneVal()
+		}
+		if !args[0].AsSet().Remove(args[1]) {
+			ctx.Raise(NewException(KeyErrorType, fmt.Sprintf("%v", args[1])))
+			return NoneVal()
 		}
 		return NoneVal()
 	}))
@@ -7881,9 +7894,10 @@ func initTypes() {
 			ctx.Raise(NewException(TypeErrorType, "discard() takes exactly 1 argument"))
 			return NoneVal()
 		}
-		if args[0].IsSet() {
-			args[0].AsSet().Discard(args[1])
+		if rejectFrozenSetMutator(ctx, args[0], "discard") {
+			return NoneVal()
 		}
+		args[0].AsSet().Discard(args[1])
 		return NoneVal()
 	}))
 
@@ -7892,9 +7906,10 @@ func initTypes() {
 			ctx.Raise(NewException(TypeErrorType, "descriptor 'clear' of 'set' object needs an argument"))
 			return NoneVal()
 		}
-		if args[0].IsSet() {
-			args[0].AsSet().Clear()
+		if rejectFrozenSetMutator(ctx, args[0], "clear") {
+			return NoneVal()
 		}
+		args[0].AsSet().Clear()
 		return NoneVal()
 	}))
 
@@ -7903,15 +7918,15 @@ func initTypes() {
 			ctx.Raise(NewException(TypeErrorType, "descriptor 'pop' of 'set' object needs an argument"))
 			return NoneVal()
 		}
-		if args[0].IsSet() {
-			val, ok := args[0].AsSet().Pop()
-			if !ok {
-				ctx.Raise(NewException(KeyErrorType, "'pop from an empty set'"))
-				return NoneVal()
-			}
-			return val
+		if rejectFrozenSetMutator(ctx, args[0], "pop") {
+			return NoneVal()
 		}
-		return NoneVal()
+		v, ok := args[0].AsSet().Pop()
+		if !ok {
+			ctx.Raise(NewException(KeyErrorType, "'pop from an empty set'"))
+			return NoneVal()
+		}
+		return v
 	}))
 
 	SetType.Dict.Set(InternString("copy"), NewBuiltinFuncVal("copy", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
@@ -7930,19 +7945,23 @@ func initTypes() {
 			ctx.Raise(NewException(TypeErrorType, "descriptor 'update' of 'set' object needs an argument"))
 			return NoneVal()
 		}
-		if args[0].IsSet() {
-			s := args[0].AsSet()
-			for _, other := range args[1:] {
-				if other.IsSet() {
-					s.UpdateFromSet(other.AsSet())
-					continue
-				}
-				items := ExtractIterableItems(ctx, other)
-				if ctx != nil && ctx.HasException() {
+		if rejectFrozenSetMutator(ctx, args[0], "update") {
+			return NoneVal()
+		}
+		s := args[0].AsSet()
+		for _, other := range args[1:] {
+			if other.IsSet() {
+				s.UpdateFromSet(other.AsSet())
+				continue
+			}
+			items := ExtractIterableItems(ctx, other)
+			if ctx != nil && ctx.HasException() {
+				return NoneVal()
+			}
+			for _, it := range items {
+				if exc, ok := s.AddChecked(it); !ok {
+					ctx.Raise(exc)
 					return NoneVal()
-				}
-				for _, it := range items {
-					s.Add(it)
 				}
 			}
 		}
@@ -7954,20 +7973,21 @@ func initTypes() {
 			ctx.Raise(NewException(TypeErrorType, "descriptor 'intersection_update' of 'set' object needs an argument"))
 			return NoneVal()
 		}
-		if args[0].IsSet() {
-			s := args[0].AsSet()
-			for _, other := range args[1:] {
-				if other.IsSet() {
-					s.IntersectionUpdateFromSet(other.AsSet())
-					continue
-				}
-				items := ExtractIterableItems(ctx, other)
-				if ctx != nil && ctx.HasException() {
-					return NoneVal()
-				}
-				otherSet := NewSetVal(items...).AsSet()
-				s.IntersectionUpdateFromSet(otherSet)
+		if rejectFrozenSetMutator(ctx, args[0], "intersection_update") {
+			return NoneVal()
+		}
+		s := args[0].AsSet()
+		for _, other := range args[1:] {
+			if other.IsSet() {
+				s.IntersectionUpdateFromSet(other.AsSet())
+				continue
 			}
+			items := ExtractIterableItems(ctx, other)
+			if ctx != nil && ctx.HasException() {
+				return NoneVal()
+			}
+			otherSet := NewSetVal(items...).AsSet()
+			s.IntersectionUpdateFromSet(otherSet)
 		}
 		return NoneVal()
 	}))
@@ -7977,20 +7997,21 @@ func initTypes() {
 			ctx.Raise(NewException(TypeErrorType, "descriptor 'difference_update' of 'set' object needs an argument"))
 			return NoneVal()
 		}
-		if args[0].IsSet() {
-			s := args[0].AsSet()
-			for _, other := range args[1:] {
-				if other.IsSet() {
-					s.DifferenceUpdateFromSet(other.AsSet())
-					continue
-				}
-				items := ExtractIterableItems(ctx, other)
-				if ctx != nil && ctx.HasException() {
-					return NoneVal()
-				}
-				for _, it := range items {
-					s.Discard(it)
-				}
+		if rejectFrozenSetMutator(ctx, args[0], "difference_update") {
+			return NoneVal()
+		}
+		s := args[0].AsSet()
+		for _, other := range args[1:] {
+			if other.IsSet() {
+				s.DifferenceUpdateFromSet(other.AsSet())
+				continue
+			}
+			items := ExtractIterableItems(ctx, other)
+			if ctx != nil && ctx.HasException() {
+				return NoneVal()
+			}
+			for _, it := range items {
+				s.Discard(it)
 			}
 		}
 		return NoneVal()
@@ -8001,19 +8022,20 @@ func initTypes() {
 			ctx.Raise(NewException(TypeErrorType, "descriptor 'symmetric_difference_update' of 'set' object needs an argument"))
 			return NoneVal()
 		}
-		if args[0].IsSet() {
-			s := args[0].AsSet()
-			if args[1].IsSet() {
-				s.SymmetricDifferenceUpdateFromSet(args[1].AsSet())
-				return NoneVal()
-			}
-			items := ExtractIterableItems(ctx, args[1])
-			if ctx != nil && ctx.HasException() {
-				return NoneVal()
-			}
-			otherSet := NewSetVal(items...).AsSet()
-			s.SymmetricDifferenceUpdateFromSet(otherSet)
+		if rejectFrozenSetMutator(ctx, args[0], "symmetric_difference_update") {
+			return NoneVal()
 		}
+		s := args[0].AsSet()
+		if args[1].IsSet() {
+			s.SymmetricDifferenceUpdateFromSet(args[1].AsSet())
+			return NoneVal()
+		}
+		items := ExtractIterableItems(ctx, args[1])
+		if ctx != nil && ctx.HasException() {
+			return NoneVal()
+		}
+		otherSet := NewSetVal(items...).AsSet()
+		s.SymmetricDifferenceUpdateFromSet(otherSet)
 		return NoneVal()
 	}))
 
@@ -8180,6 +8202,335 @@ func initTypes() {
 		}
 		return SetType.Slots.TpIter(ctx, args[0])
 	}))
+
+	setInPlaceDunder := func(name string, fn func(*PySet, *PySet)) Value {
+		return NewBuiltinFuncVal(name, func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+			if len(args) < 2 {
+				ctx.Raise(NewException(TypeErrorType, "descriptor '"+name+"' of 'set' object needs an argument"))
+				return NoneVal()
+			}
+			if rejectFrozenSetMutator(ctx, args[0], name) {
+				return NoneVal()
+			}
+			if !args[1].IsSet() {
+				return NotImplementedVal()
+			}
+			fn(args[0].AsSet(), args[1].AsSet())
+			return args[0]
+		})
+	}
+	SetType.Dict.Set(DunderIOr, setInPlaceDunder("__ior__", (*PySet).UpdateFromSet))
+	SetType.Dict.Set(DunderIAnd, setInPlaceDunder("__iand__", (*PySet).IntersectionUpdateFromSet))
+	SetType.Dict.Set(DunderISub, setInPlaceDunder("__isub__", (*PySet).DifferenceUpdateFromSet))
+	SetType.Dict.Set(DunderIXor, setInPlaceDunder("__ixor__", (*PySet).SymmetricDifferenceUpdateFromSet))
+
+	setBinDunder := func(name string, op func(*PySet, *PySet) Value, reverse bool) Value {
+		return NewBuiltinFuncVal(name, func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+			if len(args) < 2 || !args[0].IsSet() || !args[1].IsSet() {
+				return NotImplementedVal()
+			}
+			if reverse {
+				return op(args[1].AsSet(), args[0].AsSet())
+			}
+			return op(args[0].AsSet(), args[1].AsSet())
+		})
+	}
+	setCmpDunder := func(name string, op uint8) Value {
+		return NewBuiltinFuncVal(name, func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+			if len(args) < 2 || !args[0].IsSet() || !args[1].IsSet() {
+				return NotImplementedVal()
+			}
+			sa, sb := args[0].AsSet(), args[1].AsSet()
+			switch op {
+			case CmpEQ:
+				return BoolVal(sa.Len() == sb.Len() && sa.IsSubset(sb))
+			case CmpNEQ:
+				return BoolVal(sa.Len() != sb.Len() || !sa.IsSubset(sb))
+			case CmpLTE:
+				return BoolVal(sa.IsSubset(sb))
+			case CmpLT:
+				return BoolVal(sa.Len() < sb.Len() && sa.IsSubset(sb))
+			case CmpGTE:
+				return BoolVal(sb.IsSubset(sa))
+			case CmpGT:
+				return BoolVal(sa.Len() > sb.Len() && sb.IsSubset(sa))
+			}
+			return NotImplementedVal()
+		})
+	}
+	installSetOperatorDunders := func(t *PyType) {
+		t.Dict.Set(InternString("__or__"), setBinDunder("__or__", (*PySet).Union, false))
+		t.Dict.Set(InternString("__and__"), setBinDunder("__and__", (*PySet).Intersection, false))
+		t.Dict.Set(DunderSub, setBinDunder("__sub__", (*PySet).Difference, false))
+		t.Dict.Set(InternString("__xor__"), setBinDunder("__xor__", (*PySet).SymmetricDifference, false))
+		t.Dict.Set(DunderROr, setBinDunder("__ror__", (*PySet).Union, true))
+		t.Dict.Set(DunderRAnd, setBinDunder("__rand__", (*PySet).Intersection, true))
+		t.Dict.Set(DunderRSub, setBinDunder("__rsub__", (*PySet).Difference, true))
+		t.Dict.Set(DunderRXor, setBinDunder("__rxor__", (*PySet).SymmetricDifference, true))
+		t.Dict.Set(DunderEq, setCmpDunder("__eq__", CmpEQ))
+		t.Dict.Set(DunderNe, setCmpDunder("__ne__", CmpNEQ))
+		t.Dict.Set(DunderLt, setCmpDunder("__lt__", CmpLT))
+		t.Dict.Set(DunderLe, setCmpDunder("__le__", CmpLTE))
+		t.Dict.Set(DunderGt, setCmpDunder("__gt__", CmpGT))
+		t.Dict.Set(DunderGe, setCmpDunder("__ge__", CmpGTE))
+	}
+	installSetOperatorDunders(SetType)
+
+	// FrozenSet Type
+	FrozenSetType = MustNewType("frozenset", []*PyType{ObjectType}, nil)
+	emptyFrozenSetSingleton = &PySet{
+		Header: ObjectHeader{
+			Kind: KindSet,
+			Type: FrozenSetType,
+		},
+	}
+	FrozenSetType.Slots.SqLen = SetType.Slots.SqLen
+	FrozenSetType.Slots.TpIter = SetType.Slots.TpIter
+
+	buildFrozenSet := func(ctx *ExecContext, cls *PyType, args []Value, kwnames []Value) Value {
+		if cls == FrozenSetType && len(kwnames) > 0 {
+			ctx.Raise(NewException(TypeErrorType, "frozenset() takes no keyword arguments"))
+			return NoneVal()
+		}
+		posLen := len(args) - len(kwnames)
+		if posLen > 1 {
+			ctx.Raise(NewException(TypeErrorType, fmt.Sprintf("frozenset expected at most 1 argument, got %d", posLen)))
+			return NoneVal()
+		}
+		if posLen == 0 {
+			if cls == FrozenSetType {
+				return emptyFrozenSetVal()
+			}
+			return Value{ptr: &newEmptySetFor(cls).Header}
+		}
+		arg := args[0]
+		if cls == FrozenSetType {
+			if arg.IsSet() && arg.Type() == FrozenSetType {
+				return arg
+			}
+			switch {
+			case arg.IsSet():
+				if arg.AsSet().Len() == 0 {
+					return emptyFrozenSetVal()
+				}
+				return SetVal(arg.AsSet().CopyWithType(FrozenSetType))
+			case arg.IsList():
+				v, _ := NewFrozenSetValChecked(ctx, FrozenSetType, arg.AsList().Items...)
+				return v
+			case arg.IsTuple():
+				v, _ := NewFrozenSetValChecked(ctx, FrozenSetType, arg.AsTuple().Items...)
+				return v
+			case arg.IsDict():
+				return NewFrozenSetFromDict(arg.AsDict())
+			}
+			items := ExtractIterableItems(ctx, arg)
+			if ctx != nil && ctx.HasException() {
+				return NoneVal()
+			}
+			v, _ := NewFrozenSetValChecked(ctx, FrozenSetType, items...)
+			return v
+		}
+		// Subclass: always construct a fresh instance with Header.Type == cls.
+		switch {
+		case arg.IsSet():
+			return SetVal(arg.AsSet().CopyWithType(cls))
+		case arg.IsList():
+			v, _ := NewFrozenSetValChecked(ctx, cls, arg.AsList().Items...)
+			return v
+		case arg.IsTuple():
+			v, _ := NewFrozenSetValChecked(ctx, cls, arg.AsTuple().Items...)
+			return v
+		case arg.IsDict():
+			s := NewFrozenSetFromDict(arg.AsDict()).AsSet()
+			return SetVal(s.CopyWithType(cls))
+		}
+		items := ExtractIterableItems(ctx, arg)
+		if ctx != nil && ctx.HasException() {
+			return NoneVal()
+		}
+		v, _ := NewFrozenSetValChecked(ctx, cls, items...)
+		return v
+	}
+
+	frozenSetNewBuiltin := NewBuiltinFuncVal("frozenset.__new__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		cls := FrozenSetType
+		var rest []Value
+		if len(args) > 0 && args[0].IsType() {
+			cls = args[0].AsType()
+			rest = args[1:]
+		}
+		return buildFrozenSet(ctx, cls, rest, kwnames)
+	})
+	FrozenSetType.Dict.Set(DunderNew, frozenSetNewBuiltin)
+	FrozenSetType.dunderNew = frozenSetNewBuiltin
+	FrozenSetType.Slots.TpCall = func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		return buildFrozenSet(ctx, FrozenSetType, args, kwnames)
+	}
+
+	frozenSetHashBuiltin = NewBuiltinFuncVal("frozenset.__hash__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 || !args[0].IsSet() {
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__hash__' of 'frozenset' object needs an argument"))
+			return NoneVal()
+		}
+		return Int64Val(int64(hashFrozenSet(args[0].AsSet())))
+	})
+	FrozenSetType.Dict.Set(InternString("__hash__"), frozenSetHashBuiltin)
+	FrozenSetType.dunderHash = frozenSetHashBuiltin
+
+	FrozenSetType.Dict.Set(InternString("copy"), NewBuiltinFuncVal("copy", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'copy' of 'frozenset' object needs an argument"))
+			return NoneVal()
+		}
+		if args[0].IsSet() {
+			if args[0].Type() == FrozenSetType {
+				return args[0]
+			}
+			if args[0].AsSet().Len() == 0 {
+				return emptyFrozenSetVal()
+			}
+			return SetVal(args[0].AsSet().CopyWithType(FrozenSetType))
+		}
+		return emptyFrozenSetVal()
+	}))
+
+	FrozenSetType.Dict.Set(InternString("union"), NewBuiltinFuncVal("union", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 {
+			ctx.Raise(NewException(TypeErrorType, "descriptor 'union' of 'frozenset' object needs an argument"))
+			return NoneVal()
+		}
+		if !args[0].IsSet() {
+			return emptyFrozenSetVal()
+		}
+		s := args[0].AsSet()
+		if len(args) == 1 {
+			if args[0].Type() == FrozenSetType {
+				return args[0]
+			}
+			if s.Len() == 0 {
+				return emptyFrozenSetVal()
+			}
+			return SetVal(s.CopyWithType(FrozenSetType))
+		}
+		if len(args) == 2 && args[1].IsSet() {
+			return s.Union(args[1].AsSet())
+		}
+		resSet := s.CopyWithType(FrozenSetType)
+		for _, other := range args[1:] {
+			if other.IsSet() {
+				resSet.UpdateFromSet(other.AsSet())
+				continue
+			}
+			items := ExtractIterableItems(ctx, other)
+			if ctx != nil && ctx.HasException() {
+				return NoneVal()
+			}
+			for _, it := range items {
+				if exc, ok := resSet.AddChecked(it); !ok {
+					ctx.Raise(exc)
+					return NoneVal()
+				}
+			}
+		}
+		if resSet.Len() == 0 {
+			return emptyFrozenSetVal()
+		}
+		return SetVal(resSet)
+	}))
+
+	FrozenSetType.Dict.Set(InternString("intersection"), NewBuiltinFuncVal("intersection", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 || !args[0].IsSet() {
+			return emptyFrozenSetVal()
+		}
+		if len(args) == 1 {
+			if args[0].Type() == FrozenSetType {
+				return args[0]
+			}
+			if args[0].AsSet().Len() == 0 {
+				return emptyFrozenSetVal()
+			}
+			return SetVal(args[0].AsSet().CopyWithType(FrozenSetType))
+		}
+		cur := args[0].AsSet()
+		for _, other := range args[1:] {
+			if other.IsSet() {
+				cur = cur.Intersection(other.AsSet()).AsSet()
+				continue
+			}
+			items := ExtractIterableItems(ctx, other)
+			if ctx != nil && ctx.HasException() {
+				return NoneVal()
+			}
+			otherSet := NewSetVal(items...).AsSet()
+			cur = cur.Intersection(otherSet).AsSet()
+		}
+		if cur.Len() == 0 {
+			return emptyFrozenSetVal()
+		}
+		return SetVal(cur)
+	}))
+
+	FrozenSetType.Dict.Set(InternString("difference"), NewBuiltinFuncVal("difference", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 || !args[0].IsSet() {
+			return emptyFrozenSetVal()
+		}
+		if len(args) == 1 {
+			if args[0].Type() == FrozenSetType {
+				return args[0]
+			}
+			if args[0].AsSet().Len() == 0 {
+				return emptyFrozenSetVal()
+			}
+			return SetVal(args[0].AsSet().CopyWithType(FrozenSetType))
+		}
+		cur := args[0].AsSet()
+		for _, other := range args[1:] {
+			if other.IsSet() {
+				cur = cur.Difference(other.AsSet()).AsSet()
+				continue
+			}
+			items := ExtractIterableItems(ctx, other)
+			if ctx != nil && ctx.HasException() {
+				return NoneVal()
+			}
+			otherSet := NewSetVal(items...).AsSet()
+			cur = cur.Difference(otherSet).AsSet()
+		}
+		if cur.Len() == 0 {
+			return emptyFrozenSetVal()
+		}
+		return SetVal(cur)
+	}))
+
+	FrozenSetType.Dict.Set(InternString("symmetric_difference"), NewBuiltinFuncVal("symmetric_difference", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 2 || !args[0].IsSet() {
+			return emptyFrozenSetVal()
+		}
+		if args[1].IsSet() {
+			return args[0].AsSet().SymmetricDifference(args[1].AsSet())
+		}
+		items := ExtractIterableItems(ctx, args[1])
+		if ctx != nil && ctx.HasException() {
+			return NoneVal()
+		}
+		otherSet := NewSetVal(items...).AsSet()
+		return args[0].AsSet().SymmetricDifference(otherSet)
+	}))
+
+	for _, sharedName := range []string{"issubset", "issuperset", "isdisjoint", "__contains__", "__len__", "__iter__"} {
+		if fn, ok := SetType.Dict.Get(InternString(sharedName)); ok {
+			FrozenSetType.Dict.Set(InternString(sharedName), fn)
+		}
+	}
+	FrozenSetType.Dict.Set(InternString("__reduce__"), NewBuiltinFuncVal("__reduce__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
+		if len(args) < 1 || !args[0].IsSet() {
+			ctx.Raise(NewException(TypeErrorType, "descriptor '__reduce__' of 'frozenset' object needs an argument"))
+			return NoneVal()
+		}
+		items := args[0].AsSet().Items()
+		return NewTupleVal(TypeVal(args[0].Type()), NewTupleVal(NewListVal(items...)), NoneVal())
+	}))
+	installSetOperatorDunders(FrozenSetType)
 
 	// PEP 695 Type Parameter types
 	TypeVarType = MustNewType("TypeVar", []*PyType{ObjectType}, nil)

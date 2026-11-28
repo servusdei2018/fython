@@ -968,7 +968,7 @@ func compileRegCode(co *CodeObject) *RegCode {
 			default:
 				rop = REG_BIT_XOR
 			}
-			emit(pc, rop, tr, ra, rb, 0)
+			emit(pc, rop, tr, ra, rb, uint32(DecodeArgA(inst)))
 			stack = append(stack, absSlot{reg: tr, isLocal: false})
 			pc++
 

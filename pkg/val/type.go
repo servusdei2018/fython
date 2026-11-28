@@ -570,6 +570,8 @@ var (
 	MemoryViewType        *PyType
 	SliceType             *PyType
 	SetType               *PyType
+	FrozenSetType         *PyType
+	frozenSetHashBuiltin  Value
 	ComplexType           *PyType
 	FrameType             *PyType
 	LocalsProxyType       *PyType
@@ -1992,7 +1994,7 @@ func LookupAttrOptional(ctx *ExecContext, obj, name Value) (Value, bool) {
 		tp == DictType || tp == ListType || tp == TupleType || tp == StrType ||
 		tp == IntType || tp == BigIntType || tp == FloatType || tp == BoolType ||
 		tp == NoneType || tp == BytesType || tp == ByteArrayType || tp == SetType ||
-		tp == RangeType)) {
+		tp == FrozenSetType || tp == RangeType)) {
 		v, ok := defaultObjectGetAttrOptional(ctx, obj, name)
 		if !ok {
 			clearAttrError(ctx)
@@ -2047,7 +2049,7 @@ func HasAttrFast(ctx *ExecContext, obj, interned Value) bool {
 				tp == DictType || tp == ListType || tp == TupleType || tp == StrType ||
 				tp == IntType || tp == BigIntType || tp == FloatType || tp == BoolType ||
 				tp == NoneType || tp == BytesType || tp == ByteArrayType || tp == SetType ||
-				tp == RangeType))
+				tp == FrozenSetType || tp == RangeType))
 			if isStd {
 				if interned == strClass {
 					return true

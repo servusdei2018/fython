@@ -830,7 +830,7 @@ func (c *Compiler) emitAugAssignOp(t TokenType) {
 	case TOKEN_PLUSEQ:
 		c.emitOp(vm.OP_BINARY_ADD, 0, 0)
 	case TOKEN_MINUSEQ:
-		c.emitOp(vm.OP_BINARY_SUB, 0, 0)
+		c.emitOp(vm.OP_BINARY_SUB, 1, 0)
 	case TOKEN_STAREQ:
 		c.emitOp(vm.OP_BINARY_MUL, 0, 0)
 	case TOKEN_SLASHEQ:
@@ -842,11 +842,11 @@ func (c *Compiler) emitAugAssignOp(t TokenType) {
 	case TOKEN_STARSTAREQ:
 		c.emitOp(vm.OP_BINARY_POW, 0, 0)
 	case TOKEN_AMPEQ:
-		c.emitOp(vm.OP_BINARY_AND, 0, 0)
+		c.emitOp(vm.OP_BINARY_AND, 1, 0)
 	case TOKEN_PIPEEQ:
-		c.emitOp(vm.OP_BINARY_OR, 0, 0)
+		c.emitOp(vm.OP_BINARY_OR, 1, 0)
 	case TOKEN_CARETEQ:
-		c.emitOp(vm.OP_BINARY_XOR, 0, 0)
+		c.emitOp(vm.OP_BINARY_XOR, 1, 0)
 	case TOKEN_LSHIFTEQ:
 		c.emitOp(vm.OP_BINARY_LSHIFT, 0, 0)
 	case TOKEN_RSHIFTEQ:

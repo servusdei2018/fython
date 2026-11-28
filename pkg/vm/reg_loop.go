@@ -1581,7 +1581,7 @@ func (vm *VM) dispatchRegCold(st *loopState, rc *RegCode, inst RegInst, ip, entr
 		default:
 			t1Op = OP_BINARY_XOR
 		}
-		return vm.regBinarySlow(st, rc, t1Op, rd, ra, rb, ip, scratchBase)
+		return vm.regBinarySlow(st, rc, t1Op, rd, ra, rb, ip, scratchBase, aux != 0)
 
 	case REG_CMP_LT, REG_CMP_EQ, REG_CMP_OP:
 		cmpOp := uint8(aux)
@@ -1888,11 +1888,11 @@ func (vm *VM) regSetAddSafe(s *val.PySet, item val.Value) {
 }
 
 //go:noinline
-func (vm *VM) regBinarySlow(st *loopState, rc *RegCode, t1Op Opcode, rd, ra, rb uint8, ip, scratchBase int) (int, *RegCode, loopCtl) {
+func (vm *VM) regBinarySlow(st *loopState, rc *RegCode, t1Op Opcode, rd, ra, rb uint8, ip, scratchBase int, inPlace bool) (int, *RegCode, loopCtl) {
 	base := st.base
 	st.stack[scratchBase] = st.stack[base+int(ra)]
 	st.stack[scratchBase+1] = st.stack[base+int(rb)]
-	_, _, ctl := vm.opBinarySlow(st, t1Op, ip, scratchBase+2)
+	_, _, ctl := vm.opBinarySlowMode(st, t1Op, ip, scratchBase+2, inPlace)
 	if ctl == ctlRaise {
 		return ip, rc, ctlRaise
 	}
@@ -2663,7 +2663,7 @@ func (vm *VM) dispatchRegColdSub(st *loopState, rc *RegCode, rd, ra, rb uint8, m
 		default:
 			t1Op = OP_BINARY_MATMUL
 		}
-		return vm.regBinarySlow(st, rc, t1Op, rd, ra, rb, ip, scratchBase)
+		return vm.regBinarySlow(st, rc, t1Op, rd, ra, rb, ip, scratchBase, false)
 
 	case REG_COLD_BINARY_SLICE:
 		st.stack[scratchBase] = st.stack[base+int(ra)]

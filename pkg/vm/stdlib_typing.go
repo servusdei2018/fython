@@ -105,7 +105,7 @@ func initLazyTypingHooks() {
 			initTypingTypes()
 			return GenericAliasType.Slots.TpCall(ctx, val.TypeVal(GenericAliasType), args, kwnames)
 		}))
-		for _, t := range []*val.PyType{val.ListType, val.DictType, val.TupleType, val.SetType, val.TypeType} {
+		for _, t := range []*val.PyType{val.ListType, val.DictType, val.TupleType, val.SetType, val.FrozenSetType, val.TypeType} {
 			if t != nil {
 				t.Dict.Set(nameClassGetitem, lazyClassGetItem)
 			}
@@ -160,7 +160,7 @@ func initTypingTypesBody() {
 
 func installBuiltinClassGetItem() {
 	getter := val.NewClassMethodVal(val.TypeVal(GenericAliasType))
-	for _, t := range []*val.PyType{val.ListType, val.DictType, val.TupleType, val.SetType, val.TypeType} {
+	for _, t := range []*val.PyType{val.ListType, val.DictType, val.TupleType, val.SetType, val.FrozenSetType, val.TypeType} {
 		if t == nil {
 			continue
 		}

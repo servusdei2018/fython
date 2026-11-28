@@ -1575,7 +1575,7 @@ func In(item, container Value) Value {
 // InCtx performs Python containment test (item in container) with an optional ExecContext.
 func InCtx(ctx *ExecContext, item, container Value) Value {
 	cType := container.Type()
-	if container.IsSet() && cType == SetType {
+	if container.IsSet() && (cType == SetType || cType == FrozenSetType) {
 		return BoolVal(container.AsSet().Contains(item))
 	}
 	if container.IsList() && cType == ListType {
@@ -1963,6 +1963,82 @@ func BitXor(ctx *ExecContext, a, b Value) Value {
 		}
 	}
 	return raiseTypeError(ctx, "unsupported operand type(s) for ^: '"+a.Type().Name+"' and '"+b.Type().Name+"'")
+}
+
+// InPlaceOr performs Python in-place bitwise/set OR (a |= b).
+// Mutable sets mutate in place; frozensets fall back to binary BitOr.
+func InPlaceOr(ctx *ExecContext, a, b Value) Value {
+	if a.IsSet() && !a.AsSet().isFrozen() {
+		if b.IsSet() {
+			a.AsSet().UpdateFromSet(b.AsSet())
+			return a
+		}
+		return raiseTypeError(ctx, "unsupported operand type(s) for |=: '"+a.Type().Name+"' and '"+b.Type().Name+"'")
+	}
+	if aType := a.Type(); aType != nil && aType.dunderIOr.ptr != nil && ctx != nil {
+		res := ctx.Invoke2(aType.dunderIOr, a, b)
+		if ctx.HasException() || !res.IsNotImplemented() {
+			return res
+		}
+	}
+	return BitOr(ctx, a, b)
+}
+
+// InPlaceAnd performs Python in-place bitwise/set AND (a &= b).
+// Mutable sets mutate in place; frozensets fall back to binary BitAnd.
+func InPlaceAnd(ctx *ExecContext, a, b Value) Value {
+	if a.IsSet() && !a.AsSet().isFrozen() {
+		if b.IsSet() {
+			a.AsSet().IntersectionUpdateFromSet(b.AsSet())
+			return a
+		}
+		return raiseTypeError(ctx, "unsupported operand type(s) for &=: '"+a.Type().Name+"' and '"+b.Type().Name+"'")
+	}
+	if aType := a.Type(); aType != nil && aType.dunderIAnd.ptr != nil && ctx != nil {
+		res := ctx.Invoke2(aType.dunderIAnd, a, b)
+		if ctx.HasException() || !res.IsNotImplemented() {
+			return res
+		}
+	}
+	return BitAnd(ctx, a, b)
+}
+
+// InPlaceSub performs Python in-place subtraction/set difference (a -= b).
+// Mutable sets mutate in place; frozensets fall back to binary SubCtx.
+func InPlaceSub(ctx *ExecContext, a, b Value) Value {
+	if a.IsSet() && !a.AsSet().isFrozen() {
+		if b.IsSet() {
+			a.AsSet().DifferenceUpdateFromSet(b.AsSet())
+			return a
+		}
+		return raiseTypeError(ctx, "unsupported operand type(s) for -=: '"+a.Type().Name+"' and '"+b.Type().Name+"'")
+	}
+	if aType := a.Type(); aType != nil && aType.dunderISub.ptr != nil && ctx != nil {
+		res := ctx.Invoke2(aType.dunderISub, a, b)
+		if ctx.HasException() || !res.IsNotImplemented() {
+			return res
+		}
+	}
+	return SubCtx(ctx, a, b)
+}
+
+// InPlaceXor performs Python in-place bitwise/set XOR (a ^= b).
+// Mutable sets mutate in place; frozensets fall back to binary BitXor.
+func InPlaceXor(ctx *ExecContext, a, b Value) Value {
+	if a.IsSet() && !a.AsSet().isFrozen() {
+		if b.IsSet() {
+			a.AsSet().SymmetricDifferenceUpdateFromSet(b.AsSet())
+			return a
+		}
+		return raiseTypeError(ctx, "unsupported operand type(s) for ^=: '"+a.Type().Name+"' and '"+b.Type().Name+"'")
+	}
+	if aType := a.Type(); aType != nil && aType.dunderIXor.ptr != nil && ctx != nil {
+		res := ctx.Invoke2(aType.dunderIXor, a, b)
+		if ctx.HasException() || !res.IsNotImplemented() {
+			return res
+		}
+	}
+	return BitXor(ctx, a, b)
 }
 
 // LShift performs Python left shift (a << b).

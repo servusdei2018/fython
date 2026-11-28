@@ -137,6 +137,9 @@ func exactTypeAndValueEqual(a, b val.Value) bool {
 		return bytes.Equal(a.AsBytes().Data, b.AsBytes().Data)
 
 	case val.KindSet:
+		if a.Type() != b.Type() {
+			return false
+		}
 		sa := a.AsSet()
 		sb := b.AsSet()
 		if sa.Len() != sb.Len() {

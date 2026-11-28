@@ -242,6 +242,7 @@ func OptimizeCodeObject(co *CodeObject) {
 			// Pattern 14: OP_FAST_SUB_LOCAL_ADD_DEREF_TO_LOCAL
 			if op0 == OP_LOAD_FAST && op1 == OP_LOAD_FAST &&
 				(op2 == OP_BINARY_SUB || op2 == OP_BINARY_SUB_INT) &&
+				DecodeArgA(w2) == 0 &&
 				op3 == OP_LOAD_DEREF &&
 				(op4 == OP_BINARY_ADD || op4 == OP_BINARY_ADD_INT) &&
 				op5 == OP_STORE_FAST {

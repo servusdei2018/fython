@@ -4073,6 +4073,43 @@ func (s *PySet) snapshotEntries() []setKeyHash {
 	return out
 }
 
+// emptyFrozenSetSingleton is the canonical empty frozenset instance (matching CPython's singleton).
+// Initialized once during initBuiltinTypes after FrozenSetType is created.
+var emptyFrozenSetSingleton *PySet
+
+func emptyFrozenSetVal() Value {
+	return Value{ptr: &emptyFrozenSetSingleton.Header}
+}
+
+//go:noinline
+func isFrozenSubclass(tp *PyType) bool {
+	return tp != nil && tp != SetType && FrozenSetType != nil && IsSubclass(tp, FrozenSetType)
+}
+
+// isFrozen reports whether s is a frozenset or a frozenset subclass instance.
+func (s *PySet) isFrozen() bool {
+	tp := s.Header.Type
+	return tp == FrozenSetType || (tp != SetType && isFrozenSubclass(tp))
+}
+
+// IsFrozenSet reports whether v is a frozenset or a frozenset subclass instance.
+func (v Value) IsFrozenSet() bool {
+	return v.ptr != nil && v.ptr.Kind == KindSet && v.AsSet().isFrozen()
+}
+
+// setAlgebraResultType returns the result type for binary set/frozenset algebra.
+// Exact frozenset and frozenset subclasses always return base FrozenSetType (matching CPython);
+// set and set subclasses preserve their receiver type.
+func setAlgebraResultType(tp *PyType) *PyType {
+	if tp == nil {
+		return SetType
+	}
+	if tp == FrozenSetType || (tp != SetType && FrozenSetType != nil && IsSubclass(tp, FrozenSetType)) {
+		return FrozenSetType
+	}
+	return tp
+}
+
 // NewSetVal constructs a new PySet Value.
 func NewSetVal(items ...Value) Value {
 	s := &PySet{
@@ -4088,6 +4125,81 @@ func NewSetVal(items ...Value) Value {
 		}
 	}
 	return Value{ptr: &s.Header}
+}
+
+// NewFrozenSetVal constructs a new immutable frozenset Value, returning the
+// canonical empty singleton when items is empty.
+func NewFrozenSetVal(items ...Value) Value {
+	if len(items) == 0 && emptyFrozenSetSingleton != nil {
+		return emptyFrozenSetVal()
+	}
+	s := &PySet{
+		Header: ObjectHeader{
+			Kind: KindSet,
+			Type: FrozenSetType,
+		},
+	}
+	if len(items) > 0 {
+		s.initTable(len(items))
+		for _, item := range items {
+			s.addHashed(item, HashValue(item))
+		}
+	}
+	return Value{ptr: &s.Header}
+}
+
+// NewFrozenSetValChecked constructs a frozenset (or subclass cls) Value, raising
+// TypeError on ctx if any element is unhashable.
+func NewFrozenSetValChecked(ctx *ExecContext, cls *PyType, items ...Value) (Value, bool) {
+	if cls == nil {
+		cls = FrozenSetType
+	}
+	if len(items) == 0 {
+		if cls == FrozenSetType && emptyFrozenSetSingleton != nil {
+			return emptyFrozenSetVal(), true
+		}
+		return Value{ptr: &newEmptySetFor(cls).Header}, true
+	}
+	s := newSetWithCap(cls, len(items))
+	for _, item := range items {
+		if exc, ok := s.AddChecked(item); !ok {
+			if ctx != nil {
+				ctx.Raise(exc)
+			}
+			return NoneVal(), false
+		}
+	}
+	return Value{ptr: &s.Header}, true
+}
+
+// NewFrozenSetFromDict creates a new frozenset containing the keys of d.
+func NewFrozenSetFromDict(d *PyDict) Value {
+	if d.Len() == 0 && emptyFrozenSetSingleton != nil {
+		return emptyFrozenSetVal()
+	}
+	if d.Live == nil && !d.Shared && !setRaceEnabled && !MultiThreadedFlag.Load() {
+		s := &PySet{
+			Header: ObjectHeader{Kind: KindSet, Type: FrozenSetType},
+		}
+		if d.used > 0 {
+			s.initTable(int(d.used))
+			if sp := d.split; sp != nil {
+				sk := sp.keys
+				for i := range sk.Count {
+					s.putUniqueHashed(sk.Keys[i], sk.Hashes[i])
+				}
+			} else {
+				for i := range d.Entries {
+					e := &d.Entries[i]
+					if e.Active {
+						s.putUniqueHashed(e.Key, e.Hash)
+					}
+				}
+			}
+		}
+		return Value{ptr: &s.Header}
+	}
+	return NewFrozenSetVal(d.Keys()...)
 }
 
 // SetVal wraps an existing *PySet into a Value.
@@ -4263,7 +4375,11 @@ func newSetWithCap(tp *PyType, n int) *PySet {
 // tombstone-free (safe under s.mu in both single-threaded and multi-threaded/-race modes)
 // and a pre-sized putUniqueHashed compaction path when tombstones are present.
 func (s *PySet) Copy() *PySet {
-	tp := s.Header.Type
+	return s.CopyWithType(s.Header.Type)
+}
+
+// CopyWithType returns a shallow copy of s with Header.Type set to tp.
+func (s *PySet) CopyWithType(tp *PyType) *PySet {
 	if tp == nil {
 		tp = SetType
 	}
@@ -4462,8 +4578,20 @@ func isUnhashableValue(v Value) (string, bool) {
 	switch v.ptr.Kind {
 	case KindString, KindBigInt, KindComplex, KindBytes, KindRange:
 		return "", false
-	case KindList, KindDict, KindSet, KindByteArray:
+	case KindList, KindDict, KindByteArray:
 		tp := v.Type()
+		if tp != nil {
+			return tp.Name, true
+		}
+		return v.Kind().String(), true
+	case KindSet:
+		tp := v.Type()
+		if v.AsSet().isFrozen() {
+			if tp != nil && tp.dunderHash.ptr != nil && tp.dunderHash.IsNone() {
+				return tp.Name, true
+			}
+			return "", false
+		}
 		if tp != nil {
 			return tp.Name, true
 		}
@@ -4613,15 +4741,22 @@ func (s *PySet) itemsImpl() []Value {
 }
 
 // Union returns a new set containing all elements from both s and other,
-// preserving the receiver's type.
+// preserving the receiver's type (base frozenset for frozenset subclasses).
 func (s *PySet) Union(other *PySet) Value {
+	resType := setAlgebraResultType(s.Header.Type)
 	if other == nil || other == s {
-		return Value{ptr: &s.Copy().Header}
+		if resType == FrozenSetType && s.Len() == 0 && emptyFrozenSetSingleton != nil {
+			return emptyFrozenSetVal()
+		}
+		return Value{ptr: &s.CopyWithType(resType).Header}
 	}
 	if setRaceEnabled || MultiThreadedFlag.Load() {
 		sItems := s.snapshotEntries()
 		oItems := other.snapshotEntries()
-		res := newSetWithCap(s.Header.Type, len(sItems)+len(oItems))
+		if len(sItems)+len(oItems) == 0 && resType == FrozenSetType && emptyFrozenSetSingleton != nil {
+			return emptyFrozenSetVal()
+		}
+		res := newSetWithCap(resType, len(sItems)+len(oItems))
 		for _, it := range sItems {
 			res.putUniqueHashed(it.key, it.hash)
 		}
@@ -4631,16 +4766,16 @@ func (s *PySet) Union(other *PySet) Value {
 		return Value{ptr: &res.Header}
 	}
 	if other.count == 0 {
-		return Value{ptr: &s.Copy().Header}
+		if resType == FrozenSetType && s.count == 0 && emptyFrozenSetSingleton != nil {
+			return emptyFrozenSetVal()
+		}
+		return Value{ptr: &s.CopyWithType(resType).Header}
 	}
 	if s.count == 0 {
-		out := other.Copy()
-		if s.Header.Type != nil {
-			out.Header.Type = s.Header.Type
-		}
+		out := other.CopyWithType(resType)
 		return Value{ptr: &out.Header}
 	}
-	res := newSetWithCap(s.Header.Type, int(s.count+other.count))
+	res := newSetWithCap(resType, int(s.count+other.count))
 	for i := range s.entries {
 		e := &s.entries[i]
 		if e.State == setEntryOccupied {
@@ -4659,54 +4794,80 @@ func (s *PySet) Union(other *PySet) Value {
 // Intersection returns a new set containing elements present in both s and other,
 // always iterating the smaller set and probing the larger set.
 func (s *PySet) Intersection(other *PySet) Value {
+	resType := setAlgebraResultType(s.Header.Type)
+	emptyResult := func() Value {
+		if resType == FrozenSetType && emptyFrozenSetSingleton != nil {
+			return emptyFrozenSetVal()
+		}
+		return Value{ptr: &newEmptySetFor(resType).Header}
+	}
 	if other == s {
-		return Value{ptr: &s.Copy().Header}
+		if resType == FrozenSetType && s.Len() == 0 && emptyFrozenSetSingleton != nil {
+			return emptyFrozenSetVal()
+		}
+		return Value{ptr: &s.CopyWithType(resType).Header}
 	}
 	if other == nil {
-		return Value{ptr: &newEmptySetFor(s.Header.Type).Header}
+		return emptyResult()
 	}
 	if setRaceEnabled || MultiThreadedFlag.Load() {
 		sItems := s.snapshotEntries()
 		if len(sItems) == 0 {
-			return Value{ptr: &newEmptySetFor(s.Header.Type).Header}
+			return emptyResult()
 		}
-		res := newSetWithCap(s.Header.Type, len(sItems))
+		res := newSetWithCap(resType, len(sItems))
 		for _, it := range sItems {
 			if other.containsHashed(it.key, it.hash) {
 				res.putUniqueHashed(it.key, it.hash)
 			}
 		}
+		if res.count == 0 && resType == FrozenSetType && emptyFrozenSetSingleton != nil {
+			return emptyFrozenSetVal()
+		}
 		return Value{ptr: &res.Header}
 	}
 	if s.count == 0 || other.count == 0 {
-		return Value{ptr: &newEmptySetFor(s.Header.Type).Header}
+		return emptyResult()
 	}
 	small, large := s, other
 	if other.count < s.count {
 		small, large = other, s
 	}
-	res := newSetWithCap(s.Header.Type, int(small.count))
+	res := newSetWithCap(resType, int(small.count))
 	for i := range small.entries {
 		e := &small.entries[i]
 		if e.State == setEntryOccupied && large.containsHashed(e.Key, e.Hash) {
 			res.putUniqueHashed(e.Key, e.Hash)
 		}
 	}
+	if res.count == 0 && resType == FrozenSetType && emptyFrozenSetSingleton != nil {
+		return emptyFrozenSetVal()
+	}
 	return Value{ptr: &res.Header}
 }
 
 // SymmetricDifference returns a new set with elements in either s or other, but not both.
 func (s *PySet) SymmetricDifference(other *PySet) Value {
+	resType := setAlgebraResultType(s.Header.Type)
+	emptyResult := func() Value {
+		if resType == FrozenSetType && emptyFrozenSetSingleton != nil {
+			return emptyFrozenSetVal()
+		}
+		return Value{ptr: &newEmptySetFor(resType).Header}
+	}
 	if other == nil {
-		return Value{ptr: &s.Copy().Header}
+		if resType == FrozenSetType && s.Len() == 0 && emptyFrozenSetSingleton != nil {
+			return emptyFrozenSetVal()
+		}
+		return Value{ptr: &s.CopyWithType(resType).Header}
 	}
 	if other == s {
-		return Value{ptr: &newEmptySetFor(s.Header.Type).Header}
+		return emptyResult()
 	}
 	if setRaceEnabled || MultiThreadedFlag.Load() {
 		sItems := s.snapshotEntries()
 		oItems := other.snapshotEntries()
-		res := newSetWithCap(s.Header.Type, len(sItems)+len(oItems))
+		res := newSetWithCap(resType, len(sItems)+len(oItems))
 		for _, it := range sItems {
 			if !other.containsHashed(it.key, it.hash) {
 				res.putUniqueHashed(it.key, it.hash)
@@ -4717,19 +4878,22 @@ func (s *PySet) SymmetricDifference(other *PySet) Value {
 				res.addHashed(it.key, it.hash)
 			}
 		}
+		if res.count == 0 && resType == FrozenSetType && emptyFrozenSetSingleton != nil {
+			return emptyFrozenSetVal()
+		}
 		return Value{ptr: &res.Header}
 	}
 	if other.count == 0 {
-		return Value{ptr: &s.Copy().Header}
+		if resType == FrozenSetType && s.count == 0 && emptyFrozenSetSingleton != nil {
+			return emptyFrozenSetVal()
+		}
+		return Value{ptr: &s.CopyWithType(resType).Header}
 	}
 	if s.count == 0 {
-		out := other.Copy()
-		if s.Header.Type != nil {
-			out.Header.Type = s.Header.Type
-		}
+		out := other.CopyWithType(resType)
 		return Value{ptr: &out.Header}
 	}
-	res := newSetWithCap(s.Header.Type, int(s.count+other.count))
+	res := newSetWithCap(resType, int(s.count+other.count))
 	for i := range s.entries {
 		e := &s.entries[i]
 		if e.State == setEntryOccupied && !other.containsHashed(e.Key, e.Hash) {
@@ -4741,6 +4905,9 @@ func (s *PySet) SymmetricDifference(other *PySet) Value {
 		if e.State == setEntryOccupied && !s.containsHashed(e.Key, e.Hash) {
 			res.putUniqueHashed(e.Key, e.Hash)
 		}
+	}
+	if res.count == 0 && resType == FrozenSetType && emptyFrozenSetSingleton != nil {
+		return emptyFrozenSetVal()
 	}
 	return Value{ptr: &res.Header}
 }
@@ -4895,37 +5062,56 @@ func (s *PySet) Pop() (Value, bool) {
 
 // Difference returns a new set with elements in s that are not in other.
 func (s *PySet) Difference(other *PySet) Value {
+	resType := setAlgebraResultType(s.Header.Type)
+	emptyResult := func() Value {
+		if resType == FrozenSetType && emptyFrozenSetSingleton != nil {
+			return emptyFrozenSetVal()
+		}
+		return Value{ptr: &newEmptySetFor(resType).Header}
+	}
 	if other == nil {
-		return Value{ptr: &s.Copy().Header}
+		if resType == FrozenSetType && s.Len() == 0 && emptyFrozenSetSingleton != nil {
+			return emptyFrozenSetVal()
+		}
+		return Value{ptr: &s.CopyWithType(resType).Header}
 	}
 	if other == s {
-		return Value{ptr: &newEmptySetFor(s.Header.Type).Header}
+		return emptyResult()
 	}
 	if setRaceEnabled || MultiThreadedFlag.Load() {
 		sItems := s.snapshotEntries()
 		if len(sItems) == 0 {
-			return Value{ptr: &newEmptySetFor(s.Header.Type).Header}
+			return emptyResult()
 		}
-		res := newSetWithCap(s.Header.Type, len(sItems))
+		res := newSetWithCap(resType, len(sItems))
 		for _, it := range sItems {
 			if !other.containsHashed(it.key, it.hash) {
 				res.putUniqueHashed(it.key, it.hash)
 			}
 		}
+		if res.count == 0 && resType == FrozenSetType && emptyFrozenSetSingleton != nil {
+			return emptyFrozenSetVal()
+		}
 		return Value{ptr: &res.Header}
 	}
 	if other.count == 0 {
-		return Value{ptr: &s.Copy().Header}
+		if resType == FrozenSetType && s.count == 0 && emptyFrozenSetSingleton != nil {
+			return emptyFrozenSetVal()
+		}
+		return Value{ptr: &s.CopyWithType(resType).Header}
 	}
 	if s.count == 0 {
-		return Value{ptr: &newEmptySetFor(s.Header.Type).Header}
+		return emptyResult()
 	}
-	res := newSetWithCap(s.Header.Type, int(s.count))
+	res := newSetWithCap(resType, int(s.count))
 	for i := range s.entries {
 		e := &s.entries[i]
 		if e.State == setEntryOccupied && !other.containsHashed(e.Key, e.Hash) {
 			res.putUniqueHashed(e.Key, e.Hash)
 		}
+	}
+	if res.count == 0 && resType == FrozenSetType && emptyFrozenSetSingleton != nil {
+		return emptyFrozenSetVal()
 	}
 	return Value{ptr: &res.Header}
 }

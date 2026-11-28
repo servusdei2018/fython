@@ -57,7 +57,7 @@ func isPrimitiveReprKind(v Value) bool {
 	case KindDict:
 		return v.Type() == DictType
 	case KindSet:
-		return v.Type() == SetType
+		return v.Type() == SetType || v.Type() == FrozenSetType
 	}
 	return false
 }
@@ -172,6 +172,35 @@ func NativeRepr(ctx *ExecContext, v Value) string {
 		}
 		sb.WriteByte('}')
 		return sb.String()
+	case KindSet:
+		s := v.AsSet()
+		tp := v.Type()
+		isBaseSet := tp == nil || tp == SetType
+		if s == nil || s.Len() == 0 {
+			if isBaseSet {
+				return "set()"
+			}
+			return tp.Name + "()"
+		}
+		var sb strings.Builder
+		if !isBaseSet {
+			sb.WriteString(tp.Name)
+			sb.WriteByte('(')
+		}
+		sb.WriteByte('{')
+		first := true
+		for _, item := range s.Items() {
+			if !first {
+				sb.WriteString(", ")
+			}
+			first = false
+			sb.WriteString(PyRepr(ctx, item))
+		}
+		sb.WriteByte('}')
+		if !isBaseSet {
+			sb.WriteByte(')')
+		}
+		return sb.String()
 	}
 	return v.String()
 }
@@ -197,7 +226,7 @@ func PyStr(ctx *ExecContext, v Value) string {
 	}
 	if isPrimitiveReprKind(v) {
 		switch v.Kind() {
-		case KindList, KindTuple, KindDict:
+		case KindList, KindTuple, KindDict, KindSet:
 			return PyRepr(ctx, v)
 		}
 		return v.String()

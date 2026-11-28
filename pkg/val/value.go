@@ -1114,6 +1114,11 @@ func HashValue(v Value) uint32 {
 			return h
 		}
 	}
+	if v.ptr.Kind == KindSet && v.ptr.Type == FrozenSetType {
+		if h := atomic.LoadUint32(&v.ptr.Hash); h != 0 {
+			return h
+		}
+	}
 	if v.ptr == &tagFloat64 {
 		f := math.Float64frombits(v.num)
 		if f == 0.0 {
@@ -1153,6 +1158,11 @@ func TryHashValue(ctx *ExecContext, v Value) (uint32, Value, bool) {
 		return h, Value{}, true
 	}
 	if v.ptr.Kind == KindTuple && v.ptr.Type == TupleType {
+		if h := atomic.LoadUint32(&v.ptr.Hash); h != 0 {
+			return h, Value{}, true
+		}
+	}
+	if v.ptr.Kind == KindSet && v.ptr.Type == FrozenSetType {
 		if h := atomic.LoadUint32(&v.ptr.Hash); h != 0 {
 			return h, Value{}, true
 		}
@@ -1214,6 +1224,25 @@ func hashTupleFast(ctx *ExecContext, t *PyTuple) (uint32, Value, bool) {
 }
 
 //go:noinline
+func hashFrozenSet(s *PySet) uint32 {
+	if h := atomic.LoadUint32(&s.Header.Hash); h != 0 {
+		return h
+	}
+	var acc uint64
+	for i := range s.entries {
+		e := &s.entries[i]
+		if e.State == setEntryOccupied {
+			eh := uint64(e.Hash)
+			acc ^= ((eh ^ 89869747) ^ (eh << 16)) * 3644798167
+		}
+	}
+	acc ^= uint64(s.count+1) * 1927868237
+	h := mix64To32(acc)
+	atomic.StoreUint32(&s.Header.Hash, h)
+	return h
+}
+
+//go:noinline
 func hashValueSlowCtx(ctx *ExecContext, v Value) (uint32, Value, bool) {
 	if v.IsAnyString() {
 		return HashString(v.AsString()), Value{}, true
@@ -1235,6 +1264,12 @@ func hashValueSlowCtx(ctx *ExecContext, v Value) (uint32, Value, bool) {
 	}
 	if v.ptr.Kind == KindTuple && (v.ptr.Type == nil || v.ptr.Type == TupleType || v.ptr.Type.dunderHash.ptr == nil) {
 		return hashTupleFast(ctx, v.AsTuple())
+	}
+	if v.ptr.Kind == KindSet && v.AsSet().isFrozen() {
+		tp := v.ptr.Type
+		if tp == FrozenSetType || tp.dunderHash.ptr == nil || tp.dunderHash == frozenSetHashBuiltin {
+			return hashFrozenSet(v.AsSet()), Value{}, true
+		}
 	}
 	if v.ptr.Kind == KindBytes {
 		if h := atomic.LoadUint32(&v.ptr.Hash); h != 0 {
@@ -1353,10 +1388,19 @@ func (v Value) String() string {
 		return sb.String()
 	case KindSet:
 		s := v.AsSet()
+		tp := v.Type()
+		isBaseSet := tp == nil || tp == SetType
 		if s == nil || s.Len() == 0 {
-			return "set()"
+			if isBaseSet {
+				return "set()"
+			}
+			return tp.Name + "()"
 		}
 		var sb strings.Builder
+		if !isBaseSet {
+			sb.WriteString(tp.Name)
+			sb.WriteByte('(')
+		}
 		sb.WriteString("{")
 		first := true
 		for _, item := range s.Items() {
@@ -1367,6 +1411,9 @@ func (v Value) String() string {
 			sb.WriteString(item.String())
 		}
 		sb.WriteString("}")
+		if !isBaseSet {
+			sb.WriteByte(')')
+		}
 		return sb.String()
 	case KindExceptionGroup:
 		eg := v.AsExceptionGroup()

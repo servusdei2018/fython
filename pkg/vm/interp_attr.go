@@ -10,7 +10,7 @@ import (
 
 func isNativeAttrCacheableType(tp *val.PyType) bool {
 	return tp == val.StrType || tp == val.ListType || tp == val.DictType ||
-		tp == val.SetType || tp == val.BytesType || tp == val.ByteArrayType ||
+		tp == val.SetType || tp == val.FrozenSetType || tp == val.BytesType || tp == val.ByteArrayType ||
 		tp == val.IntType || tp == val.BigIntType || tp == val.FloatType ||
 		tp == val.BoolType || tp == val.NoneType || tp == val.RangeType ||
 		(PatternType != nil && tp == PatternType) ||

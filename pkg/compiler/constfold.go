@@ -467,12 +467,14 @@ func isHashableConst(v val.Value) bool {
 			}
 		}
 		return true
+	case val.KindSet:
+		return v.IsFrozenSet()
 	default:
 		return false
 	}
 }
 
-// tryBuildConstSet builds a constant PySet for O(1) membership tests when all
+// tryBuildConstSet builds a constant frozenset for O(1) membership tests when all
 // elements are non-starred hashable compile-time constants.
 func (c *Compiler) tryBuildConstSet(elemIDs []ExprID) (val.Value, bool) {
 	if len(elemIDs) > maxFoldTupleLen {
@@ -490,7 +492,7 @@ func (c *Compiler) tryBuildConstSet(elemIDs []ExprID) (val.Value, bool) {
 		}
 		items[i] = v
 	}
-	return val.NewSetVal(items...), true
+	return val.NewFrozenSetVal(items...), true
 }
 
 // stmtsHaveScopeDecls reports whether any statement in stmts contains scope

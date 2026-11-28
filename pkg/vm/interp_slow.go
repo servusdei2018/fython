@@ -739,6 +739,13 @@ func (vm *VM) opForIterRangeWriteLoop(st *loopState, inst uint32, ip, sp int) (i
 
 //go:noinline
 func (vm *VM) opBinarySlow(st *loopState, op Opcode, ip, sp int) (int, int, loopCtl) {
+	inPlace := ip >= 0 && ip < st.codeLen && st.codePtr != nil &&
+		DecodeArgA(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip)*4))) != 0
+	return vm.opBinarySlowMode(st, op, ip, sp, inPlace)
+}
+
+//go:noinline
+func (vm *VM) opBinarySlowMode(st *loopState, op Opcode, ip, sp int, inPlace bool) (int, int, loopCtl) {
 	stack := st.stack
 	b := stack[sp-1]
 	a := stack[sp-2]
@@ -763,7 +770,11 @@ func (vm *VM) opBinarySlow(st *loopState, op Opcode, ip, sp int) (int, int, loop
 	case OP_BINARY_ADD, OP_BINARY_ADD_INT, OP_BINARY_ADD_FLOAT:
 		res = val.AddCtx(&vm.execCtx, a, b)
 	case OP_BINARY_SUB, OP_BINARY_SUB_INT:
-		res = val.SubCtx(&vm.execCtx, a, b)
+		if inPlace {
+			res = val.InPlaceSub(&vm.execCtx, a, b)
+		} else {
+			res = val.SubCtx(&vm.execCtx, a, b)
+		}
 	case OP_BINARY_MUL:
 		res = val.MulCtx(&vm.execCtx, a, b)
 	case OP_BINARY_TRUE_DIV:
@@ -775,11 +786,23 @@ func (vm *VM) opBinarySlow(st *loopState, op Opcode, ip, sp int) (int, int, loop
 	case OP_BINARY_POW:
 		res = val.PowCtx(&vm.execCtx, a, b)
 	case OP_BINARY_AND:
-		res = val.BitAnd(&vm.execCtx, a, b)
+		if inPlace {
+			res = val.InPlaceAnd(&vm.execCtx, a, b)
+		} else {
+			res = val.BitAnd(&vm.execCtx, a, b)
+		}
 	case OP_BINARY_OR:
-		res = val.BitOr(&vm.execCtx, a, b)
+		if inPlace {
+			res = val.InPlaceOr(&vm.execCtx, a, b)
+		} else {
+			res = val.BitOr(&vm.execCtx, a, b)
+		}
 	case OP_BINARY_XOR:
-		res = val.BitXor(&vm.execCtx, a, b)
+		if inPlace {
+			res = val.InPlaceXor(&vm.execCtx, a, b)
+		} else {
+			res = val.BitXor(&vm.execCtx, a, b)
+		}
 	case OP_BINARY_LSHIFT:
 		res = val.LShift(&vm.execCtx, a, b)
 	case OP_BINARY_RSHIFT:
@@ -991,7 +1014,7 @@ func (vm *VM) opCompareSlow(st *loopState, inst uint32, ip, sp int) (int, int, l
 		var found bool
 		var handled bool
 		switch {
-		case b.IsSet() && bType == val.SetType:
+		case b.IsSet() && (bType == val.SetType || bType == val.FrozenSetType):
 			found = b.AsSet().Contains(a)
 			handled = true
 		case b.IsDict() && bType == val.DictType:

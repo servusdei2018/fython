@@ -38,7 +38,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 	d.Set(val.InternString("slice"), val.TypeVal(val.SliceType))
 	d.Set(val.InternString("type"), val.TypeVal(val.TypeType))
 	d.Set(val.InternString("set"), val.TypeVal(val.SetType))
-	d.Set(val.InternString("frozenset"), val.TypeVal(val.SetType))
+	d.Set(val.InternString("frozenset"), val.TypeVal(val.FrozenSetType))
 	d.Set(val.InternString("frozendict"), val.TypeVal(val.FrozenDictType))
 	d.Set(val.InternString("sentinel"), val.TypeVal(val.SentinelType))
 	d.Set(val.InternString("classmethod"), val.TypeVal(val.ClassMethodType))
@@ -229,7 +229,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		return val.NoneVal()
 	}))
 
-	for _, t := range []*val.PyType{val.ListType, val.TupleType, val.DictType, val.SetType, val.BytesType, val.ByteArrayType, val.MappingProxyType} {
+	for _, t := range []*val.PyType{val.ListType, val.TupleType, val.DictType, val.SetType, val.FrozenSetType, val.BytesType, val.ByteArrayType, val.MappingProxyType} {
 		val.InstallNativeRepr(t)
 	}
 
@@ -483,6 +483,9 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			}
 			return val.Int64Val(int64(h))
 		}
+		if obj.IsSet() && obj.Type() == val.FrozenSetType {
+			return val.Int64Val(int64(val.HashValue(obj)))
+		}
 		tp := obj.Type()
 		if hashFn, owner, ok := tp.LookupMRO(nameHash); ok {
 			if hashFn.IsNone() {
@@ -500,7 +503,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			}
 			return val.Int64Val(int64(h))
 		}
-		if obj.IsList() || obj.IsDict() || obj.IsSet() || obj.IsByteArray() {
+		if obj.IsList() || obj.IsDict() || (obj.IsSet() && !obj.IsFrozenSet()) || obj.IsByteArray() {
 			return val.RaiseTypeError(ctx, "unhashable type: '"+tp.Name+"'")
 		}
 		ptrVal := int64(uintptr(unsafe.Pointer(obj.HeaderPtr())))

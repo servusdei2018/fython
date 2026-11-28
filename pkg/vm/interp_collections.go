@@ -738,6 +738,10 @@ func (vm *VM) opBuildSet(st *loopState, inst uint32, ip, sp int) (int, int, loop
 	for i := range count {
 		val.ClearEphemeral(stack[sp+i])
 		val.DetachStringBuf(stack[sp+i])
+		if badType, bad := val.IsUnhashableValue(stack[sp+i]); bad {
+			st.raiseExc = val.NewTypeError("unhashable type: '" + badType + "'")
+			return ip, sp, ctlRaise
+		}
 	}
 	setVal := val.NewSetVal(stack[sp : sp+count]...)
 	stack[sp] = setVal
@@ -1067,6 +1071,10 @@ func (vm *VM) opBuildMap(st *loopState, inst uint32, ip, sp int) (int, int, loop
 		val.ClearEphemeral(stack[i+1])
 		val.DetachStringBuf(stack[i])
 		val.DetachStringBuf(stack[i+1])
+		if badType, bad := val.IsUnhashableValue(stack[i]); bad {
+			st.raiseExc = val.NewTypeError("unhashable type: '" + badType + "'")
+			return ip, sp - count*2, ctlRaise
+		}
 		d.Set(stack[i], stack[i+1])
 	}
 	sp -= count * 2
