@@ -17,7 +17,7 @@ const (
 	// FycMagic is the 4-byte magic signature for Fython bytecode files ("FYTH" in ASCII).
 	FycMagic uint32 = 0x48545946
 	// FycVersion is the current bytecode format version.
-	FycVersion uint32 = 13
+	FycVersion uint32 = 14
 	// FycHeaderSize is the fixed size of the .fyc file header in bytes.
 	FycHeaderSize = 64
 )

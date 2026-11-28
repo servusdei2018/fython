@@ -1,10 +1,10 @@
 package vm
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/hex"
 	"hash/crc32"
-	"strings"
 	"sync"
 
 	"github.com/servusdei2018/fython/pkg/val"
@@ -72,41 +72,63 @@ func (e *Engine) createBinasciiModule() val.Value {
 			return val.NoneVal()
 		}
 		newline := true
-		if v, ok := kwArg(args, kwnames, "newline"); ok {
-			newline = v.IsTruthy()
-		}
 		padded := true
-		if v, ok := kwArg(args, kwnames, "padded"); ok {
-			padded = v.IsTruthy()
-		}
 		wrapcol := 0
-		if v, ok := kwArg(args, kwnames, "wrapcol"); ok && v.IsInt64() {
-			wrapcol = int(v.AsInt64())
-		}
 		enc := base64.StdEncoding
-		if v, ok := kwArg(args, kwnames, "alphabet"); ok && !v.IsNone() {
-			if b, ok := getBytesFromValue(v); ok && len(b) == 64 {
-				enc = base64.NewEncoding(string(b))
+		if len(kwnames) > 0 {
+			kwStart := len(args) - len(kwnames)
+			for i, kn := range kwnames {
+				v := args[kwStart+i]
+				switch {
+				case val.StringEqualsASCII(kn, "newline"):
+					newline = v.IsTruthy()
+				case val.StringEqualsASCII(kn, "padded"):
+					padded = v.IsTruthy()
+				case val.StringEqualsASCII(kn, "wrapcol"):
+					if v.IsInt64() {
+						wrapcol = int(v.AsInt64())
+					}
+				case val.StringEqualsASCII(kn, "alphabet"):
+					if !v.IsNone() {
+						if b, ok := getBytesFromValue(v); ok && len(b) == 64 {
+							enc = base64.NewEncoding(string(b))
+						}
+					}
+				}
 			}
 		}
 		if !padded {
 			enc = enc.WithPadding(base64.NoPadding)
 		}
-		dst := make([]byte, enc.EncodedLen(len(data)))
-		enc.Encode(dst, data)
-		if wrapcol > 0 && len(dst) > wrapcol {
-			var wrapped []byte
-			for len(dst) > wrapcol {
-				wrapped = append(wrapped, dst[:wrapcol]...)
-				wrapped = append(wrapped, '\n')
-				dst = dst[wrapcol:]
+		encLen := enc.EncodedLen(len(data))
+		if wrapcol > 0 && encLen > wrapcol {
+			raw := make([]byte, encLen)
+			enc.Encode(raw, data)
+			extraNL := (encLen - 1) / wrapcol
+			total := encLen + extraNL
+			if newline {
+				total++
 			}
-			wrapped = append(wrapped, dst...)
-			dst = wrapped
+			wrapped := make([]byte, 0, total)
+			for len(raw) > wrapcol {
+				wrapped = append(wrapped, raw[:wrapcol]...)
+				wrapped = append(wrapped, '\n')
+				raw = raw[wrapcol:]
+			}
+			wrapped = append(wrapped, raw...)
+			if newline {
+				wrapped = append(wrapped, '\n')
+			}
+			return val.NewBytesVal(wrapped)
 		}
 		if newline {
-			dst = append(dst, '\n')
+			dst := make([]byte, encLen+1)
+			enc.Encode(dst[:encLen], data)
+			dst[encLen] = '\n'
+			return val.NewBytesVal(dst)
 		}
+		dst := make([]byte, encLen)
+		enc.Encode(dst, data)
 		return val.NewBytesVal(dst)
 	})
 
@@ -122,44 +144,120 @@ func (e *Engine) createBinasciiModule() val.Value {
 			ctx.Raise(val.NewException(val.TypeErrorType, "a bytes-like object is required"))
 			return val.NoneVal()
 		}
+		strictMode := false
 		padded := true
-		if v, ok := kwArg(args, kwnames, "padded"); ok {
-			padded = v.IsTruthy()
-		}
+		var ignoreChars []byte
+		alphabet := base64StdAlphabet
 		enc := base64.StdEncoding
-		if v, ok := kwArg(args, kwnames, "alphabet"); ok && !v.IsNone() {
-			if b, ok := getBytesFromValue(v); ok && len(b) == 64 {
-				enc = base64.NewEncoding(string(b))
+		if len(kwnames) > 0 {
+			kwStart := len(args) - len(kwnames)
+			for i, kn := range kwnames {
+				v := args[kwStart+i]
+				switch {
+				case val.StringEqualsASCII(kn, "strict_mode"):
+					strictMode = v.IsTruthy()
+				case val.StringEqualsASCII(kn, "padded"):
+					padded = v.IsTruthy()
+				case val.StringEqualsASCII(kn, "ignorechars"):
+					if b, ok := getBytesFromValue(v); ok {
+						ignoreChars = b
+					}
+				case val.StringEqualsASCII(kn, "alphabet"):
+					if !v.IsNone() {
+						if b, ok := getBytesFromValue(v); ok && len(b) == 64 {
+							alphabet = b
+							enc = base64.NewEncoding(string(b))
+						}
+					}
+				}
 			}
 		}
 		if !padded {
 			enc = enc.WithPadding(base64.NoPadding)
 		}
 
-		// Filter out ASCII whitespace and newlines if not strict
-		clean := make([]byte, 0, len(data))
-		for _, b := range data {
-			if b == ' ' || b == '\t' || b == '\r' || b == '\n' {
-				continue
+		// Zero-copy fast path: Go's base64.Encoding.Decode natively ignores \r and \n.
+		// In strict_mode=True, reject \r/\n unless explicitly in ignorechars.
+		if len(ignoreChars) == 0 && (!strictMode || (bytes.IndexByte(data, '\n') < 0 && bytes.IndexByte(data, '\r') < 0)) {
+			dst := make([]byte, enc.DecodedLen(len(data)))
+			n, err := enc.Decode(dst, data)
+			if err == nil {
+				return val.NewBytesVal(dst[:n])
 			}
-			clean = append(clean, b)
+			if strictMode {
+				ctx.Raise(val.NewException(binasciiErrorType, "Incorrect padding or invalid base64 characters"))
+				return val.NoneVal()
+			}
+		}
+
+		// Fallback path: filter ignored/non-alphabet bytes according to CPython semantics.
+		var clean []byte
+		if strictMode {
+			var ignoreMap [256]bool
+			for _, b := range ignoreChars {
+				ignoreMap[b] = true
+			}
+			clean = make([]byte, 0, len(data))
+			for _, b := range data {
+				if ignoreMap[b] {
+					continue
+				}
+				if b == '\r' || b == '\n' {
+					ctx.Raise(val.NewException(binasciiErrorType, "Only base64 data is allowed"))
+					return val.NoneVal()
+				}
+				clean = append(clean, b)
+			}
+		} else {
+			var validMap [256]bool
+			for _, b := range alphabet {
+				validMap[b] = true
+			}
+			clean = make([]byte, 0, len(data))
+			padSeen := 0
+			for _, b := range data {
+				if validMap[b] {
+					if padSeen > 0 {
+						// In CPython strict_mode=False, trailing data after valid '=' padding is ignored.
+						break
+					}
+					clean = append(clean, b)
+				} else if b == '=' && padded {
+					if len(clean)%4 == 0 {
+						break
+					}
+					clean = append(clean, b)
+					padSeen++
+					if len(clean)%4 == 0 {
+						break
+					}
+				}
+			}
 		}
 
 		dst := make([]byte, enc.DecodedLen(len(clean)))
 		n, err := enc.Decode(dst, clean)
 		if err != nil {
-			// If std failed, attempt URL encoding fallback
-			if enc == base64.StdEncoding {
+			if !strictMode && enc == base64.StdEncoding {
 				uenc := base64.URLEncoding
 				if !padded {
 					uenc = uenc.WithPadding(base64.NoPadding)
 				}
-				if n2, err2 := uenc.Decode(dst, clean); err2 == nil {
-					return val.NewBytesVal(dst[:n2])
+				// Re-filter against URL alphabet if std failed.
+				uClean := make([]byte, 0, len(data))
+				for _, b := range data {
+					if b == ' ' || b == '\t' || b == '\r' || b == '\n' {
+						continue
+					}
+					uClean = append(uClean, b)
+				}
+				uDst := make([]byte, uenc.DecodedLen(len(uClean)))
+				if n2, err2 := uenc.Decode(uDst, uClean); err2 == nil {
+					return val.NewBytesVal(uDst[:n2])
 				}
 			}
-			exc := val.NewException(binasciiErrorType, "Incorrect padding or invalid base64 characters")
-			panic(exc)
+			ctx.Raise(val.NewException(binasciiErrorType, "Incorrect padding or invalid base64 characters"))
+			return val.NoneVal()
 		}
 		return val.NewBytesVal(dst[:n])
 	})
@@ -195,17 +293,18 @@ func (e *Engine) createBinasciiModule() val.Value {
 			ctx.Raise(val.NewException(val.TypeErrorType, "a bytes-like object is required"))
 			return val.NoneVal()
 		}
-		s := strings.TrimSpace(string(data))
-		if len(s)%2 != 0 {
-			exc := val.NewException(binasciiErrorType, "Odd-length string")
-			panic(exc)
+		trimmed := bytes.TrimSpace(data)
+		if len(trimmed)%2 != 0 {
+			ctx.Raise(val.NewException(binasciiErrorType, "Odd-length string"))
+			return val.NoneVal()
 		}
-		dst, err := hex.DecodeString(s)
+		dst := make([]byte, hex.DecodedLen(len(trimmed)))
+		n, err := hex.Decode(dst, trimmed)
 		if err != nil {
-			exc := val.NewException(binasciiErrorType, "Non-hexadecimal digit found")
-			panic(exc)
+			ctx.Raise(val.NewException(binasciiErrorType, "Non-hexadecimal digit found"))
+			return val.NoneVal()
 		}
-		return val.NewBytesVal(dst)
+		return val.NewBytesVal(dst[:n])
 	}
 	set("unhexlify", unhexlifyFn)
 	set("a2b_hex", unhexlifyFn)

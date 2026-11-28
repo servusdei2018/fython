@@ -92,11 +92,16 @@ func (vm *VM) opMapAdd(st *loopState, inst uint32, ip, sp int) (int, int, loopCt
 	d := dictVal.AsDict()
 	if compKind := DecodeArgA(inst); compKind != 0 && d.Len() == 0 {
 		if n, ok := listAppendHint(stack, sp, depth-1); ok {
+			// OP_FOR_ITER has already consumed the first element before the
+			// first OP_MAP_ADD executes, so the total count includes it.
+			total := n + 1
 			if compKind == 2 {
-				n = max(n/2, 1)
-			}
-			if n > 5 {
-				d.Reserve(n)
+				total = max(total/2, 1)
+				if total > 5 {
+					d.Reserve(total)
+				}
+			} else if total > 5 {
+				d.ReserveExact(total)
 			}
 		}
 	}

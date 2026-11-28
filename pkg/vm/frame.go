@@ -1306,6 +1306,19 @@ func (vm *VM) acquireForIter(obj val.Value) val.Value {
 		it.Kind = val.IterKindTuple
 	case obj.IsDict():
 		it.Kind = val.IterKindDict
+		it.Cur = int64(obj.AsDict().Len())
+	case obj.IsDictView():
+		dv := obj.AsDictView()
+		it.Obj = val.DictVal(dv.Dict)
+		it.Cur = int64(dv.Dict.Len())
+		switch dv.ViewKind {
+		case val.DictViewKeys:
+			it.Kind = val.IterKindDict
+		case val.DictViewValues:
+			it.Kind = val.IterKindDictValues
+		default:
+			it.Kind = val.IterKindDictItems
+		}
 	case obj.IsSet():
 		it.Kind = val.IterKindSet
 		it.Cur = int64(obj.AsSet().Len())

@@ -547,6 +547,8 @@ var (
 	ListType              *PyType
 	DictType              *PyType
 	DictKeysType          *PyType
+	DictValuesType        *PyType
+	DictItemsType         *PyType
 	TupleType             *PyType
 	CodeType              *PyType
 	FunctionType          *PyType

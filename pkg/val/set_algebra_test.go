@@ -434,6 +434,12 @@ func TestSetReentrantEqMutationNoDeadlock(t *testing.T) {
 
 func TestSetConcurrentAccessRace(t *testing.T) {
 	for _, mt := range []bool{false, true} {
+		if !mt && !setRaceEnabled {
+			// Without -race, MultiThreadedFlag=false explicitly elides s.mu locking
+			// for single-threaded execution; concurrent access requires MultiThreadedFlag=true
+			// (or -race, where setRaceEnabled forces locking).
+			continue
+		}
 		prevMT := MultiThreadedFlag.Swap(mt)
 		a := makeIntSet(0, 64)
 		b := makeIntSet(32, 96)

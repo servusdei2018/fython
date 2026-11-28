@@ -55,6 +55,7 @@ type pyStringIO struct {
 	buf         []byte
 	pos         int // Unicode code-point offset (== bytePos when asciiOnly)
 	bytePos     int // cached byte offset into buf (-1 if unresolved)
+	runeLen     int // exact Unicode code-point length of buf (== len(buf) when asciiOnly)
 	asciiOnly   bool
 	newlineMode uint8
 	isClosed    bool
@@ -137,7 +138,7 @@ func (sio *pyStringIO) runeLenLocked() int {
 	if sio.asciiOnly {
 		return len(sio.buf)
 	}
-	return utf8.RuneCount(sio.buf)
+	return sio.runeLen
 }
 
 func (sio *pyStringIO) resolveBytePosLocked() int {
@@ -204,13 +205,23 @@ func appendStringIOWrite(sio *pyStringIO, arg val.Value) int {
 	}
 	added := sio.buf[oldLen:]
 	if isASCIIBytes(added) {
-		sio.pos = len(sio.buf)
+		if sio.asciiOnly {
+			sio.runeLen = len(sio.buf)
+			sio.pos = len(sio.buf)
+		} else {
+			sio.runeLen += len(added)
+			sio.pos = sio.runeLen
+		}
 		sio.bytePos = len(sio.buf)
 		return len(added)
 	}
-	sio.asciiOnly = false
+	if sio.asciiOnly {
+		sio.runeLen = oldLen
+		sio.asciiOnly = false
+	}
 	runes := utf8.RuneCount(added)
-	sio.pos += runes
+	sio.runeLen += runes
+	sio.pos = sio.runeLen
 	sio.bytePos = len(sio.buf)
 	return runes
 }
@@ -228,6 +239,7 @@ func releaseStringIOBuf(sio *pyStringIO) {
 		releaseStrIOBox(box)
 	}
 	sio.buf = nil
+	sio.runeLen = 0
 	sio.pos = 0
 	sio.bytePos = 0
 	sio.isClosed = true
@@ -802,7 +814,7 @@ func initIOTypes() {
 				ctx.Raise(val.NewException(val.TypeErrorType, "string argument expected, got '"+v.Type().Name+"'"))
 				return val.NoneVal()
 			}
-			if sio.asciiOnly && sio.newlineMode == sioNewlineLF && sio.pos == len(sio.buf) {
+			if sio.newlineMode == sioNewlineLF && sio.pos == sio.runeLenLocked() {
 				written := appendStringIOWrite(sio, v)
 				return val.Int64Val(int64(written))
 			}
@@ -816,18 +828,25 @@ func initIOTypes() {
 			data := translateSIONewlines(raw, sio.newlineMode)
 			origRunes := len(raw)
 			if !isASCIIBytes(raw) {
-				sio.asciiOnly = false
+				if sio.asciiOnly {
+					sio.runeLen = len(sio.buf)
+					sio.asciiOnly = false
+				}
 				origRunes = utf8.RuneCount(raw)
 			}
 			dataRunes := len(data)
 			if !isASCIIBytes(data) {
-				sio.asciiOnly = false
+				if sio.asciiOnly {
+					sio.runeLen = len(sio.buf)
+					sio.asciiOnly = false
+				}
 				dataRunes = utf8.RuneCount(data)
 			}
 			bufRunes := sio.runeLenLocked()
 			switch {
 			case sio.pos == bufRunes:
 				sio.buf = append(sio.buf, data...)
+				sio.runeLen = bufRunes + dataRunes
 				sio.pos += dataRunes
 				sio.bytePos = len(sio.buf)
 			case sio.pos > bufRunes:
@@ -845,6 +864,7 @@ func initIOTypes() {
 					clear(sio.buf[oldLen:])
 					sio.buf = append(sio.buf, data...)
 				}
+				sio.runeLen = bufRunes + pad + dataRunes
 				sio.pos += dataRunes
 				sio.bytePos = len(sio.buf)
 			default:
@@ -856,17 +876,20 @@ func initIOTypes() {
 					} else {
 						sio.buf = append(sio.buf[:bStart], data...)
 					}
+					sio.runeLen = len(sio.buf)
 					sio.pos = end
 					sio.bytePos = end
 				} else {
 					bEnd := bStart
-					for r := 0; r < dataRunes && bEnd < len(sio.buf); r++ {
+					overwritten := 0
+					for overwritten < dataRunes && bEnd < len(sio.buf) {
 						if sio.buf[bEnd] < 0x80 {
 							bEnd++
 						} else {
 							_, sz := utf8.DecodeRune(sio.buf[bEnd:])
 							bEnd += sz
 						}
+						overwritten++
 					}
 					oldSpan := bEnd - bStart
 					newSpan := len(data)
@@ -888,6 +911,7 @@ func initIOTypes() {
 							copy(sio.buf[bStart:], data)
 						}
 					}
+					sio.runeLen = bufRunes - overwritten + dataRunes
 					sio.pos += dataRunes
 					sio.bytePos = bStart + newSpan
 				}
@@ -1105,11 +1129,13 @@ func initIOTypes() {
 			if sio.asciiOnly {
 				if size < len(sio.buf) {
 					sio.buf = sio.buf[:size]
+					sio.runeLen = size
 				}
 			} else {
 				bCut := runeIndexToByteOffset(sio.buf, size)
 				if bCut < len(sio.buf) {
 					sio.buf = sio.buf[:bCut]
+					sio.runeLen = size
 					if sio.bytePos > bCut {
 						sio.bytePos = -1
 					}
@@ -1237,6 +1263,11 @@ func initIOTypes() {
 			}
 			sio.buf = initBytes
 			sio.asciiOnly = isASCIIBytes(initBytes)
+			if sio.asciiOnly {
+				sio.runeLen = len(initBytes)
+			} else {
+				sio.runeLen = utf8.RuneCount(initBytes)
+			}
 			sio.pos = 0
 			sio.bytePos = 0
 			sio.isClosed = false

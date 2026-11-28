@@ -1705,19 +1705,69 @@ func strSqItem(ctx *ExecContext, a, idxVal Value) Value {
 		}
 		return SmallStringVal(s[idx : idx+1])
 	}
-	runes := StringValRunes(a)
-	if idx < 0 {
-		idx += len(runes)
-	}
-	if idx < 0 || idx >= len(runes) {
-		if ctx != nil {
-			ctx.Raise(NewIndexError("string index out of range"))
-			return NoneVal()
+	if a.ptr != nil && a.ptr.Kind == KindString {
+		if p := (*PyString)(unsafe.Pointer(a.ptr)).RuneCache.Load(); p != nil {
+			runes := *p
+			if idx < 0 {
+				idx += len(runes)
+			}
+			if idx < 0 || idx >= len(runes) {
+				if ctx != nil {
+					ctx.Raise(NewIndexError("string index out of range"))
+					return NoneVal()
+				}
+				ctx.Raise(NewException(IndexErrorType, "string index out of range"))
+				return NoneVal()
+			}
+			return NewStringVal(string(runes[idx]))
 		}
-		ctx.Raise(NewException(IndexErrorType, "string index out of range"))
+	}
+	if idx >= 0 {
+		b := 0
+		cur := 0
+		for b < len(s) {
+			if s[b] < 0x80 {
+				if cur == idx {
+					return SmallStringVal(s[b : b+1])
+				}
+				b++
+				cur++
+				continue
+			}
+			_, sz := utf8.DecodeRuneInString(s[b:])
+			if cur == idx {
+				return NewStringVal(s[b : b+sz])
+			}
+			b += sz
+			cur++
+		}
+	} else {
+		need := -idx
+		b := len(s)
+		seen := 0
+		for b > 0 {
+			if s[b-1] < 0x80 {
+				b--
+				seen++
+				if seen == need {
+					return SmallStringVal(s[b : b+1])
+				}
+				continue
+			}
+			_, sz := utf8.DecodeLastRuneInString(s[:b])
+			b -= sz
+			seen++
+			if seen == need {
+				return NewStringVal(s[b : b+sz])
+			}
+		}
+	}
+	if ctx != nil {
+		ctx.Raise(NewIndexError("string index out of range"))
 		return NoneVal()
 	}
-	return NewStringVal(string(runes[idx]))
+	ctx.Raise(NewException(IndexErrorType, "string index out of range"))
+	return NoneVal()
 }
 
 func strMpSubscript(ctx *ExecContext, a, idxVal Value) Value {
@@ -1730,31 +1780,101 @@ func strMpSubscript(ctx *ExecContext, a, idxVal Value) Value {
 				panic(err.Error())
 			}
 			if sliceLen == 0 {
-				return NewStringVal("")
+				return SmallStringVal("")
 			}
 			if step == 1 {
 				return NewStringVal(s[start:stop])
 			}
-			var buf strings.Builder
-			buf.Grow(sliceLen)
+			out := make([]byte, sliceLen)
 			cur := start
-			for range sliceLen {
-				buf.WriteByte(s[cur])
+			for i := range sliceLen {
+				out[i] = s[cur]
 				cur += step
 			}
-			return NewStringVal(buf.String())
+			return strTranslateOwnedBytes(out)
 		}
-		runes := StringValRunes(a)
-		start, stop, step, sliceLen, err := NormalizeSliceIndices(sl.Start, sl.Stop, sl.Step, len(runes))
+		var cachedRunes []rune
+		if a.ptr != nil && a.ptr.Kind == KindString {
+			if p := (*PyString)(unsafe.Pointer(a.ptr)).RuneCache.Load(); p != nil {
+				cachedRunes = *p
+			}
+		}
+		if cachedRunes != nil {
+			start, stop, step, sliceLen, err := NormalizeSliceIndices(sl.Start, sl.Stop, sl.Step, len(cachedRunes))
+			if err != nil {
+				panic(err.Error())
+			}
+			if sliceLen == 0 {
+				return SmallStringVal("")
+			}
+			if step == 1 {
+				return NewStringVal(string(cachedRunes[start:stop]))
+			}
+			resRunes := make([]rune, sliceLen)
+			cur := start
+			for i := range sliceLen {
+				resRunes[i] = cachedRunes[cur]
+				cur += step
+			}
+			return NewStringVal(string(resRunes))
+		}
+		nRunes := utf8.RuneCountInString(s)
+		start, stop, step, sliceLen, err := NormalizeSliceIndices(sl.Start, sl.Stop, sl.Step, nRunes)
 		if err != nil {
 			panic(err.Error())
 		}
 		if sliceLen == 0 {
-			return NewStringVal("")
+			return SmallStringVal("")
 		}
 		if step == 1 {
-			return NewStringVal(string(runes[start:stop]))
+			bStart, bEnd := 0, len(s)
+			cur := 0
+			for i := 0; i < len(s); {
+				if cur == start {
+					bStart = i
+				}
+				if cur == stop {
+					bEnd = i
+					break
+				}
+				if s[i] < 0x80 {
+					i++
+				} else {
+					_, sz := utf8.DecodeRuneInString(s[i:])
+					i += sz
+				}
+				cur++
+			}
+			return NewStringVal(s[bStart:bEnd])
 		}
+		if step > 1 {
+			out := make([]byte, 0, sliceLen*2)
+			target := start
+			picked := 0
+			cur := 0
+			for i := 0; i < len(s) && picked < sliceLen; {
+				if s[i] < 0x80 {
+					if cur == target {
+						out = append(out, s[i])
+						picked++
+						target += step
+					}
+					i++
+					cur++
+					continue
+				}
+				_, sz := utf8.DecodeRuneInString(s[i:])
+				if cur == target {
+					out = append(out, s[i:i+sz]...)
+					picked++
+					target += step
+				}
+				i += sz
+				cur++
+			}
+			return strTranslateOwnedBytes(out)
+		}
+		runes := StringValRunes(a)
 		resRunes := make([]rune, sliceLen)
 		cur := start
 		for i := range sliceLen {
@@ -3342,9 +3462,21 @@ func ExtractIterableItems(ctx *ExecContext, arg Value) []Value {
 	if arg.IsDict() {
 		return arg.AsDict().Keys()
 	}
-	if arg.Type() == DictKeysType {
-		pk := (*PyDictKeys)(AsPointer(arg))
-		return pk.Dict.Keys()
+	if arg.IsDictView() {
+		dv := arg.AsDictView()
+		switch dv.ViewKind {
+		case DictViewKeys:
+			return dv.Dict.Keys()
+		case DictViewValues:
+			return dv.Dict.Values()
+		default:
+			raw := dv.Dict.Items()
+			out := make([]Value, len(raw))
+			for i, it := range raw {
+				out[i] = NewTupleVal(it.Key, it.Value)
+			}
+			return out
+		}
 	}
 	if arg.IsAnyString() {
 		s := arg.AsString()
@@ -4870,13 +5002,14 @@ func initTypes() {
 	}
 
 	StrType.Dict.Set(InternString("maketrans"), NewBuiltinFuncVal("maketrans", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		resDict := NewDictVal(16).AsDict()
 		if len(args) == 1 {
+			resDict := NewDictVal(16).AsDict()
 			if args[0].IsDict() {
 				for _, it := range args[0].AsDict().Items() {
 					var k Value
 					if it.Key.IsAnyString() && len(it.Key.AsString()) > 0 {
-						k = Int64Val(int64([]rune(it.Key.AsString())[0]))
+						r, _ := utf8.DecodeRuneInString(it.Key.AsString())
+						k = Int64Val(int64(r))
 					} else {
 						k = it.Key
 					}
@@ -4885,16 +5018,33 @@ func initTypes() {
 			}
 			return Value{ptr: &resDict.Header}
 		}
+		var resDict *PyDict
 		if len(args) >= 2 {
-			fromStr := []rune(args[0].AsString())
-			toStr := []rune(args[1].AsString())
-			if len(fromStr) != len(toStr) {
-				ctx.Raise(NewException(ValueErrorType, "the first two maketrans arguments must have equal length"))
-				return NoneVal()
+			fs := args[0].AsString()
+			ts := args[1].AsString()
+			if isASCII(fs) && isASCII(ts) {
+				if len(fs) != len(ts) {
+					ctx.Raise(NewException(ValueErrorType, "the first two maketrans arguments must have equal length"))
+					return NoneVal()
+				}
+				resDict = NewDictVal(max(len(fs), 16)).AsDict()
+				for i := range len(fs) {
+					resDict.Set(Int64Val(int64(fs[i])), Int64Val(int64(ts[i])))
+				}
+			} else {
+				fromStr := []rune(fs)
+				toStr := []rune(ts)
+				if len(fromStr) != len(toStr) {
+					ctx.Raise(NewException(ValueErrorType, "the first two maketrans arguments must have equal length"))
+					return NoneVal()
+				}
+				resDict = NewDictVal(max(len(fromStr), 16)).AsDict()
+				for i := range fromStr {
+					resDict.Set(Int64Val(int64(fromStr[i])), Int64Val(int64(toStr[i])))
+				}
 			}
-			for i := range fromStr {
-				resDict.Set(Int64Val(int64(fromStr[i])), Int64Val(int64(toStr[i])))
-			}
+		} else {
+			resDict = NewDictVal(16).AsDict()
 		}
 		if len(args) >= 3 {
 			for _, r := range args[2].AsString() {
@@ -4921,10 +5071,11 @@ func initTypes() {
 			}
 			return Value{num: out, ptr: &tagInlineStr}
 		}
-		if s, ok := unwrapStrVal(args[0]); ok {
-			return NewStringVal(strings.ToLower(s))
+		s, ok := unwrapStrVal(args[0])
+		if !ok {
+			s = args[0].AsString()
 		}
-		return NewStringVal(strings.ToLower(args[0].AsString()))
+		return strCaseTransform(args[0], s, false)
 	}))
 
 	StrType.Dict.Set(InternString("upper"), NewBuiltinFuncVal("upper", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
@@ -4944,10 +5095,11 @@ func initTypes() {
 			}
 			return Value{num: out, ptr: &tagInlineStr}
 		}
-		if s, ok := unwrapStrVal(args[0]); ok {
-			return NewStringVal(strings.ToUpper(s))
+		s, ok := unwrapStrVal(args[0])
+		if !ok {
+			s = args[0].AsString()
 		}
-		return NewStringVal(strings.ToUpper(args[0].AsString()))
+		return strCaseTransform(args[0], s, true)
 	}))
 
 	StrType.Dict.Set(InternString("startswith"), NewBuiltinFuncVal("startswith", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
@@ -5757,15 +5909,7 @@ func initTypes() {
 		if len(args) > 0 && args[0].IsType() {
 			cls = args[0].AsType()
 		}
-		if cls != DictType {
-			d := NewDictVal(16).AsDict()
-			d.Header.Type = cls
-			return Value{num: uint64(KindDict), ptr: &d.Header}
-		}
 		posArgs := max(len(args)-1-len(kwnames), 0)
-		if posArgs == 0 && len(kwnames) == 0 {
-			return NewDictVal(0)
-		}
 		totalHint := len(kwnames)
 		if posArgs == 1 {
 			other := args[1]
@@ -5780,19 +5924,27 @@ func initTypes() {
 				totalHint += len(other.AsTuple().Items)
 			case other.IsSet():
 				totalHint += other.AsSet().Len()
+			case other.IsDictView():
+				totalHint += other.AsDictView().Dict.Len()
 			default:
 				if totalHint == 0 {
 					totalHint = 1
 				}
 			}
 		}
-		if totalHint == 0 {
-			return NewDictVal(0)
+		var d *PyDict
+		switch {
+		case totalHint == 0:
+			d = NewDictVal(0).AsDict()
+		case totalHint <= 5:
+			d = NewSmallDictDirect(0)
+		default:
+			d = NewDictVal(totalHint).AsDict()
 		}
-		if totalHint <= 5 {
-			return DictVal(NewSmallDictDirect(0))
+		if cls != DictType {
+			d.Header.Type = cls
 		}
-		return NewDictVal(totalHint)
+		return Value{num: uint64(KindDict), ptr: &d.Header}
 	})
 	DictType.Dict.Set(DunderNew, dictNewBuiltin)
 	DictType.dunderNew = dictNewBuiltin
@@ -5841,123 +5993,14 @@ func initTypes() {
 		return NoneVal()
 	}))
 
-	DictKeysType = MustNewType("dict_keys", []*PyType{ObjectType}, nil)
-	DictKeysType.Slots.SqLen = func(ctx *ExecContext, self Value) int64 {
-		pk := (*PyDictKeys)(AsPointer(self))
-		return int64(pk.Dict.Len())
-	}
-	DictKeysType.Slots.TpIter = func(ctx *ExecContext, self Value) Value {
-		pk := (*PyDictKeys)(AsPointer(self))
-		return NewIterVal(Value{num: uint64(KindDict), ptr: &pk.Dict.Header})
-	}
-	dictKeysSub := func(ctx *ExecContext, a, b Value) Value {
-		s1 := NewSetVal(ExtractIterableItems(ctx, a)...).AsSet()
-		s2 := NewSetVal(ExtractIterableItems(ctx, b)...).AsSet()
-		return s1.Difference(s2)
-	}
-	DictKeysType.Slots.NbSub = dictKeysSub
-	dictKeysOr := func(ctx *ExecContext, a, b Value) Value {
-		s1 := NewSetVal(ExtractIterableItems(ctx, a)...).AsSet()
-		s2 := NewSetVal(ExtractIterableItems(ctx, b)...).AsSet()
-		return s1.Union(s2)
-	}
-	dictKeysAnd := func(ctx *ExecContext, a, b Value) Value {
-		s1 := NewSetVal(ExtractIterableItems(ctx, a)...).AsSet()
-		s2 := NewSetVal(ExtractIterableItems(ctx, b)...).AsSet()
-		return s1.Intersection(s2)
-	}
-	dictKeysXor := func(ctx *ExecContext, a, b Value) Value {
-		s1 := NewSetVal(ExtractIterableItems(ctx, a)...).AsSet()
-		s2 := NewSetVal(ExtractIterableItems(ctx, b)...).AsSet()
-		return s1.SymmetricDifference(s2)
-	}
-	DictKeysType.Dict.Set(DunderSub, NewBuiltinFuncVal("__sub__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		if len(args) < 2 {
-			ctx.Raise(NewException(TypeErrorType, "__sub__() takes 1 argument"))
-			return NoneVal()
-		}
-		return dictKeysSub(ctx, args[0], args[1])
-	}))
-	DictKeysType.Dict.Set(InternString("__rsub__"), NewBuiltinFuncVal("__rsub__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		if len(args) < 2 {
-			ctx.Raise(NewException(TypeErrorType, "__rsub__() takes 1 argument"))
-			return NoneVal()
-		}
-		return dictKeysSub(ctx, args[1], args[0])
-	}))
-	DictKeysType.Dict.Set(InternString("__or__"), NewBuiltinFuncVal("__or__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		if len(args) < 2 {
-			ctx.Raise(NewException(TypeErrorType, "__or__() takes 1 argument"))
-			return NoneVal()
-		}
-		return dictKeysOr(ctx, args[0], args[1])
-	}))
-	DictKeysType.Dict.Set(InternString("__ror__"), NewBuiltinFuncVal("__ror__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		if len(args) < 2 {
-			ctx.Raise(NewException(TypeErrorType, "__ror__() takes 1 argument"))
-			return NoneVal()
-		}
-		return dictKeysOr(ctx, args[1], args[0])
-	}))
-	DictKeysType.Dict.Set(InternString("__and__"), NewBuiltinFuncVal("__and__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		if len(args) < 2 {
-			ctx.Raise(NewException(TypeErrorType, "__and__() takes 1 argument"))
-			return NoneVal()
-		}
-		return dictKeysAnd(ctx, args[0], args[1])
-	}))
-	DictKeysType.Dict.Set(InternString("__rand__"), NewBuiltinFuncVal("__rand__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		if len(args) < 2 {
-			ctx.Raise(NewException(TypeErrorType, "__rand__() takes 1 argument"))
-			return NoneVal()
-		}
-		return dictKeysAnd(ctx, args[1], args[0])
-	}))
-	DictKeysType.Dict.Set(InternString("__xor__"), NewBuiltinFuncVal("__xor__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		if len(args) < 2 {
-			ctx.Raise(NewException(TypeErrorType, "__xor__() takes 1 argument"))
-			return NoneVal()
-		}
-		return dictKeysXor(ctx, args[0], args[1])
-	}))
-	DictKeysType.Dict.Set(InternString("__rxor__"), NewBuiltinFuncVal("__rxor__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		if len(args) < 2 {
-			ctx.Raise(NewException(TypeErrorType, "__rxor__() takes 1 argument"))
-			return NoneVal()
-		}
-		return dictKeysXor(ctx, args[1], args[0])
-	}))
-	DictKeysType.Dict.Set(DunderIter, NewBuiltinFuncVal("__iter__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		if len(args) < 1 {
-			ctx.Raise(NewException(TypeErrorType, "__iter__() missing self"))
-			return NoneVal()
-		}
-		return DictKeysType.Slots.TpIter(ctx, args[0])
-	}))
-	DictKeysType.Dict.Set(DunderLen, NewBuiltinFuncVal("__len__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		if len(args) < 1 {
-			ctx.Raise(NewException(TypeErrorType, "__len__() missing self"))
-			return NoneVal()
-		}
-		return Int64Val(DictKeysType.Slots.SqLen(ctx, args[0]))
-	}))
-	DictKeysType.Dict.Set(InternString("__contains__"), NewBuiltinFuncVal("__contains__", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
-		if len(args) < 2 {
-			ctx.Raise(NewException(TypeErrorType, "__contains__() takes 1 argument"))
-			return NoneVal()
-		}
-		pk := (*PyDictKeys)(AsPointer(args[0]))
-		_, found := pk.Dict.Get(args[1])
-		return BoolVal(found)
-	}))
+	initDictViewTypes()
 
 	DictType.Dict.Set(InternString("keys"), NewBuiltinFuncVal("keys", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		if len(args) < 1 {
 			ctx.Raise(NewException(TypeErrorType, "descriptor 'keys' of 'dict' object needs an argument"))
 			return NoneVal()
 		}
-		d := args[0].AsDict()
-		return NewDictKeysVal(d)
+		return NewDictKeysVal(args[0].AsDict())
 	}))
 
 	DictType.Dict.Set(InternString("values"), NewBuiltinFuncVal("values", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
@@ -5965,8 +6008,7 @@ func initTypes() {
 			ctx.Raise(NewException(TypeErrorType, "descriptor 'values' of 'dict' object needs an argument"))
 			return NoneVal()
 		}
-		d := args[0].AsDict()
-		return NewListVal(d.Values()...)
+		return NewDictValuesVal(args[0].AsDict())
 	}))
 
 	DictType.Dict.Set(InternString("items"), NewBuiltinFuncVal("items", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
@@ -5974,13 +6016,7 @@ func initTypes() {
 			ctx.Raise(NewException(TypeErrorType, "descriptor 'items' of 'dict' object needs an argument"))
 			return NoneVal()
 		}
-		d := args[0].AsDict()
-		rawItems := d.Items()
-		tuples := make([]Value, len(rawItems))
-		for i, it := range rawItems {
-			tuples[i] = NewTupleVal(it.Key, it.Value)
-		}
-		return NewListVal(tuples...)
+		return NewDictItemsVal(args[0].AsDict())
 	}))
 
 	DictType.Dict.Set(InternString("copy"), NewBuiltinFuncVal("copy", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
@@ -6007,9 +6043,11 @@ func initTypes() {
 			ctx.Raise(NewException(TypeErrorType, "pop expected at least 1 arguments, got 0"))
 			return NoneVal()
 		}
+		if badType, bad := IsUnhashableValue(args[1]); bad {
+			return raiseTypeError(ctx, "unhashable type: '"+badType+"'")
+		}
 		d := args[0].AsDict()
-		if val, ok := d.Get(args[1]); ok {
-			d.Delete(args[1])
+		if val, ok := d.Pop(args[1]); ok {
 			return val
 		}
 		if len(args) > 2 {
@@ -6038,16 +6076,14 @@ func initTypes() {
 			ctx.Raise(NewException(TypeErrorType, "setdefault expected at least 1 arguments, got 0"))
 			return NoneVal()
 		}
-		d := args[0].AsDict()
-		if val, ok := d.Get(args[1]); ok {
-			return val
+		if badType, bad := IsUnhashableValue(args[1]); bad {
+			return raiseTypeError(ctx, "unhashable type: '"+badType+"'")
 		}
 		defVal := NoneVal()
 		if len(args) > 2 {
 			defVal = args[2]
 		}
-		d.Set(args[1], defVal)
-		return defVal
+		return args[0].AsDict().SetDefault(args[1], defVal)
 	}))
 
 	DictType.Dict.Set(InternString("update"), NewBuiltinFuncVal("update", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
@@ -6068,7 +6104,11 @@ func initTypes() {
 				}
 			} else if keysFn, _, ok := other.Type().LookupMRO(strKeys); ok {
 				keysVal := ctx.Invoke1(keysFn, other)
-				for _, k := range ExtractIterableItems(ctx, keysVal) {
+				items := ExtractIterableItems(ctx, keysVal)
+				if d.Len() == 0 && len(items) > 5 {
+					d.Reserve(len(items))
+				}
+				for _, k := range items {
 					var v Value
 					if getItemFn, _, ok := other.Type().LookupMRO(DunderGetItem); ok {
 						v = ctx.Invoke2(getItemFn, other, k)
@@ -6076,7 +6116,11 @@ func initTypes() {
 					d.Set(k, v)
 				}
 			} else {
-				for _, item := range ExtractIterableItems(ctx, other) {
+				items := ExtractIterableItems(ctx, other)
+				if d.Len() == 0 && len(items) > 5 {
+					d.Reserve(len(items))
+				}
+				for _, item := range items {
 					if item.IsTuple() && len(item.AsTuple().Items) >= 2 {
 						d.Set(item.AsTuple().Items[0], item.AsTuple().Items[1])
 					}
@@ -6866,26 +6910,21 @@ func initTypes() {
 	MappingProxyType.Dict.Set(InternString("keys"), NewBuiltinFuncVal("keys", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		mp := args[0].AsMappingProxy()
 		if mp.Mapping.IsDict() {
-			return NewListVal(mp.Mapping.AsDict().Keys()...)
+			return NewDictKeysVal(mp.Mapping.AsDict())
 		}
 		return NewListVal()
 	}))
 	MappingProxyType.Dict.Set(InternString("values"), NewBuiltinFuncVal("values", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		mp := args[0].AsMappingProxy()
 		if mp.Mapping.IsDict() {
-			return NewListVal(mp.Mapping.AsDict().Values()...)
+			return NewDictValuesVal(mp.Mapping.AsDict())
 		}
 		return NewListVal()
 	}))
 	MappingProxyType.Dict.Set(InternString("items"), NewBuiltinFuncVal("items", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		mp := args[0].AsMappingProxy()
 		if mp.Mapping.IsDict() {
-			items := mp.Mapping.AsDict().Items()
-			list := make([]Value, len(items))
-			for i, it := range items {
-				list[i] = NewTupleVal(it.Key, it.Value)
-			}
-			return NewListVal(list...)
+			return NewDictItemsVal(mp.Mapping.AsDict())
 		}
 		return NewListVal()
 	}))
@@ -10424,20 +10463,4 @@ func TryFastPrimitiveDunderNew(fn Value, args []Value) (Value, bool) {
 		return Value{}, false
 	}
 	return tryFastPrimitiveDunderNew2(fn.ptr, subcls, args[1])
-}
-
-type PyDictKeys struct {
-	inst PyInstance
-	Dict *PyDict
-}
-
-func NewDictKeysVal(d *PyDict) Value {
-	pk := &PyDictKeys{
-		inst: PyInstance{
-			Header: ObjectHeader{Kind: KindInstance, Type: DictKeysType},
-			Shape:  DictKeysType.RootShape,
-		},
-		Dict: d,
-	}
-	return ObjectVal(&pk.inst.Header)
 }

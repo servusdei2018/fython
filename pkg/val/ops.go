@@ -1606,6 +1606,13 @@ func InCtx(ctx *ExecContext, item, container Value) Value {
 		_, ok := container.AsDict().Get(item)
 		return BoolVal(ok)
 	}
+	if container.IsDictView() {
+		res := dictViewContains(ctx, container.AsDictView(), item)
+		if ctx != nil && ctx.HasException() {
+			return NoneVal()
+		}
+		return BoolVal(res)
+	}
 	if container.IsAnyString() && cType == StrType {
 		if !item.IsAnyString() {
 			return raiseTypeError(ctx, "'in <string>' requires string as left operand, not "+item.Type().Name)
@@ -1872,15 +1879,7 @@ func BitOr(ctx *ExecContext, a, b Value) Value {
 		u := MustNewType(nameA+" | "+nameB, []*PyType{ObjectType}, nil)
 		return TypeVal(u)
 	}
-	if m, _, ok := a.Type().LookupMRO(strOr); ok {
-		if ctx != nil {
-			res := ctx.Invoke2(m, a, b)
-			if !res.IsNotImplemented() {
-				return res
-			}
-		}
-	}
-	if a.IsDict() && b.IsDict() {
+	if a.IsDict() && b.IsDict() && a.Type() == DictType && b.Type() == DictType {
 		da := a.AsDict()
 		db := b.AsDict()
 		merged := NewDictVal(da.Len() + db.Len())
@@ -1889,13 +1888,13 @@ func BitOr(ctx *ExecContext, a, b Value) Value {
 			if sp := da.split; sp != nil {
 				sk := sp.keys
 				for i := range sk.Count {
-					md.PutNewHashed(sk.Keys[i], sp.vals[i], sk.Hashes[i])
+					md.putUniqueHashed(sk.Keys[i], sp.vals[i], sk.Hashes[i])
 				}
 			} else {
 				for i := range da.Entries {
 					e := &da.Entries[i]
 					if e.Active {
-						md.PutNewHashed(e.Key, e.Value, e.Hash)
+						md.putUniqueHashed(e.Key, e.Value, e.Hash)
 					}
 				}
 			}
@@ -1922,6 +1921,29 @@ func BitOr(ctx *ExecContext, a, b Value) Value {
 				return true
 			})
 		}
+		return merged
+	}
+	if m, _, ok := a.Type().LookupMRO(strOr); ok {
+		if ctx != nil {
+			res := ctx.Invoke2(m, a, b)
+			if !res.IsNotImplemented() {
+				return res
+			}
+		}
+	}
+	if a.IsDict() && b.IsDict() {
+		da := a.AsDict()
+		db := b.AsDict()
+		merged := NewDictVal(da.Len() + db.Len())
+		md := merged.AsDict()
+		da.ForEachActive(func(k, v Value) bool {
+			md.Set(k, v)
+			return true
+		})
+		db.ForEachActive(func(k, v Value) bool {
+			md.Set(k, v)
+			return true
+		})
 		return merged
 	}
 	if m, _, ok := b.Type().LookupMRO(DunderROr); ok {

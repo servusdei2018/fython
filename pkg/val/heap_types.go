@@ -381,6 +381,11 @@ const (
 	IterKindChainFromIterable
 	IterKindZip
 	IterKindEnumerate
+	IterKindDictValues
+	IterKindDictItems
+	IterKindDictRevKeys
+	IterKindDictRevValues
+	IterKindDictRevItems
 )
 
 // PyIter represents a zero-allocation iterator over lists, tuples, dicts, ranges, or itertools streams.
@@ -763,6 +768,8 @@ func ListLenHint(v Value) (int, bool) {
 		return len(v.AsTuple().Items), true
 	case KindDict:
 		return v.AsDict().Len(), true
+	case KindDictView:
+		return v.AsDictView().Dict.Len(), true
 	case KindSet:
 		return v.AsSet().Len(), true
 	case KindString:
@@ -1786,6 +1793,17 @@ func NewIterVal(obj Value) Value {
 		it.Kind = IterKindTuple
 	case obj.IsDict():
 		it.Kind = IterKindDict
+		it.Cur = int64(obj.AsDict().Len())
+	case obj.IsDictView():
+		dv := obj.AsDictView()
+		switch dv.ViewKind {
+		case DictViewKeys:
+			return NewDictViewIterVal(dv.Dict, IterKindDict)
+		case DictViewValues:
+			return NewDictViewIterVal(dv.Dict, IterKindDictValues)
+		default:
+			return NewDictViewIterVal(dv.Dict, IterKindDictItems)
+		}
 	case obj.IsRange():
 		it.Kind = IterKindRange
 		it.Cur = int64(obj.RangeStart())
@@ -1808,6 +1826,177 @@ func NewIterVal(obj Value) Value {
 		it.Kind = IterKindInvalid
 	}
 	return Value{num: 0, ptr: &it.Header}
+}
+
+// NewDictViewIterVal constructs a live forward or reverse PyIter over a PyDict.
+func NewDictViewIterVal(d *PyDict, kind IterKind) Value {
+	it := &PyIter{
+		Header: ObjectHeader{Kind: KindIter, Type: IterType},
+		Obj:    DictVal(d),
+		Kind:   kind,
+		Cur:    int64(d.Len()),
+	}
+	if kind == IterKindDictRevKeys || kind == IterKindDictRevValues || kind == IterKindDictRevItems {
+		it.Idx = d.revIterStartIdx()
+	}
+	return Value{num: 0, ptr: &it.Header}
+}
+
+func (d *PyDict) revIterStartIdx() int {
+	if d.Live != nil {
+		inst := d.Live
+		if MultiThreadedFlag.Load() {
+			mu := inst.lock()
+			mu.RLock()
+			n := len(inst.Shape.Attrs)
+			mu.RUnlock()
+			return n
+		}
+		return len(inst.Shape.Attrs)
+	}
+	locked := d.rlockDict()
+	var n int
+	if sp := d.split; sp != nil {
+		n = sp.keys.Count
+	} else {
+		n = len(d.Entries)
+	}
+	if locked {
+		d.mu.RUnlock()
+	}
+	return n
+}
+
+// NextDictItemPairCtx advances an IterKindDictItems or IterKindDictRevItems iterator
+// by one step, returning (key, value, true) without allocating a 2-tuple.
+func (it *PyIter) NextDictItemPairCtx(ctx *ExecContext) (Value, Value, bool) {
+	if it.Idx < 0 {
+		return NoneVal(), NoneVal(), false
+	}
+	rev := it.Kind == IterKindDictRevItems
+	return it.Obj.AsDict().iterNextPair(ctx, it, rev)
+}
+
+func (d *PyDict) iterNextPair(ctx *ExecContext, it *PyIter, rev bool) (Value, Value, bool) {
+	if d.Live != nil {
+		inst := d.Live
+		if MultiThreadedFlag.Load() {
+			mu := inst.lock()
+			mu.RLock()
+			defer mu.RUnlock()
+		}
+		curLen := 0
+		attrs := inst.Shape.Attrs
+		for _, a := range attrs {
+			if a.Index < len(inst.Slots) && !inst.Slots[a.Index].IsUnbound() {
+				curLen++
+			}
+		}
+		if int64(curLen) != it.Cur {
+			it.Idx = -1
+			if ctx != nil {
+				ctx.Raise(NewException(RuntimeErrorType, "dictionary changed size during iteration"))
+			}
+			return NoneVal(), NoneVal(), false
+		}
+		if !rev {
+			for it.Idx < len(attrs) {
+				a := attrs[it.Idx]
+				it.Idx++
+				if a.Index < len(inst.Slots) && !inst.Slots[a.Index].IsUnbound() {
+					return a.Name, inst.Slots[a.Index], true
+				}
+			}
+		} else {
+			if it.Idx > len(attrs) {
+				it.Idx = len(attrs)
+			}
+			for it.Idx > 0 {
+				it.Idx--
+				a := attrs[it.Idx]
+				if a.Index < len(inst.Slots) && !inst.Slots[a.Index].IsUnbound() {
+					return a.Name, inst.Slots[a.Index], true
+				}
+			}
+		}
+		it.Idx = -1
+		return NoneVal(), NoneVal(), false
+	}
+	locked := d.rlockDict()
+	if int64(d.used) != it.Cur {
+		it.Idx = -1
+		if locked {
+			d.mu.RUnlock()
+		}
+		if ctx != nil {
+			ctx.Raise(NewException(RuntimeErrorType, "dictionary changed size during iteration"))
+		}
+		return NoneVal(), NoneVal(), false
+	}
+	if sp := d.split; sp != nil {
+		if !rev {
+			if it.Idx < sp.keys.Count {
+				k := sp.keys.Keys[it.Idx]
+				v := sp.vals[it.Idx]
+				it.Idx++
+				if locked {
+					d.mu.RUnlock()
+				}
+				return k, v, true
+			}
+		} else {
+			if it.Idx > sp.keys.Count {
+				it.Idx = sp.keys.Count
+			}
+			if it.Idx > 0 {
+				it.Idx--
+				k := sp.keys.Keys[it.Idx]
+				v := sp.vals[it.Idx]
+				if locked {
+					d.mu.RUnlock()
+				}
+				return k, v, true
+			}
+		}
+		it.Idx = -1
+		if locked {
+			d.mu.RUnlock()
+		}
+		return NoneVal(), NoneVal(), false
+	}
+	if !rev {
+		for it.Idx < len(d.Entries) {
+			entry := &d.Entries[it.Idx]
+			it.Idx++
+			if entry.Active {
+				k, v := entry.Key, entry.Value
+				if locked {
+					d.mu.RUnlock()
+				}
+				return k, v, true
+			}
+		}
+	} else {
+		if it.Idx > len(d.Entries) {
+			it.Idx = len(d.Entries)
+		}
+		for it.Idx > 0 {
+			it.Idx--
+			entry := &d.Entries[it.Idx]
+			if entry.Active {
+				k, v := entry.Key, entry.Value
+				if locked {
+					d.mu.RUnlock()
+				}
+				return k, v, true
+			}
+		}
+	}
+	it.Idx = -1
+	if locked {
+		d.mu.RUnlock()
+	}
+	return NoneVal(), NoneVal(), false
 }
 
 // NewRangeIterVal constructs a heap-allocated KindIter Value for range(start, stop, step).
@@ -2012,40 +2201,47 @@ func (it *PyIter) NextCtx(ctx *ExecContext) (Value, bool) {
 		it.Cur += it.Step
 		return res, true
 	case IterKindDict:
-		dict := it.Obj.AsDict()
-		if dict.Live != nil {
-			return dict.liveIterNext(it)
-		}
-		locked := dict.rlockDict()
-		if sp := dict.split; sp != nil {
-			if it.Idx < sp.keys.Count {
-				key := sp.keys.Keys[it.Idx]
-				it.Idx++
-				if locked {
-					dict.mu.RUnlock()
-				}
-				return key, true
-			}
-			if locked {
-				dict.mu.RUnlock()
-			}
+		if it.Idx < 0 {
 			return NoneVal(), false
 		}
-		for it.Idx < len(dict.Entries) {
-			entry := &dict.Entries[it.Idx]
-			it.Idx++
-			if entry.Active {
-				key := entry.Key
-				if locked {
-					dict.mu.RUnlock()
-				}
-				return key, true
-			}
+		k, _, ok := it.Obj.AsDict().iterNextPair(ctx, it, false)
+		return k, ok
+	case IterKindDictValues:
+		if it.Idx < 0 {
+			return NoneVal(), false
 		}
-		if locked {
-			dict.mu.RUnlock()
+		_, v, ok := it.Obj.AsDict().iterNextPair(ctx, it, false)
+		return v, ok
+	case IterKindDictItems:
+		if it.Idx < 0 {
+			return NoneVal(), false
 		}
-		return NoneVal(), false
+		k, v, ok := it.Obj.AsDict().iterNextPair(ctx, it, false)
+		if !ok {
+			return NoneVal(), false
+		}
+		return NewTupleVal(k, v), true
+	case IterKindDictRevKeys:
+		if it.Idx < 0 {
+			return NoneVal(), false
+		}
+		k, _, ok := it.Obj.AsDict().iterNextPair(ctx, it, true)
+		return k, ok
+	case IterKindDictRevValues:
+		if it.Idx < 0 {
+			return NoneVal(), false
+		}
+		_, v, ok := it.Obj.AsDict().iterNextPair(ctx, it, true)
+		return v, ok
+	case IterKindDictRevItems:
+		if it.Idx < 0 {
+			return NoneVal(), false
+		}
+		k, v, ok := it.Obj.AsDict().iterNextPair(ctx, it, true)
+		if !ok {
+			return NoneVal(), false
+		}
+		return NewTupleVal(k, v), true
 	case IterKindSet:
 		if it.Idx < 0 {
 			return NoneVal(), false
@@ -3297,6 +3493,50 @@ func (d *PyDict) Reserve(n int) {
 	d.initTable(n)
 }
 
+// ReserveExact pre-sizes an empty combined PyDict for a known exact entry count n
+// (such as an unconditional dict comprehension), sizing the index table for n
+// while capping the dense Entries slice at n instead of maxDense to avoid
+// over-allocating unused entry capacity.
+func (d *PyDict) ReserveExact(n int) {
+	if n <= 5 || d.Live != nil || d.split != nil {
+		d.Reserve(n)
+		return
+	}
+	if d.lockDict() {
+		defer d.mu.Unlock()
+	}
+	if d.used != 0 || d.filled != 0 || d.split != nil {
+		return
+	}
+	if len(d.indices) > 0 && int(d.mask+1)*2 >= n*3 && cap(d.Entries) >= n {
+		return
+	}
+	tableCap := uint32(8)
+	for int(tableCap)*2 < n*3 {
+		tableCap <<= 1
+	}
+	shift := uint8(0)
+	if tableCap > 65536 {
+		shift = 2
+	} else if tableCap > 256 {
+		shift = 1
+	}
+	if tableCap <= 32 {
+		d.initTable(n)
+		return
+	}
+	d.Header.Flags &^= FlagEphemeralDict | FlagEphemeralFrameDict
+	d.indices = make([]byte, int(tableCap)<<shift)
+	d.mask = tableCap - 1
+	d.indexShift = shift
+	if cap(d.Entries) < n {
+		d.Entries = make([]DictEntry, 0, n)
+	}
+	if d.VersionTag == 0 {
+		d.VersionTag = 1
+	}
+}
+
 func (d *PyDict) readIndex(slot uint32) uint32 {
 	switch d.indexShift {
 	case 0:
@@ -3797,6 +4037,40 @@ func (d *PyDict) setLocked(key, value Value) {
 	}
 }
 
+// putUniqueHashed inserts a key-value pair known not to be present in a freshly
+// pre-sized, tombstone-free combined dict (zero equality checks, zero re-hashing).
+func (d *PyDict) putUniqueHashed(key, value Value, h uint32) {
+	mask := d.mask
+	slot := h & mask
+	if d.indexShift == 0 {
+		for d.indices[slot] != dictIndexEmpty {
+			slot = (slot + 1) & mask
+		}
+		entryIdx := len(d.Entries)
+		d.Entries = append(d.Entries, DictEntry{
+			Hash:   h,
+			Active: true,
+			Key:    key,
+			Value:  value,
+		})
+		d.indices[slot] = byte(entryIdx + dictIndexOffset)
+	} else {
+		for d.readIndex(slot) != dictIndexEmpty {
+			slot = (slot + 1) & mask
+		}
+		entryIdx := len(d.Entries)
+		d.Entries = append(d.Entries, DictEntry{
+			Hash:   h,
+			Active: true,
+			Key:    key,
+			Value:  value,
+		})
+		d.writeIndex(slot, uint32(entryIdx+dictIndexOffset))
+	}
+	d.filled++
+	d.used++
+}
+
 // PutNew inserts a key-value pair into a pre-sized dict (e.g. fresh parser output),
 // updating in-place if the key already exists (matching Python duplicate-key semantics).
 func (d *PyDict) PutNew(key, value Value) {
@@ -4074,6 +4348,171 @@ func (d *PyDict) getLocked(key Value) (Value, bool) {
 		}
 		slot = (slot + 1) & mask
 	}
+}
+
+// Pop removes key from PyDict in a single hash+probe pass, returning the removed value and true if present.
+func (d *PyDict) Pop(key Value) (Value, bool) {
+	if d.Live != nil {
+		k := InternValue(key)
+		if v, ok := d.Live.GetAttr(k); ok {
+			d.Live.DeleteAttr(k)
+			return v, true
+		}
+		return NoneVal(), false
+	}
+	var h uint32
+	var preHashed bool
+	if key.IsInstance() {
+		h = HashValue(key)
+		preHashed = true
+	}
+	if d.lockDict() {
+		defer d.mu.Unlock()
+	}
+	if len(d.Entries) == 0 {
+		if d.split == nil {
+			return NoneVal(), false
+		}
+		if d.splitLookup(key) < 0 {
+			return NoneVal(), false
+		}
+		d.promoteSplitToCombined()
+	}
+	if !preHashed {
+		h = HashValue(key)
+	}
+	mask := d.mask
+	slot := h & mask
+	for {
+		raw := d.readIndex(slot)
+		if raw == dictIndexEmpty {
+			return NoneVal(), false
+		}
+		if raw >= dictIndexOffset {
+			e := &d.Entries[int(raw)-dictIndexOffset]
+			if e.Key == key || (e.Hash == h && e.Active && dictKeyEqual(e.Key, key)) {
+				val := e.Value
+				e.Active = false
+				e.Key = NoneVal()
+				e.Value = NoneVal()
+				d.writeIndex(slot, dictIndexDummy)
+				d.used--
+				d.bumpVersionTag()
+				if d.owner != nil {
+					d.owner.bumpVersion()
+				}
+				return val, true
+			}
+		}
+		slot = (slot + 1) & mask
+	}
+}
+
+// SetDefault returns the existing value for key if present; otherwise inserts key -> defVal
+// and returns defVal in a single hash+probe pass.
+func (d *PyDict) SetDefault(key, defVal Value) Value {
+	if d.Live != nil {
+		k := InternValue(key)
+		if v, ok := d.Live.GetAttr(k); ok {
+			return v
+		}
+		d.Live.SetAttr(k, defVal)
+		return defVal
+	}
+	var h uint32
+	var preHashed bool
+	if key.IsInstance() {
+		h = HashValue(key)
+		preHashed = true
+	}
+	if d.lockDict() {
+		defer d.mu.Unlock()
+	}
+	if len(d.indices) == 0 {
+		if d.split != nil {
+			if idx := d.splitLookup(key); idx >= 0 {
+				return d.split.vals[idx]
+			}
+			d.promoteSplitToCombined()
+		} else {
+			d.initTable(4)
+		}
+	}
+	if !preHashed {
+		h = HashValue(key)
+	}
+	mask := d.mask
+	slot := h & mask
+	insertSlot := -1
+	if d.indexShift == 0 {
+		for {
+			raw := d.indices[slot]
+			if raw == dictIndexEmpty {
+				if insertSlot < 0 {
+					insertSlot = int(slot)
+				}
+				break
+			}
+			if raw == dictIndexDummy {
+				if insertSlot < 0 {
+					insertSlot = int(slot)
+				}
+			} else {
+				e := &d.Entries[int(raw)-dictIndexOffset]
+				if e.Key == key || (e.Hash == h && e.Active && dictKeyEqual(e.Key, key)) {
+					return e.Value
+				}
+			}
+			slot = (slot + 1) & mask
+		}
+	} else {
+		for {
+			raw := d.readIndex(slot)
+			if raw == dictIndexEmpty {
+				if insertSlot < 0 {
+					insertSlot = int(slot)
+				}
+				break
+			}
+			if raw == dictIndexDummy {
+				if insertSlot < 0 {
+					insertSlot = int(slot)
+				}
+			} else {
+				e := &d.Entries[int(raw)-dictIndexOffset]
+				if e.Key == key || (e.Hash == h && e.Active && dictKeyEqual(e.Key, key)) {
+					return e.Value
+				}
+			}
+			slot = (slot + 1) & mask
+		}
+	}
+	if (int(d.filled)+1)*3 > int(d.mask+1)*2 || len(d.Entries)+dictIndexOffset >= d.maxIndexValue() {
+		d.resize(int(d.used) + 1)
+		mask = d.mask
+		slot = h & mask
+		for d.readIndex(slot) != dictIndexEmpty {
+			slot = (slot + 1) & mask
+		}
+		insertSlot = int(slot)
+	}
+	entryIdx := len(d.Entries)
+	d.Entries = append(d.Entries, DictEntry{
+		Hash:   h,
+		Active: true,
+		Key:    key,
+		Value:  defVal,
+	})
+	if d.readIndex(uint32(insertSlot)) == dictIndexEmpty {
+		d.filled++
+	}
+	d.writeIndex(uint32(insertSlot), uint32(entryIdx+dictIndexOffset))
+	d.used++
+	d.bumpVersionTag()
+	if d.owner != nil {
+		d.owner.bumpVersion()
+	}
+	return defVal
 }
 
 // Delete removes key from PyDict if present, returning true if an entry was removed in a thread-safe manner.
@@ -4775,8 +5214,9 @@ func (s *PySet) CopyWithType(tp *PyType) *PySet {
 		return out
 	}
 	out := newSetWithCap(tp, int(s.count))
-	for i := range s.entries {
-		e := &s.entries[i]
+	entries := s.entries
+	for i := range entries {
+		e := &entries[i]
 		if e.State == setEntryOccupied {
 			out.putUniqueHashed(e.Key, e.Hash)
 		}
@@ -5144,18 +5584,49 @@ func (s *PySet) Union(other *PySet) Value {
 		out := other.CopyWithType(resType)
 		return Value{ptr: &out.Header}
 	}
-	res := newSetWithCap(resType, int(s.count+other.count))
-	for i := range s.entries {
-		e := &s.entries[i]
+	large, small := s, other
+	if other.count > s.count {
+		large, small = other, s
+	}
+	var stackIdx [256]uint32
+	missing := stackIdx[:0]
+	for i := range small.entries {
+		e := &small.entries[i]
+		if e.State == setEntryOccupied && !large.containsHashed(e.Key, e.Hash) {
+			missing = append(missing, uint32(i))
+		}
+	}
+	if len(missing) == 0 {
+		out := large.CopyWithType(resType)
+		return Value{ptr: &out.Header}
+	}
+	total := int(large.count) + len(missing)
+	if large.used == large.count && len(large.entries) > 0 && total*3 <= len(large.entries)*2 {
+		entries := make([]setEntry, len(large.entries))
+		copy(entries, large.entries)
+		res := &PySet{
+			Header:  ObjectHeader{Kind: KindSet, Type: resType},
+			entries: entries,
+			count:   large.count,
+			used:    large.used,
+			mask:    large.mask,
+		}
+		for _, idx := range missing {
+			e := &small.entries[idx]
+			res.putUniqueHashed(e.Key, e.Hash)
+		}
+		return Value{ptr: &res.Header}
+	}
+	res := newSetWithCap(resType, total)
+	for i := range large.entries {
+		e := &large.entries[i]
 		if e.State == setEntryOccupied {
 			res.putUniqueHashed(e.Key, e.Hash)
 		}
 	}
-	for i := range other.entries {
-		e := &other.entries[i]
-		if e.State == setEntryOccupied {
-			res.addHashed(e.Key, e.Hash)
-		}
+	for _, idx := range missing {
+		e := &small.entries[idx]
+		res.putUniqueHashed(e.Key, e.Hash)
 	}
 	return Value{ptr: &res.Header}
 }
@@ -5202,15 +5673,21 @@ func (s *PySet) Intersection(other *PySet) Value {
 	if other.count < s.count {
 		small, large = other, s
 	}
-	res := newSetWithCap(resType, int(small.count))
+	var stackIdx [256]uint32
+	hits := stackIdx[:0]
 	for i := range small.entries {
 		e := &small.entries[i]
 		if e.State == setEntryOccupied && large.containsHashed(e.Key, e.Hash) {
-			res.putUniqueHashed(e.Key, e.Hash)
+			hits = append(hits, uint32(i))
 		}
 	}
-	if res.count == 0 && resType == FrozenSetType && emptyFrozenSetSingleton != nil {
-		return emptyFrozenSetVal()
+	if len(hits) == 0 {
+		return emptyResult()
+	}
+	res := newSetWithCap(resType, len(hits))
+	for _, idx := range hits {
+		e := &small.entries[idx]
+		res.putUniqueHashed(e.Key, e.Hash)
 	}
 	return Value{ptr: &res.Header}
 }
@@ -5472,15 +5949,21 @@ func (s *PySet) Difference(other *PySet) Value {
 	if s.count == 0 {
 		return emptyResult()
 	}
-	res := newSetWithCap(resType, int(s.count))
+	var stackIdx [256]uint32
+	hits := stackIdx[:0]
 	for i := range s.entries {
 		e := &s.entries[i]
 		if e.State == setEntryOccupied && !other.containsHashed(e.Key, e.Hash) {
-			res.putUniqueHashed(e.Key, e.Hash)
+			hits = append(hits, uint32(i))
 		}
 	}
-	if res.count == 0 && resType == FrozenSetType && emptyFrozenSetSingleton != nil {
-		return emptyFrozenSetVal()
+	if len(hits) == 0 {
+		return emptyResult()
+	}
+	res := newSetWithCap(resType, len(hits))
+	for _, idx := range hits {
+		e := &s.entries[idx]
+		res.putUniqueHashed(e.Key, e.Hash)
 	}
 	return Value{ptr: &res.Header}
 }
@@ -6353,24 +6836,6 @@ func (d *PyDict) liveItems() []DictItem {
 		}
 	}
 	return items
-}
-
-func (d *PyDict) liveIterNext(it *PyIter) (Value, bool) {
-	inst := d.Live
-	if MultiThreadedFlag.Load() {
-		mu := inst.lock()
-		mu.RLock()
-		defer mu.RUnlock()
-	}
-	attrs := inst.Shape.Attrs
-	for it.Idx < len(attrs) {
-		a := attrs[it.Idx]
-		it.Idx++
-		if a.Index < len(inst.Slots) && !inst.Slots[a.Index].IsUnbound() {
-			return a.Name, true
-		}
-	}
-	return NoneVal(), false
 }
 
 // ActiveEntries returns a snapshot of all live entries in insertion order.

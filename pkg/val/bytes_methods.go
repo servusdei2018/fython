@@ -84,6 +84,9 @@ func bytesMethodArg(v Value) ([]byte, bool) {
 
 // DecodeBytesToString decodes binary data into a string using the specified encoding.
 func DecodeBytesToString(data []byte, encoding string) (string, error) {
+	if encoding == "" || encoding == "utf-8" || encoding == "utf8" || encoding == "UTF-8" {
+		return string(data), nil
+	}
 	norm := strings.ToLower(encoding)
 	norm = strings.ReplaceAll(norm, "-", "_")
 	norm = strings.ReplaceAll(norm, " ", "_")
@@ -92,20 +95,24 @@ func DecodeBytesToString(data []byte, encoding string) (string, error) {
 	case "", "utf_8", "utf8", "u8", "utf_8_sig", "utf8_sig":
 		return string(data), nil
 	case "latin_1", "latin1", "iso_8859_1", "iso8859_1", "8859", "cp819", "raw_unicode_escape":
+		if IsASCIIBytes(data) {
+			return string(data), nil
+		}
 		runes := make([]rune, len(data))
 		for i, b := range data {
 			runes[i] = rune(b)
 		}
 		return string(runes), nil
 	case "ascii", "us_ascii":
-		runes := make([]rune, len(data))
+		if IsASCIIBytes(data) {
+			return string(data), nil
+		}
 		for i, b := range data {
 			if b > 127 {
 				return "", fmt.Errorf("UnicodeDecodeError: 'ascii' codec can't decode byte 0x%02x in position %d: ordinal not in range(128)", b, i)
 			}
-			runes[i] = rune(b)
 		}
-		return string(runes), nil
+		return string(data), nil
 	default:
 		_ = utf8.RuneCount(data)
 		return string(data), nil
@@ -274,27 +281,34 @@ func initBytesMethods() {
 			ctx.Raise(NewException(TypeErrorType, "join() takes 1 argument"))
 			return NoneVal()
 		}
-		items := ExtractIterableItems(ctx, args[1])
+		var items []Value
+		switch {
+		case args[1].IsList() && args[1].Type() == ListType:
+			items = args[1].AsList().Items
+		case args[1].IsTuple() && args[1].Type() == TupleType:
+			items = args[1].AsTuple().Items
+		default:
+			items = ExtractIterableItems(ctx, args[1])
+		}
 		var totalLen int
-		rawItems := make([][]byte, len(items))
 		for i, item := range items {
 			b, ok := bytesMethodArg(item)
 			if !ok {
 				ctx.Raise(NewException(TypeErrorType, "sequence item"+strconv.Itoa(i)+": expected a bytes-like object"))
 				return NoneVal()
 			}
-			rawItems[i] = b
 			totalLen += len(b)
 		}
-		if len(rawItems) > 1 {
-			totalLen += (len(rawItems) - 1) * len(self)
+		if len(items) > 1 {
+			totalLen += (len(items) - 1) * len(self)
 		}
 		out := make([]byte, 0, totalLen)
-		for i, raw := range rawItems {
+		for i, item := range items {
 			if i > 0 && len(self) > 0 {
 				out = append(out, self...)
 			}
-			out = append(out, raw...)
+			b, _ := bytesMethodArg(item)
+			out = append(out, b...)
 		}
 		if args[0].IsByteArray() {
 			return NewByteArrayVal(out)
@@ -331,7 +345,7 @@ func initBytesMethods() {
 		if len(args) > 2 {
 			maxsplit = int(args[2].AsInt64())
 		}
-		var parts [][]byte
+		isBA := args[0].IsByteArray()
 		if len(args) > 1 && !args[1].IsNone() {
 			sepBytes, ok := bytesMethodArg(args[1])
 			if !ok {
@@ -342,23 +356,67 @@ func initBytesMethods() {
 				ctx.Raise(NewException(ValueErrorType, "empty separator"))
 				return NoneVal()
 			}
-			if maxsplit >= 0 {
-				parts = bytes.SplitN(self, sepBytes, maxsplit+1)
-			} else {
-				parts = bytes.Split(self, sepBytes)
+			if maxsplit == 0 {
+				out := make([]Value, 1)
+				if isBA {
+					out[0] = NewByteArrayVal(self)
+				} else {
+					out[0] = NewBytesVal(self)
+				}
+				return NewListFromOwnedSlice(out)
 			}
-		} else {
-			parts = bytesSplitWhitespace(self, maxsplit, false)
+			count := bytes.Count(self, sepBytes) + 1
+			if maxsplit >= 0 && count > maxsplit+1 {
+				count = maxsplit + 1
+			}
+			out := make([]Value, 0, count)
+			rest := self
+			if len(sepBytes) == 1 {
+				b := sepBytes[0]
+				for maxsplit < 0 || len(out) < maxsplit {
+					idx := bytes.IndexByte(rest, b)
+					if idx < 0 {
+						break
+					}
+					if isBA {
+						out = append(out, NewByteArrayVal(rest[:idx]))
+					} else {
+						out = append(out, NewBytesVal(rest[:idx]))
+					}
+					rest = rest[idx+1:]
+				}
+			} else {
+				sepLen := len(sepBytes)
+				for maxsplit < 0 || len(out) < maxsplit {
+					idx := bytes.Index(rest, sepBytes)
+					if idx < 0 {
+						break
+					}
+					if isBA {
+						out = append(out, NewByteArrayVal(rest[:idx]))
+					} else {
+						out = append(out, NewBytesVal(rest[:idx]))
+					}
+					rest = rest[idx+sepLen:]
+				}
+			}
+			if isBA {
+				out = append(out, NewByteArrayVal(rest))
+			} else {
+				out = append(out, NewBytesVal(rest))
+			}
+			return NewListFromOwnedSlice(out)
 		}
+		parts := bytesSplitWhitespace(self, maxsplit, false)
 		out := make([]Value, len(parts))
 		for i, p := range parts {
-			if args[0].IsByteArray() {
+			if isBA {
 				out[i] = NewByteArrayVal(p)
 			} else {
 				out[i] = NewBytesVal(p)
 			}
 		}
-		return NewListVal(out...)
+		return NewListFromOwnedSlice(out)
 	}
 
 	rsplitFn := func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
@@ -367,7 +425,7 @@ func initBytesMethods() {
 		if len(args) > 2 {
 			maxsplit = int(args[2].AsInt64())
 		}
-		var parts [][]byte
+		isBA := args[0].IsByteArray()
 		if len(args) > 1 && !args[1].IsNone() {
 			sepBytes, ok := bytesMethodArg(args[1])
 			if !ok {
@@ -379,34 +437,74 @@ func initBytesMethods() {
 				return NoneVal()
 			}
 			if maxsplit < 0 {
-				parts = bytes.Split(self, sepBytes)
-			} else {
+				count := bytes.Count(self, sepBytes) + 1
+				out := make([]Value, 0, count)
 				rest := self
-				for len(parts) < maxsplit {
-					idx := bytes.LastIndex(rest, sepBytes)
+				sepLen := len(sepBytes)
+				for {
+					var idx int
+					if sepLen == 1 {
+						idx = bytes.IndexByte(rest, sepBytes[0])
+					} else {
+						idx = bytes.Index(rest, sepBytes)
+					}
 					if idx < 0 {
 						break
 					}
-					parts = append(parts, rest[idx+len(sepBytes):])
-					rest = rest[:idx]
+					if isBA {
+						out = append(out, NewByteArrayVal(rest[:idx]))
+					} else {
+						out = append(out, NewBytesVal(rest[:idx]))
+					}
+					rest = rest[idx+sepLen:]
 				}
-				parts = append(parts, rest)
-				for l, r := 0, len(parts)-1; l < r; l, r = l+1, r-1 {
-					parts[l], parts[r] = parts[r], parts[l]
+				if isBA {
+					out = append(out, NewByteArrayVal(rest))
+				} else {
+					out = append(out, NewBytesVal(rest))
 				}
+				return NewListFromOwnedSlice(out)
 			}
-		} else {
-			parts = bytesSplitWhitespace(self, maxsplit, true)
+			out := make([]Value, 0, min(maxsplit+1, 16))
+			rest := self
+			sepLen := len(sepBytes)
+			for len(out) < maxsplit {
+				var idx int
+				if sepLen == 1 {
+					idx = bytes.LastIndexByte(rest, sepBytes[0])
+				} else {
+					idx = bytes.LastIndex(rest, sepBytes)
+				}
+				if idx < 0 {
+					break
+				}
+				if isBA {
+					out = append(out, NewByteArrayVal(rest[idx+sepLen:]))
+				} else {
+					out = append(out, NewBytesVal(rest[idx+sepLen:]))
+				}
+				rest = rest[:idx]
+			}
+			if isBA {
+				out = append(out, NewByteArrayVal(rest))
+			} else {
+				out = append(out, NewBytesVal(rest))
+			}
+			for l, r := 0, len(out)-1; l < r; l, r = l+1, r-1 {
+				out[l], out[r] = out[r], out[l]
+			}
+			return NewListFromOwnedSlice(out)
 		}
+		parts := bytesSplitWhitespace(self, maxsplit, true)
 		out := make([]Value, len(parts))
 		for i, p := range parts {
-			if args[0].IsByteArray() {
+			if isBA {
 				out[i] = NewByteArrayVal(p)
 			} else {
 				out[i] = NewBytesVal(p)
 			}
 		}
-		return NewListVal(out...)
+		return NewListFromOwnedSlice(out)
 	}
 
 	stripFn := func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {

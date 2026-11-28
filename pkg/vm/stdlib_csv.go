@@ -3,7 +3,7 @@ package vm
 import (
 	"errors"
 	"fmt"
-	"strings"
+	"strconv"
 	"sync"
 
 	"github.com/servusdei2018/fython/pkg/val"
@@ -39,6 +39,7 @@ type csvDialect struct {
 	skipinitialspace bool
 	lineterminator   string
 	quoting          int
+	strict           bool
 }
 
 func extractKwArgs(args, kwnames []val.Value) map[string]val.Value {
@@ -130,6 +131,10 @@ func resolveDialect(v val.Value, kw map[string]val.Value) (*csvDialect, error) {
 			if !valQuoting.IsNone() && valQuoting.IsInt64() {
 				d.quoting = int(valQuoting.AsInt64())
 			}
+			valStrict := getDialectAttr(v, "strict")
+			if !valStrict.IsNone() {
+				d.strict = valStrict.IsTruthy()
+			}
 		}
 	}
 
@@ -163,6 +168,9 @@ func resolveDialect(v val.Value, kw map[string]val.Value) (*csvDialect, error) {
 		if v, ok := kw["quoting"]; ok && v.IsInt64() {
 			d.quoting = int(v.AsInt64())
 		}
+		if v, ok := kw["strict"]; ok {
+			d.strict = v.IsTruthy()
+		}
 	}
 
 	if len(d.delimiter) != 1 {
@@ -181,13 +189,382 @@ type pyCsvWriter struct {
 	inst    val.PyInstance
 	fileobj val.Value
 	dialect *csvDialect
+	rowBuf  []byte
 }
 
 type pyCsvReader struct {
-	inst    val.PyInstance
-	iter    val.Value
-	dialect *csvDialect
-	lineNum int64
+	inst     val.PyInstance
+	iter     val.Value
+	dialect  *csvDialect
+	lineNum  int64
+	fieldBuf []byte
+}
+
+func csvFieldNeedsQuote(field []byte, delimByte, quoteByte, escByte byte) bool {
+	for _, b := range field {
+		if b == delimByte || b == '\r' || b == '\n' || (quoteByte != 0 && b == quoteByte) || (escByte != 0 && b == escByte) {
+			return true
+		}
+	}
+	return false
+}
+
+func csvFieldNeedsQuoteStr(field string, delimByte, quoteByte, escByte byte) bool {
+	for i := range len(field) {
+		b := field[i]
+		if b == delimByte || b == '\r' || b == '\n' || (quoteByte != 0 && b == quoteByte) || (escByte != 0 && b == escByte) {
+			return true
+		}
+	}
+	return false
+}
+
+func appendCsvQuotedStr(buf []byte, s string, quoteByte, escByte byte, doublequote bool) []byte {
+	buf = append(buf, quoteByte)
+	start := 0
+	for i := range len(s) {
+		b := s[i]
+		if b == quoteByte {
+			if i > start {
+				buf = append(buf, s[start:i]...)
+			}
+			switch {
+			case doublequote:
+				buf = append(buf, quoteByte, quoteByte)
+			case escByte != 0:
+				buf = append(buf, escByte, quoteByte)
+			default:
+				buf = append(buf, quoteByte)
+			}
+			start = i + 1
+		} else if escByte != 0 && b == escByte {
+			if i > start {
+				buf = append(buf, s[start:i]...)
+			}
+			buf = append(buf, escByte, escByte)
+			start = i + 1
+		}
+	}
+	if start < len(s) {
+		buf = append(buf, s[start:]...)
+	}
+	return append(buf, quoteByte)
+}
+
+func appendCsvEscapedStr(buf []byte, s string, delimByte, escByte byte) []byte {
+	start := 0
+	for i := range len(s) {
+		b := s[i]
+		if b == delimByte || b == escByte || b == '\r' || b == '\n' {
+			if i > start {
+				buf = append(buf, s[start:i]...)
+			}
+			buf = append(buf, escByte, b)
+			start = i + 1
+		}
+	}
+	if start < len(s) {
+		buf = append(buf, s[start:]...)
+	}
+	return buf
+}
+
+func csvWriteRow(ctx *val.ExecContext, pw *pyCsvWriter, writeMethod val.Value, row val.Value) val.Value {
+	var items []val.Value
+	switch {
+	case row.IsList() && row.Type() == val.ListType:
+		items = row.AsList().Items
+	case row.IsTuple() && row.Type() == val.TupleType:
+		items = row.AsTuple().Items
+	default:
+		items = val.ExtractIterableItems(ctx, row)
+	}
+	d := pw.dialect
+	delimByte := d.delimiter[0]
+	var quoteByte byte
+	if len(d.quotechar) > 0 {
+		quoteByte = d.quotechar[0]
+	}
+	var escByte byte
+	if len(d.escapechar) > 0 {
+		escByte = d.escapechar[0]
+	}
+
+	buf := pw.rowBuf[:0]
+	var numTmp [64]byte
+	for idx, item := range items {
+		if idx > 0 {
+			buf = append(buf, delimByte)
+		}
+		var s string
+		var numBytes []byte
+		isNumBytes := false
+		isNumeric := false
+		switch {
+		case item.IsAnyString():
+			s = item.AsString()
+		case item.IsNone():
+			s = ""
+		case item.IsInt64():
+			numBytes = strconv.AppendInt(numTmp[:0], item.AsInt64(), 10)
+			isNumBytes = true
+			isNumeric = true
+		case item.IsFloat64():
+			numBytes = val.AppendFloatRepr(numTmp[:0], item.AsFloat64())
+			isNumBytes = true
+			isNumeric = true
+		case item.IsBool():
+			if item.AsBool() {
+				s = "True"
+			} else {
+				s = "False"
+			}
+		default:
+			s = val.PyStr(ctx, item)
+		}
+
+		needQuote := false
+		switch d.quoting {
+		case quoteAll:
+			needQuote = true
+		case quoteMinimal:
+			if isNumBytes {
+				needQuote = csvFieldNeedsQuote(numBytes, delimByte, quoteByte, escByte)
+			} else {
+				needQuote = csvFieldNeedsQuoteStr(s, delimByte, quoteByte, escByte)
+			}
+		case quoteNonNumeric:
+			needQuote = !isNumeric
+		case quoteStrings:
+			needQuote = item.IsAnyString()
+		case quoteNotNull:
+			needQuote = !item.IsNone()
+		case quoteNone:
+			needQuote = false
+		}
+
+		switch {
+		case needQuote && quoteByte != 0:
+			if isNumBytes {
+				buf = append(buf, quoteByte)
+				buf = append(buf, numBytes...)
+				buf = append(buf, quoteByte)
+			} else {
+				buf = appendCsvQuotedStr(buf, s, quoteByte, escByte, d.doublequote)
+			}
+		case d.quoting == quoteNone && escByte != 0:
+			if isNumBytes {
+				buf = append(buf, numBytes...)
+			} else {
+				buf = appendCsvEscapedStr(buf, s, delimByte, escByte)
+			}
+		default:
+			if isNumBytes {
+				buf = append(buf, numBytes...)
+			} else {
+				buf = append(buf, s...)
+			}
+		}
+	}
+
+	buf = append(buf, d.lineterminator...)
+	pw.rowBuf = buf
+	return ctx.Invoke1(writeMethod, val.NewStringFromBytes(buf))
+}
+
+func csvEmitField(ctx *val.ExecContext, fields []val.Value, s string, useBuf bool, fieldBuf []byte, wasQuoted bool, quoting int) ([]val.Value, bool) {
+	if quoting == quoteNonNumeric && !wasQuoted {
+		var raw string
+		if useBuf {
+			raw = string(fieldBuf)
+		} else {
+			raw = s
+		}
+		if len(raw) == 0 {
+			return append(fields, val.SmallStringVal("")), true
+		}
+		f, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			ctx.Raise(val.NewException(val.ValueErrorType, "could not convert string to float: '"+raw+"'"))
+			return fields, false
+		}
+		return append(fields, val.Float64Val(f)), true
+	}
+	if useBuf {
+		return append(fields, val.NewStringFromBytes(fieldBuf)), true
+	}
+	return append(fields, val.NewStringVal(s)), true
+}
+
+func csvReadNextRow(ctx *val.ExecContext, pr *pyCsvReader) (val.Value, val.IterStatus) {
+	itObj := pr.iter.AsIter()
+	lineVal, ok := itObj.Next()
+	if !ok {
+		return val.NoneVal(), val.IterExhausted
+	}
+	pr.lineNum++
+	line := lineVal.AsString()
+
+	// Empty line (including bare \n, \r\n, or \r) yields an empty list [].
+	if len(line) == 0 || line == "\n" || line == "\r\n" || line == "\r" {
+		return val.NewListVal(), val.IterYielded
+	}
+
+	d := pr.dialect
+	delimByte := d.delimiter[0]
+	var quoteByte byte
+	if len(d.quotechar) > 0 {
+		quoteByte = d.quotechar[0]
+	}
+	var escByte byte
+	if len(d.escapechar) > 0 {
+		escByte = d.escapechar[0]
+	}
+
+	fields := make([]val.Value, 0, 8)
+	fieldBuf := pr.fieldBuf[:0]
+	useBuf := false
+	inQuotes := false
+	wasQuoted := false
+	atFieldStart := true
+	fieldStart := 0
+
+	for {
+		n := len(line)
+		i := 0
+		endOfRecord := false
+		for i < n {
+			b := line[i]
+			if inQuotes {
+				if escByte != 0 && b == escByte {
+					if i+1 < n {
+						fieldBuf = append(fieldBuf, line[i+1])
+						i += 2
+						continue
+					}
+					break
+				}
+				if quoteByte != 0 && b == quoteByte {
+					if d.doublequote && i+1 < n && line[i+1] == quoteByte {
+						fieldBuf = append(fieldBuf, quoteByte)
+						i += 2
+						continue
+					}
+					inQuotes = false
+					i++
+					continue
+				}
+				runStart := i
+				i++
+				for i < n {
+					c := line[i]
+					if (quoteByte != 0 && c == quoteByte) || (escByte != 0 && c == escByte) {
+						break
+					}
+					i++
+				}
+				fieldBuf = append(fieldBuf, line[runStart:i]...)
+				continue
+			}
+
+			// Not inQuotes.
+			if b == '\r' || b == '\n' {
+				var okEmit bool
+				fields, okEmit = csvEmitField(ctx, fields, line[fieldStart:i], useBuf, fieldBuf, wasQuoted, d.quoting)
+				if !okEmit {
+					pr.fieldBuf = fieldBuf[:0]
+					return val.NoneVal(), val.IterError
+				}
+				endOfRecord = true
+				break
+			}
+			if atFieldStart {
+				if d.skipinitialspace && b == ' ' {
+					i++
+					fieldStart = i
+					continue
+				}
+				if quoteByte != 0 && d.quoting != quoteNone && b == quoteByte {
+					inQuotes = true
+					wasQuoted = true
+					atFieldStart = false
+					useBuf = true
+					fieldBuf = fieldBuf[:0]
+					i++
+					continue
+				}
+			}
+			if escByte != 0 && b == escByte {
+				if !useBuf {
+					fieldBuf = append(fieldBuf[:0], line[fieldStart:i]...)
+					useBuf = true
+				}
+				if i+1 < n {
+					fieldBuf = append(fieldBuf, line[i+1])
+					i += 2
+				} else {
+					i++
+				}
+				atFieldStart = false
+				continue
+			}
+			if b == delimByte {
+				var okEmit bool
+				fields, okEmit = csvEmitField(ctx, fields, line[fieldStart:i], useBuf, fieldBuf, wasQuoted, d.quoting)
+				if !okEmit {
+					pr.fieldBuf = fieldBuf[:0]
+					return val.NoneVal(), val.IterError
+				}
+				atFieldStart = true
+				useBuf = false
+				wasQuoted = false
+				fieldBuf = fieldBuf[:0]
+				i++
+				fieldStart = i
+				continue
+			}
+			atFieldStart = false
+			if useBuf {
+				fieldBuf = append(fieldBuf, b)
+			}
+			i++
+		}
+
+		if endOfRecord {
+			break
+		}
+		if inQuotes {
+			nextVal, ok := itObj.Next()
+			if !ok {
+				if d.strict {
+					pr.fieldBuf = fieldBuf[:0]
+					ctx.Raise(val.NewException(csvErrorType, "unexpected end of data"))
+					return val.NoneVal(), val.IterError
+				}
+				var okEmit bool
+				fields, okEmit = csvEmitField(ctx, fields, "", true, fieldBuf, wasQuoted, d.quoting)
+				if !okEmit {
+					pr.fieldBuf = fieldBuf[:0]
+					return val.NoneVal(), val.IterError
+				}
+				break
+			}
+			pr.lineNum++
+			line = nextVal.AsString()
+			fieldStart = 0
+			continue
+		}
+		var okEmit bool
+		fields, okEmit = csvEmitField(ctx, fields, line[fieldStart:n], useBuf, fieldBuf, wasQuoted, d.quoting)
+		if !okEmit {
+			pr.fieldBuf = fieldBuf[:0]
+			return val.NoneVal(), val.IterError
+		}
+		break
+	}
+
+	pr.fieldBuf = fieldBuf[:0]
+	return val.NewListFromOwnedSlice(fields), val.IterYielded
 }
 
 func initCsvTypes() {
@@ -220,63 +597,8 @@ func initCsvTypes() {
 				return val.NoneVal()
 			}
 			pw := (*pyCsvWriter)(val.AsPointer(args[0]))
-			row := args[1]
-			items := val.ExtractIterableItems(ctx, row)
-			d := pw.dialect
-
-			var parts []string
-			for _, item := range items {
-				var s string
-				switch {
-				case item.IsAnyString():
-					s = item.AsString()
-				case item.IsNone():
-					s = ""
-				default:
-					s = item.String()
-				}
-
-				needQuote := false
-				switch d.quoting {
-				case quoteAll:
-					needQuote = true
-				case quoteMinimal:
-					needQuote = strings.Contains(s, d.delimiter) ||
-						(d.quotechar != "" && strings.Contains(s, d.quotechar)) ||
-						strings.Contains(s, "\r") || strings.Contains(s, "\n")
-				case quoteNonNumeric:
-					if !item.IsInt64() && !item.IsFloat64() {
-						needQuote = true
-					}
-				case quoteStrings:
-					if item.IsAnyString() {
-						needQuote = true
-					}
-				case quoteNotNull:
-					if !item.IsNone() {
-						needQuote = true
-					}
-				case quoteNone:
-					needQuote = false
-				}
-
-				if needQuote && d.quotechar != "" {
-					if d.doublequote {
-						s = strings.ReplaceAll(s, d.quotechar, d.quotechar+d.quotechar)
-					} else if d.escapechar != "" {
-						s = strings.ReplaceAll(s, d.quotechar, d.escapechar+d.quotechar)
-					}
-					s = d.quotechar + s + d.quotechar
-				} else if d.quoting == quoteNone && d.escapechar != "" {
-					s = strings.ReplaceAll(s, d.delimiter, d.escapechar+d.delimiter)
-				}
-				parts = append(parts, s)
-			}
-
-			line := strings.Join(parts, d.delimiter) + d.lineterminator
 			writeMethod := val.ObjectGetAttr(ctx, pw.fileobj, val.InternString("write"))
-			ctx.Invoke1(writeMethod, val.NewStringVal(line))
-			return val.NoneVal()
+			return csvWriteRow(ctx, pw, writeMethod, args[1])
 		}))
 
 		csvWriterType.Dict.Set(val.InternString("writerows"), val.NewBuiltinFuncVal("writerows", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
@@ -284,10 +606,19 @@ func initCsvTypes() {
 				ctx.Raise(val.NewException(val.TypeErrorType, "writerows() missing rows argument"))
 				return val.NoneVal()
 			}
-			rowIter := val.ExtractIterableItems(ctx, args[1])
-			wrow := val.ObjectGetAttr(ctx, args[0], val.InternString("writerow"))
-			for _, r := range rowIter {
-				ctx.Invoke1(wrow, r)
+			pw := (*pyCsvWriter)(val.AsPointer(args[0]))
+			writeMethod := val.ObjectGetAttr(ctx, pw.fileobj, val.InternString("write"))
+			var rows []val.Value
+			switch {
+			case args[1].IsList() && args[1].Type() == val.ListType:
+				rows = args[1].AsList().Items
+			case args[1].IsTuple() && args[1].Type() == val.TupleType:
+				rows = args[1].AsTuple().Items
+			default:
+				rows = val.ExtractIterableItems(ctx, args[1])
+			}
+			for _, r := range rows {
+				csvWriteRow(ctx, pw, writeMethod, r)
 			}
 			return val.NoneVal()
 		}))
@@ -298,7 +629,7 @@ func initCsvTypes() {
 		csvReaderType.Slots.TpIter = func(ctx *val.ExecContext, o val.Value) val.Value { return o }
 		csvReaderType.Slots.TpGetAttr = func(ctx *val.ExecContext, obj, name val.Value) val.Value {
 			pr := (*pyCsvReader)(val.AsPointer(obj))
-			if name.AsString() == "line_num" {
+			if val.StringEqualsASCII(name, "line_num") {
 				return val.Int64Val(pr.lineNum)
 			}
 			return val.ObjectGetAttr(ctx, obj, name)
@@ -306,85 +637,7 @@ func initCsvTypes() {
 
 		csvReaderType.Slots.TpIterNext = func(ctx *val.ExecContext, o val.Value) (val.Value, val.IterStatus) {
 			pr := (*pyCsvReader)(val.AsPointer(o))
-			itObj := pr.iter.AsIter()
-			lineVal, ok := itObj.Next()
-			if !ok {
-				return val.NoneVal(), val.IterExhausted
-			}
-			pr.lineNum++
-			line := lineVal.AsString()
-			line = strings.TrimRight(line, "\r\n")
-
-			d := pr.dialect
-			var fields []val.Value
-
-			// Parse CSV fields according to dialect
-			inQuotes := false
-			var currentField strings.Builder
-			runes := []rune(line)
-			delimRune := rune(d.delimiter[0])
-			var quoteRune rune
-			if d.quotechar != "" {
-				quoteRune = rune(d.quotechar[0])
-			}
-			var escRune rune
-			if d.escapechar != "" {
-				escRune = rune(d.escapechar[0])
-			}
-
-			i := 0
-			for i < len(runes) {
-				r := runes[i]
-				if inQuotes {
-					if escRune != 0 && r == escRune && i+1 < len(runes) {
-						currentField.WriteRune(runes[i+1])
-						i += 2
-						continue
-					}
-					if quoteRune != 0 && r == quoteRune {
-						if d.doublequote && i+1 < len(runes) && runes[i+1] == quoteRune {
-							currentField.WriteRune(quoteRune)
-							i += 2
-							continue
-						}
-						inQuotes = false
-						i++
-						continue
-					}
-					currentField.WriteRune(r)
-					i++
-				} else {
-					if escRune != 0 && r == escRune && i+1 < len(runes) {
-						currentField.WriteRune(runes[i+1])
-						i += 2
-						continue
-					}
-					if quoteRune != 0 && r == quoteRune && (currentField.Len() == 0 || (d.skipinitialspace && strings.TrimSpace(currentField.String()) == "")) {
-						inQuotes = true
-						currentField.Reset()
-						i++
-						continue
-					}
-					if r == delimRune {
-						f := currentField.String()
-						if d.skipinitialspace {
-							f = strings.TrimLeft(f, " \t")
-						}
-						fields = append(fields, val.NewStringVal(f))
-						currentField.Reset()
-						i++
-						continue
-					}
-					currentField.WriteRune(r)
-					i++
-				}
-			}
-			f := currentField.String()
-			if d.skipinitialspace && !inQuotes {
-				f = strings.TrimLeft(f, " \t")
-			}
-			fields = append(fields, val.NewStringVal(f))
-			return val.NewListVal(fields...), val.IterYielded
+			return csvReadNextRow(ctx, pr)
 		}
 
 		// Register built-in default dialects

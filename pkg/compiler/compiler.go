@@ -90,6 +90,7 @@ type Compiler struct {
 	isSingle       bool
 	optimize       int
 	hasSliceOps    bool
+	compLocalSlots map[string]int
 }
 
 func buildLineStarts(src []byte) []int {
@@ -1022,6 +1023,10 @@ func (c *Compiler) compileNameLoad(name string) error {
 		c.emitOp(vm.OP_LOAD_CONST, 0, idx)
 		return nil
 	}
+	if slot, ok := c.compLocalSlots[name]; ok {
+		c.emitOp(vm.OP_LOAD_FAST, 0, uint16(slot))
+		return nil
+	}
 	sym := c.scope.Symbols[name]
 	if c.scope.CanSeeClass && name != annClassDictName && name != annCondAnnotations &&
 		(sym == nil || sym.Storage == StorageGlobal || sym.Storage == StorageFree) {
@@ -1077,6 +1082,10 @@ func (c *Compiler) compileNameLoad(name string) error {
 func (c *Compiler) compileNameStore(name string) error {
 	if name == "__debug__" {
 		return errors.New("SyntaxError: cannot assign to __debug__")
+	}
+	if slot, ok := c.compLocalSlots[name]; ok {
+		c.emitOp(vm.OP_STORE_FAST, 0, uint16(slot))
+		return nil
 	}
 	sym := c.scope.Symbols[name]
 	if sym == nil {
@@ -3271,6 +3280,43 @@ func (c *Compiler) compTargetNames(idx uint32) []string {
 // compSaveLocals copies the enclosing function's value of every local the
 // comprehension is about to rebind into its hidden slot. The copy is raw, so
 // an unbound local stays unbound. It returns the matching restore pairs.
+// compBindNonFuncLocals isolates comprehension target variables in temporary
+// fast-local slots when compiling at module or class scope, matching Python's
+// isolated comprehension scope (e.g. `{v: k for k, v in globals().items()}`
+// must not mutate globals()).
+func (c *Compiler) compBindNonFuncLocals(idx uint32) func() {
+	if c.scope == nil || c.scope.Kind == ScopeFunction {
+		return func() {}
+	}
+	names := c.compTargetNames(idx)
+	if len(names) == 0 {
+		return func() {}
+	}
+	if c.compLocalSlots == nil {
+		c.compLocalSlots = make(map[string]int, len(names))
+	}
+	type savedEntry struct {
+		name   string
+		prev   int
+		hadOld bool
+	}
+	saved := make([]savedEntry, 0, len(names))
+	for _, name := range names {
+		prev, had := c.compLocalSlots[name]
+		saved = append(saved, savedEntry{name: name, prev: prev, hadOld: had})
+		c.compLocalSlots[name] = c.allocTempLocal()
+	}
+	return func() {
+		for _, s := range slices.Backward(saved) {
+			if s.hadOld {
+				c.compLocalSlots[s.name] = s.prev
+			} else {
+				delete(c.compLocalSlots, s.name)
+			}
+		}
+	}
+}
+
 func (c *Compiler) compSaveLocals(idx uint32) (restore func()) {
 	if c.scope == nil || c.scope.Kind != ScopeFunction {
 		return func() {}
@@ -3307,6 +3353,9 @@ func (c *Compiler) compileListComp(expr *ASTExpr) error {
 		if curr.IsAsync {
 			if err := c.compileExpr(curr.Iter); err != nil {
 				return err
+			}
+			if currIdx == expr.Extra {
+				defer c.compBindNonFuncLocals(expr.Extra)()
 			}
 			c.emitOp(vm.OP_GET_AITER, 0, 0)
 
@@ -3374,6 +3423,9 @@ func (c *Compiler) compileListComp(expr *ASTExpr) error {
 		if err := c.compileExpr(curr.Iter); err != nil {
 			return err
 		}
+		if currIdx == expr.Extra {
+			defer c.compBindNonFuncLocals(expr.Extra)()
+		}
 		c.emitOp(vm.OP_GET_ITER, 0, 0)
 
 		loopStart := len(c.code)
@@ -3427,6 +3479,9 @@ func (c *Compiler) compileDictComp(expr *ASTExpr) error {
 		if curr.IsAsync {
 			if err := c.compileExpr(curr.Iter); err != nil {
 				return err
+			}
+			if currIdx == expr.Extra {
+				defer c.compBindNonFuncLocals(expr.Extra)()
 			}
 			c.emitOp(vm.OP_GET_AITER, 0, 0)
 
@@ -3496,6 +3551,9 @@ func (c *Compiler) compileDictComp(expr *ASTExpr) error {
 
 		if err := c.compileExpr(curr.Iter); err != nil {
 			return err
+		}
+		if currIdx == expr.Extra {
+			defer c.compBindNonFuncLocals(expr.Extra)()
 		}
 		c.emitOp(vm.OP_GET_ITER, 0, 0)
 
@@ -4335,6 +4393,9 @@ func (c *Compiler) compileSetComp(expr *ASTExpr) error {
 			if err := c.compileExpr(curr.Iter); err != nil {
 				return err
 			}
+			if currIdx == expr.Extra {
+				defer c.compBindNonFuncLocals(expr.Extra)()
+			}
 			c.emitOp(vm.OP_GET_AITER, 0, 0)
 
 			iterSlot := c.allocTempLocal()
@@ -4400,6 +4461,9 @@ func (c *Compiler) compileSetComp(expr *ASTExpr) error {
 
 		if err := c.compileExpr(curr.Iter); err != nil {
 			return err
+		}
+		if currIdx == expr.Extra {
+			defer c.compBindNonFuncLocals(expr.Extra)()
 		}
 		c.emitOp(vm.OP_GET_ITER, 0, 0)
 

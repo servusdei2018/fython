@@ -21,7 +21,7 @@ func posArgs(args, kwnames []val.Value) []val.Value {
 func kwArg(args, kwnames []val.Value, name string) (val.Value, bool) {
 	start := len(args) - len(kwnames)
 	for i, kn := range kwnames {
-		if kn.AsString() == name {
+		if val.StringEqualsASCII(kn, name) {
 			return args[start+i], true
 		}
 	}

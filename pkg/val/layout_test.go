@@ -17,6 +17,7 @@ var (
 	_ [0 - unsafe.Offsetof(PyGenerator{}.Header)]byte
 	_ [0 - unsafe.Offsetof(PyCoroutine{}.Header)]byte
 	_ [0 - unsafe.Offsetof(PyTuple{}.Header)]byte
+	_ [0 - unsafe.Offsetof(PyDictView{}.Header)]byte
 )
 
 func TestCoreStructLayouts(t *testing.T) {
@@ -49,6 +50,9 @@ func TestCoreStructLayouts(t *testing.T) {
 	}
 	if got := unsafe.Sizeof(PyDict{}); got > 144 {
 		t.Fatalf("unsafe.Sizeof(PyDict{}) = %d, want <= 144", got)
+	}
+	if got := unsafe.Sizeof(PyDictView{}); got > 32 {
+		t.Fatalf("unsafe.Sizeof(PyDictView{}) = %d, want <= 32", got)
 	}
 	if got := unsafe.Sizeof(PySet{}); got > 72 {
 		t.Fatalf("unsafe.Sizeof(PySet{}) = %d, want <= 72", got)

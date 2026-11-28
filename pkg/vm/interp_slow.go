@@ -368,6 +368,12 @@ func (vm *VM) opBinarySubscrSlow(st *loopState, ip, sp int) (int, int, loopCtl) 
 func (vm *VM) opGetIterSlow(st *loopState, ip, sp int) (int, int, loopCtl) {
 	stack := st.stack
 	top := stack[sp-1]
+	if (top.IsDictView() || (top.IsDict() && top.Type() == val.DictType)) && ip+1 < st.codeLen {
+		if nextOp := DecodeOpcode(*(*uint32)(unsafe.Add(st.codePtr, uintptr(ip+1)*4))); nextOp == OP_FOR_ITER || nextOp == OP_FOR_ITER_GEN {
+			stack[sp-1] = vm.acquireForIter(top)
+			return ip + 1, sp, ctlNext
+		}
+	}
 	if top.IsInstance() && !vm.hasTrackedViews {
 		if inst := top.AsInstance(); inst != nil && inst.Shape != nil {
 			if tp := inst.Header.Type; tp != nil {
@@ -534,6 +540,31 @@ func (vm *VM) opForIterSlow(st *loopState, inst uint32, ip, sp int) (int, int, l
 		if pyIter.Kind == val.IterKindInvalid {
 			st.raiseExc = val.NewTypeError(fmt.Sprintf("'%s' object is not iterable", pyIter.Obj.Type().Name))
 			return ip, sp, ctlRaise
+		}
+		if (pyIter.Kind == val.IterKindDictItems || pyIter.Kind == val.IterKindDictRevItems) &&
+			!val.MultiThreadedFlag.Load() && callerForIterUnpackCount(st.cache, ip+1) == 2 {
+			st.ip = ip
+			vm.execCtx.SP = sp
+			k, v, ok := pyIter.NextDictItemPairCtx(&vm.execCtx)
+			stack = st.syncStackFromVM(vm, stack)
+			if vm.execCtx.HasException() {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				st.raiseExc = exc
+				return ip, sp, ctlRaise
+			}
+			if ok {
+				var buf [2]val.Value
+				buf[0] = k
+				buf[1] = v
+				stack[sp] = vm.acquireEphemeralTuple(buf[:])
+				sp++
+				ip++
+				return ip, sp, ctlReload
+			}
+			vm.releaseForIter(pyIter)
+			sp--
+			return jumpTarget, sp, ctlReload
 		}
 		if pyIter.Kind == val.IterKindZip || pyIter.Kind == val.IterKindEnumerate {
 			st.ip = ip

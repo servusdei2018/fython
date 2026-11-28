@@ -2,10 +2,13 @@ package val
 
 import (
 	"bytes"
+	"math"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
+	"unsafe"
 )
 
 // strMethodArg extracts the underlying Go string from a str or str-subclass instance.
@@ -123,8 +126,41 @@ func PyRepr(ctx *ExecContext, v Value) string {
 // types install it as their __repr__ so the method never calls itself.
 // Container elements still dispatch through PyRepr.
 func NativeRepr(ctx *ExecContext, v Value) string {
+	var seenBuf [8]*ObjectHeader
+	return nativeReprRec(ctx, v, seenBuf[:0])
+}
+
+func reprSeenContains(seen []*ObjectHeader, ptr *ObjectHeader) bool {
+	return slices.Contains(seen, ptr)
+}
+
+func reprElem(ctx *ExecContext, v Value, seen []*ObjectHeader) string {
+	if ctx != nil && !isPrimitiveReprKind(v) {
+		if fn, owner, ok := v.Type().LookupMRO(strRepr); ok && owner != ObjectType {
+			if v.ptr != nil && (v.ptr.Kind == KindDict || v.ptr.Kind == KindList || v.ptr.Kind == KindDictView) {
+				if v.Type() == DictType || v.Type() == ListType || v.Type() == DictKeysType || v.Type() == DictValuesType || v.Type() == DictItemsType {
+					return nativeReprRec(ctx, v, seen)
+				}
+			}
+			var res Value
+			if descrGet := fn.Type().Slots.TpDescrGet; descrGet != nil {
+				bound := descrGet(ctx, fn, v, v.Type())
+				res = ctx.Invoke0(bound)
+			} else {
+				res = ctx.Invoke1(fn, v)
+			}
+			if s, ok := strMethodArg(res); ok {
+				return s
+			}
+			return res.String()
+		}
+	}
+	return nativeReprRec(ctx, v, seen)
+}
+
+func nativeReprRec(ctx *ExecContext, v Value, seen []*ObjectHeader) string {
 	if v.Kind() == KindMappingProxy {
-		return "mappingproxy(" + PyRepr(ctx, v.AsMappingProxy().Mapping) + ")"
+		return "mappingproxy(" + reprElem(ctx, v.AsMappingProxy().Mapping, seen) + ")"
 	}
 	switch v.Kind() {
 	case KindComplex:
@@ -136,6 +172,10 @@ func NativeRepr(ctx *ExecContext, v Value) string {
 		var items []Value
 		open, close := "[", "]"
 		if v.Kind() == KindList {
+			if reprSeenContains(seen, v.ptr) {
+				return "[...]"
+			}
+			seen = append(seen, v.ptr)
 			items = v.AsList().Items
 		} else {
 			items = v.AsTuple().Items
@@ -147,7 +187,7 @@ func NativeRepr(ctx *ExecContext, v Value) string {
 			if i > 0 {
 				sb.WriteString(", ")
 			}
-			sb.WriteString(PyRepr(ctx, it))
+			sb.WriteString(reprElem(ctx, it, seen))
 		}
 		if v.Kind() == KindTuple && len(items) == 1 {
 			sb.WriteByte(',')
@@ -155,6 +195,10 @@ func NativeRepr(ctx *ExecContext, v Value) string {
 		sb.WriteString(close)
 		return sb.String()
 	case KindDict:
+		if reprSeenContains(seen, v.ptr) {
+			return "{...}"
+		}
+		seen = append(seen, v.ptr)
 		var sb strings.Builder
 		sb.WriteByte('{')
 		first := true
@@ -166,11 +210,50 @@ func NativeRepr(ctx *ExecContext, v Value) string {
 				sb.WriteString(", ")
 			}
 			first = false
-			sb.WriteString(PyRepr(ctx, e.Key))
+			sb.WriteString(reprElem(ctx, e.Key, seen))
 			sb.WriteString(": ")
-			sb.WriteString(PyRepr(ctx, e.Value))
+			sb.WriteString(reprElem(ctx, e.Value, seen))
 		}
 		sb.WriteByte('}')
+		return sb.String()
+	case KindDictView:
+		dv := v.AsDictView()
+		if reprSeenContains(seen, v.ptr) {
+			return "..."
+		}
+		seen = append(seen, v.ptr)
+		var sb strings.Builder
+		switch dv.ViewKind {
+		case DictViewKeys:
+			sb.WriteString("dict_keys([")
+		case DictViewValues:
+			sb.WriteString("dict_values([")
+		default:
+			sb.WriteString("dict_items([")
+		}
+		first := true
+		for _, e := range dv.Dict.ActiveEntries() {
+			if e.Key.IsUnbound() {
+				continue
+			}
+			if !first {
+				sb.WriteString(", ")
+			}
+			first = false
+			switch dv.ViewKind {
+			case DictViewKeys:
+				sb.WriteString(reprElem(ctx, e.Key, seen))
+			case DictViewValues:
+				sb.WriteString(reprElem(ctx, e.Value, seen))
+			default:
+				sb.WriteByte('(')
+				sb.WriteString(reprElem(ctx, e.Key, seen))
+				sb.WriteString(", ")
+				sb.WriteString(reprElem(ctx, e.Value, seen))
+				sb.WriteByte(')')
+			}
+		}
+		sb.WriteString("])")
 		return sb.String()
 	case KindSet:
 		s := v.AsSet()
@@ -194,7 +277,7 @@ func NativeRepr(ctx *ExecContext, v Value) string {
 				sb.WriteString(", ")
 			}
 			first = false
-			sb.WriteString(PyRepr(ctx, item))
+			sb.WriteString(reprElem(ctx, item, seen))
 		}
 		sb.WriteByte('}')
 		if !isBaseSet {
@@ -835,13 +918,28 @@ func strSplitWhitespace(s string, maxsplit int, fromRight bool) []string {
 
 func strSplitASCIIWhitespaceDirect(s string, maxsplit int) (Value, bool) {
 	n := len(s)
-	// Fast-scan to verify ASCII and count tokens or bail to Unicode fallback.
+	// Fast-scan to verify ASCII and count tokens in one pass.
+	wordCount := 0
+	inWord := false
 	for i := range n {
-		if s[i] >= 0x80 {
+		c := s[i]
+		if c >= 0x80 {
 			return Value{}, false
 		}
+		isSpace := c == ' ' || (c >= '\t' && c <= '\r')
+		if !isSpace {
+			if !inWord {
+				wordCount++
+				inWord = true
+			}
+		} else {
+			inWord = false
+		}
 	}
-	items := make([]Value, 0, 8)
+	if maxsplit >= 0 && wordCount > maxsplit+1 {
+		wordCount = maxsplit + 1
+	}
+	items := make([]Value, 0, wordCount)
 	i := 0
 	for i < n {
 		for i < n && (s[i] == ' ' || (s[i] >= '\t' && s[i] <= '\r')) {
@@ -874,6 +972,101 @@ func strSplitASCIIWhitespaceDirect(s string, maxsplit int) (Value, bool) {
 	}
 	lst := &PyList{Header: ObjectHeader{Kind: KindList, Type: ListType}, Items: items}
 	return Value{ptr: &lst.Header}, true
+}
+
+func strSplitUnicodeWhitespaceDirect(s string, maxsplit int, fromRight bool) Value {
+	if fromRight && maxsplit >= 0 {
+		return stringsToList(strSplitWhitespace(s, maxsplit, true))
+	}
+	n := len(s)
+	est := 8
+	if maxsplit >= 0 && maxsplit+1 < est {
+		est = maxsplit + 1
+	}
+	items := make([]Value, 0, est)
+	i := 0
+	for i < n {
+		// Skip leading whitespace.
+		for i < n {
+			b := s[i]
+			if b < 0x80 {
+				if b == ' ' || (b >= '\t' && b <= '\r') {
+					i++
+					continue
+				}
+				break
+			}
+			r, sz := utf8.DecodeRuneInString(s[i:])
+			if !unicode.IsSpace(r) {
+				break
+			}
+			i += sz
+		}
+		if i >= n {
+			break
+		}
+		if maxsplit >= 0 && len(items) == maxsplit {
+			items = append(items, NewStringVal(s[i:]))
+			break
+		}
+		start := i
+		for i < n {
+			b := s[i]
+			if b < 0x80 {
+				if b == ' ' || (b >= '\t' && b <= '\r') {
+					break
+				}
+				i++
+				continue
+			}
+			r, sz := utf8.DecodeRuneInString(s[i:])
+			if unicode.IsSpace(r) {
+				break
+			}
+			i += sz
+		}
+		items = append(items, NewStringVal(s[start:i]))
+	}
+	return NewListFromOwnedSlice(items)
+}
+
+func strRsplitSepDirect(s, sep string, maxsplit int) Value {
+	if maxsplit == 0 {
+		items := make([]Value, 1)
+		items[0] = NewStringVal(s)
+		return NewListFromOwnedSlice(items)
+	}
+	if maxsplit < 0 {
+		return strSplitSepDirect(s, sep, -1)
+	}
+	items := make([]Value, 0, min(maxsplit+1, 16))
+	rest := s
+	sepLen := len(sep)
+	if sepLen == 1 {
+		b := sep[0]
+		for len(items) < maxsplit {
+			idx := strings.LastIndexByte(rest, b)
+			if idx < 0 {
+				break
+			}
+			items = append(items, NewStringVal(rest[idx+1:]))
+			rest = rest[:idx]
+		}
+	} else {
+		for len(items) < maxsplit {
+			idx := strings.LastIndex(rest, sep)
+			if idx < 0 {
+				break
+			}
+			items = append(items, NewStringVal(rest[idx+sepLen:]))
+			rest = rest[:idx]
+		}
+	}
+	items = append(items, NewStringVal(rest))
+	for l, r := 0, len(items)-1; l < r; l, r = l+1, r-1 {
+		items[l], items[r] = items[r], items[l]
+	}
+	return NewListFromOwnedSlice(items)
 }
 
 func strSplitSepDirect(s, sep string, maxsplit int) Value {
@@ -1206,9 +1399,17 @@ func initStrExtraMethods() {
 			return NoneVal()
 		}
 		if before, after, ok := strings.Cut(s, sep); ok {
-			return NewTupleVal(NewStringVal(before), NewStringVal(sep), NewStringVal(after))
+			sepV := args[1]
+			if !sepV.IsInlineStr() && sepV.Type() != StrType {
+				sepV = NewStringVal(sep)
+			}
+			return NewTupleVal(NewStringVal(before), sepV, NewStringVal(after))
 		}
-		return NewTupleVal(NewStringVal(s), NewStringVal(""), NewStringVal(""))
+		selfV := args[0]
+		if !selfV.IsInlineStr() && selfV.Type() != StrType {
+			selfV = NewStringVal(s)
+		}
+		return NewTupleVal(selfV, SmallStringVal(""), SmallStringVal(""))
 	})
 	set("rpartition", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		s := strSelf("rpartition", args)
@@ -1222,9 +1423,17 @@ func initStrExtraMethods() {
 			return NoneVal()
 		}
 		if idx := strings.LastIndex(s, sep); idx >= 0 {
-			return NewTupleVal(NewStringVal(s[:idx]), NewStringVal(sep), NewStringVal(s[idx+len(sep):]))
+			sepV := args[1]
+			if !sepV.IsInlineStr() && sepV.Type() != StrType {
+				sepV = NewStringVal(sep)
+			}
+			return NewTupleVal(NewStringVal(s[:idx]), sepV, NewStringVal(s[idx+len(sep):]))
 		}
-		return NewTupleVal(NewStringVal(""), NewStringVal(""), NewStringVal(s))
+		selfV := args[0]
+		if !selfV.IsInlineStr() && selfV.Type() != StrType {
+			selfV = NewStringVal(s)
+		}
+		return NewTupleVal(SmallStringVal(""), SmallStringVal(""), selfV)
 	})
 	splitImpl := func(name string, fromRight bool) func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
 		return func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
@@ -1248,7 +1457,7 @@ func initStrExtraMethods() {
 						return res
 					}
 				}
-				return stringsToList(strSplitWhitespace(s, maxsplit, fromRight))
+				return strSplitUnicodeWhitespaceDirect(s, maxsplit, fromRight)
 			}
 			sep, _ := strMethodArg(sepV)
 			if sep == "" {
@@ -1258,24 +1467,7 @@ func initStrExtraMethods() {
 			if !fromRight {
 				return strSplitSepDirect(s, sep, maxsplit)
 			}
-			if maxsplit < 0 {
-				return stringsToList(strings.Split(s, sep))
-			}
-			var parts []string
-			rest := s
-			for len(parts) < maxsplit {
-				idx := strings.LastIndex(rest, sep)
-				if idx < 0 {
-					break
-				}
-				parts = append(parts, rest[idx+len(sep):])
-				rest = rest[:idx]
-			}
-			parts = append(parts, rest)
-			for l, r := 0, len(parts)-1; l < r; l, r = l+1, r-1 {
-				parts[l], parts[r] = parts[r], parts[l]
-			}
-			return stringsToList(parts)
+			return strRsplitSepDirect(s, sep, maxsplit)
 		}
 	}
 	set("split", splitImpl("split", false))
@@ -1292,7 +1484,18 @@ func initStrExtraMethods() {
 		if len(s) == 0 {
 			return NewListVal()
 		}
-		nLines := strings.Count(s, "\n") + 1
+		nLines := 1
+		for i := 0; i < len(s); i++ {
+			switch s[i] {
+			case '\n':
+				nLines++
+			case '\r':
+				nLines++
+				if i+1 < len(s) && s[i+1] == '\n' {
+					i++
+				}
+			}
+		}
 		items := make([]Value, 0, nLines)
 		start := 0
 		for i := 0; i < len(s); {
@@ -1439,43 +1642,7 @@ func initStrExtraMethods() {
 			ctx.Raise(NewException(TypeErrorType, "translate() takes exactly one argument (0 given)"))
 			return NoneVal()
 		}
-		table := args[1]
-		var sb strings.Builder
-		for _, r := range s {
-			var mapped Value
-			found := false
-			if table.IsDict() {
-				mapped, found = table.AsDict().Get(Int64Val(int64(r)))
-			} else {
-				func() {
-					defer func() {
-						if rec := recover(); rec != nil {
-							found = false
-						}
-					}()
-					mapped = GetItemCtx(ctx, table, Int64Val(int64(r)))
-					if ctx != nil && ctx.HasException() {
-						ctx.ClearException()
-						found = false
-						return
-					}
-					found = true
-				}()
-			}
-			if !found {
-				sb.WriteRune(r)
-				continue
-			}
-			switch {
-			case mapped.IsNone():
-			case mapped.IsInt64():
-				sb.WriteRune(rune(mapped.AsInt64()))
-			default:
-				ms, _ := strMethodArg(mapped)
-				sb.WriteString(ms)
-			}
-		}
-		return NewStringVal(sb.String())
+		return strTranslate(ctx, args[0], s, args[1])
 	})
 
 	set("format", func(ctx *ExecContext, callable Value, args []Value, kwnames []Value) Value {
@@ -1497,4 +1664,452 @@ func initStrExtraMethods() {
 			return GetItemCtx(ctx, mapping, NewStringVal(name)), true
 		})
 	})
+}
+
+const (
+	trUnchanged   uint8 = 0
+	trDelete      uint8 = 1
+	trASCIIByte   uint8 = 2
+	trRune        uint8 = 3
+	trString      uint8 = 4
+	trInvalidInt  uint8 = 5
+	trInvalidType uint8 = 6
+)
+
+func strTranslateOwnedBytes(out []byte) Value {
+	if len(out) <= 7 {
+		return SmallStringFromBytes(out)
+	}
+	return NewStringVal(unsafe.String(unsafe.SliceData(out), len(out)))
+}
+
+// strCaseTransform implements str.lower (toUpper=false) and str.upper (toUpper=true)
+// with an ASCII fast path that avoids strings.Map overhead on ASCII bytes and returns
+// selfVal directly when unchanged and selfVal is an exact str.
+func strCaseTransform(selfVal Value, s string, toUpper bool) Value {
+	n := len(s)
+	if n == 0 {
+		if selfVal.IsInlineStr() || selfVal.Type() == StrType {
+			return selfVal
+		}
+		return SmallStringVal("")
+	}
+	firstDiff := -1
+	nonASCII := false
+	if toUpper {
+		for i := range n {
+			c := s[i]
+			if c >= 0x80 {
+				firstDiff = i
+				nonASCII = true
+				break
+			}
+			if c >= 'a' && c <= 'z' {
+				firstDiff = i
+				break
+			}
+		}
+	} else {
+		for i := range n {
+			c := s[i]
+			if c >= 0x80 {
+				firstDiff = i
+				nonASCII = true
+				break
+			}
+			if c >= 'A' && c <= 'Z' {
+				firstDiff = i
+				break
+			}
+		}
+	}
+	if firstDiff < 0 {
+		if selfVal.IsInlineStr() || selfVal.Type() == StrType {
+			return selfVal
+		}
+		return NewStringVal(s)
+	}
+	if !nonASCII {
+		out := make([]byte, n)
+		copy(out, s[:firstDiff])
+		i := firstDiff
+		if toUpper {
+			for ; i < n; i++ {
+				c := s[i]
+				if c >= 0x80 {
+					nonASCII = true
+					break
+				}
+				if c >= 'a' && c <= 'z' {
+					c -= 'a' - 'A'
+				}
+				out[i] = c
+			}
+		} else {
+			for ; i < n; i++ {
+				c := s[i]
+				if c >= 0x80 {
+					nonASCII = true
+					break
+				}
+				if c >= 'A' && c <= 'Z' {
+					c += 'a' - 'A'
+				}
+				out[i] = c
+			}
+		}
+		if !nonASCII {
+			return strTranslateOwnedBytes(out)
+		}
+		buf := out[:i]
+		return strCaseTransformUTF8Tail(buf, s[i:], toUpper)
+	}
+	buf := make([]byte, 0, n)
+	buf = append(buf, s[:firstDiff]...)
+	return strCaseTransformUTF8Tail(buf, s[firstDiff:], toUpper)
+}
+
+func strCaseTransformUTF8Tail(buf []byte, rest string, toUpper bool) Value {
+	for i := 0; i < len(rest); {
+		c := rest[i]
+		if c < 0x80 {
+			if toUpper {
+				if c >= 'a' && c <= 'z' {
+					c -= 'a' - 'A'
+				}
+			} else {
+				if c >= 'A' && c <= 'Z' {
+					c += 'a' - 'A'
+				}
+			}
+			buf = append(buf, c)
+			i++
+			continue
+		}
+		r, sz := utf8.DecodeRuneInString(rest[i:])
+		var mapped rune
+		if toUpper {
+			mapped = unicode.ToUpper(r)
+		} else {
+			mapped = unicode.ToLower(r)
+		}
+		if mapped == r {
+			buf = append(buf, rest[i:i+sz]...)
+		} else {
+			buf = utf8.AppendRune(buf, mapped)
+		}
+		i += sz
+	}
+	return strTranslateOwnedBytes(buf)
+}
+
+func appendTranslatedValue(ctx *ExecContext, out []byte, mapped Value) ([]byte, bool) {
+	switch {
+	case mapped.IsNone():
+		return out, true
+	case mapped.IsInt64():
+		cp := mapped.AsInt64()
+		if cp < 0 || cp > 0x10FFFF {
+			ctx.Raise(NewException(ValueErrorType, "character mapping must be in range(0x110000)"))
+			return out, false
+		}
+		return utf8.AppendRune(out, rune(cp)), true
+	case mapped.IsBool():
+		if mapped.AsBool() {
+			return append(out, 1), true
+		}
+		return append(out, 0), true
+	default:
+		if ms, ok := strMethodArg(mapped); ok {
+			return append(out, ms...), true
+		}
+		ctx.Raise(NewException(TypeErrorType, "character mapping must return integer, None or str"))
+		return out, false
+	}
+}
+
+func strTranslate(ctx *ExecContext, selfVal Value, s string, table Value) Value {
+	if len(s) == 0 {
+		if selfVal.IsInlineStr() || selfVal.Type() == StrType {
+			return selfVal
+		}
+		return SmallStringVal("")
+	}
+	if table.IsDict() && table.Type() == DictType {
+		return strTranslateDict(ctx, s, table.AsDict())
+	}
+	return strTranslateMapping(ctx, s, table)
+}
+
+func strTranslateDict(ctx *ExecContext, s string, d *PyDict) Value {
+	var asciiKind [128]uint8
+	var asciiOut [128]byte
+	var asciiRune [128]rune
+	var asciiStrIdx [128]uint16
+	for i := range 128 {
+		asciiOut[i] = byte(i)
+	}
+	var multiStrs []string
+	pure1to1 := true
+	asciiOutOnly := true
+	hasNonASCIIKey := false
+	hasComplexKey := false
+
+	recordEntry := func(k, v Value) {
+		var cp int64
+		switch {
+		case k.IsInt64():
+			cp = k.AsInt64()
+		case k.IsBool():
+			if k.AsBool() {
+				cp = 1
+			}
+		case k.IsFloat64():
+			f := k.AsFloat64()
+			if math.IsNaN(f) || math.IsInf(f, 0) || f != math.Trunc(f) || f < 0 || f > 0x10FFFF {
+				return
+			}
+			cp = int64(f)
+		default:
+			hasComplexKey = true
+			return
+		}
+		if cp < 0 || cp > 0x10FFFF {
+			return
+		}
+		if cp >= 128 {
+			hasNonASCIIKey = true
+			return
+		}
+		switch {
+		case v.IsNone():
+			asciiKind[cp] = trDelete
+			pure1to1 = false
+		case v.IsInt64():
+			rc := v.AsInt64()
+			switch {
+			case rc < 0 || rc > 0x10FFFF:
+				asciiKind[cp] = trInvalidInt
+				pure1to1 = false
+			case rc < 128:
+				asciiKind[cp] = trASCIIByte
+				asciiOut[cp] = byte(rc)
+			default:
+				asciiKind[cp] = trRune
+				asciiRune[cp] = rune(rc)
+				pure1to1 = false
+				asciiOutOnly = false
+			}
+		case v.IsBool():
+			asciiKind[cp] = trASCIIByte
+			if v.AsBool() {
+				asciiOut[cp] = 1
+			} else {
+				asciiOut[cp] = 0
+			}
+		default:
+			if ms, ok := strMethodArg(v); ok {
+				switch {
+				case len(ms) == 0:
+					asciiKind[cp] = trDelete
+					pure1to1 = false
+				case len(ms) == 1 && ms[0] < 0x80:
+					asciiKind[cp] = trASCIIByte
+					asciiOut[cp] = ms[0]
+				default:
+					asciiKind[cp] = trString
+					asciiStrIdx[cp] = uint16(len(multiStrs))
+					multiStrs = append(multiStrs, ms)
+					pure1to1 = false
+					asciiOutOnly = false
+				}
+			} else {
+				asciiKind[cp] = trInvalidType
+				pure1to1 = false
+			}
+		}
+	}
+
+	if d.Live != nil {
+		for _, it := range d.liveItems() {
+			recordEntry(it.Key, it.Value)
+		}
+	} else {
+		locked := d.rlockDict()
+		if sp := d.split; sp != nil {
+			sk := sp.keys
+			for i := range sk.Count {
+				recordEntry(sk.Keys[i], sp.vals[i])
+			}
+		} else {
+			for i := range d.Entries {
+				if d.Entries[i].Active {
+					recordEntry(d.Entries[i].Key, d.Entries[i].Value)
+				}
+			}
+		}
+		if locked {
+			d.mu.RUnlock()
+		}
+	}
+
+	if hasComplexKey {
+		out := make([]byte, 0, len(s))
+		for _, r := range s {
+			mapped, found := d.Get(Int64Val(int64(r)))
+			if !found {
+				out = utf8.AppendRune(out, r)
+				continue
+			}
+			var ok bool
+			out, ok = appendTranslatedValue(ctx, out, mapped)
+			if !ok {
+				return NoneVal()
+			}
+		}
+		return strTranslateOwnedBytes(out)
+	}
+
+	if isASCII(s) {
+		if pure1to1 {
+			out := make([]byte, len(s))
+			for i := range len(s) {
+				out[i] = asciiOut[s[i]]
+			}
+			return strTranslateOwnedBytes(out)
+		}
+		out := make([]byte, 0, len(s))
+		if asciiOutOnly {
+			for i := range len(s) {
+				b := s[i]
+				switch asciiKind[b] {
+				case trUnchanged:
+					out = append(out, b)
+				case trASCIIByte:
+					out = append(out, asciiOut[b])
+				case trDelete:
+				case trInvalidInt:
+					ctx.Raise(NewException(ValueErrorType, "character mapping must be in range(0x110000)"))
+					return NoneVal()
+				default:
+					ctx.Raise(NewException(TypeErrorType, "character mapping must return integer, None or str"))
+					return NoneVal()
+				}
+			}
+			return strTranslateOwnedBytes(out)
+		}
+		for i := range len(s) {
+			b := s[i]
+			switch asciiKind[b] {
+			case trUnchanged:
+				out = append(out, b)
+			case trASCIIByte:
+				out = append(out, asciiOut[b])
+			case trDelete:
+			case trRune:
+				out = utf8.AppendRune(out, asciiRune[b])
+			case trString:
+				out = append(out, multiStrs[asciiStrIdx[b]]...)
+			case trInvalidInt:
+				ctx.Raise(NewException(ValueErrorType, "character mapping must be in range(0x110000)"))
+				return NoneVal()
+			default:
+				ctx.Raise(NewException(TypeErrorType, "character mapping must return integer, None or str"))
+				return NoneVal()
+			}
+		}
+		return strTranslateOwnedBytes(out)
+	}
+
+	out := make([]byte, 0, len(s))
+	for i := 0; i < len(s); {
+		b := s[i]
+		if b < 0x80 {
+			switch asciiKind[b] {
+			case trUnchanged:
+				out = append(out, b)
+			case trASCIIByte:
+				out = append(out, asciiOut[b])
+			case trDelete:
+			case trRune:
+				out = utf8.AppendRune(out, asciiRune[b])
+			case trString:
+				out = append(out, multiStrs[asciiStrIdx[b]]...)
+			case trInvalidInt:
+				ctx.Raise(NewException(ValueErrorType, "character mapping must be in range(0x110000)"))
+				return NoneVal()
+			default:
+				ctx.Raise(NewException(TypeErrorType, "character mapping must return integer, None or str"))
+				return NoneVal()
+			}
+			i++
+			continue
+		}
+		r, sz := utf8.DecodeRuneInString(s[i:])
+		if !hasNonASCIIKey {
+			out = append(out, s[i:i+sz]...)
+			i += sz
+			continue
+		}
+		mapped, found := d.Get(Int64Val(int64(r)))
+		if !found {
+			out = append(out, s[i:i+sz]...)
+			i += sz
+			continue
+		}
+		var ok bool
+		out, ok = appendTranslatedValue(ctx, out, mapped)
+		if !ok {
+			return NoneVal()
+		}
+		i += sz
+	}
+	return strTranslateOwnedBytes(out)
+}
+
+func strTranslateMapping(ctx *ExecContext, s string, table Value) Value {
+	out := make([]byte, 0, len(s))
+	for _, r := range s {
+		var mapped Value
+		found := false
+		var rethrow any
+		func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					if v, ok := rec.(Value); ok && v.Type() != nil && (IsSubclass(v.Type(), LookupErrorType) || IsSubclass(v.Type(), KeyErrorType)) {
+						found = false
+						return
+					}
+					rethrow = rec
+				}
+			}()
+			mapped = GetItemCtx(ctx, table, Int64Val(int64(r)))
+			if ctx != nil && ctx.HasException() {
+				exc := ctx.ActiveException
+				if exc.Type() != nil && (IsSubclass(exc.Type(), LookupErrorType) || IsSubclass(exc.Type(), KeyErrorType)) {
+					ctx.ClearException()
+					found = false
+					return
+				}
+				return
+			}
+			found = true
+		}()
+		if rethrow != nil {
+			panic(rethrow)
+		}
+		if ctx != nil && ctx.HasException() {
+			return NoneVal()
+		}
+		if !found {
+			out = utf8.AppendRune(out, r)
+			continue
+		}
+		var ok bool
+		out, ok = appendTranslatedValue(ctx, out, mapped)
+		if !ok {
+			return NoneVal()
+		}
+	}
+	return strTranslateOwnedBytes(out)
 }

@@ -229,7 +229,7 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 		return val.NoneVal()
 	}))
 
-	for _, t := range []*val.PyType{val.ListType, val.TupleType, val.DictType, val.SetType, val.FrozenSetType, val.BytesType, val.ByteArrayType, val.MappingProxyType} {
+	for _, t := range []*val.PyType{val.ListType, val.TupleType, val.DictType, val.DictKeysType, val.DictValuesType, val.DictItemsType, val.SetType, val.FrozenSetType, val.BytesType, val.ByteArrayType, val.MappingProxyType} {
 		val.InstallNativeRepr(t)
 	}
 
@@ -248,7 +248,11 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 			return val.NoneVal()
 		}
 		if args[0].IsType() && args[0].AsType() == val.DictType {
-			out := val.NewDictVal(4)
+			capHint := 4
+			if n, ok := val.ListLenHint(args[1]); ok && n > capHint && n <= 1<<20 {
+				capHint = n
+			}
+			out := val.NewDictVal(capHint)
 			d := out.AsDict()
 			for {
 				k, ok := it.Next()

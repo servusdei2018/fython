@@ -17,7 +17,213 @@ var (
 	zlibErrorType      *val.PyType
 	zlibCompressType   *val.PyType
 	zlibDecompressType *val.PyType
+
+	// Per-level writer pools indexed by level+1 (levels -1..9 -> 0..10).
+	zlibWriterPools  [11]sync.Pool
+	flateWriterPools [11]sync.Pool
+	gzipWriterPools  [11]sync.Pool
+
+	// Reader pools for decompression reuse.
+	zlibReaderPool  sync.Pool
+	flateReaderPool sync.Pool
+	gzipReaderPool  sync.Pool
+
+	// Static valid empty streams used to detach caller input slices before
+	// returning pooled zlib/gzip readers without triggering header parse errors.
+	emptyZlibStream = []byte{0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01}
+	emptyGzipStream = []byte{
+		0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0xff, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+	}
 )
+
+func zlibCompressPooled(b []byte, lvl, wbits int) ([]byte, error) {
+	est := min(max(len(b)/2+64, 64), 65536)
+	var buf bytes.Buffer
+	buf.Grow(est)
+	bucket := lvl + 1
+	switch {
+	case wbits < 0:
+		var fw *flate.Writer
+		if pooled := flateWriterPools[bucket].Get(); pooled != nil {
+			fw = pooled.(*flate.Writer)
+			fw.Reset(&buf)
+		} else {
+			var err error
+			fw, err = flate.NewWriter(&buf, lvl)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if _, err := fw.Write(b); err != nil {
+			fw.Reset(io.Discard)
+			flateWriterPools[bucket].Put(fw)
+			return nil, err
+		}
+		if err := fw.Close(); err != nil {
+			fw.Reset(io.Discard)
+			flateWriterPools[bucket].Put(fw)
+			return nil, err
+		}
+		fw.Reset(io.Discard)
+		flateWriterPools[bucket].Put(fw)
+	case wbits > 15:
+		var gw *gzip.Writer
+		if pooled := gzipWriterPools[bucket].Get(); pooled != nil {
+			gw = pooled.(*gzip.Writer)
+			gw.Reset(&buf)
+		} else {
+			var err error
+			gw, err = gzip.NewWriterLevel(&buf, lvl)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if _, err := gw.Write(b); err != nil {
+			gw.Reset(io.Discard)
+			gzipWriterPools[bucket].Put(gw)
+			return nil, err
+		}
+		if err := gw.Close(); err != nil {
+			gw.Reset(io.Discard)
+			gzipWriterPools[bucket].Put(gw)
+			return nil, err
+		}
+		gw.Reset(io.Discard)
+		gzipWriterPools[bucket].Put(gw)
+	default:
+		var zw *zlib.Writer
+		if pooled := zlibWriterPools[bucket].Get(); pooled != nil {
+			zw = pooled.(*zlib.Writer)
+			zw.Reset(&buf)
+		} else {
+			var err error
+			zw, err = zlib.NewWriterLevel(&buf, lvl)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if _, err := zw.Write(b); err != nil {
+			zw.Reset(io.Discard)
+			zlibWriterPools[bucket].Put(zw)
+			return nil, err
+		}
+		if err := zw.Close(); err != nil {
+			zw.Reset(io.Discard)
+			zlibWriterPools[bucket].Put(zw)
+			return nil, err
+		}
+		zw.Reset(io.Discard)
+		zlibWriterPools[bucket].Put(zw)
+	}
+	return buf.Bytes(), nil
+}
+
+func zlibDecompressPooled(b []byte, wbits int) ([]byte, error) {
+	br := bytes.NewReader(b)
+	est := min(max(len(b)*4, 512), 1<<20)
+	var out bytes.Buffer
+	out.Grow(est)
+
+	mode := 0 // 0=zlib, 1=flate, 2=gzip
+	switch {
+	case wbits < 0:
+		mode = 1
+	case wbits > 15 && wbits <= 31:
+		mode = 2
+	case wbits > 31:
+		switch {
+		case len(b) >= 2 && b[0] == 0x1f && b[1] == 0x8b:
+			mode = 2
+		case len(b) >= 1 && (b[0] == 0x78 || b[0] == 0x58):
+			mode = 0
+		default:
+			mode = 1
+		}
+	}
+
+	switch mode {
+	case 1:
+		var fr io.ReadCloser
+		if pooled := flateReaderPool.Get(); pooled != nil {
+			fr = pooled.(io.ReadCloser)
+			if err := fr.(flate.Resetter).Reset(br, nil); err != nil {
+				fr = flate.NewReader(br)
+			}
+		} else {
+			fr = flate.NewReader(br)
+		}
+		_, err := out.ReadFrom(fr)
+		closeErr := fr.Close()
+		if resetter, ok := fr.(flate.Resetter); ok && resetter.Reset(bytes.NewReader(nil), nil) == nil {
+			flateReaderPool.Put(fr)
+		}
+		if err != nil && err != io.EOF {
+			return nil, err
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+		return out.Bytes(), nil
+	case 2:
+		var gzr *gzip.Reader
+		var err error
+		if pooled := gzipReaderPool.Get(); pooled != nil {
+			gzr = pooled.(*gzip.Reader)
+			err = gzr.Reset(br)
+		} else {
+			gzr, err = gzip.NewReader(br)
+		}
+		if err != nil {
+			if gzr != nil && gzr.Reset(bytes.NewReader(emptyGzipStream)) == nil {
+				gzipReaderPool.Put(gzr)
+			}
+			return nil, err
+		}
+		_, err = out.ReadFrom(gzr)
+		closeErr := gzr.Close()
+		if gzr.Reset(bytes.NewReader(emptyGzipStream)) == nil {
+			gzipReaderPool.Put(gzr)
+		}
+		if err != nil && err != io.EOF {
+			return nil, err
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+		return out.Bytes(), nil
+	default:
+		var zr io.ReadCloser
+		var err error
+		if pooled := zlibReaderPool.Get(); pooled != nil {
+			zr = pooled.(io.ReadCloser)
+			err = zr.(zlib.Resetter).Reset(br, nil)
+		} else {
+			zr, err = zlib.NewReader(br)
+		}
+		if err != nil {
+			if zr != nil {
+				if resetter, ok := zr.(zlib.Resetter); ok && resetter.Reset(bytes.NewReader(emptyZlibStream), nil) == nil {
+					zlibReaderPool.Put(zr)
+				}
+			}
+			return nil, err
+		}
+		_, err = out.ReadFrom(zr)
+		closeErr := zr.Close()
+		if resetter, ok := zr.(zlib.Resetter); ok && resetter.Reset(bytes.NewReader(emptyZlibStream), nil) == nil {
+			zlibReaderPool.Put(zr)
+		}
+		if err != nil && err != io.EOF {
+			return nil, err
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+		return out.Bytes(), nil
+	}
+}
 
 type pyZlibCompress struct {
 	inst  val.PyInstance
@@ -544,7 +750,6 @@ func (e *Engine) createZlibModule() val.Value {
 	// compress(data, level=Z_DEFAULT_COMPRESSION, wbits=MAX_WBITS)
 	set("compress", val.NewBuiltinFuncVal("compress", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		pa := posArgs(args, kwnames)
-		kw := extractKwArgs(args, kwnames)
 		if len(pa) < 1 {
 			ctx.Raise(val.NewException(val.TypeErrorType, "compress() requires data argument"))
 			return val.NoneVal()
@@ -553,72 +758,35 @@ func (e *Engine) createZlibModule() val.Value {
 		level := -1
 		if len(pa) > 1 && pa[1].IsInt64() {
 			level = int(pa[1].AsInt64())
-		} else if v, ok := kw["level"]; ok && v.IsInt64() {
-			level = int(v.AsInt64())
+		} else if len(kwnames) > 0 {
+			if v, ok := kwArg(args, kwnames, "level"); ok && v.IsInt64() {
+				level = int(v.AsInt64())
+			}
 		}
 		wbits := 15
 		if len(pa) > 2 && pa[2].IsInt64() {
 			wbits = int(pa[2].AsInt64())
-		} else if v, ok := kw["wbits"]; ok && v.IsInt64() {
-			wbits = int(v.AsInt64())
+		} else if len(kwnames) > 0 {
+			if v, ok := kwArg(args, kwnames, "wbits"); ok && v.IsInt64() {
+				wbits = int(v.AsInt64())
+			}
 		}
 
 		lvl := level
 		if lvl < -1 || lvl > 9 {
 			lvl = flate.DefaultCompression
 		}
-		var buf bytes.Buffer
-		switch {
-		case wbits < 0:
-			fw, err := flate.NewWriter(&buf, lvl)
-			if err != nil {
-				ctx.Raise(val.NewException(zlibErrorType, err.Error()))
-				return val.NoneVal()
-			}
-			if _, err := fw.Write(b); err != nil {
-				ctx.Raise(val.NewException(zlibErrorType, err.Error()))
-				return val.NoneVal()
-			}
-			if err := fw.Close(); err != nil {
-				ctx.Raise(val.NewException(zlibErrorType, err.Error()))
-				return val.NoneVal()
-			}
-		case wbits > 15:
-			gw, err := gzip.NewWriterLevel(&buf, lvl)
-			if err != nil {
-				ctx.Raise(val.NewException(zlibErrorType, err.Error()))
-				return val.NoneVal()
-			}
-			if _, err := gw.Write(b); err != nil {
-				ctx.Raise(val.NewException(zlibErrorType, err.Error()))
-				return val.NoneVal()
-			}
-			if err := gw.Close(); err != nil {
-				ctx.Raise(val.NewException(zlibErrorType, err.Error()))
-				return val.NoneVal()
-			}
-		default:
-			zw, err := zlib.NewWriterLevel(&buf, lvl)
-			if err != nil {
-				ctx.Raise(val.NewException(zlibErrorType, err.Error()))
-				return val.NoneVal()
-			}
-			if _, err := zw.Write(b); err != nil {
-				ctx.Raise(val.NewException(zlibErrorType, err.Error()))
-				return val.NoneVal()
-			}
-			if err := zw.Close(); err != nil {
-				ctx.Raise(val.NewException(zlibErrorType, err.Error()))
-				return val.NoneVal()
-			}
+		out, err := zlibCompressPooled(b, lvl, wbits)
+		if err != nil {
+			ctx.Raise(val.NewException(zlibErrorType, err.Error()))
+			return val.NoneVal()
 		}
-		return val.NewBytesVal(buf.Bytes())
+		return val.NewBytesVal(out)
 	}))
 
 	// decompress(data, wbits=MAX_WBITS, bufsize=DEF_BUF_SIZE)
 	set("decompress", val.NewBuiltinFuncVal("decompress", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
 		pa := posArgs(args, kwnames)
-		kw := extractKwArgs(args, kwnames)
 		if len(pa) < 1 {
 			ctx.Raise(val.NewException(val.TypeErrorType, "decompress() requires data argument"))
 			return val.NoneVal()
@@ -627,64 +795,14 @@ func (e *Engine) createZlibModule() val.Value {
 		wbits := 15
 		if len(pa) > 1 && pa[1].IsInt64() {
 			wbits = int(pa[1].AsInt64())
-		} else if v, ok := kw["wbits"]; ok && v.IsInt64() {
-			wbits = int(v.AsInt64())
+		} else if len(kwnames) > 0 {
+			if v, ok := kwArg(args, kwnames, "wbits"); ok && v.IsInt64() {
+				wbits = int(v.AsInt64())
+			}
 		}
 
-		br := bytes.NewReader(b)
-		var r io.Reader
-		var closeReader io.Closer
-		switch {
-		case wbits < 0:
-			fr := flate.NewReader(br)
-			r = fr
-			closeReader = fr
-		case wbits > 15 && wbits <= 31:
-			gzr, err := gzip.NewReader(br)
-			if err != nil {
-				ctx.Raise(val.NewException(zlibErrorType, err.Error()))
-				return val.NoneVal()
-			}
-			r = gzr
-			closeReader = gzr
-		case wbits > 31:
-			switch {
-			case len(b) >= 2 && b[0] == 0x1f && b[1] == 0x8b:
-				gzr, err := gzip.NewReader(br)
-				if err != nil {
-					ctx.Raise(val.NewException(zlibErrorType, err.Error()))
-					return val.NoneVal()
-				}
-				r = gzr
-				closeReader = gzr
-			case len(b) >= 1 && (b[0] == 0x78 || b[0] == 0x58):
-				zr, err := zlib.NewReader(br)
-				if err != nil {
-					ctx.Raise(val.NewException(zlibErrorType, err.Error()))
-					return val.NoneVal()
-				}
-				r = zr
-				closeReader = zr
-			default:
-				fr := flate.NewReader(br)
-				r = fr
-				closeReader = fr
-			}
-		default:
-			zr, err := zlib.NewReader(br)
-			if err != nil {
-				ctx.Raise(val.NewException(zlibErrorType, err.Error()))
-				return val.NoneVal()
-			}
-			r = zr
-			closeReader = zr
-		}
-
-		out, err := io.ReadAll(r)
-		if closeReader != nil {
-			_ = closeReader.Close()
-		}
-		if err != nil && err != io.EOF {
+		out, err := zlibDecompressPooled(b, wbits)
+		if err != nil {
 			ctx.Raise(val.NewException(zlibErrorType, err.Error()))
 			return val.NoneVal()
 		}

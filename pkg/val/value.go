@@ -62,6 +62,7 @@ const (
 	KindComplex        // Heap-allocated complex number (*PyComplex)
 	KindLazyImport     // Heap-allocated lazy import placeholder (*PyLazyImport)
 	KindAsyncGenerator // Heap-allocated detached async generator frame (*PyAsyncGenerator)
+	KindDictView       // Heap-allocated lazy dict view (*PyDictView)
 )
 
 // ObjectHeader Flags bitmask constants.
@@ -240,6 +241,8 @@ func (k Kind) String() string {
 		return "complex"
 	case KindLazyImport:
 		return "lazy_import"
+	case KindDictView:
+		return "dict_view"
 	default:
 		return "unknown"
 	}
@@ -752,6 +755,8 @@ func (v Value) isTruthySlowCtx(ctx *ExecContext) bool {
 		return len(v.AsList().Items) > 0
 	case KindDict:
 		return v.AsDict().Len() > 0
+	case KindDictView:
+		return v.AsDictView().Dict.Len() > 0
 	case KindSet:
 		return v.AsSet().Len() > 0
 	case KindTuple:
@@ -1485,6 +1490,8 @@ func (v Value) String() string {
 	case KindMappingProxy:
 		mp := v.AsMappingProxy()
 		return fmt.Sprintf("mappingproxy(%s)", mp.Mapping.String())
+	case KindDictView:
+		return NativeRepr(nil, v)
 	default:
 		return fmt.Sprintf("<%s object at %p>", v.Type().Name, v.ptr)
 	}

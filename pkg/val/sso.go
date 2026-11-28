@@ -239,6 +239,17 @@ func inlineEqualsHeapString(num uint64, s string) bool {
 	return true
 }
 
+// StringEqualsASCII reports whether string Value v equals Go string lit with zero allocations.
+func StringEqualsASCII(v Value, lit string) bool {
+	if v.ptr == &tagInlineStr {
+		return inlineEqualsHeapString(v.num, lit)
+	}
+	if v.ptr != nil && v.ptr.Kind == KindString {
+		return (*PyString)(unsafe.Pointer(v.ptr)).Data == lit
+	}
+	return false
+}
+
 // StringLen returns the character length of a KindInlineStr, KindString, or str subclass Value (0 allocations).
 func (v Value) StringLen() int {
 	if v.ptr == &tagInlineStr {
