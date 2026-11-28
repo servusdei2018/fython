@@ -339,8 +339,15 @@ type PySlice struct {
 // Compile-time assertion that PyModule.Header is at byte offset 0.
 var _ [0 - unsafe.Offsetof(PyModule{}.Header)]byte
 
+// nextModuleDictVer assigns each newly created PyModule a unique upper-32-bit
+// epoch in its Dict.VersionTag so ICKindModuleAttr guards cannot ABA-alias on
+// short-lived types.ModuleType objects.
+var nextModuleDictVer uint64
+
 // NewModuleVal wraps a newly created PyModule as a Value of KindModule.
 func NewModuleVal(name, file string) Value {
+	dict := NewDictVal(16).AsDict()
+	dict.VersionTag = atomic.AddUint64(&nextModuleDictVer, 1<<32)
 	mod := &PyModule{
 		Header: ObjectHeader{
 			Kind: KindModule,
@@ -348,7 +355,7 @@ func NewModuleVal(name, file string) Value {
 		},
 		Name: name,
 		File: file,
-		Dict: NewDictVal(16).AsDict(),
+		Dict: dict,
 	}
 	mod.Dict.Set(strName, NewStringVal(name))
 	if file != "" {
@@ -2101,6 +2108,37 @@ func NewEnumerateIterVal(subIter Value, start int64) Value {
 	return Value{num: 0, ptr: &it.Header}
 }
 
+// NewEnumerateBigIterVal constructs a concrete PyIter for enumerate(iterable, start)
+// when start is a BigInt (stored in Sub).
+func NewEnumerateBigIterVal(subIter, start Value) Value {
+	it := &PyIter{
+		Header: ObjectHeader{Kind: KindIter, Type: IterType},
+		Kind:   IterKindEnumerate,
+		Obj:    subIter,
+		Sub:    start,
+	}
+	return Value{num: 0, ptr: &it.Header}
+}
+
+// NextEnumerateIndex returns the current enumerate index and advances the counter,
+// promoting int64 math.MaxInt64 cleanly to BigInt for the following step.
+func (it *PyIter) NextEnumerateIndex() Value {
+	if it.Sub.IsBigInt() {
+		cur := it.Sub
+		next := new(big.Int).Add(&cur.AsBigInt().Val, big.NewInt(1))
+		it.Sub = NewBigIntVal(next)
+		return cur
+	}
+	idx := it.Cur
+	if idx == math.MaxInt64 {
+		next := new(big.Int).Add(big.NewInt(math.MaxInt64), big.NewInt(1))
+		it.Sub = NewBigIntVal(next)
+		return Int64Val(idx)
+	}
+	it.Cur = idx + 1
+	return Int64Val(idx)
+}
+
 // AsIter performs a zero-cost offset-0 downcast from Value to *PyIter.
 func (v Value) AsIter() *PyIter {
 	return (*PyIter)(unsafe.Pointer(v.ptr))
@@ -2433,10 +2471,8 @@ func (it *PyIter) NextCtx(ctx *ExecContext) (Value, bool) {
 		if !ok {
 			return NoneVal(), false
 		}
-		idx := it.Cur
-		it.Cur++
 		var buf [2]Value
-		buf[0] = Int64Val(idx)
+		buf[0] = it.NextEnumerateIndex()
 		buf[1] = v
 		return NewTupleFromSlice(buf[:]), true
 	case IterKindFunc:
@@ -4211,8 +4247,15 @@ func (d *PyDict) GetWithSlot(key Value) (Value, int, bool) {
 	return d.getWithSlotLocked(key)
 }
 
-// GetWithSlotHint checks the cached slot index first under RLock before falling back to full lookup.
+// GetWithSlotHint checks the cached slot index first before falling back to full lookup.
 func (d *PyDict) GetWithSlotHint(key Value, slotHint int) (Value, int, bool) {
+	if !d.Shared && !MultiThreadedFlag.Load() && d.Live == nil && d.split == nil &&
+		slotHint >= 0 && slotHint < len(d.Entries) {
+		e := &d.Entries[slotHint]
+		if e.Active && e.Key == key {
+			return e.Value, slotHint, true
+		}
+	}
 	if d.Live != nil {
 		return d.liveGetWithSlot(key)
 	}
@@ -4236,6 +4279,29 @@ func (d *PyDict) GetWithSlotHint(key Value, slotHint int) (Value, int, bool) {
 		}
 	}
 	return d.getWithSlotLocked(key)
+}
+
+// SetWithSlotHint updates an existing dict entry at slotHint in O(1) when
+// single-threaded, non-split, and non-live, falling back to Set otherwise.
+// Returns the resolved slot index (or -1 if unavailable).
+func (d *PyDict) SetWithSlotHint(key, value Value, slotHint int) int {
+	if !d.Shared && !MultiThreadedFlag.Load() && d.Live == nil && d.split == nil &&
+		slotHint >= 0 && slotHint < len(d.Entries) {
+		e := &d.Entries[slotHint]
+		if e.Active && e.Key == key {
+			e.Value = value
+			atomic.AddUint64(&d.VersionTag, 1)
+			if d.owner != nil {
+				d.owner.bumpVersion()
+			}
+			return slotHint
+		}
+	}
+	d.Set(key, value)
+	if _, slot, ok := d.GetWithSlotHint(key, slotHint); ok {
+		return slot
+	}
+	return -1
 }
 
 func (d *PyDict) getWithSlotLocked(key Value) (Value, int, bool) {

@@ -17,6 +17,7 @@ const (
 	REG_MOV RegOp = iota
 	REG_LOAD_CONST
 	REG_LOAD_GLOBAL
+	REG_STORE_GLOBAL
 	REG_LOAD_DEREF
 	REG_ADD
 	REG_SUB
@@ -38,6 +39,7 @@ const (
 	REG_STORE_SUBSCR
 	REG_GET_ITER
 	REG_FOR_ITER
+	REG_FOR_ITER_UNPACK2
 	REG_SETUP_RANGE
 	REG_FOR_ITER_RANGE
 	REG_UNPACK_SEQUENCE
@@ -266,9 +268,12 @@ func compileRegCode(co *CodeObject) *RegCode {
 	n := len(code)
 
 	// Pass 1: discover basic block starts, validate EntryIP is never a jump/exception target,
-	// and check opcode eligibility.
+	// and check opcode eligibility. isTarget tracks actual jump/exception boundaries (excluding
+	// fallthrough-only block starts) so OP_FOR_ITER can fuse safely with its fallthrough consumer.
 	isBlockStart := make([]bool, n+1)
+	isTarget := make([]bool, n+1)
 	isBlockStart[entryIP] = true
+	isTarget[entryIP] = true
 
 	for _, e := range co.ExceptionTable {
 		if e.StartIP < 0 || e.EndIP > n || e.TargetIP < entryIP || e.TargetIP >= n {
@@ -280,6 +285,9 @@ func compileRegCode(co *CodeObject) *RegCode {
 		isBlockStart[e.StartIP] = true
 		isBlockStart[e.EndIP] = true
 		isBlockStart[e.TargetIP] = true
+		isTarget[e.StartIP] = true
+		isTarget[e.EndIP] = true
+		isTarget[e.TargetIP] = true
 	}
 
 	for pc := entryIP; pc < n; {
@@ -297,6 +305,7 @@ func compileRegCode(co *CodeObject) *RegCode {
 				return nil
 			}
 			isBlockStart[target] = true
+			isTarget[target] = true
 			if pc+1 < n && DecodeOpcode(code[pc+1]) == OP_NOP {
 				step = 2
 			}
@@ -310,6 +319,7 @@ func compileRegCode(co *CodeObject) *RegCode {
 				return nil
 			}
 			isBlockStart[target] = true
+			isTarget[target] = true
 			if pc+1 < n {
 				isBlockStart[pc+1] = true
 			}
@@ -870,7 +880,11 @@ func compileRegCode(co *CodeObject) *RegCode {
 			}
 			valSlot := stack[len(stack)-1]
 			stack = stack[:len(stack)-1]
-			emitCold(pc, REG_COLD_STORE_GLOBAL, regUnused, valSlot.reg, regUnused, 0, argBx, regUnused, 0)
+			icIdx, ok := allocIC()
+			if !ok {
+				return nil
+			}
+			emit(pc, REG_STORE_GLOBAL, regUnused, valSlot.reg, regUnused, (uint32(argBx)<<16)|uint32(icIdx))
 			pc++
 
 		case OP_LOAD_DEREF:
@@ -1280,8 +1294,8 @@ func compileRegCode(co *CodeObject) *RegCode {
 			if !recordTargetDepth(targetPC, len(stack)-1) {
 				return nil
 			}
-			// Fuse FOR_ITER + STORE_FAST into direct destination register when safe.
-			if pc+1 < n && !isBlockStart[pc+1] {
+			// Fuse FOR_ITER + STORE_FAST or FOR_ITER + UNPACK_SEQUENCE(2) [+ STORE_FAST x2] when safe.
+			if pc+1 < n && !isTarget[pc+1] {
 				nextInst := code[pc+1]
 				nextOp := DecodeOpcode(nextInst)
 				if (nextOp == OP_STORE_FAST || nextOp == OP_STORE_FAST_VIEW) && int(DecodeArgBx(nextInst)) < numLocals {
@@ -1292,6 +1306,40 @@ func compileRegCode(co *CodeObject) *RegCode {
 					jIdx := emit(pc, REG_FOR_ITER, dst, iterReg, regUnused, 0)
 					jumpFixups = append(jumpFixups, regJumpFixup{regIP: jIdx, targetPC: targetPC})
 					curAssigned.set(int(dst))
+					pc += 2
+					continue
+				}
+				if nextOp == OP_UNPACK_SEQUENCE && DecodeArgBx(nextInst) == 2 {
+					if pc+3 < n && !isTarget[pc+2] && !isTarget[pc+3] {
+						inst2 := code[pc+2]
+						inst3 := code[pc+3]
+						op2 := DecodeOpcode(inst2)
+						op3 := DecodeOpcode(inst3)
+						if (op2 == OP_STORE_FAST || op2 == OP_STORE_FAST_VIEW) && int(DecodeArgBx(inst2)) < numLocals &&
+							(op3 == OP_STORE_FAST || op3 == OP_STORE_FAST_VIEW) && int(DecodeArgBx(inst3)) < numLocals {
+							dst0 := uint8(DecodeArgBx(inst2))
+							dst1 := uint8(DecodeArgBx(inst3))
+							jIdx := emit(pc, REG_FOR_ITER_UNPACK2, dst0, iterReg, dst1, 0)
+							jumpFixups = append(jumpFixups, regJumpFixup{regIP: jIdx, targetPC: targetPC})
+							curAssigned.set(int(dst0))
+							curAssigned.set(int(dst1))
+							pc += 4
+							continue
+						}
+					}
+					baseDepth := len(stack)
+					baseReg, ok := tempReg(baseDepth)
+					if !ok {
+						return nil
+					}
+					topReg, ok := tempReg(baseDepth + 1)
+					if !ok {
+						return nil
+					}
+					// Tier-1 UNPACK_SEQUENCE(2) leaves item[1] at baseReg and item[0] at topReg (top of stack).
+					jIdx := emit(pc, REG_FOR_ITER_UNPACK2, topReg, iterReg, baseReg, 0)
+					jumpFixups = append(jumpFixups, regJumpFixup{regIP: jIdx, targetPC: targetPC})
+					stack = append(stack, absSlot{reg: baseReg, isLocal: false}, absSlot{reg: topReg, isLocal: false})
 					pc += 2
 					continue
 				}

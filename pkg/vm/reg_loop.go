@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"math"
 	"sync/atomic"
 	"unsafe"
 
@@ -86,10 +87,12 @@ const (
 	regSlowReturn
 	regSlowMethodNative
 	regSlowCallBuiltin
+	regSlowCallTier1
 	regSlowSafepoint
 	regSlowForIterExhaust
 	regSlowDictGet
 	regSlowDictSet
+	regSlowStoreGlobal
 )
 
 // runRegLoop executes Tier-2 3-address register bytecode directly on vm.stack[st.base:].
@@ -155,6 +158,10 @@ func (vm *VM) runRegLoop(st *loopState, rc *RegCode, entryFrameIdx int) (val.Val
 						}
 					}
 				}
+				break innerLoop
+
+			case REG_STORE_GLOBAL:
+				slowKind = regSlowStoreGlobal
 				break innerLoop
 
 			case REG_LOAD_DEREF:
@@ -724,6 +731,83 @@ func (vm *VM) runRegLoop(st *loopState, rc *RegCode, entryFrameIdx int) (val.Val
 				}
 				break innerLoop
 
+			case REG_FOR_ITER_UNPACK2:
+				ra := uint8(inst >> 40)
+				it := *(*val.Value)(unsafe.Add(regsPtr, uintptr(ra)*16))
+				if it.IsIter() {
+					pyIter := it.AsIter()
+					if pyIter.Kind == val.IterKindEnumerate {
+						if pyIter.Sub.HeaderPtr() == nil && pyIter.Cur < math.MaxInt64 && pyIter.Obj.IsIter() {
+							sub := pyIter.Obj.AsIter()
+							if sub.Kind == val.IterKindList {
+								items := sub.Obj.AsList().Items
+								if uint(sub.Idx) < uint(len(items)) {
+									idx := pyIter.Cur
+									pyIter.Cur = idx + 1
+									v := items[sub.Idx]
+									sub.Idx++
+									*(*val.Value)(unsafe.Add(regsPtr, uintptr(uint8(inst>>48))*16)) = val.Int64Val(idx)
+									*(*val.Value)(unsafe.Add(regsPtr, uintptr(uint8(inst>>32))*16)) = v
+									ip++
+									continue
+								}
+								exhaustIter = pyIter
+								slowKind = regSlowForIterExhaust
+								break innerLoop
+							}
+							if sub.Kind == val.IterKindTuple {
+								items := sub.Obj.AsTuple().Items
+								if uint(sub.Idx) < uint(len(items)) {
+									idx := pyIter.Cur
+									pyIter.Cur = idx + 1
+									v := items[sub.Idx]
+									sub.Idx++
+									*(*val.Value)(unsafe.Add(regsPtr, uintptr(uint8(inst>>48))*16)) = val.Int64Val(idx)
+									*(*val.Value)(unsafe.Add(regsPtr, uintptr(uint8(inst>>32))*16)) = v
+									ip++
+									continue
+								}
+								exhaustIter = pyIter
+								slowKind = regSlowForIterExhaust
+								break innerLoop
+							}
+						}
+					} else if pyIter.Kind == val.IterKindZip && pyIter.Stop == 0 && pyIter.Step == 0 && len(pyIter.Seq) == 2 {
+						s0, s1 := pyIter.Seq[0], pyIter.Seq[1]
+						if s0.IsIter() && s1.IsIter() {
+							it0, it1 := s0.AsIter(), s1.AsIter()
+							if it0.Kind == val.IterKindList && it1.Kind == val.IterKindList {
+								items0 := it0.Obj.AsList().Items
+								items1 := it1.Obj.AsList().Items
+								if uint(it0.Idx) < uint(len(items0)) && uint(it1.Idx) < uint(len(items1)) {
+									v0 := items0[it0.Idx]
+									v1 := items1[it1.Idx]
+									it0.Idx++
+									it1.Idx++
+									*(*val.Value)(unsafe.Add(regsPtr, uintptr(uint8(inst>>48))*16)) = v0
+									*(*val.Value)(unsafe.Add(regsPtr, uintptr(uint8(inst>>32))*16)) = v1
+									ip++
+									continue
+								}
+							} else if it0.Kind == val.IterKindTuple && it1.Kind == val.IterKindTuple {
+								items0 := it0.Obj.AsTuple().Items
+								items1 := it1.Obj.AsTuple().Items
+								if uint(it0.Idx) < uint(len(items0)) && uint(it1.Idx) < uint(len(items1)) {
+									v0 := items0[it0.Idx]
+									v1 := items1[it1.Idx]
+									it0.Idx++
+									it1.Idx++
+									*(*val.Value)(unsafe.Add(regsPtr, uintptr(uint8(inst>>48))*16)) = v0
+									*(*val.Value)(unsafe.Add(regsPtr, uintptr(uint8(inst>>32))*16)) = v1
+									ip++
+									continue
+								}
+							}
+						}
+					}
+				}
+				break innerLoop
+
 			case REG_SETUP_RANGE:
 				ra := uint8(inst >> 40)
 				count := uint8(inst >> 32)
@@ -863,22 +947,34 @@ func (vm *VM) runRegLoop(st *loopState, rc *RegCode, entryFrameIdx int) (val.Val
 					entry := &st.cache.regIC[icIdx]
 					if target == entry.CachedVal && entry.CalleeCache != nil {
 						cc := entry.CalleeCache
-						if calleeRC := cc.regCode; calleeRC != nil && cc.owner == vm && cc.co != nil {
+						if cc.owner == vm && cc.co != nil {
 							fn := target.AsFunction()
 							if fn.Code.HeaderPtr() == &cc.co.Header && len(fn.Defaults) == 0 && fn.KwDefaults == nil &&
 								cc.co.SimplePositionalOnly && argc == cc.co.PositionalParamCount && !cc.co.HasCellVars {
 								newBase := st.base + int(ra) + 1
 								st.periodicTick++
-								if st.frameIdx+1 < 1000 &&
+								if calleeRC := cc.regCode; calleeRC != nil {
+									if st.frameIdx+1 < 1000 &&
+										st.frameIdx+2 <= len(vm.frames) &&
+										newBase+max(256, int(calleeRC.maxRegs)+64) <= len(st.stack) {
+										pushFn = fn
+										pushCC = cc
+										pushRC = calleeRC
+										pushNewBase = newBase
+										pushDstReg = int(uint8(inst >> 48))
+										needSafepoint = (st.periodicTick & 0xFF) == 0
+										slowKind = regSlowPushFrame
+										break innerLoop
+									}
+								} else if st.frameIdx+1 < 1000 &&
 									st.frameIdx+2 <= len(vm.frames) &&
-									newBase+max(256, int(calleeRC.maxRegs)+64) <= len(st.stack) {
+									newBase+max(256, max(cc.co.EffectiveLocals, cc.co.NumLocals)+64) <= len(st.stack) {
 									pushFn = fn
 									pushCC = cc
-									pushRC = calleeRC
 									pushNewBase = newBase
 									pushDstReg = int(uint8(inst >> 48))
-									needSafepoint = (st.periodicTick & 0xFF) == 0
-									slowKind = regSlowPushFrame
+									nativeArgc = argc
+									slowKind = regSlowCallTier1
 									break innerLoop
 								}
 							}
@@ -956,6 +1052,19 @@ func (vm *VM) runRegLoop(st *loopState, rc *RegCode, entryFrameIdx int) (val.Val
 									break innerLoop
 								}
 							}
+						} else if entry.Kind == ICKindModuleAttr && entry.NativeFn != nil && receiver.IsModule() {
+							mod := receiver.AsModule()
+							if mod.Header.Type == val.ModuleType && mod.Dict != nil &&
+								entry.ExpectedAuxVer == uint64(uintptr(unsafe.Pointer(mod))) &&
+								entry.ExpectedTypeVer == atomic.LoadUint64(&mod.Dict.VersionTag) {
+								nativeFn = entry.NativeFn
+								nativeSelf = entry.CachedVal
+								nativeArgReg = ra + 1
+								nativeArgc = argc
+								nativeDstReg = uint8(inst >> 48)
+								slowKind = regSlowCallBuiltin
+								break innerLoop
+							}
 						}
 					}
 				}
@@ -997,6 +1106,17 @@ func (vm *VM) runRegLoop(st *loopState, rc *RegCode, entryFrameIdx int) (val.Val
 				goto doRaise
 			}
 			*(*val.Value)(unsafe.Add(regsPtr, uintptr(nativeDstReg)*16)) = res
+			ip++
+			continue
+
+		case regSlowCallTier1:
+			res, raised := vm.callTier1SimpleFromRegWithCache(st, rc, pushFn, pushCC, pushNewBase, nativeArgc, ip)
+			st.stack = st.syncStackFromExecCtx(vm, st.stack)
+			regsPtr = unsafe.Add(unsafe.Pointer(unsafe.SliceData(st.stack)), uintptr(st.base)*16)
+			if raised {
+				goto doRaise
+			}
+			*(*val.Value)(unsafe.Add(regsPtr, uintptr(pushDstReg)*16)) = res
 			ip++
 			continue
 
@@ -1098,6 +1218,32 @@ func (vm *VM) runRegLoop(st *loopState, rc *RegCode, entryFrameIdx int) (val.Val
 			obj.AsDict().Set(key, v)
 			ip++
 			continue
+
+		case regSlowStoreGlobal:
+			inst := *(*RegInst)(unsafe.Add(codePtr, uintptr(ip)*8))
+			v := *(*val.Value)(unsafe.Add(regsPtr, uintptr(uint8(inst>>40))*16))
+			vhdr := v.HeaderPtr()
+			if (st.globals.Header.Type == val.DictType || st.globals.Header.Type == nil) &&
+				(vhdr == nil || ((vhdr.Flags&val.FlagEphemeralAll) == 0 && vhdr.Kind != val.KindMemoryView && (vhdr.Kind != val.KindString || (*val.PyString)(unsafe.Pointer(vhdr)).Buf == nil))) {
+				aux := uint32(inst)
+				name := *(*val.Value)(unsafe.Add(constsPtr, uintptr(aux>>16)*16))
+				icIdx := int(aux & 0xFFFF)
+				slotHint := -1
+				if st.cache.regGlobals == st.globals && icIdx < len(st.cache.regIC) {
+					slotHint = int(st.cache.regIC[icIdx].SlotIndex)
+				}
+				newSlot := st.globals.SetWithSlotHint(name, v, slotHint)
+				if newSlot >= 0 {
+					ic := st.cache.ensureRegIC(rc.numIC)
+					if st.cache.regGlobals != st.globals {
+						clear(ic)
+						st.cache.regGlobals = st.globals
+					}
+					ic[icIdx].SlotIndex = int32(newSlot)
+				}
+				ip++
+				continue
+			}
 		}
 
 		// Default / fallback: dispatchRegCold.
@@ -1482,7 +1628,12 @@ func (vm *VM) dispatchRegCold(st *loopState, rc *RegCode, inst RegInst, ip, entr
 		constIdx := aux >> 16
 		icIdx := int(aux & 0xFFFF)
 		name := st.consts[constIdx]
-		if v, ok := st.globals.Get(name); ok {
+		slotHint := -1
+		if (st.globals.Header.Type == val.DictType || st.globals.Header.Type == nil) &&
+			st.cache.regGlobals == st.globals && icIdx < len(st.cache.regIC) {
+			slotHint = int(st.cache.regIC[icIdx].SlotIndex)
+		}
+		if v, slot, ok := st.globals.GetWithSlotHint(name, slotHint); ok {
 			if v.IsLazyImport() {
 				vm.execCtx.SP = scratchBase
 				resolved, err := vm.resolveLazyImport(nil, name, v)
@@ -1503,6 +1654,7 @@ func (vm *VM) dispatchRegCold(st *loopState, rc *RegCode, inst RegInst, ip, entr
 				ic[icIdx] = ICSlot{
 					CachedVal:       v,
 					ExpectedTypeVer: atomic.LoadUint64(&st.globals.VersionTag),
+					SlotIndex:       int32(slot),
 					Kind:            ICKindGlobal,
 				}
 			}
@@ -1549,6 +1701,41 @@ func (vm *VM) dispatchRegCold(st *loopState, rc *RegCode, inst RegInst, ip, entr
 		}
 		st.raiseExc = val.NewNameError("name '" + name.AsString() + "' is not defined")
 		return ip, rc, ctlRaise
+
+	case REG_STORE_GLOBAL:
+		constIdx := aux >> 16
+		icIdx := int(aux & 0xFFFF)
+		v := st.stack[base+int(ra)]
+		val.ClearEphemeral(v)
+		val.DetachStringBuf(v)
+		markViewEscaped(v)
+		name := st.consts[constIdx]
+		if st.globals.Header.Type == val.DictType || st.globals.Header.Type == nil {
+			slotHint := -1
+			if st.cache.regGlobals == st.globals && icIdx < len(st.cache.regIC) {
+				slotHint = int(st.cache.regIC[icIdx].SlotIndex)
+			}
+			newSlot := st.globals.SetWithSlotHint(name, v, slotHint)
+			if newSlot >= 0 {
+				ic := st.cache.ensureRegIC(rc.numIC)
+				if st.cache.regGlobals != st.globals {
+					clear(ic)
+					st.cache.regGlobals = st.globals
+				}
+				ic[icIdx].SlotIndex = int32(newSlot)
+			}
+		} else {
+			vm.execCtx.SP = scratchBase
+			vm.setItemSafe(val.ObjectVal(&st.globals.Header), name, v)
+			st.stack = st.syncStackFromExecCtx(vm, st.stack)
+			if vm.execCtx.HasException() {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				st.raiseExc = exc
+				return ip, rc, ctlRaise
+			}
+		}
+		return ip + 1, rc, ctlReload
 
 	case REG_LOAD_DEREF:
 		if int(aux) < len(st.cells) && st.cells[aux].IsCell() {
@@ -1708,6 +1895,9 @@ func (vm *VM) dispatchRegCold(st *loopState, rc *RegCode, inst RegInst, ip, entr
 		}
 		st.stack[base+int(rd)] = item
 		return ip + 1, rc, ctlReload
+
+	case REG_FOR_ITER_UNPACK2:
+		return vm.regForIterUnpack2Slow(st, rc, rd, ra, rb, int(aux), ip, scratchBase)
 
 	case REG_SETUP_RANGE:
 		count := int(rb)
@@ -1885,6 +2075,178 @@ func (vm *VM) regSetAddSafe(s *val.PySet, item val.Value) {
 		}
 	}()
 	s.Add(item)
+}
+
+//go:noinline
+func (vm *VM) regForIterUnpack2Slow(st *loopState, rc *RegCode, rd, ra, rb uint8, targetIP, ip, scratchBase int) (int, *RegCode, loopCtl) {
+	base := st.base
+	it := st.stack[base+int(ra)]
+	vm.execCtx.SP = scratchBase
+
+	if it.IsIter() {
+		pyIter := it.AsIter()
+		switch pyIter.Kind {
+		case val.IterKindEnumerate:
+			var item val.Value
+			var ok bool
+			if pyIter.Obj.IsIter() {
+				item, ok = pyIter.Obj.AsIter().NextCtx(&vm.execCtx)
+			} else if pyIter.Obj.IsGenerator() {
+				var status val.IterStatus
+				item, status = vm.resumeGenerator(&vm.execCtx, pyIter.Obj.AsGenerator(), val.NoneVal())
+				ok = status == val.IterYielded
+			} else if tpNext := pyIter.Obj.Type().Slots.TpIterNext; tpNext != nil {
+				var status val.IterStatus
+				item, status = vm.iterNextSafe(tpNext, pyIter.Obj)
+				ok = status == val.IterYielded
+			}
+			st.stack = st.syncStackFromExecCtx(vm, st.stack)
+			if vm.execCtx.HasException() {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				st.raiseExc = exc
+				return ip, rc, ctlRaise
+			}
+			if !ok {
+				vm.releaseForIter(pyIter)
+				st.stack[base+int(ra)] = val.Value{}
+				return targetIP, rc, ctlReload
+			}
+			idxVal := pyIter.NextEnumerateIndex()
+			st.stack[base+int(rd)] = idxVal
+			st.stack[base+int(rb)] = item
+			return ip + 1, rc, ctlReload
+
+		case val.IterKindZip:
+			if len(pyIter.Seq) == 2 {
+				if pyIter.Stop != 0 {
+					vm.releaseForIter(pyIter)
+					st.stack[base+int(ra)] = val.Value{}
+					return targetIP, rc, ctlReload
+				}
+				v0, ok0 := pyIter.Seq[0].AsIter().NextCtx(&vm.execCtx)
+				st.stack = st.syncStackFromExecCtx(vm, st.stack)
+				if vm.execCtx.HasException() {
+					exc := vm.execCtx.ActiveException
+					vm.execCtx.ClearException()
+					st.raiseExc = exc
+					return ip, rc, ctlRaise
+				}
+				if !ok0 {
+					pyIter.Stop = 1
+					if pyIter.Step != 0 {
+						raiseZipStrict(&vm.execCtx, pyIter.Seq, 0)
+						st.stack = st.syncStackFromExecCtx(vm, st.stack)
+						if vm.execCtx.HasException() {
+							exc := vm.execCtx.ActiveException
+							vm.execCtx.ClearException()
+							st.raiseExc = exc
+							return ip, rc, ctlRaise
+						}
+					}
+					vm.releaseForIter(pyIter)
+					st.stack[base+int(ra)] = val.Value{}
+					return targetIP, rc, ctlReload
+				}
+				v1, ok1 := pyIter.Seq[1].AsIter().NextCtx(&vm.execCtx)
+				st.stack = st.syncStackFromExecCtx(vm, st.stack)
+				if vm.execCtx.HasException() {
+					exc := vm.execCtx.ActiveException
+					vm.execCtx.ClearException()
+					st.raiseExc = exc
+					return ip, rc, ctlRaise
+				}
+				if !ok1 {
+					pyIter.Stop = 1
+					if pyIter.Step != 0 {
+						raiseZipStrict(&vm.execCtx, pyIter.Seq, 1)
+						st.stack = st.syncStackFromExecCtx(vm, st.stack)
+						if vm.execCtx.HasException() {
+							exc := vm.execCtx.ActiveException
+							vm.execCtx.ClearException()
+							st.raiseExc = exc
+							return ip, rc, ctlRaise
+						}
+					}
+					vm.releaseForIter(pyIter)
+					st.stack[base+int(ra)] = val.Value{}
+					return targetIP, rc, ctlReload
+				}
+				st.stack[base+int(rd)] = v0
+				st.stack[base+int(rb)] = v1
+				return ip + 1, rc, ctlReload
+			}
+
+		case val.IterKindDictItems, val.IterKindDictRevItems:
+			k, v, ok := pyIter.NextDictItemPairCtx(&vm.execCtx)
+			st.stack = st.syncStackFromExecCtx(vm, st.stack)
+			if vm.execCtx.HasException() {
+				exc := vm.execCtx.ActiveException
+				vm.execCtx.ClearException()
+				st.raiseExc = exc
+				return ip, rc, ctlRaise
+			}
+			if !ok {
+				vm.releaseForIter(pyIter)
+				st.stack[base+int(ra)] = val.Value{}
+				return targetIP, rc, ctlReload
+			}
+			st.stack[base+int(rd)] = k
+			st.stack[base+int(rb)] = v
+			return ip + 1, rc, ctlReload
+		}
+	}
+
+	// Generic fallback: advance any iterator, then unpack 2 items into (rd, rb).
+	var item val.Value
+	var status val.IterStatus
+	if it.IsGenerator() {
+		item, status = vm.resumeGenerator(&vm.execCtx, it.AsGenerator(), val.NoneVal())
+	} else if tpIterNext := it.Type().Slots.TpIterNext; tpIterNext != nil {
+		item, status = vm.iterNextSafe(tpIterNext, it)
+	} else {
+		st.raiseExc = val.NewTypeError("'" + it.Type().Name + "' object is not an iterator")
+		return ip, rc, ctlRaise
+	}
+	st.stack = st.syncStackFromExecCtx(vm, st.stack)
+	if vm.execCtx.HasException() {
+		exc := vm.execCtx.ActiveException
+		vm.execCtx.ClearException()
+		st.raiseExc = exc
+		return ip, rc, ctlRaise
+	}
+	if status == val.IterExhausted {
+		if it.IsGenerator() {
+			vm.releaseGenerator(it.AsGenerator())
+		} else if it.IsIter() && (it.HeaderPtr().Flags&val.FlagEphemeralIter) != 0 {
+			vm.releaseForIter(it.AsIter())
+		}
+		st.stack[base+int(ra)] = val.Value{}
+		return targetIP, rc, ctlReload
+	}
+	if item.IsTuple() {
+		if items := item.AsTuple().Items; len(items) == 2 {
+			st.stack[base+int(rd)] = items[0]
+			st.stack[base+int(rb)] = items[1]
+			return ip + 1, rc, ctlReload
+		}
+	} else if item.IsList() {
+		if items := item.AsList().Items; len(items) == 2 {
+			st.stack[base+int(rd)] = items[0]
+			st.stack[base+int(rb)] = items[1]
+			return ip + 1, rc, ctlReload
+		}
+	}
+	st.stack[scratchBase] = item
+	_, _, ctl := vm.opUnpackSequence(st, Encode(OP_UNPACK_SEQUENCE, 0, 2), ip, scratchBase+1)
+	if ctl == ctlRaise {
+		return ip, rc, ctlRaise
+	}
+	// opUnpackSequence places item[1] at scratchBase and item[0] at scratchBase+1.
+	st.stack[base+int(rd)] = st.stack[scratchBase+1]
+	st.stack[base+int(rb)] = st.stack[scratchBase]
+	clear(st.stack[scratchBase : scratchBase+2])
+	return ip + 1, rc, ctlReload
 }
 
 //go:noinline
@@ -2158,21 +2520,25 @@ func (vm *VM) regCallPosSlow(st *loopState, rc *RegCode, rd, funcReg uint8, argc
 				nextIP, nextRC := vm.pushRegFrameFast(st, rc, fn, cc, calleeRC, newBase, int(rd), ip)
 				return nextIP, nextRC, ctlReload
 			}
-			// Zero-alloc Tier-1 bridge for exact-arity Tier-1 functions (including __class__-bearing super() methods).
-			if callee.DirectCaptureCount == 0 {
-				if scratchBase+max(256, callee.NumLocals+64) > len(st.stack) {
-					st.stack = vm.growStack(st, st.stack, scratchBase+max(256, callee.NumLocals+128))
-				}
-				if argc > 0 {
-					copy(st.stack[scratchBase:scratchBase+argc], st.stack[argStart:argStart+argc])
-				}
-				res, raised := vm.callTier1SimpleFromReg(st, rc, fn, callee, scratchBase, argc, ip)
-				if raised {
-					return ip, rc, ctlRaise
-				}
-				st.stack[base+int(rd)] = res
-				return ip + 1, rc, ctlReload
+			// Zero-alloc Tier-1 bridge for exact-arity Tier-1 functions (including closures and super() methods).
+			ic := st.cache.ensureRegIC(rc.numIC)
+			ic[icIdx] = ICSlot{
+				CachedVal:   target,
+				CalleeCache: cc,
 			}
+			numLocals := max(callee.EffectiveLocals, max(callee.NumLocals, argc))
+			if scratchBase+max(256, numLocals+64) > len(st.stack) {
+				st.stack = vm.growStack(st, st.stack, scratchBase+max(256, numLocals+128))
+			}
+			if argc > 0 {
+				copy(st.stack[scratchBase:scratchBase+argc], st.stack[argStart:argStart+argc])
+			}
+			res, raised := vm.callTier1SimpleFromRegWithCache(st, rc, fn, cc, scratchBase, argc, ip)
+			if raised {
+				return ip, rc, ctlRaise
+			}
+			st.stack[base+int(rd)] = res
+			return ip + 1, rc, ctlReload
 		}
 	}
 
@@ -2235,6 +2601,84 @@ func (vm *VM) regCallMethodPICSlow(st *loopState, rc *RegCode, rd, recvReg uint8
 				}
 				st.stack[base+int(rd)] = res
 				return ip + 1, rc, ctlReload
+			}
+		}
+	}
+
+	// General module-attribute call quickening (works for any module: math, struct, time, os, user modules).
+	if !vm.hasTrackedViews && receiver.IsModule() {
+		mod := receiver.AsModule()
+		if mod.Header.Type == val.ModuleType && mod.Dict != nil {
+			modVer := atomic.LoadUint64(&mod.Dict.VersionTag)
+			modPtr := uint64(uintptr(unsafe.Pointer(mod)))
+			interned := val.InternValue(methodName)
+			if v, ok := mod.Dict.Get(interned); ok && !v.IsLazyImport() {
+				if v.IsBuiltinFunc() {
+					if bf := v.AsBuiltinFunc(); bf.Fn != nil {
+						ic := st.cache.ensureRegIC(rc.numIC)
+						ic[icIdx] = ICSlot{
+							Kind:            ICKindModuleAttr,
+							ExpectedTypeVer: modVer,
+							ExpectedAuxVer:  modPtr,
+							CachedVal:       v,
+							NativeFn:        bf.Fn,
+						}
+						vm.execCtx.SP = scratchBase
+						res := vm.invokeBuiltinSafe(bf.Fn, v, st.stack[argStart:argStart+argc], nil)
+						st.stack = st.syncStackFromExecCtx(vm, st.stack)
+						if vm.execCtx.HasException() {
+							exc := vm.execCtx.ActiveException
+							vm.execCtx.ClearException()
+							st.raiseExc = exc
+							return ip, rc, ctlRaise
+						}
+						st.stack[base+int(rd)] = res
+						return ip + 1, rc, ctlReload
+					}
+				} else if v.IsFunction() {
+					fn := v.AsFunction()
+					callee := AsCodeObject(fn.Code)
+					if callee != nil && !callee.IsGenerator && !callee.IsCoroutine && !callee.IsAsyncGenerator &&
+						callee.SimplePositionalOnly && argc == callee.PositionalParamCount &&
+						len(fn.Defaults) == 0 && fn.KwDefaults == nil && !callee.HasCellVars {
+						cc := vm.fastCalleeCache(callee)
+						if cc.tier2Done == 0 {
+							maybeOptimizeCodeObject(vm, callee, cc)
+						}
+						if calleeRC := cc.regCode; calleeRC != nil {
+							if st.frameIdx+2 > len(vm.frames) {
+								vm.ensureFrameCapacity(st.frameIdx + 2)
+							}
+							if st.frameIdx+1 >= 1000 {
+								st.raiseExc = val.NewException(val.RecursionErrorType, "maximum recursion depth exceeded")
+								return ip, rc, ctlRaise
+							}
+							newBase := scratchBase
+							need := newBase + max(256, int(calleeRC.maxRegs)+64)
+							if need > len(st.stack) {
+								st.stack = vm.growStack(st, st.stack, need)
+							}
+							if argc > 0 {
+								copy(st.stack[newBase:newBase+argc], st.stack[argStart:argStart+argc])
+							}
+							nextIP, nextRC := vm.pushRegFrameFast(st, rc, fn, cc, calleeRC, newBase, int(rd), ip)
+							return nextIP, nextRC, ctlReload
+						}
+						numLocals := max(callee.EffectiveLocals, max(callee.NumLocals, argc))
+						if scratchBase+max(256, numLocals+64) > len(st.stack) {
+							st.stack = vm.growStack(st, st.stack, scratchBase+max(256, numLocals+128))
+						}
+						if argc > 0 {
+							copy(st.stack[scratchBase:scratchBase+argc], st.stack[argStart:argStart+argc])
+						}
+						res, raised := vm.callTier1SimpleFromRegWithCache(st, rc, fn, cc, scratchBase, argc, ip)
+						if raised {
+							return ip, rc, ctlRaise
+						}
+						st.stack[base+int(rd)] = res
+						return ip + 1, rc, ctlReload
+					}
+				}
 			}
 		}
 	}
@@ -2396,7 +2840,8 @@ func (vm *VM) regCallMethodPICSlow(st *loopState, rc *RegCode, rd, recvReg uint8
 }
 
 // callTier1SimpleFromReg invokes an exact-arity Tier-1 Python function (including
-// super()-using methods with fn.CellPtrs) from a RegCode caller with 0 heap allocations.
+// closures with DirectCaptureCount > 0 and super()-using methods with fn.CellPtrs)
+// from a RegCode caller with 0 heap allocations.
 //
 //go:noinline
 func (vm *VM) callTier1SimpleFromReg(
@@ -2410,6 +2855,22 @@ func (vm *VM) callTier1SimpleFromReg(
 	if cc.tier2Done == 0 {
 		maybeOptimizeCodeObject(vm, callee, cc)
 	}
+	return vm.callTier1SimpleFromRegWithCache(st, callerRC, fn, cc, newBase, totalArgs, callRegIP)
+}
+
+// callTier1SimpleFromRegWithCache invokes an exact-arity Tier-1 Python function
+// using a pre-resolved VMCodeCache, binding fn.CellPtrs and copying any zero-cell
+// DirectCaptureCount captures into trailing local slots.
+//
+//go:noinline
+func (vm *VM) callTier1SimpleFromRegWithCache(
+	st *loopState,
+	callerRC *RegCode,
+	fn *val.PyFunction,
+	cc *VMCodeCache,
+	newBase, totalArgs, callRegIP int,
+) (val.Value, bool) {
+	callee := cc.co
 	codePtr, codeLen := vm.loadWindow(callee, cc)
 
 	savedFrameIdx := st.frameIdx
@@ -2437,9 +2898,16 @@ func (vm *VM) callTier1SimpleFromReg(
 	saved.flags = (saved.flags & frameFlagHasShadow) | frameFlagReg | frameFlagStackIsVM
 
 	nextFrame := savedFrameIdx + 1
-	numLocals := max(callee.NumLocals, totalArgs)
-	for i := totalArgs; i < numLocals; i++ {
+	numLocals := max(callee.EffectiveLocals, max(callee.NumLocals, totalArgs))
+	unboundEnd := numLocals
+	if callee.DirectCaptureCount > 0 && callee.DirectCaptureBase < unboundEnd {
+		unboundEnd = callee.DirectCaptureBase
+	}
+	for i := totalArgs; i < unboundEnd; i++ {
 		st.stack[newBase+i] = val.UnboundVal()
+	}
+	if callee.DirectCaptureCount > 0 && len(fn.Closure) >= callee.DirectCaptureCount {
+		copy(st.stack[newBase+callee.DirectCaptureBase:], fn.Closure[:callee.DirectCaptureCount])
 	}
 
 	st.frameIdx = nextFrame
@@ -2454,8 +2922,13 @@ func (vm *VM) callTier1SimpleFromReg(
 	if fn.Globals != nil {
 		st.globals = fn.Globals
 	}
-	st.cells = fn.Closure
-	st.cellPtrs = fn.CellPtrs
+	if callee.DirectCaptureCount > 0 {
+		st.cells = nil
+		st.cellPtrs = nil
+	} else {
+		st.cells = fn.Closure
+		st.cellPtrs = fn.CellPtrs
+	}
 	st.ip = callee.EntryIP
 	st.sp = newBase + numLocals
 
@@ -2468,6 +2941,8 @@ func (vm *VM) callTier1SimpleFromReg(
 	vm.unhandledException = val.NoneVal()
 
 	res := vm.runLoopWithGlobals(st)
+
+	clear(st.stack[newBase : newBase+numLocals])
 
 	st.frameIdx = savedFrameIdx
 	st.startFrameIdx = savedStartFrameIdx

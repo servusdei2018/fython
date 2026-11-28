@@ -359,9 +359,11 @@ func NewInstanceOfType(cls *PyType) Value {
 		if (cls.Flags & FlagHasCExtBase) != 0 {
 			return NewCInstanceVal(cls)
 		}
+		dict := NewDictVal(16).AsDict()
+		dict.VersionTag = atomic.AddUint64(&nextModuleDictVer, 1<<32)
 		mod := &PyModule{
 			Header: ObjectHeader{Kind: KindModule, Type: cls},
-			Dict:   NewDictVal(16).AsDict(),
+			Dict:   dict,
 		}
 		return Value{num: 0, ptr: &mod.Header}
 	}

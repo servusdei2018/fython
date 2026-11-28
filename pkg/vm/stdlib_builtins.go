@@ -869,18 +869,64 @@ func (vm *VM) populateAllBuiltins(d *val.PyDict) {
 
 	// enumerate & zip & reversed & sorted
 	d.Set(val.InternString("enumerate"), val.NewBuiltinFuncVal("enumerate", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {
-		if len(args) < 1 {
-			return val.RaiseTypeError(ctx, "enumerate() takes at least 1 argument")
+		posCount := len(args) - len(kwnames)
+		var iterableVal val.Value
+		hasIterable := false
+		var startVal val.Value
+		hasStart := false
+		if posCount > 2 {
+			return val.RaiseTypeError(ctx, "enumerate() takes at most 2 arguments")
 		}
-		start := int64(0)
-		if len(args) > 1 && args[1].IsInt64() {
-			start = args[1].AsInt64()
+		if posCount >= 1 {
+			iterableVal = args[0]
+			hasIterable = true
 		}
-		it := iterFor(ctx, args[0])
+		if posCount == 2 {
+			startVal = args[1]
+			hasStart = true
+		}
+		for i, kn := range kwnames {
+			v := args[posCount+i]
+			switch kn.AsString() {
+			case "iterable":
+				if hasIterable {
+					return val.RaiseTypeError(ctx, "argument for enumerate() given by name ('iterable') and position (1)")
+				}
+				iterableVal = v
+				hasIterable = true
+			case "start":
+				if hasStart {
+					return val.RaiseTypeError(ctx, "argument for enumerate() given by name ('start') and position (2)")
+				}
+				startVal = v
+				hasStart = true
+			default:
+				return val.RaiseTypeError(ctx, "'"+kn.AsString()+"' is an invalid keyword argument for enumerate()")
+			}
+		}
+		if !hasIterable {
+			return val.RaiseTypeError(ctx, "enumerate() missing required argument 'iterable'")
+		}
+		it := iterFor(ctx, iterableVal)
 		if it == nil {
 			return val.NoneVal()
 		}
-		return val.NewEnumerateIterVal(val.ObjectVal(&it.Header), start)
+		if hasStart {
+			if startVal.IsBigInt() {
+				return val.NewEnumerateBigIterVal(val.ObjectVal(&it.Header), startVal)
+			}
+			if startVal.IsInt64() {
+				return val.NewEnumerateIterVal(val.ObjectVal(&it.Header), startVal.AsInt64())
+			}
+			if startVal.IsBool() {
+				if startVal.AsBool() {
+					return val.NewEnumerateIterVal(val.ObjectVal(&it.Header), 1)
+				}
+				return val.NewEnumerateIterVal(val.ObjectVal(&it.Header), 0)
+			}
+			return val.RaiseTypeError(ctx, "'"+startVal.Type().Name+"' object cannot be interpreted as an integer")
+		}
+		return val.NewEnumerateIterVal(val.ObjectVal(&it.Header), 0)
 	}))
 
 	d.Set(val.InternString("zip"), val.NewBuiltinFuncVal("zip", func(ctx *val.ExecContext, callable val.Value, args []val.Value, kwnames []val.Value) val.Value {

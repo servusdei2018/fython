@@ -455,10 +455,8 @@ func (vm *VM) nextZipEnumeratePooled(pyIter *val.PyIter) (val.Value, bool) {
 		if !ok {
 			return val.NoneVal(), false
 		}
-		idx := pyIter.Cur
-		pyIter.Cur++
 		var buf [2]val.Value
-		buf[0] = val.Int64Val(idx)
+		buf[0] = pyIter.NextEnumerateIndex()
 		buf[1] = v
 		if !val.MultiThreadedFlag.Load() {
 			return vm.acquireEphemeralTuple(buf[:]), true
