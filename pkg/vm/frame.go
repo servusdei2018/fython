@@ -1701,6 +1701,37 @@ func (vm *VM) frameGlobals(idx int) *val.PyDict {
 	return vm.globals
 }
 
+// detachExposedKwDict clears pool-ownership bits on the frame-owned
+// VarKWSafe **kwargs dict, if present. Materializing a frame (via
+// sys._getframe, f_locals, or traceback capture) exposes live locals to user
+// code; without this, teardown would recycle the pooled dict while user code
+// still holds it, and the next call would reuse the same object and mutate
+// the previously captured value. Clearing the bits is always safe: the dict
+// simply degrades to an ordinary heap dict.
+//
+//go:noinline
+func (vm *VM) detachExposedKwDict(fSlot *CallFrame, targetIdx int) {
+	co := fSlot.codeObject()
+	base := fSlot.baseOffset
+	if co == nil && targetIdx == vm.activeFrameIdx {
+		co = vm.activeCO
+		base = vm.activeBaseOffset
+	}
+	if co == nil || !co.VarKWSafe || co.VarKWIdx < 0 {
+		return
+	}
+	idx := base + co.VarKWIdx
+	if idx < 0 || idx >= len(vm.stack) {
+		return
+	}
+	v := vm.stack[idx]
+	if !v.IsDict() {
+		return
+	}
+	d := v.AsDict()
+	d.Header.Flags &^= val.FlagEphemeralDict | val.FlagEphemeralFrameDict
+}
+
 func (vm *VM) materializeFrame(targetIdx int) val.Value {
 	if targetIdx < 0 || targetIdx >= len(vm.frames) {
 		return val.NoneVal()
@@ -1709,6 +1740,12 @@ func (vm *VM) materializeFrame(targetIdx int) val.Value {
 		vm.syncActiveFrame(vm.activeState, vm.activeState.ip)
 	}
 	fSlot := &vm.frames[targetIdx]
+	// A frame exposed here may hand its live **kwargs dict to user code
+	// (e.g. sys._getframe(1).f_locals["kw"]). Detach the pooled VarKWSafe
+	// dict from pool ownership up front so frame teardown skips recycling
+	// it even if the caller retains the dict past return. Placed before the
+	// cached-shadow early return so repeated materializations stay covered.
+	vm.detachExposedKwDict(fSlot, targetIdx)
 	fIP := fSlot.ip
 	if (fSlot.flags&frameFlagReg) != 0 && fSlot.cache != nil && fSlot.cache.regCode != nil {
 		regIP := fIP
